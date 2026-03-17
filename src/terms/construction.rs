@@ -1895,34 +1895,27 @@ pub fn precompute_reparam_invariant_from_canonical(
         });
     }
 
-    // Build global roots (rank_k x p) for the reparam computation.
-    // This is needed because Q is p x p and the transformation R_k @ Q
-    // must produce rank_k x p outputs.
-    let global_roots: Vec<Array2<f64>> = penalties.iter().map(|cp| cp.global_root()).collect();
-    let rs_faer: Vec<Mat<f64>> = global_roots.iter().map(array_to_faer).collect();
-
-    // Build balanced penalty by accumulating block-locally
-    let mut s_balanced = Mat::<f64>::zeros(p, p);
+    // Group penalties by col_range to detect block-diagonal structure.
+    struct PenRef {
+        penalty_index: usize,
+    }
+    let mut block_groups: BTreeMap<(usize, usize), Vec<PenRef>> = BTreeMap::new();
     let mut has_nonzero = false;
-    for cp in penalties {
+    for (i, cp) in penalties.iter().enumerate() {
         if cp.rank() == 0 {
             continue;
         }
         let local = cp.local_penalty();
         let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
         if frob_norm > 1e-12 {
-            let scale = 1.0 / frob_norm;
-            let r = &cp.col_range;
-            for i in 0..local.nrows() {
-                for j in 0..local.ncols() {
-                    s_balanced[(r.start + i, r.start + j)] += scale * local[[i, j]];
-                }
-            }
             has_nonzero = true;
         }
+        let key = (cp.col_range.start, cp.col_range.end);
+        block_groups.entry(key).or_default().push(PenRef { penalty_index: i });
     }
 
     if !has_nonzero {
+        let global_roots: Vec<Array2<f64>> = penalties.iter().map(|cp| cp.global_root()).collect();
         return Ok(ReparamInvariant {
             split: SubspaceSplit::identity(p),
             rs_transformed_base: global_roots,
@@ -1931,57 +1924,287 @@ pub fn precompute_reparam_invariant_from_canonical(
         });
     }
 
-    let (bal_eigenvalues, bal_eigenvectors) =
-        robust_eigh_faer(&s_balanced, Side::Lower, "balanced penalty matrix")?;
-
-    let mut order: Vec<usize> = (0..p).collect();
-    order.sort_by(|&i, &j| {
-        bal_eigenvalues[j]
-            .partial_cmp(&bal_eigenvalues[i])
-            .unwrap_or(Ordering::Equal)
-            .then(i.cmp(&j))
-    });
-
-    let mut qs = Mat::<f64>::zeros(p, p);
-    for (col_idx, &idx) in order.iter().enumerate() {
-        for row in 0..p {
-            qs[(row, col_idx)] = bal_eigenvectors[(row, idx)];
+    // Check for overlapping ranges.
+    let ranges: Vec<(usize, usize)> = block_groups.keys().copied().collect();
+    let mut overlapping = false;
+    for i in 1..ranges.len() {
+        if ranges[i].0 < ranges[i - 1].1 {
+            overlapping = true;
+            break;
         }
     }
 
-    let mut bal_eigenvalues_ordered = Vec::with_capacity(p);
-    for &idx in &order {
-        bal_eigenvalues_ordered.push(bal_eigenvalues[idx]);
-    }
-    let max_bal = bal_eigenvalues_ordered
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let rank_tol = if max_bal > 0.0 { max_bal * 1e-12 } else { 1e-12 };
-    let penalized_rank = bal_eigenvalues_ordered
-        .iter()
-        .take_while(|&&val| val > rank_tol)
-        .count();
-    let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p)?;
+    if overlapping {
+        // Fallback: global p×p eigendecomposition.
+        let global_roots: Vec<Array2<f64>> =
+            penalties.iter().map(|cp| cp.global_root()).collect();
+        let rs_faer: Vec<Mat<f64>> = global_roots.iter().map(array_to_faer).collect();
 
-    let mut rs_transformed_base: Vec<Mat<f64>> = Vec::with_capacity(m);
-    for rs in &rs_faer {
-        let mut product = Mat::<f64>::zeros(rs.nrows(), qs.ncols());
-        matmul(
-            product.as_mut(),
-            Accum::Replace,
-            rs.as_ref(),
-            qs.as_ref(),
-            1.0,
-            Par::Seq,
-        );
-        rs_transformed_base.push(product);
+        let mut s_balanced = Mat::<f64>::zeros(p, p);
+        for cp in penalties {
+            if cp.rank() == 0 {
+                continue;
+            }
+            let local = cp.local_penalty();
+            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            if frob_norm > 1e-12 {
+                let scale = 1.0 / frob_norm;
+                let r = &cp.col_range;
+                for i in 0..local.nrows() {
+                    for j in 0..local.ncols() {
+                        s_balanced[(r.start + i, r.start + j)] += scale * local[[i, j]];
+                    }
+                }
+            }
+        }
+
+        let (bal_eigenvalues, bal_eigenvectors) =
+            robust_eigh_faer(&s_balanced, Side::Lower, "balanced penalty matrix")?;
+
+        let mut order: Vec<usize> = (0..p).collect();
+        order.sort_by(|&i, &j| {
+            bal_eigenvalues[j]
+                .partial_cmp(&bal_eigenvalues[i])
+                .unwrap_or(Ordering::Equal)
+                .then(i.cmp(&j))
+        });
+
+        let mut qs = Mat::<f64>::zeros(p, p);
+        for (col_idx, &idx) in order.iter().enumerate() {
+            for row in 0..p {
+                qs[(row, col_idx)] = bal_eigenvectors[(row, idx)];
+            }
+        }
+
+        let max_bal = order
+            .iter()
+            .map(|&idx| bal_eigenvalues[idx].abs())
+            .fold(0.0_f64, f64::max);
+        let rank_tol = if max_bal > 0.0 { max_bal * 1e-12 } else { 1e-12 };
+        let penalized_rank = order
+            .iter()
+            .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
+            .count();
+        let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p)?;
+
+        let mut rs_transformed_base: Vec<Mat<f64>> = Vec::with_capacity(m);
+        for rs in &rs_faer {
+            let mut product = Mat::<f64>::zeros(rs.nrows(), qs.ncols());
+            matmul(
+                product.as_mut(),
+                Accum::Replace,
+                rs.as_ref(),
+                qs.as_ref(),
+                1.0,
+                Par::Seq,
+            );
+            rs_transformed_base.push(product);
+        }
+
+        return Ok(ReparamInvariant {
+            split,
+            rs_transformed_base: rs_transformed_base.iter().map(mat_to_array).collect(),
+            has_nonzero,
+            max_balanced_eigenvalue: max_bal,
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-overlapping: block-diagonal eigendecomposition at O(Σ p_k³).
+    // -----------------------------------------------------------------------
+    // The balanced sum is block-diagonal ⟹ its eigenvectors are block-local.
+    // Q_pen and Q_null are assembled by embedding block-local eigenvectors.
+
+    // Track which columns are covered by any penalty.
+    let mut covered = vec![false; p];
+    for cp in penalties {
+        for j in cp.col_range.clone() {
+            covered[j] = true;
+        }
+    }
+    let uncovered_cols: Vec<usize> = (0..p).filter(|j| !covered[*j]).collect();
+
+    struct BlockResult {
+        col_range: Range<usize>,
+        q_pen_local: Array2<f64>,
+        q_null_local: Array2<f64>,
+        qs_local: Array2<f64>,
+        max_bal: f64,
+        penalty_indices: Vec<usize>,
+    }
+
+    let mut block_results = Vec::with_capacity(block_groups.len());
+    let mut global_max_bal = 0.0_f64;
+
+    for (&(start, end), refs) in &block_groups {
+        let block_dim = end - start;
+
+        // Build local balanced sum.
+        let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
+        let mut block_has_nonzero = false;
+        for pref in refs {
+            let cp = &penalties[pref.penalty_index];
+            let local = cp.local_penalty();
+            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            if frob_norm > 1e-12 {
+                s_balanced_local.scaled_add(1.0 / frob_norm, &local);
+                block_has_nonzero = true;
+            }
+        }
+
+        let penalty_indices: Vec<usize> = refs.iter().map(|r| r.penalty_index).collect();
+
+        if !block_has_nonzero {
+            block_results.push(BlockResult {
+                col_range: start..end,
+                q_pen_local: Array2::zeros((block_dim, 0)),
+                q_null_local: Array2::eye(block_dim),
+                qs_local: Array2::eye(block_dim),
+                max_bal: 0.0,
+                penalty_indices,
+            });
+            continue;
+        }
+
+        // Eigendecompose the local balanced penalty.
+        let (bal_eigenvalues, bal_eigenvectors) =
+            robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
+
+        let mut order: Vec<usize> = (0..block_dim).collect();
+        order.sort_by(|&i, &j| {
+            bal_eigenvalues[j]
+                .partial_cmp(&bal_eigenvalues[i])
+                .unwrap_or(Ordering::Equal)
+                .then(i.cmp(&j))
+        });
+
+        let max_bal = order
+            .iter()
+            .map(|&idx| bal_eigenvalues[idx].abs())
+            .fold(0.0_f64, f64::max);
+        let rank_tol = if max_bal > 0.0 { max_bal * 1e-12 } else { 1e-12 };
+        let penalized_rank = order
+            .iter()
+            .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
+            .count();
+        let null_count = block_dim - penalized_rank;
+
+        let mut q_pen_local = Array2::zeros((block_dim, penalized_rank));
+        let mut q_null_local = Array2::zeros((block_dim, null_count));
+        for (col_idx, &idx) in order.iter().enumerate() {
+            if col_idx < penalized_rank {
+                for row in 0..block_dim {
+                    q_pen_local[[row, col_idx]] = bal_eigenvectors[[row, idx]];
+                }
+            } else {
+                let null_col = col_idx - penalized_rank;
+                for row in 0..block_dim {
+                    q_null_local[[row, null_col]] = bal_eigenvectors[[row, idx]];
+                }
+            }
+        }
+
+        // Local Q_s = [Q_pen | Q_null]
+        let mut qs_local = Array2::zeros((block_dim, block_dim));
+        for i in 0..block_dim {
+            for j in 0..penalized_rank {
+                qs_local[[i, j]] = q_pen_local[[i, j]];
+            }
+            for j in 0..null_count {
+                qs_local[[i, penalized_rank + j]] = q_null_local[[i, j]];
+            }
+        }
+
+        global_max_bal = global_max_bal.max(max_bal);
+        block_results.push(BlockResult {
+            col_range: start..end,
+            q_pen_local,
+            q_null_local,
+            qs_local,
+            max_bal,
+            penalty_indices,
+        });
+    }
+
+    // Assemble global Q_pen and Q_null.
+    let total_pen_rank: usize = block_results.iter().map(|br| br.q_pen_local.ncols()).sum();
+    let total_null: usize =
+        block_results.iter().map(|br| br.q_null_local.ncols()).sum() + uncovered_cols.len();
+
+    let mut q_pen = Array2::zeros((p, total_pen_rank));
+    let mut q_null = Array2::zeros((p, total_null));
+    let mut pen_col = 0usize;
+    let mut null_col = 0usize;
+
+    for br in &block_results {
+        let start = br.col_range.start;
+        let bd = br.q_pen_local.nrows();
+        let pen_r = br.q_pen_local.ncols();
+        let null_r = br.q_null_local.ncols();
+        if pen_r > 0 {
+            q_pen
+                .slice_mut(s![start..(start + bd), pen_col..(pen_col + pen_r)])
+                .assign(&br.q_pen_local);
+            pen_col += pen_r;
+        }
+        if null_r > 0 {
+            q_null
+                .slice_mut(s![start..(start + bd), null_col..(null_col + null_r)])
+                .assign(&br.q_null_local);
+            null_col += null_r;
+        }
+    }
+    for &j in &uncovered_cols {
+        q_null[[j, null_col]] = 1.0;
+        null_col += 1;
+    }
+
+    let split = SubspaceSplit { q_pen, q_null };
+
+    // Assemble global transformed roots.
+    // For each penalty, extract the block columns from its global root and
+    // multiply by the local Q_s. Since Q_s is block-diagonal, this only
+    // touches the relevant block columns.
+    let mut rs_transformed_base = vec![Array2::zeros((0, p)); m];
+
+    for br in &block_results {
+        let start = br.col_range.start;
+        let end = br.col_range.end;
+
+        for &pi in &br.penalty_indices {
+            let cp = &penalties[pi];
+            // Extract local root: root is rank_k × block_dim.
+            let local_root = &cp.root;
+            let rank_k = local_root.nrows();
+
+            // Transform: rs_local_transformed = local_root * qs_local
+            let rs_transformed_local = local_root.dot(&br.qs_local);
+
+            // Embed into global coordinates: rank_k × p.
+            let mut rs_global = Array2::zeros((rank_k, p));
+            rs_global
+                .slice_mut(s![.., start..end])
+                .assign(&rs_transformed_local);
+            rs_transformed_base[pi] = rs_global;
+        }
+    }
+
+    // Handle penalties with rank 0 that didn't enter any block group.
+    for (i, cp) in penalties.iter().enumerate() {
+        if rs_transformed_base[i].dim() == (0, p) {
+            continue; // already sized correctly for rank-0
+        }
+        if rs_transformed_base[i].nrows() == 0 && rs_transformed_base[i].ncols() == 0 {
+            // Rank-0 penalty that wasn't in any block group.
+            rs_transformed_base[i] = Array2::zeros((cp.rank(), p));
+        }
     }
 
     Ok(ReparamInvariant {
         split,
-        rs_transformed_base: rs_transformed_base.iter().map(mat_to_array).collect(),
+        rs_transformed_base,
         has_nonzero,
-        max_balanced_eigenvalue: max_bal,
+        max_balanced_eigenvalue: global_max_bal,
     })
 }
 

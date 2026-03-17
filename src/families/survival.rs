@@ -350,6 +350,8 @@ pub struct WorkingModelSurvival {
     monotonicity: MonotonicityPenalty,
     structurally_monotonic: bool,
     structural_time_columns: usize,
+    monotonicity_constraint_rows: Option<Array2<f64>>,
+    monotonicity_constraint_offsets: Option<Array1<f64>>,
     workspace: std::sync::Mutex<SurvivalWorkspace>,
 }
 
@@ -370,6 +372,8 @@ impl Clone for WorkingModelSurvival {
             monotonicity: self.monotonicity.clone(),
             structurally_monotonic: self.structurally_monotonic,
             structural_time_columns: self.structural_time_columns,
+            monotonicity_constraint_rows: self.monotonicity_constraint_rows.clone(),
+            monotonicity_constraint_offsets: self.monotonicity_constraint_offsets.clone(),
             workspace: std::sync::Mutex::new(workspace),
         }
     }
@@ -399,6 +403,35 @@ impl WorkingModelSurvival {
 
     fn row_derivative_constraint_lower_bound(&self, _: usize) -> f64 {
         self.derivative_guard()
+    }
+
+    pub fn set_monotonicity_constraint_rows(
+        &mut self,
+        rows: Array2<f64>,
+        offsets: Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        if rows.ncols() != self.coefficient_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "survival monotonicity constraint width mismatch: got {}, expected {}",
+                rows.ncols(),
+                self.coefficient_dim()
+            )));
+        }
+        if rows.nrows() != offsets.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "survival monotonicity constraint row mismatch: rows={} offsets={}",
+                rows.nrows(),
+                offsets.len()
+            )));
+        }
+        if rows.iter().any(|v| !v.is_finite()) || offsets.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::InvalidInput(
+                "survival monotonicity constraints must be finite".to_string(),
+            ));
+        }
+        self.monotonicity_constraint_rows = Some(rows);
+        self.monotonicity_constraint_offsets = Some(offsets);
+        Ok(())
     }
 
     fn coefficient_dim(&self) -> usize {
@@ -665,6 +698,33 @@ impl WorkingModelSurvival {
         if p == 0 {
             return None;
         }
+        if let (Some(rows), Some(offsets)) = (
+            self.monotonicity_constraint_rows.as_ref(),
+            self.monotonicity_constraint_offsets.as_ref(),
+        ) {
+            let activerows: Vec<usize> = (0..rows.nrows())
+                .filter(|&i| {
+                    rows.row(i)
+                        .iter()
+                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                        > DERIVATIVE_ROW_NORM_TOL
+                })
+                .collect();
+            if activerows.is_empty() {
+                return None;
+            }
+            let mut a = Array2::<f64>::zeros((activerows.len(), p));
+            let mut b = Array1::<f64>::zeros(activerows.len());
+            for (r, &i) in activerows.iter().enumerate() {
+                a.row_mut(r).assign(&rows.row(i));
+                b[r] = self.derivative_guard() - offsets[i];
+            }
+            return if self.structurally_monotonic {
+                Some(LinearInequalityConstraints { a, b })
+            } else {
+                Some(compress_positive_collinear_constraints(&a, &b))
+            };
+        }
         let mut derivative_row = vec![0.0_f64; p];
         let activerows: Vec<usize> = (0..self.nrows())
             .filter(|&i| {
@@ -778,6 +838,8 @@ impl WorkingModelSurvival {
             monotonicity,
             structurally_monotonic: false,
             structural_time_columns: 0,
+            monotonicity_constraint_rows: None,
+            monotonicity_constraint_offsets: None,
             workspace: std::sync::Mutex::new(SurvivalWorkspace::new(n)),
         }
     }

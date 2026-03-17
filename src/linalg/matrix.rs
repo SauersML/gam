@@ -17,6 +17,7 @@ const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 
 pub use crate::linalg::utils::PcgSolveInfo;
 
@@ -967,9 +968,8 @@ impl BlockDesignOperator {
                 let pj = other.ncols();
                 let mut cross = Array2::<f64>::zeros((1, pj));
                 let ones = Array1::from_elem(self.n, 1.0);
-                let weighted = Array1::from_shape_fn(self.n, |idx| {
-                    ones[idx] * weights[idx].max(0.0)
-                });
+                let weighted =
+                    Array1::from_shape_fn(self.n, |idx| ones[idx] * weights[idx].max(0.0));
                 let row = other.apply_transpose(&weighted);
                 cross.row_mut(0).assign(&row);
                 Ok(cross)
@@ -995,9 +995,8 @@ impl BlockDesignOperator {
                 for c in 0..pj {
                     e_c[c] = 1.0;
                     let col_j = bj.apply(&e_c);
-                    let weighted = Array1::from_shape_fn(self.n, |idx| {
-                        col_j[idx] * weights[idx].max(0.0)
-                    });
+                    let weighted =
+                        Array1::from_shape_fn(self.n, |idx| col_j[idx] * weights[idx].max(0.0));
                     let cross_col = bi.apply_transpose(&weighted);
                     cross.column_mut(c).assign(&cross_col);
                     e_c[c] = 0.0;
@@ -1093,34 +1092,41 @@ impl BlockDesignOperator {
 
             // Intercept × anything: contribution at row i = m_ab[0, :] · row_i(B_b)
             (DesignBlock::Intercept(_), other) => {
-                // m_ab is (1, p_b).  For each i: m_ab[0,:] · row_i(other).
-                let dense_b = other.to_dense();
                 let m_row = m_ab.row(0);
                 let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    out[i] = dense_b.row(i).dot(&m_row);
+                for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+                    let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+                    let chunk = other.row_chunk(start..end);
+                    for local in 0..(end - start) {
+                        out[start + local] = chunk.row(local).dot(&m_row);
+                    }
                 }
                 Ok(out)
             }
             (other, DesignBlock::Intercept(_)) => {
-                // m_ab is (p_a, 1).  For each i: row_i(other) · m_ab[:,0].
-                let dense_a = other.to_dense();
                 let m_col = m_ab.column(0);
                 let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    out[i] = dense_a.row(i).dot(&m_col);
+                for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+                    let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+                    let chunk = other.row_chunk(start..end);
+                    for local in 0..(end - start) {
+                        out[start + local] = chunk.row(local).dot(&m_col);
+                    }
                 }
                 Ok(out)
             }
 
-            // Generic fallback: materialize both blocks.
+            // Generic fallback: stream row chunks rather than materializing both blocks.
             _ => {
-                let da = block_a.to_dense();
-                let db = block_b.to_dense();
-                let da_m = fast_ab(&da, m_ab);
                 let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    out[i] = da_m.row(i).dot(&db.row(i));
+                for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+                    let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+                    let chunk_a = block_a.row_chunk(start..end);
+                    let chunk_b = block_b.row_chunk(start..end);
+                    let chunk_a_m = fast_ab(&chunk_a, m_ab);
+                    for local in 0..(end - start) {
+                        out[start + local] = chunk_a_m.row(local).dot(&chunk_b.row(local));
+                    }
                 }
                 Ok(out)
             }
@@ -1279,9 +1285,7 @@ impl DesignOperator for BlockDesignOperator {
         self.blocks.iter().any(|b| {
             matches!(
                 b,
-                DesignBlock::RandomEffect(_)
-                    | DesignBlock::Operator(_)
-                    | DesignBlock::Intercept(_)
+                DesignBlock::RandomEffect(_) | DesignBlock::Operator(_) | DesignBlock::Intercept(_)
             )
         })
     }
@@ -1389,7 +1393,9 @@ impl DesignOperator for ReparamDesignOperator {
         ridge: f64,
     ) -> Array1<f64> {
         let q_beta = self.q.dot(vector);
-        let inner_result = self.inner.apply_weighted_normal(weights, &q_beta, None, 0.0);
+        let inner_result = self
+            .inner
+            .apply_weighted_normal(weights, &q_beta, None, 0.0);
         let mut out = self.q.t().dot(&inner_result);
         if let Some(pen) = penalty {
             out += &pen.dot(vector);
@@ -1460,7 +1466,6 @@ impl MultiChannelOperator {
             p,
         })
     }
-
 }
 
 impl DesignOperator for MultiChannelOperator {
@@ -1614,6 +1619,174 @@ pub struct RowwiseKroneckerOperator {
     pub n: usize,
     pub p_cov: usize,
     pub p_time: usize,
+}
+
+/// Generic rowwise Kronecker operator for dense marginal designs.
+///
+/// Each row is the Kronecker product of the corresponding marginal rows:
+/// `X[i, :] = B_1[i, :] ⊗ ... ⊗ B_d[i, :]`.
+///
+/// This keeps tensor-product terms operator-backed in the main model path so
+/// fitting no longer requires an eager `n x prod(q_j)` realization.
+pub struct TensorProductDesignOperator {
+    marginals: Vec<Arc<Array2<f64>>>,
+    n: usize,
+    total_cols: usize,
+}
+
+impl TensorProductDesignOperator {
+    pub fn new(marginals: Vec<Arc<Array2<f64>>>) -> Result<Self, String> {
+        if marginals.is_empty() {
+            return Err("TensorProductDesignOperator requires at least one marginal".to_string());
+        }
+        let n = marginals[0].nrows();
+        let total_cols = marginals.iter().try_fold(1usize, |acc, marginal| {
+            if marginal.nrows() != n {
+                return Err(format!(
+                    "TensorProductDesignOperator row mismatch: expected {n}, got {}",
+                    marginal.nrows()
+                ));
+            }
+            acc.checked_mul(marginal.ncols()).ok_or_else(|| {
+                "TensorProductDesignOperator total column count overflow".to_string()
+            })
+        })?;
+        Ok(Self {
+            marginals,
+            n,
+            total_cols,
+        })
+    }
+
+    fn row_values(&self, row: usize) -> Vec<f64> {
+        let mut values = vec![1.0_f64];
+        for marginal in &self.marginals {
+            let q = marginal.ncols();
+            let mut next = vec![0.0_f64; values.len() * q];
+            for (prefix_idx, &prefix) in values.iter().enumerate() {
+                for col in 0..q {
+                    next[prefix_idx * q + col] = prefix * marginal[[row, col]];
+                }
+            }
+            values = next;
+        }
+        values
+    }
+}
+
+impl DesignOperator for TensorProductDesignOperator {
+    fn nrows(&self) -> usize {
+        self.n
+    }
+
+    fn ncols(&self) -> usize {
+        self.total_cols
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.n);
+        for row in 0..self.n {
+            let row_values = self.row_values(row);
+            let mut acc = 0.0_f64;
+            for (j, &value) in row_values.iter().enumerate() {
+                acc += value * vector[j];
+            }
+            out[row] = acc;
+        }
+        out
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.total_cols);
+        for row in 0..self.n {
+            let scale = vector[row];
+            if scale == 0.0 {
+                continue;
+            }
+            let row_values = self.row_values(row);
+            for (j, &value) in row_values.iter().enumerate() {
+                out[j] += scale * value;
+            }
+        }
+        out
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.n {
+            return Err(format!(
+                "TensorProductDesignOperator::diag_xtw_x: weights length {} != n {}",
+                weights.len(),
+                self.n
+            ));
+        }
+        let mut xtwx = Array2::<f64>::zeros((self.total_cols, self.total_cols));
+        for row in 0..self.n {
+            let wi = weights[row].max(0.0);
+            if wi == 0.0 {
+                continue;
+            }
+            let row_values = self.row_values(row);
+            for a in 0..self.total_cols {
+                let va = row_values[a];
+                if va == 0.0 {
+                    continue;
+                }
+                for b in a..self.total_cols {
+                    let vb = row_values[b];
+                    if vb == 0.0 {
+                        continue;
+                    }
+                    let value = wi * va * vb;
+                    xtwx[[a, b]] += value;
+                    if a != b {
+                        xtwx[[b, a]] += value;
+                    }
+                }
+            }
+        }
+        Ok(xtwx)
+    }
+
+    fn uses_matrix_free_pcg(&self) -> bool {
+        true
+    }
+
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        if middle.nrows() != self.total_cols || middle.ncols() != self.total_cols {
+            return Err(format!(
+                "TensorProductDesignOperator::quadratic_form_diag dimension mismatch: {}x{} vs expected {}x{}",
+                middle.nrows(),
+                middle.ncols(),
+                self.total_cols,
+                self.total_cols
+            ));
+        }
+        let mut out = Array1::<f64>::zeros(self.n);
+        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+            let chunk = self.row_chunk(start..end);
+            let chunk_m = fast_ab(&chunk, middle);
+            for local in 0..(end - start) {
+                out[start + local] = chunk.row(local).dot(&chunk_m.row(local)).max(0.0);
+            }
+        }
+        Ok(out)
+    }
+
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((rows.end - rows.start, self.total_cols));
+        for (local_row, global_row) in rows.enumerate() {
+            let row_values = self.row_values(global_row);
+            for (j, &value) in row_values.iter().enumerate() {
+                out[[local_row, j]] = value;
+            }
+        }
+        out
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.row_chunk(0..self.n)
+    }
 }
 
 impl RowwiseKroneckerOperator {
@@ -1781,6 +1954,29 @@ impl DesignOperator for RowwiseKroneckerOperator {
         true
     }
 
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        let p_total = self.p_cov * self.p_time;
+        if middle.nrows() != p_total || middle.ncols() != p_total {
+            return Err(format!(
+                "RowwiseKroneckerOperator::quadratic_form_diag dimension mismatch: {}x{} vs expected {}x{}",
+                middle.nrows(),
+                middle.ncols(),
+                p_total,
+                p_total
+            ));
+        }
+        let mut out = Array1::<f64>::zeros(self.n);
+        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+            let chunk = self.row_chunk(start..end);
+            let chunk_m = fast_ab(&chunk, middle);
+            for local in 0..(end - start) {
+                out[start + local] = chunk.row(local).dot(&chunk_m.row(local)).max(0.0);
+            }
+        }
+        Ok(out)
+    }
+
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         let p_cov = self.p_cov;
         let p_time = self.p_time;
@@ -1905,9 +2101,7 @@ impl DesignOperator for ConditionedDesign {
         // Apply the full transformation in one pass (symmetric).
         for i in 0..p {
             for j in i..p {
-                let val = a[i] * base[[i, j]] * a[j]
-                    - a[i] * cw[i] * d[j]
-                    - d[i] * cw[j] * a[j]
+                let val = a[i] * base[[i, j]] * a[j] - a[i] * cw[i] * d[j] - d[i] * cw[j] * a[j]
                     + sum_w * d[i] * d[j];
                 base[[i, j]] = val;
                 base[[j, i]] = val;
@@ -3386,9 +3580,9 @@ impl DesignMatrix {
         match self {
             Self::Dense(matrix) => matrix.slice(s![rows, ..]).to_owned(),
             Self::Sparse(matrix) => {
-                let csr = matrix
-                    .to_csr_arc()
-                    .unwrap_or_else(|| panic!("DesignMatrix::row_chunk: failed to obtain CSR view"));
+                let csr = matrix.to_csr_arc().unwrap_or_else(|| {
+                    panic!("DesignMatrix::row_chunk: failed to obtain CSR view")
+                });
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();

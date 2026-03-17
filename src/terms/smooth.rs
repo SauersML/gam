@@ -1,25 +1,24 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
     BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
-    DuchonBasisSpec, MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo,
-    PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
-    applyweighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivative,
-    build_duchon_basis_log_kappasecond_derivative, build_duchon_basiswithworkspace,
-    build_matern_basis,
+    DuchonBasisSpec, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
+    PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec,
+    apply_sum_to_zero_constraint, applyweighted_orthogonality_constraint, build_bspline_basis_1d,
+    build_duchon_basis, build_duchon_basis_log_kappa_aniso_derivatives,
+    build_duchon_basis_log_kappa_derivative, build_duchon_basis_log_kappasecond_derivative,
+    build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivative,
-    build_matern_basiswithworkspace,
-    build_matern_basis_log_kappasecond_derivative, build_matern_collocation_operator_matrices,
-    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
-    build_thin_plate_basis_log_kappasecond_derivative, estimate_penalty_nullity,
-    filter_active_penalty_candidates,
+    build_matern_basis_log_kappasecond_derivative, build_matern_basiswithworkspace,
+    build_matern_collocation_operator_matrices, build_thin_plate_basis,
+    build_thin_plate_basis_log_kappa_derivative, build_thin_plate_basis_log_kappasecond_derivative,
+    estimate_penalty_nullity, filter_active_penalty_candidates,
 };
 use crate::construction::kronecker_product;
 use crate::custom_family::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
-    ExactNewtonOuterObjective, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    evaluate_custom_family_joint_hyper, fit_custom_family,
+    ExactNewtonOuterObjective, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState,
@@ -30,6 +29,7 @@ use crate::faer_ndarray::fast_atv;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix,
+    TensorProductDesignOperator,
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::LinearInequalityConstraints;
@@ -168,6 +168,9 @@ pub struct SmoothTerm {
     /// Optional term-local inequality constraints in local coefficient coordinates.
     /// `A_local * beta_local >= b_local`.
     pub linear_constraints_local: Option<LinearInequalityConstraints>,
+    /// Optional factored tensor-product representation preserved for operator-backed
+    /// assembly in the main design builder.
+    pub kronecker_factored: Option<KroneckerFactoredBasis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,6 +461,12 @@ impl TermCollectionSpec {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum PenaltyStructureHint {
+    Ridge(f64),
+    Kronecker(Vec<Array2<f64>>),
+}
+
 /// A penalty matrix stored at its natural block size together with the
 /// column range it occupies in the global coefficient vector.
 ///
@@ -471,6 +480,9 @@ pub struct BlockwisePenalty {
     /// The local penalty matrix — dimensions `block_p × block_p` where
     /// `block_p = col_range.len()`.
     pub local: Array2<f64>,
+    /// Optional structural hint so downstream spectral/logdet code can stay
+    /// block-local or factorized without reverse-engineering the matrix.
+    pub structure_hint: Option<PenaltyStructureHint>,
 }
 
 impl BlockwisePenalty {
@@ -478,7 +490,38 @@ impl BlockwisePenalty {
     pub fn new(col_range: Range<usize>, local: Array2<f64>) -> Self {
         debug_assert_eq!(col_range.len(), local.nrows());
         debug_assert_eq!(col_range.len(), local.ncols());
-        Self { col_range, local }
+        Self {
+            col_range,
+            local,
+            structure_hint: None,
+        }
+    }
+
+    pub fn ridge(col_range: Range<usize>, scale: f64) -> Self {
+        let block_size = col_range.len();
+        let mut local = Array2::<f64>::zeros((block_size, block_size));
+        for i in 0..block_size {
+            local[[i, i]] = scale;
+        }
+        Self {
+            col_range,
+            local,
+            structure_hint: Some(PenaltyStructureHint::Ridge(scale)),
+        }
+    }
+
+    pub fn kronecker(
+        col_range: Range<usize>,
+        local: Array2<f64>,
+        factors: Vec<Array2<f64>>,
+    ) -> Self {
+        debug_assert_eq!(col_range.len(), local.nrows());
+        debug_assert_eq!(col_range.len(), local.ncols());
+        Self {
+            col_range,
+            local,
+            structure_hint: Some(PenaltyStructureHint::Kronecker(factors)),
+        }
     }
 
     /// Expand this blockwise penalty into a full `p_total × p_total` dense
@@ -1922,6 +1965,11 @@ fn build_tensor_bspline_basis(
             degrees: marginal_degrees,
             identifiability_transform: z_opt,
         },
+        kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
+            Some(KroneckerFactoredBasis { marginal_designs })
+        } else {
+            None
+        },
     })
 }
 
@@ -2389,10 +2437,7 @@ pub fn build_smooth_design_withworkspace(
             .zip(activeinfos.into_iter())
         {
             let global_index = penalties_global.len();
-            penalties_global.push(BlockwisePenalty::new(
-                col_start..col_end,
-                s_local.clone(),
-            ));
+            penalties_global.push(BlockwisePenalty::new(col_start..col_end, s_local.clone()));
             nullspace_dims_global.push(ns);
             let mut penalty = info.clone();
             penalty.nullspace_dim_hint = ns;
@@ -2519,38 +2564,29 @@ pub fn build_term_collection_design(
     let p_smooth = smooth.total_smooth_cols();
     let p_total = p_intercept + p_lin + p_rand + p_smooth;
 
-    // Build the dense core: intercept + linear + smooth columns.
-    let p_dense = p_intercept + p_lin + p_smooth;
-    let mut dense_core = Array2::<f64>::zeros((n, p_dense));
-    dense_core.column_mut(0).fill(1.0);
+    let linear_block = if p_lin > 0 {
+        let mut out = Array2::<f64>::zeros((n, p_lin));
+        for (j, linear) in spec.linear_terms.iter().enumerate() {
+            out.column_mut(j).assign(&data.column(linear.feature_col));
+        }
+        Some(out)
+    } else {
+        None
+    };
 
     let mut linear_ranges = Vec::<(String, Range<usize>)>::with_capacity(p_lin);
     for (j, linear) in spec.linear_terms.iter().enumerate() {
         let col = p_intercept + j;
-        dense_core
-            .column_mut(col)
-            .assign(&data.column(linear.feature_col));
         // Column ranges are in the global (full) coordinate system:
         // [intercept | linear | random_effects | smooth]
         linear_ranges.push((linear.name.clone(), col..(col + 1)));
-    }
-    if p_smooth > 0 {
-        let mut smooth_col = p_intercept + p_lin;
-        for td in &smooth.term_designs {
-            let k = td.ncols();
-            dense_core
-                .slice_mut(s![.., smooth_col..(smooth_col + k)])
-                .assign(td);
-            smooth_col += k;
-        }
     }
 
     // Track random-effect column ranges in the global coordinate system.
     // Global layout: [intercept(1) | linear(p_lin) | RE_0(q0) | RE_1(q1) | … | smooth(p_smooth)]
     let mut random_effect_ranges =
         Vec::<(String, Range<usize>)>::with_capacity(random_blocks.len());
-    let mut random_effect_levels =
-        Vec::<(String, Vec<u64>)>::with_capacity(random_blocks.len());
+    let mut random_effect_levels = Vec::<(String, Vec<u64>)>::with_capacity(random_blocks.len());
     let mut col_cursor = p_intercept + p_lin;
     for block in &random_blocks {
         let q = block.num_groups;
@@ -2560,82 +2596,67 @@ pub fn build_term_collection_design(
         col_cursor = end;
     }
 
-    // Assemble the full DesignMatrix.
+    // ── Assemble the full DesignMatrix ────────────────────────────────
     //
-    // Use a BlockDesignOperator when random effects are present OR when any
-    // smooth term has Kronecker (tensor-product) structure.  The factored
-    // tensor terms become implicit DesignBlock::Operator blocks, avoiding
-    // materialization of the full n × ∏q_j design.
-    let any_kronecker = smooth.terms.iter().any(|t| t.kronecker_factored.is_some());
+    // Always use a BlockDesignOperator with per-term blocks.  The full
+    // (n, p_total) dense matrix is NEVER materialized:
+    //
+    //   Block 0:     Intercept — zero storage, implicit all-ones column
+    //   Block 1:     Linear terms — (n, p_lin) extracted from data
+    //   Blocks 2..k: Random-effect operators — O(n) one-hot, no dense storage
+    //   Blocks k+1..: Per-smooth-term dense blocks — each (n, p_term)
+    //
+    // Splitting smooth terms into per-term blocks means cross-block grams
+    // are small O(p_i × p_j) BLAS operations.  Tensor product terms with
+    // Kronecker structure become DesignBlock::Operator, avoiding the full
+    // n × ∏q_j materialization.
 
-    let design: DesignMatrix = if random_blocks.is_empty() && !any_kronecker {
-        // No RE, no Kronecker — dense_core already has [intercept | linear | smooth].
-        DesignMatrix::Dense(Arc::new(dense_core))
-    } else {
-        // Build the block operator.
-        //
-        // Global column layout:
-        //   [intercept + linear] | [RE_0] | … | [smooth_term_0] | [smooth_term_1] | …
-        //
-        // When any smooth term has Kronecker structure, split smooth into per-term
-        // blocks so factored terms become DesignBlock::Operator.  Otherwise, the
-        // smooth section is a single dense block.
-        let p_pre_re = p_intercept + p_lin;
-        let mut blocks = Vec::<DesignBlock>::new();
+    let mut blocks = Vec::<DesignBlock>::new();
 
-        // Block 0: intercept + linear (dense).
-        if p_pre_re > 0 {
-            let pre_re = dense_core.slice(s![.., ..p_pre_re]).to_owned();
-            blocks.push(DesignBlock::Dense(Arc::new(pre_re)));
-        }
+    // Block 0: intercept — zero storage.
+    blocks.push(DesignBlock::Intercept(n));
 
-        // Blocks 1..k: random-effect operators.
-        for block in &random_blocks {
-            let re_op = RandomEffectOperator::new(
-                block.group_ids.clone(),
-                block.num_groups,
-            );
-            blocks.push(DesignBlock::RandomEffect(Arc::new(re_op)));
-        }
+    // Block 1: linear terms.
+    if let Some(lin_block) = linear_block {
+        blocks.push(DesignBlock::Dense(Arc::new(lin_block)));
+    }
 
-        // Smooth blocks.
-        if p_smooth > 0 {
-            if any_kronecker {
-                // Per-term blocks: factored terms become Operator, others Dense.
-                for term in &smooth.terms {
-                    if let Some(ref kron) = term.kronecker_factored {
-                        let marginals: Vec<Arc<Array2<f64>>> = kron
-                            .marginal_designs
-                            .iter()
-                            .map(|m| Arc::new(m.clone()))
-                            .collect();
-                        let op = TensorProductDesignOperator::new(marginals).map_err(|e| {
-                            BasisError::InvalidInput(format!(
-                                "TensorProductDesignOperator for term '{}': {e}",
-                                term.name
-                            ))
-                        })?;
-                        blocks.push(DesignBlock::Operator(Arc::new(op)));
-                    } else {
-                        let r = &term.coeff_range;
-                        let cols_in_dense = (p_pre_re + r.start)..(p_pre_re + r.end);
-                        let term_block =
-                            dense_core.slice(s![.., cols_in_dense]).to_owned();
-                        blocks.push(DesignBlock::Dense(Arc::new(term_block)));
-                    }
-                }
+    // Blocks: random-effect operators — O(n) implicit one-hot.
+    for block in &random_blocks {
+        let re_op = RandomEffectOperator::new(block.group_ids.clone(), block.num_groups);
+        blocks.push(DesignBlock::RandomEffect(Arc::new(re_op)));
+    }
+
+    // Blocks: per-smooth-term.  Each smooth term gets its own block so that
+    // cross-block grams are tiny.  Factored tensor terms become Operator
+    // blocks; all others are small dense blocks.
+    if p_smooth > 0 {
+        for (term_idx, term) in smooth.terms.iter().enumerate() {
+            if let Some(ref kron) = term.kronecker_factored {
+                let marginals: Vec<Arc<Array2<f64>>> = kron
+                    .marginal_designs
+                    .iter()
+                    .map(|m| Arc::new(m.clone()))
+                    .collect();
+                let op = TensorProductDesignOperator::new(marginals).map_err(|e| {
+                    BasisError::InvalidInput(format!(
+                        "TensorProductDesignOperator for term '{}': {e}",
+                        term.name
+                    ))
+                })?;
+                blocks.push(DesignBlock::Operator(Arc::new(op)));
             } else {
-                // Single dense smooth block (original path).
-                let smooth_part = dense_core.slice(s![.., p_pre_re..]).to_owned();
-                blocks.push(DesignBlock::Dense(Arc::new(smooth_part)));
+                blocks.push(DesignBlock::Dense(Arc::new(
+                    smooth.term_designs[term_idx].clone(),
+                )));
             }
         }
+    }
 
-        let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
-            BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
-        })?;
-        DesignMatrix::Operator(Arc::new(block_op))
-    };
+    let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
+        BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
+    })?;
+    let design = DesignMatrix::Operator(Arc::new(block_op));
 
     let mut penalties = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims = Vec::<usize>::new();
@@ -2736,8 +2757,8 @@ pub fn build_term_collection_design(
     {
         let global_index = penalties.len();
         // Offset the per-term block range from smooth-local to model-global.
-        let offset_range = (bp_smooth.col_range.start + smooth_start)
-            ..(bp_smooth.col_range.end + smooth_start);
+        let offset_range =
+            (bp_smooth.col_range.start + smooth_start)..(bp_smooth.col_range.end + smooth_start);
         let bp = if let Some(factors) = localinfo.penalty.kronecker_factors.as_ref() {
             BlockwisePenalty::kronecker(offset_range, bp_smooth.local.clone(), factors.clone())
         } else if matches!(localinfo.penalty.source, PenaltySource::TensorGlobalRidge)
@@ -3034,10 +3055,7 @@ fn apply_spatial_orthogonality_to_parametric(
             .zip(activeinfos.into_iter())
         {
             let global_index = penalties_global.len();
-            penalties_global.push(BlockwisePenalty::new(
-                col_start..col_end,
-                s_local.clone(),
-            ));
+            penalties_global.push(BlockwisePenalty::new(col_start..col_end, s_local.clone()));
             nullspace_dims_global.push(ns);
             let mut penalty = info.clone();
             penalty.nullspace_dim_hint = ns;
@@ -4653,7 +4671,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         name: "eta".to_string(),
         design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
         offset: offset.to_owned(),
-        penalties: retained_penalties.iter().cloned().map(PenaltyMatrix::Dense).collect(),
+        penalties: retained_penalties
+            .iter()
+            .cloned()
+            .map(PenaltyMatrix::Dense)
+            .collect(),
         nullspace_dims: retained_nullspace_dims.clone(),
         initial_log_lambdas: Array1::from_vec(retained_log_lambdas.clone()),
         initial_beta: Some(baseline.fit.beta.clone()),
@@ -7153,7 +7175,11 @@ fn fit_bounded_term_collection_with_design(
         name: "eta".to_string(),
         design: DesignMatrix::Dense(Arc::new(designzeroed)),
         offset: offset.to_owned(),
-        penalties: fit_penalties.iter().cloned().map(PenaltyMatrix::Dense).collect(),
+        penalties: fit_penalties
+            .iter()
+            .cloned()
+            .map(PenaltyMatrix::Dense)
+            .collect(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas,
         initial_beta: Some(initial_beta),
@@ -7371,17 +7397,17 @@ fn stratified_spatial_subsample(
     spec: &TermCollectionSpec,
     target_size: usize,
 ) -> Vec<usize> {
+    use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
-    use rand::SeedableRng;
 
     let n = data.nrows();
     if n <= target_size {
         return (0..n).collect();
     }
 
-    let spatial_cols: Option<Vec<usize>> = spec.smooth_terms.iter().find_map(|term| {
-        match &term.basis {
+    let spatial_cols: Option<Vec<usize>> =
+        spec.smooth_terms.iter().find_map(|term| match &term.basis {
             SmoothBasisSpec::ThinPlate { feature_cols, .. }
             | SmoothBasisSpec::Matern { feature_cols, .. }
             | SmoothBasisSpec::Duchon { feature_cols, .. } => {
@@ -7392,8 +7418,7 @@ fn stratified_spatial_subsample(
                 }
             }
             _ => None,
-        }
-    });
+        });
 
     let mut rng = StdRng::seed_from_u64(42);
 
@@ -7424,8 +7449,7 @@ fn stratified_spatial_subsample(
     }
 
     let total_cells_target = (target_size / 5).max(1);
-    let cells_per_axis =
-        ((total_cells_target as f64).powf(1.0 / d as f64)).ceil() as usize;
+    let cells_per_axis = ((total_cells_target as f64).powf(1.0 / d as f64)).ceil() as usize;
     let cells_per_axis = cells_per_axis.max(1);
 
     let mut cell_members: std::collections::HashMap<Vec<usize>, Vec<usize>> =
@@ -7456,9 +7480,8 @@ fn stratified_spatial_subsample(
         if remaining_budget == 0 {
             break;
         }
-        let alloc =
-            ((members.len() as f64 / remaining_population as f64) * remaining_budget as f64)
-                .round() as usize;
+        let alloc = ((members.len() as f64 / remaining_population as f64) * remaining_budget as f64)
+            .round() as usize;
         let alloc = alloc.max(1).min(members.len()).min(remaining_budget);
         members.shuffle(&mut rng);
         selected.extend_from_slice(&members[..alloc]);
@@ -7541,7 +7564,7 @@ fn evaluate_joint_reml_at_theta(
         weights,
         design.design.clone(),
         offset,
-        design.global_penalties(),
+        design.penalties.clone(),
         theta,
         rho_dim,
         hyper_dirs,
@@ -9412,18 +9435,17 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .get(term_idx)
             .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
             .clone();
-        let realization =
-            build_single_smooth_term_realization_withworkspace(
-                self.data,
-                &termspec,
-                &mut self.basisworkspace,
+        let realization = build_single_smooth_term_realization_withworkspace(
+            self.data,
+            &termspec,
+            &mut self.basisworkspace,
+        )
+        .map_err(|e| {
+            format!(
+                "failed to rebuild smooth term '{}' during incremental κ realization: {e}",
+                termspec.name
             )
-            .map_err(|e| {
-                format!(
-                    "failed to rebuild smooth term '{}' during incremental κ realization: {e}",
-                    termspec.name
-                )
-            })?;
+        })?;
         self.replace_term_realization(term_idx, realization)?;
         Ok(true)
     }
@@ -10247,9 +10269,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             options,
             &pilot_kappa,
         )?;
-        log::info!(
-            "[spatial-kappa] pilot complete; fitting full n={n} with frozen geometry"
-        );
+        log::info!("[spatial-kappa] pilot complete; fitting full n={n} with frozen geometry");
         let frozen_spec = pilot_result.resolvedspec;
         let full_result = fit_term_collection_forspec(
             data,
@@ -11529,8 +11549,16 @@ mod tests {
         // one Kronecker penalty per marginal + optional ridge
         assert_eq!(sd.penalties.len(), 3);
         assert_eq!(sd.nullspace_dims.len(), 3);
-        assert!(sd.penalties.iter().all(|bp| bp.local.nrows() == bp.block_size()));
-        assert!(sd.penalties.iter().all(|bp| bp.col_range.end <= sd.total_smooth_cols()));
+        assert!(
+            sd.penalties
+                .iter()
+                .all(|bp| bp.local.nrows() == bp.block_size())
+        );
+        assert!(
+            sd.penalties
+                .iter()
+                .all(|bp| bp.col_range.end <= sd.total_smooth_cols())
+        );
     }
 
     #[test]
@@ -11576,7 +11604,12 @@ mod tests {
             },
             shape: ShapeConstraint::None,
         };
-        let got = build_smooth_design(data.view(), &[term]).unwrap().term_designs.into_iter().next().unwrap();
+        let got = build_smooth_design(data.view(), &[term])
+            .unwrap()
+            .term_designs
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(got.dim(), expected.dim());
         for i in 0..got.nrows() {
             for j in 0..got.ncols() {

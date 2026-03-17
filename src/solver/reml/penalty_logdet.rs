@@ -60,10 +60,10 @@ use ndarray::{Array1, Array2, s};
 use crate::faer_ndarray::FaerEigh;
 
 /// Check whether a set of penalties have mutually disjoint column ranges.
-fn are_penalties_disjoint(penalties: &[crate::terms::smooth::Penalty]) -> bool {
+fn are_penalties_disjoint(penalties: &[crate::construction::CanonicalPenalty]) -> bool {
     for (i, a) in penalties.iter().enumerate() {
         for b in &penalties[i + 1..] {
-            if a.start() < b.end() && b.start() < a.end() {
+            if a.col_range.start < b.col_range.end && b.col_range.start < a.col_range.end {
                 return false;
             }
         }
@@ -101,7 +101,7 @@ impl PenaltyPseudologdet {
     ///
     /// This is the preferred entry point for REML logdet computation.
     pub fn from_penalties(
-        penalties: &[crate::terms::smooth::Penalty],
+        penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         ridge: f64,
         p_total: usize,
@@ -126,9 +126,9 @@ impl PenaltyPseudologdet {
         } else {
             // Fallback: assemble full p×p combined penalty.
             let mut s_total = Array2::<f64>::zeros((p_total, p_total));
-            for (k, pen) in penalties.iter().enumerate() {
+            for (k, cp) in penalties.iter().enumerate() {
                 if k < lambdas.len() {
-                    pen.add_to(&mut s_total, lambdas[k]);
+                    cp.accumulate_weighted(&mut s_total, lambdas[k]);
                 }
             }
             if ridge > 0.0 {
@@ -145,7 +145,7 @@ impl PenaltyPseudologdet {
     /// The total logdet is the sum of per-block logdets. The W-factor is
     /// block-diagonal (embedded in p_total space).
     fn from_penalties_block_factored(
-        penalties: &[crate::terms::smooth::Penalty],
+        penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         ridge: f64,
         p_total: usize,
@@ -162,17 +162,22 @@ impl PenaltyPseudologdet {
 
         // Group penalties by their exact block range.
         let mut blocks: Vec<BlockData> = Vec::new();
-        for (k, pen) in penalties.iter().enumerate() {
+        for (k, cp) in penalties.iter().enumerate() {
             let lambda = if k < lambdas.len() { lambdas[k] } else { 0.0 };
+            let r = &cp.col_range;
             // Find or create block with matching range.
-            if let Some(bd) = blocks.iter_mut().find(|bd| bd.start == pen.start() && bd.end == pen.end()) {
-                bd.local.scaled_add(lambda, &pen.local);
+            if let Some(bd) = blocks
+                .iter_mut()
+                .find(|bd| bd.start == r.start && bd.end == r.end)
+            {
+                bd.local.scaled_add(lambda, &cp.local);
             } else {
-                let mut local = Array2::<f64>::zeros((pen.block_size(), pen.block_size()));
-                local.scaled_add(lambda, &pen.local);
+                let bd = cp.block_dim();
+                let mut local = Array2::<f64>::zeros((bd, bd));
+                local.scaled_add(lambda, &cp.local);
                 blocks.push(BlockData {
-                    start: pen.start(),
-                    end: pen.end(),
+                    start: r.start,
+                    end: r.end,
                     local,
                 });
             }
@@ -501,7 +506,6 @@ impl PenaltyPseudologdet {
         self.rank
     }
 
-
     // ── Reduced-space representations ──────────────────────────────────────
 
     /// Compute Y = W^T M W for an arbitrary symmetric matrix M.
@@ -640,6 +644,55 @@ impl PenaltyPseudologdet {
         (det1, det2)
     }
 
+    /// Block-local variant of `rho_derivatives()` that consumes canonical
+    /// penalties directly without materializing global `p x p` penalty matrices.
+    pub fn rho_derivatives_from_penalties(
+        &self,
+        penalties: &[crate::construction::CanonicalPenalty],
+        lambdas: &[f64],
+    ) -> (Array1<f64>, Array2<f64>) {
+        let k = penalties.len();
+        if k == 0 || self.rank == 0 {
+            return (Array1::zeros(k), Array2::zeros((k, k)));
+        }
+
+        let y_k: Vec<Array2<f64>> = penalties
+            .iter()
+            .map(|penalty| {
+                let start = penalty.col_range.start;
+                let end = penalty.col_range.end;
+                let w_block = self.w_factor.slice(s![start..end, ..]).to_owned();
+                let local_w = penalty.local.dot(&w_block);
+                w_block.t().dot(&local_w)
+            })
+            .collect();
+
+        let mut det1 = Array1::<f64>::zeros(k);
+        for (idx, y) in y_k.iter().enumerate() {
+            let tr: f64 = (0..self.rank).map(|i| y[[i, i]]).sum();
+            det1[idx] = lambdas[idx] * tr;
+        }
+
+        let mut det2 = Array2::<f64>::zeros((k, k));
+        for ki in 0..k {
+            for li in 0..=ki {
+                let tr_ab: f64 = y_k[ki]
+                    .iter()
+                    .zip(y_k[li].t().iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum();
+                let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
+                if ki == li {
+                    val += det1[ki];
+                }
+                det2[[ki, li]] = val;
+                det2[[li, ki]] = val;
+            }
+        }
+
+        (det1, det2)
+    }
+
     // ── τ/ψ-parameter derivatives (design-moving) ─────────────────────────
 
     /// First derivative of log|S|₊ w.r.t. a design-moving parameter τ_i.
@@ -750,6 +803,36 @@ impl PenaltyPseudologdet {
         lambda_k * (linear - quad)
     }
 
+    /// Block-local variant of `rho_tau_hessian_component()` for canonical penalties.
+    pub fn rho_tau_hessian_component_block_local(
+        &self,
+        penalty: &crate::construction::CanonicalPenalty,
+        lambda_k: f64,
+        s_tau_i: &Array2<f64>,
+        ds_k_dtau_i: Option<&Array2<f64>>,
+    ) -> f64 {
+        if self.rank == 0 {
+            return 0.0;
+        }
+
+        let start = penalty.col_range.start;
+        let end = penalty.col_range.end;
+        let w_block = self.w_factor.slice(s![start..end, ..]).to_owned();
+        let local_w = penalty.local.dot(&w_block);
+        let y_k = w_block.t().dot(&local_w);
+        let y_tau = self.reduced(s_tau_i);
+
+        let quad: f64 = y_k.iter().zip(y_tau.t().iter()).map(|(&a, &b)| a * b).sum();
+
+        let linear = if let Some(dsk) = ds_k_dtau_i {
+            let y_dsk = self.reduced(dsk);
+            (0..self.rank).map(|r| y_dsk[[r, r]]).sum::<f64>()
+        } else {
+            0.0
+        };
+
+        lambda_k * (linear - quad)
+    }
 }
 
 #[cfg(test)]

@@ -542,17 +542,20 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::PoissonLog | GlmLikelihoodFamily::GammaLog, _) => {
-                update_glmvectors(
+            (GlmLikelihoodFamily::PoissonLog, _) => {
+                write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
+                Ok(())
+            }
+            (GlmLikelihoodFamily::GammaLog, _) => {
+                write_gamma_log_working_state(
                     y,
                     eta,
-                    &InverseLink::Standard(LinkFunction::Log),
                     priorweights,
                     mu,
                     weights,
                     z,
                     derivatives,
-                )?;
+                );
                 Ok(())
             }
         }
@@ -564,12 +567,7 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
         mu: &Array1<f64>,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
-        Ok(calculate_deviance(
-            y,
-            mu,
-            self.link_function(),
-            priorweights,
-        ))
+        Ok(calculate_deviance(y, mu, *self, priorweights))
     }
 }
 
@@ -602,8 +600,8 @@ impl FirthDiagnostics {
 ///
 /// The **outer** REML/LAML criterion MUST use the observed Hessian for the
 /// exact Laplace approximation. For canonical links (logit-Binomial, log-Poisson),
-/// observed = Fisher so both are correct. For non-canonical links (probit, cloglog,
-/// SAS, mixture, flexible), the observed weight includes a residual-dependent
+/// observed = Fisher so both are correct. For non-canonical links (including
+/// probit, cloglog, SAS, mixture, flexible, and Gamma-log), the observed weight includes a residual-dependent
 /// correction W_obs = W_Fisher - (y-mu)*B, and using Fisher weights would yield
 /// a PQL-type surrogate instead of the true Laplace criterion.
 ///
@@ -1085,6 +1083,7 @@ impl<'a> GamWorkingModel<'a> {
         s_transformed: Array2<f64>,
         e_transformed: Array2<f64>,
         workspace: PirlsWorkspace,
+        likelihood: GlmLikelihoodFamily,
         link_kind: InverseLink,
         firth_bias_reduction: bool,
         qs: Option<Array2<f64>>,
@@ -1116,12 +1115,6 @@ impl<'a> GamWorkingModel<'a> {
                 x_transformed.nrows()
             }
             WorkingCoordinateDesign::TransformedImplicit { .. } => x_original.nrows(),
-        };
-        let likelihood = match &link_kind {
-            InverseLink::Standard(link) => likelihood_from_link(*link),
-            InverseLink::Sas(_) => GlmLikelihoodFamily::BinomialSas,
-            InverseLink::BetaLogistic(_) => GlmLikelihoodFamily::BinomialBetaLogistic,
-            InverseLink::Mixture(_) => GlmLikelihoodFamily::BinomialMixture,
         };
         GamWorkingModel {
             x_original,
@@ -1319,7 +1312,7 @@ impl<'a> GamWorkingModel<'a> {
     }
 
     fn supports_observed_hessian_curvature(&self) -> bool {
-        supports_observed_hessian_curvature_for_inverse_link(&self.link_kind)
+        supports_observed_hessian_curvature_for_likelihood(self.likelihood, &self.link_kind)
     }
 
     /// Compute the Hessian-side weight arrays (w, c, d) for the requested curvature kind.
@@ -1330,7 +1323,9 @@ impl<'a> GamWorkingModel<'a> {
     ///   c_obs = c_Fisher + h'*B - (y-mu)*B_eta
     ///   d_obs = d_Fisher + h''*B + 2*h'*B_eta - (y-mu)*B_etaeta
     ///
-    /// For canonical links (logit-Binomial, log-Poisson), B = 0 so observed = Fisher.
+    /// For canonical links (for example logit-Binomial and log-Poisson), B = 0
+    /// so observed = Fisher. Gamma-log is non-canonical and therefore needs its
+    /// own observed-information correction.
     ///
     /// These arrays serve dual purpose:
     /// 1. **Inner iteration**: They define the Newton system H*delta = -g.
@@ -1355,6 +1350,7 @@ impl<'a> GamWorkingModel<'a> {
         }
 
         let (hessian_weights, hessian_c, hessian_d) = compute_observed_hessian_curvature_arrays(
+            self.likelihood,
             &self.link_kind,
             &self.workspace.eta_buf,
             self.y,
@@ -3920,9 +3916,11 @@ pub enum PirlsStatus {
 /// * `penalized_hessian_transformed`: The penalized Hessian matrix at convergence
 ///   (`X'W_H X + S_λ`, with `W_H` equal to Fisher or observed curvature,
 ///   depending on the accepted PIRLS step) in the STABLE, TRANSFORMED basis.
-/// * `deviance`: The final deviance value. Note that this means different things depending on the link function:
-///    - For `LinkFunction::Identity` (Gaussian): This is the Residual Sum of Squares (RSS).
-///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
+/// * `deviance`: The final deviance value. This is family-specific:
+///    - Gaussian identity: weighted residual sum of squares.
+///    - Binomial families: binomial deviance.
+///    - Poisson log: Poisson deviance.
+///    - Gamma log: Gamma unit deviance for the fixed shape-1 model.
 /// * `finalweights`: The final Hessian-side working weights at convergence.
 /// * `solveweights`: The final score-side Fisher weights used in
 ///   `X'W(z-eta) - S beta`.
@@ -4071,6 +4069,7 @@ impl PirlsResult {
         y: ArrayView1<'_, f64>,
         priorweights: ArrayView1<'_, f64>,
         offset: ArrayView1<'_, f64>,
+        likelihood: GlmLikelihoodFamily,
         inverse_link: &InverseLink,
     ) -> Result<Self, EstimationError> {
         if !self.cache_compacted {
@@ -4078,10 +4077,16 @@ impl PirlsResult {
         }
 
         let (score_c_array, score_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
-            computeworkingweight_derivatives_from_eta(inverse_link, &self.final_eta, priorweights)?;
+            computeworkingweight_derivatives_from_eta(
+                likelihood,
+                inverse_link,
+                &self.final_eta,
+                priorweights,
+            )?;
         let (finalweights, solve_c_array, solve_d_array) =
             if self.hessian_curvature == HessianCurvatureKind::Observed {
                 compute_observed_hessian_curvature_arrays(
+                    likelihood,
                     inverse_link,
                     &self.final_eta,
                     y,
@@ -4397,6 +4402,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
     })?;
 
+    let likelihood = config.likelihood;
     let link_function = config.link_function();
 
     use crate::construction::{
@@ -4521,7 +4527,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
-        let deviance = calculate_deviance(y, &finalmu, link_function, priorweights);
+        let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
         let ridge_used = baseridge;
         let stabilizedhessian = if ridge_used > 0.0 {
             penalized_hessian.addridge(ridge_used).map_err(|e| {
@@ -4569,6 +4575,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
         let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
             computeworkingweight_derivatives_from_eta(
+                config.likelihood,
                 &config.link_kind,
                 &final_eta,
                 priorweights_owned.view(),
@@ -4627,6 +4634,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         reparam_result_active.s_transformed.clone(),
         reparam_result_active.e_transformed.clone(),
         workspace,
+        likelihood,
         config.link_kind.clone(),
         config.firth_bias_reduction
             && matches!(
@@ -4810,6 +4818,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
 #[derive(Clone)]
 pub struct PirlsConfig {
+    pub likelihood: GlmLikelihoodFamily,
     pub link_kind: InverseLink,
     pub max_iterations: usize,
     pub convergence_tolerance: f64,
@@ -5282,19 +5291,9 @@ fn write_identityworking_state(
     }
 }
 
-/// Working state for log-link GLM families (Poisson, Gamma).
-///
-/// For log link: μ = exp(η), dμ/dη = μ.
-/// Fisher weight = (dμ/dη)² / V(μ).
-/// We use the "canonical log-link" form where the weight is simply μ for
-/// Poisson (V=μ) and 1 for Gamma (V=μ²). Since we don't know the specific
-/// family here, we use the generic formula: W = μ (works for Poisson;
-/// Gamma gets W=1 via observed information in the outer REML loop, but
-/// the canonical Fisher weight μ²/μ² = 1 happens to give w = prior_w,
-/// which underflows less). We use W = μ uniformly — for Gamma, the REML
-/// evaluator corrects via observed c/d derivatives anyway.
+/// Working state for Poisson with a log link.
 #[inline]
-fn write_log_link_working_state(
+fn write_poisson_log_working_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -5308,25 +5307,60 @@ fn write_log_link_working_state(
     let n = eta.len();
     let mut derivatives = derivatives;
     for i in 0..n {
-        let eta_i = eta[i].clamp(-700.0, 700.0);
+        let eta_raw = eta[i];
+        let eta_i = eta_raw.clamp(-700.0, 700.0);
         let mu_i = eta_i.exp().max(MIN_MU);
         mu[i] = mu_i;
-        // Fisher weight for canonical log link: W = prior_w * (dμ/dη)² / V(μ)
-        // For Poisson (V=μ): W = prior_w * μ²/μ = prior_w * μ
-        // For Gamma  (V=μ²): W = prior_w * μ²/μ² = prior_w
-        // We use W = prior_w * μ which is correct for Poisson and conservative for Gamma.
-        let w = (priorweights[i] * mu_i).max(MIN_WEIGHT);
-        weights[i] = w;
-        // Working variable: z = η + (y - μ) / (dμ/dη) = η + (y - μ)/μ = η + y/μ - 1
+        let raw_weight = priorweights[i].max(0.0) * mu_i;
+        let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+        weights[i] = if raw_weight > 0.0 {
+            raw_weight.max(MIN_WEIGHT)
+        } else {
+            0.0
+        };
         z[i] = eta_i + (y[i] - mu_i) / mu_i;
         if let Some(derivs) = derivatives.as_mut() {
-            // For log link: all derivatives of exp(η) are exp(η) = μ
             derivs.dmu_deta[i] = mu_i;
             derivs.d2mu_deta2[i] = mu_i;
             derivs.d3mu_deta3[i] = mu_i;
-            // c = dW/dη = prior_w * μ, d = d²W/dη² = prior_w * μ
-            derivs.c[i] = priorweights[i] * mu_i;
-            derivs.d[i] = priorweights[i] * mu_i;
+            if floor_active || eta_raw != eta_i {
+                derivs.c[i] = 0.0;
+                derivs.d[i] = 0.0;
+            } else {
+                derivs.c[i] = raw_weight;
+                derivs.d[i] = raw_weight;
+            }
+        }
+    }
+}
+
+/// Working state for Gamma(shape = 1) with a log link.
+///
+/// With `mu = exp(eta)` and `V(mu) = mu^2`, the Fisher weight is the
+/// prior/sample weight itself, independent of `eta`.
+#[inline]
+fn write_gamma_log_working_state(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+) {
+    const MIN_MU: f64 = 1e-10;
+    for i in 0..eta.len() {
+        let eta_i = eta[i].clamp(-700.0, 700.0);
+        let mu_i = eta_i.exp().max(MIN_MU);
+        mu[i] = mu_i;
+        weights[i] = priorweights[i].max(0.0);
+        z[i] = eta_i + (y[i] - mu_i) / mu_i;
+        if let Some(derivs) = derivatives.as_mut() {
+            derivs.dmu_deta[i] = mu_i;
+            derivs.d2mu_deta2[i] = mu_i;
+            derivs.d3mu_deta3[i] = mu_i;
+            derivs.c[i] = 0.0;
+            derivs.d[i] = 0.0;
         }
     }
 }
@@ -5450,7 +5484,7 @@ pub fn update_glmvectors(
             Ok(())
         }
         LinkFunction::Log => {
-            write_log_link_working_state(y, eta, priorweights, mu, weights, z, derivatives);
+            write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
             Ok(())
         }
     }
@@ -5714,6 +5748,7 @@ pub fn update_glmvectors_integrated_by_family(
 ///   In that regime analytic and central-FD gradients can diverge because FD may
 ///   straddle a kink.
 fn computeworkingweight_derivatives_from_eta(
+    likelihood: GlmLikelihoodFamily,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -5728,31 +5763,49 @@ fn computeworkingweight_derivatives_from_eta(
     EstimationError,
 > {
     let n = eta.len();
-    let link = inverse_link.link_function();
     let mut c = Array1::<f64>::zeros(n);
     let mut d = Array1::<f64>::zeros(n);
     let mut dmu_deta = Array1::<f64>::zeros(n);
     let mut d2mu_deta2 = Array1::<f64>::zeros(n);
     let mut d3mu_deta3 = Array1::<f64>::zeros(n);
-    match link {
-        LinkFunction::Identity => {
+    match likelihood {
+        GlmLikelihoodFamily::GaussianIdentity => {
             dmu_deta.fill(1.0);
         }
-        LinkFunction::Log => {
+        GlmLikelihoodFamily::PoissonLog => {
+            const MIN_WEIGHT: f64 = 1e-12;
             for i in 0..n {
-                let jet = standard_inverse_link_jet(inverse_link, eta[i].clamp(-700.0, 700.0))?;
-                c[i] = 0.0;
-                d[i] = 0.0;
+                let eta_used = eta[i].clamp(-700.0, 700.0);
+                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                let raw_weight = priorweights[i].max(0.0) * jet.mu;
+                let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                if eta[i] != eta_used || floor_active {
+                    c[i] = 0.0;
+                    d[i] = 0.0;
+                } else {
+                    c[i] = raw_weight;
+                    d[i] = raw_weight;
+                }
                 dmu_deta[i] = jet.d1;
                 d2mu_deta2[i] = jet.d2;
                 d3mu_deta3[i] = jet.d3;
             }
         }
-        LinkFunction::Logit
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::Sas
-        | LinkFunction::BetaLogistic => {
+        GlmLikelihoodFamily::GammaLog => {
+            for i in 0..n {
+                let jet = standard_inverse_link_jet(inverse_link, eta[i].clamp(-700.0, 700.0))?;
+                dmu_deta[i] = jet.d1;
+                d2mu_deta2[i] = jet.d2;
+                d3mu_deta3[i] = jet.d3;
+            }
+        }
+        GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture => {
+            let link = inverse_link.link_function();
             let zero_on_nonsmooth =
                 matches!(link, LinkFunction::Logit) && logit_clampzero_enabled();
             for i in 0..n {
@@ -5891,13 +5944,57 @@ const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
 const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
 
 #[inline]
-fn supports_observed_hessian_curvature_for_inverse_link(inverse_link: &InverseLink) -> bool {
+fn fixed_glm_dispersion(likelihood: GlmLikelihoodFamily) -> f64 {
+    match likelihood {
+        GlmLikelihoodFamily::GammaLog => 1.0,
+        _ => 1.0,
+    }
+}
+
+#[inline]
+fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodFamily) -> WeightFamily {
+    match likelihood {
+        GlmLikelihoodFamily::GaussianIdentity => WeightFamily::Gaussian,
+        GlmLikelihoodFamily::PoissonLog => WeightFamily::Poisson,
+        GlmLikelihoodFamily::GammaLog => WeightFamily::Gamma,
+        GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture => WeightFamily::Binomial,
+    }
+}
+
+#[inline]
+fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
+    match inverse_link {
+        InverseLink::Standard(LinkFunction::Identity) => WeightLink::Identity,
+        InverseLink::Standard(LinkFunction::Log) => WeightLink::Log,
+        InverseLink::Standard(LinkFunction::Logit) => WeightLink::Logit,
+        InverseLink::Standard(LinkFunction::Probit)
+        | InverseLink::Standard(LinkFunction::CLogLog)
+        | InverseLink::Standard(LinkFunction::Sas)
+        | InverseLink::Standard(LinkFunction::BetaLogistic)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => WeightLink::Other,
+    }
+}
+
+#[inline]
+fn supports_observed_hessian_curvature_for_likelihood(
+    likelihood: GlmLikelihoodFamily,
+    _: &InverseLink,
+) -> bool {
     matches!(
-        inverse_link,
-        InverseLink::Standard(LinkFunction::Probit | LinkFunction::CLogLog)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_)
+        likelihood,
+        GlmLikelihoodFamily::GammaLog
+            | GlmLikelihoodFamily::BinomialProbit
+            | GlmLikelihoodFamily::BinomialCLogLog
+            | GlmLikelihoodFamily::BinomialSas
+            | GlmLikelihoodFamily::BinomialBetaLogistic
+            | GlmLikelihoodFamily::BinomialMixture
     )
 }
 
@@ -5922,8 +6019,8 @@ fn observed_hessian_weight_floor(fisher_weight: f64) -> f64 {
 /// This function is the primary entry point for obtaining the observed weights
 /// that flow into the outer REML/LAML Hessian H_obs = X' W_obs X + S. The
 /// observed corrections include residual-dependent terms that vanish for
-/// canonical links but are nonzero for probit, cloglog, SAS, mixture, and
-/// flexible links.
+/// canonical links but are nonzero for probit, cloglog, SAS, mixture, Gamma-log,
+/// and other flexible links.
 ///
 /// The output arrays are:
 /// - `hessian_weights`: W_obs per observation (floored to maintain SPD).
@@ -5934,6 +6031,7 @@ fn observed_hessian_weight_floor(fisher_weight: f64) -> f64 {
 /// response.md Section 3 for the mathematical justification of why observed
 /// (not Fisher) information is required.
 fn compute_observed_hessian_curvature_arrays(
+    likelihood: GlmLikelihoodFamily,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     y: ArrayView1<'_, f64>,
@@ -5944,10 +6042,14 @@ fn compute_observed_hessian_curvature_arrays(
     fisher_weights: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-    assert!(supports_observed_hessian_curvature_for_inverse_link(
+    assert!(supports_observed_hessian_curvature_for_likelihood(
+        likelihood,
         inverse_link
     ));
     let n = eta.len();
+    let weight_family = weight_family_for_glm_likelihood(likelihood);
+    let weight_link = weight_link_for_inverse_link(inverse_link);
+    let phi = fixed_glm_dispersion(likelihood);
     let mut hessian_weights = Array1::<f64>::zeros(n);
     let mut hessian_c = Array1::<f64>::zeros(n);
     let mut hessian_d = Array1::<f64>::zeros(n);
@@ -5957,16 +6059,22 @@ fn compute_observed_hessian_curvature_arrays(
             inverse_link,
             eta_used,
         )?;
-        let (w_obs, c_obs, d_obs) = observed_weight_noncanonical(
+        let jet = MixtureInverseLinkJet {
+            mu: mu[i],
+            d1: dmu_deta[i],
+            d2: d2mu_deta2[i],
+            d3: d3mu_deta3[i],
+        };
+        let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
+            weight_family,
+            weight_link,
+            eta_used,
             y[i],
             mu[i],
-            dmu_deta[i],
-            d2mu_deta2[i],
-            d3mu_deta3[i],
-            h4,
-            VarianceJet::bernoulli(mu[i]),
-            1.0,
+            phi,
             priorweights[i].max(0.0),
+            jet,
+            h4,
         );
         let fisher_floor = observed_hessian_weight_floor(fisher_weights[i]);
         // Keep the Newton system SPD when the observed correction turns the
@@ -5999,7 +6107,7 @@ fn compute_observed_hessian_curvature_arrays(
 ///   c_obs = c_Fisher + h' * B - (y - mu) * B_eta
 ///   d_obs = d_Fisher + h'' * B + 2*h' * B_eta - (y - mu) * B_etaeta
 ///
-/// For canonical links (logit-Binomial, log-Poisson, log-Gamma), B = 0
+/// For canonical links (for example logit-Binomial and log-Poisson), B = 0
 /// so observed = Fisher and no correction is needed.
 ///
 /// These observed quantities are required for:
@@ -6269,6 +6377,16 @@ pub enum WeightLink {
     Other,
 }
 
+#[inline]
+fn variance_jet_for_weight_family(family: WeightFamily, mu: f64) -> VarianceJet {
+    match family {
+        WeightFamily::Gaussian => VarianceJet::gaussian(),
+        WeightFamily::Binomial => VarianceJet::binomial_n(mu),
+        WeightFamily::Poisson => VarianceJet::poisson(mu),
+        WeightFamily::Gamma => VarianceJet::gamma(mu),
+    }
+}
+
 /// Dispatch to closed-form observed-information weights for known family-link
 /// combinations, falling back to the generic noncanonical formula.
 ///
@@ -6308,12 +6426,7 @@ pub fn observed_weight_dispatch(
         }
         _ => {
             // Generic noncanonical path via the full variance-function jet.
-            let vj = match family {
-                WeightFamily::Gaussian => VarianceJet::gaussian(),
-                WeightFamily::Binomial => VarianceJet::binomial_n(mu),
-                WeightFamily::Poisson => VarianceJet::poisson(mu),
-                WeightFamily::Gamma => VarianceJet::gamma(mu),
-            };
+            let vj = variance_jet_for_weight_family(family, mu);
             observed_weight_noncanonical(y, mu, jet.d1, jet.d2, jet.d3, h4, vj, phi, prior_weight)
         }
     }
@@ -6330,6 +6443,7 @@ pub fn fisher_weight_dispatch(
     mu: f64,
     phi: f64,
     prior_weight: f64,
+    jet: MixtureInverseLinkJet,
 ) -> (f64, f64, f64) {
     match (family, link) {
         (WeightFamily::Gaussian, WeightLink::Log) => {
@@ -6343,22 +6457,13 @@ pub fn fisher_weight_dispatch(
             observed_weight_binomial_logit(1.0, mu, prior_weight)
         }
         _ => {
-            // Caller should use the generic path for unsupported combos.
-            // Return Fisher weights = observed weights at y=mu (residual=0),
-            // which is the definition of Fisher information.
-            let vj = match family {
-                WeightFamily::Gaussian => VarianceJet::gaussian(),
-                WeightFamily::Binomial => VarianceJet::binomial_n(mu),
-                WeightFamily::Poisson => VarianceJet::poisson(mu),
-                WeightFamily::Gamma => VarianceJet::gamma(mu),
-            };
-            // At y=mu the observed correction vanishes, giving Fisher weights.
+            let vj = variance_jet_for_weight_family(family, mu);
             observed_weight_noncanonical(
-                mu, // y = mu → residual = 0
                 mu,
-                1.0, // placeholder h1 for generic path
-                0.0,
-                0.0,
+                mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
                 0.0,
                 vj,
                 phi,
@@ -6491,32 +6596,20 @@ pub fn directionalworking_curvature_from_c_array(
 }
 
 #[inline]
-fn likelihood_from_link(link: LinkFunction) -> GlmLikelihoodFamily {
-    match link {
-        LinkFunction::Log => GlmLikelihoodFamily::PoissonLog,
-        LinkFunction::Logit => GlmLikelihoodFamily::BinomialLogit,
-        LinkFunction::Probit => GlmLikelihoodFamily::BinomialProbit,
-        LinkFunction::CLogLog => GlmLikelihoodFamily::BinomialCLogLog,
-        LinkFunction::Sas => GlmLikelihoodFamily::BinomialSas,
-        LinkFunction::BetaLogistic => GlmLikelihoodFamily::BinomialBetaLogistic,
-        LinkFunction::Identity => GlmLikelihoodFamily::GaussianIdentity,
-    }
-}
-
-#[inline]
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
-    link: LinkFunction,
+    likelihood: GlmLikelihoodFamily,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
     const EPS: f64 = 1e-8;
-    match link {
-        LinkFunction::Logit
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::Sas
-        | LinkFunction::BetaLogistic => {
+    match likelihood {
+        GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture => {
             let total_residual =
                 ndarray::Zip::from(y)
                     .and(mu)
@@ -6539,19 +6632,14 @@ pub fn calculate_deviance(
                     });
             2.0 * total_residual
         }
-        LinkFunction::Identity => {
-            // Weighted RSS: sum_i w_i (y_i - mu_i)^2
+        GlmLikelihoodFamily::GaussianIdentity => {
             ndarray::Zip::from(y)
                 .and(mu)
                 .and(priorweights)
                 .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
                 .sum()
         }
-        LinkFunction::Log => {
-            // Poisson deviance: 2 * sum w_i [y_i * ln(y_i/mu_i) - (y_i - mu_i)]
-            // with convention 0 * ln(0) = 0.
-            // This is also a reasonable deviance for Gamma(log) since the IRLS
-            // convergence criterion just needs a monotonic objective.
+        GlmLikelihoodFamily::PoissonLog => {
             let total =
                 ndarray::Zip::from(y)
                     .and(mu)
@@ -6567,6 +6655,65 @@ pub fn calculate_deviance(
                     });
             2.0 * total
         }
+        GlmLikelihoodFamily::GammaLog => {
+            let total =
+                ndarray::Zip::from(y)
+                    .and(mu)
+                    .and(priorweights)
+                    .fold(0.0, |acc, &yi, &mui, &wi| {
+                        let yi_c = yi.max(EPS);
+                        let mui_c = mui.max(EPS);
+                        let ratio = yi_c / mui_c;
+                        acc + wi * (ratio - 1.0 - ratio.ln())
+                    });
+            2.0 * total
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn calculate_loglikelihood_omitting_constants(
+    y: ArrayView1<f64>,
+    mu: &Array1<f64>,
+    likelihood: GlmLikelihoodFamily,
+    priorweights: ArrayView1<f64>,
+) -> f64 {
+    const EPS: f64 = 1e-8;
+    match likelihood {
+        GlmLikelihoodFamily::GaussianIdentity => ndarray::Zip::from(y)
+            .and(mu)
+            .and(priorweights)
+            .fold(0.0, |acc, &yi, &mui, &wi| {
+                let resid = yi - mui;
+                acc - 0.5 * wi * resid * resid
+            }),
+        GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture => ndarray::Zip::from(y)
+            .and(mu)
+            .and(priorweights)
+            .fold(0.0, |acc, &yi, &mui, &wi| {
+                let mui_c = mui.clamp(EPS, 1.0 - EPS);
+                acc + wi * (yi * mui_c.ln() + (1.0 - yi) * (1.0 - mui_c).ln())
+            }),
+        GlmLikelihoodFamily::PoissonLog => ndarray::Zip::from(y)
+            .and(mu)
+            .and(priorweights)
+            .fold(0.0, |acc, &yi, &mui, &wi| {
+                let mui_c = mui.max(EPS);
+                let log_term = if yi > 0.0 { yi * mui_c.ln() } else { 0.0 };
+                acc + wi * (log_term - mui_c)
+            }),
+        GlmLikelihoodFamily::GammaLog => ndarray::Zip::from(y)
+            .and(mu)
+            .and(priorweights)
+            .fold(0.0, |acc, &yi, &mui, &wi| {
+                let mui_c = mui.max(EPS);
+                acc + wi * (-mui_c.ln() - yi / mui_c)
+            }),
     }
 }
 
@@ -6893,7 +7040,8 @@ mod tests {
     use super::{
         InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet,
-        calculate_scale, compress_activeworking_set, compute_constraint_kkt_diagnostics,
+        calculate_deviance, calculate_scale, compress_activeworking_set,
+        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
         default_beta_guess_external, fit_model_for_fixed_rho, logit_clampzero_enabled,
         should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
@@ -6901,7 +7049,9 @@ mod tests {
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
-    use crate::types::{Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView};
+    use crate::types::{
+        Coefficients, GlmLikelihoodFamily, InverseLink, LinkFunction, LogSmoothingParamsView,
+    };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
@@ -7205,6 +7355,7 @@ mod tests {
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let rs = vec![array![[1.0]]];
         let config = PirlsConfig {
+            likelihood: GlmLikelihoodFamily::BinomialLogit,
             link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -7287,6 +7438,120 @@ mod tests {
                 expected.d,
                 epsilon = 1e-8,
                 max_relative = 1e-7
+            );
+        }
+    }
+
+    #[test]
+    fn gamma_log_deviance_uses_gamma_formula() {
+        let y = array![2.0, 5.0];
+        let mu = array![1.0, 4.0];
+        let w = array![1.5, 0.75];
+        let dev = calculate_deviance(y.view(), &mu, GlmLikelihoodFamily::GammaLog, w.view());
+        let expected = 2.0
+            * (1.5 * (2.0_f64 / 1.0 - 1.0 - (2.0_f64 / 1.0).ln())
+                + 0.75 * (5.0_f64 / 4.0 - 1.0 - (5.0_f64 / 4.0).ln()));
+        assert_relative_eq!(dev, expected, epsilon = 1e-12, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn gamma_log_observed_curvature_matches_shape_one_closed_form() {
+        let eta = array![0.2, -0.4];
+        let mu = eta.mapv(f64::exp);
+        let y = array![1.8, 0.7];
+        let w = array![2.0, 0.5];
+        let dmu = mu.clone();
+        let d2mu = mu.clone();
+        let d3mu = mu.clone();
+        let fisher = w.clone();
+
+        let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
+            GlmLikelihoodFamily::GammaLog,
+            &InverseLink::Standard(LinkFunction::Log),
+            &eta,
+            y.view(),
+            &mu,
+            &dmu,
+            &d2mu,
+            &d3mu,
+            &fisher,
+            w.view(),
+        )
+        .expect("gamma-log observed curvature should evaluate");
+
+        for i in 0..eta.len() {
+            let expected_w = w[i] * y[i] / mu[i];
+            assert_relative_eq!(w_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
+            assert_relative_eq!(c_obs[i], -expected_w, epsilon = 1e-12, max_relative = 1e-12);
+            assert_relative_eq!(d_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn poisson_cache_rehydration_preserves_log_derivatives() {
+        let x = array![[1.0], [1.0], [1.0], [1.0]];
+        let y = array![1.0, 2.0, 4.0, 8.0];
+        let w = Array1::ones(4);
+        let offset = Array1::zeros(4);
+        let rho = array![0.0];
+        let rs = vec![array![[1.0]]];
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodFamily::PoissonLog,
+            link_kind: InverseLink::Standard(LinkFunction::Log),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+        };
+
+        let (fit, _) = fit_model_for_fixed_rho(
+            LogSmoothingParamsView::new(rho.view()),
+            PirlsProblem {
+                x: x.view(),
+                offset: offset.view(),
+                y: y.view(),
+                priorweights: w.view(),
+                covariate_se: None,
+            },
+            PenaltyConfig {
+                rs_original: &rs,
+                balanced_penalty_root: None,
+                reparam_invariant: None,
+                p: 1,
+                coefficient_lower_bounds: None,
+                linear_constraints_original: None,
+                penalty_shrinkage_floor: None,
+                canonical_penalties: None,
+            },
+            &config,
+            None,
+        )
+        .expect("poisson PIRLS fit");
+
+        let compacted = fit.compact_for_reml_cache();
+        let rehydrated = compacted
+            .rehydrate_after_reml_cache(
+                &DesignMatrix::from(x.clone()),
+                y.view(),
+                w.view(),
+                offset.view(),
+                GlmLikelihoodFamily::PoissonLog,
+                &InverseLink::Standard(LinkFunction::Log),
+            )
+            .expect("rehydration should succeed");
+
+        assert_eq!(fit.solve_c_array.len(), rehydrated.solve_c_array.len());
+        for i in 0..fit.solve_c_array.len() {
+            assert_relative_eq!(
+                fit.solve_c_array[i],
+                rehydrated.solve_c_array[i],
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
+            assert_relative_eq!(
+                fit.solve_d_array[i],
+                rehydrated.solve_d_array[i],
+                epsilon = 1e-12,
+                max_relative = 1e-12
             );
         }
     }
@@ -7596,6 +7861,7 @@ mod root_cause_tests {
         // Penalty on the second coefficient only (leave intercept unpenalized).
         let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
         let config = PirlsConfig {
+            likelihood: GlmLikelihoodFamily::GaussianIdentity,
             link_kind: InverseLink::Standard(LinkFunction::Identity),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -7657,6 +7923,7 @@ mod root_cause_tests {
         let rho = array![0.0];
         let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
         let config = PirlsConfig {
+            likelihood: GlmLikelihoodFamily::BinomialLogit,
             link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -7738,6 +8005,7 @@ mod root_cause_tests {
                 array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
             ];
             let config = PirlsConfig {
+                likelihood: GlmLikelihoodFamily::BinomialLogit,
                 link_kind: InverseLink::Standard(LinkFunction::Logit),
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,

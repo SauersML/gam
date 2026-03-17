@@ -1,32 +1,16 @@
 use super::*;
-use crate::linalg::utils::{
-    boundary_hit_indices, symmetric_spectrum_condition_number,
-};
-use crate::pirls::PirlsWorkspace;
 use crate::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };
+use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
+use crate::linalg::utils::{boundary_hit_indices, symmetric_spectrum_condition_number};
+use crate::pirls::PirlsWorkspace;
 use crate::terms::smooth::{BlockwisePenalty, penalties_to_global, weighted_blockwise_penalty_sum};
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 const TK_BLOCK_SIZE: usize = 128;
-
-/// Expand a local penalty root (rank_k × block_p) into a global root
-/// (rank_k × p_total) by scattering columns into the correct positions.
-fn root_local_to_global(
-    local_root: Array2<f64>,
-    col_range: Range<usize>,
-    p_total: usize,
-) -> Array2<f64> {
-    let rank = local_root.nrows();
-    let mut global = Array2::<f64>::zeros((rank, p_total));
-    global
-        .slice_mut(s![.., col_range.start..col_range.end])
-        .assign(&local_root);
-    global
-}
 
 struct TkCorrectionTerms {
     value: f64,
@@ -103,11 +87,22 @@ impl<'a> RemlState<'a> {
         let (penalty_rank, log_det_s) =
             self.fixed_subspace_penalty_rank_and_logdet(e_for_logdet, ridge_passport)?;
         let lambdas = rho.mapv(f64::exp);
-        let (det1, det2_full) = self.structural_penalty_logdet_derivatives(
-            penalty_roots,
-            &lambdas,
-            ridge_passport.penalty_logdet_ridge(),
-        )?;
+
+        // Prefer the block-local path when canonical penalties are available
+        // and match the penalty count (i.e., we're not in a projected subspace).
+        let (det1, det2_full) = if self.canonical_penalties.len() == penalty_roots.len() {
+            self.structural_penalty_logdet_derivatives_block_local(
+                &lambdas,
+                ridge_passport.penalty_logdet_ridge(),
+            )?
+        } else {
+            self.structural_penalty_logdet_derivatives(
+                penalty_roots,
+                &lambdas,
+                ridge_passport.penalty_logdet_ridge(),
+            )?
+        };
+
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             Some(det2_full)
         } else {
@@ -287,9 +282,7 @@ impl<'a> RemlState<'a> {
                         .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
                         .sum::<f64>()
             };
-            let correction_trace: f64 = (0..n)
-                .map(|i| c_array[i] * x_vks[idx][i] * lev_p[i])
-                .sum();
+            let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
             gradient[idx] = trace_ak_p + correction_trace;
         }
 
@@ -391,8 +384,9 @@ impl<'a> RemlState<'a> {
             let r_beta = r_k.dot(beta);
             let mut s_k_beta = Array1::<f64>::zeros(p);
             for a in 0..p {
-                s_k_beta[a] =
-                    (0..r_k.nrows()).map(|row| r_k[[row, a]] * r_beta[row]).sum::<f64>();
+                s_k_beta[a] = (0..r_k.nrows())
+                    .map(|row| r_k[[row, a]] * r_beta[row])
+                    .sum::<f64>();
             }
             let a_k_beta = &s_k_beta * lambdas[idx];
             let v_k = h_inv_solve(&a_k_beta);
@@ -405,7 +399,15 @@ impl<'a> RemlState<'a> {
         // Gradient via helper
         // ══════════════════════════════════════════════════════════════════
         let gradient = Self::tk_gradient_from_intermediates(
-            x_dense, z, c_array, d_array, penalty_roots, lambdas, &x_vks, h_inv_solve, None,
+            x_dense,
+            z,
+            c_array,
+            d_array,
+            penalty_roots,
+            lambdas,
+            &x_vks,
+            h_inv_solve,
+            None,
         );
 
         // ══════════════════════════════════════════════════════════════════
@@ -615,10 +617,8 @@ impl<'a> RemlState<'a> {
                 .try_to_dense_arc("exact TK correction requires dense design access")
                 .map_err(EstimationError::InvalidInput)?;
             let xt = x_dense.t().to_owned();
-            let z_mat = crate::linalg::sparse_exact::solve_sparse_spdmulti(
-                sparse.factor.as_ref(),
-                &xt,
-            )?;
+            let z_mat =
+                crate::linalg::sparse_exact::solve_sparse_spdmulti(sparse.factor.as_ref(), &xt)?;
             let factor_ref = sparse.factor.clone();
             let h_inv_solve = |rhs: &Array1<f64>| -> Array1<f64> {
                 crate::linalg::sparse_exact::solve_sparse_spd(&factor_ref, rhs)
@@ -989,8 +989,8 @@ impl<'a> RemlState<'a> {
     where
         X: Into<DesignMatrix>,
     {
-        // Derive global roots (rank_k x p) from canonical penalties for backward
-        // compatibility with code paths that need the p-wide form.
+        // Retain p-wide roots only for the remaining dense-only reparameterization
+        // and analytic-correction consumers.
         let rs_list: Vec<Array2<f64>> = canonical_penalties
             .iter()
             .map(|cp| cp.global_root())
@@ -1017,13 +1017,9 @@ impl<'a> RemlState<'a> {
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
 
-        // Build sparse penalty blocks from global forms (needed for sparse Cholesky).
-        let s_list_global: Vec<Array2<f64>> = canonical_penalties
-            .iter()
-            .map(|cp| cp.global_penalty())
-            .collect();
         let sparse_penalty_blocks =
-            build_sparse_penalty_blocks(&s_list_global, &rs_list)?.map(Arc::new);
+            build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
+                .map(Arc::new);
 
         Ok(Self {
             y,
@@ -1766,6 +1762,7 @@ impl<'a> RemlState<'a> {
                     self.y,
                     self.weights,
                     self.offset.view(),
+                    pirls_config.likelihood,
                     &pirls_config.link_kind,
                 )?));
             }
@@ -2054,9 +2051,7 @@ impl<'a> RemlState<'a> {
                             );
                         }
                         if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
-                            let condition_number = symmetric_spectrum_condition_number(
-                                &pht_dense,
-                            );
+                            let condition_number = symmetric_spectrum_condition_number(&pht_dense);
                             log::warn!(
                                 "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
                                 condition_number
@@ -2376,8 +2371,12 @@ impl<'a> RemlState<'a> {
             0.0
         };
 
-        // Log-likelihood: for both Gaussian and GLM, deviance = -2 * log_likelihood.
-        let log_likelihood = -0.5 * pirls_result.deviance;
+        let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
+            self.y,
+            &pirls_result.finalmu,
+            self.config.likelihood(),
+            self.weights,
+        );
 
         // Firth operator: passed through to the unified evaluator which computes
         // the Firth gradient and Hessian internally. Only active when Firth is
@@ -2507,7 +2506,12 @@ impl<'a> RemlState<'a> {
                 )
             };
 
-        let log_likelihood = -0.5 * pirls_result.deviance;
+        let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
+            self.y,
+            &pirls_result.finalmu,
+            self.config.likelihood(),
+            self.weights,
+        );
 
         // Construct barrier config for monotonicity constraints.
         // The sparse path operates in the original (non-reparameterized)
@@ -2683,11 +2687,7 @@ impl<'a> RemlState<'a> {
         // Build HessianOperator from the sparse Cholesky factor, with Takahashi
         // selected inverse for O(nnz) trace computations when available.
         let hessian_op: Box<dyn HessianOperator> = {
-            let mut op = SparseCholeskyOperator::new(
-                sparse.factor.clone(),
-                sparse.logdet_h,
-                p_dim,
-            );
+            let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
@@ -2766,7 +2766,9 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root};
+        use super::unified::{
+            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root,
+        };
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
@@ -2780,11 +2782,7 @@ impl<'a> RemlState<'a> {
         // Build HessianOperator from the sparse Cholesky factor, with Takahashi
         // selected inverse for O(nnz) trace computations when available.
         let hessian_op: Box<dyn HessianOperator> = {
-            let mut op = SparseCholeskyOperator::new(
-                sparse.factor.clone(),
-                sparse.logdet_h,
-                p_dim,
-            );
+            let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
@@ -3007,8 +3005,7 @@ impl<'a> RemlState<'a> {
         >,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
-            DenseSpectralOperator, HessianOperator, InnerSolutionBuilder,
-            reml_laml_evaluate,
+            DenseSpectralOperator, HessianOperator, InnerSolutionBuilder, reml_laml_evaluate,
         };
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -3183,11 +3180,7 @@ impl<'a> RemlState<'a> {
         let beta = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta.len();
         let hessian_op: Box<dyn HessianOperator> = {
-            let mut op = SparseCholeskyOperator::new(
-                sparse.factor.clone(),
-                sparse.logdet_h,
-                p_dim,
-            );
+            let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
