@@ -1,7 +1,6 @@
 use super::*;
-use crate::faer_ndarray::FaerLblt;
 use crate::linalg::utils::{
-    StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
+    boundary_hit_indices, symmetric_spectrum_condition_number,
 };
 use crate::pirls::PirlsWorkspace;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
@@ -145,7 +144,6 @@ impl<'a> RemlState<'a> {
         d_array: &Array1<f64>,
         penalty_roots: &[Array2<f64>],
         lambdas: &[f64],
-        v_ks: &[Array1<f64>],
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
     ) -> Array1<f64> {
@@ -383,7 +381,7 @@ impl<'a> RemlState<'a> {
         // Gradient via helper
         // ══════════════════════════════════════════════════════════════════
         let gradient = Self::tk_gradient_from_intermediates(
-            x_dense, z, c_array, d_array, penalty_roots, lambdas, &v_ks, &x_vks, h_inv_solve,
+            x_dense, z, c_array, d_array, penalty_roots, lambdas, &x_vks, h_inv_solve,
         );
 
         // ══════════════════════════════════════════════════════════════════
@@ -502,7 +500,6 @@ impl<'a> RemlState<'a> {
                     d_array,
                     penalty_roots,
                     &lambdas_plus,
-                    &v_ks_plus,
                     &x_vks_plus,
                     h_inv_solve,
                 );
@@ -513,7 +510,6 @@ impl<'a> RemlState<'a> {
                     d_array,
                     penalty_roots,
                     &lambdas_minus,
-                    &v_ks_minus,
                     &x_vks_minus,
                     h_inv_solve,
                 );
@@ -739,14 +735,14 @@ impl<'a> RemlState<'a> {
         tk_terms: TkCorrectionTerms,
     ) -> super::unified::RemlLamlResult {
         result.cost += tk_terms.value;
-        if let (Some(ref mut grad), Some(tk_grad)) = (&mut result.gradient, tk_terms.gradient) {
+        if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
             let k = rho.len().min(grad.len()).min(tk_grad.len());
             {
                 let mut sl = grad.slice_mut(s![..k]);
                 sl += &tk_grad.slice(s![..k]);
             }
         }
-        if let (Some(ref mut hess), Some(tk_hess)) = (&mut result.hessian, tk_terms.hessian) {
+        if let (Some(ref mut hess), Some(tk_hess)) = (result.hessian.as_mut(), tk_terms.hessian) {
             let k = rho
                 .len()
                 .min(hess.nrows())
@@ -1370,40 +1366,6 @@ impl<'a> RemlState<'a> {
     pub fn clearwarm_start(&self) {
         self.warm_start_beta.write().unwrap().take();
         self.cache_manager.invalidate_eval_bundle();
-    }
-
-    /// Returns the per-penalty square-root matrices in the transformed coefficient basis
-    /// without any λ weighting. Each returned R_k satisfies S_k = R_kᵀ R_k in that basis.
-    /// Using these avoids accidental double counting of λ when forming derivatives.
-    ///
-    /// # Arguments
-    /// * `pr` - The PIRLS result with the transformation matrix Qs
-    ///
-    /// # Returns
-    pub(super) fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
-        let mut planner = RidgePlanner::new(h);
-        let stable_solver = StableSolver::new("reml hessian");
-        loop {
-            let ridge = planner.ridge();
-            let regularized = addridge(h, ridge);
-            if let Ok(factor) = stable_solver.factorize(&regularized) {
-                return match factor {
-                    crate::faer_ndarray::FaerSymmetricFactor::Llt(inner) => FaerFactor::Llt(inner),
-                    crate::faer_ndarray::FaerSymmetricFactor::Ldlt(inner) => {
-                        FaerFactor::Ldlt(inner)
-                    }
-                    crate::faer_ndarray::FaerSymmetricFactor::Lblt(inner) => {
-                        FaerFactor::Lblt(inner)
-                    }
-                };
-            }
-            if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
-                let view = FaerArrayView::new(&regularized);
-                let f = FaerLblt::new(view.as_ref(), Side::Lower);
-                return FaerFactor::Lblt(f);
-            }
-            planner.bumpwith_matrix(h);
-        }
     }
 
     // Accessor methods for private fields
@@ -2773,7 +2735,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        use super::unified::{PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root};
+        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root};
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
@@ -3007,7 +2969,7 @@ impl<'a> RemlState<'a> {
         >,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
-            DenseSpectralOperator, HessianOperator, InnerSolutionBuilder, PenaltyLogdetDerivs,
+            DenseSpectralOperator, HessianOperator, InnerSolutionBuilder,
             reml_laml_evaluate,
         };
 
@@ -3445,7 +3407,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        use super::unified::{DenseSpectralOperator, PenaltyLogdetDerivs};
+        use super::unified::DenseSpectralOperator;
 
         let pirls_result = bundle.pirls_result.as_ref();
         let ridge_passport = pirls_result.ridge_passport;
@@ -3472,7 +3434,7 @@ impl<'a> RemlState<'a> {
             })?,
         );
 
-        let (penalty_rank, log_det_s) =
+        let (penalty_rank, ..) =
             self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
 
         let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {

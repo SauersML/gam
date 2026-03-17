@@ -1,6 +1,6 @@
 use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState,
+    ParameterBlockState, PenaltyMatrix,
 };
 use gam::families::custom_family::{
     CustomFamilyBlockPsiDerivative, ExactNewtonJointPsiTerms, ExactNewtonOuterObjective,
@@ -162,7 +162,8 @@ fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
         name: "rho_block".to_string(),
         design: gam::matrix::DesignMatrix::Dense(Arc::new(array![[1.0]])),
         offset: array![0.0],
-        penalties: vec![Array2::eye(1)],
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![0],
         initial_log_lambdas: array![0.0],
         initial_beta: Some(array![0.0]),
     };
@@ -221,6 +222,7 @@ fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
         design: gam::matrix::DesignMatrix::Dense(Arc::new(array![[1.0]])),
         offset: array![0.0],
         penalties: vec![],
+        nullspace_dims: vec![],
         initial_log_lambdas: Array1::zeros(0),
         initial_beta: Some(array![0.0]),
     };

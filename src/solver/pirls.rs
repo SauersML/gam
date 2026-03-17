@@ -1169,7 +1169,6 @@ impl<'a> GamWorkingModel<'a> {
     /// See response.md Section 3 for the mathematical justification.
     fn into_final_state(self) -> GamModelFinalState {
         let GamWorkingModel {
-            x_original,
             coordinate_design,
             e_transformed,
             lastmu,

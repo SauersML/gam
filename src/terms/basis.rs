@@ -120,6 +120,9 @@ pub enum BasisError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 // ============================================================================
@@ -6403,7 +6406,7 @@ struct SpatialDistanceCacheEntry {
     center_center_r: Arc<Array2<f64>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 struct SpatialDistanceCache {
     map: HashMap<SpatialDistanceCacheKey, SpatialDistanceCacheEntry>,
     order: Vec<SpatialDistanceCacheKey>,
@@ -6420,7 +6423,7 @@ struct ConstraintNullspaceCacheKey {
     order_code: u8,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 struct ConstraintNullspaceCache {
     map: HashMap<ConstraintNullspaceCacheKey, Arc<Array2<f64>>>,
     order: Vec<ConstraintNullspaceCacheKey>,
@@ -6428,7 +6431,7 @@ struct ConstraintNullspaceCache {
 
 const CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES: usize = 32;
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 struct BasisCacheContext {
     spatial_distance: SpatialDistanceCache,
     constraint_nullspace: ConstraintNullspaceCache,
@@ -6438,7 +6441,7 @@ struct BasisCacheContext {
 ///
 /// Pass one workspace through repeated basis builds to avoid global mutable state
 /// and to keep caching scoped to a caller-controlled lifecycle.
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 pub struct BasisWorkspace {
     cache: BasisCacheContext,
 }

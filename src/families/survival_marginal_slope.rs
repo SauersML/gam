@@ -834,7 +834,8 @@ impl SurvivalMarginalSlopeFamily {
                 let (g, h) = self.row_primary_gradient_hessian(row, c);
                 (g.clone(), h.clone())
             } else {
-                self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                let (_, g, h) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                (g, h)
             };
             let third = self.row_primary_third_contracted(row, block_states, &dir)?;
             let (_, left_vec) = self
@@ -917,7 +918,8 @@ impl SurvivalMarginalSlopeFamily {
                 let (g, h) = self.row_primary_gradient_hessian(row, c);
                 (g.clone(), h.clone())
             } else {
-                self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                let (_, g, h) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                (g, h)
             };
             let third_i = self.row_primary_third_contracted(row, block_states, &dir_i)?;
             let third_j = self.row_primary_third_contracted(row, block_states, &dir_j)?;

@@ -707,8 +707,6 @@ pub struct SimplicialFactor {
     l_values: Vec<f64>,
     /// AMD forward permutation: perm_fwd[original] = permuted
     perm_fwd: Vec<usize>,
-    /// AMD inverse permutation: perm_inv[permuted] = original
-    perm_inv: Vec<usize>,
     /// Dimension
     n: usize,
     /// log|H| = 2 * sum(log(L_ii))
@@ -731,7 +729,6 @@ pub fn factorize_simplicial(
             l_row_idx: Vec::new(),
             l_values: Vec::new(),
             perm_fwd: Vec::new(),
-            perm_inv: Vec::new(),
             n: 0,
             logdet: 0.0,
         });
@@ -849,7 +846,6 @@ pub fn factorize_simplicial(
         l_row_idx,
         l_values,
         perm_fwd,
-        perm_inv,
         n,
         logdet,
     })
@@ -869,8 +865,6 @@ pub struct TakahashiInverse {
     row_idx: Vec<usize>,
     /// Forward permutation
     perm_fwd: Vec<usize>,
-    /// Inverse permutation
-    perm_inv: Vec<usize>,
     /// Dimension
     n: usize,
 }
@@ -954,7 +948,6 @@ impl TakahashiInverse {
             col_ptr,
             row_idx,
             perm_fwd: factor.perm_fwd.clone(),
-            perm_inv: factor.perm_inv.clone(),
             n,
         }
     }

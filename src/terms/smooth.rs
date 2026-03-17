@@ -593,7 +593,6 @@ pub(crate) struct SpatialPsiDerivative {
     pub global_range: Range<usize>,
     pub total_p: usize,
     pub x_psi_local: Array2<f64>,
-    pub s_psi_local: Array2<f64>,
     pub s_psi_components_local: Vec<Array2<f64>>,
     pub x_psi_psi_local: Array2<f64>,
     pub s_psi_psi_components_local: Vec<Array2<f64>>,
@@ -2011,15 +2010,15 @@ pub fn build_smooth_design(
     terms: &[SmoothTermSpec],
 ) -> Result<RawSmoothDesign, BasisError> {
     let mut ws = crate::basis::BasisWorkspace::new();
-    build_smooth_design_with_workspace(data, terms, &mut ws)
+    build_smooth_design_withworkspace(data, terms, &mut ws)
 }
 
 /// Like `build_smooth_design` but reuses a persistent workspace for
 /// distance-matrix caching across repeated κ-proposal basis rebuilds.
-pub fn build_smooth_design_with_workspace(
+pub fn build_smooth_design_withworkspace(
     data: ArrayView2<'_, f64>,
     terms: &[SmoothTermSpec],
-    _workspace: &mut crate::basis::BasisWorkspace,
+    workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<RawSmoothDesign, BasisError> {
     let n = data.nrows();
     let mut local_designs = Vec::<Array2<f64>>::with_capacity(terms.len());
@@ -2130,7 +2129,7 @@ pub fn build_smooth_design_with_workspace(
                 } else {
                     None
                 };
-                let mut result = build_matern_basiswithworkspace(x.view(), spec, _workspace)?;
+                let mut result = build_matern_basiswithworkspace(x.view(), spec, workspace)?;
                 if let BasisMetadata::Matern { input_scales, .. } = &mut result.metadata {
                     *input_scales = scales;
                 }
@@ -2170,7 +2169,7 @@ pub fn build_smooth_design_with_workspace(
                 ) {
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
-                let mut result = build_duchon_basiswithworkspace(x.view(), &spec_local, _workspace)?;
+                let mut result = build_duchon_basiswithworkspace(x.view(), &spec_local, workspace)?;
                 if let BasisMetadata::Duchon { input_scales, .. } = &mut result.metadata {
                     *input_scales = scales;
                 }
@@ -7324,7 +7323,7 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         global_range,
         total_p,
         x_psi_local,
-        s_psi_local,
+        s_psi_local_check,
         x_psi_psi_local,
         s_psi_psi_local,
         s_psi_components_local,
@@ -7346,8 +7345,7 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         .map(|j| penalty_start + j)
         .collect::<Vec<_>>();
     let penalty_index = penalty_indices[0];
-    let s_psi0 = s_psi_local;
-    if s_psi0.nrows() == 0 || s_psi_psi_local.nrows() == 0 {
+    if s_psi_local_check.nrows() == 0 || s_psi_psi_local.nrows() == 0 {
         return Ok(None);
     }
     Ok(Some(SpatialPsiDerivative {
@@ -7356,7 +7354,6 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         global_range,
         total_p,
         x_psi_local,
-        s_psi_local: s_psi0,
         s_psi_components_local,
         x_psi_psi_local,
         s_psi_psi_components_local,
@@ -7499,10 +7496,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         };
         let s_psi_components = aniso_result.penalties_first[a].clone();
         let s_psi_psi_components = aniso_result.penalties_second_diag[a].clone();
-        let p_smooth = smooth_term.coeff_range.len();
-        let s_psi_local = s_psi_components
-            .iter()
-            .fold(Array2::<f64>::zeros((p_smooth, p_smooth)), |acc, m| acc + m);
         // Build cross-design entries for other axes b != a in this group.
         // These will be indexed by (b, cross_matrix) where b is the axis
         // offset within the d-entry block.
@@ -7545,7 +7538,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             global_range: global_range.clone(),
             total_p: p_total,
             x_psi_local,
-            s_psi_local,
             s_psi_components_local: s_psi_components,
             x_psi_psi_local,
             s_psi_psi_components_local: s_psi_psi_components,
@@ -7975,10 +7967,6 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         }
     }
 
-    fn store_cost(&mut self, cost: f64) {
-        self.last_cost = Some(cost);
-    }
-
     fn store_eval(&mut self, eval: (f64, Array1<f64>, Array2<f64>)) {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
@@ -8187,7 +8175,6 @@ fn try_exact_joint_spatial_aniso_optimization(
         offset: ArrayView1<'d, f64>,
         family: LikelihoodFamily,
         options: &'d FitOptions,
-        dims_per_term: &'d [usize],
         rho_dim: usize,
         best_cost: f64,
         cache: SingleBlockExactJointDesignCache<'d>,
@@ -8261,7 +8248,6 @@ fn try_exact_joint_spatial_aniso_optimization(
         offset,
         family,
         options,
-        dims_per_term,
         rho_dim,
         best_cost: f64::INFINITY,
         cache: SingleBlockExactJointDesignCache::new(
@@ -8348,7 +8334,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     );
     // No sum-to-zero enforcement needed: ψ coordinates are unconstrained during
     // optimization. The decomposition into (ψ̄, η) happens in apply_tospec.
-    let mut theta_star = result.rho;
+    let theta_star = result.rho;
     Ok(theta_star)
 }
 
@@ -8726,12 +8712,12 @@ fn build_single_smooth_term_realization(
 
 /// Like `build_single_smooth_term_realization` but reuses a persistent
 /// `BasisWorkspace` for distance-matrix caching across κ proposals.
-fn build_single_smooth_term_realization_with_workspace(
+fn build_single_smooth_term_realization_withworkspace(
     data: ArrayView2<'_, f64>,
     termspec: &SmoothTermSpec,
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<SingleSmoothTermRealization, BasisError> {
-    let raw = build_smooth_design_with_workspace(data, std::slice::from_ref(termspec), workspace)?;
+    let raw = build_smooth_design_withworkspace(data, std::slice::from_ref(termspec), workspace)?;
     finish_single_smooth_term_realization(raw, termspec)
 }
 
@@ -9003,7 +8989,7 @@ struct FrozenTermCollectionIncrementalRealizer<'d> {
     /// Persistent workspace for basis cache reuse across κ proposals.
     /// Distance matrices are cached here so they're computed once and
     /// reused across repeated `apply_log_kappa_to_term` calls.
-    basis_workspace: crate::basis::BasisWorkspace,
+    basisworkspace: crate::basis::BasisWorkspace,
 }
 
 impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
@@ -9090,7 +9076,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             smooth_penalty_ranges,
             full_penalty_ranges,
             full_smooth_start,
-            basis_workspace: crate::basis::BasisWorkspace::new(),
+            basisworkspace: crate::basis::BasisWorkspace::new(),
         })
     }
 
@@ -9159,10 +9145,10 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
             .clone();
         let realization =
-            build_single_smooth_term_realization_with_workspace(
+            build_single_smooth_term_realization_withworkspace(
                 self.data,
                 &termspec,
-                &mut self.basis_workspace,
+                &mut self.basisworkspace,
             )
             .map_err(|e| {
                 format!(
@@ -9547,10 +9533,6 @@ impl<'d> ExactJointDesignCache<'d> {
         }
     }
 
-    fn store_cost(&mut self, cost: f64) {
-        self.last_cost = Some(cost);
-    }
-
     fn store_eval(&mut self, eval: (f64, Array1<f64>, Option<Array2<f64>>)) {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
@@ -9786,7 +9768,7 @@ where
                 }
             },
             eval_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
-                if let Some((cost, mut grad, hess)) = ctx.cache.memoized_eval(theta) {
+                if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
                     ctx.track_best(theta, cost);
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
@@ -11770,8 +11752,6 @@ mod tests {
         assert!(cache.memoized_cost(&theta0).is_none());
         assert!(cache.memoized_eval(&theta0).is_none());
 
-        cache.store_cost(3.5);
-        assert_eq!(cache.memoized_cost(&theta0), Some(3.5));
         let eval = (
             2.25,
             Array1::<f64>::ones(theta0.len()),
@@ -11870,8 +11850,6 @@ mod tests {
         assert!(cache.memoized_cost(&theta0).is_none());
         assert!(cache.memoized_eval(&theta0).is_none());
 
-        cache.store_cost(1.75);
-        assert_eq!(cache.memoized_cost(&theta0), Some(1.75));
         let eval = (
             0.5,
             Array1::<f64>::ones(theta0.len()),

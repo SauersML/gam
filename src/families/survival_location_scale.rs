@@ -26,7 +26,7 @@ use crate::inference::prediction_linalg::{
     PredictionCovarianceBackend, dense_row_chunk, design_row_chunk, rowwise_local_covariances,
 };
 use crate::matrix::{
-    DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, MultiChannelOperator,
+    DesignMatrix, DesignOperator, EmbeddedColumnBlock, EmbeddedSquareBlock, MultiChannelOperator,
     RowwiseKroneckerOperator, SymmetricMatrix, xt_diag_x_symmetric,
 };
 use crate::mixture_link::{
@@ -3279,7 +3279,7 @@ fn validate_time_block(n: usize, b: &TimeBlockInput) -> Result<(), String> {
 }
 
 fn stack_offsets(parts: &[&Array1<f64>]) -> Array1<f64> {
-    let total = parts.iter().map(|part| part.len()).sum();
+    let total: usize = parts.iter().map(|part| part.len()).sum();
     let mut out = Array1::<f64>::zeros(total);
     let mut offset = 0usize;
     for part in parts {
@@ -3301,7 +3301,6 @@ struct TimeBlockPrepared {
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
     penalties: Vec<Array2<f64>>,
-    nullspace_dims: Vec<usize>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
 }
@@ -3364,7 +3363,6 @@ fn prepare_identified_time_block(
         design_exit,
         design_derivative_exit,
         penalties,
-        nullspace_dims: input.nullspace_dims.clone(),
         initial_beta,
         transform: TimeIdentifiabilityTransform { z },
     })

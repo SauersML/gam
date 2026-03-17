@@ -52,7 +52,7 @@ use crate::types::{MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, ArrayView1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_matmut, fast_ab, fast_atb,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, fast_ab, fast_atb,
 };
 use faer::{MatRef, Side};
 use rayon::prelude::*;

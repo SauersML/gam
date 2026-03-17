@@ -1,14 +1,11 @@
 use self::cache::AtomicFlagGuard;
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
-use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt, fast_atv};
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, assemble_and_factor_sparse_penalized_system,
     build_sparse_penalty_blocks,
 };
 use crate::types::SasLinkState;
-use faer::Side;
-use faer::linalg::solvers::Solve as FaerSolve;
 use ndarray::s;
 use std::ops::Range;
 use std::sync::Arc;
@@ -23,22 +20,6 @@ pub(crate) mod penalty_logdet;
 mod runtime;
 mod trace;
 pub(crate) mod unified;
-
-enum FaerFactor {
-    Llt(FaerLlt<f64>),
-    Lblt(FaerLblt<f64>),
-    Ldlt(FaerLdlt<f64>),
-}
-
-impl FaerFactor {
-    fn solve_in_place(&self, rhs: faer::MatMut<'_, f64>) {
-        match self {
-            Self::Llt(factor) => factor.solve_in_place(rhs),
-            Self::Lblt(factor) => factor.solve_in_place(rhs),
-            Self::Ldlt(factor) => factor.solve_in_place(rhs),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1854,7 +1835,6 @@ impl PirlsLruCache {
 /// the math kernels so objective/derivative routines can stay algebra-focused.
 struct EvalCacheManager {
     pirls_cache: RwLock<PirlsLruCache>,
-    faer_factor_cache: RwLock<HashMap<Vec<u64>, Arc<FaerFactor>>>,
     current_eval_bundle: RwLock<Option<EvalShared>>,
     pirls_cache_enabled: AtomicBool,
 }
@@ -1863,7 +1843,6 @@ impl EvalCacheManager {
     fn new() -> Self {
         Self {
             pirls_cache: RwLock::new(PirlsLruCache::new(MAX_PIRLS_CACHE_ENTRIES)),
-            faer_factor_cache: RwLock::new(HashMap::new()),
             current_eval_bundle: RwLock::new(None),
             pirls_cache_enabled: AtomicBool::new(true),
         }
@@ -1895,7 +1874,6 @@ impl EvalCacheManager {
 
     fn clear_eval_and_factor_caches(&self) {
         self.invalidate_eval_bundle();
-        self.faer_factor_cache.write().unwrap().clear();
     }
 }
 
