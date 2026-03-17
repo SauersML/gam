@@ -13,7 +13,7 @@ use crate::basis::{
     build_thin_plate_basis_log_kappa_derivative, build_thin_plate_basis_log_kappasecond_derivative,
     estimate_penalty_nullity, filter_active_penalty_candidates,
 };
-use crate::construction::kronecker_product;
+use crate::construction::{kronecker_logdet_and_derivatives, kronecker_product};
 use crate::custom_family::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
@@ -22,7 +22,7 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState,
-    UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
+    PenaltySpec, UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
@@ -638,75 +638,20 @@ impl KroneckerPenaltySystem {
         lambdas: &[f64],
         ridge: f64,
     ) -> (f64, Array1<f64>, Array2<f64>) {
-        let d = self.ndim();
         let n_pen = self.num_penalties();
         assert_eq!(lambdas.len(), n_pen, "lambda count mismatch");
-
-        let mut logdet = 0.0;
-        let mut grad = Array1::<f64>::zeros(n_pen);
-        let mut hess = Array2::<f64>::zeros((n_pen, n_pen));
-        let tol = 1e-12;
-
-        let mut multi_idx = vec![0usize; d];
-        loop {
-            let mut sigma = ridge;
-            for k in 0..d {
-                sigma += lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]];
-            }
-            if self.has_double_penalty {
-                sigma += lambdas[d];
-            }
-
-            if sigma > tol {
-                logdet += sigma.ln();
-                let inv_sigma = 1.0 / sigma;
-                let inv_sigma2 = inv_sigma * inv_sigma;
-
-                for k in 0..d {
-                    let ck = lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]];
-                    grad[k] += ck * inv_sigma;
-                }
-                if self.has_double_penalty {
-                    grad[d] += lambdas[d] * inv_sigma;
-                }
-
-                for k in 0..n_pen {
-                    let ck = if k < d {
-                        lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]]
-                    } else {
-                        lambdas[d]
-                    };
-                    hess[[k, k]] += ck * inv_sigma - ck * ck * inv_sigma2;
-                    for l in (k + 1)..n_pen {
-                        let cl = if l < d {
-                            lambdas[l] * self.marginal_eigensystems[l].0[multi_idx[l]]
-                        } else {
-                            lambdas[d]
-                        };
-                        let off = -ck * cl * inv_sigma2;
-                        hess[[k, l]] += off;
-                        hess[[l, k]] += off;
-                    }
-                }
-            }
-
-            let mut carry = true;
-            for dim in (0..d).rev() {
-                if carry {
-                    multi_idx[dim] += 1;
-                    if multi_idx[dim] < self.marginal_dims[dim] {
-                        carry = false;
-                    } else {
-                        multi_idx[dim] = 0;
-                    }
-                }
-            }
-            if carry {
-                break;
-            }
-        }
-
-        (logdet, grad, hess)
+        let marginal_evals: Vec<Array1<f64>> = self
+            .marginal_eigensystems
+            .iter()
+            .map(|(evals, _)| evals.clone())
+            .collect();
+        kronecker_logdet_and_derivatives(
+            &marginal_evals,
+            &self.marginal_dims,
+            lambdas,
+            self.has_double_penalty,
+            ridge,
+        )
     }
 }
 
@@ -5217,7 +5162,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         _ => -2.0 * final_eval.obs.log_likelihood,
     };
     let mut local_penalty_blocks =
-        Vec::<Array2<f64>>::with_capacity(baseline.design.penalties.len());
+        Vec::<PenaltySpec>::with_capacity(baseline.design.penalties.len());
     for (global_idx, bp) in baseline.design.penalties.iter().enumerate() {
         if adaptive_penalty_indices.contains(&global_idx) {
             let cache = runtime_caches
@@ -5259,13 +5204,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 scalar_operatorhessian(&cache.d2, &state.curvature.betahessian_diag())
                     .mapv(|v| adaptive_params[cache_idx].lambda[2] * v)
             };
-            local_penalty_blocks.push(penalty_matrixwith_local_block(
+            // Wrap the pre-scaled global penalty matrix as PenaltySpec::Dense.
+            local_penalty_blocks.push(PenaltySpec::Dense(penalty_matrixwith_local_block(
                 baseline.design.design.ncols(),
                 cache.coeff_global_range.clone(),
                 &local,
-            ));
+            )));
         } else {
-            local_penalty_blocks.push(bp.to_global(p_total).mapv(|v| v * full_lambdas[global_idx]));
+            local_penalty_blocks.push(PenaltySpec::Dense(bp.to_global(p_total).mapv(|v| v * full_lambdas[global_idx])));
         }
     }
     let (edf_by_block, edf_total) = if let Some(cov) = beta_covariance.as_ref() {
@@ -7280,25 +7226,38 @@ fn exact_bounded_edf(
     for (k, ps) in penalties.iter().enumerate() {
         let lambda_k = lambdas[k];
         match ps {
-            PenaltySpec::Block { local, col_range } => {
+            PenaltySpec::Block { local, col_range, .. } => {
                 s_lambda
                     .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
                     .scaled_add(lambda_k, local);
+                // Compute penalty rank from the block-local matrix directly.
+                let penalty_rank =
+                    local.nrows().saturating_sub(estimate_penalty_nullity(local).map_err(|e| {
+                        EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
+                    })?);
+                // Trace only involves the block slice of latent_cov.
+                let cov_block = latent_cov.slice(ndarray::s![col_range.clone(), col_range.clone()]);
+                let trace_k = lambda_k
+                    * trace_of_dense_product(&cov_block.to_owned(), local)
+                        .map_err(EstimationError::InvalidInput)?;
+                trace_sum += trace_k;
+                let p_k = penalty_rank as f64;
+                edf_by_block.push((p_k - trace_k).clamp(0.0, p_k));
             }
             PenaltySpec::Dense(m) => {
                 s_lambda.scaled_add(lambda_k, m);
+                let penalty_rank =
+                    p.saturating_sub(estimate_penalty_nullity(m).map_err(|e| {
+                        EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
+                    })?);
+                let trace_k = lambda_k
+                    * trace_of_dense_product(latent_cov, m)
+                        .map_err(EstimationError::InvalidInput)?;
+                trace_sum += trace_k;
+                let p_k = penalty_rank as f64;
+                edf_by_block.push((p_k - trace_k).clamp(0.0, p_k));
             }
         }
-        let penalty_dense = ps.to_global(p);
-        let penalty_rank =
-            p.saturating_sub(estimate_penalty_nullity(&penalty_dense).map_err(|e| {
-                    EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
-                })?);
-        let trace_k = lambda_k
-            * trace_of_dense_product(latent_cov, penalty).map_err(EstimationError::InvalidInput)?;
-        trace_sum += trace_k;
-        let p_k = penalty_rank as f64;
-        edf_by_block.push((p_k - trace_k).clamp(0.0, p_k));
     }
 
     let nullity_total = estimate_penalty_nullity(&s_lambda)
@@ -7422,7 +7381,7 @@ fn fit_bounded_term_collection_with_design(
         penalties: fit_penalties
             .iter()
             .map(|ps| match ps {
-                PenaltySpec::Block { local, col_range } => PenaltyMatrix::Blockwise {
+                PenaltySpec::Block { local, col_range, .. } => PenaltyMatrix::Blockwise {
                     local: local.clone(),
                     col_range: col_range.clone(),
                     total_dim: design.design.ncols(),
@@ -7469,7 +7428,7 @@ fn fit_bounded_term_collection_with_design(
     let mut s_lambda_internal = Array2::<f64>::zeros((p_fit, p_fit));
     for (k, penalty) in fit_penalties.iter().enumerate() {
         match penalty {
-            PenaltySpec::Block { local, col_range } => {
+            PenaltySpec::Block { local, col_range, .. } => {
                 s_lambda_internal
                     .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
                     .scaled_add(fit.lambdas[k], local);
@@ -13388,7 +13347,7 @@ mod tests {
 
     #[test]
     fn exact_bounded_edf_matches_trace_formula_for_simple_penalty() {
-        let penalties = vec![Array2::eye(1)];
+        let penalties = vec![PenaltySpec::Dense(Array2::eye(1))];
         let lambdas = array![0.25];
         let cov = array![[2.0]];
         let (edf_by_block, edf_total) =

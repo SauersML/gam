@@ -66,7 +66,7 @@ impl<'a> RemlState<'a> {
         // whether P-IRLS uses standard or factored Qs.
         if let Some(ref kron) = self.kronecker_penalty_system {
             let lambdas_slice = lambdas.as_slice().unwrap();
-            let (_logdet, det1, det2) = kron.logdet_and_derivatives(lambdas_slice, ridge);
+            let (_, det1, det2) = kron.logdet_and_derivatives(lambdas_slice, ridge);
             return Ok((det1, det2));
         }
 

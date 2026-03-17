@@ -116,6 +116,42 @@ impl PenaltySpec {
             structure_hint: bp.structure_hint.clone(),
         }
     }
+
+    /// Materialize the full `p x p` dense penalty matrix.
+    /// For `Dense`, this is a clone.  For `Block`, this embeds `local` into a
+    /// zero matrix at the given `col_range`.
+    pub fn to_dense(&self) -> Array2<f64> {
+        match self {
+            PenaltySpec::Dense(m) => m.clone(),
+            PenaltySpec::Block { local, col_range, .. } => {
+                let p = col_range.end.max(local.nrows());
+                // Caller should supply p externally when the total dim is larger;
+                // this is the best we can do without it.
+                let mut out = Array2::zeros((p, p));
+                out.slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
+                    .assign(local);
+                out
+            }
+        }
+    }
+
+    /// Materialize the full `p_total x p_total` dense penalty matrix.
+    /// For `Dense`, this is a clone (asserts that it matches `p_total`).
+    /// For `Block`, this embeds `local` into a `p_total x p_total` zero matrix.
+    pub fn to_global(&self, p_total: usize) -> Array2<f64> {
+        match self {
+            PenaltySpec::Dense(m) => {
+                debug_assert_eq!(m.nrows(), p_total);
+                m.clone()
+            }
+            PenaltySpec::Block { local, col_range, .. } => {
+                let mut out = Array2::zeros((p_total, p_total));
+                out.slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
+                    .assign(local);
+                out
+            }
+        }
+    }
 }
 
 const KAHAN_SWITCH_ELEMS: usize = 10_000;
@@ -2468,14 +2504,28 @@ where
         };
         let mut traces = vec![0.0f64; k];
         for (kk, cp) in pirls_res.reparam_result.canonical_transformed.iter().enumerate() {
-            let root_global = cp.global_root();
-            let ekt_arr = root_global.t().to_owned();
-            let sol = factor.solvemulti(&ekt_arr).map_err(|_| {
+            // Build the p × rank RHS with nonzeros only in [start..end] rows.
+            let r = &cp.col_range;
+            let rank = cp.rank();
+            let p_dim = factor.dim();
+            let mut rhs = Array2::<f64>::zeros((p_dim, rank));
+            for col in 0..rank {
+                for row in 0..cp.block_dim() {
+                    rhs[[r.start + row, col]] = cp.root[[col, row]];
+                }
+            }
+            let sol = factor.solvemulti(&rhs).map_err(|_| {
                 EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
                 }
             })?;
-            let frob: f64 = sol.iter().zip(ekt_arr.iter()).map(|(&a, &b)| a * b).sum();
+            // Frobenius inner product: only the block rows of rhs are nonzero.
+            let mut frob = 0.0f64;
+            for col in 0..rank {
+                for row in 0..cp.block_dim() {
+                    frob += sol[[r.start + row, col]] * rhs[[r.start + row, col]];
+                }
+            }
             traces[kk] = lambdas[kk] * frob;
         }
         edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
