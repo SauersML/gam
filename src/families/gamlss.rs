@@ -1640,10 +1640,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design
-                .global_penalties()
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+                .penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
@@ -1663,10 +1660,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             )?)),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design
-                .global_penalties()
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+                .penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: noise_log_lambdas,
             initial_beta: noise_beta_hint,
@@ -1806,10 +1800,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design
-                .global_penalties()
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+                .penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
@@ -1829,10 +1820,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             )?)),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design
-                .global_penalties()
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+                .penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
@@ -1997,17 +1985,16 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         layout.validate_theta_len(theta.len(), "binomial location-scale")?;
         let identifiednoise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
-        let mut log_sigma_penalties = noise_design.global_penalties();
-        log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
+        let p_noise = identifiednoise_design.ncols();
+        let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
+            noise_design.penalties_as_penalty_matrix();
+        log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design
-                .global_penalties()
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+                .penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
@@ -2016,10 +2003,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(Arc::new(identifiednoise_design)),
             offset: Array1::zeros(self.y.len()),
-            penalties: log_sigma_penalties
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+            penalties: log_sigma_penalty_matrices,
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
@@ -2160,17 +2144,16 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         layout.validate_theta_len(theta.len(), "wiggle location-scale")?;
         let identifiednoise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
-        let mut log_sigma_penalties = noise_design.global_penalties();
-        log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
+        let p_noise = identifiednoise_design.ncols();
+        let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
+            noise_design.penalties_as_penalty_matrix();
+        log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design
-                .global_penalties()
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+                .penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
@@ -2179,10 +2162,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(Arc::new(identifiednoise_design)),
             offset: Array1::zeros(self.y.len()),
-            penalties: log_sigma_penalties
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+            penalties: log_sigma_penalty_matrices,
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
@@ -2649,7 +2629,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 name: "eta".to_string(),
                 design: design.design.clone(),
                 offset: Array1::zeros(y_cloned.len()),
-                penalties: design.global_penalties().into_iter().map(|m| PenaltyMatrix::Dense(m)).collect(),
+                penalties: design.penalties_as_penalty_matrix(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),

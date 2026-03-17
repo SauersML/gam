@@ -609,6 +609,17 @@ impl TermCollectionDesign {
         penalties_to_global(&self.penalties, p)
     }
 
+    /// Convert blockwise penalties to `PenaltyMatrix::Blockwise` without
+    /// expanding to `p_total × p_total`. This is the preferred path for
+    /// family modules that accept `Vec<PenaltyMatrix>`.
+    pub fn penalties_as_penalty_matrix(&self) -> Vec<crate::custom_family::PenaltyMatrix> {
+        let p = self.design.ncols();
+        self.penalties
+            .iter()
+            .map(|bp| crate::custom_family::PenaltyMatrix::from_blockwise(bp.clone(), p))
+            .collect()
+    }
+
     /// Number of penalty blocks.
     #[inline]
     pub fn num_penalties(&self) -> usize {
