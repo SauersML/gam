@@ -1250,6 +1250,8 @@ pub struct ExternalOptimOptions {
     /// Relative shrinkage floor for penalized block eigenvalues.
     /// See [`FitOptions::penalty_shrinkage_floor`] for details.
     pub penalty_shrinkage_floor: Option<f64>,
+    /// Kronecker-factored penalty system for tensor-product smooth terms.
+    pub kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
 }
 
 fn resolve_external_family(
@@ -4319,6 +4321,7 @@ where
         linear_constraints: opts.linear_constraints.clone(),
         firth_bias_reduction: None,
         penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+        kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
     };
 
     let result = if matches!(
