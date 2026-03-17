@@ -4263,29 +4263,40 @@ fn gaussian_joint_psisecondweights(
         let wi = scalars.w[i];
         let mi = scalars.m[i];
         let ni = scalars.n[i];
+        let ki = scalars.kappa[i];
         let ma = mu_a[i];
-        let ea = eta_a[i];
         let mb = mu_b[i];
-        let eb = eta_b[i];
         let mab = mu_ab[i];
-        let eab = eta_ab[i];
-        let cross = ma * eb + mb * ea;
-        let ea_eb = ea * eb;
+        // κ-scaled log-sigma directions.
+        let sea = ki * eta_a[i];
+        let seb = ki * eta_b[i];
+        let seab = ki * eta_ab[i];
+        let cross = ma * seb + mb * sea;
+        let sea_seb = sea * seb;
         let ma_mb = ma * mb;
-        objective_psi_psirow[i]
-            .write(wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * ea_eb - mi * mab + (1.0 - ni) * eab);
-        d2scoremu[i].write(wi * mab - 2.0 * wi * cross - 4.0 * mi * ea_eb + 2.0 * mi * eab);
-        d2score_ls[i].write(
-            -2.0 * wi * ma_mb - 4.0 * mi * cross - 4.0 * ni * ea_eb
-                + 2.0 * mi * mab
-                + 2.0 * ni * eab,
+        // Objective psi-psi: d²NLL/d(ψ_a)d(ψ_b).
+        // Score_μ = -m, Score_ls = κ(1-n). Hessian blocks carry κ, κ².
+        objective_psi_psirow[i].write(
+            wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * sea_seb
+                - mi * mab
+                + ki * (1.0 - ni) * eta_ab[i],
         );
-        d2hmumu[i].write(4.0 * wi * ea_eb - 2.0 * wi * eab);
-        d2hmu_ls[i].write(-2.0 * wi * mab + 4.0 * wi * cross + 8.0 * mi * ea_eb - 4.0 * mi * eab);
+        d2scoremu[i].write(wi * mab - 2.0 * wi * cross - 4.0 * mi * sea_seb + 2.0 * mi * seab);
+        d2score_ls[i].write(
+            ki * (-2.0 * wi * ma_mb - 4.0 * mi * cross - 4.0 * ni * sea_seb
+                + 2.0 * mi * mab
+                + 2.0 * ni * seab),
+        );
+        d2hmumu[i].write(4.0 * wi * sea_seb - 2.0 * wi * seab);
+        // Cross block carries overall κ; scale-scale block carries κ².
+        d2hmu_ls[i].write(
+            ki * (-2.0 * wi * mab + 4.0 * wi * cross + 8.0 * mi * sea_seb - 4.0 * mi * seab),
+        );
         d2h_ls_ls[i].write(
-            4.0 * wi * ma_mb + 8.0 * mi * cross + 8.0 * ni * ea_eb
-                - 4.0 * mi * mab
-                - 4.0 * ni * eab,
+            ki * ki
+                * (4.0 * wi * ma_mb + 8.0 * mi * cross + 8.0 * ni * sea_seb
+                    - 4.0 * mi * mab
+                    - 4.0 * ni * seab),
         );
     }
     unsafe {

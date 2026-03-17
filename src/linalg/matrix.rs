@@ -1014,9 +1014,8 @@ impl BlockDesignOperator {
             (DesignBlock::Intercept(_), other) => {
                 let pj = other.ncols();
                 let mut cross = Array2::<f64>::zeros((1, pj));
-                let ones = Array1::from_elem(self.n, 1.0);
                 let weighted =
-                    Array1::from_shape_fn(self.n, |idx| ones[idx] * weights[idx].max(0.0));
+                    Array1::from_shape_fn(self.n, |idx| weights[idx].max(0.0));
                 let row = other.apply_transpose(&weighted);
                 cross.row_mut(0).assign(&row);
                 Ok(cross)
@@ -1464,9 +1463,14 @@ impl DesignOperator for ReparamDesignOperator {
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         // diag(X_new M X_new') = diag(X_inner Q M Q' X_inner')
-        // Let M' = Q M Q', then delegate to inner.
-        let qm = fast_ab(&self.q, middle);
-        let qmqt = fast_ab(&qm, &self.q.t().to_owned());
+        // Let M_inner = Q M Q', then delegate to inner.
+        let qm = fast_ab(&self.q, middle);  // (p_inner, p_new)
+        let qmqt = {
+            // Q M Q' = (Q M) · Q' without allocating the transpose.
+            let qt = self.q.t();
+            let qt_owned = qt.to_owned();
+            fast_ab(&qm, &qt_owned)
+        };
         self.inner.quadratic_form_diag(&qmqt)
     }
 

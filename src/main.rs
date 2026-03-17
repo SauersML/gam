@@ -76,17 +76,15 @@ use gam::smooth::{
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
-    SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, SurvivalTimeWiggleBuild,
-    SURVIVAL_TIME_FLOOR, append_survival_timewiggle_columns,
+    SurvivalTimeBasisConfig, append_survival_timewiggle_columns,
     build_survival_baseline_offsets, build_survival_time_basis,
     build_survival_time_monotonicity_collocation,
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, evaluate_survival_baseline,
     normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, resolved_survival_time_basis_config,
-    survival_baseline_targetname, survival_basis_supports_structural_monotonicity,
-    survival_likelihood_modename, survival_monotonicity_log_grid,
+    require_structural_survival_time_basis, survival_baseline_targetname,
+    survival_basis_supports_structural_monotonicity, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     ResidualDistribution, SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
