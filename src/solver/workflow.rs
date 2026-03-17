@@ -661,9 +661,10 @@ use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
     SurvivalLikelihoodMode, SurvivalTimeWiggleBuild, append_survival_timewiggle_columns,
     build_survival_baseline_offsets, build_survival_time_basis,
-    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
-    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    build_survival_time_monotonicity_collocation, build_survival_timewiggle_from_baseline,
+    build_time_varying_survival_covariate_template, normalize_survival_time_pair,
+    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
+    parse_survival_time_basis_config,
 };
 use crate::families::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, SurvivalLocationScaleTermSpec, TimeBlockInput,
@@ -711,6 +712,12 @@ pub struct FitConfig {
     /// If set, fit a location-scale model with this formula for the noise parameter.
     pub noise_formula: Option<String>,
 
+    // Marginal-slope
+    /// Formula for the log-slope model (survival marginal-slope or Bernoulli marginal-slope).
+    pub logslope_formula: Option<String>,
+    /// Column name for the z (exposure/dose) variable in marginal-slope models.
+    pub z_column: Option<String>,
+
     // Fitting options
     pub scale_dimensions: bool,
     pub ridge_lambda: f64,
@@ -738,6 +745,8 @@ impl Default for FitConfig {
             sigma_time_k: None,
             sigma_time_degree: 3,
             noise_formula: None,
+            logslope_formula: None,
+            z_column: None,
             scale_dimensions: false,
             ridge_lambda: 1e-6,
         }
@@ -772,7 +781,7 @@ pub fn materialize<'a>(
     if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
         materialize_survival(&parsed, data, &col_map, config, &entry_col, &exit_col, &event_col)
     } else if config.noise_formula.is_some() {
-        Err("location-scale (noise_formula) materialization through the unified API is not yet supported; use FitRequest::GaussianLocationScale or FitRequest::BinomialLocationScale directly".to_string())
+        materialize_location_scale(&parsed, data, &col_map, config)
     } else {
         materialize_standard(&parsed, data, &col_map, config)
     }
@@ -973,13 +982,11 @@ fn materialize_survival<'a>(
     }
 
     // Parse survival config
-    // NOTE: currently only LocationScale is supported through the unified API.
-    // Transformation, Weibull, and MarginalSlope require additional wiring.
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
-    if !matches!(survival_mode, SurvivalLikelihoodMode::LocationScale) {
+    if matches!(survival_mode, SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull) {
         return Err(format!(
             "survival likelihood '{}' is not yet supported through the unified API; \
-             only 'location-scale' is currently available. Use FitRequest directly for other modes.",
+             use 'location-scale' or 'marginal-slope'. For transformation/weibull, use FitRequest directly.",
             config.survival_likelihood
         ));
     }
@@ -1038,6 +1045,17 @@ fn materialize_survival<'a>(
         timewiggle_build = Some(tw);
     }
 
+    // Monotonicity collocation — feeds into TimeBlockInput constraint fields
+    let timewiggle_ref = timewiggle_build.as_ref().map(|tw| (&tw.knots, tw.degree));
+    let (mono_rows, mono_offsets) = build_survival_time_monotonicity_collocation(
+        &age_entry,
+        &age_exit,
+        &time_build,
+        &baseline_cfg,
+        timewiggle_ref,
+    )?;
+    let has_mono = mono_rows.nrows() > 0;
+
     // Build covariate spec
     let mut termspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
     if config.scale_dimensions {
@@ -1090,52 +1108,179 @@ fn materialize_survival<'a>(
         None
     };
 
-    // Assemble SurvivalLocationScaleTermSpec
+    // Assemble the time block (shared between LocationScale and MarginalSlope)
     let time_p = time_build.x_exit_time.ncols()
         + timewiggle_build.as_ref().map_or(0, |tw| tw.design_exit.ncols());
-    let spec = SurvivalLocationScaleTermSpec {
-        age_entry: age_entry.clone(),
-        age_exit: age_exit.clone(),
-        event_target: event,
-        weights: Array1::ones(n),
-        inverse_link: survival_inverse_link,
-        derivative_guard: 1e-6,
-        derivative_softness: 1e-4,
-        time_anchor: None,
-        max_iter: 200,
-        tol: 1e-7,
-        time_block: TimeBlockInput {
-            design_entry: time_design_entry,
-            design_exit: time_design_exit,
-            design_derivative_exit: time_design_derivative,
-            offset_entry: eta_offset_entry,
-            offset_exit: eta_offset_exit,
-            derivative_offset_exit,
-            penalties: time_penalties,
-            nullspace_dims: time_nullspace_dims,
-            initial_log_lambdas: time_initial_log_lambdas,
-            initial_beta: Some(Array1::zeros(time_p)),
-        },
-        thresholdspec: termspec,
-        log_sigmaspec,
-        threshold_template,
-        log_sigma_template,
-        linkwiggle_block: None,
+    let time_block = TimeBlockInput {
+        design_entry: time_design_entry,
+        design_exit: time_design_exit,
+        design_derivative_exit: time_design_derivative,
+        constraint_design_derivative: if has_mono { Some(mono_rows) } else { None },
+        offset_entry: eta_offset_entry,
+        offset_exit: eta_offset_exit,
+        derivative_offset_exit,
+        constraint_derivative_offset: if has_mono { Some(mono_offsets) } else { None },
+        penalties: time_penalties,
+        nullspace_dims: time_nullspace_dims,
+        initial_log_lambdas: time_initial_log_lambdas,
+        initial_beta: Some(Array1::zeros(time_p)),
     };
 
-    Ok(MaterializedModel {
-        request: FitRequest::SurvivalLocationScale(SurvivalLocationScaleFitRequest {
-            data: data.values.view(),
-            spec,
-            wiggle: effective_linkwiggle.map(|cfg| LinkWiggleConfig {
-                degree: cfg.degree,
-                num_internal_knots: cfg.num_internal_knots,
-                penalty_orders: cfg.penalty_orders,
-                double_penalty: cfg.double_penalty,
+    let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+
+    match survival_mode {
+        SurvivalLikelihoodMode::LocationScale => {
+            let spec = SurvivalLocationScaleTermSpec {
+                age_entry: age_entry.clone(),
+                age_exit: age_exit.clone(),
+                event_target: event,
+                weights: Array1::ones(n),
+                inverse_link: survival_inverse_link,
+                derivative_guard: 1e-6,
+                derivative_softness: 1e-4,
+                time_anchor: None,
+                max_iter: 200,
+                tol: 1e-7,
+                time_block,
+                thresholdspec: termspec,
+                log_sigmaspec,
+                threshold_template,
+                log_sigma_template,
+                linkwiggle_block: None,
+            };
+
+            Ok(MaterializedModel {
+                request: FitRequest::SurvivalLocationScale(SurvivalLocationScaleFitRequest {
+                    data: data.values.view(),
+                    spec,
+                    wiggle: effective_linkwiggle.map(|cfg| LinkWiggleConfig {
+                        degree: cfg.degree,
+                        num_internal_knots: cfg.num_internal_knots,
+                        penalty_orders: cfg.penalty_orders,
+                        double_penalty: cfg.double_penalty,
+                    }),
+                    kappa_options,
+                    optimize_inverse_link: true,
+                }),
+                inference_notes,
+            })
+        }
+        SurvivalLikelihoodMode::MarginalSlope => {
+            let z_col_name = config.z_column.as_deref().ok_or_else(|| {
+                "marginal-slope survival requires z_column in FitConfig".to_string()
+            })?;
+            let z_idx = *col_map.get(z_col_name)
+                .ok_or_else(|| format!("z column '{z_col_name}' not found"))?;
+            let z = data.values.column(z_idx).to_owned();
+            let logslopespec = if let Some(ls_formula) = config.logslope_formula.as_deref() {
+                let ls_parsed = parse_formula(&format!("{} ~ {ls_formula}", parsed.response))?;
+                build_termspec(&ls_parsed.terms, data, col_map, &mut inference_notes)?
+            } else {
+                termspec
+            };
+            let spec = SurvivalMarginalSlopeTermSpec {
+                age_entry: age_entry.clone(),
+                age_exit: age_exit.clone(),
+                event_target: event,
+                weights: Array1::ones(n),
+                z,
+                derivative_guard: 1e-6,
+                time_block,
+                logslopespec,
+            };
+
+            Ok(MaterializedModel {
+                request: FitRequest::SurvivalMarginalSlope(SurvivalMarginalSlopeFitRequest {
+                    data: data.values.view(),
+                    spec,
+                    options: BlockwiseFitOptions::default(),
+                    kappa_options,
+                }),
+                inference_notes,
+            })
+        }
+        // Transformation and Weibull are rejected earlier in this function.
+        _ => unreachable!(),
+    }
+}
+
+fn materialize_location_scale<'a>(
+    parsed: &ParsedFormula,
+    data: &'a Dataset,
+    col_map: &HashMap<String, usize>,
+    config: &FitConfig,
+) -> Result<MaterializedModel<'a>, String> {
+    let y_col = *col_map
+        .get(&parsed.response)
+        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y = data.values.column(y_col).to_owned();
+    let mut inference_notes = Vec::new();
+
+    let noise_formula = config.noise_formula.as_deref()
+        .ok_or_else(|| "noise_formula is required for location-scale models".to_string())?;
+    let noise_parsed = parse_formula(&format!("{} ~ {noise_formula}", parsed.response))?;
+
+    let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
+    let family = resolve_family(config.family.as_deref(), link_choice.as_ref(), y.view())?;
+
+    let effective_linkwiggle = effectivelinkwiggle_formulaspec(
+        parsed.linkwiggle.as_ref(),
+        link_choice.as_ref(),
+    );
+
+    let mut meanspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
+    let mut log_sigmaspec = build_termspec(&noise_parsed.terms, data, col_map, &mut inference_notes)?;
+    if config.scale_dimensions {
+        enable_scale_dimensions(&mut meanspec);
+        enable_scale_dimensions(&mut log_sigmaspec);
+    }
+
+    let weights = Array1::ones(data.values.nrows());
+    let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+    let options = BlockwiseFitOptions::default();
+
+    let wiggle_cfg = effective_linkwiggle.map(|cfg| LinkWiggleConfig {
+        degree: cfg.degree,
+        num_internal_knots: cfg.num_internal_knots,
+        penalty_orders: cfg.penalty_orders,
+        double_penalty: cfg.double_penalty,
+    });
+
+    if is_binomial_family(family) {
+        let link_kind = link_choice.as_ref()
+            .map(|c| InverseLink::Standard(c.link))
+            .unwrap_or(InverseLink::Standard(LinkFunction::Logit));
+        Ok(MaterializedModel {
+            request: FitRequest::BinomialLocationScale(BinomialLocationScaleFitRequest {
+                data: data.values.view(),
+                spec: BinomialLocationScaleTermSpec {
+                    y,
+                    weights,
+                    link_kind,
+                    thresholdspec: meanspec,
+                    log_sigmaspec,
+                },
+                wiggle: wiggle_cfg,
+                options,
+                kappa_options,
             }),
-            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
-            optimize_inverse_link: true,
-        }),
-        inference_notes,
-    })
+            inference_notes,
+        })
+    } else {
+        Ok(MaterializedModel {
+            request: FitRequest::GaussianLocationScale(GaussianLocationScaleFitRequest {
+                data: data.values.view(),
+                spec: GaussianLocationScaleTermSpec {
+                    y,
+                    weights,
+                    meanspec,
+                    log_sigmaspec,
+                },
+                wiggle: wiggle_cfg,
+                options,
+                kappa_options,
+            }),
+            inference_notes,
+        })
+    }
 }

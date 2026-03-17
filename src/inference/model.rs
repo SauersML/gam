@@ -10,6 +10,9 @@ use crate::inference::predict::{
     GaussianLocationScalePredictor, PredictableModel, StandardPredictor, SurvivalPredictor,
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
+use crate::families::survival_construction::{
+    SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
+};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::types::{
     InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec, SasLinkState,
@@ -1263,5 +1266,78 @@ impl Deref for FittedModel {
 impl DerefMut for FittedModel {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.payload_mut()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconstruct library types from saved models
+// ---------------------------------------------------------------------------
+
+pub fn survival_baseline_config_from_model(
+    model: &FittedModel,
+) -> Result<SurvivalBaselineConfig, String> {
+    parse_survival_baseline_config(
+        model
+            .survival_baseline_target
+            .as_deref()
+            .unwrap_or("linear"),
+        model.survival_baseline_scale,
+        model.survival_baseline_shape,
+        model.survival_baseline_rate,
+        model.survival_baseline_makeham,
+    )
+}
+
+pub fn load_survival_time_basis_config_from_model(
+    model: &FittedModel,
+) -> Result<SurvivalTimeBasisConfig, String> {
+    match model
+        .survival_time_basis
+        .as_deref()
+        .ok_or_else(|| "saved survival model missing survival_time_basis".to_string())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "none" => Ok(SurvivalTimeBasisConfig::None),
+        "linear" => Ok(SurvivalTimeBasisConfig::Linear),
+        "bspline" => {
+            let degree = model.survival_time_degree.ok_or_else(|| {
+                "saved survival bspline model missing survival_time_degree".to_string()
+            })?;
+            let knots = model.survival_time_knots.clone().ok_or_else(|| {
+                "saved survival bspline model missing survival_time_knots".to_string()
+            })?;
+            let smooth_lambda = model.survival_time_smooth_lambda.unwrap_or(1e-2);
+            if degree < 1 || knots.is_empty() {
+                return Err("saved survival bspline time basis metadata is invalid".to_string());
+            }
+            Ok(SurvivalTimeBasisConfig::BSpline {
+                degree,
+                knots: Array1::from_vec(knots),
+                smooth_lambda,
+            })
+        }
+        "ispline" => {
+            let degree = model.survival_time_degree.ok_or_else(|| {
+                "saved survival ispline model missing survival_time_degree".to_string()
+            })?;
+            let knots = model.survival_time_knots.clone().ok_or_else(|| {
+                "saved survival ispline model missing survival_time_knots".to_string()
+            })?;
+            let keep_cols = model.survival_time_keep_cols.clone().ok_or_else(|| {
+                "saved survival ispline model missing survival_time_keep_cols".to_string()
+            })?;
+            let smooth_lambda = model.survival_time_smooth_lambda.unwrap_or(1e-2);
+            if degree < 1 || knots.is_empty() || keep_cols.is_empty() {
+                return Err("saved survival ispline time basis metadata is invalid".to_string());
+            }
+            Ok(SurvivalTimeBasisConfig::ISpline {
+                degree,
+                knots: Array1::from_vec(knots),
+                keep_cols,
+                smooth_lambda,
+            })
+        }
+        other => Err(format!("unsupported saved survival_time_basis '{other}'")),
     }
 }
