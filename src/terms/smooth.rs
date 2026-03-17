@@ -213,7 +213,9 @@ impl SmoothDesign {
 #[derive(Debug, Clone)]
 pub struct RawSmoothDesign {
     pub term_designs: Vec<Array2<f64>>,
-    pub penalties: Vec<Array2<f64>>,
+    /// Per-term block-local penalties.  Each `col_range` is relative to the
+    /// smooth block (i.e. indexing into the concatenation of `term_designs`).
+    pub penalties: Vec<BlockwisePenalty>,
     pub nullspace_dims: Vec<usize>,
     pub penaltyinfo: Vec<PenaltyBlockInfo>,
     pub dropped_penaltyinfo: Vec<DroppedPenaltyBlockInfo>,
