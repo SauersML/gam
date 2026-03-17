@@ -1463,10 +1463,12 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<Arc<PirlsResult>, EstimationError> {
-        let use_cache = self
-            .cache_manager
-            .pirls_cache_enabled
-            .load(Ordering::Relaxed);
+        let screening_active = self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0;
+        let use_cache = !screening_active
+            && self
+                .cache_manager
+                .pirls_cache_enabled
+                .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
         let key_opt = self.rhokey_sanitized(rho);
         if use_cache

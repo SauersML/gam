@@ -1484,6 +1484,7 @@ where
             heuristic_lambdas: heuristic_lambdas.map(|s| s.to_vec()),
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
+            screening_cap: Some(reml_state.screening_max_inner_iterations.clone()),
         };
 
         let mut obj = ClosureObjective {
@@ -1593,6 +1594,7 @@ where
             heuristic_lambdas: heuristic_theta_ref.map(|s| s.to_vec()),
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
+            screening_cap: Some(reml_state.screening_max_inner_iterations.clone()),
         };
         let mut obj = ClosureObjective {
             state: &mut reml_state,

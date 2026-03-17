@@ -2654,6 +2654,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         heuristic_lambdas: None,
         initial_rho: Some(theta0),
         fallback_policy: FallbackPolicy::Automatic,
+        screening_cap: None,
     };
 
     let outer = crate::solver::outer_strategy::run_outer(
