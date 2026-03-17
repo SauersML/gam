@@ -1785,12 +1785,14 @@ impl TensorProductDesignOperator {
             // Reshape β to (q₁, tail_total), compute B₁ · β_mat → (n, tail_total)
             // via a single GEMM.  Then elementwise-multiply each column by the
             // corresponding tail marginal products and row-sum.
-            let beta_mat = Array2::from_shape_vec(
+            //
+            // Zero-copy reshape: β is contiguous and q₁·tail_total = total_cols.
+            let beta_view = ndarray::ArrayView2::from_shape(
                 (q0, tail_total),
-                vector.as_slice().unwrap().to_vec(),
+                vector.as_slice().unwrap(),
             )
             .expect("β reshape for GEMM");
-            let temp = fast_ab(b0.as_ref(), &beta_mat); // (n, tail_total)
+            let temp = fast_ab(b0.as_ref(), &beta_view); // (n, tail_total)
 
             let mut out = Array1::<f64>::zeros(n);
             let mut tail_indices = vec![0usize; tail_dims.len()];
