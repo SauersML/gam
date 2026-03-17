@@ -1813,7 +1813,7 @@ impl<'a> RemlState<'a> {
                 coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
                 linear_constraints_original: self.linear_constraints.as_ref(),
                 penalty_shrinkage_floor: self.penalty_shrinkage_floor,
-                penalties: Some(&self.penalties),
+                canonical_penalties: Some(&self.canonical_penalties),
             };
             let pirls_start = std::time::Instant::now();
             let result = pirls::fit_model_for_fixed_rho(

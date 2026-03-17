@@ -1455,9 +1455,8 @@ where
     )?;
     // Derive legacy global roots for PIRLS compatibility.
     let rs_list: Vec<Array2<f64>> = canonical.iter().map(|cp| cp.global_root()).collect();
-    // Reconstruct global penalties for downstream code that needs them.
-    let s_list: Vec<Array2<f64>> = canonical.iter().map(|cp| cp.global_penalty()).collect();
-    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_list);
+    let conditioning =
+        ParametricColumnConditioning::infer_from_canonical_penalties(&x, &canonical);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());

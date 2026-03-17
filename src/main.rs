@@ -6955,9 +6955,10 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     let alo_result = if let Some(unified) = model.unified() {
                         let eta = design.design.dot(&fit.beta);
                         let report_offset = Array1::<f64>::zeros(design.design.nrows());
+                        let dense_alo_design = design.design.to_dense();
                         gam::alo::compute_alo_diagnostics_from_unified(
                             unified,
-                            &design.design,
+                            &dense_alo_design,
                             &eta,
                             &report_offset,
                             link,
@@ -6990,8 +6991,8 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                             if let Some(dt) = design.smooth.terms.iter().find(|t| t.name == st.name)
                             {
                                 let x_col = ds.values.column(col);
-                                let contrib = design
-                                    .design
+                                let dense_for_smooth = design.design.to_dense();
+                                let contrib = dense_for_smooth
                                     .slice(s![.., dt.coeff_range.clone()])
                                     .dot(&fit.beta.slice(s![dt.coeff_range.clone()]));
                                 let mut pairs: Vec<(f64, f64)> =
