@@ -906,6 +906,116 @@ pub fn precompute_reparam_invariant(
     })
 }
 
+/// Precompute the lambda-invariant reparameterization structure from canonical penalties.
+/// Same algorithm as `precompute_reparam_invariant`, but uses block-local roots
+/// directly instead of requiring rank x p global roots.
+pub fn precompute_reparam_invariant_from_canonical(
+    penalties: &[CanonicalPenalty],
+    p: usize,
+) -> Result<ReparamInvariant, EstimationError> {
+    use std::cmp::Ordering;
+
+    let m = penalties.len();
+
+    if m == 0 {
+        return Ok(ReparamInvariant {
+            split: SubspaceSplit::identity(p),
+            rs_transformed_base: Vec::new(),
+            has_nonzero: false,
+            max_balanced_eigenvalue: 0.0,
+        });
+    }
+
+    // Build global roots (rank_k x p) for the reparam computation.
+    // This is needed because Q is p x p and the transformation R_k @ Q
+    // must produce rank_k x p outputs.
+    let global_roots: Vec<Array2<f64>> = penalties.iter().map(|cp| cp.global_root()).collect();
+    let rs_faer: Vec<Mat<f64>> = global_roots.iter().map(array_to_faer).collect();
+
+    // Build balanced penalty by accumulating block-locally
+    let mut s_balanced = Mat::<f64>::zeros(p, p);
+    let mut has_nonzero = false;
+    for cp in penalties {
+        if cp.rank() == 0 {
+            continue;
+        }
+        let local = cp.local_penalty();
+        let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+        if frob_norm > 1e-12 {
+            let scale = 1.0 / frob_norm;
+            let r = &cp.col_range;
+            for i in 0..local.nrows() {
+                for j in 0..local.ncols() {
+                    s_balanced[(r.start + i, r.start + j)] += scale * local[[i, j]];
+                }
+            }
+            has_nonzero = true;
+        }
+    }
+
+    if !has_nonzero {
+        return Ok(ReparamInvariant {
+            split: SubspaceSplit::identity(p),
+            rs_transformed_base: global_roots,
+            has_nonzero: false,
+            max_balanced_eigenvalue: 0.0,
+        });
+    }
+
+    let (bal_eigenvalues, bal_eigenvectors) =
+        robust_eigh_faer(&s_balanced, Side::Lower, "balanced penalty matrix")?;
+
+    let mut order: Vec<usize> = (0..p).collect();
+    order.sort_by(|&i, &j| {
+        bal_eigenvalues[j]
+            .partial_cmp(&bal_eigenvalues[i])
+            .unwrap_or(Ordering::Equal)
+            .then(i.cmp(&j))
+    });
+
+    let mut qs = Mat::<f64>::zeros(p, p);
+    for (col_idx, &idx) in order.iter().enumerate() {
+        for row in 0..p {
+            qs[(row, col_idx)] = bal_eigenvectors[(row, idx)];
+        }
+    }
+
+    let mut bal_eigenvalues_ordered = Vec::with_capacity(p);
+    for &idx in &order {
+        bal_eigenvalues_ordered.push(bal_eigenvalues[idx]);
+    }
+    let max_bal = bal_eigenvalues_ordered
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let rank_tol = if max_bal > 0.0 { max_bal * 1e-12 } else { 1e-12 };
+    let penalized_rank = bal_eigenvalues_ordered
+        .iter()
+        .take_while(|&&val| val > rank_tol)
+        .count();
+    let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p)?;
+
+    let mut rs_transformed_base: Vec<Mat<f64>> = Vec::with_capacity(m);
+    for rs in &rs_faer {
+        let mut product = Mat::<f64>::zeros(rs.nrows(), qs.ncols());
+        matmul(
+            product.as_mut(),
+            Accum::Replace,
+            rs.as_ref(),
+            qs.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+        rs_transformed_base.push(product);
+    }
+
+    Ok(ReparamInvariant {
+        split,
+        rs_transformed_base: rs_transformed_base.iter().map(mat_to_array).collect(),
+        has_nonzero,
+        max_balanced_eigenvalue: max_bal,
+    })
+}
+
 /// Apply stable reparameterization using precomputed lambda-invariant structures.
 ///
 /// `penalty_shrinkage_floor`: optional relative shrinkage floor for eigenvalues
