@@ -435,29 +435,22 @@ mod tests {
             col.dot(&row)
         };
 
-        // With smooth δ-regularization, the null-direction trace is
-        // tr((S+δI)⁻¹ S_null) ≈ 1/δ × (null projection) which is nonzero but
-        // proportional to 1/δ. For a pure nullspace direction S_null = u₀ u₀ᵀ,
-        // the contribution is 1/(0+δ) = 1/δ ≈ 1e10 × spectral_scale.
-        // This is correct behavior: the smooth regularization assigns a
-        // well-defined (though large) sensitivity to the nullspace.
+        // With the exact pseudoinverse, the null-direction trace is zero:
+        // tr(S⁺ S_null) = 0 because S⁺ projects onto the positive eigenspace
+        // and u₀ is orthogonal to it.
         let tr_null = state
             .fixed_subspace_penalty_trace(e, &s_dir_null, pr.ridge_passport)
             .expect("trace-null");
-        // The nullspace trace should be approximately 1/δ where δ = 1e-10 * max_ev.
-        // It should be finite and positive.
         assert!(
-            tr_null.is_finite() && tr_null >= 0.0,
-            "nullspace direction trace should be finite and non-negative with \
-             δ-regularization: got {tr_null:.3e}"
+            tr_null.abs() < 1e-10,
+            "nullspace direction trace should be ~0 with exact pseudoinverse: got {tr_null:.3e}"
         );
 
         let tr_pos = state
             .fixed_subspace_penalty_trace(e, &s_dir_pos, pr.ridge_passport)
             .expect("trace-pos");
-        // With δ-regularization, expected is 1/(σ_pos + δ) ≈ 1/σ_pos for σ_pos >> δ.
-        let delta = super::unified::smooth_logdet_delta(evals.as_slice().unwrap());
-        let expected_pos = 1.0 / (evals[pos_idx] + delta);
+        // With exact pseudoinverse, expected is 1/σ_pos.
+        let expected_pos = 1.0 / evals[pos_idx];
         let rel = (tr_pos - expected_pos).abs() / expected_pos.abs().max(1e-12);
         assert!(
             rel < 1e-6,

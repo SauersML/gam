@@ -248,11 +248,10 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// Returns `None` if not needed or not implemented.
     fn hessian_second_derivative_correction(
         &self,
-        v_k: &Array1<f64>,
-        v_l: &Array1<f64>,
-        u_kl: &Array1<f64>,
+        _: &Array1<f64>,
+        _: &Array1<f64>,
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let _ = (v_k, v_l, u_kl);
         Ok(None)
     }
 
@@ -298,9 +297,8 @@ pub struct GaussianDerivatives;
 impl HessianDerivativeProvider for GaussianDerivatives {
     fn hessian_derivative_correction(
         &self,
-        v_k: &Array1<f64>,
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let _ = v_k;
         Ok(None)
     }
     fn has_corrections(&self) -> bool {
@@ -1235,66 +1233,42 @@ impl HyperOperator for SparseDirectionalHyperOperator {
 //  Data structures
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Derivatives of the smooth pseudo-logdeterminant L_δ(S) with respect to ρ.
+/// Exact pseudo-logdeterminant log|S|₊ and its derivatives with respect to ρ.
 ///
-/// # Smooth δ-regularized pseudo-logdet
+/// # Exact pseudo-logdet on the positive eigenspace
 ///
-/// Instead of the hard ε-threshold truncation log|S|₊ = Σ_{σ_i > ε} log σ_i,
-/// we use the smooth relaxation from response.md Section 7:
+/// For S(ρ) = Σ exp(ρ_k) S_k with S_k ⪰ 0, the nullspace
+/// N(S) = ∩_k N(S_k) is structurally fixed (independent of ρ).
+/// No eigenvalue of S crosses zero during optimization, so the
+/// pseudo-logdet L = Σ_{σ_i > 0} log σ_i is C∞ in ρ.
 ///
-///   L_δ(S) = log det(S + δI) − m₀ log δ
+/// ## Computation
 ///
-/// where m₀ is the known nullity of the penalty family (e.g., polynomial
-/// nullspace dimension for Duchon/TPS/Matérn splines, differencing order for
-/// B-splines).
+/// Eigendecompose S, identify positive eigenvalues σ_i > ε (where ε is a
+/// relative threshold for numerical zero detection), then:
 ///
-/// ## Why the hard threshold is problematic
+///   L(S)     = Σ_{positive} log σ_i
+///   ∂_k L    = tr(S⁺ A_k)            where A_k = λ_k S_k
+///   ∂²_kl L  = δ_{kl} ∂_k L − tr(S⁺ A_l S⁺ A_k)
 ///
-/// The hard ε-threshold creates artificial kinks in the REML/LAML objective
-/// when eigenvalues of S(ρ) cross ε as outer parameters θ vary. At these
-/// crossings, both the gradient and Hessian of log|S|₊ are discontinuous,
-/// which:
-/// - Causes BFGS line-search failures and poor convergence
-/// - Requires expensive leakage/moving-nullspace corrections (U₊ᵀ S_k U₀)
-/// - Makes the objective non-differentiable at exactly the points where
-///   the optimizer needs reliable gradient information
-///
-/// ## How L_δ recovers the pseudo-logdet
-///
-/// As δ → 0, the m₀ null eigenvalues contribute m₀ log δ to log det(S + δI),
-/// which is exactly cancelled by the −m₀ log δ correction. The remaining
-/// eigenvalues σ_i > 0 contribute log(σ_i + δ) → log σ_i. Thus L_δ → log|S|₊.
-///
-/// ## Leakage correction is automatic
-///
-/// Because (S + δI) is always full rank, there is no eigenspace partitioning
-/// and no moving-nullspace correction needed. The derivatives are simply:
-///
-///   ∂_k L_δ = tr((S + δI)⁻¹ S_k)
-///   ∂²_kl L_δ = tr((S + δI)⁻¹ S_kl) − tr((S + δI)⁻¹ S_l (S + δI)⁻¹ S_k)
-///
-/// No explicit leakage matrices, no nullspace partitioning, no eigenvalue
-/// thresholding. The full-rank inverse automatically captures what previously
-/// required the moving-nullspace correction terms.
-///
-/// These are computed once from the penalty structure and shared between
-/// cost and gradient (and optionally Hessian).
-///
-/// Reference: response.md Section 7.
+/// S⁺ is the Moore-Penrose pseudoinverse restricted to the positive
+/// eigenspace. These are the exact derivatives of L — no δ-regularization,
+/// no nullity metadata, no chain-rule inconsistencies.
 #[derive(Clone, Debug)]
 pub struct PenaltyLogdetDerivs {
-    /// L_δ(S) — the smooth pseudo-logdeterminant value.
+    /// L(S) = log|S|₊ — the exact pseudo-logdeterminant on the positive eigenspace.
     ///
-    /// L_δ(S) = log det(S + δI) − m₀ log δ, where m₀ is the total penalty
-    /// nullity and δ is chosen proportional to machine epsilon × spectral scale.
+    /// L(S) = Σ_{σ_i > ε} log σ_i, where ε is a relative threshold that
+    /// identifies the structural nullspace directly from the eigenspectrum.
     pub value: f64,
-    /// ∂/∂ρₖ L_δ(S) — first derivatives (one per smoothing parameter).
+    /// ∂/∂ρₖ L(S) — first derivatives (one per smoothing parameter).
     ///
-    /// ∂_k L_δ = tr((S + δI)⁻¹ Aₖ) where Aₖ = λₖ Sₖ.
+    /// ∂_k L = tr(S⁺ Aₖ) where Aₖ = λₖ Sₖ and S⁺ is the pseudoinverse
+    /// restricted to the positive eigenspace.
     pub first: Array1<f64>,
-    /// ∂²/(∂ρₖ∂ρₗ) L_δ(S) — second derivatives (for outer Hessian).
+    /// ∂²/(∂ρₖ∂ρₗ) L(S) — second derivatives (for outer Hessian).
     ///
-    /// ∂²_kl L_δ = δ_{kl} ∂_k L_δ − λₖ λₗ tr((S + δI)⁻¹ Sₖ (S + δI)⁻¹ Sₗ).
+    /// ∂²_kl L = δ_{kl} ∂_k L − λₖ λₗ tr(S⁺ Sₖ S⁺ Sₗ).
     pub second: Option<Array2<f64>>,
 }
 
@@ -1456,44 +1430,16 @@ impl HyperOperator for PenaltyHyperOperator<'_> {
     }
 }
 
-/// Default δ scale factor for the smooth pseudo-logdet regularization.
+/// Scale factor for δ-regularized matrix inverses (not used for logdet).
 ///
-/// δ is set to SMOOTH_LOGDET_DELTA_SCALE × max(eigenvalues of S), ensuring
-/// the regularization is negligible relative to the spectral scale but
-/// sufficient to make (S + δI) full rank and C∞ smooth.
-///
-/// The exact value of δ matters less than the smoothness guarantee.
-/// Values in the range 1e-8 to 1e-12 all converge to the true pseudo-logdet
-/// but 1e-10 provides a good balance between numerical conditioning and
-/// accuracy.
-///
-/// Reference: response.md Section 7.
+/// Used only by `smooth_logdet_delta` → `delta_regularized_inverse` for
+/// numerical stability when inverting near-singular matrices.
 pub(crate) const SMOOTH_LOGDET_DELTA_SCALE: f64 = 1e-10;
 
-/// Compute the smooth δ-regularized pseudo-logdet: L_δ(S) = log det(S + δI) − m₀ log δ.
+/// Choose δ for δ-regularized matrix inverses based on the spectral scale.
 ///
-/// This replaces the hard ε-threshold truncation of null eigenvalues.
-/// As δ → 0, L_δ converges to the true pseudo-logdet Σ_{σ_i > 0} log σ_i.
-/// The regularization ensures C∞ smoothness in outer parameters θ,
-/// eliminating artificial kinks when eigenvalues cross the threshold.
-///
-/// # Arguments
-/// * `eigenvalues` - Eigenvalues of S (may include zeros for null eigenvalues)
-/// * `nullity` - m₀, the known nullity of the penalty family
-/// * `delta` - Regularization parameter δ (typically SMOOTH_LOGDET_DELTA_SCALE × max eigenvalue)
-///
-/// Reference: response.md Section 7.
-pub(crate) fn smooth_pseudo_logdet(eigenvalues: &[f64], nullity: usize, delta: f64) -> f64 {
-    let log_det = eigenvalues.iter().map(|&s| (s + delta).ln()).sum::<f64>();
-    log_det - (nullity as f64) * delta.ln()
-}
-
-/// Choose δ for the smooth pseudo-logdet based on the spectral scale.
-///
-/// δ = SMOOTH_LOGDET_DELTA_SCALE × max(|eigenvalues|, 1.0)
-///
-/// The max(., 1.0) floor prevents δ from being too small when all eigenvalues
-/// are near zero (degenerate penalty), which would cause log(δ) to dominate.
+/// δ = SMOOTH_LOGDET_DELTA_SCALE × max(|eigenvalues|, 1.0).
+/// Used only by `delta_regularized_inverse`, not for penalty logdet.
 pub(crate) fn smooth_logdet_delta(eigenvalues: &[f64]) -> f64 {
     let max_ev = eigenvalues
         .iter()
@@ -1501,6 +1447,41 @@ pub(crate) fn smooth_logdet_delta(eigenvalues: &[f64]) -> f64 {
         .fold(0.0_f64, |a, b| a.max(b.abs()))
         .max(1.0);
     SMOOTH_LOGDET_DELTA_SCALE * max_ev
+}
+
+/// Positive-eigenvalue threshold for a given eigenspectrum.
+///
+/// For a p×p PSD matrix, eigendecomposition introduces errors of order
+/// `p × ε_mach × ‖S‖`. True null eigenvalues sit in this noise band.
+/// The threshold must be above the noise floor but well below any
+/// genuinely positive eigenvalue.
+///
+/// Uses `p × ε_mach × max(|eigenvalues|, 1)` with a safety factor,
+/// giving ~1e-13 × max_ev for typical sizes (p ≤ 1000).
+pub(crate) fn positive_eigenvalue_threshold(eigenvalues: &[f64]) -> f64 {
+    let p = eigenvalues.len();
+    let max_ev = eigenvalues
+        .iter()
+        .copied()
+        .fold(0.0_f64, |a, b| a.max(b.abs()))
+        .max(1.0);
+    // Safety factor of 100 above the theoretical noise floor p × ε_mach × ‖S‖.
+    let safety = 100.0;
+    safety * (p as f64) * f64::EPSILON * max_ev
+}
+
+/// Exact pseudo-logdet on the positive eigenspace: L = Σ_{σ_i > threshold} log σ_i.
+///
+/// No δ-regularization, no nullity parameter. The structural nullspace is
+/// identified directly from the eigenspectrum. For PSD penalty sums
+/// S(ρ) = Σ exp(ρ_k) S_k, the positive eigenspace is structurally fixed,
+/// so this function is C∞ in ρ.
+pub(crate) fn exact_pseudo_logdet(eigenvalues: &[f64], threshold: f64) -> f64 {
+    eigenvalues
+        .iter()
+        .filter(|&&s| s > threshold)
+        .map(|&s| s.ln())
+        .sum()
 }
 
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
@@ -4913,31 +4894,27 @@ pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
     Ok(r)
 }
 
-/// Compute penalty logdet derivatives for a block-diagonal penalty structure.
+/// Compute the exact pseudo-logdet log|S|₊ and its ρ-derivatives for a
+/// blockwise penalty structure.
 ///
-/// Given per-block penalty matrices and current log-lambdas, computes:
-/// Compute the smooth δ-regularized pseudo-logdet and its ρ-derivatives
-/// for a blockwise penalty structure.
+/// For each block, eigendecomposes S_b = Σ λ_k S_k, identifies the positive
+/// eigenspace (structural nullspace detected from the eigenspectrum), and
+/// computes exact derivatives on that subspace:
 ///
-/// Computes:
-/// - L_δ(S) = log det(S + δI) − m₀ log δ  (the smooth pseudo-logdeterminant)
-/// - ∂/∂ρₖ L_δ = tr((S + δI)⁻¹ Aₖ) for each smoothing parameter k
-/// - ∂²/(∂ρₖ∂ρₗ) L_δ (second derivatives for the outer Hessian)
+/// - L(S) = Σ_{σ_i > ε} log σ_i
+/// - ∂/∂ρₖ L = tr(S⁺ Aₖ)
+/// - ∂²/(∂ρₖ∂ρₗ) L = δ_{kl} ∂_k L − tr(S⁺ Aₗ S⁺ Aₖ)
 ///
-/// The smooth δ-regularization replaces the hard ε-threshold truncation,
-/// making the objective C∞ in outer parameters and eliminating the need for
-/// leakage/moving-nullspace corrections. See `PenaltyLogdetDerivs` for details.
+/// For S(ρ) = Σ exp(ρ_k) S_k with S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k)
+/// is structurally fixed (independent of ρ), so L is C∞ in ρ and these are
+/// its exact derivatives.
 ///
 /// `per_block_rho[b]` contains the log-lambdas for block b.
 /// `per_block_penalties[b]` contains the penalty matrices for block b.
-/// `per_block_nullity[b]` contains the penalty nullities for block b (one per penalty).
 /// `ridge` is an additional ridge for logdet stability (0 if not applicable).
-///
-/// Reference: response.md Section 7.
 pub fn compute_block_penalty_logdet_derivs(
     per_block_rho: &[Array1<f64>],
     per_block_penalties: &[&[Array2<f64>]],
-    per_block_nullity: &[&[usize]],
     ridge: f64,
 ) -> Result<PenaltyLogdetDerivs, String> {
     use faer::Side;
@@ -4973,37 +4950,31 @@ pub fn compute_block_penalty_logdet_derivs(
             .eigh(Side::Lower)
             .map_err(|e| format!("penalty logdet eigendecomposition failed for block {b}: {e}"))?;
 
-        // Compute δ proportional to machine epsilon × spectral scale.
-        let delta = smooth_logdet_delta(eigs.as_slice().unwrap());
+        // Identify structurally positive eigenvalues. For S(ρ) = Σ exp(ρ_k) S_k
+        // with S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k) is independent of ρ,
+        // so no eigenvalue crosses this threshold during optimization.
+        let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
 
-        // Total block nullity m₀ = sum of per-penalty nullities.
-        // For a single-penalty block, this is the penalty's nullspace dimension.
-        // For multi-penalty blocks, we use the combined nullity of the penalty sum.
-        let block_nullity: usize = if b < per_block_nullity.len() {
-            per_block_nullity[b].iter().copied().max().unwrap_or(0)
-        } else {
-            0
-        };
-
-        // Smooth pseudo-logdet: L_δ(S_b) = log det(S_b + δI) − m₀ log δ.
-        let block_logdet = smooth_pseudo_logdet(eigs.as_slice().unwrap(), block_nullity, delta);
+        // Exact pseudo-logdet: L = Σ_{σ_i > ε} log σ_i.
+        let block_logdet = exact_pseudo_logdet(eigs.as_slice().unwrap(), threshold);
         log_det_total += block_logdet;
 
-        // (S + δI)⁻¹ for trace derivatives: full-rank inverse (no eigenspace
-        // partitioning needed). Every eigenvalue is shifted by δ, so all are positive.
-        //
-        // W_factor: W such that W Wᵀ = (S + δI)⁻¹.
-        // W_factor has shape (p, p) since (S + δI) is full rank.
-        let mut w_factor = Array2::zeros((p, p));
+        // S⁺ factor on the positive eigenspace: W such that W Wᵀ = S⁺.
+        // Shape (p, rank) where rank = number of positive eigenvalues.
+        let rank = eigs.iter().filter(|&&e| e > threshold).count();
+        let mut w_factor = Array2::zeros((p, rank));
+        let mut col = 0;
         for (idx, &ev) in eigs.iter().enumerate() {
-            let scale = 1.0 / (ev + delta).sqrt();
-            for row in 0..p {
-                w_factor[[row, idx]] = vecs[[row, idx]] * scale;
+            if ev > threshold {
+                let scale = 1.0 / ev.sqrt();
+                for row in 0..p {
+                    w_factor[[row, col]] = vecs[[row, idx]] * scale;
+                }
+                col += 1;
             }
         }
 
-        // For each smoothing parameter in this block:
-        // ∂/∂ρ_k L_δ = tr((S + δI)⁻¹ A_k) = tr(W Wᵀ A_k) = tr(Wᵀ A_k W).
+        // First derivatives: ∂/∂ρ_k L = tr(S⁺ A_k) where A_k = λ_k S_k.
         for (k, s_k) in penalties.iter().enumerate() {
             let a_k = s_k.mapv(|v| lambdas[k] * v);
             let aw = a_k.dot(&w_factor);
@@ -5039,19 +5010,23 @@ pub fn compute_block_penalty_logdet_derivs(
             .eigh(faer::Side::Lower)
             .map_err(|e| format!("penalty det2 eigendecomposition failed for block {b}: {e}"))?;
 
-        // Use the same δ as for the value computation.
-        let delta = smooth_logdet_delta(eigs.as_slice().unwrap());
+        let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
+        let rank = eigs.iter().filter(|&&e| e > threshold).count();
 
-        // Full-rank (S + δI)⁻¹ factor: W such that W Wᵀ = (S + δI)⁻¹.
-        let mut w_factor = Array2::zeros((p, p));
+        // S⁺ factor on positive eigenspace: W Wᵀ = S⁺, shape (p, rank).
+        let mut w_factor = Array2::zeros((p, rank));
+        let mut col = 0;
         for (idx, &ev) in eigs.iter().enumerate() {
-            let scale = 1.0 / (ev + delta).sqrt();
-            for row in 0..p {
-                w_factor[[row, idx]] = vecs[[row, idx]] * scale;
+            if ev > threshold {
+                let scale = 1.0 / ev.sqrt();
+                for row in 0..p {
+                    w_factor[[row, col]] = vecs[[row, idx]] * scale;
+                }
+                col += 1;
             }
         }
 
-        // Y_k = (S + δI)⁻¹ A_k = W Wᵀ A_k → in reduced space: Y_k_r = Wᵀ A_k W
+        // Y_k = S⁺ A_k in reduced space: Y_k_r = Wᵀ A_k W, shape (rank, rank).
         let kb = block_rho.len();
         let mut y_k_reduced = Vec::with_capacity(kb);
         for (k, s_k) in penalties.iter().enumerate() {
@@ -5061,11 +5036,7 @@ pub fn compute_block_penalty_logdet_derivs(
             y_k_reduced.push(y_kr);
         }
 
-        // Second derivatives of L_δ:
-        //   ∂²_kl L_δ = δ_{kl} ∂_k L_δ − λ_k λ_l tr((S+δI)⁻¹ S_k (S+δI)⁻¹ S_l)
-        //
-        // No leakage correction needed: (S + δI) is always full rank, so
-        // eigenspace partitioning and moving-nullspace terms vanish.
+        // Second derivatives: ∂²_kl L = δ_{kl} ∂_k L − tr(S⁺ A_l S⁺ A_k).
         for k in 0..kb {
             for l in 0..=k {
                 let tr_ab: f64 = y_k_reduced[k]
@@ -5915,8 +5886,7 @@ mod tests {
         assert!((grad - 0.5).abs() < 0.1); // sigmoid at 0 ≈ 0.5
 
         // Well below floor: value should stay above DP_FLOOR
-        let (val, below_grad) = smooth_floor_dp(0.0);
-        let _ = below_grad;
+        let (val, _) = smooth_floor_dp(0.0);
         assert!(val >= DP_FLOOR);
     }
 
@@ -6025,18 +5995,15 @@ mod tests {
         let deviance = yty - 2.0 * beta.dot(&xty) + beta.dot(&xtx.dot(&beta));
         let log_likelihood = -0.5 * deviance;
 
-        // Penalty logdet: L_δ(Σ λₖ Sₖ) = log det(S + δI) − m₀ log δ
+        // Penalty logdet: exact pseudo-logdet on positive eigenspace.
         let mut s_total = Array2::zeros((p, p));
         s_total.scaled_add(lambdas[0], &s1);
         s_total.scaled_add(lambdas[1], &s2);
         let (s_eigs, _) = s_total.eigh(faer::Side::Lower).unwrap();
-        let tol = 1e-10;
-        let penalty_rank = s_eigs.iter().filter(|&&v| v > tol).count();
-        let nullity = p - penalty_rank;
-        let delta = smooth_logdet_delta(s_eigs.as_slice().unwrap());
-        let log_det_s = smooth_pseudo_logdet(s_eigs.as_slice().unwrap(), nullity, delta);
+        let threshold = positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
+        let log_det_s = exact_pseudo_logdet(s_eigs.as_slice().unwrap(), threshold);
 
-        // Penalty logdet first derivatives (numerical FD using smooth L_δ).
+        // Penalty logdet first derivatives (numerical FD).
         let mut det1 = Array1::zeros(rho.len());
         let eps = 1e-7;
         for k in 0..rho.len() {
@@ -6047,9 +6014,9 @@ mod tests {
             s_plus.scaled_add(lambdas_plus[0], &s1);
             s_plus.scaled_add(lambdas_plus[1], &s2);
             let (s_eigs_plus, _) = s_plus.eigh(faer::Side::Lower).unwrap();
-            let delta_plus = smooth_logdet_delta(s_eigs_plus.as_slice().unwrap());
+            let threshold_plus = positive_eigenvalue_threshold(s_eigs_plus.as_slice().unwrap());
             let log_det_s_plus =
-                smooth_pseudo_logdet(s_eigs_plus.as_slice().unwrap(), nullity, delta_plus);
+                exact_pseudo_logdet(s_eigs_plus.as_slice().unwrap(), threshold_plus);
 
             let mut rho_minus = rho.to_vec();
             rho_minus[k] -= eps;
@@ -6058,9 +6025,9 @@ mod tests {
             s_minus.scaled_add(lambdas_minus[0], &s1);
             s_minus.scaled_add(lambdas_minus[1], &s2);
             let (s_eigs_minus, _) = s_minus.eigh(faer::Side::Lower).unwrap();
-            let delta_minus = smooth_logdet_delta(s_eigs_minus.as_slice().unwrap());
+            let threshold_minus = positive_eigenvalue_threshold(s_eigs_minus.as_slice().unwrap());
             let log_det_s_minus =
-                smooth_pseudo_logdet(s_eigs_minus.as_slice().unwrap(), nullity, delta_minus);
+                exact_pseudo_logdet(s_eigs_minus.as_slice().unwrap(), threshold_minus);
 
             det1[k] = (log_det_s_plus - log_det_s_minus) / (2.0 * eps);
         }

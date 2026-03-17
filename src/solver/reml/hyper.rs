@@ -458,9 +458,9 @@ impl<'a> RemlState<'a> {
                 Some(b_j)
             };
 
-            // --- ld_s_j: smooth penalty pseudo-logdet derivative ---
-            // ld_s_j = tr((S + δI)⁻¹ S_{τ_j}).
-            // Uses the δ-regularized inverse (via fixed_subspace_penalty_trace).
+            // --- ld_s_j: penalty pseudo-logdet derivative ---
+            // ld_s_j = tr(S⁺ S_{τ_j}).
+            // Uses the exact pseudoinverse (via fixed_subspace_penalty_trace).
             let ld_s_j =
                 self.fixed_subspace_penalty_trace(&e_eval, &s_tau_j, pirls_result.ridge_passport)?;
 
@@ -718,16 +718,20 @@ impl<'a> RemlState<'a> {
         let (s_eigs, svecs) = s_eval
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let delta = super::unified::smooth_logdet_delta(s_eigs.as_slice().unwrap());
+        // Pseudoinverse S⁺ restricted to the positive eigenspace.
+        let threshold =
+            super::unified::positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
         let mut s_reg_inv = Array2::<f64>::zeros((p_dim, p_dim));
         for idx in 0..p_dim {
-            let inv_ev = 1.0 / (s_eigs[idx] + delta);
-            let ucol = svecs.column(idx).to_owned();
-            let outer = ucol
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&ucol.view().insert_axis(Axis(0)));
-            s_reg_inv += &outer.mapv(|v| v * inv_ev);
+            if s_eigs[idx] > threshold {
+                let inv_ev = 1.0 / s_eigs[idx];
+                let ucol = svecs.column(idx).to_owned();
+                let outer = ucol
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&ucol.view().insert_axis(Axis(0)));
+                s_reg_inv += &outer.mapv(|v| v * inv_ev);
+            }
         }
         let sdag_s_tau: Vec<Array2<f64>> = s_tau_list.iter().map(|s| s_reg_inv.dot(s)).collect();
         let a_k_mats: Vec<Array2<f64>> = self
@@ -1095,24 +1099,23 @@ impl<'a> RemlState<'a> {
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
-        // Choose δ proportional to machine epsilon × spectral scale.
-        let delta = super::unified::smooth_logdet_delta(s_eigs.as_slice().unwrap());
-
-        // Build (S + δI)⁻¹ via the eigendecomposition.
-        // Every eigenvalue is shifted by δ, so all are positive — no partitioning needed.
+        // Pseudoinverse S⁺ restricted to the positive eigenspace.
+        let threshold =
+            super::unified::positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
         let mut s_reg_inv = Array2::<f64>::zeros((p_dim, p_dim));
         for idx in 0..p_dim {
-            let ev = s_eigs[idx];
-            let inv_ev = 1.0 / (ev + delta);
-            let ucol = svecs.column(idx).to_owned();
-            let outer = ucol
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&ucol.view().insert_axis(Axis(0)));
-            s_reg_inv += &outer.mapv(|v| v * inv_ev);
+            if s_eigs[idx] > threshold {
+                let inv_ev = 1.0 / s_eigs[idx];
+                let ucol = svecs.column(idx).to_owned();
+                let outer = ucol
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&ucol.view().insert_axis(Axis(0)));
+                s_reg_inv += &outer.mapv(|v| v * inv_ev);
+            }
         }
 
-        // Pre-compute (S + δI)⁻¹ S_{τ_j} products for the trace terms.
+        // Pre-compute S⁺ S_{τ_j} products for the trace terms.
         let sdag_s_tau: Vec<Array2<f64>> = s_tau_list.iter().map(|s| s_reg_inv.dot(s)).collect();
 
         // Pre-compute A_k = λ_k R_k^T R_k for ρ-τ pairs.
@@ -1258,20 +1261,11 @@ impl<'a> RemlState<'a> {
         let is_gaussian_tt = is_gaussian_identity;
 
         let tau_tau_pair_fn = move |i: usize, j: usize| -> super::unified::HyperCoordPair {
-            // ld_s_{ij}: second derivative of L_δ(S) = log det(S + δI) − m₀ log δ
-            // w.r.t. τ_i, τ_j.
+            // ld_s_{ij}: second derivative of log|S|₊ w.r.t. τ_i, τ_j.
             //
-            // Using the smooth δ-regularized inverse (S + δI)⁻¹ instead of the
-            // pseudoinverse S⁺:
+            //   ∂²_ij L = tr(S⁺ S_j S⁺ S_i) − tr(S⁺ S_ij)
             //
-            //   ∂²_ij L_δ = tr((S+δI)⁻¹ S_j (S+δI)⁻¹ S_i) − tr((S+δI)⁻¹ S_ij)
-            //
-            // No leakage/moving-nullspace correction is needed because (S + δI)
-            // is always full rank. The leakage correction that was previously
-            // required (tr(Σ⁺² L_i L_jᵀ) terms) is automatically captured by
-            // the full-rank inverse.
-            //
-            // Reference: response.md Section 7.
+            // Uses the exact pseudoinverse S⁺ on the positive eigenspace.
             let ld_s_quad = Self::trace_product(&sdag_s_tau_tt[j], &sdag_s_tau_tt[i]);
             let ld_s_linear = s_tau_tau_tt[i][j]
                 .as_ref()

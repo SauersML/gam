@@ -865,8 +865,7 @@ mod tests {
         .expect("posterior");
 
         let z = array![0.15, -0.35];
-        let (logp, grad) = posterior.compute_logp_and_grad_nd(&z);
-        let _ = logp;
+        let (_, grad) = posterior.compute_logp_and_grad_nd(&z);
 
         let eps = 1e-6;
         for j in 0..z.len() {
@@ -1272,7 +1271,7 @@ mod tests {
         )
         .expect("construct linear posterior");
         let mut grad_linear = Array1::<f64>::zeros(2);
-        let _ = HamiltonianTarget::logp_and_grad(&posterior_linear, &z, &mut grad_linear);
+        HamiltonianTarget::logp_and_grad(&posterior_linear, &z, &mut grad_linear);
 
         let posterior_struct = super::survival_hmc::SurvivalPosterior::new(
             age_entry.view(),
@@ -1296,7 +1295,7 @@ mod tests {
         )
         .expect("construct structural posterior");
         let mut grad_struct = Array1::<f64>::zeros(2);
-        let _ = HamiltonianTarget::logp_and_grad(&posterior_struct, &z, &mut grad_struct);
+        HamiltonianTarget::logp_and_grad(&posterior_struct, &z, &mut grad_struct);
 
         assert!(
             (grad_struct[0] - grad_linear[0]).abs() > 1e-6,
@@ -3006,12 +3005,9 @@ impl JointBetaRhoPosterior {
         // log|S|₊ and ∂/∂ρ_k log|S|₊ = tr(S₊⁻¹ A_k) from the same decomposition.
         //
         // All penalty matrices live in a single block (no multi-block structure).
-        // Per-penalty nullities: use zero when structural nullity is unknown.
-        let nullity_vec = vec![0usize; self.penalty_matrices.len()];
         let penalty_logdet = compute_block_penalty_logdet_derivs(
             &[rho.clone()],
             &[self.penalty_matrices.as_slice()],
-            &[nullity_vec.as_slice()],
             0.0,
         );
         let (log_det_s, logdet_grad) = match penalty_logdet {

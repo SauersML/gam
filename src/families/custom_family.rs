@@ -4811,17 +4811,9 @@ fn unified_joint_cost_gradient(
         }
     }
 
-    // Compute penalty logdet derivatives.
+    // Compute penalty logdet derivatives (exact pseudo-logdet on positive eigenspace).
     let per_block_penalties: Vec<&[Array2<f64>]> =
         specs.iter().map(|s| s.penalties.as_slice()).collect();
-    // Per-block nullities: use zero nullity for each penalty when structural
-    // nullity info is not available from the block specs.
-    let per_block_nullity_vecs: Vec<Vec<usize>> =
-        specs.iter().map(|s| vec![0; s.penalties.len()]).collect();
-    let per_block_nullity_refs: Vec<&[usize]> = per_block_nullity_vecs
-        .iter()
-        .map(|v| v.as_slice())
-        .collect();
     let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
         ridge
     } else {
@@ -4830,7 +4822,6 @@ fn unified_joint_cost_gradient(
     let penalty_logdet = compute_block_penalty_logdet_derivs(
         per_block,
         &per_block_penalties,
-        &per_block_nullity_refs,
         penalty_logdet_ridge,
     )?;
 
@@ -5614,7 +5605,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
         let (start, end) = ranges[block_idx];
         let p_block = end - start;
 
-        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+        for (_, deriv) in block_derivs.iter().enumerate() {
             // 1. Get family-provided likelihood objects (joint flattened space).
             let psi_terms = if let Some(workspace) = psi_workspace.as_ref() {
                 if let Some(terms) = workspace.first_order_terms(psi_global)? {
@@ -5671,7 +5662,6 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
             });
 
             psi_global += 1;
-            let _ = local_idx; // silence unused warning
         }
     }
 
@@ -7536,12 +7526,10 @@ mod tests {
 
         fn diagonalworking_weights_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
+            _: &[ParameterBlockState],
+            _: usize,
             d_eta: &Array1<f64>,
         ) -> Result<Option<Array1<f64>>, String> {
-            let _ = block_states;
-            let _ = block_idx;
             Ok(Some(Array1::zeros(d_eta.len())))
         }
     }
@@ -7577,12 +7565,10 @@ mod tests {
 
         fn block_linear_constraints(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
             block_idx: usize,
-            spec: &ParameterBlockSpec,
+            _: &ParameterBlockSpec,
         ) -> Result<Option<LinearInequalityConstraints>, String> {
-            let _ = block_states;
-            let _ = spec;
             if block_idx != 0 {
                 return Ok(None);
             }
@@ -7599,9 +7585,8 @@ mod tests {
     impl CustomFamily for PreferJointExactFamily {
         fn evaluate(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-            let _ = block_states;
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -7613,13 +7598,10 @@ mod tests {
 
         fn exact_newton_hessian_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            d_beta: &Array1<f64>,
+            _: &[ParameterBlockState],
+            _: usize,
+            _: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = block_idx;
-            let _ = d_beta;
             Err(
                 "blockwise exact-newton path should not be used when joint path is available"
                     .to_string(),
@@ -7628,19 +7610,16 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
             Ok(Some(array![[2.0]]))
         }
 
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
-            d_beta_flat: &Array1<f64>,
+            _: &[ParameterBlockState],
+            _: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = d_beta_flat;
             Ok(Some(array![[0.0]]))
         }
     }
@@ -7680,36 +7659,30 @@ mod tests {
 
         fn exact_newton_joint_hessian_with_specs(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
             specs: &[ParameterBlockSpec],
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::eye(p)))
         }
 
         fn exact_newton_joint_hessian_directional_derivative_with_specs(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
             specs: &[ParameterBlockSpec],
-            d_beta_flat: &Array1<f64>,
+            _: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = d_beta_flat;
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::zeros((p, p))))
         }
 
         fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
             specs: &[ParameterBlockSpec],
-            d_beta_u_flat: &Array1<f64>,
-            d_betav_flat: &Array1<f64>,
+            _: &Array1<f64>,
+            _: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = d_beta_u_flat;
-            let _ = d_betav_flat;
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::zeros((p, p))))
         }
@@ -7748,31 +7721,25 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
             Ok(Some(array![[2.0]]))
         }
 
         fn exact_newton_hessian_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            d_beta: &Array1<f64>,
+            _: &[ParameterBlockState],
+            _: usize,
+            _: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = block_idx;
-            let _ = d_beta;
             Ok(Some(array![[0.0]]))
         }
 
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
-            d_beta_flat: &Array1<f64>,
+            _: &[ParameterBlockState],
+            _: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = d_beta_flat;
             Ok(Some(array![[0.0]]))
         }
     }
@@ -7783,9 +7750,8 @@ mod tests {
     impl CustomFamily for OneBlockExactPsiHookFamily {
         fn evaluate(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-            let _ = block_states;
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -7801,45 +7767,35 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
             Ok(Some(array![[1.0]]))
         }
 
         fn exact_newton_hessian_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            d_beta: &Array1<f64>,
+            _: &[ParameterBlockState],
+            _: usize,
+            _: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = block_idx;
-            let _ = d_beta;
             Ok(Some(array![[0.0]]))
         }
 
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
-            d_beta_flat: &Array1<f64>,
+            _: &[ParameterBlockState],
+            _: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = d_beta_flat;
             Ok(Some(array![[0.0]]))
         }
 
         fn exact_newton_joint_psi_terms(
             &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-            derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-            psi_index: usize,
+            _: &[ParameterBlockState],
+            _: &[ParameterBlockSpec],
+            _: &[Vec<CustomFamilyBlockPsiDerivative>],
+            _: usize,
         ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-            let _ = block_states;
-            let _ = specs;
-            let _ = derivative_blocks;
-            let _ = psi_index;
             Ok(Some(ExactNewtonJointPsiTerms {
                 objective_psi: 3.5,
                 score_psi: array![0.0],
@@ -7855,9 +7811,8 @@ mod tests {
     impl CustomFamily for OneBlockIndefinitePseudoLaplaceFamily {
         fn evaluate(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-            let _ = block_states;
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -7873,9 +7828,8 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
             Ok(Some(array![[-1.0]]))
         }
     }
@@ -7910,9 +7864,8 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
             Ok(Some(array![[2.0, 0.1], [3.0, 2.0]]))
         }
     }
@@ -7923,9 +7876,8 @@ mod tests {
     impl CustomFamily for OneBlockAlwaysErrorFamily {
         fn evaluate(
             &self,
-            block_states: &[ParameterBlockState],
+            _: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-            let _ = block_states;
             Err("synthetic outer objective failure: block[0] evaluate()".to_string())
         }
     }
@@ -7950,11 +7902,9 @@ mod tests {
 
         fn exact_newton_joint_hessian_with_specs(
             &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
+            _: &[ParameterBlockState],
+            _: &[ParameterBlockSpec],
         ) -> Result<Option<Array2<f64>>, String> {
-            let _ = block_states;
-            let _ = specs;
             Err("synthetic covariance assembly failure".to_string())
         }
     }

@@ -1319,21 +1319,10 @@ impl WorkingModelSurvival {
             .iter()
             .map(|v| v.as_slice())
             .collect();
-        // Per-block nullities: survival penalty blocks typically have no nullspace
-        // (full-rank penalties). Use zero nullity for each block.
-        let per_block_nullity_vecs: Vec<Vec<usize>> = per_block_penalty_matrices
-            .iter()
-            .map(|v| vec![0; v.len()])
-            .collect();
-        let per_block_nullity_refs: Vec<&[usize]> = per_block_nullity_vecs
-            .iter()
-            .map(|v| v.as_slice())
-            .collect();
         let penalty_logdet = if k_count > 0 {
             compute_block_penalty_logdet_derivs(
                 &per_block_rho,
                 &per_block_penalty_refs,
-                &per_block_nullity_refs,
                 0.0,
             )
             .map_err(EstimationError::InvalidInput)?
