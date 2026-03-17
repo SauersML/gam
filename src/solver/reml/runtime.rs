@@ -133,6 +133,152 @@ impl<'a> RemlState<'a> {
     /// For the gradient, also needs a solver for H⁻¹ v (used to compute
     /// mode responses v_k = H⁻¹(A_k β̂)). The `h_inv_solve` closure
     /// provides this.
+    /// Compute the TK gradient given Z, precomputed v_ks and x_vks.
+    ///
+    /// Returns the k-vector of gradient entries. This helper is called by the
+    /// main analytic core for the base gradient, and again with perturbed
+    /// inputs to build the Hessian via matrix-level differentiation.
+    fn tk_gradient_from_intermediates(
+        x_dense: &Array2<f64>,
+        z: &Array2<f64>,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+        penalty_roots: &[Array2<f64>],
+        lambdas: &[f64],
+        v_ks: &[Array1<f64>],
+        x_vks: &[Array1<f64>],
+        h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
+    ) -> Array1<f64> {
+        let n = x_dense.nrows();
+        let p = x_dense.ncols();
+        let k = penalty_roots.len();
+        let xt = x_dense.t();
+
+        // Hat leverages
+        let mut h_diag = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let val = x_dense.row(i).dot(&z.column(i));
+            h_diag[i] = if val.is_finite() { val } else { 0.0 };
+        }
+
+        // y = H⁻¹ X^T(c⊙h)
+        let m_vec = c_array * &h_diag;
+        let x_m = xt.dot(&m_vec);
+        let y = h_inv_solve(&x_m);
+        let x_y = x_dense.dot(&y);
+
+        // P_total (Q + T2a combined, then T2b, then T1)
+        let mut diag_combined = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            diag_combined[i] = d_array[i] * h_diag[i] - c_array[i] * x_y[i];
+        }
+        let mut p_total = Array2::<f64>::zeros((p, p));
+        for i in 0..n {
+            let wi = diag_combined[i];
+            if wi == 0.0 {
+                continue;
+            }
+            let z_i = z.column(i);
+            for a in 0..p {
+                let wa = wi * z_i[a];
+                for b in a..p {
+                    let val = wa * z_i[b];
+                    p_total[[a, b]] += val;
+                    if a != b {
+                        p_total[[b, a]] += val;
+                    }
+                }
+            }
+        }
+        p_total.mapv_inplace(|v| 0.25 * v);
+        for a in 0..p {
+            for b in 0..p {
+                p_total[[a, b]] -= 0.125 * y[a] * y[b];
+            }
+        }
+
+        // T1: subtract ¼ Z M Z^T
+        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
+            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
+            let z_block_j = z.slice(s![.., j0..j1]);
+            let c_j = c_array.slice(s![j0..j1]);
+            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
+                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
+                let x_block_i = x_dense.slice(s![i0..i1, ..]);
+                let c_i = c_array.slice(s![i0..i1]);
+                let gram = x_block_i.dot(&z_block_j.to_owned());
+                for bi in 0..(i1 - i0) {
+                    let ci = c_i[bi];
+                    if ci == 0.0 {
+                        continue;
+                    }
+                    for bj in 0..(j1 - j0) {
+                        let cj = c_j[bj];
+                        if cj == 0.0 {
+                            continue;
+                        }
+                        let gij = gram[[bi, bj]];
+                        let weight = ci * cj * gij * gij;
+                        let ii = i0 + bi;
+                        let jj = j0 + bj;
+                        let sym_factor = if ii == jj { 1.0 } else { 2.0 };
+                        let scale = -0.25 * weight * sym_factor;
+                        if ii == jj {
+                            let z_i = z.column(ii);
+                            for a in 0..p {
+                                for b in a..p {
+                                    let val = scale * z_i[a] * z_i[b];
+                                    p_total[[a, b]] += val;
+                                    if a != b {
+                                        p_total[[b, a]] += val;
+                                    }
+                                }
+                            }
+                        } else {
+                            let z_ii = z.column(ii);
+                            let z_jj = z.column(jj);
+                            let half_scale = 0.5 * scale;
+                            for a in 0..p {
+                                for b in 0..p {
+                                    p_total[[a, b]] +=
+                                        half_scale * (z_ii[a] * z_jj[b] + z_jj[a] * z_ii[b]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute leverage from P and gradient entries
+        let xp = x_dense.dot(&p_total);
+        let mut lev_p = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            lev_p[i] = xp.row(i).dot(&x_dense.row(i).to_owned());
+        }
+
+        let mut gradient = Array1::<f64>::zeros(k);
+        for idx in 0..k {
+            let r_k = &penalty_roots[idx];
+            let rk_p = r_k.dot(&p_total);
+            let trace_ak_p = lambdas[idx]
+                * (0..r_k.nrows())
+                    .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
+                    .sum::<f64>();
+            let correction_trace: f64 = (0..n)
+                .map(|i| c_array[i] * x_vks[idx][i] * lev_p[i])
+                .sum();
+            gradient[idx] = trace_ak_p + correction_trace;
+        }
+
+        for g in gradient.iter_mut() {
+            if !g.is_finite() {
+                *g = 0.0;
+            }
+        }
+        gradient
+    }
+
     fn tierney_kadane_analytic_core(
         &self,
         x_dense: &Array2<f64>,
@@ -143,11 +289,13 @@ impl<'a> RemlState<'a> {
         lambdas: &[f64],
         beta: &Array1<f64>,
         compute_gradient: bool,
+        compute_hessian: bool,
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = penalty_roots.len();
+        let xt = x_dense.t();
 
         // ── Hat leverages h_i = x_i^T H⁻¹ x_i ──
         let mut h_diag = Array1::<f64>::zeros(n);
@@ -212,199 +360,195 @@ impl<'a> RemlState<'a> {
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Analytic gradient: ∂TK/∂ρ_k = tr(Ḣ_k · P_total)
+        // Precompute v_k = H⁻¹(A_k β̂) and x_vk = X v_k for all k.
         // ══════════════════════════════════════════════════════════════════
-
-        // ── Build P_total (p × p) ──
-        //
-        // P_Q     = Z diag(d⊙h) Z^T               (from Q term)
-        // P_{T2a} = Z diag(c⊙(Xy)) Z^T             (from T2 term, ∂w piece)
-        // P_{T2b} = y y^T                           (from T2 term, ∂H⁻¹ piece)
-        // P_{T1}  = Z · [(cc^T) ⊙ G²] · Z^T        (from T1 term)
-        //
-        // P_total = ¼ P_Q - ¼ P_{T1} - ¼ P_{T2a} - ⅛ P_{T2b}
-        //
-        // Build P_Q - P_{T2a} together as Z diag(d⊙h - c⊙Xy) Z^T since they
-        // share the same Z..Z^T structure.
-
-        // Xy: the n-vector X y
-        let x_y = x_dense.dot(&y);
-
-        // Combined diagonal weight: d⊙h - c⊙Xy
-        let mut diag_combined = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            diag_combined[i] = d_array[i] * h_diag[i] - c_array[i] * x_y[i];
-        }
-        // P_combined = Z diag(diag_combined) Z^T (p×p)
-        // Efficient: P = Σ_i diag_combined[i] · z_i z_i^T
-        let mut p_total = Array2::<f64>::zeros((p, p));
-        for i in 0..n {
-            let wi = diag_combined[i];
-            if wi == 0.0 {
-                continue;
-            }
-            let z_i = z.column(i);
-            for a in 0..p {
-                let wa = wi * z_i[a];
-                for b in a..p {
-                    let val = wa * z_i[b];
-                    p_total[[a, b]] += val;
-                    if a != b {
-                        p_total[[b, a]] += val;
-                    }
-                }
-            }
-        }
-        // Scale by 1/4
-        p_total.mapv_inplace(|v| 0.25 * v);
-
-        // Subtract 1/8 y y^T
-        for a in 0..p {
-            for b in 0..p {
-                p_total[[a, b]] -= 0.125 * y[a] * y[b];
-            }
-        }
-
-        // ── P_{T1} contribution: -¼ Z · M · Z^T where M_{ij} = c_i c_j G_ij² ──
-        //
-        // We need to subtract ¼ Z M Z^T from P_total.
-        // Z M Z^T = Σ_{i,j} M_{ij} z_i z_j^T
-        //         = Σ_{i,j} c_i c_j G_ij² z_i z_j^T
-        //
-        // This is O(n² p) which matches the T1 value computation's cost.
-        // We use the same blocking strategy.
-        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
-            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-            let z_block_j = z.slice(s![.., j0..j1]);
-            let c_j = c_array.slice(s![j0..j1]);
-            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
-                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
-                let x_block_i = x_dense.slice(s![i0..i1, ..]);
-                let c_i = c_array.slice(s![i0..i1]);
-                // Gram: G[bi, bj] = x_{i0+bi}^T H⁻¹ x_{j0+bj}
-                let gram = x_block_i.dot(&z_block_j.to_owned());
-
-                for bi in 0..(i1 - i0) {
-                    let ci = c_i[bi];
-                    if ci == 0.0 {
-                        continue;
-                    }
-                    for bj in 0..(j1 - j0) {
-                        let cj = c_j[bj];
-                        if cj == 0.0 {
-                            continue;
-                        }
-                        let gij = gram[[bi, bj]];
-                        let weight = ci * cj * gij * gij;
-                        let sym_factor = if i0 == j0 && bi == bj {
-                            1.0
-                        } else if i0 == j0 {
-                            2.0
-                        } else {
-                            2.0
-                        };
-                        // Subtract ¼ weight · (z_i z_j^T + z_j z_i^T) / 2 for off-diag
-                        // Actually: M is symmetric, and we iterate upper triangle.
-                        // For i≠j: contribute weight·(z_i z_j^T + z_j z_i^T)
-                        // For i=j: contribute weight·z_i z_i^T
-                        let ii = i0 + bi;
-                        let jj = j0 + bj;
-                        let scale = -0.25 * weight * sym_factor;
-                        if ii == jj {
-                            // z_i z_i^T
-                            let z_i = z.column(ii);
-                            for a in 0..p {
-                                for b in a..p {
-                                    let val = scale * z_i[a] * z_i[b];
-                                    p_total[[a, b]] += val;
-                                    if a != b {
-                                        p_total[[b, a]] += val;
-                                    }
-                                }
-                            }
-                        } else {
-                            // (z_i z_j^T + z_j z_i^T) / 2 * sym_factor
-                            // Since sym_factor already accounts for the (i,j)+(j,i)
-                            // pairing via the upper-triangle iteration, we add
-                            // scale * (z_i z_j^T + z_j z_i^T).
-                            // But wait, we need just z_i z_j^T (the
-                            // trace_product with Ḣ_k will handle symmetry of Ḣ_k).
-                            // Actually P_total must be symmetric for correctness.
-                            let z_ii = z.column(ii);
-                            let z_jj = z.column(jj);
-                            let half_scale = 0.5 * scale;
-                            for a in 0..p {
-                                for b in 0..p {
-                                    p_total[[a, b]] +=
-                                        half_scale * (z_ii[a] * z_jj[b] + z_jj[a] * z_ii[b]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Compute gradient: grad[k] = tr(Ḣ_k · P_total) ──
-        //
-        // Ḣ_k = A_k + X^T diag(c ⊙ Xv_k) X
-        // where A_k = λ_k S_k = λ_k R_k^T R_k, v_k = H⁻¹(A_k β̂).
-        //
-        // tr(Ḣ_k P) = tr(A_k P) + Σ_i c_i (Xv_k)_i (X P X^T)_{ii}
-        //
-        // Precompute the "leverage from P" vector: lev_i = (X P X^T)_{ii} = X_i · P X_i
-        let xp = x_dense.dot(&p_total); // n × p
-        let mut lev_p = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            lev_p[i] = xp.row(i).dot(&x_dense.row(i).to_owned());
-        }
-
-        let mut gradient = Array1::<f64>::zeros(k);
+        let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
+        let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k);
         for idx in 0..k {
             let r_k = &penalty_roots[idx];
-            // A_k = λ_k R_k^T R_k
-            // tr(A_k P) = λ_k tr(R_k^T R_k P) = λ_k Σ_{a,b} S_k[a,b] P[a,b]
-            // = λ_k || R_k P ||²_F ... no. Actually:
-            // tr(S_k P) = Σ_{a,b} (R_k^T R_k)[a,b] P[b,a] = tr(R_k P R_k^T)
-            //           which is just Frobenius of R_k P^{1/2}... but simpler:
-            // tr(S_k P) = Σ_a (R_k P R_k^T)[a,a] = trace of the product.
-            // Since R_k is (rank_k × p) and P is (p × p):
-            let rk_p = r_k.dot(&p_total); // rank_k × p
-            let trace_ak_p = lambdas[idx]
-                * (0..r_k.nrows())
-                    .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
-                    .sum::<f64>();
-
-            // v_k = H⁻¹(λ_k S_k β̂)
             let r_beta = r_k.dot(beta);
             let mut s_k_beta = Array1::<f64>::zeros(p);
             for a in 0..p {
-                s_k_beta[a] = (0..r_k.nrows()).map(|row| r_k[[row, a]] * r_beta[row]).sum::<f64>();
+                s_k_beta[a] =
+                    (0..r_k.nrows()).map(|row| r_k[[row, a]] * r_beta[row]).sum::<f64>();
             }
             let a_k_beta = &s_k_beta * lambdas[idx];
             let v_k = h_inv_solve(&a_k_beta);
-
-            // Observation correction: tr(X^T diag(c ⊙ Xv_k) X · P)
-            //                       = Σ_i c_i (Xv_k)_i lev_p[i]
             let x_vk = x_dense.dot(&v_k);
-            let correction_trace: f64 = (0..n)
-                .map(|i| c_array[i] * x_vk[i] * lev_p[i])
-                .sum();
-
-            gradient[idx] = trace_ak_p + correction_trace;
+            v_ks.push(v_k);
+            x_vks.push(x_vk);
         }
 
-        // Sanitize
-        for g in gradient.iter_mut() {
-            if !g.is_finite() {
-                *g = 0.0;
+        // ══════════════════════════════════════════════════════════════════
+        // Gradient via helper
+        // ══════════════════════════════════════════════════════════════════
+        let gradient = Self::tk_gradient_from_intermediates(
+            x_dense, z, c_array, d_array, penalty_roots, lambdas, &v_ks, &x_vks, h_inv_solve,
+        );
+
+        // ══════════════════════════════════════════════════════════════════
+        // Hessian via analytic matrix-level perturbation
+        //
+        // For each l, the first-order perturbation of H⁻¹ w.r.t. ρ_l is:
+        //   δH⁻¹ = -H⁻¹ Ḣ_l H⁻¹
+        // so:
+        //   δZ = -H⁻¹ Ḣ_l Z         (perturbation of Z = H⁻¹ X^T)
+        //   δv_k = -H⁻¹ Ḣ_l v_k + δ_kl v_k   (perturbation of v_k)
+        //
+        // We compute the gradient at Z ± ε δZ_l with v_k ± ε δv_k_l,
+        // then Hessian[:,l] = (g⁺ - g⁻) / (2ε).
+        // ══════════════════════════════════════════════════════════════════
+        let hessian = if compute_hessian && k > 0 {
+            let eps = 1e-5_f64;
+            let mut hess = Array2::<f64>::zeros((k, k));
+
+            for l in 0..k {
+                // Compute Ḣ_l Z = A_l Z + X^T diag(c ⊙ x_vl) X Z, column by column.
+                // Then δZ_l = H⁻¹(Ḣ_l Z).
+                let r_l = &penalty_roots[l];
+                let x_vl = &x_vks[l];
+
+                // A_l Z: for each column j, A_l z_j = λ_l R_l^T (R_l z_j)
+                // C_l Z: for each column j, X^T(c ⊙ x_vl ⊙ (X z_j))
+                let mut h_dot_l_z = Array2::<f64>::zeros((p, n));
+                for j in 0..n {
+                    let z_j = z.column(j).to_owned();
+                    // A_l z_j
+                    let rl_zj = r_l.dot(&z_j);
+                    let mut col = Array1::<f64>::zeros(p);
+                    for a in 0..p {
+                        col[a] = lambdas[l]
+                            * (0..r_l.nrows())
+                                .map(|row| r_l[[row, a]] * rl_zj[row])
+                                .sum::<f64>();
+                    }
+                    // C_l z_j = X^T(c ⊙ x_vl ⊙ (X z_j))
+                    let x_zj = x_dense.dot(&z_j);
+                    let mut weights = Array1::<f64>::zeros(n);
+                    for i in 0..n {
+                        weights[i] = c_array[i] * x_vl[i] * x_zj[i];
+                    }
+                    col += &x_dense.t().dot(&weights);
+                    h_dot_l_z.column_mut(j).assign(&col);
+                }
+
+                // δZ_l = H⁻¹(Ḣ_l Z)
+                let mut delta_z_l = Array2::<f64>::zeros((p, n));
+                for j in 0..n {
+                    let col = h_dot_l_z.column(j).to_owned();
+                    let solved = h_inv_solve(&col);
+                    delta_z_l.column_mut(j).assign(&solved);
+                }
+
+                // δv_k = -H⁻¹(Ḣ_l v_k) + δ_kl v_k for each k
+                let mut delta_v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
+                for kk in 0..k {
+                    let v_kk = &v_ks[kk];
+                    // Ḣ_l v_k = A_l v_k + X^T(c ⊙ x_vl ⊙ X v_k)
+                    let rl_vk = r_l.dot(v_kk);
+                    let mut h_dot_l_vk = Array1::<f64>::zeros(p);
+                    for a in 0..p {
+                        h_dot_l_vk[a] = lambdas[l]
+                            * (0..r_l.nrows())
+                                .map(|row| r_l[[row, a]] * rl_vk[row])
+                                .sum::<f64>();
+                    }
+                    let x_vkk = &x_vks[kk];
+                    let mut w = Array1::<f64>::zeros(n);
+                    for i in 0..n {
+                        w[i] = c_array[i] * x_vl[i] * x_vkk[i];
+                    }
+                    h_dot_l_vk += &x_dense.t().dot(&w);
+
+                    let mut dv = h_inv_solve(&h_dot_l_vk);
+                    dv.mapv_inplace(|v| -v); // -H⁻¹(Ḣ_l v_k)
+                    if kk == l {
+                        dv += v_kk; // + δ_kl v_k
+                    }
+                    delta_v_ks.push(dv);
+                }
+
+                // Perturbed inputs: Z± = Z ∓ ε δZ_l, v_k± = v_k ± ε δv_k
+                let mut z_plus = z.to_owned();
+                let mut z_minus = z.to_owned();
+                z_plus.scaled_add(-eps, &delta_z_l);
+                z_minus.scaled_add(eps, &delta_z_l);
+
+                let mut v_ks_plus: Vec<Array1<f64>> = Vec::with_capacity(k);
+                let mut v_ks_minus: Vec<Array1<f64>> = Vec::with_capacity(k);
+                let mut x_vks_plus: Vec<Array1<f64>> = Vec::with_capacity(k);
+                let mut x_vks_minus: Vec<Array1<f64>> = Vec::with_capacity(k);
+                for kk in 0..k {
+                    let mut vp = v_ks[kk].clone();
+                    vp.scaled_add(eps, &delta_v_ks[kk]);
+                    let mut vm = v_ks[kk].clone();
+                    vm.scaled_add(-eps, &delta_v_ks[kk]);
+                    x_vks_plus.push(x_dense.dot(&vp));
+                    x_vks_minus.push(x_dense.dot(&vm));
+                    v_ks_plus.push(vp);
+                    v_ks_minus.push(vm);
+                }
+
+                // Perturbed lambdas: λ_l(ρ+ε) = e^{ρ_l+ε} ≈ λ_l(1+ε)
+                let mut lambdas_plus: Vec<f64> = lambdas.to_vec();
+                let mut lambdas_minus: Vec<f64> = lambdas.to_vec();
+                lambdas_plus[l] = (lambdas[l].ln() + eps).exp();
+                lambdas_minus[l] = (lambdas[l].ln() - eps).exp();
+
+                let grad_plus = Self::tk_gradient_from_intermediates(
+                    x_dense,
+                    &z_plus,
+                    c_array,
+                    d_array,
+                    penalty_roots,
+                    &lambdas_plus,
+                    &v_ks_plus,
+                    &x_vks_plus,
+                    h_inv_solve,
+                );
+                let grad_minus = Self::tk_gradient_from_intermediates(
+                    x_dense,
+                    &z_minus,
+                    c_array,
+                    d_array,
+                    penalty_roots,
+                    &lambdas_minus,
+                    &v_ks_minus,
+                    &x_vks_minus,
+                    h_inv_solve,
+                );
+
+                let inv_2eps = 0.5 / eps;
+                for kk in 0..k {
+                    hess[[kk, l]] = (grad_plus[kk] - grad_minus[kk]) * inv_2eps;
+                }
             }
-        }
+
+            // Symmetrize (should be symmetric already, but enforce numerically)
+            for kk in 0..k {
+                for ll in (kk + 1)..k {
+                    let avg = 0.5 * (hess[[kk, ll]] + hess[[ll, kk]]);
+                    hess[[kk, ll]] = avg;
+                    hess[[ll, kk]] = avg;
+                }
+            }
+
+            // Sanitize
+            for val in hess.iter_mut() {
+                if !val.is_finite() {
+                    *val = 0.0;
+                }
+            }
+
+            Some(hess)
+        } else {
+            None
+        };
 
         Ok(TkCorrectionTerms {
             value,
             gradient: Some(gradient),
-            hessian: None,
+            hessian,
         })
     }
 
@@ -439,6 +583,7 @@ impl<'a> RemlState<'a> {
         }
 
         let compute_gradient = mode != super::unified::EvalMode::ValueOnly;
+        let compute_hessian = mode == super::unified::EvalMode::ValueGradientHessian;
 
         // Build Z = H⁻¹ X^T and solve closure, then call shared analytic core.
         if let Some(sparse) = bundle.sparse_exact.as_ref() {
@@ -482,6 +627,7 @@ impl<'a> RemlState<'a> {
                 &lambdas,
                 &beta,
                 compute_gradient,
+                compute_hessian,
                 &h_inv_solve,
             );
         }
@@ -581,6 +727,7 @@ impl<'a> RemlState<'a> {
             &lambdas,
             &beta,
             compute_gradient,
+            compute_hessian,
             &h_inv_solve,
         )
     }
