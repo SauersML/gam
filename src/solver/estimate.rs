@@ -535,6 +535,40 @@ impl ParametricColumnConditioning {
         Self::from_column_indices(x, &unpenalized)
     }
 
+    /// Infer unpenalized columns from blockwise penalties via `col_range` — O(k),
+    /// no matrix scanning needed.
+    fn infer_from_blockwise_penalties(
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+    ) -> Self {
+        let p = x.ncols();
+        let mut penalized = vec![false; p];
+        for bp in s_list {
+            for j in bp.col_range.clone() {
+                penalized[j] = true;
+            }
+        }
+        let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
+        Self::from_column_indices(x, &unpenalized)
+    }
+
+    /// Infer unpenalized columns from canonical penalties via `col_range` — O(k),
+    /// no matrix scanning needed.
+    fn infer_from_canonical_penalties(
+        x: &DesignMatrix,
+        s_list: &[crate::construction::CanonicalPenalty],
+    ) -> Self {
+        let p = x.ncols();
+        let mut penalized = vec![false; p];
+        for cp in s_list {
+            for j in cp.col_range.clone() {
+                penalized[j] = true;
+            }
+        }
+        let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
+        Self::from_column_indices(x, &unpenalized)
+    }
+
     fn is_active(&self) -> bool {
         !self.columns.is_empty()
     }
@@ -1406,17 +1440,28 @@ where
         return Err(EstimationError::InvalidInput(message));
     }
 
-    use crate::construction::compute_penalty_square_roots;
-
     let p = x.ncols();
-    validate_full_size_penalties(&s_list, p, "optimize_external_design")?;
-    let (s_list, active_nullspace_dims) =
-        canonicalize_active_penalties(s_list, &opts.nullspace_dims, "optimize_external_design")?;
+    validate_blockwise_penalties(&s_list, p, "optimize_external_design")?;
+    // Convert BlockwisePenalty → PenaltySpec::Block for the canonical pipeline.
+    let specs: Vec<PenaltySpec> = s_list
+        .into_iter()
+        .map(PenaltySpec::from_blockwise)
+        .collect();
+    let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
+        &specs,
+        &opts.nullspace_dims,
+        p,
+        "optimize_external_design",
+    )?;
+    // Derive legacy global roots for PIRLS compatibility.
+    let rs_list: Vec<Array2<f64>> = canonical.iter().map(|cp| cp.global_root()).collect();
+    // Reconstruct global penalties for downstream code that needs them.
+    let s_list: Vec<Array2<f64>> = canonical.iter().map(|cp| cp.global_penalty()).collect();
     let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_list);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
-    let k = s_list.len();
+    let k = canonical.len();
     if active_nullspace_dims.len() != k {
         return Err(EstimationError::InvalidInput(format!(
             "nullspace_dims length mismatch: expected {k} entries for active penalties, got {}",
@@ -1425,20 +1470,19 @@ where
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
 
-    let rs_list = compute_penalty_square_roots(&s_list)?;
-
     // Own the external arrays once; the conditioned design is shared through `reml_state`.
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let x_o = x;
     let offset_o = offset.to_owned();
-    let s_list_shared = Arc::new(s_list);
+    let canonical_shared = Arc::new(canonical);
     let mut reml_state = RemlState::newwith_offset_shared(
         y_o.view(),
         x_fit,
         w_o.view(),
         offset_o.view(),
-        Arc::clone(&s_list_shared),
+        Arc::clone(&canonical_shared),
+        rs_list,
         p,
         &cfg,
         Some(active_nullspace_dims.clone()),
