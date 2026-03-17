@@ -925,8 +925,57 @@ pub trait HyperOperator: Send + Sync {
 /// operator-backed implicit drifts. A few workflows need to carry both a dense
 /// correction and an operator-backed main term, so this type can represent both
 /// simultaneously without relying on dummy zero-sized matrices.
+/// A block-local square matrix embedded in joint p-space. Supports O(p_block²)
+/// matvec without materializing to full p×p.
+#[derive(Clone)]
+pub struct BlockLocalDrift {
+    pub local: Array2<f64>,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl BlockLocalDrift {
+    /// Total joint dimension (needed for to_dense materialization).
+    fn total_dim_from_context(&self, hint: usize) -> usize {
+        hint.max(self.end)
+    }
+}
+
+impl HyperOperator for BlockLocalDrift {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::zeros(v.len());
+        let v_block = v.slice(ndarray::s![self.start..self.end]);
+        let local_result = self.local.dot(&v_block);
+        out.slice_mut(ndarray::s![self.start..self.end])
+            .assign(&local_result);
+        out
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        let v_block = v.slice(ndarray::s![self.start..self.end]);
+        let u_block = u.slice(ndarray::s![self.start..self.end]);
+        u_block.dot(&self.local.dot(&v_block))
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let p = self.total_dim_from_context(self.end);
+        let mut out = Array2::zeros((p, p));
+        out.slice_mut(ndarray::s![self.start..self.end, self.start..self.end])
+            .assign(&self.local);
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
+}
+
 pub struct HyperCoordDrift {
+    /// Full p×p dense matrix (forces dense fallback when present).
     pub dense: Option<Array2<f64>>,
+    /// Block-local penalty contribution (does NOT force dense fallback).
+    pub block_local: Option<BlockLocalDrift>,
+    /// Implicit operator (fast path).
     pub operator: Option<Box<dyn HyperOperator>>,
 }
 
@@ -934,6 +983,7 @@ impl HyperCoordDrift {
     pub fn none() -> Self {
         Self {
             dense: None,
+            block_local: None,
             operator: None,
         }
     }
@@ -941,6 +991,7 @@ impl HyperCoordDrift {
     pub fn from_dense(dense: Array2<f64>) -> Self {
         Self {
             dense: Some(dense),
+            block_local: None,
             operator: None,
         }
     }
@@ -948,6 +999,7 @@ impl HyperCoordDrift {
     pub fn from_operator(operator: Box<dyn HyperOperator>) -> Self {
         Self {
             dense: None,
+            block_local: None,
             operator: Some(operator),
         }
     }
@@ -957,15 +1009,35 @@ impl HyperCoordDrift {
         operator: Option<Box<dyn HyperOperator>>,
     ) -> Self {
         let dense = dense.filter(|mat| !(operator.is_some() && mat.is_empty()));
-        Self { dense, operator }
+        Self {
+            dense,
+            block_local: None,
+            operator,
+        }
+    }
+
+    pub fn from_block_local_and_operator(
+        local: Array2<f64>,
+        start: usize,
+        end: usize,
+        operator: Option<Box<dyn HyperOperator>>,
+    ) -> Self {
+        Self {
+            dense: None,
+            block_local: Some(BlockLocalDrift { local, start, end }),
+            operator,
+        }
     }
 
     pub fn has_operator(&self) -> bool {
         self.operator.is_some()
     }
 
+    /// Returns true when the drift can be applied without materializing a full
+    /// p×p dense matrix. This is the case when there is no full-dense component,
+    /// even if a block-local component is present (block-local matvec is O(p_block²)).
     pub fn uses_operator_fast_path(&self) -> bool {
-        self.operator.is_some() && self.dense.is_none()
+        self.dense.is_none() && (self.operator.is_some() || self.block_local.is_some())
     }
 
     pub fn operator_ref(&self) -> Option<&dyn HyperOperator> {
@@ -973,25 +1045,53 @@ impl HyperCoordDrift {
     }
 
     pub fn materialize(&self) -> Array2<f64> {
-        match (&self.dense, &self.operator) {
-            (Some(dense), Some(operator)) => {
-                let mut out = dense.clone();
-                out += &operator.to_dense();
-                out
-            }
-            (Some(dense), None) => dense.clone(),
-            (None, Some(operator)) => operator.to_dense(),
-            (None, None) => Array2::zeros((0, 0)),
+        let p = self.infer_dim();
+        if p == 0 {
+            return Array2::zeros((0, 0));
         }
+        let mut out = self
+            .dense
+            .clone()
+            .unwrap_or_else(|| Array2::zeros((p, p)));
+        if let Some(bl) = &self.block_local {
+            out.slice_mut(ndarray::s![bl.start..bl.end, bl.start..bl.end])
+                .scaled_add(1.0, &bl.local);
+        }
+        if let Some(op) = &self.operator {
+            out += &op.to_dense();
+        }
+        out
     }
 
     pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        match (&self.dense, &self.operator) {
-            (Some(dense), Some(operator)) => dense.dot(v) + operator.mul_vec(v),
-            (Some(dense), None) => dense.dot(v),
-            (None, Some(operator)) => operator.mul_vec(v),
-            (None, None) => Array1::zeros(0),
+        let mut out = Array1::zeros(v.len());
+        if let Some(dense) = &self.dense {
+            out += &dense.dot(v);
         }
+        if let Some(bl) = &self.block_local {
+            let v_block = v.slice(ndarray::s![bl.start..bl.end]);
+            let local_result = bl.local.dot(&v_block);
+            out.slice_mut(ndarray::s![bl.start..bl.end])
+                .scaled_add(1.0, &local_result);
+        }
+        if let Some(op) = &self.operator {
+            out += &op.mul_vec(v);
+        }
+        out
+    }
+
+    fn infer_dim(&self) -> usize {
+        if let Some(d) = &self.dense {
+            return d.nrows();
+        }
+        if let Some(op) = &self.operator {
+            return op.to_dense().nrows();
+        }
+        if let Some(bl) = &self.block_local {
+            // Can't know total dim from block-local alone; return end as estimate
+            return bl.end;
+        }
+        0
     }
 }
 
@@ -1447,6 +1547,112 @@ pub(crate) fn smooth_logdet_delta(eigenvalues: &[f64]) -> f64 {
         .fold(0.0_f64, |a, b| a.max(b.abs()))
         .max(1.0);
     SMOOTH_LOGDET_DELTA_SCALE * max_ev
+}
+
+/// Compute the exact dimension of the intersection ∩_k N(S_k) for PSD penalties.
+///
+/// For a single penalty, this is just `nullspace_dims[0]`. For multiple
+/// penalties, eigendecomposes each S_k individually, extracts its nullspace
+/// basis (bottom `nullspace_dims[k]` eigenvectors), and iteratively
+/// intersects the subspaces via SVD.
+///
+/// Returns 0 if any penalty is full rank (nullspace_dims[k] == 0).
+pub(crate) fn exact_intersection_nullity(
+    penalties: &[Array2<f64>],
+    nullspace_dims: &[usize],
+) -> usize {
+    if penalties.is_empty() || nullspace_dims.is_empty() {
+        return 0;
+    }
+    if penalties.len() != nullspace_dims.len() {
+        return 0;
+    }
+    // If any penalty is full rank, the intersection nullspace is {0}.
+    if nullspace_dims.iter().any(|&m| m == 0) {
+        return 0;
+    }
+
+    // Single penalty: nullity is exact from structural info.
+    if penalties.len() == 1 {
+        return nullspace_dims[0];
+    }
+
+    // Multiple penalties: intersect nullspace bases iteratively.
+    // Eigendecompose S_1, get its nullspace basis (bottom m_1 eigenvectors).
+    let p = penalties[0].nrows();
+    let (_, vecs0) = match penalties[0].eigh(faer::Side::Lower) {
+        Ok(ev) => ev,
+        Err(_) => return 0,
+    };
+    let m0 = nullspace_dims[0].min(p);
+    // Null basis: bottom m0 eigenvectors (ascending order from eigh).
+    // N has shape (p, current_dim).
+    let mut n_basis = Array2::<f64>::zeros((p, m0));
+    for col in 0..m0 {
+        for row in 0..p {
+            n_basis[[row, col]] = vecs0[[row, col]];
+        }
+    }
+    const SHARED_DIR_THRESHOLD: f64 = 0.99;
+
+    for k in 1..penalties.len() {
+        let current_dim = n_basis.ncols();
+        if current_dim == 0 {
+            return 0;
+        }
+
+        // Eigendecompose S_k, get its nullspace basis.
+        let (_, vecs_k) = match penalties[k].eigh(faer::Side::Lower) {
+            Ok(ev) => ev,
+            Err(_) => return 0,
+        };
+        let mk = nullspace_dims[k].min(p);
+        let mut nk_basis = Array2::<f64>::zeros((p, mk));
+        for col in 0..mk {
+            for row in 0..p {
+                nk_basis[[row, col]] = vecs_k[[row, col]];
+            }
+        }
+
+        // Intersect: M = N^T N_k (current_dim × mk).
+        // SVD of M: singular values near 1 indicate shared directions.
+        let m_mat = n_basis.t().dot(&nk_basis);
+        let (u_opt, s, _) = match crate::faer_ndarray::FaerSvd::svd(&m_mat, true, false) {
+            Ok(usv) => usv,
+            Err(_) => return 0,
+        };
+        let u = match u_opt {
+            Some(u) => u,
+            None => return 0,
+        };
+
+        // Count singular values ≈ 1 (shared directions).
+        let shared: Vec<usize> = s
+            .iter()
+            .enumerate()
+            .filter(|(_, &sv)| sv > SHARED_DIR_THRESHOLD)
+            .map(|(i, _)| i)
+            .collect();
+
+        if shared.is_empty() {
+            return 0;
+        }
+
+        // Update basis to the shared directions: N_new = N * u_shared.
+        let mut n_new = Array2::<f64>::zeros((p, shared.len()));
+        for (new_col, &orig_col) in shared.iter().enumerate() {
+            for row in 0..p {
+                let mut val = 0.0;
+                for j in 0..current_dim {
+                    val += n_basis[[row, j]] * u[[j, orig_col]];
+                }
+                n_new[[row, new_col]] = val;
+            }
+        }
+        n_basis = n_new;
+    }
+
+    n_basis.ncols()
 }
 
 /// Positive-eigenvalue threshold for a given eigenspectrum.
@@ -4963,17 +5169,13 @@ pub fn compute_block_penalty_logdet_derivs(
         let rank = if !block_nullspace_dims.is_empty()
             && block_nullspace_dims.len() == penalties.len()
         {
-            // Structural intersection nullity: for S = Σ λ_k S_k with S_k ⪰ 0,
-            // N(S) = ∩_k N(S_k). A conservative upper bound on the intersection
-            // nullity is min_k nullity(S_k), since the intersection can't be
-            // larger than any individual nullspace. We use this to determine rank,
-            // then validate against the eigenvalue spectrum.
-            let intersection_nullity = block_nullspace_dims.iter().copied().min().unwrap_or(0);
-            let structural_rank = p.saturating_sub(intersection_nullity);
-            // Validate: the structural rank eigenvalues should all be above the
-            // numerical noise floor. If not, use the structural rank anyway —
-            // the structural information is more reliable than the numerics.
-            structural_rank
+            // Exact intersection nullity: dim(∩_k N(S_k)).
+            // For single-penalty blocks this is just nullspace_dims[0].
+            // For multi-penalty blocks, eigendecomposes each S_k and
+            // intersects their nullspace bases via SVD.
+            let intersection_nullity =
+                exact_intersection_nullity(penalties, block_nullspace_dims);
+            p.saturating_sub(intersection_nullity)
         } else {
             let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
             eigs.iter().filter(|&&e| e > threshold).count()

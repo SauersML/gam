@@ -308,6 +308,8 @@ pub struct TimeBlockInput {
     pub offset_exit: Array1<f64>,
     pub derivative_offset_exit: Array1<f64>,
     pub penalties: Vec<Array2<f64>>,
+    /// Structural nullspace dimension of each penalty matrix.
+    pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,
     pub initial_beta: Option<Array1<f64>>,
 }
@@ -3011,7 +3013,7 @@ fn prepare_survival_location_scale_model(
         offset_exit: spec.time_block.offset_exit.clone(),
         derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
         penalties: time_prepared.penalties.clone(),
-        nullspace_dims: vec![],
+        nullspace_dims: spec.time_block.nullspace_dims.clone(),
         initial_log_lambdas: spec.time_block.initial_log_lambdas.clone(),
         initial_beta: time_prepared.initial_beta.clone(),
     });
@@ -3021,7 +3023,7 @@ fn prepare_survival_location_scale_model(
         design: DesignMatrix::Dense(Arc::new(time_stacked_design)),
         offset: time_stacked_offset,
         penalties: time_prepared.penalties.clone(),
-        nullspace_dims: vec![],
+        nullspace_dims: spec.time_block.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &time_prepared.penalties,
             spec.time_block.initial_log_lambdas.clone(),
@@ -4972,6 +4974,92 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             log_likelihood: ll,
             blockworking_sets,
         })
+    }
+
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        // Fast path for backtracking line search: compute only the scalar
+        // log-likelihood, skipping all gradient/Hessian/derivative assembly.
+        let n = self.n;
+        let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
+            self.validate_joint_states(block_states)?;
+
+        // Value-only sigma: just exp(eta_ls), no derivative arrays needed.
+        let sigma_exit: Vec<f64> = eta_ls_exit
+            .iter()
+            .map(|&e| crate::families::sigma_link::safe_exp(e))
+            .collect();
+        let sigma_entry: Option<Vec<f64>> = if self.x_log_sigma_entry.is_some() {
+            Some(
+                eta_ls_entry
+                    .iter()
+                    .map(|&e| crate::families::sigma_link::safe_exp(e))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let soft = self.derivative_softness.max(0.0);
+        let guard = self.derivative_guard;
+        let mut ll = 0.0;
+
+        for i in 0..n {
+            let w = self.w[i];
+            if w <= 0.0 {
+                continue;
+            }
+            let d = self.y[i].clamp(0.0, 1.0);
+
+            let sigma_entry_i = sigma_entry.as_ref().map_or(sigma_exit[i], |se| se[i]);
+            let state = self.row_predictor_state(
+                h0[i],
+                h1[i],
+                d_raw[i],
+                eta_t_entry[i],
+                eta_t_exit[i],
+                sigma_entry_i,
+                sigma_exit[i],
+                etaw.map(|w| w[i]),
+            );
+
+            // Survival probabilities at entry and exit (value only).
+            let u0 = -state.h0 + state.q0;
+            let u1 = -state.h1 + state.q1;
+            let s0 = inverse_link_survival_probvalue(&self.inverse_link, u0).max(MIN_PROB);
+            let s1 = inverse_link_survival_probvalue(&self.inverse_link, u1).max(MIN_PROB);
+
+            // Log-density at exit: log f(u1).
+            // The jet gives (d1=f, d2=f', d3=f''); we only need f = d1.
+            let j1 = inverse_link_jet_for_inverse_link(&self.inverse_link, u1)
+                .map_err(|e| format!("inverse link evaluation failed at row {i} exit: {e}"))?;
+            let logphi1 = if j1.d1 <= MIN_PROB {
+                MIN_PROB.ln()
+            } else {
+                j1.d1.ln()
+            };
+
+            // Log time-derivative contribution.
+            let log_g_safe = if state.d_raw.is_finite() {
+                (state.d_raw + soft).max(1e-12).ln()
+            } else {
+                soft.max(1e-12).ln()
+            };
+            let g = if state.d_raw.is_finite() {
+                state.d_raw
+            } else {
+                0.0
+            };
+            if guard > 0.0 && g <= guard {
+                return Err(format!(
+                    "survival location-scale monotonicity violated at row {i}: d_eta/dt={g:.3e} <= guard={:.3e}",
+                    guard
+                ));
+            }
+
+            ll += w * (d * (logphi1 + log_g_safe) + (1.0 - d) * s1.ln() - s0.ln());
+        }
+
+        Ok(ll)
     }
 
     fn exact_newton_hessian_directional_derivative(
