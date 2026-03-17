@@ -1051,11 +1051,11 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        // ── Build S⁺ for ld_s pair computations ──
+        // ── Build PenaltyPseudologdet for ld_s pair computations ──
         //
-        // Exact pseudoinverse on the positive eigenspace: eigendecompose S,
-        // threshold small eigenvalues, and invert only on the positive subspace.
-        // This gives S⁺ used in the log|S|₊ gradient and Hessian traces.
+        // Canonical penalty pseudo-logdeterminant: eigendecomposes S once and
+        // provides tau_hessian_component / rho_tau_hessian_component methods
+        // for all derivative queries on log|S|₊.
         let rs_eval: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
             reparam_result
                 .rs_transformed

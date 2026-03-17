@@ -2361,11 +2361,28 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
 
 /// Build row-wise Kronecker product: each row of the result is
 /// kron(cov_row[i,:], time_row[i,:]).
+/// Threshold (bytes) below which materializing the full rowwise-Kronecker design
+/// is cheaper than the implicit operator (avoids per-column dispatch overhead
+/// and enables BLAS-accelerated dense X'WX).
+const ROWWISE_KRONECKER_MATERIALIZE_THRESHOLD: usize = 64 * 1024 * 1024; // 64 MB
+
 fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> DesignMatrix {
-    DesignMatrix::Operator(Arc::new(
-        RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
-            .expect("rowwise kronecker design should have matched row counts"),
-    ))
+    let n = cov_design.nrows();
+    let p_cov = cov_design.ncols();
+    let p_time = time_basis.ncols();
+    let bytes = n * p_cov * p_time * 8;
+    if bytes <= ROWWISE_KRONECKER_MATERIALIZE_THRESHOLD {
+        // Small enough to materialize: better cache locality + BLAS X'WX.
+        let op = RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
+            .expect("rowwise kronecker design should have matched row counts");
+        DesignMatrix::Dense(Arc::new(op.to_dense()))
+    } else {
+        // Biobank scale: keep implicit.
+        DesignMatrix::Operator(Arc::new(
+            RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
+                .expect("rowwise kronecker design should have matched row counts"),
+        ))
+    }
 }
 
 /// Prepared covariate block data for the family struct.
@@ -2399,20 +2416,8 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
             initial_beta: b.initial_beta.clone(),
         }),
         CovariateBlockKind::TimeVarying(tv) => {
-            let design_exit = DesignMatrix::Operator(Arc::new(
-                RowwiseKroneckerOperator::new(
-                    tv.design_covariates.clone(),
-                    Arc::new(tv.time_basis_exit.clone()),
-                )
-                .map_err(|e| format!("RowwiseKronecker exit: {e}"))?,
-            ));
-            let design_entry = DesignMatrix::Operator(Arc::new(
-                RowwiseKroneckerOperator::new(
-                    tv.design_covariates.clone(),
-                    Arc::new(tv.time_basis_entry.clone()),
-                )
-                .map_err(|e| format!("RowwiseKronecker entry: {e}"))?,
-            ));
+            let design_exit = rowwise_kronecker(&tv.design_covariates, &tv.time_basis_exit);
+            let design_entry = rowwise_kronecker(&tv.design_covariates, &tv.time_basis_entry);
             Ok(PreparedCovBlock {
                 design_exit,
                 design_entry: Some(design_entry),

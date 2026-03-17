@@ -238,6 +238,376 @@ impl<'a> RemlState<'a> {
         Ok(if value.is_finite() { value } else { 0.0 })
     }
 
+    /// Analytic TK value + gradient from dense H.
+    ///
+    /// Gradient formula (holding c, d fixed, differentiating through Σ = H⁻¹):
+    ///
+    ///   ∂TK/∂ρ_k = tr(Ḣ_k · P_total)
+    ///
+    /// where P_total is computed once from value intermediates:
+    ///
+    ///   P_total = ¼ P_Q - ¼ P_{T1} - ¼ P_{T2a} - ⅛ P_{T2b}
+    ///   P_Q     = Z diag(d⊙h) Z^T
+    ///   P_{T1}  = Z · [(cc^T) ⊙ G²] · Z^T
+    ///   P_{T2a} = Z diag(c⊙(Xy)) Z^T
+    ///   P_{T2b} = y y^T
+    ///
+    /// and Ḣ_k = A_k + X^T diag(c⊙Xv_k) X is the total Hessian drift.
+    fn tierney_kadane_analytic_from_dense(
+        &self,
+        x_dense: &Array2<f64>,
+        h_eff_eval: &Array2<f64>,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+        penalty_roots: &[Array2<f64>],
+        lambdas: &[f64],
+        beta: &Array1<f64>,
+        compute_gradient: bool,
+    ) -> Result<TkCorrectionTerms, EstimationError> {
+        let n = x_dense.nrows();
+        let p = x_dense.ncols();
+        let k = penalty_roots.len();
+
+        if n == 0 || p == 0 {
+            return Ok(TkCorrectionTerms {
+                value: 0.0,
+                gradient: if compute_gradient {
+                    Some(Array1::zeros(k))
+                } else {
+                    None
+                },
+                hessian: None,
+            });
+        }
+
+        // ── Z = H⁻¹ X^T (p × n) ──
+        let xt = x_dense.t().to_owned();
+        let z = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+            let mut solved = Array2::<f64>::zeros((p, n));
+            for col in 0..n {
+                let rhs = xt.column(col).to_owned();
+                let sol = chol.solvevec(&rhs);
+                solved.column_mut(col).assign(&sol);
+            }
+            solved
+        } else {
+            let (evals, evecs) = h_eff_eval
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let floor = 1e-12;
+            let mut solved = Array2::<f64>::zeros((p, n));
+            for m in 0..evals.len() {
+                let ev = evals[m];
+                if ev <= floor {
+                    continue;
+                }
+                let u = evecs.column(m).to_owned();
+                let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
+                for row in 0..p {
+                    let u_row = u[row];
+                    for col in 0..n {
+                        solved[[row, col]] += u_row * coeffs[col];
+                    }
+                }
+            }
+            solved
+        };
+
+        // ── Hat leverages h_i = x_i^T H⁻¹ x_i ──
+        let mut h_diag = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let val = x_dense.row(i).dot(&z.column(i));
+            h_diag[i] = if val.is_finite() { val } else { 0.0 };
+        }
+
+        // ── Q term: -⅛ Σ_i d_i h_ii² ──
+        let q_term = -0.125
+            * d_array
+                .iter()
+                .zip(h_diag.iter())
+                .map(|(&d_i, &h_i)| d_i * h_i * h_i)
+                .sum::<f64>();
+
+        // ── T2 term: ⅛ ‖w‖² where w = X^T(c⊙h), y = H⁻¹ w ──
+        let m_vec = c_array * &h_diag; // c ⊙ h (n-vector)
+        let x_m = xt.dot(&m_vec); // X^T(c⊙h) (p-vector)
+        let y = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+            chol.solvevec(&x_m)
+        } else {
+            let (evals, evecs) = h_eff_eval
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let floor = 1e-12;
+            let mut solved = Array1::<f64>::zeros(p);
+            for m_idx in 0..evals.len() {
+                let ev = evals[m_idx];
+                if ev <= floor {
+                    continue;
+                }
+                let u = evecs.column(m_idx).to_owned();
+                let coeff = u.dot(&x_m) / ev;
+                solved.scaled_add(coeff, &u);
+            }
+            solved
+        };
+        let t2_term = 0.125 * x_m.dot(&y);
+
+        // ── T1 term: 1/12 Σ_{i,j} c_i c_j G_ij³ (blocked) ──
+        let mut t1_sum = 0.0_f64;
+        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
+            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
+            let z_block = z.slice(s![.., j0..j1]).to_owned();
+            let c_j = c_array.slice(s![j0..j1]);
+            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
+                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
+                let x_block = x_dense.slice(s![i0..i1, ..]);
+                let c_i = c_array.slice(s![i0..i1]);
+                let gram = x_block.dot(&z_block);
+                let mut block_sum = 0.0_f64;
+                for bi in 0..(i1 - i0) {
+                    let ci = c_i[bi];
+                    if ci == 0.0 {
+                        continue;
+                    }
+                    for bj in 0..(j1 - j0) {
+                        let cj = c_j[bj];
+                        if cj == 0.0 {
+                            continue;
+                        }
+                        let kij = gram[[bi, bj]];
+                        block_sum += ci * cj * kij * kij * kij;
+                    }
+                }
+                t1_sum += if i0 == j0 { block_sum } else { 2.0 * block_sum };
+            }
+        }
+
+        let value = q_term + t1_sum / 12.0 + t2_term;
+        let value = if value.is_finite() { value } else { 0.0 };
+
+        if !compute_gradient {
+            return Ok(TkCorrectionTerms {
+                value,
+                gradient: None,
+                hessian: None,
+            });
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // Analytic gradient: ∂TK/∂ρ_k = tr(Ḣ_k · P_total)
+        // ══════════════════════════════════════════════════════════════════
+
+        // ── Build P_total (p × p) ──
+        //
+        // P_Q     = Z diag(d⊙h) Z^T               (from Q term)
+        // P_{T2a} = Z diag(c⊙(Xy)) Z^T             (from T2 term, ∂w piece)
+        // P_{T2b} = y y^T                           (from T2 term, ∂H⁻¹ piece)
+        // P_{T1}  = Z · [(cc^T) ⊙ G²] · Z^T        (from T1 term)
+        //
+        // P_total = ¼ P_Q - ¼ P_{T1} - ¼ P_{T2a} - ⅛ P_{T2b}
+        //
+        // Build P_Q - P_{T2a} together as Z diag(d⊙h - c⊙Xy) Z^T since they
+        // share the same Z..Z^T structure.
+
+        // Xy: the n-vector X y
+        let x_y = x_dense.dot(&y);
+
+        // Combined diagonal weight: d⊙h - c⊙Xy
+        let mut diag_combined = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            diag_combined[i] = d_array[i] * h_diag[i] - c_array[i] * x_y[i];
+        }
+        // P_combined = Z diag(diag_combined) Z^T (p×p)
+        // Efficient: P = Σ_i diag_combined[i] · z_i z_i^T
+        let mut p_total = Array2::<f64>::zeros((p, p));
+        for i in 0..n {
+            let wi = diag_combined[i];
+            if wi == 0.0 {
+                continue;
+            }
+            let z_i = z.column(i);
+            for a in 0..p {
+                let wa = wi * z_i[a];
+                for b in a..p {
+                    let val = wa * z_i[b];
+                    p_total[[a, b]] += val;
+                    if a != b {
+                        p_total[[b, a]] += val;
+                    }
+                }
+            }
+        }
+        // Scale by 1/4
+        p_total.mapv_inplace(|v| 0.25 * v);
+
+        // Subtract 1/8 y y^T
+        for a in 0..p {
+            for b in 0..p {
+                p_total[[a, b]] -= 0.125 * y[a] * y[b];
+            }
+        }
+
+        // ── P_{T1} contribution: -¼ Z · M · Z^T where M_{ij} = c_i c_j G_ij² ──
+        //
+        // We need to subtract ¼ Z M Z^T from P_total.
+        // Z M Z^T = Σ_{i,j} M_{ij} z_i z_j^T
+        //         = Σ_{i,j} c_i c_j G_ij² z_i z_j^T
+        //
+        // This is O(n² p) which matches the T1 value computation's cost.
+        // We use the same blocking strategy.
+        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
+            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
+            let z_block_j = z.slice(s![.., j0..j1]);
+            let c_j = c_array.slice(s![j0..j1]);
+            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
+                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
+                let x_block_i = x_dense.slice(s![i0..i1, ..]);
+                let c_i = c_array.slice(s![i0..i1]);
+                let z_block_i = z.slice(s![.., i0..i1]);
+                // Gram: G[bi, bj] = x_{i0+bi}^T z_{j0+bj} = X_block_i · z_block_j
+                let gram = x_block_i.dot(&z_block_j.t().to_owned().t());
+
+                for bi in 0..(i1 - i0) {
+                    let ci = c_i[bi];
+                    if ci == 0.0 {
+                        continue;
+                    }
+                    for bj in 0..(j1 - j0) {
+                        let cj = c_j[bj];
+                        if cj == 0.0 {
+                            continue;
+                        }
+                        let gij = gram[[bi, bj]];
+                        let weight = ci * cj * gij * gij;
+                        let sym_factor = if i0 == j0 && bi == bj {
+                            1.0
+                        } else if i0 == j0 {
+                            2.0
+                        } else {
+                            2.0
+                        };
+                        // Subtract ¼ weight · (z_i z_j^T + z_j z_i^T) / 2 for off-diag
+                        // Actually: M is symmetric, and we iterate upper triangle.
+                        // For i≠j: contribute weight·(z_i z_j^T + z_j z_i^T)
+                        // For i=j: contribute weight·z_i z_i^T
+                        let ii = i0 + bi;
+                        let jj = j0 + bj;
+                        let scale = -0.25 * weight * sym_factor;
+                        if ii == jj {
+                            // z_i z_i^T
+                            let z_i = z.column(ii);
+                            for a in 0..p {
+                                for b in a..p {
+                                    let val = scale * z_i[a] * z_i[b];
+                                    p_total[[a, b]] += val;
+                                    if a != b {
+                                        p_total[[b, a]] += val;
+                                    }
+                                }
+                            }
+                        } else {
+                            // (z_i z_j^T + z_j z_i^T) / 2 * sym_factor
+                            // Since sym_factor already accounts for the (i,j)+(j,i)
+                            // pairing via the upper-triangle iteration, we add
+                            // scale * (z_i z_j^T + z_j z_i^T).
+                            // But wait, we need just z_i z_j^T (the
+                            // trace_product with Ḣ_k will handle symmetry of Ḣ_k).
+                            // Actually P_total must be symmetric for correctness.
+                            let z_ii = z.column(ii);
+                            let z_jj = z.column(jj);
+                            let half_scale = 0.5 * scale;
+                            for a in 0..p {
+                                for b in 0..p {
+                                    p_total[[a, b]] +=
+                                        half_scale * (z_ii[a] * z_jj[b] + z_jj[a] * z_ii[b]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Compute gradient: grad[k] = tr(Ḣ_k · P_total) ──
+        //
+        // Ḣ_k = A_k + X^T diag(c ⊙ Xv_k) X
+        // where A_k = λ_k S_k = λ_k R_k^T R_k, v_k = H⁻¹(A_k β̂).
+        //
+        // tr(Ḣ_k P) = tr(A_k P) + Σ_i c_i (Xv_k)_i (X P X^T)_{ii}
+        //
+        // Precompute the "leverage from P" vector: lev_i = (X P X^T)_{ii} = X_i · P X_i
+        let xp = x_dense.dot(&p_total); // n × p
+        let mut lev_p = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            lev_p[i] = xp.row(i).dot(&x_dense.row(i).to_owned());
+        }
+
+        let mut gradient = Array1::<f64>::zeros(k);
+        for idx in 0..k {
+            let r_k = &penalty_roots[idx];
+            // A_k = λ_k R_k^T R_k
+            // tr(A_k P) = λ_k tr(R_k^T R_k P) = λ_k Σ_{a,b} S_k[a,b] P[a,b]
+            // = λ_k || R_k P ||²_F ... no. Actually:
+            // tr(S_k P) = Σ_{a,b} (R_k^T R_k)[a,b] P[b,a] = tr(R_k P R_k^T)
+            //           which is just Frobenius of R_k P^{1/2}... but simpler:
+            // tr(S_k P) = Σ_a (R_k P R_k^T)[a,a] = trace of the product.
+            // Since R_k is (rank_k × p) and P is (p × p):
+            let rk_p = r_k.dot(&p_total); // rank_k × p
+            let trace_ak_p = lambdas[idx]
+                * (0..r_k.nrows())
+                    .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
+                    .sum::<f64>();
+
+            // v_k = H⁻¹(λ_k S_k β̂)
+            let r_beta = r_k.dot(beta);
+            let mut s_k_beta = Array1::<f64>::zeros(p);
+            for a in 0..p {
+                s_k_beta[a] = (0..r_k.nrows()).map(|row| r_k[[row, a]] * r_beta[row]).sum::<f64>();
+            }
+            let a_k_beta = &s_k_beta * lambdas[idx];
+            let v_k = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+                chol.solvevec(&a_k_beta)
+            } else {
+                // Eigendecomposition fallback
+                let (evals, evecs) = h_eff_eval
+                    .eigh(Side::Lower)
+                    .map_err(EstimationError::EigendecompositionFailed)?;
+                let floor = 1e-12;
+                let mut sol = Array1::<f64>::zeros(p);
+                for m in 0..evals.len() {
+                    if evals[m] > floor {
+                        let u = evecs.column(m);
+                        let coeff = u.dot(&a_k_beta) / evals[m];
+                        sol.scaled_add(coeff, &u.to_owned());
+                    }
+                }
+                sol
+            };
+
+            // Observation correction: tr(X^T diag(c ⊙ Xv_k) X · P)
+            //                       = Σ_i c_i (Xv_k)_i lev_p[i]
+            let x_vk = x_dense.dot(&v_k);
+            let correction_trace: f64 = (0..n)
+                .map(|i| c_array[i] * x_vk[i] * lev_p[i])
+                .sum();
+
+            gradient[idx] = trace_ak_p + correction_trace;
+        }
+
+        // Sanitize
+        for g in gradient.iter_mut() {
+            if !g.is_finite() {
+                *g = 0.0;
+            }
+        }
+
+        Ok(TkCorrectionTerms {
+            value,
+            gradient: Some(gradient),
+            hessian: None,
+        })
+    }
+
     fn tierney_kadane_exact_value_from_sparse(
         &self,
         x_dense: &Array2<f64>,
@@ -1556,10 +1926,10 @@ impl<'a> RemlState<'a> {
             );
             let pirls_elapsed = pirls_start.elapsed();
             let screen_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
-            if let Ok((ref res, _)) = result {
+            if let Ok((ref res, ref wm)) = result {
                 log::info!(
                     "[PIRLS-timing] iters={} status={:?} max_eta={:.1} firth_logdet={} elapsed={:.3}s screening={}",
-                    res.iterations,
+                    wm.iterations,
                     res.status,
                     res.max_abs_eta,
                     res.firth_log_det()
