@@ -155,7 +155,7 @@ impl<'a> RemlState<'a> {
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
-        penalty_roots: &[Array2<f64>],
+        penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
@@ -163,7 +163,7 @@ impl<'a> RemlState<'a> {
     ) -> Array1<f64> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
-        let k = penalty_roots.len();
+        let k = penalties.len();
         let xt = x_dense.t();
 
         // Hat leverages
@@ -274,11 +274,14 @@ impl<'a> RemlState<'a> {
             let trace_ak_p = if let Some(coords) = penalty_coords {
                 coords[idx].trace_with_dense(&p_total, lambdas[idx])
             } else {
-                let r_k = &penalty_roots[idx];
-                let rk_p = r_k.dot(&p_total);
+                // Block-local trace: tr(lambda_k * S_k * P) = lambda_k * tr(R_k P[block,block] R_k^T)
+                let cp = &penalties[idx];
+                let r = &cp.col_range;
+                let p_block = p_total.slice(s![r.start..r.end, r.start..r.end]);
+                let rk_p = cp.root.dot(&p_block);
                 lambdas[idx]
-                    * (0..r_k.nrows())
-                        .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
+                    * (0..cp.rank())
+                        .map(|row| rk_p.row(row).dot(&cp.root.row(row).to_owned()))
                         .sum::<f64>()
             };
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
@@ -299,7 +302,7 @@ impl<'a> RemlState<'a> {
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
-        penalty_roots: &[Array2<f64>],
+        penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         beta: &Array1<f64>,
         compute_gradient: bool,
@@ -308,7 +311,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<TkCorrectionTerms, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
-        let k = penalty_roots.len();
+        let k = penalties.len();
         let xt = x_dense.t();
 
         // ── Hat leverages h_i = x_i^T H⁻¹ x_i ──
@@ -379,12 +382,15 @@ impl<'a> RemlState<'a> {
         let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
         let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k);
         for idx in 0..k {
-            let r_k = &penalty_roots[idx];
-            let r_beta = r_k.dot(beta);
+            // Block-local: S_k beta = root^T (root beta[block]), then embed.
+            let cp = &penalties[idx];
+            let r = &cp.col_range;
+            let beta_block = beta.slice(s![r.start..r.end]);
+            let r_beta = cp.root.dot(&beta_block);
             let mut s_k_beta = Array1::<f64>::zeros(p);
-            for a in 0..p {
-                s_k_beta[a] = (0..r_k.nrows())
-                    .map(|row| r_k[[row, a]] * r_beta[row])
+            for a in 0..cp.block_dim() {
+                s_k_beta[r.start + a] = (0..cp.rank())
+                    .map(|row| cp.root[[row, a]] * r_beta[row])
                     .sum::<f64>();
             }
             let a_k_beta = &s_k_beta * lambdas[idx];
@@ -402,7 +408,7 @@ impl<'a> RemlState<'a> {
             z,
             c_array,
             d_array,
-            penalty_roots,
+            penalties,
             lambdas,
             &x_vks,
             h_inv_solve,
@@ -428,21 +434,23 @@ impl<'a> RemlState<'a> {
             for l in 0..k {
                 // Compute Ḣ_l Z = A_l Z + X^T diag(c ⊙ x_vl) X Z, column by column.
                 // Then δZ_l = H⁻¹(Ḣ_l Z).
-                let r_l = &penalty_roots[l];
+                let cp_l = &penalties[l];
+                let rl = &cp_l.col_range;
                 let x_vl = &x_vks[l];
 
-                // A_l Z: for each column j, A_l z_j = λ_l R_l^T (R_l z_j)
+                // A_l Z: for each column j, A_l z_j = λ_l R_l^T (R_l z_j[block])
                 // C_l Z: for each column j, X^T(c ⊙ x_vl ⊙ (X z_j))
                 let mut h_dot_l_z = Array2::<f64>::zeros((p, n));
                 for j in 0..n {
                     let z_j = z.column(j).to_owned();
-                    // A_l z_j
-                    let rl_zj = r_l.dot(&z_j);
+                    // A_l z_j — block-local
+                    let z_j_block = z_j.slice(s![rl.start..rl.end]);
+                    let rl_zj = cp_l.root.dot(&z_j_block);
                     let mut col = Array1::<f64>::zeros(p);
-                    for a in 0..p {
-                        col[a] = lambdas[l]
-                            * (0..r_l.nrows())
-                                .map(|row| r_l[[row, a]] * rl_zj[row])
+                    for a in 0..cp_l.block_dim() {
+                        col[rl.start + a] = lambdas[l]
+                            * (0..cp_l.rank())
+                                .map(|row| cp_l.root[[row, a]] * rl_zj[row])
                                 .sum::<f64>();
                     }
                     // C_l z_j = X^T(c ⊙ x_vl ⊙ (X z_j))
@@ -624,12 +632,6 @@ impl<'a> RemlState<'a> {
                     .unwrap_or_else(|_| Array1::zeros(rhs.len()))
             };
 
-            // Penalty roots from canonical penalties (already precomputed).
-            let penalty_roots: Vec<Array2<f64>> = self
-                .canonical_penalties
-                .iter()
-                .map(|cp| cp.global_root())
-                .collect();
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
 
@@ -638,7 +640,7 @@ impl<'a> RemlState<'a> {
                 &z_mat,
                 &c_array,
                 &d_array,
-                &penalty_roots,
+                &self.canonical_penalties,
                 &lambdas,
                 &beta,
                 compute_gradient,

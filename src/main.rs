@@ -47,15 +47,13 @@ use gam::inference::data::{
     load_datasetwith_schema as load_dataset_auto_with_schema,
 };
 use gam::inference::formula_dsl::{
-    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, SmoothKind,
-    build_smooth_basis, build_termspec, col_minmax, effectivelinkwiggle_formulaspec,
-    enable_scale_dimensions, formula_rhs_text, heuristic_centers, heuristic_knots,
+    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, build_termspec,
+    effectivelinkwiggle_formulaspec, enable_scale_dimensions, formula_rhs_text, heuristic_knots,
     heuristic_knots_for_column, inverse_link_supports_joint_wiggle,
-    linkchoice_supports_joint_wiggle, linkname, option_bool, option_f64, option_usize,
-    option_usize_any, parse_countwith_basis_alias, parse_duchon_order, parse_duchon_power,
-    parse_formula, parse_link_choice, parse_linkwiggle_formulaspec, parse_matern_nu,
-    parse_matching_auxiliary_formula, parse_ps_internal_knots, parse_surv_response, resolve_col,
-    spatial_center_strategy_for_dimension, unique_count_column, validate_auxiliary_formula_controls,
+    linkchoice_supports_joint_wiggle, linkname, option_usize, parse_duchon_order,
+    parse_duchon_power, parse_formula, parse_link_choice, parse_linkwiggle_formulaspec,
+    parse_matching_auxiliary_formula, parse_surv_response, unique_count_column,
+    validate_auxiliary_formula_controls,
 };
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,

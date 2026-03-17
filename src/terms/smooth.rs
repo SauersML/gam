@@ -614,6 +614,41 @@ impl TermCollectionDesign {
     pub fn num_penalties(&self) -> usize {
         self.penalties.len()
     }
+
+    /// Extract a `KroneckerPenaltySystem` if exactly one smooth term has
+    /// Kronecker structure and it accounts for all penalties.
+    ///
+    /// Returns `None` if no Kronecker structure is present or if the model
+    /// has multiple smooth terms with mixed structure.
+    pub fn kronecker_penalty_system(&self) -> Option<KroneckerPenaltySystem> {
+        let kron_terms: Vec<&KroneckerFactoredBasis> = self
+            .smooth
+            .terms
+            .iter()
+            .filter_map(|t| t.kronecker_factored.as_ref())
+            .collect();
+        if kron_terms.len() != 1 {
+            return None; // 0 or multiple Kronecker terms — not supported yet
+        }
+        let kron = kron_terms[0];
+        // Only use the Kronecker path when the model is purely this tensor term
+        // (no other smooth terms with separate penalties).
+        let non_kron_smooth_terms = self
+            .smooth
+            .terms
+            .iter()
+            .filter(|t| t.kronecker_factored.is_none())
+            .count();
+        if non_kron_smooth_terms > 0 {
+            return None; // mixed model — fall back to standard path
+        }
+        KroneckerPenaltySystem::new(
+            kron.marginal_penalties.clone(),
+            kron.marginal_dims.clone(),
+            kron.has_double_penalty,
+        )
+        .ok()
+    }
 }
 
 #[derive(Clone)]

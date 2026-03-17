@@ -1,10 +1,29 @@
-use gam::construction::compute_penalty_square_roots;
-use gam::estimate::{ExternalOptimOptions, evaluate_externalcost_andridge};
+use gam::construction::CanonicalPenalty;
+use gam::estimate::{ExternalOptimOptions, PenaltySpec, evaluate_externalcost_andridge};
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+
+fn canonicalize_test_penalties(
+    s_list: &[Array2<f64>],
+) -> Vec<CanonicalPenalty> {
+    let p = s_list[0].nrows();
+    s_list
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, s)| {
+            gam::construction::canonicalize_penalty_spec(
+                &PenaltySpec::Dense(s.clone()),
+                p,
+                idx,
+                "test",
+            )
+            .expect("canonicalize test penalty")
+        })
+        .collect()
+}
 
 fn make_problem(seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<Array2<f64>>) {
     let n = 100;
@@ -35,7 +54,7 @@ fn fit_beta_norm(
     x: &Array2<f64>,
     y: &Array1<f64>,
     w: &Array1<f64>,
-    rs: &[Array2<f64>],
+    penalties: &[CanonicalPenalty],
     rho: f64,
     firth: bool,
 ) -> f64 {
@@ -46,18 +65,6 @@ fn fit_beta_norm(
         firth_bias_reduction: firth,
     };
     let offset = Array1::<f64>::zeros(y.len());
-    let p = x.ncols();
-    let canonical: Vec<gam::construction::CanonicalPenalty> = rs.iter().map(|r| {
-        let local = r.t().dot(r);
-        gam::construction::CanonicalPenalty {
-            root: r.clone(),
-            col_range: 0..p,
-            total_dim: p,
-            nullity: 0,
-            local,
-            positive_eigenvalues: Vec::new(),
-        }
-    }).collect();
     let (fit, _) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
         PirlsProblem {
@@ -68,7 +75,7 @@ fn fit_beta_norm(
             covariate_se: None,
         },
         PenaltyConfig {
-            canonical_penalties: &canonical,
+            canonical_penalties: penalties,
             balanced_penalty_root: None,
             reparam_invariant: None,
             p,
@@ -89,7 +96,7 @@ fn proxycostwith_pirls(
     x: &Array2<f64>,
     y: &Array1<f64>,
     w: &Array1<f64>,
-    rs: &[Array2<f64>],
+    penalties: &[CanonicalPenalty],
     s: &Array2<f64>,
     rho: f64,
     firth: bool,
@@ -102,17 +109,6 @@ fn proxycostwith_pirls(
     };
     let offset = Array1::<f64>::zeros(y.len());
     let p = x.ncols();
-    let canonical: Vec<gam::construction::CanonicalPenalty> = rs.iter().map(|r| {
-        let local = r.t().dot(r);
-        gam::construction::CanonicalPenalty {
-            root: r.clone(),
-            col_range: 0..p,
-            total_dim: p,
-            nullity: 0,
-            local,
-            positive_eigenvalues: Vec::new(),
-        }
-    }).collect();
     let (fit, _) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
         PirlsProblem {
@@ -123,7 +119,7 @@ fn proxycostwith_pirls(
             covariate_se: None,
         },
         PenaltyConfig {
-            canonical_penalties: &canonical,
+            canonical_penalties: penalties,
             balanced_penalty_root: None,
             reparam_invariant: None,
             p,

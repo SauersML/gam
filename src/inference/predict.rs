@@ -1647,6 +1647,8 @@ impl PredictableModel for BinomialLocationScalePredictor {
                     let dphi = jet.d1;
                     let scale = dq_dq0[i];
                     let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
+                    // dq/dη_ls = κ · η_t / σ where κ = (dσ/dη_ls)/σ.
+                    // For standard exp link κ=1; on the safe_exp plateau κ=0.
                     let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
                     for j in 0..p_t {
                         grad[[i, j]] = dprob_deta_t * x_t[[i, j]];

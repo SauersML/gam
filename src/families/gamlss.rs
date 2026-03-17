@@ -4331,23 +4331,30 @@ fn gaussian_joint_psi_mixed_driftweights(
         let wi = scalars.w[i];
         let mi = scalars.m[i];
         let ni = scalars.n[i];
+        let ki = scalars.kappa[i];
         let dm = dotmu[i];
-        let de = dot_eta[i];
         let ma = mu_a[i];
-        let ea = eta_a[i];
         let dma = dotmu_a[i];
-        let dea = dot_eta_a[i];
-        let cross = de * ma + dm * ea;
-        // First directional: w_u not needed, compute c_u and d_u inline
-        dhmumu_u[i].write(-2.0 * wi * de);
-        dhmu_ls_u[i].write(-2.0 * wi * dm - 4.0 * mi * de);
-        dh_ls_ls_u[i].write(-4.0 * mi * dm - 4.0 * ni * de);
-        d2hmumu[i].write(4.0 * wi * de * ea - 2.0 * wi * dea);
-        d2hmu_ls[i].write(-2.0 * wi * dma + 4.0 * wi * cross + 8.0 * mi * de * ea - 4.0 * mi * dea);
+        // κ-scaled log-sigma directions.
+        let sde = ki * dot_eta[i];
+        let sea = ki * eta_a[i];
+        let sdea = ki * dot_eta_a[i];
+        let cross = sde * ma + dm * sea;
+        // First directional derivative of Hessian blocks.
+        dhmumu_u[i].write(-2.0 * wi * sde);
+        // Cross block carries overall κ; scale-scale block carries κ².
+        dhmu_ls_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde));
+        dh_ls_ls_u[i].write(ki * ki * (-4.0 * mi * dm - 4.0 * ni * sde));
+        // Second directional derivative of Hessian blocks.
+        d2hmumu[i].write(4.0 * wi * sde * sea - 2.0 * wi * sdea);
+        d2hmu_ls[i].write(
+            ki * (-2.0 * wi * dma + 4.0 * wi * cross + 8.0 * mi * sde * sea - 4.0 * mi * sdea),
+        );
         d2h_ls_ls[i].write(
-            4.0 * wi * dm * ma + 8.0 * mi * cross + 8.0 * ni * de * ea
-                - 4.0 * mi * dma
-                - 4.0 * ni * dea,
+            ki * ki
+                * (4.0 * wi * dm * ma + 8.0 * mi * cross + 8.0 * ni * sde * sea
+                    - 4.0 * mi * dma
+                    - 4.0 * ni * sdea),
         );
     }
     unsafe {
@@ -6754,14 +6761,16 @@ impl GaussianLocationScaleWiggleFamily {
         }
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
         let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
-        let coeff_ml = (2.0 * &rows.m) * &geom.dq_dq0;
-        let coeff_ll = 2.0 * &rows.n;
+        // Cross blocks involving η_ls carry overall κ; scale-scale carries κ².
+        let coeff_ml = (2.0 * &rows.kappa * &rows.m) * &geom.dq_dq0;
+        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.n;
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm)?;
         let h_ml = xt_diag_y_dense(xmu, &coeff_ml, x_ls)?;
         let h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
         let h_mw = xt_diag_y_dense(xmu, &(&rows.w * &geom.dq_dq0), &geom.basis)?
             + &xt_diag_y_dense(xmu, &(-&rows.m), &geom.basis_d1)?;
-        let h_lw = xt_diag_y_dense(x_ls, &(2.0 * &rows.m), &geom.basis)?;
+        // ls-wiggle cross block carries one κ from the η_ls chain.
+        let h_lw = xt_diag_y_dense(x_ls, &(2.0 * &rows.kappa * &rows.m), &geom.basis)?;
         let h_ww = xt_diag_x_dense(&geom.basis, &rows.w)?;
         Ok(Some(gaussian_pack_wiggle_joint_symmetrichessian(
             &h_mm, &h_ml, &h_mw, &h_ll, &h_lw, &h_ww,
@@ -6801,6 +6810,8 @@ impl GaussianLocationScaleWiggleFamily {
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
         let xi = xmu.dot(&umu);
         let zeta = x_ls.dot(&u_ls);
+        // κ-scaled log-sigma direction: σ is frozen on the safe_exp plateau.
+        let szeta = &rows.kappa * &zeta;
         let phi = geom.basis.dot(&uw);
         let mut q_u = &geom.dq_dq0 * &xi;
         q_u += &phi;
@@ -6810,19 +6821,21 @@ impl GaussianLocationScaleWiggleFamily {
         g2_u += &geom.basis_d2.dot(&uw);
         let basis_u = scale_matrix_rows(&geom.basis_d1, &xi)?;
         let basis1_u = scale_matrix_rows(&geom.basis_d2, &xi)?;
-        let dw_u = -2.0 * &rows.w * &zeta;
-        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &zeta);
-        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &zeta);
+        let dw_u = -2.0 * &rows.w * &szeta;
+        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta);
+        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta);
 
         let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
             - &(&dm_u * &geom.d2q_dq02)
             - &(&rows.m * &g2_u);
-        let coeff_ml_u = 2.0 * (&dm_u * &geom.dq_dq0 + &rows.m * &s1_u);
-        let coeff_ll_u = 2.0 * &dn_u;
+        // Cross blocks involving η_ls carry overall κ; scale-scale carries κ².
+        let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u);
+        let coeff_ll_u = 2.0 * &rows.kappa * &rows.kappa * &dn_u;
         let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
         let c_u = -&dm_u;
-        let l_u = 2.0 * &dm_u;
+        // ls-wiggle cross block carries one κ from the η_ls chain.
+        let l_u = 2.0 * &rows.kappa * &dm_u;
 
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm_u)?;
         let h_ml = xt_diag_y_dense(xmu, &coeff_ml_u, x_ls)?;
@@ -6832,7 +6845,7 @@ impl GaussianLocationScaleWiggleFamily {
             + &xt_diag_y_dense(xmu, &c_u, &geom.basis_d1)?
             + &xt_diag_y_dense(xmu, &(-&rows.m), &basis1_u)?;
         let h_lw = xt_diag_y_dense(x_ls, &l_u, &geom.basis)?
-            + &xt_diag_y_dense(x_ls, &(2.0 * &rows.m), &basis_u)?;
+            + &xt_diag_y_dense(x_ls, &(2.0 * &rows.kappa * &rows.m), &basis_u)?;
         let a_ww = xt_diag_y_dense(&basis_u, &rows.w, &geom.basis)?;
         let h_ww = &a_ww + &a_ww.t() + &xt_diag_x_dense(&geom.basis, &dw_u)?;
         Ok(Some(gaussian_pack_wiggle_joint_symmetrichessian(
@@ -6913,17 +6926,20 @@ impl GaussianLocationScaleWiggleFamily {
         let basis1_v = scale_matrix_rows(&geom.basis_d2, &xi_v)?;
         let basis1_uv = scale_matrix_rows(&geom.basis_d3, &(&xi_u * &xi_v))?;
 
-        let dw_u = -2.0 * &rows.w * &zeta_u;
-        let dw_v = -2.0 * &rows.w * &zeta_v;
-        let dw_uv = 4.0 * &rows.w * &(&zeta_u * &zeta_v);
-        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &zeta_u);
-        let dm_v = -(&rows.w * &q_v) - &(2.0 * &rows.m * &zeta_v);
-        let dm_uv = &(2.0 * &rows.w * &(&q_u * &zeta_v + &q_v * &zeta_u)) - &(&rows.w * &q_uv)
-            + &(4.0 * &rows.m * &(&zeta_u * &zeta_v));
+        // κ-scaled log-sigma directions: σ is frozen on the safe_exp plateau.
+        let szeta_u = &rows.kappa * &zeta_u;
+        let szeta_v = &rows.kappa * &zeta_v;
+        let dw_u = -2.0 * &rows.w * &szeta_u;
+        let dw_v = -2.0 * &rows.w * &szeta_v;
+        let dw_uv = 4.0 * &rows.w * &(&szeta_u * &szeta_v);
+        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta_u);
+        let dm_v = -(&rows.w * &q_v) - &(2.0 * &rows.m * &szeta_v);
+        let dm_uv = &(2.0 * &rows.w * &(&q_u * &szeta_v + &q_v * &szeta_u)) - &(&rows.w * &q_uv)
+            + &(4.0 * &rows.m * &(&szeta_u * &szeta_v));
         let dn_uv = &(2.0 * &rows.w * &(&q_u * &q_v))
-            + &(4.0 * &rows.m * &(&q_u * &zeta_v + &q_v * &zeta_u))
+            + &(4.0 * &rows.m * &(&q_u * &szeta_v + &q_v * &szeta_u))
             - &(2.0 * &rows.m * &q_uv)
-            + &(4.0 * &rows.n * &(&zeta_u * &zeta_v));
+            + &(4.0 * &rows.n * &(&szeta_u * &szeta_v));
 
         let coeff_mm_uv = &(&dw_uv * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &dw_u * &geom.dq_dq0 * &s1_v)
@@ -6934,9 +6950,11 @@ impl GaussianLocationScaleWiggleFamily {
             - &(&dm_u * &g2_v)
             - &(&dm_v * &g2_u)
             - &(&rows.m * &g2_uv);
-        let coeff_ml_uv =
-            2.0 * (&dm_uv * &geom.dq_dq0 + &dm_u * &s1_v + &dm_v * &s1_u + &rows.m * &s1_uv);
-        let coeff_ll_uv = 2.0 * &dn_uv;
+        // Cross blocks involving η_ls carry overall κ; scale-scale carries κ².
+        let coeff_ml_uv = 2.0
+            * &rows.kappa
+            * &(&dm_uv * &geom.dq_dq0 + &dm_u * &s1_v + &dm_v * &s1_u + &rows.m * &s1_uv);
+        let coeff_ll_uv = 2.0 * &rows.kappa * &rows.kappa * &dn_uv;
 
         let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
         let a_v = &dw_v * &geom.dq_dq0 + &rows.w * &s1_v;
@@ -6944,9 +6962,10 @@ impl GaussianLocationScaleWiggleFamily {
         let c_u = -&dm_u;
         let c_v = -&dm_v;
         let c_uv = -&dm_uv;
-        let l_u = 2.0 * &dm_u;
-        let l_v = 2.0 * &dm_v;
-        let l_uv = 2.0 * &dm_uv;
+        // ls-wiggle cross block carries one κ from the η_ls chain.
+        let l_u = 2.0 * &rows.kappa * &dm_u;
+        let l_v = 2.0 * &rows.kappa * &dm_v;
+        let l_uv = 2.0 * &rows.kappa * &dm_uv;
 
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm_uv)?;
         let h_ml = xt_diag_y_dense(xmu, &coeff_ml_uv, x_ls)?;
@@ -6962,7 +6981,7 @@ impl GaussianLocationScaleWiggleFamily {
         let h_lw = xt_diag_y_dense(x_ls, &l_uv, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l_u, &basis_v)?
             + &xt_diag_y_dense(x_ls, &l_v, &basis_u)?
-            + &xt_diag_y_dense(x_ls, &(2.0 * &rows.m), &basis_uv)?;
+            + &xt_diag_y_dense(x_ls, &(2.0 * &rows.kappa * &rows.m), &basis_uv)?;
         let a_ab = xt_diag_y_dense(&basis_uv, &rows.w, &geom.basis)?;
         let a_ij = xt_diag_y_dense(&basis_u, &rows.w, &basis_v)?;
         let a_iwj = xt_diag_y_dense(&basis_u, &dw_v, &geom.basis)?;
