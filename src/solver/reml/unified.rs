@@ -4727,6 +4727,9 @@ impl HessianOperator for DenseSpectralOperator {
 pub struct SparseCholeskyOperator {
     /// The sparse Cholesky factorization.
     factor: std::sync::Arc<crate::linalg::sparse_exact::SparseExactFactor>,
+    /// Takahashi selected inverse (precomputed H^{-1} entries on the filled pattern of L).
+    /// When available, trace computations use direct lookups instead of column solves.
+    takahashi: Option<std::sync::Arc<crate::linalg::sparse_exact::TakahashiInverse>>,
     /// Precomputed log-determinant from the Cholesky diagonal.
     cached_logdet: f64,
     /// Dimension of H.
@@ -4742,9 +4745,18 @@ impl SparseCholeskyOperator {
     ) -> Self {
         Self {
             factor,
+            takahashi: None,
             cached_logdet: logdet_h,
             n_dim: dim,
         }
+    }
+
+    pub fn with_takahashi(
+        mut self,
+        taka: std::sync::Arc<crate::linalg::sparse_exact::TakahashiInverse>,
+    ) -> Self {
+        self.takahashi = Some(taka);
+        self
     }
 
     fn trace_hinv_operator_exact(&self, op: &dyn HyperOperator) -> f64 {

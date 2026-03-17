@@ -23,6 +23,8 @@ use ::opt::{
     ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -496,12 +498,6 @@ pub trait OuterObjective {
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
 
-    /// Enter cheap screening mode: cap inner iterations for `eval_cost()` calls.
-    /// Default is a no-op (objectives that don't support screening ignore this).
-    fn enter_screening_mode(&mut self, _: usize) {}
-
-    /// Exit screening mode and restore normal inner iteration limits.
-    fn exit_screening_mode(&mut self) {}
 }
 
 /// Closure-based adapter for [`OuterObjective`].
@@ -841,6 +837,10 @@ pub struct OuterConfig {
     pub initial_rho: Option<Array1<f64>>,
     /// Centralized retry policy for degraded outer plans.
     pub fallback_policy: FallbackPolicy,
+    /// Shared atomic for screening iteration cap. When present, the screening
+    /// loop sets this to `screen_max_inner_iterations` before eval_cost calls
+    /// and resets to 0 afterward. The inner solver reads it atomically.
+    pub screening_cap: Option<Arc<AtomicUsize>>,
 }
 
 impl Default for OuterConfig {
@@ -855,6 +855,7 @@ impl Default for OuterConfig {
             heuristic_lambdas: None,
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
+            screening_cap: None,
         }
     }
 }
@@ -1000,7 +1001,9 @@ fn run_outer_with_plan(
         );
         let screen_start = std::time::Instant::now();
         if screen_max > 0 {
-            obj.enter_screening_mode(screen_max);
+            if let Some(cap) = config.screening_cap.as_ref() {
+                cap.store(screen_max, Ordering::Relaxed);
+            }
         }
         let mut scored: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
         for (i, rho) in seeds.iter().enumerate() {
@@ -1015,8 +1018,8 @@ fn run_outer_with_plan(
                 },
             ));
         }
-        if screen_max > 0 {
-            obj.exit_screening_mode();
+        if let Some(cap) = config.screening_cap.as_ref() {
+            cap.store(0, Ordering::Relaxed);
         }
         log::info!(
             "[OUTER] {context}: screening done in {:.3}s",

@@ -11600,7 +11600,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
-        binomial_link_has_closed_form(&self.link_kind)
+        true
     }
 
     fn diagonalworking_weights_directional_derivative(

@@ -137,6 +137,20 @@ fn probit_pdfthird_derivative(eta: f64) -> f64 {
 }
 
 #[inline]
+fn probit_pdffourth_derivative(eta: f64) -> f64 {
+    // mu''''' = Phi^{(5)}(eta) = (eta^4 - 6*eta^2 + 3) * phi(eta).
+    if eta.is_nan() {
+        return f64::NAN;
+    }
+    if !eta.is_finite() {
+        return 0.0;
+    }
+    let x = eta;
+    let phi = normal_pdf(x);
+    canonicalzero((x * x * x * x - 6.0 * x * x + 3.0) * phi)
+}
+
+#[inline]
 fn chain_inverse_link_jet(base: InverseLinkJet, z1: f64, z2: f64, z3: f64) -> InverseLinkJet {
     InverseLinkJet {
         mu: base.mu,
@@ -221,6 +235,68 @@ fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64
             }
             let denom = 1.0 + eta * eta;
             24.0 * eta * (1.0 - eta * eta) / (std::f64::consts::PI * denom.powi(4))
+        }
+    }
+}
+
+/// Fifth derivative of a component inverse-link CDF (= fourth derivative of PDF).
+/// Extends `component_inverse_link_pdfthird_derivative` by one derivative order.
+#[inline]
+fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f64) -> f64 {
+    match component {
+        LinkComponent::Probit => probit_pdffourth_derivative(eta),
+        LinkComponent::Logit => {
+            // d5 = d1(1 - 30mu + 150mu² - 240mu³ + 120mu⁴)
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
+                return 0.0;
+            }
+            let mu = logistic_stable(eta);
+            let d1 = mu * (1.0 - mu);
+            let mu2 = mu * mu;
+            d1 * (1.0 - 30.0 * mu + 150.0 * mu2 - 240.0 * mu2 * mu + 120.0 * mu2 * mu2)
+        }
+        LinkComponent::CLogLog => {
+            // d5 = d1(t^4 - 10t^3 + 25t^2 - 15t + 1)  where t = exp(eta)
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
+                return 0.0;
+            }
+            let t = eta.exp();
+            canonicalzero(stable_nonnegative_poly_times_exp_neg(
+                t,
+                &[0.0, 1.0, -15.0, 25.0, -10.0, 1.0],
+            ))
+        }
+        LinkComponent::LogLog => {
+            // d5 = d1(-r^4 + 10r^3 - 25r^2 + 15r - 1) where r = exp(-eta)
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
+                return 0.0;
+            }
+            let r = (-eta).exp();
+            canonicalzero(stable_nonnegative_poly_times_exp_neg(
+                r,
+                &[0.0, -1.0, 15.0, -25.0, 10.0, -1.0],
+            ))
+        }
+        LinkComponent::Cauchit => {
+            // d5 = 24(1 - 10eta^2 + 5eta^4) / [pi * (1+eta^2)^5]
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
+                return 0.0;
+            }
+            let e2 = eta * eta;
+            let denom = 1.0 + e2;
+            24.0 * (1.0 - 10.0 * e2 + 5.0 * e2 * e2) / (std::f64::consts::PI * denom.powi(5))
         }
     }
 }
@@ -340,6 +416,19 @@ fn tanh_bound_d4(value: f64, bound: f64) -> f64 {
     let t = (value / b).tanh();
     let s = 1.0 - t * t;
     8.0 * t * s * (2.0 - 3.0 * t * t) / (b * b * b)
+}
+
+#[inline]
+fn tanh_bound_d5(value: f64, bound: f64) -> f64 {
+    // 5th derivative of B * tanh(x/B):
+    //   g5 = 8 * s * (2 - 15*t^2 + 15*t^4) / B^4
+    // where t = tanh(x/B) and s = 1 - t^2.
+    let b = bound.max(f64::EPSILON);
+    let t = (value / b).tanh();
+    let s = 1.0 - t * t;
+    let t2 = t * t;
+    let b4 = b * b * b * b;
+    8.0 * s * (2.0 - 15.0 * t2 + 15.0 * t2 * t2) / b4
 }
 
 #[inline]
@@ -769,6 +858,56 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
     }
 }
 
+/// Fifth derivative of the inverse-link CDF (= fourth derivative of the PDF).
+///
+/// Extends `inverse_link_pdfthird_derivative_for_inverse_link` by one order.
+/// Used for the outer REML Hessian Q[v_k, v_l] term in survival models,
+/// specifically the `m1 * u_{abcd}` Faa di Bruno contribution.
+pub fn inverse_link_pdffourth_derivative_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+) -> Result<f64, EstimationError> {
+    match link {
+        InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
+        InverseLink::Standard(LinkFunction::Log) => {
+            Ok(eta.clamp(-700.0, 700.0).exp())
+        }
+        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdffourth_derivative(eta)),
+        InverseLink::Standard(LinkFunction::Logit) => Ok(
+            component_inverse_link_pdffourth_derivative(LinkComponent::Logit, eta),
+        ),
+        InverseLink::Standard(LinkFunction::CLogLog) => Ok(
+            component_inverse_link_pdffourth_derivative(LinkComponent::CLogLog, eta),
+        ),
+        InverseLink::Standard(LinkFunction::Sas) => {
+            Ok(sas_inverse_link_pdffourth_derivative(eta, 0.0, 0.0))
+        }
+        InverseLink::Sas(state) => Ok(sas_inverse_link_pdffourth_derivative(
+            eta,
+            state.epsilon,
+            state.log_delta,
+        )),
+        InverseLink::Standard(LinkFunction::BetaLogistic) => Ok(
+            beta_logistic_inverse_link_pdffourth_derivative(eta, 0.0, 0.0),
+        ),
+        InverseLink::BetaLogistic(state) => Ok(
+            beta_logistic_inverse_link_pdffourth_derivative(
+                eta,
+                state.log_delta,
+                state.epsilon,
+            ),
+        ),
+        InverseLink::Mixture(state) => Ok(state
+            .components
+            .iter()
+            .zip(state.pi.iter())
+            .map(|(&component, &weight)| {
+                weight * component_inverse_link_pdffourth_derivative(component, eta)
+            })
+            .sum()),
+    }
+}
+
 pub fn inverse_link_jet_for_link_function(
     link: LinkFunction,
     eta: f64,
@@ -1063,6 +1202,30 @@ pub fn beta_logistic_inverse_link_pdfthird_derivative(eta: f64, delta: f64, epsi
     d1 * (t * t * t - 3.0 * c * t * du - c * u2)
 }
 
+/// Fifth derivative of the beta-logistic inverse-link CDF (= 4th deriv of PDF).
+///
+/// With `P_4 = t^3 - 3ct*u' - c*u''` giving `d4 = d1 * P_4`, the next order is:
+///
+///   d5 = d1 * [t^4 - 6c*t^2*u' - 4c*t*u'' + 3c^2*u'^2 - c*u''']
+///
+/// where u' = u(1-u), u'' = u'(1-2u), u''' = u''(1-2u) - 2*u'^2.
+pub fn beta_logistic_inverse_link_pdffourth_derivative(eta: f64, delta: f64, epsilon: f64) -> f64 {
+    let (u, du) = logistic_uwith_derivatives(eta);
+    if du == 0.0 {
+        return 0.0;
+    }
+    let a = (delta - epsilon).exp();
+    let b = (delta + epsilon).exp();
+    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    let d1 = log_d1.exp();
+    let c = a + b;
+    let t = a * (1.0 - u) - b * u;
+    let u2 = du * (1.0 - 2.0 * u);
+    let u3 = u2 * (1.0 - 2.0 * u) - 2.0 * du * du;
+    let t2 = t * t;
+    d1 * (t2 * t2 - 6.0 * c * t2 * du - 4.0 * c * t * u2 + 3.0 * c * c * du * du - c * u3)
+}
+
 pub fn beta_logistic_inverse_link_jetwith_param_partials(
     eta: f64,
     delta: f64,
@@ -1259,6 +1422,100 @@ pub fn sas_inverse_link_pdfthird_derivative(eta: f64, epsilon: f64, log_delta: f
         + 3.0 * base.d2 * z2 * z2
         + 4.0 * base.d2 * z1 * z3
         + base.d1 * z4;
+    canonicalzero(out)
+}
+
+/// Fifth derivative of the SAS inverse-link CDF (= fourth derivative of the PDF).
+///
+/// Extends `sas_inverse_link_pdfthird_derivative` by one more derivative order,
+/// using the same composition chain u(eta) = g(r(eta)), z = sinh(u), mu = Phi(z).
+///
+/// The Faà di Bruno expansion at order 5 for u(eta) = g(r(eta)) is:
+///   u5 = g5 r1^5 + 10 g4 r1^3 r2 + 15 g3 r1 r2^2 + 10 g3 r1^2 r3
+///        + 10 g2 r2 r3 + 5 g2 r1 r4 + g1 r5
+///
+/// The z = sinh(u) expansion at order 5 is the standard Faà di Bruno for sinh:
+///   z5 = c*u1^5 + 10*s*u1^3*u2 + 15*c*u1*u2^2 + 10*c*u1^2*u3
+///        + 10*s*u2*u3 + 5*s*u1*u4 + c*u5
+///
+/// The mu = Phi(z) expansion at order 5 uses probit derivatives:
+///   mu^(5) = Phi5*z1^5 + 10*Phi4*z1^3*z2 + 15*Phi3*z1*z2^2 + 10*Phi3*z1^2*z3
+///            + 10*Phi2*z2*z3 + 5*Phi2*z1*z4 + Phi1*z5
+pub fn sas_inverse_link_pdffourth_derivative(eta: f64, epsilon: f64, log_delta: f64) -> f64 {
+    let e = if eta.is_finite() { eta } else { 0.0 };
+    let a = e.asinh();
+    let delta = sas_delta_from_raw_log_delta(log_delta);
+    let u_raw = delta * a - epsilon;
+    let u = tanh_bound(u_raw, SAS_U_CLAMP);
+    let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
+    let g2 = tanh_bound_d2(u_raw, SAS_U_CLAMP);
+    let g3 = tanh_bound_d3(u_raw, SAS_U_CLAMP);
+    let g4 = tanh_bound_d4(u_raw, SAS_U_CLAMP);
+    let g5 = tanh_bound_d5(u_raw, SAS_U_CLAMP);
+    let s = u.sinh();
+    let c = u.cosh();
+    let z = s;
+
+    // Probit derivatives at z.
+    let base = probit_jet(z);
+    let phi3 = probit_pdfthird_derivative(z); // Phi^{(4)}
+    let phi4 = probit_pdffourth_derivative(z); // Phi^{(5)}
+
+    // Powers of q = sqrt(1 + eta^2) for r1..r5.
+    let q = e.hypot(1.0);
+    let inv_q = 1.0 / q;
+    let inv_q2 = inv_q * inv_q;
+    let inv_q3 = inv_q2 * inv_q;
+    let inv_q5 = inv_q3 * inv_q2;
+    let inv_q7 = inv_q5 * inv_q2;
+    let inv_q9 = inv_q7 * inv_q2;
+
+    let r1 = delta * inv_q;
+    let r2 = -delta * e * inv_q3;
+    let r3 = delta * (2.0 * e * e - 1.0) * inv_q5;
+    let r4 = delta * e * (9.0 - 6.0 * e * e) * inv_q7;
+    let r5 = delta * (9.0 - 72.0 * e * e + 24.0 * e * e * e * e) * inv_q9;
+
+    // u1..u5 via Faà di Bruno for g(r(eta)).
+    let u1 = g1 * r1;
+    let u2 = g2 * r1 * r1 + g1 * r2;
+    let u3 = g3 * r1 * r1 * r1 + 3.0 * g2 * r1 * r2 + g1 * r3;
+    let u4 = g4 * r1.powi(4)
+        + 6.0 * g3 * r1 * r1 * r2
+        + 3.0 * g2 * r2 * r2
+        + 4.0 * g2 * r1 * r3
+        + g1 * r4;
+    let u5 = g5 * r1.powi(5)
+        + 10.0 * g4 * r1 * r1 * r1 * r2
+        + 15.0 * g3 * r1 * r2 * r2
+        + 10.0 * g3 * r1 * r1 * r3
+        + 10.0 * g2 * r2 * r3
+        + 5.0 * g2 * r1 * r4
+        + g1 * r5;
+
+    // z1..z5 via Faà di Bruno for sinh(u(eta)).
+    let z1 = c * u1;
+    let z2 = s * u1 * u1 + c * u2;
+    let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
+    let z4 =
+        s * u1.powi(4) + 6.0 * c * u1 * u1 * u2 + 3.0 * s * u2 * u2 + 4.0 * s * u1 * u3 + c * u4;
+    let z5 = c * u1.powi(5)
+        + 10.0 * s * u1 * u1 * u1 * u2
+        + 15.0 * c * u1 * u2 * u2
+        + 10.0 * c * u1 * u1 * u3
+        + 10.0 * s * u2 * u3
+        + 5.0 * s * u1 * u4
+        + c * u5;
+
+    // mu^(5) = Phi^(5)*z1^5 + 10*Phi^(4)*z1^3*z2 + 15*Phi^(3)*z1*z2^2
+    //        + 10*Phi^(3)*z1^2*z3 + 10*Phi^(2)*z2*z3 + 5*Phi^(2)*z1*z4 + Phi^(1)*z5
+    let out = phi4 * z1.powi(5)
+        + 10.0 * phi3 * z1 * z1 * z1 * z2
+        + 15.0 * base.d3 * z1 * z2 * z2
+        + 10.0 * base.d3 * z1 * z1 * z3
+        + 10.0 * base.d2 * z2 * z3
+        + 5.0 * base.d2 * z1 * z4
+        + base.d1 * z5;
     canonicalzero(out)
 }
 

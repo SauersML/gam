@@ -4,11 +4,12 @@ use crate::custom_family::{
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_embedded_dense_psi_operator,
-    build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper, first_psi_linear_map,
-    fit_custom_family, resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi,
-    second_psi_linear_map, shared_dense_arc, should_materialize_custom_family_psi_dense,
-    weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    build_embedded_dense_psi_operator, build_rowwise_kronecker_psi_operator,
+    evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
+    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
+    shared_dense_arc, should_materialize_custom_family_psi_dense, weighted_crossprod_psi_maps,
+    wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
 use crate::families::gamlss::{
@@ -25,8 +26,8 @@ use crate::inference::prediction_linalg::{
     PredictionCovarianceBackend, dense_row_chunk, design_row_chunk, rowwise_local_covariances,
 };
 use crate::matrix::{
-    DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, MultiChannelOperator, SymmetricMatrix,
-    xt_diag_x_symmetric,
+    DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, MultiChannelOperator,
+    RowwiseKroneckerOperator, SymmetricMatrix, xt_diag_x_symmetric,
 };
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdfthird_derivative_for_inverse_link,
@@ -272,14 +273,11 @@ pub fn residual_distribution_inverse_link(distribution: ResidualDistribution) ->
 /// in turn enters the m4 ingredient of the Faà di Bruno chain rule for
 /// the outer REML Hessian Q[v_k, v_l] term.
 ///
-/// Currently supports the three standard survival residual distributions:
-/// - Probit (Gaussian): f''''(u) = (u⁴ - 6u² + 3) φ(u)
-/// - Logit (Logistic):  f''''(u) = s(1-s)(1 - 30s + 150s² - 240s³ + 120s⁴)
-/// - CLogLog (Gumbel):  f''''(u) = f · (1 - 15e^u + 25e^{2u} - 10e^{3u} + e^{4u})
-///
-/// For mixture or non-standard links, this returns 0.0 as a conservative
-/// fallback (the 4th-order correction is then incomplete but the lower-order
-/// terms remain correct).
+/// For the three standard survival residual distributions (Probit, Logit,
+/// CLogLog), uses the closed-form ResidualDistribution implementations.
+/// For all other inverse links (SAS, BetaLogistic, Mixture), delegates
+/// to the generic `inverse_link_pdffourth_derivative_for_inverse_link`
+/// dispatcher in mixture_link.rs.
 fn inverse_link_pdffourth_derivative(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
         InverseLink::Standard(LinkFunction::Probit) => {
@@ -291,11 +289,14 @@ fn inverse_link_pdffourth_derivative(inverse_link: &InverseLink, eta: f64) -> f6
         InverseLink::Standard(LinkFunction::CLogLog) => {
             ResidualDistribution::Gumbel.pdffourth_derivative(eta)
         }
-        // Conservative fallback: for non-standard links the 4th-order
-        // correction term m1·u_αβγδ is dropped. The remaining terms
-        // (m4·u products, m3·u products, m2·u products) are still present
-        // because they only need m1..m3 and u through 3rd order.
-        _ => 0.0,
+        _ => {
+            // Delegate to the generic dispatcher which covers SAS,
+            // BetaLogistic, and Mixture inverse links.
+            crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                inverse_link, eta,
+            )
+            .unwrap_or(0.0)
+        }
     }
 }
 
@@ -2360,141 +2361,10 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
 /// Build row-wise Kronecker product: each row of the result is
 /// kron(cov_row[i,:], time_row[i,:]).
 fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> DesignMatrix {
-    let n = cov_design.nrows();
-    let p_cov = cov_design.ncols();
-    let p_time = time_basis.ncols();
-    let p_tensor = p_cov * p_time;
-
-    // For B-spline time basis with degree d, each row has d+1 nonzeros.
-    // If covariate design is dense: density = (d+1)/p_time ≈ 4/12 ≈ 33% → sparse.
-    // If covariate design is also sparse: even sparser.
-    // Use sparse when estimated density < 50%.
-    let cov_is_sparse = matches!(cov_design, DesignMatrix::Sparse(_));
-    // Operator variant follows the dense path for sparsity estimation.
-    let max_time_nnz_per_row = p_time.min(8); // B-spline degree 3 → 4 nonzero
-    let estimated_nnz_per_row = if cov_is_sparse {
-        // Conservative estimate
-        p_cov.min(p_cov) * max_time_nnz_per_row
-    } else {
-        p_cov * max_time_nnz_per_row
-    };
-    let use_sparse = estimated_nnz_per_row * 2 < p_tensor;
-
-    if use_sparse {
-        let mut triplets = Vec::with_capacity(n * estimated_nnz_per_row);
-        match cov_design {
-            DesignMatrix::Dense(x_cov) => {
-                for i in 0..n {
-                    for jc in 0..p_cov {
-                        let cv = x_cov[[i, jc]];
-                        if cv == 0.0 {
-                            continue;
-                        }
-                        for jt in 0..p_time {
-                            let tv = time_basis[[i, jt]];
-                            if tv == 0.0 {
-                                continue;
-                            }
-                            triplets.push(faer::sparse::Triplet::new(i, jc * p_time + jt, cv * tv));
-                        }
-                    }
-                }
-            }
-            DesignMatrix::Sparse(xs) => {
-                let csr = xs.to_csr_arc().expect("CSR view for rowwise kronecker");
-                let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for i in 0..n {
-                    for ptr in row_ptr[i]..row_ptr[i + 1] {
-                        let jc = col_idx[ptr];
-                        let cv = vals[ptr];
-                        if cv == 0.0 {
-                            continue;
-                        }
-                        for jt in 0..p_time {
-                            let tv = time_basis[[i, jt]];
-                            if tv == 0.0 {
-                                continue;
-                            }
-                            triplets.push(faer::sparse::Triplet::new(i, jc * p_time + jt, cv * tv));
-                        }
-                    }
-                }
-            }
-            DesignMatrix::Operator(op) => {
-                let x_cov = op.to_dense();
-                for i in 0..n {
-                    for jc in 0..p_cov {
-                        let cv = x_cov[[i, jc]];
-                        if cv == 0.0 {
-                            continue;
-                        }
-                        for jt in 0..p_time {
-                            let tv = time_basis[[i, jt]];
-                            if tv == 0.0 {
-                                continue;
-                            }
-                            triplets.push(faer::sparse::Triplet::new(i, jc * p_time + jt, cv * tv));
-                        }
-                    }
-                }
-            }
-        }
-        DesignMatrix::from(
-            faer::sparse::SparseColMat::try_new_from_triplets(n, p_tensor, &triplets)
-                .expect("build sparse tensor product design"),
-        )
-    } else {
-        let mut out = Array2::<f64>::zeros((n, p_tensor));
-        match cov_design {
-            DesignMatrix::Dense(x_cov) => {
-                for i in 0..n {
-                    for jc in 0..p_cov {
-                        let cv = x_cov[[i, jc]];
-                        if cv == 0.0 {
-                            continue;
-                        }
-                        for jt in 0..p_time {
-                            out[[i, jc * p_time + jt]] = cv * time_basis[[i, jt]];
-                        }
-                    }
-                }
-            }
-            DesignMatrix::Sparse(xs) => {
-                let csr = xs.to_csr_arc().expect("CSR view for rowwise kronecker");
-                let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for i in 0..n {
-                    for ptr in row_ptr[i]..row_ptr[i + 1] {
-                        let jc = col_idx[ptr];
-                        let cv = vals[ptr];
-                        for jt in 0..p_time {
-                            out[[i, jc * p_time + jt]] = cv * time_basis[[i, jt]];
-                        }
-                    }
-                }
-            }
-            DesignMatrix::Operator(op) => {
-                let x_cov = op.to_dense();
-                for i in 0..n {
-                    for jc in 0..p_cov {
-                        let cv = x_cov[[i, jc]];
-                        if cv == 0.0 {
-                            continue;
-                        }
-                        for jt in 0..p_time {
-                            out[[i, jc * p_time + jt]] = cv * time_basis[[i, jt]];
-                        }
-                    }
-                }
-            }
-        }
-        DesignMatrix::Dense(Arc::new(out))
-    }
+    DesignMatrix::Operator(Arc::new(
+        RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
+            .expect("rowwise kronecker design should have matched row counts"),
+    ))
 }
 
 /// Prepared covariate block data for the family struct.
@@ -3049,7 +2919,12 @@ fn prepare_survival_location_scale_model(
         name: "time_transform".to_string(),
         design: time_solver_design,
         offset: time_stacked_offset,
-        penalties: time_prepared.penalties.iter().cloned().map(PenaltyMatrix::Dense).collect(),
+        penalties: time_prepared
+            .penalties
+            .iter()
+            .cloned()
+            .map(PenaltyMatrix::Dense)
+            .collect(),
         nullspace_dims: spec.time_block.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &time_prepared.penalties,
@@ -3078,7 +2953,12 @@ fn prepare_survival_location_scale_model(
         name: "threshold".to_string(),
         design: threshold_solver_design,
         offset: threshold_solver_offset,
-        penalties: threshold_prep.penalties.iter().cloned().map(PenaltyMatrix::Dense).collect(),
+        penalties: threshold_prep
+            .penalties
+            .iter()
+            .cloned()
+            .map(PenaltyMatrix::Dense)
+            .collect(),
         nullspace_dims: threshold_prep.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &threshold_prep.penalties,
@@ -3143,7 +3023,12 @@ fn prepare_survival_location_scale_model(
         name: "log_sigma".to_string(),
         design: log_sigma_solver_design,
         offset: log_sigma_solver_offset,
-        penalties: log_sigma_prep.penalties.clone(),
+        penalties: log_sigma_prep
+            .penalties
+            .iter()
+            .cloned()
+            .map(PenaltyMatrix::Dense)
+            .collect(),
         nullspace_dims: log_sigma_prep.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &log_sigma_prep.penalties,
@@ -3156,7 +3041,12 @@ fn prepare_survival_location_scale_model(
             name: "linkwiggle".to_string(),
             design: w.design.clone(),
             offset: Array1::zeros(n),
-            penalties: w.penalties.clone(),
+            penalties: w
+                .penalties
+                .iter()
+                .cloned()
+                .map(PenaltyMatrix::Dense)
+                .collect(),
             nullspace_dims: w.nullspace_dims.clone(),
             initial_log_lambdas: initial_log_lambdas(&w.penalties, w.initial_log_lambdas.clone())?,
             initial_beta: w.initial_beta.clone(),
@@ -8017,7 +7907,7 @@ mod tests {
                     [1.0]
                 ])),
                 offset: Array1::zeros(9),
-                penalties: vec![Array2::eye(1)],
+                penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
                 nullspace_dims: vec![],
                 initial_log_lambdas: array![0.0],
                 initial_beta: Some(array![0.2]),
@@ -8026,7 +7916,7 @@ mod tests {
                 name: "threshold".to_string(),
                 design: DesignMatrix::Dense(Arc::new(array![[1.0], [0.4], [-0.6]])),
                 offset: Array1::zeros(3),
-                penalties: Vec::new(),
+                penalties: vec![],
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.35]),
@@ -8035,7 +7925,7 @@ mod tests {
                 name: "log_sigma".to_string(),
                 design: DesignMatrix::Dense(Arc::new(array![[1.0], [-0.3], [0.5]])),
                 offset: Array1::zeros(3),
-                penalties: Vec::new(),
+                penalties: vec![],
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![-0.15]),
