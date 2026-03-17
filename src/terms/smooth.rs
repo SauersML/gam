@@ -2727,32 +2727,28 @@ pub fn build_term_collection_design(
             smooth.penaltyinfo.len()
         )));
     }
-    for ((s_local, &ns), localinfo) in smooth
+    let smooth_start = p_intercept + p_lin + p_rand;
+    for ((bp_smooth, &ns), localinfo) in smooth
         .penalties
         .iter()
         .zip(smooth.nullspace_dims.iter())
         .zip(smooth.penaltyinfo.iter())
     {
-        let start = p_intercept + p_lin + p_rand;
         let global_index = penalties.len();
-        // Propagate structural hints from PenaltyInfo to BlockwisePenalty
-        // for efficient block-scale spectral decomposition.
-        let bp = {
-            let col_range = start..(start + p_smooth);
-            let local = s_local.clone();
-            if let Some(factors) = localinfo.penalty.kronecker_factors.as_ref() {
-                BlockwisePenalty::kronecker(col_range, local, factors.clone())
-            } else if matches!(localinfo.penalty.source, PenaltySource::TensorGlobalRidge)
-                || matches!(
-                    localinfo.penalty.source,
-                    PenaltySource::Other(ref s) if s.starts_with("RandomEffectRidge")
-                )
-            {
-                // Detect identity/ridge penalties from their source tag.
-                BlockwisePenalty::ridge(col_range, 1.0)
-            } else {
-                BlockwisePenalty::new(col_range, local)
-            }
+        // Offset the per-term block range from smooth-local to model-global.
+        let offset_range = (bp_smooth.col_range.start + smooth_start)
+            ..(bp_smooth.col_range.end + smooth_start);
+        let bp = if let Some(factors) = localinfo.penalty.kronecker_factors.as_ref() {
+            BlockwisePenalty::kronecker(offset_range, bp_smooth.local.clone(), factors.clone())
+        } else if matches!(localinfo.penalty.source, PenaltySource::TensorGlobalRidge)
+            || matches!(
+                localinfo.penalty.source,
+                PenaltySource::Other(ref s) if s.starts_with("RandomEffectRidge")
+            )
+        {
+            BlockwisePenalty::ridge(offset_range, 1.0)
+        } else {
+            BlockwisePenalty::new(offset_range, bp_smooth.local.clone())
         };
         penalties.push(bp);
         nullspace_dims.push(ns);
@@ -7368,6 +7364,115 @@ fn enforce_term_constraint_feasibility(
         return Err(EstimationError::ParameterConstraintViolation(msg));
     }
     Ok(())
+}
+
+fn stratified_spatial_subsample(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    target_size: usize,
+) -> Vec<usize> {
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+
+    let n = data.nrows();
+    if n <= target_size {
+        return (0..n).collect();
+    }
+
+    let spatial_cols: Option<Vec<usize>> = spec.smooth_terms.iter().find_map(|term| {
+        match &term.basis {
+            SmoothBasisSpec::ThinPlate { feature_cols, .. }
+            | SmoothBasisSpec::Matern { feature_cols, .. }
+            | SmoothBasisSpec::Duchon { feature_cols, .. } => {
+                if feature_cols.len() >= 1 {
+                    Some(feature_cols.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    });
+
+    let mut rng = StdRng::seed_from_u64(42);
+
+    let cols = match spatial_cols {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            let mut indices: Vec<usize> = (0..n).collect();
+            indices.shuffle(&mut rng);
+            indices.truncate(target_size);
+            indices.sort_unstable();
+            return indices;
+        }
+    };
+
+    let d = cols.len();
+    let mut mins = vec![f64::INFINITY; d];
+    let mut maxs = vec![f64::NEG_INFINITY; d];
+    for i in 0..n {
+        for (ax, &col) in cols.iter().enumerate() {
+            let v = data[[i, col]];
+            if v < mins[ax] {
+                mins[ax] = v;
+            }
+            if v > maxs[ax] {
+                maxs[ax] = v;
+            }
+        }
+    }
+
+    let total_cells_target = (target_size / 5).max(1);
+    let cells_per_axis =
+        ((total_cells_target as f64).powf(1.0 / d as f64)).ceil() as usize;
+    let cells_per_axis = cells_per_axis.max(1);
+
+    let mut cell_members: std::collections::HashMap<Vec<usize>, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        let mut cell_key = Vec::with_capacity(d);
+        for (ax, &col) in cols.iter().enumerate() {
+            let range = maxs[ax] - mins[ax];
+            let cell = if range <= 0.0 {
+                0
+            } else {
+                let frac = (data[[i, col]] - mins[ax]) / range;
+                (frac * cells_per_axis as f64).floor() as usize
+            };
+            cell_key.push(cell.min(cells_per_axis - 1));
+        }
+        cell_members.entry(cell_key).or_default().push(i);
+    }
+
+    let mut selected: Vec<usize> = Vec::with_capacity(target_size);
+    let mut remaining_budget = target_size;
+    let mut remaining_population = n;
+
+    let mut cells: Vec<(Vec<usize>, Vec<usize>)> = cell_members.into_iter().collect();
+    cells.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (_, members) in &mut cells {
+        if remaining_budget == 0 {
+            break;
+        }
+        let alloc =
+            ((members.len() as f64 / remaining_population as f64) * remaining_budget as f64)
+                .round() as usize;
+        let alloc = alloc.max(1).min(members.len()).min(remaining_budget);
+        members.shuffle(&mut rng);
+        selected.extend_from_slice(&members[..alloc]);
+        remaining_budget = remaining_budget.saturating_sub(alloc);
+        remaining_population = remaining_population.saturating_sub(members.len());
+    }
+
+    if selected.len() > target_size {
+        selected.shuffle(&mut rng);
+        selected.truncate(target_size);
+    }
+
+    selected.sort_unstable();
+    selected
 }
 
 pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Vec<usize> {
