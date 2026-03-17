@@ -1767,33 +1767,44 @@ impl TensorProductDesignOperator {
         }
 
         // Two alternating buffers for the contraction chain.
+        // Data starts in buf_a; each contraction reads from one and writes to the other.
         let mut buf_a = vec![0.0_f64; self.total_cols];
         let mut buf_b = vec![0.0_f64; self.total_cols];
 
         let mut out = Array1::<f64>::zeros(self.n);
         for row in 0..self.n {
-            // Start: copy β into working buffer.
+            // Start: copy β into buf_a.
             buf_a[..self.total_cols].copy_from_slice(&vector[..self.total_cols]);
             let mut current_len = self.total_cols;
+            let mut src_is_a = true; // tracks which buffer holds current data
 
             // Contract from the last marginal backwards.
             for dim in (0..d).rev() {
                 let q = self.marginals[dim].ncols();
                 let contracted_len = current_len / q;
-                let dst = if dim % 2 == 0 { &mut buf_b } else { &mut buf_a };
-                let src = if dim % 2 == 0 { &buf_a } else { &buf_b };
-                for c in 0..contracted_len {
-                    let mut acc = 0.0_f64;
-                    for t in 0..q {
-                        acc += src[c * q + t] * self.marginals[dim][[row, t]];
+                if src_is_a {
+                    for c in 0..contracted_len {
+                        let mut acc = 0.0_f64;
+                        for t in 0..q {
+                            acc += buf_a[c * q + t] * self.marginals[dim][[row, t]];
+                        }
+                        buf_b[c] = acc;
                     }
-                    dst[c] = acc;
+                } else {
+                    for c in 0..contracted_len {
+                        let mut acc = 0.0_f64;
+                        for t in 0..q {
+                            acc += buf_b[c * q + t] * self.marginals[dim][[row, t]];
+                        }
+                        buf_a[c] = acc;
+                    }
                 }
+                src_is_a = !src_is_a;
                 current_len = contracted_len;
             }
 
-            // After d contractions, result is a scalar in the appropriate buffer.
-            out[row] = if d % 2 == 0 { buf_b[0] } else { buf_a[0] };
+            // After d contractions, result is a scalar in the last-written buffer.
+            out[row] = if src_is_a { buf_a[0] } else { buf_b[0] };
         }
         out
     }

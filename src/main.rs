@@ -2631,8 +2631,11 @@ fn run_predict_binomial_location_scale(
     let saved_loc_link = saved_link_kind.ok_or_else(|| {
         "binomial-location-scale model is missing link state/metadata".to_string()
     })?;
-    let sigma = eta_noise.mapv(f64::exp);
-    let dsigma = sigma.clone();
+    let sigma = eta_noise.mapv(crate::families::sigma_link::safe_exp);
+    let dsigma = eta_noise.mapv(|eta| {
+        let jet = crate::families::sigma_link::exp_sigma_jet1_scalar(eta);
+        jet.d1
+    });
     let q0 = Array1::from_iter(
         eta_t
             .iter()
