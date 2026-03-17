@@ -18,7 +18,7 @@ use crate::construction::kronecker_product;
 use crate::custom_family::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
-    ExactNewtonOuterObjective, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    ExactNewtonOuterObjective, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{
@@ -4499,7 +4499,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         name: "eta".to_string(),
         design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
         offset: offset.to_owned(),
-        penalties: retained_penalties.clone(),
+        penalties: retained_penalties.iter().cloned().map(PenaltyMatrix::Dense).collect(),
         nullspace_dims: retained_nullspace_dims.clone(),
         initial_log_lambdas: Array1::from_vec(retained_log_lambdas.clone()),
         initial_beta: Some(baseline.fit.beta.clone()),
@@ -7000,7 +7000,7 @@ fn fit_bounded_term_collection_with_design(
         name: "eta".to_string(),
         design: DesignMatrix::Dense(Arc::new(designzeroed)),
         offset: offset.to_owned(),
-        penalties: fit_penalties.clone(),
+        penalties: fit_penalties.iter().cloned().map(PenaltyMatrix::Dense).collect(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas,
         initial_beta: Some(initial_beta),

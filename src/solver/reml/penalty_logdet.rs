@@ -556,7 +556,7 @@ mod tests {
     /// Two-penalty case: S(ρ₁,ρ₂) = diag(e^ρ₁, e^ρ₂).
     #[test]
     fn test_two_penalty_logdet() {
-        let rho = [1.0, -0.5];
+        let rho = [1.0_f64, -0.5];
         let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
         let s1 = array![[1.0, 0.0], [0.0, 0.0]];
         let s2 = array![[0.0, 0.0], [0.0, 1.0]];
@@ -678,7 +678,7 @@ mod tests {
         // log|S|₊ = log(s₁) + log(s₂) = const, so ∂_ψ L = 0.
         let s1 = 3.0_f64;
         let s2 = 1.0_f64;
-        let psi = 0.5;
+        let psi = 0.5_f64;
         let c = psi.cos();
         let s = psi.sin();
 

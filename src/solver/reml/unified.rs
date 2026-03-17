@@ -4858,26 +4858,9 @@ impl HessianOperator for SparseCholeskyOperator {
     }
 
     fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-        // Takahashi fast path: tr(H⁻¹ A H⁻¹ B) = tr(Z A Z B) where Z = H⁻¹
-        // For full dense matrices: Z_full * A is p×p, then element-wise contract
-        // with (Z_full * B)^T.  This is O(p³) but avoids 2p column solves.
-        if let Some(ref taka) = self.takahashi {
-            let p = a.nrows();
-            // Build Z as dense p×p from Takahashi lookups
-            let mut z = Array2::<f64>::zeros((p, p));
-            for i in 0..p {
-                for j in i..p {
-                    let val = taka.get(i, j);
-                    z[[i, j]] = val;
-                    z[[j, i]] = val;
-                }
-            }
-            let za = z.dot(a);
-            let zb = z.dot(b);
-            // tr(ZA * ZB) = sum_ij (ZA)_ij * (ZB^T)_ij = sum_ij (ZA)_ij * (ZB)_ji
-            return (&za * &zb.t()).sum();
-        }
-        // Fallback: default trait implementation via solve_multi
+        // For general dense matrices, column solves are better than materializing
+        // full Z from Takahashi (O(p * nnz) vs O(p³)). Takahashi cross-traces
+        // are only used for block-local operators via trace_hinv_operator_cross.
         let solved_a = self.solve_multi(a);
         let solved_b = self.solve_multi(b);
         (&solved_a.t() * &solved_b).sum()
@@ -4888,32 +4871,9 @@ impl HessianOperator for SparseCholeskyOperator {
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> f64 {
-        // Takahashi fast path for block-local operator
-        if let Some(ref taka) = self.takahashi {
-            if let Some((b_local, b_start, b_end)) = op.block_local_data() {
-                let p = matrix.nrows();
-                // Build full Z from Takahashi
-                let mut z = Array2::<f64>::zeros((p, p));
-                for i in 0..p {
-                    for j in i..p {
-                        let val = taka.get(i, j);
-                        z[[i, j]] = val;
-                        z[[j, i]] = val;
-                    }
-                }
-                let za = z.dot(matrix);
-                // ZB is only nonzero in columns b_start..b_end
-                let z_block_cols = z.slice(ndarray::s![.., b_start..b_end]);
-                let zb_partial = z_block_cols.dot(b_local); // p × p_block
-                // tr(ZA * ZB) = sum_i sum_j (ZA)_{ij} * (ZB)_{ji}
-                // (ZB)_{ji} nonzero only for i in b_start..b_end, so restrict
-                // to rows b_start..b_end of ZA.
-                let za_rows = za.slice(ndarray::s![b_start..b_end, ..]); // p_block × p
-                // tr = sum_{local_i, j} za_rows[local_i, j] * zb_partial[j, local_i]
-                //    = (za_rows ⊙ zb_partial^T).sum()
-                return (&za_rows * &zb_partial.t()).sum();
-            }
-        }
+        // For mixed dense-matrix × block-local-operator, column solves are
+        // still better than materializing full Z. Only use Takahashi when both
+        // sides are block-local (handled in trace_hinv_operator_cross).
         self.trace_hinv_matrix_operator_cross_exact(matrix, op)
     }
 
@@ -4936,25 +4896,8 @@ impl HessianOperator for SparseCholeskyOperator {
                     // tr(ZA * ZB) = sum_ij (ZA)_ij * (ZB^T)_ij
                     return (&za * &zb.t()).sum();
                 }
-                // Different blocks: materialize full Z, exploit block sparsity
-                // of A (cols a_start..a_end) and B (cols b_start..b_end).
-                let p = self.n_dim;
-                let mut z = Array2::<f64>::zeros((p, p));
-                for i in 0..p {
-                    for j in i..p {
-                        let val = taka.get(i, j);
-                        z[[i, j]] = val;
-                        z[[j, i]] = val;
-                    }
-                }
-                let z_a_cols = z.slice(ndarray::s![.., a_start..a_end]);
-                let za_partial = z_a_cols.dot(a_local); // p × p_a
-                let z_b_cols = z.slice(ndarray::s![.., b_start..b_end]);
-                let zb_partial = z_b_cols.dot(b_local); // p × p_b
-                // tr(ZA * ZB) = sum_{i in B-block, j in A-block} (ZA)_{ij} * (ZB)_{ji}
-                let za_b_rows = za_partial.slice(ndarray::s![b_start..b_end, ..]); // p_b × p_a
-                let zb_a_rows = zb_partial.slice(ndarray::s![a_start..a_end, ..]); // p_a × p_b
-                return (&za_b_rows * &zb_a_rows.t()).sum();
+                // Different blocks: column solves are better than materializing
+                // full p×p Z. Fall through to exact path.
             }
         }
         self.trace_hinv_operator_cross_exact(left, right)
