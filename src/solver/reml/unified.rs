@@ -1507,86 +1507,6 @@ impl PenaltyCoordinate {
         }
     }
 
-    /// Returns the block-local scaled penalty matrix (p_block × p_block) along
-    /// with the embedding range, WITHOUT materializing into total_dim × total_dim.
-    /// For DenseRoot (full-rank, no block structure), returns (matrix, 0, p).
-    pub fn scaled_block_local(&self, scale: f64) -> (Array2<f64>, usize, usize) {
-        match self {
-            Self::DenseRoot(root) => {
-                let mut out = root.t().dot(root);
-                out *= scale;
-                let p = out.nrows();
-                (out, 0, p)
-            }
-            Self::BlockRoot {
-                root, start, end, ..
-            } => {
-                let mut block = root.t().dot(root);
-                block *= scale;
-                (block, *start, *end)
-            }
-        }
-    }
-
-    /// Whether this coordinate has block structure (not full-rank dense).
-    pub fn is_block_local(&self) -> bool {
-        matches!(self, Self::BlockRoot { .. })
-    }
-
-    /// Apply λ_k S_k to a vector v without materializing the full matrix.
-    /// For BlockRoot: extracts v[start..end], multiplies by local S_k, embeds result.
-    pub fn scaled_matvec(&self, v: &Array1<f64>, scale: f64) -> Array1<f64> {
-        match self {
-            Self::DenseRoot(root) => {
-                let root_v = root.dot(v);
-                let mut out = root.t().dot(&root_v);
-                out *= scale;
-                out
-            }
-            Self::BlockRoot {
-                root, start, end, ..
-            } => {
-                let mut out = Array1::zeros(v.len());
-                let v_block = v.slice(ndarray::s![*start..*end]);
-                let root_v = root.dot(&v_block);
-                let mut block_result = root.t().dot(&root_v);
-                block_result *= scale;
-                out.slice_mut(ndarray::s![*start..*end])
-                    .assign(&block_result);
-                out
-            }
-        }
-    }
-
-    /// Compute tr(M · λ_k S_k) where M is given as a dense matrix, without
-    /// materializing λ_k S_k to full total_dim × total_dim.
-    /// For BlockRoot: only reads M[start..end, start..end].
-    pub fn trace_with_dense(&self, m: &Array2<f64>, scale: f64) -> f64 {
-        match self {
-            Self::DenseRoot(root) => {
-                // tr(M · (scale · R'R)) = scale · tr(M R' R) = scale · Σ (R M R')_{ii}
-                // = scale · ‖R M^{1/2}‖_F^2 ... but simpler: scale · tr((RM) R')
-                let rm = root.dot(m);
-                scale
-                    * rm.iter()
-                        .zip(root.iter())
-                        .map(|(&a, &b)| a * b)
-                        .sum::<f64>()
-            }
-            Self::BlockRoot {
-                root, start, end, ..
-            } => {
-                let m_block = m.slice(ndarray::s![*start..*end, *start..*end]);
-                let rm = root.dot(&m_block);
-                scale
-                    * rm.iter()
-                        .zip(root.iter())
-                        .map(|(&a, &b)| a * b)
-                        .sum::<f64>()
-            }
-        }
-    }
-
     pub fn scaled_operator<'a>(
         &'a self,
         scale: f64,
@@ -1709,7 +1629,7 @@ pub(crate) fn exact_intersection_nullity(
         let shared: Vec<usize> = s
             .iter()
             .enumerate()
-            .filter(|(_, &sv)| sv > SHARED_DIR_THRESHOLD)
+            .filter(|(_, sv)| **sv > SHARED_DIR_THRESHOLD)
             .map(|(i, _)| i)
             .collect();
 
@@ -6342,7 +6262,7 @@ mod tests {
             firth_logdet: 0.0,
             firth_op: None,
             n_observations: n,
-            nullspace_dim: (p - penalty_rank) as f64,
+            nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,

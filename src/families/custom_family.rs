@@ -146,7 +146,7 @@ impl PenaltyMatrix {
     pub fn quadratic_form(&self, beta: &Array1<f64>) -> f64 {
         match self {
             Self::Dense(m) => beta.dot(&m.dot(beta)),
-            Self::KroneckerFactored { left, right } => {
+            Self::KroneckerFactored { .. } => {
                 let sv = self.dot(beta);
                 beta.dot(&sv)
             }
@@ -1919,8 +1919,7 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                 .map(|gid| ((gid, info.implicit_axis), idx))
         })
         .collect();
-    Ok(Some(
-        info_list
+    let collected: Result<Vec<CustomFamilyBlockPsiDerivative>, String> = info_list
             .into_iter()
             .enumerate()
             .map(|(psi_idx, info)| {
@@ -2028,7 +2027,7 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                         }
                     }
                 }
-                CustomFamilyBlockPsiDerivative {
+                Ok(CustomFamilyBlockPsiDerivative {
                     penalty_index: Some(info.penalty_index),
                     x_psi: x_full,
                     s_psi: Array2::<f64>::zeros((0, 0)),
@@ -2039,10 +2038,10 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                     implicit_operator: design_operator,
                     implicit_axis: info.implicit_axis,
                     implicit_group_id: info.aniso_group_id,
-                }
+                })
             })
-            .collect(),
-    ))
+            .collect();
+    Ok(Some(collected?))
 }
 
 #[derive(Clone)]
@@ -6019,20 +6018,6 @@ fn assemble_block_local_s_psi_psi(
     }
 }
 
-/// Embed a block-local matrix (p_block × p_block) into the full joint
-/// coefficient space (total × total) at the block's parameter range.
-fn embed_block_local_matrix(
-    local: &Array2<f64>,
-    start: usize,
-    end: usize,
-    total: usize,
-) -> Array2<f64> {
-    let mut full = Array2::<f64>::zeros((total, total));
-    full.slice_mut(ndarray::s![start..end, start..end])
-        .assign(local);
-    full
-}
-
 /// Build `HyperCoord` objects for ψ (custom family) hyperparameters.
 ///
 /// Converts family-provided (a^ℓ, q, L) objects and penalty derivatives
@@ -6224,8 +6209,6 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         end: usize,
         /// Unscaled penalty matrix S_k for use with `PenaltyPseudologdet::rho_tau_hessian_component`.
         s_k_unscaled: Array2<f64>,
-        /// Current λ_k = exp(ρ_k).
-        lambda_k: f64,
     }
 
     // Build the psi coordinate cache once. These block-local S_psi matrices are
@@ -6260,14 +6243,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let (start, end) = ranges_arc[block_idx];
         for penalty_idx in 0..count {
             let s_k_unscaled = specs_arc[block_idx].penalties[penalty_idx].to_dense();
-            let lambda_k = per_block[block_idx][penalty_idx].exp();
             rho_penalty_cache.push(RhoPenaltyCacheEntry {
                 block_idx,
                 penalty_idx,
                 start,
                 end,
                 s_k_unscaled,
-                lambda_k,
             });
         }
     }
@@ -8824,8 +8805,8 @@ mod tests {
             name: "wiggle".to_string(),
             design: wiggle_block.design.clone(),
             offset: wiggle_block.offset.clone(),
-            penalties: wiggle_block.penalties.clone(),
-            nullspace_dims: vec![],
+            penalties: wiggle_block.penalties.iter().map(|p| PenaltyMatrix::Dense(p.clone())).collect(),
+            nullspace_dims: wiggle_block.nullspace_dims.clone(),
             initial_log_lambdas: array![0.1],
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
         };

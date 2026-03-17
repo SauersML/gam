@@ -5,7 +5,7 @@ use ad_trait::function_engine::FunctionEngine;
 use autodiff::{F1, Float, diff};
 use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState,
+    ParameterBlockState, PenaltyMatrix,
 };
 use gam::families::custom_family::{
     CustomFamilyBlockPsiDerivative, evaluate_custom_family_joint_hyper,
@@ -398,7 +398,8 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             name: "shape".to_string(),
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+            nullspace_dims: vec![0],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         },
@@ -407,6 +408,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         },
@@ -479,7 +481,8 @@ fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space()
         name: "constrained".to_string(),
         design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
         offset: array![0.0],
-        penalties: vec![Array2::eye(1)],
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![0],
         initial_log_lambdas: array![0.0],
         initial_beta: Some(array![lower]),
     }];
@@ -551,7 +554,8 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             name: "shape".to_string(),
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+            nullspace_dims: vec![0],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         },
@@ -560,6 +564,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         },

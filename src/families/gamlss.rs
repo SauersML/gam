@@ -272,7 +272,7 @@ impl ParameterBlockInput {
             penalties: self
                 .penalties
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: self.nullspace_dims,
             initial_log_lambdas,
@@ -682,15 +682,18 @@ fn gaussian_location_scalewarm_start(
     let betamu = if let Some(beta) = mean_beta_hint {
         beta.clone()
     } else {
-        solve_penalizedweighted_projection(
-            &mu_block.design,
-            &mu_block.offset,
-            y,
-            weights,
-            &mu_block.penalties,
-            &mu_block.initial_log_lambdas,
-            ridge_floor,
-        )?
+        {
+            let dense_penalties: Vec<Array2<f64>> = mu_block.penalties.iter().map(|p| p.to_dense()).collect();
+            solve_penalizedweighted_projection(
+                &mu_block.design,
+                &mu_block.offset,
+                y,
+                weights,
+                &dense_penalties,
+                &mu_block.initial_log_lambdas,
+                ridge_floor,
+            )?
+        }
     };
     let mut mu_hat = mu_block.design.matrixvectormultiply(&betamu);
     mu_hat += &mu_block.offset;
@@ -713,15 +716,18 @@ fn gaussian_location_scalewarm_start(
     } else {
         let eta_sigma = sigma_hat.ln();
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
-        solve_penalizedweighted_projection(
-            &log_sigma_block.design,
-            &log_sigma_block.offset,
-            &sigma_target,
-            weights,
-            &log_sigma_block.penalties,
-            &log_sigma_block.initial_log_lambdas,
-            ridge_floor,
-        )?
+        {
+            let dense_penalties: Vec<Array2<f64>> = log_sigma_block.penalties.iter().map(|p| p.to_dense()).collect();
+            solve_penalizedweighted_projection(
+                &log_sigma_block.design,
+                &log_sigma_block.offset,
+                &sigma_target,
+                weights,
+                &dense_penalties,
+                &log_sigma_block.initial_log_lambdas,
+                ridge_floor,
+            )?
+        }
     };
     Ok((betamu, beta_log_sigma, sigma_hat))
 }
@@ -809,12 +815,7 @@ fn binomial_location_scalewarm_start(
             name: threshold_block.name.clone(),
             design: threshold_block.design.clone(),
             offset: threshold_block.offset.clone(),
-            penalties: threshold_block
-                .penalties
-                .iter()
-                .cloned()
-                .map(PenaltyMatrix::Dense)
-                .collect(),
+            penalties: threshold_block.penalties.clone(),
             nullspace_dims: vec![],
             initial_log_lambdas: threshold_block.initial_log_lambdas.clone(),
             initial_beta: mean_beta_hint.cloned(),
@@ -823,12 +824,7 @@ fn binomial_location_scalewarm_start(
             name: log_sigma_block.name.clone(),
             design: log_sigma_block.design.clone(),
             offset: log_sigma_block.offset.clone(),
-            penalties: log_sigma_block
-                .penalties
-                .iter()
-                .cloned()
-                .map(PenaltyMatrix::Dense)
-                .collect(),
+            penalties: log_sigma_block.penalties.clone(),
             nullspace_dims: vec![],
             initial_log_lambdas: log_sigma_block.initial_log_lambdas.clone(),
             initial_beta: noise_beta_hint.cloned(),
@@ -1158,23 +1154,6 @@ fn single_block_spatial_dims_per_term(
                 .unwrap_or(1)
         })
         .collect()
-}
-
-fn enforce_spatial_psi_sum_to_zero(
-    theta: &mut Array1<f64>,
-    rho_dim: usize,
-    dims_per_term: &[usize],
-) {
-    let mut offset = rho_dim;
-    for &dim in dims_per_term {
-        if dim > 1 {
-            let mean = theta.slice(s![offset..offset + dim]).mean().unwrap_or(0.0);
-            for axis in 0..dim {
-                theta[offset + axis] -= mean;
-            }
-        }
-        offset += dim;
-    }
 }
 
 pub struct BinomialLocationScaleFitResult {
@@ -1509,7 +1488,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             penalties: mean_design
                 .global_penalties()
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: mean_log_lambdas,
@@ -1530,7 +1509,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             penalties: noise_design
                 .global_penalties()
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: noise_log_lambdas,
@@ -1671,7 +1650,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             penalties: mean_design
                 .global_penalties()
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
@@ -1692,7 +1671,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             penalties: noise_design
                 .global_penalties()
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
@@ -1727,7 +1706,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                     .penalties
                     .iter()
                     .cloned()
-                    .map(PenaltyMatrix::Dense)
+                    .map(|m| PenaltyMatrix::Dense(m))
                     .collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
@@ -1865,7 +1844,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             penalties: mean_design
                 .global_penalties()
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
@@ -1877,7 +1856,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             offset: Array1::zeros(self.y.len()),
             penalties: log_sigma_penalties
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
@@ -2028,7 +2007,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             penalties: mean_design
                 .global_penalties()
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
@@ -2040,7 +2019,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             offset: Array1::zeros(self.y.len()),
             penalties: log_sigma_penalties
                 .into_iter()
-                .map(PenaltyMatrix::Dense)
+                .map(|m| PenaltyMatrix::Dense(m))
                 .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
@@ -2075,7 +2054,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                     .penalties
                     .iter()
                     .cloned()
-                    .map(PenaltyMatrix::Dense)
+                    .map(|m| PenaltyMatrix::Dense(m))
                     .collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
@@ -2407,11 +2386,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 eta_block: ParameterBlockInput {
                     design: DesignMatrix::Dense(Arc::new(pilot_design.design.clone())),
                     offset: Array1::zeros(y.len()),
-                    penalties: pilot_design
-                        .global_penalties()
-                        .into_iter()
-                        .map(PenaltyMatrix::Dense)
-                        .collect(),
+                    penalties: pilot_design.global_penalties(),
                     nullspace_dims: vec![],
                     initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
                     initial_beta: Some(pilot_fit.beta.clone()),
@@ -2512,11 +2487,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 name: "eta".to_string(),
                 design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y_cloned.len()),
-                penalties: design
-                    .global_penalties()
-                    .into_iter()
-                    .map(PenaltyMatrix::Dense)
-                    .collect(),
+                penalties: design.global_penalties().into_iter().map(|m| PenaltyMatrix::Dense(m)).collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),
@@ -2525,7 +2496,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 name: "wiggle".to_string(),
                 design: wiggle_design.clone(),
                 offset: wiggle_offset.clone(),
-                penalties: wiggle_penalties.clone(),
+                penalties: wiggle_penalties.iter().map(|p| PenaltyMatrix::Dense(p.clone())).collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 initial_beta: wiggle_initial_beta.clone(),
@@ -2682,11 +2653,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             eta_block: ParameterBlockInput {
                 design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y.len()),
-                penalties: design
-                    .global_penalties()
-                    .into_iter()
-                    .map(PenaltyMatrix::Dense)
-                    .collect(),
+                penalties: design.global_penalties(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
                 initial_beta: Some(pilot_beta),

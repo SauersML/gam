@@ -235,8 +235,6 @@ fn manualrow_geometry(psi: f64, p: &CombinedLocationScaleParams) -> ManualRowGeo
     let z1_a = p.z1_1 + p.z1_2 * psi;
     let z2_a = p.z2_1 + p.z2_2 * psi;
     let x_a = p.x_1 + p.x_2 * psi;
-    let z1_ab = p.z1_2;
-    let z2_ab = p.z2_2;
     let a = p.beta_1 * z1 + p.beta_2 * z2;
     let a_a = p.beta_1 * z1_a + p.beta_2 * z2_a;
     let ell = p.beta_ls * x;

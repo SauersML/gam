@@ -717,7 +717,7 @@ impl<'a> RemlState<'a> {
         );
         let pld = super::penalty_logdet::PenaltyPseudologdet::from_assembled(s_eval)
             .map_err(EstimationError::InvalidInput)?;
-        let s_k_unscaled: Vec<Array2<f64>> = self.s_full_list.clone();
+        let s_k_unscaled: Vec<Array2<f64>> = self.s_full_list.to_vec();
 
         let x_dense = self
             .x()

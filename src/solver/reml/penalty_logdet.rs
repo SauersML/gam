@@ -75,8 +75,6 @@ pub struct PenaltyPseudologdet {
     inv_evals_sq: Array1<f64>,
     /// Positive eigenspace rank.
     rank: usize,
-    /// Dimension of the full space.
-    p_dim: usize,
     /// log|S|₊ = Σ log σ_i for positive eigenvalues.
     value: f64,
 }
@@ -97,7 +95,6 @@ impl PenaltyPseudologdet {
                 u_null: None,
                 inv_evals_sq: Array1::zeros(0),
                 rank: 0,
-                p_dim: 0,
                 value: 0.0,
             });
         }
@@ -140,7 +137,6 @@ impl PenaltyPseudologdet {
                 u_null: None,
                 inv_evals_sq: Array1::zeros(0),
                 rank: 0,
-                p_dim: 0,
                 value: 0.0,
             });
         }
@@ -193,7 +189,6 @@ impl PenaltyPseudologdet {
                 u_null: None,
                 inv_evals_sq: Array1::zeros(0),
                 rank: 0,
-                p_dim: 0,
                 value: 0.0,
             });
         }
@@ -254,7 +249,6 @@ impl PenaltyPseudologdet {
             u_null,
             inv_evals_sq,
             rank,
-            p_dim,
             value,
         })
     }

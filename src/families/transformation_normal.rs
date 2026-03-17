@@ -119,14 +119,6 @@ pub struct TransformationNormalFamily {
     /// Response derivative basis: n × p_resp. Columns: [0, 1, dev'_1(y), ..., dev'_k(y)].
     response_deriv_basis: Array2<f64>,
 
-    // --- Response-direction knots and transform (stored for prediction) ---
-    /// B-spline knots for the response direction.
-    response_knots: Array1<f64>,
-    /// B-spline degree for the response direction.
-    response_degree: usize,
-    /// Nullspace transform for the deviation basis.
-    response_transform: Array2<f64>,
-
     // --- Covariate side (rebuilt on κ change) ---
     /// Number of covariate basis columns.
     p_cov: usize,
@@ -236,9 +228,6 @@ impl TransformationNormalFamily {
             x_deriv_kron,
             response_val_basis: resp_val,
             response_deriv_basis: resp_deriv,
-            response_knots: resp_knots,
-            response_degree: config.response_degree,
-            response_transform: resp_transform,
             p_cov,
             tensor_penalties,
             monotonicity_constraints,
@@ -339,9 +328,6 @@ impl TransformationNormalFamily {
             x_deriv_kron,
             response_val_basis,
             response_deriv_basis,
-            response_knots,
-            response_degree,
-            response_transform,
             p_cov,
             tensor_penalties,
             monotonicity_constraints,
@@ -380,53 +366,6 @@ impl TransformationNormalFamily {
     }
 
     // --- Internal helpers ---
-
-    /// Evaluate the response value basis at new response values using stored knots/transform.
-    fn evaluate_response_value_basis_at(
-        &self,
-        response: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let n = response.len();
-        let (raw_val, _) = create_basis::<Dense>(
-            response.view(),
-            KnotSource::Provided(self.response_knots.view()),
-            self.response_degree,
-            BasisOptions::value(),
-        )
-        .map_err(|e| e.to_string())?;
-        let dev_val = raw_val.as_ref().dot(&self.response_transform);
-        let dev_dim = dev_val.ncols();
-        let p_resp = 2 + dev_dim;
-        let mut basis = Array2::<f64>::zeros((n, p_resp));
-        basis.column_mut(0).fill(1.0);
-        basis.column_mut(1).assign(&response.view());
-        basis.slice_mut(s![.., 2..]).assign(&dev_val);
-        Ok(basis)
-    }
-
-    /// Evaluate the response derivative basis at new response values using stored knots/transform.
-    fn evaluate_response_deriv_basis_at(
-        &self,
-        response: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let n = response.len();
-        let (raw_d1, _) = create_basis::<Dense>(
-            response.view(),
-            KnotSource::Provided(self.response_knots.view()),
-            self.response_degree,
-            BasisOptions::first_derivative(),
-        )
-        .map_err(|e| e.to_string())?;
-        let dev_d1 = raw_d1.as_ref().dot(&self.response_transform);
-        let dev_dim = dev_d1.ncols();
-        let p_resp = 2 + dev_dim;
-        let mut basis = Array2::<f64>::zeros((n, p_resp));
-        // Column 0: d(1)/dy = 0
-        // Column 1: d(y)/dy = 1
-        basis.column_mut(1).fill(1.0);
-        basis.slice_mut(s![.., 2..]).assign(&dev_d1);
-        Ok(basis)
-    }
 
     /// Compute h and h' from the current coefficients.
     ///
