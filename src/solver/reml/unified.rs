@@ -224,6 +224,32 @@ pub trait HessianOperator: Send + Sync {
         self.trace_hinv_product(&full)
     }
 
+    /// tr(H⁻¹ A H⁻¹ A) for a block-local penalty matrix A embedded at [start..end].
+    ///
+    /// `block` is the p_block × p_block local penalty matrix and `scale` is the
+    /// smoothing parameter (λ_k). The full A = scale · embed(block, start, end).
+    ///
+    /// Default implementation materializes the full p×p matrix and delegates to
+    /// `trace_hinv_product_cross`. The `DenseSpectralOperator` override uses
+    /// W-factor slicing for O(rank × block_size × (block_size + p)) work.
+    fn trace_hinv_block_local_cross(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        let p = self.dim();
+        let bs = end - start;
+        let mut full = Array2::<f64>::zeros((p, p));
+        for i in 0..bs {
+            for j in 0..bs {
+                full[[start + i, start + j]] = scale * block[[i, j]];
+            }
+        }
+        self.trace_hinv_product_cross(&full, &full)
+    }
+
     /// Cross-trace for the logdet Hessian:
     /// `∂²_{ij} log|R_ε(H)| = tr(G_ε Ḧ_{ij}) + spectral_cross(Ḣ_i, Ḣ_j)`.
     ///
@@ -2757,7 +2783,8 @@ pub fn compute_firth_hessian_contribution(
     v_ks: &[Array1<f64>],
     h_k_matrices: &[Array2<f64>],
     a_k_betas: &[Array1<f64>],
-    a_k_matrices: &[Array2<f64>],
+    penalty_coords: &[PenaltyCoordinate],
+    lambdas: &[f64],
 ) -> Array2<f64> {
     let k = v_ks.len();
     let p = beta.len();
@@ -2794,7 +2821,7 @@ pub fn compute_firth_hessian_contribution(
             // B_{kl} = −β_{kl} where β_{kl} = H⁻¹(Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂)
             // is the second implicit mode response (reused from LAML computation).
             let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
-            rhs += &a_k_matrices[kk].dot(&v_ks[ll]);
+            rhs += &penalty_coords[kk].scaled_matvec(&v_ks[ll], lambdas[kk]);
             if kk == ll {
                 rhs -= &a_k_betas[kk];
             }
@@ -3489,7 +3516,7 @@ fn compute_outer_hessian(
     // ── Firth Hessian contribution (computed internally from firth_op) ──
     //
     // ∂²Φ/∂ρₖ∂ρₗ is computed using the precomputed v_ks, h_k_matrices,
-    // a_k_betas, and a_k_matrices that are already available. This replaces
+    // a_k_betas, and penalty_coords that are already available. This replaces
     // the formerly caller-injected Firth Hessian.
     if let Some(ref firth_op) = solution.firth_op {
         let fh = compute_firth_hessian_contribution(
@@ -3499,7 +3526,8 @@ fn compute_outer_hessian(
             &v_ks,
             &h_k_matrices,
             &a_k_betas,
-            &a_k_matrices,
+            &solution.penalty_coords,
+            lambdas,
         );
         let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
         sl += &fh;
@@ -3632,6 +3660,9 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         // Denominator: tr(H⁻¹ B_k H⁻¹ B_k)
         let denominator = if coord.uses_operator_fast_path() {
             trace_hinv_penalty_cross(hop, coord, lambdas[idx], coord, lambdas[idx])
+        } else if coord.is_block_local() {
+            let (block, start, end) = coord.scaled_block_local(1.0);
+            hop.trace_hinv_block_local_cross(&block, lambdas[idx], start, end)
         } else {
             let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
             hop.trace_hinv_product_cross(&a_k_matrix, &a_k_matrix)
@@ -3827,6 +3858,9 @@ pub fn compute_hybrid_efs_update(
         let trace_term = if coord.uses_operator_fast_path() {
             let op = coord.scaled_operator(lambdas[idx], None);
             hop.trace_hinv_operator(&op)
+        } else if coord.is_block_local() {
+            let (block, start, end) = coord.scaled_block_local(1.0);
+            hop.trace_hinv_block_local(&block, lambdas[idx], start, end)
         } else {
             let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
             hop.trace_hinv_h_k(&a_k_matrix, None)
@@ -3834,6 +3868,9 @@ pub fn compute_hybrid_efs_update(
         let numerator = 2.0 * a_k_eff - trace_term;
         let denominator = if coord.uses_operator_fast_path() {
             trace_hinv_penalty_cross(hop, coord, lambdas[idx], coord, lambdas[idx])
+        } else if coord.is_block_local() {
+            let (block, start, end) = coord.scaled_block_local(1.0);
+            hop.trace_hinv_block_local_cross(&block, lambdas[idx], start, end)
         } else {
             let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
             hop.trace_hinv_product_cross(&a_k_matrix, &a_k_matrix)
@@ -4647,6 +4684,35 @@ impl HessianOperator for DenseSpectralOperator {
                 .sum::<f64>()
     }
 
+    fn trace_hinv_block_local_cross(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        // tr(H⁻¹ A H⁻¹ A) where A = scale · embed(block, start, end).
+        //
+        // H⁻¹ = W W^T where W = U diag(1/√r_ε).
+        // Let W_block = W[start..end, :] (block_size × rank).
+        // C = scale · W_block^T · block  (rank × block_size).
+        // Then H⁻¹ A restricted to the block_size nonzero input columns gives
+        // the p × block_size matrix W·C, and:
+        //   tr(H⁻¹ A H⁻¹ A) = ||W C||_F^2 = tr(C^T W^T W C)
+        // Since W^T W = diag(1/r_ε), this is Σ_a (1/r_a) ||C[a,:]||^2.
+        let w_block = self.w_factor.slice(ndarray::s![start..end, ..]);
+        let c = w_block.t().dot(block).mapv(|v| v * scale); // rank × block_size
+        let rank = c.nrows();
+        let mut result = 0.0;
+        for a in 0..rank {
+            let inv_r = 1.0 / self.reg_eigenvalues[a];
+            let row = c.row(a);
+            let row_norm_sq: f64 = row.iter().map(|&v| v * v).sum();
+            result += inv_r * row_norm_sq;
+        }
+        result
+    }
+
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
         // Spectral divided-difference kernel:
         // result = Σ_{a,b} Γ_{ab} (Ḣ'_i)_{ab} (Ḣ'_j)_{ba}
@@ -5081,6 +5147,17 @@ impl HessianOperator for BlockCoupledOperator {
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
         self.inner.trace_logdet_hessian_cross(h_i, h_j)
+    }
+
+    fn trace_hinv_block_local_cross(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        self.inner
+            .trace_hinv_block_local_cross(block, scale, start, end)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
