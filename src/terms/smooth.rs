@@ -1907,6 +1907,7 @@ fn build_tensor_bspline_basis(
             nullspace_dim_hint: 0,
             source: PenaltySource::TensorGlobalRidge,
             normalization_scale: 1.0,
+            kronecker_factors: None,
         });
     }
 
@@ -3385,7 +3386,7 @@ fn fit_term_collection_on_realized_design(
     let base_fit_opts = adaptive_fit_options_base(options, design);
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
-            design.design.view(),
+            design.design.clone(),
             y,
             weights,
             offset,
@@ -4648,7 +4649,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .map_err(EstimationError::InvalidInput)?;
     let shared_y = Arc::new(y.to_owned());
     let sharedweights = Arc::new(weights.to_owned());
-    let shared_design = Arc::new(baseline.design.design.clone());
+    let shared_design = baseline.design.design.to_dense_arc();
     let shared_offset = Arc::new(offset.to_owned());
     let shared_runtime_caches = Arc::new(runtime_caches.to_vec());
     let shared_hyperspecs = Arc::new(hyperspecs.clone());
@@ -4689,7 +4690,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     }));
     let blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
+        design: baseline.design.design.clone(),
         offset: offset.to_owned(),
         penalties: retained_penalties
             .iter()
@@ -4954,7 +4955,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         base_family.with_adaptive_params(adaptive_params.clone(), Arc::new(fixed_total.clone()));
     let final_blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
+        design: baseline.design.design.clone(),
         offset: offset.to_owned(),
         penalties: vec![],
         nullspace_dims: vec![],
@@ -7111,7 +7112,8 @@ fn fit_bounded_term_collection_with_design(
         })
         .collect();
     let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
-    let fit_design = conditioning.apply_to_design(&design.design);
+    let dense_design = design.design.as_dense_cow();
+    let fit_design = conditioning.apply_to_design(&dense_design);
     let global_penalties = design.global_penalties();
     let fit_penalties = conditioning.transform_penalties_to_internal(&global_penalties);
     if design.linear_constraints.is_some() {
@@ -13720,7 +13722,7 @@ mod tests {
             sas_link_state: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(Array1::ones(n)),
-            design: Arc::new(baseline.design.design.clone()),
+            design: baseline.design.design.to_dense_arc(),
             offset: Arc::new(Array1::zeros(n)),
             linear_constraints: baseline.design.linear_constraints.clone(),
             runtime_caches: Arc::new(runtime_caches.clone()),
@@ -13733,7 +13735,7 @@ mod tests {
         };
         let blockspec = ParameterBlockSpec {
             name: "eta".to_string(),
-            design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
+            design: baseline.design.design.clone(),
             offset: Array1::zeros(n),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -13912,7 +13914,7 @@ mod tests {
             sas_link_state: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(Array1::ones(n)),
-            design: Arc::new(baseline.design.design.clone()),
+            design: baseline.design.design.to_dense_arc(),
             offset: Arc::new(Array1::zeros(n)),
             linear_constraints: baseline.design.linear_constraints.clone(),
             runtime_caches: Arc::new(runtime_caches.clone()),
@@ -13925,7 +13927,7 @@ mod tests {
         };
         let blockspec = ParameterBlockSpec {
             name: "eta".to_string(),
-            design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
+            design: baseline.design.design.clone(),
             offset: Array1::zeros(n),
             penalties: vec![],
             nullspace_dims: vec![],
