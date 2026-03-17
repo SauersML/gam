@@ -9906,10 +9906,11 @@ where
     )
     .map_err(|e| e.to_string())?;
 
-    let mut theta_star = result.rho;
+    // Drop the ClosureObjective to release the mutable borrow on state.
+    drop(obj);
 
-    // No sum-to-zero enforcement: ψ coordinates are unconstrained during
-    // optimization. apply_tospec decomposes into (ψ̄, η) at the end.
+    let theta_star = result.rho;
+
     state.cache.ensure_theta(&theta_star)?;
 
     let resolved_specs: Vec<TermCollectionSpec> = collect_specs(&state.cache);
