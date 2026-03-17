@@ -1956,6 +1956,10 @@ pub fn precompute_reparam_invariant_from_canonical(
         qs_local: Array2<f64>,
         max_bal: f64,
         penalty_indices: Vec<usize>,
+        /// Column offset of this block's penalized directions within global Q_pen.
+        pen_col_offset: usize,
+        /// Column offset of this block's null directions within global Q_null.
+        null_col_offset: usize,
     }
 
     let mut block_results = Vec::with_capacity(block_groups.len());
@@ -1987,6 +1991,8 @@ pub fn precompute_reparam_invariant_from_canonical(
                 qs_local: Array2::eye(block_dim),
                 max_bal: 0.0,
                 penalty_indices,
+                pen_col_offset: 0, // set later
+                null_col_offset: 0, // set later
             });
             continue;
         }
@@ -2048,18 +2054,28 @@ pub fn precompute_reparam_invariant_from_canonical(
             qs_local,
             max_bal,
             penalty_indices,
+            pen_col_offset: 0, // set later
+            null_col_offset: 0, // set later
         });
     }
 
-    // Assemble global Q_pen and Q_null.
+    // Compute column offsets for each block in the global Q_pen / Q_null layout.
     let total_pen_rank: usize = block_results.iter().map(|br| br.q_pen_local.ncols()).sum();
     let total_null: usize =
         block_results.iter().map(|br| br.q_null_local.ncols()).sum() + uncovered_cols.len();
+    {
+        let mut pen_off = 0usize;
+        let mut null_off = 0usize;
+        for br in &mut block_results {
+            br.pen_col_offset = pen_off;
+            br.null_col_offset = null_off;
+            pen_off += br.q_pen_local.ncols();
+            null_off += br.q_null_local.ncols();
+        }
+    }
 
     let mut q_pen = Array2::zeros((p, total_pen_rank));
     let mut q_null = Array2::zeros((p, total_null));
-    let mut pen_col = 0usize;
-    let mut null_col = 0usize;
 
     for br in &block_results {
         let start = br.col_range.start;
@@ -2068,17 +2084,16 @@ pub fn precompute_reparam_invariant_from_canonical(
         let null_r = br.q_null_local.ncols();
         if pen_r > 0 {
             q_pen
-                .slice_mut(s![start..(start + bd), pen_col..(pen_col + pen_r)])
+                .slice_mut(s![start..(start + bd), br.pen_col_offset..(br.pen_col_offset + pen_r)])
                 .assign(&br.q_pen_local);
-            pen_col += pen_r;
         }
         if null_r > 0 {
             q_null
-                .slice_mut(s![start..(start + bd), null_col..(null_col + null_r)])
+                .slice_mut(s![start..(start + bd), br.null_col_offset..(br.null_col_offset + null_r)])
                 .assign(&br.q_null_local);
-            null_col += null_r;
         }
     }
+    let mut null_col = block_results.iter().map(|br| br.q_null_local.ncols()).sum::<usize>();
     for &j in &uncovered_cols {
         q_null[[j, null_col]] = 1.0;
         null_col += 1;
@@ -2086,30 +2101,41 @@ pub fn precompute_reparam_invariant_from_canonical(
 
     let split = SubspaceSplit { q_pen, q_null };
 
-    // Assemble global transformed roots.
-    // For each penalty, extract the block columns from its global root and
-    // multiply by the local Q_s. Since Q_s is block-diagonal, this only
-    // touches the relevant block columns.
+    // Assemble global transformed roots in the Q_s-rotated coordinate system.
+    //
+    // The consumer (`stable_reparameterization_with_invariant`) reads columns
+    // `0..total_pen_rank` as the penalized subspace and `total_pen_rank..p` as
+    // the null subspace. So for each block b we must scatter:
+    //   - the first pen_rank_b local columns → global columns pen_col_offset_b .. + pen_rank_b
+    //   - the remaining null_rank_b local columns → global columns (total_pen_rank + null_col_offset_b) ..
     let mut rs_transformed_base = vec![Array2::zeros((0, p)); m];
 
     for br in &block_results {
-        let start = br.col_range.start;
-        let end = br.col_range.end;
+        let pen_r = br.q_pen_local.ncols();
+        let null_r = br.q_null_local.ncols();
 
         for &pi in &br.penalty_indices {
             let cp = &penalties[pi];
-            // Extract local root: root is rank_k × block_dim.
             let local_root = &cp.root;
             let rank_k = local_root.nrows();
 
             // Transform: rs_local_transformed = local_root * qs_local
+            // Columns [0..pen_r] are penalized, [pen_r..block_dim] are null.
             let rs_transformed_local = local_root.dot(&br.qs_local);
 
-            // Embed into global coordinates: rank_k × p.
+            // Scatter into Q_s-rotated global layout.
             let mut rs_global = Array2::zeros((rank_k, p));
-            rs_global
-                .slice_mut(s![.., start..end])
-                .assign(&rs_transformed_local);
+            if pen_r > 0 {
+                rs_global
+                    .slice_mut(s![.., br.pen_col_offset..(br.pen_col_offset + pen_r)])
+                    .assign(&rs_transformed_local.slice(s![.., ..pen_r]));
+            }
+            if null_r > 0 {
+                let null_global_start = total_pen_rank + br.null_col_offset;
+                rs_global
+                    .slice_mut(s![.., null_global_start..(null_global_start + null_r)])
+                    .assign(&rs_transformed_local.slice(s![.., pen_r..(pen_r + null_r)]));
+            }
             rs_transformed_base[pi] = rs_global;
         }
     }
