@@ -1970,4 +1970,9 @@ pub(crate) struct RemlState<'a> {
     /// Shared with `OuterConfig.screening_cap` so the screening loop can
     /// set/clear it atomically without accessing `RemlState` directly.
     pub(crate) screening_max_inner_iterations: Arc<AtomicUsize>,
+
+    /// When set, the penalties have Kronecker (tensor-product) structure and
+    /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.
+    /// Populated via `set_kronecker_penalty_system` after construction.
+    pub(crate) kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
 }

@@ -4133,11 +4133,14 @@ fn gaussian_joint_first_directionalweights(
         let wi = scalars.w[i];
         let mi = scalars.m[i];
         let ni = scalars.n[i];
+        let ki = scalars.kappa[i];
         let dm = dotmu[i];
-        let de = dot_eta[i];
-        w_u[i].write(-2.0 * wi * de);
-        c_u[i].write(-2.0 * wi * dm - 4.0 * mi * de);
-        d_u[i].write(-4.0 * mi * dm - 4.0 * ni * de);
+        // κ-scaled log-sigma direction: σ is frozen on the safe_exp plateau.
+        let sde = ki * dot_eta[i];
+        w_u[i].write(-2.0 * wi * sde);
+        // Cross block carries overall κ; scale-scale block carries κ².
+        c_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde));
+        d_u[i].write(ki * ki * (-4.0 * mi * dm - 4.0 * ni * sde));
     }
     let w_u = unsafe { w_u.assume_init() };
     let c_u = unsafe { c_u.assume_init() };
@@ -4160,14 +4163,20 @@ fn gaussian_jointsecond_directionalweights(
         let wi = scalars.w[i];
         let mi = scalars.m[i];
         let ni = scalars.n[i];
+        let ki = scalars.kappa[i];
         let dmu = dotmu_u[i];
-        let deu = dot_eta_u[i];
         let dmv = dotmuv[i];
-        let dev = dot_etav[i];
-        w_uv[i].write(4.0 * wi * deu * dev);
-        c_uv[i].write(4.0 * wi * (dmu * dev + dmv * deu) + 8.0 * mi * deu * dev);
+        // κ-scaled log-sigma directions.
+        let sdeu = ki * dot_eta_u[i];
+        let sdev = ki * dot_etav[i];
+        w_uv[i].write(4.0 * wi * sdeu * sdev);
+        // Cross block carries overall κ; scale-scale block carries κ².
+        c_uv[i].write(ki * (4.0 * wi * (dmu * sdev + dmv * sdeu) + 8.0 * mi * sdeu * sdev));
         d_uv[i].write(
-            4.0 * wi * dmu * dmv + 8.0 * mi * (dmu * dev + dmv * deu) + 8.0 * ni * deu * dev,
+            ki * ki
+                * (4.0 * wi * dmu * dmv
+                    + 8.0 * mi * (dmu * sdev + dmv * sdeu)
+                    + 8.0 * ni * sdeu * sdev),
         );
     }
     let w_uv = unsafe { w_uv.assume_init() };
@@ -4197,20 +4206,24 @@ fn gaussian_joint_psi_firstweights(
         let wi = scalars.w[i];
         let mi = scalars.m[i];
         let ni = scalars.n[i];
+        let ki = scalars.kappa[i];
         let ma = mu_a[i];
         let ea = eta_a[i];
+        // κ-scaled log-sigma direction.
+        let sea = ki * ea;
         let smu = -mi;
-        let sls = 1.0 - ni;
+        let sls = ki * (1.0 - ni);
         scoremu[i].write(smu);
         score_ls[i].write(sls);
-        dscoremu[i].write(wi * ma + 2.0 * mi * ea);
-        dscore_ls[i].write(2.0 * mi * ma + 2.0 * ni * ea);
+        dscoremu[i].write(wi * ma + 2.0 * mi * sea);
+        dscore_ls[i].write(ki * (2.0 * mi * ma + 2.0 * ni * sea));
         hmumu[i].write(wi);
-        hmu_ls[i].write(2.0 * mi);
-        h_ls_ls[i].write(2.0 * ni);
-        dhmumu[i].write(-2.0 * wi * ea);
-        dhmu_ls[i].write(-2.0 * wi * ma - 4.0 * mi * ea);
-        dh_ls_ls[i].write(-4.0 * mi * ma - 4.0 * ni * ea);
+        // Cross block carries overall κ; scale-scale block carries κ².
+        hmu_ls[i].write(2.0 * ki * mi);
+        h_ls_ls[i].write(2.0 * ki * ki * ni);
+        dhmumu[i].write(-2.0 * wi * sea);
+        dhmu_ls[i].write(ki * (-2.0 * wi * ma - 4.0 * mi * sea));
+        dh_ls_ls[i].write(ki * ki * (-4.0 * mi * ma - 4.0 * ni * sea));
         objective_psirow[i].write(smu * ma + sls * ea);
     }
     unsafe {

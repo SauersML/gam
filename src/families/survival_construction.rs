@@ -22,10 +22,11 @@ use crate::families::gamlss::{
     WiggleBlockConfig, buildwiggle_block_input_from_knots, buildwiggle_block_input_from_seed,
     monotone_wiggle_basis_with_derivative_order,
 };
-use crate::families::survival_location_scale::SurvivalCovariateTermBlockTemplate;
+use crate::families::survival_location_scale::{
+    ResidualDistribution, SurvivalCovariateTermBlockTemplate,
+};
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::DesignMatrix;
-use crate::survival_location_scale::ResidualDistribution;
 
 // ---------------------------------------------------------------------------
 // Types
