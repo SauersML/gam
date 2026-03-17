@@ -10768,7 +10768,12 @@ impl BinomialLocationScaleFamily {
         for i in 0..n {
             let q = core.q0[i];
             let r = 1.0 / core.sigma[i].max(1e-12);
-            let q_psi = -r * z_t[i] - q * z_ls[i];
+            // s = (dσ/dη_ls) / σ: equals 1 when sigma is actively changing
+            // (standard exp link), 0 on the safe_exp plateau (|η_ls| ≥ 700).
+            // Every eta_ls chain-rule term must be scaled by s.
+            let s = core.dsigma_deta[i] / core.sigma[i].max(1e-12);
+            let sz = s * z_ls[i];
+            let q_psi = -r * z_t[i] - q * sz;
             let (a, b, c) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
@@ -10777,14 +10782,14 @@ impl BinomialLocationScaleFamily {
                 &self.link_kind,
             );
             r_t[i] = -a * r;
-            r_ls[i] = -a * q;
-            dr_t[i] = -b * q_psi * r + a * r * z_ls[i];
+            r_ls[i] = -a * q * s;
+            dr_t[i] = -b * q_psi * r + a * r * sz;
             dr_ls[i] = -(a + q * b) * q_psi;
             h_tt[i] = b * r * r;
             h_tl[i] = r * (a + q * b);
             h_ll[i] = q * (a + q * b);
-            dh_tt[i] = r * r * (c * q_psi - 2.0 * b * z_ls[i]);
-            dh_tl[i] = r * ((2.0 * b + c * q) * q_psi - (a + q * b) * z_ls[i]);
+            dh_tt[i] = r * r * (c * q_psi - 2.0 * b * sz);
+            dh_tl[i] = r * ((2.0 * b + c * q) * q_psi - (a + q * b) * sz);
             dh_ll[i] = (a + 3.0 * q * b + q * q * c) * q_psi;
             objective_psi += r_t[i] * z_t[i] + r_ls[i] * z_ls[i];
         }
