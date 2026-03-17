@@ -27,6 +27,7 @@ use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::probability::normal_pdf;
+use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -41,6 +42,8 @@ use std::sync::Arc;
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
+const WIGGLE_MONOTONICITY_GUARD: f64 = 1e-8;
+const WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL: usize = 8;
 
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
@@ -403,6 +406,71 @@ pub fn buildwiggle_block_input_from_seed(
         cfg.double_penalty,
     )?;
     Ok((block, knots))
+}
+
+pub(crate) fn wiggle_monotonicity_collocation_points(knots: &Array1<f64>) -> Array1<f64> {
+    let mut breaks: Vec<f64> = knots.iter().copied().filter(|v| v.is_finite()).collect();
+    breaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    breaks.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
+    if breaks.len() <= 1 {
+        return Array1::from_vec(breaks);
+    }
+
+    let mut grid = Vec::new();
+    for (idx, window) in breaks.windows(2).enumerate() {
+        let left = window[0];
+        let right = window[1];
+        if (right - left).abs() <= 1e-12 {
+            continue;
+        }
+        if idx == 0 {
+            grid.push(left);
+        }
+        for step in 1..=WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL {
+            let frac = step as f64 / WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL as f64;
+            grid.push(left + frac * (right - left));
+        }
+    }
+    grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    grid.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
+    Array1::from_vec(grid)
+}
+
+pub(crate) fn wiggle_monotonicity_linear_constraints(
+    knots: &Array1<f64>,
+    degree: usize,
+    beta_dim: usize,
+) -> Result<LinearInequalityConstraints, String> {
+    let grid = wiggle_monotonicity_collocation_points(knots);
+    let (basis, _) = create_basis::<Dense>(
+        grid.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::first_derivative(),
+    )
+    .map_err(|e| format!("failed to build wiggle monotonicity derivative basis: {e}"))?;
+    let full = basis.as_ref().clone();
+    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
+        .map_err(|e| format!("failed to build wiggle monotonicity transform: {e}"))?;
+    if full.ncols() != z.nrows() {
+        return Err(format!(
+            "wiggle monotonicity basis/constraint mismatch: basis has {} columns but transform has {} rows",
+            full.ncols(),
+            z.nrows()
+        ));
+    }
+    let a = full.dot(&z);
+    if a.ncols() != beta_dim {
+        return Err(format!(
+            "wiggle monotonicity constraint width mismatch: basis has {} columns but wiggle block has {} coefficients",
+            a.ncols(),
+            beta_dim
+        ));
+    }
+    Ok(LinearInequalityConstraints {
+        a,
+        b: Array1::from_elem(grid.len(), WIGGLE_MONOTONICITY_GUARD - 1.0),
+    })
 }
 
 fn append_selected_wiggle_penalty_orders(
@@ -7687,6 +7755,22 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         true
     }
 
+    fn block_linear_constraints(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        if block_idx != Self::BLOCK_WIGGLE {
+            return Ok(None);
+        }
+        Ok(Some(wiggle_monotonicity_linear_constraints(
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            spec.design.ncols(),
+        )?))
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
             return Err(format!(
@@ -8450,6 +8534,22 @@ impl BinomialMeanWiggleFamily {
 impl CustomFamily for BinomialMeanWiggleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
+    }
+
+    fn block_linear_constraints(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        if block_idx != Self::BLOCK_WIGGLE {
+            return Ok(None);
+        }
+        Ok(Some(wiggle_monotonicity_linear_constraints(
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            spec.design.ncols(),
+        )?))
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -9432,6 +9532,7 @@ impl CustomFamily for GammaLogFamily {
                     m,
                     phi_gamma,
                     self.weights[i],
+                    jet,
                 );
                 // Cross-check Gaussian-log and Gaussian-inverse specializations
                 // using the current observation's coordinates. These exercise the
@@ -9443,6 +9544,7 @@ impl CustomFamily for GammaLogFamily {
                     m,
                     phi_gamma,
                     self.weights[i],
+                    jet,
                 );
                 let (w_gi, _, _) = fisher_weight_dispatch(
                     WeightFamily::Gaussian,
@@ -9451,6 +9553,7 @@ impl CustomFamily for GammaLogFamily {
                     m,
                     phi_gamma,
                     self.weights[i],
+                    jet,
                 );
                 let (w_obs_gl, _, _) = observed_weight_dispatch(
                     WeightFamily::Gaussian,
@@ -14327,6 +14430,22 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         true
     }
 
+    fn block_linear_constraints(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        if block_idx != Self::BLOCK_WIGGLE {
+            return Ok(None);
+        }
+        Ok(Some(wiggle_monotonicity_linear_constraints(
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            spec.design.ncols(),
+        )?))
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
             return Err(format!(
@@ -16353,6 +16472,7 @@ mod tests {
             log_step: std::f64::consts::LN_2,
             min_length_scale: 0.1,
             max_length_scale: 2.0,
+            pilot_subsample_threshold: 10_000,
         }
     }
 

@@ -154,6 +154,50 @@ pub fn dense_to_sparse(
     })
 }
 
+fn embed_dense_block_to_sparse(
+    local: &Array2<f64>,
+    row_offset: usize,
+    col_offset: usize,
+    nrows: usize,
+    ncols: usize,
+    tol: f64,
+) -> Result<SparseColMat<usize, f64>, EstimationError> {
+    let mut triplets = Vec::new();
+    for row in 0..local.nrows() {
+        for col in 0..local.ncols() {
+            let value = local[[row, col]];
+            if value.abs() > tol {
+                triplets.push(Triplet::new(row_offset + row, col_offset + col, value));
+            }
+        }
+    }
+    SparseColMat::try_new_from_triplets(nrows, ncols, &triplets).map_err(|_| {
+        EstimationError::InvalidInput("failed to embed dense block as sparse CSC".to_string())
+    })
+}
+
+fn embed_dense_block_to_sparse_symmetric_upper(
+    local: &Array2<f64>,
+    offset: usize,
+    total_dim: usize,
+    tol: f64,
+) -> Result<SparseColMat<usize, f64>, EstimationError> {
+    let mut triplets = Vec::new();
+    for row in 0..local.nrows() {
+        for col in row..local.ncols() {
+            let value = local[[row, col]];
+            if value.abs() > tol {
+                triplets.push(Triplet::new(offset + row, offset + col, value));
+            }
+        }
+    }
+    SparseColMat::try_new_from_triplets(total_dim, total_dim, &triplets).map_err(|_| {
+        EstimationError::InvalidInput(
+            "failed to embed dense symmetric block as sparse upper-triangle CSC".to_string(),
+        )
+    })
+}
+
 /// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.
 ///
 /// This encoding is required by sparse SPD routines in this module that interpret
@@ -674,6 +718,70 @@ pub fn build_sparse_penalty_blocks(
             p_end,
             positive_eigenvalues: Arc::new(positive_eigenvalues),
             block_support_strict,
+            s_k_sparse,
+            s_k_block_dense: Arc::new(s_k_block_dense),
+            s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),
+            r_k_sparse,
+            r_krows,
+        });
+    }
+    Ok(Some(blocks))
+}
+
+/// Build sparse penalty blocks from canonical penalties, avoiding redundant
+/// block-range scanning and eigendecomposition. Uses the pre-computed col_range
+/// and positive_eigenvalues from `CanonicalPenalty`.
+pub fn build_sparse_penalty_blocks_from_canonical(
+    penalties: &[crate::construction::CanonicalPenalty],
+    p: usize,
+) -> Result<Option<Vec<SparsePenaltyBlock>>, EstimationError> {
+    if penalties.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    // Check for overlapping ranges.
+    let mut sorted_ranges: Vec<(usize, usize, usize)> = penalties
+        .iter()
+        .enumerate()
+        .map(|(i, cp)| (i, cp.col_range.start, cp.col_range.end))
+        .collect();
+    sorted_ranges.sort_by_key(|&(_, start, _)| start);
+    for pair in sorted_ranges.windows(2) {
+        let (_, _, end_left) = pair[0];
+        let (_, start_right, _) = pair[1];
+        if end_left > start_right {
+            return Ok(None);
+        }
+    }
+
+    let mut blocks = Vec::with_capacity(penalties.len());
+    for (term_index, cp) in penalties.iter().enumerate() {
+        let p_start = cp.col_range.start;
+        let p_end = cp.col_range.end;
+        let s_k_block_dense = cp.local_penalty();
+        let s_k_sparse =
+            embed_dense_block_to_sparse_symmetric_upper(&s_k_block_dense, p_start, p, ZERO_TOL)?;
+        let r_k_sparse = embed_dense_block_to_sparse(&cp.root, 0, p_start, cp.rank(), p, ZERO_TOL)?;
+        let r_krows = Arc::new(r_k_sparse.as_ref().to_row_major().map_err(|_| {
+            EstimationError::InvalidInput("failed to convert penalty root to CSR".to_string())
+        })?);
+
+        let mut s_k_block_upper_entries = Vec::<(usize, usize, f64)>::new();
+        for col in 0..s_k_block_dense.ncols() {
+            for row in 0..=col {
+                let value = s_k_block_dense[[row, col]];
+                if value.abs() > ZERO_TOL {
+                    s_k_block_upper_entries.push((row, col, value));
+                }
+            }
+        }
+
+        blocks.push(SparsePenaltyBlock {
+            term_index,
+            p_start,
+            p_end,
+            positive_eigenvalues: Arc::new(cp.positive_eigenvalues.clone()),
+            block_support_strict: true,
             s_k_sparse,
             s_k_block_dense: Arc::new(s_k_block_dense),
             s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),

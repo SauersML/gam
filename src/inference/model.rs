@@ -2,6 +2,7 @@ use crate::basis::{
     BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
 };
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
+use crate::families::gamlss::wiggle_monotonicity_collocation_points;
 use crate::inference::predict::{
     BernoulliMarginalSlopePredictor, BinomialLocationScalePredictor,
     GaussianLocationScalePredictor, PredictableModel, StandardPredictor, SurvivalPredictor,
@@ -326,6 +327,36 @@ pub struct SavedPredictionRuntime {
 }
 
 impl SavedLinkWiggleRuntime {
+    fn validate_global_monotonicity(&self) -> Result<(), String> {
+        let knots = Array1::from_vec(self.knots.clone());
+        let grid = wiggle_monotonicity_collocation_points(&knots);
+        if grid.is_empty() {
+            return Ok(());
+        }
+        let d_constrained = self.constrained_basis(&grid, BasisOptions::first_derivative())?;
+        let beta_link_wiggle = Array1::from_vec(self.beta.clone());
+        let dq_dq0 = d_constrained.dot(&beta_link_wiggle) + 1.0;
+        if let Some((idx, value)) = dq_dq0.iter().copied().enumerate().find(|(_, v)| *v <= 0.0) {
+            return Err(format!(
+                "saved link-wiggle is not monotone on its knot domain at collocation row {idx}: dq/dq0={value:.3e} <= 0"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_monotone_derivative(&self, q0: &Array1<f64>) -> Result<Array1<f64>, String> {
+        self.validate_global_monotonicity()?;
+        let d_constrained = self.constrained_basis(q0, BasisOptions::first_derivative())?;
+        let beta_link_wiggle = Array1::from_vec(self.beta.clone());
+        let dq_dq0 = d_constrained.dot(&beta_link_wiggle) + 1.0;
+        if let Some((idx, value)) = dq_dq0.iter().copied().enumerate().find(|(_, v)| *v <= 0.0) {
+            return Err(format!(
+                "saved link-wiggle is not monotone at row {idx}: dq/dq0={value:.3e} <= 0"
+            ));
+        }
+        Ok(dq_dq0)
+    }
+
     fn constrained_basis(
         &self,
         q0: &Array1<f64>,
@@ -364,6 +395,7 @@ impl SavedLinkWiggleRuntime {
     }
 
     pub fn design(&self, q0: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.validate_global_monotonicity()?;
         self.constrained_basis(q0, BasisOptions::value())
     }
 
@@ -380,15 +412,56 @@ impl SavedLinkWiggleRuntime {
     }
 
     pub fn apply(&self, q0: &Array1<f64>) -> Result<Array1<f64>, String> {
-        let xwiggle = self.design(q0)?;
+        self.validate_monotone_derivative(q0)?;
+        let xwiggle = self.constrained_basis(q0, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
         Ok(q0 + &xwiggle.dot(&beta_link_wiggle))
     }
 
     pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, String> {
-        let d_constrained = self.constrained_basis(q0, BasisOptions::first_derivative())?;
-        let beta_link_wiggle = Array1::from_vec(self.beta.clone());
-        Ok((d_constrained.dot(&beta_link_wiggle) + 1.0).mapv(|v| v.clamp(-1e6, 1e6)))
+        self.validate_monotone_derivative(q0)
+    }
+}
+
+impl SavedBaselineTimeWiggleRuntime {
+    pub fn validate_global_monotonicity(&self) -> Result<(), String> {
+        let knots = Array1::from_vec(self.knots.clone());
+        let grid = wiggle_monotonicity_collocation_points(&knots);
+        if grid.is_empty() {
+            return Ok(());
+        }
+        let (basis, _) = create_basis::<Dense>(
+            grid.view(),
+            KnotSource::Provided(knots.view()),
+            self.degree,
+            BasisOptions::first_derivative(),
+        )
+        .map_err(|e| format!("failed to evaluate saved baseline-timewiggle derivative basis: {e}"))?;
+        let full = basis.as_ref().clone();
+        let (z, _) = compute_geometric_constraint_transform(&knots, self.degree, 2)
+            .map_err(|e| format!("failed to reconstruct saved baseline-timewiggle transform: {e}"))?;
+        if full.ncols() != z.nrows() {
+            return Err(format!(
+                "saved baseline-timewiggle derivative basis/constraint mismatch: basis has {} columns but transform has {} rows",
+                full.ncols(),
+                z.nrows()
+            ));
+        }
+        let constrained = full.dot(&z);
+        if constrained.ncols() != self.beta.len() {
+            return Err(format!(
+                "saved baseline-timewiggle dimension mismatch: coefficients have {} entries but basis has {} columns",
+                self.beta.len(),
+                constrained.ncols()
+            ));
+        }
+        let dq_dq0 = constrained.dot(&Array1::from_vec(self.beta.clone())) + 1.0;
+        if let Some((idx, value)) = dq_dq0.iter().copied().enumerate().find(|(_, v)| *v <= 0.0) {
+            return Err(format!(
+                "saved baseline-timewiggle is not monotone on its knot domain at collocation row {idx}: 1+w'={value:.3e} <= 0"
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -24,7 +24,8 @@ pub(crate) mod unified;
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectionalHyperParam, EvalShared, FirthDenseOperator, LinkFunction, RemlConfig, RemlState,
+        DirectionalHyperParam, EvalShared, FirthDenseOperator, GlmLikelihoodFamily, LinkFunction,
+        RemlConfig, RemlState,
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
@@ -125,7 +126,7 @@ mod tests {
         // Tight inner tolerance: the envelope theorem requires an exact inner
         // P-IRLS optimum; 1e-10 leaves enough residual gradient to cause ~12%
         // V_tau mismatch on this small (n=8) logistic problem.
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-14, false);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-14, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
@@ -287,7 +288,7 @@ mod tests {
             [0.0, 0.0, 0.0, 0.3],
         ];
         let offset = Array1::<f64>::zeros(y.len());
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-9, true);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-9, true);
         let p = x.ncols();
         let state = RemlState::newwith_offset(
             y.view(),
@@ -392,7 +393,7 @@ mod tests {
         // Rank-deficient penalty with clear nullspace on first coordinate.
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
         let rho = array![0.0];
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, false);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-10, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
@@ -474,7 +475,7 @@ mod tests {
         )
         .expect("single-penalty hyper direction");
         let rho = array![0.0];
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clearwarm_start();
         let g = single_directional_tau_gradient(&state, &rho, hyper)
@@ -507,7 +508,7 @@ mod tests {
         )
         .expect("single-penalty hyper direction");
         let rho = array![0.0];
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clearwarm_start();
         let g = single_directional_tau_gradient(&state, &rho, hyper)
@@ -533,7 +534,7 @@ mod tests {
             [1.0, 1.7, -0.6],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clearwarm_start();
         let rho = array![0.0];
@@ -596,7 +597,7 @@ mod tests {
             [1.0, 1.7, -0.6],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clearwarm_start();
         let rho = array![0.0];
@@ -694,7 +695,7 @@ mod tests {
             [1.0, 0.9, -0.2],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let theta = array![0.0, 0.0];
         let hyper_dirs = vec![
@@ -732,7 +733,7 @@ mod tests {
             [1.0, 1.7, -0.6],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
-        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
+        let cfg = RemlConfig::external(GlmLikelihoodFamily::BinomialLogit, 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clearwarm_start();
         let rho = array![0.0];

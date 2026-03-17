@@ -2316,25 +2316,16 @@ fn run_predict_survival(
         } else {
             dense_raw_sigma
         };
-        let eta_t = threshold_design.design.dot(&beta_threshold);
-        let eta_ls = DesignMatrix::Dense(Arc::new(prepared_sigma_design.clone()))
-            .matrixvectormultiply(&beta_log_sigma);
-        let sigma = eta_ls.mapv(f64::exp);
         let beta_link_wiggle = model
             .beta_link_wiggle
             .as_ref()
             .map(|v| Array1::from_vec(v.clone()));
-        let x_link_wiggle = if beta_link_wiggle.is_some() {
-            let q0 = Array1::from_iter(
-                eta_t
-                    .iter()
-                    .zip(sigma.iter())
-                    .map(|(&t, &s)| -t / s.max(1e-12)),
+        if beta_link_wiggle.is_some() {
+            return Err(
+                "saved survival location-scale models with linkwiggle are unsupported because the historical fit path optimized the wrong surrogate model"
+                    .to_string(),
             );
-            saved_linkwiggle_design(&q0, model)?.map(|d| DesignMatrix::Dense(Arc::new(d)))
-        } else {
-            None
-        };
+        }
         let pred_input = SurvivalLocationScalePredictInput {
             x_time_exit: x_time_exit,
             eta_time_offset_exit: eta_offset_exit.clone(),
@@ -2342,7 +2333,7 @@ fn run_predict_survival(
             eta_threshold_offset: Array1::zeros(n),
             x_log_sigma: DesignMatrix::Dense(Arc::new(prepared_sigma_design)),
             eta_log_sigma_offset: Array1::zeros(n),
-            x_link_wiggle: x_link_wiggle.clone(),
+            x_link_wiggle: None,
             inverse_link: survival_inverse_link.clone(),
         };
         let fit_stub = gam::survival_location_scale::survival_fit_from_parts(
@@ -2350,11 +2341,11 @@ fn run_predict_survival(
                 beta_time: beta_time.clone(),
                 beta_threshold: beta_threshold.clone(),
                 beta_log_sigma: beta_log_sigma.clone(),
-                beta_link_wiggle: beta_link_wiggle.clone(),
+                beta_link_wiggle: None,
                 lambdas_time: Array1::zeros(0),
                 lambdas_threshold: Array1::zeros(0),
                 lambdas_log_sigma: Array1::zeros(0),
-                lambdas_linkwiggle: beta_link_wiggle.as_ref().map(|_| Array1::zeros(0)),
+                lambdas_linkwiggle: None,
                 log_likelihood: 0.0,
                 reml_score: 0.0,
                 stable_penalty_term: 0.0,
@@ -4285,6 +4276,180 @@ struct SurvivalTimeWiggleBuild {
     degree: usize,
 }
 
+const SURVIVAL_MONOTONICITY_COLLOCATION_POINTS: usize = 8;
+const SURVIVAL_MONOTONICITY_UNIFORM_SEGMENTS: usize = 32;
+
+fn build_survival_timewiggle_derivative_design(
+    eta_exit: &Array1<f64>,
+    derivative_exit: &Array1<f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+) -> Result<Array2<f64>, String> {
+    let (basis_derivative, _) = create_basis::<Dense>(
+        eta_exit.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::first_derivative(),
+    )
+    .map_err(|e| format!("failed to build baseline-timewiggle derivative basis: {e}"))?;
+    let full_derivative = basis_derivative.as_ref();
+    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
+        .map_err(|e| format!("failed to build baseline-timewiggle constraint transform: {e}"))?;
+    if full_derivative.ncols() != z.nrows() {
+        return Err(format!(
+            "baseline-timewiggle derivative basis/constraint mismatch: basis has {} columns but transform has {} rows",
+            full_derivative.ncols(),
+            z.nrows()
+        ));
+    }
+    let mut design_derivative_exit = full_derivative.dot(&z);
+    for i in 0..design_derivative_exit.nrows() {
+        let chain = derivative_exit[i];
+        for j in 0..design_derivative_exit.ncols() {
+            design_derivative_exit[[i, j]] *= chain;
+        }
+    }
+    Ok(design_derivative_exit)
+}
+
+fn resolved_survival_time_basis_config(
+    time_build: &SurvivalTimeBuildOutput,
+) -> Result<SurvivalTimeBasisConfig, String> {
+    match time_build.basisname.as_str() {
+        "none" => Ok(SurvivalTimeBasisConfig::None),
+        "linear" => Ok(SurvivalTimeBasisConfig::Linear),
+        "bspline" => Ok(SurvivalTimeBasisConfig::BSpline {
+            degree: time_build
+                .degree
+                .ok_or_else(|| "survival time basis is missing bspline degree".to_string())?,
+            knots: Array1::from_vec(
+                time_build
+                    .knots
+                    .clone()
+                    .ok_or_else(|| "survival time basis is missing bspline knots".to_string())?,
+            ),
+            smooth_lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+        }),
+        "ispline" => Ok(SurvivalTimeBasisConfig::ISpline {
+            degree: time_build
+                .degree
+                .ok_or_else(|| "survival time basis is missing ispline degree".to_string())?,
+            knots: Array1::from_vec(
+                time_build
+                    .knots
+                    .clone()
+                    .ok_or_else(|| "survival time basis is missing ispline knots".to_string())?,
+            ),
+            keep_cols: time_build.keep_cols.clone().ok_or_else(|| {
+                "survival time basis is missing ispline keep_cols".to_string()
+            })?,
+            smooth_lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+        }),
+        other => Err(format!("unsupported survival time basis '{other}'")),
+    }
+}
+
+fn survival_monotonicity_log_grid(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_build: &SurvivalTimeBuildOutput,
+    include_uniform_density: bool,
+) -> Vec<f64> {
+    let min_log = age_entry
+        .iter()
+        .chain(age_exit.iter())
+        .map(|&t| t.max(SURVIVAL_TIME_FLOOR).ln())
+        .fold(f64::INFINITY, f64::min);
+    let max_log = age_entry
+        .iter()
+        .chain(age_exit.iter())
+        .map(|&t| t.max(SURVIVAL_TIME_FLOOR).ln())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !min_log.is_finite() || !max_log.is_finite() {
+        return Vec::new();
+    }
+    if (max_log - min_log).abs() <= 1e-12 {
+        return vec![min_log];
+    }
+
+    let mut breaks = vec![min_log, max_log];
+    if let Some(knots) = time_build.knots.as_ref() {
+        for &k in knots {
+            if k.is_finite() && k > min_log && k < max_log {
+                breaks.push(k);
+            }
+        }
+    }
+    if include_uniform_density || breaks.len() <= 2 {
+        for idx in 1..SURVIVAL_MONOTONICITY_UNIFORM_SEGMENTS {
+            let frac = idx as f64 / SURVIVAL_MONOTONICITY_UNIFORM_SEGMENTS as f64;
+            breaks.push(min_log + frac * (max_log - min_log));
+        }
+    }
+    breaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    breaks.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
+
+    let mut grid = Vec::new();
+    for (idx, window) in breaks.windows(2).enumerate() {
+        let left = window[0];
+        let right = window[1];
+        if idx == 0 {
+            grid.push(left);
+        }
+        for step in 1..=SURVIVAL_MONOTONICITY_COLLOCATION_POINTS {
+            let frac = step as f64 / SURVIVAL_MONOTONICITY_COLLOCATION_POINTS as f64;
+            grid.push(left + frac * (right - left));
+        }
+    }
+    grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    grid.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
+    grid
+}
+
+fn build_survival_time_monotonicity_collocation(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_build: &SurvivalTimeBuildOutput,
+    baseline_cfg: &SurvivalBaselineConfig,
+    timewiggle: Option<(&Array1<f64>, usize)>,
+) -> Result<(Array2<f64>, Array1<f64>), String> {
+    let log_grid =
+        survival_monotonicity_log_grid(age_entry, age_exit, time_build, timewiggle.is_some());
+    if log_grid.is_empty() {
+        return Ok((Array2::zeros((0, 0)), Array1::zeros(0)));
+    }
+    let grid_times = Array1::from_iter(log_grid.into_iter().map(f64::exp));
+    let time_cfg = resolved_survival_time_basis_config(time_build)?;
+    let collocation_time = build_survival_time_basis(
+        &grid_times,
+        &grid_times,
+        time_cfg,
+        None,
+    )?;
+    let (_, eta_grid, derivative_grid_offset) =
+        build_survival_baseline_offsets(&grid_times, &grid_times, baseline_cfg)?;
+    let mut derivative_design = collocation_time.x_derivative_time;
+    if let Some((wiggle_knots, wiggle_degree)) = timewiggle {
+        let wiggle_derivative = build_survival_timewiggle_derivative_design(
+            &eta_grid,
+            &derivative_grid_offset,
+            wiggle_knots,
+            wiggle_degree,
+        )?;
+        let p_base = derivative_design.ncols();
+        let p_w = wiggle_derivative.ncols();
+        let mut combined = Array2::<f64>::zeros((derivative_design.nrows(), p_base + p_w));
+        combined
+            .slice_mut(s![.., 0..p_base])
+            .assign(&derivative_design);
+        combined
+            .slice_mut(s![.., p_base..p_base + p_w])
+            .assign(&wiggle_derivative);
+        derivative_design = combined;
+    }
+    Ok((derivative_design, derivative_grid_offset))
+}
+
 fn build_survival_timewiggle_from_baseline(
     eta_entry: &Array1<f64>,
     eta_exit: &Array1<f64>,
@@ -4324,32 +4489,8 @@ fn build_survival_timewiggle_from_baseline(
             DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
             _ => return Err("baseline-timewiggle exit design must be dense".to_string()),
         };
-    let knot_arr = knots.clone();
-    let (basis_derivative, _) = create_basis::<Dense>(
-        eta_exit.view(),
-        KnotSource::Provided(knot_arr.view()),
-        cfg.degree,
-        BasisOptions::first_derivative(),
-    )
-    .map_err(|e| format!("failed to build baseline-timewiggle derivative basis: {e}"))?;
-    let full_derivative = basis_derivative.as_ref();
-    let (z, _) = compute_geometric_constraint_transform(&knot_arr, cfg.degree, 2)
-        .map_err(|e| format!("failed to build baseline-timewiggle constraint transform: {e}"))?;
-    if full_derivative.ncols() != z.nrows() {
-        return Err(format!(
-            "baseline-timewiggle derivative basis/constraint mismatch: basis has {} columns but transform has {} rows",
-            full_derivative.ncols(),
-            z.nrows()
-        ));
-    }
-    let constrained_derivative = full_derivative.dot(&z);
-    let mut design_derivative_exit = constrained_derivative;
-    for i in 0..n {
-        let chain = derivative_exit[i];
-        for j in 0..design_derivative_exit.ncols() {
-            design_derivative_exit[[i, j]] *= chain;
-        }
-    }
+    let design_derivative_exit =
+        build_survival_timewiggle_derivative_design(eta_exit, derivative_exit, &knots, cfg.degree)?;
     Ok(SurvivalTimeWiggleBuild {
         design_entry,
         design_exit,
@@ -4432,6 +4573,9 @@ fn saved_linkwiggle_basis(
         Some(runtime) => match basis_options.derivative_order {
             0 => Ok(Some(runtime.design(q0)?)),
             1 => {
+                runtime
+                    .derivative_q0(q0)
+                    .map(|_| ())?;
                 let knot_arr = Array1::from_vec(runtime.knots.clone());
                 let (basis, _) = create_basis::<Dense>(
                     q0.view(),
@@ -4513,11 +4657,18 @@ fn saved_baseline_timewiggle_components(
     match model.saved_baseline_time_wiggle()? {
         None => Ok(None),
         Some(runtime) => {
-            let knots = Array1::from_vec(runtime.knots);
+            runtime.validate_global_monotonicity()?;
+            let crate::inference::model::SavedBaselineTimeWiggleRuntime {
+                knots,
+                degree,
+                beta,
+                ..
+            } = runtime;
+            let knots = Array1::from_vec(knots);
             let entry = match buildwiggle_block_input_from_knots(
                 eta_entry.view(),
                 &knots,
-                runtime.degree,
+                degree,
                 2,
                 false,
             )?
@@ -4529,7 +4680,7 @@ fn saved_baseline_timewiggle_components(
             let exit = match buildwiggle_block_input_from_knots(
                 eta_exit.view(),
                 &knots,
-                runtime.degree,
+                degree,
                 2,
                 false,
             )?
@@ -4538,7 +4689,7 @@ fn saved_baseline_timewiggle_components(
                 DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
                 _ => return Err("saved baseline-timewiggle exit design must be dense".to_string()),
             };
-            let betaw = runtime.beta;
+            let betaw = beta;
             if entry.ncols() != betaw.len() || exit.ncols() != betaw.len() {
                 return Err(format!(
                     "saved baseline-timewiggle dimension mismatch: coefficients have {} entries but basis has entry={} exit={}",
@@ -4547,31 +4698,24 @@ fn saved_baseline_timewiggle_components(
                     exit.ncols()
                 ));
             }
-            let (basis_derivative, _) = create_basis::<Dense>(
-                eta_exit.view(),
-                KnotSource::Provided(knots.view()),
-                runtime.degree,
-                BasisOptions::first_derivative(),
+            let derivative = build_survival_timewiggle_derivative_design(
+                eta_exit,
+                derivative_exit,
+                &knots,
+                degree,
             )
             .map_err(|e| {
-                format!("failed to evaluate saved baseline-timewiggle derivative basis: {e}")
+                e.replace(
+                    "build baseline-timewiggle",
+                    "evaluate saved baseline-timewiggle",
+                )
             })?;
-            let (z, _) = compute_geometric_constraint_transform(&knots, runtime.degree, 2)
-                .map_err(|e| {
-                    format!("failed to reconstruct saved baseline-timewiggle transform: {e}")
-                })?;
-            let mut derivative = basis_derivative.as_ref().dot(&z);
             if derivative.ncols() != betaw.len() {
                 return Err(format!(
                     "saved baseline-timewiggle derivative dimension mismatch: coefficients have {} entries but derivative basis has {} columns",
                     betaw.len(),
                     derivative.ncols()
                 ));
-            }
-            for i in 0..derivative.nrows() {
-                for j in 0..derivative.ncols() {
-                    derivative[[i, j]] *= derivative_exit[i];
-                }
             }
             Ok(Some((entry, exit, derivative)))
         }
@@ -4892,6 +5036,21 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_args.ridge_lambda,
         )),
     )?;
+    let time_monotonicity_collocation = if learn_timewiggle
+        || !survival_basis_supports_structural_monotonicity(&time_build.basisname)
+    {
+        Some(build_survival_time_monotonicity_collocation(
+            &age_entry,
+            &age_exit,
+            &time_build,
+            &baseline_cfg,
+            timewiggle_build
+                .as_ref()
+                .map(|wiggle| (&wiggle.knots, wiggle.degree)),
+        )?)
+    } else {
+        None
+    };
     progress.advance_workflow(2);
     if likelihood_mode != SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
         require_structural_survival_time_basis(&time_build.basisname, "survival fitting")?;
@@ -4972,9 +5131,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     design_entry: time_design_entry.clone(),
                     design_exit: time_design_exit.clone(),
                     design_derivative_exit: time_design_derivative_exit.clone(),
+                    constraint_design_derivative: time_monotonicity_collocation
+                        .as_ref()
+                        .map(|(rows, _)| rows.clone()),
                     offset_entry: eta_offset_entry.clone(),
                     offset_exit: eta_offset_exit.clone(),
                     derivative_offset_exit: derivative_offset_exit.clone(),
+                    constraint_derivative_offset: time_monotonicity_collocation
+                        .as_ref()
+                        .map(|(_, offsets)| offsets.clone()),
                     penalties: time_penalties.clone(),
                     nullspace_dims: time_nullspace_dims.clone(),
                     initial_log_lambdas: time_initial_log_lambdas.clone(),
@@ -5194,9 +5359,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 design_entry: time_design_entry.clone(),
                 design_exit: time_design_exit.clone(),
                 design_derivative_exit: time_design_derivative_exit.clone(),
+                constraint_design_derivative: time_monotonicity_collocation
+                    .as_ref()
+                    .map(|(rows, _)| rows.clone()),
                 offset_entry: eta_offset_entry.clone(),
                 offset_exit: eta_offset_exit.clone(),
                 derivative_offset_exit: derivative_offset_exit.clone(),
+                constraint_derivative_offset: time_monotonicity_collocation
+                    .as_ref()
+                    .map(|(_, offsets)| offsets.clone()),
                 penalties: time_penalties.clone(),
                 nullspace_dims: time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -5302,6 +5473,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
+    if let Some((time_rows, offsets)) = time_monotonicity_collocation.as_ref() {
+        let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
+        full_rows
+            .slice_mut(s![.., 0..time_rows.ncols()])
+            .assign(time_rows);
+        model
+            .set_monotonicity_constraint_rows(full_rows, offsets.clone())
+            .map_err(|e| format!("failed to install survival monotonicity collocation: {e}"))?;
+    }
     if likelihood_mode != SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
         model
             .set_structural_monotonicity(true, p_time_total)
@@ -5809,6 +5989,26 @@ fn run_sample_survival(
         &derivative_offset_exit,
         model,
     )?;
+    let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
+    let saved_timewiggle_knots = saved_timewiggle_runtime
+        .as_ref()
+        .map(|wiggle| Array1::from_vec(wiggle.knots.clone()));
+    let time_monotonicity_collocation = if saved_timewiggle_runtime.is_some()
+        || !survival_basis_supports_structural_monotonicity(&time_build.basisname)
+    {
+        Some(build_survival_time_monotonicity_collocation(
+            &age_entry,
+            &age_exit,
+            &time_build,
+            &baseline_cfg,
+            saved_timewiggle_runtime
+                .as_ref()
+                .zip(saved_timewiggle_knots.as_ref())
+                .map(|(wiggle, knots)| (knots, wiggle.degree)),
+        )?)
+    } else {
+        None
+    };
     let p_time = time_build.x_exit_time.ncols();
     let p_timewiggle = saved_timewiggle
         .as_ref()
@@ -5955,6 +6155,15 @@ fn run_sample_survival(
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
+    if let Some((time_rows, offsets)) = time_monotonicity_collocation.as_ref() {
+        let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
+        full_rows
+            .slice_mut(s![.., 0..time_rows.ncols()])
+            .assign(time_rows);
+        model_surv
+            .set_monotonicity_constraint_rows(full_rows, offsets.clone())
+            .map_err(|e| format!("failed to install survival monotonicity collocation: {e}"))?;
+    }
     if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
         && !baseline_timewiggle_is_present(model)
     {
@@ -8759,7 +8968,6 @@ fn build_model_summary(
         .or(fit.beta_standard_errors());
     let cov_forwald = fit.beta_covariance_corrected().or(fit.beta_covariance());
 
-    let link = family_to_link(family);
     let nullmu = match family {
         LikelihoodFamily::GaussianIdentity => {
             let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
@@ -8803,7 +9011,16 @@ fn build_model_summary(
             Array1::from_elem(y.len(), baseline)
         }
     };
-    let null_dev = gam::pirls::calculate_deviance(y, &nullmu, link, weights);
+    let null_dev = if let Ok(glm_family) = crate::types::GlmLikelihoodFamily::try_from(family) {
+        gam::pirls::calculate_deviance(y, &nullmu, glm_family, weights)
+    } else {
+        gam::pirls::calculate_deviance(
+            y,
+            &nullmu,
+            crate::types::GlmLikelihoodFamily::GaussianIdentity,
+            weights,
+        )
+    };
     let deviance_explained = if null_dev.is_finite() && null_dev > 0.0 {
         Some((1.0 - fit.deviance / null_dev).clamp(-9.0, 1.0))
     } else {

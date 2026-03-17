@@ -306,9 +306,11 @@ pub struct TimeBlockInput {
     pub design_entry: Array2<f64>,
     pub design_exit: Array2<f64>,
     pub design_derivative_exit: Array2<f64>,
+    pub constraint_design_derivative: Option<Array2<f64>>,
     pub offset_entry: Array1<f64>,
     pub offset_exit: Array1<f64>,
     pub derivative_offset_exit: Array1<f64>,
+    pub constraint_derivative_offset: Option<Array1<f64>>,
     pub penalties: Vec<Array2<f64>>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
@@ -756,6 +758,8 @@ struct SurvivalLocationScaleFamily {
     x_time_exit: Array2<f64>,
     x_time_deriv: Array2<f64>,
     offset_time_deriv: Array1<f64>,
+    x_time_deriv_constraints: Option<Array2<f64>>,
+    offset_time_deriv_constraints: Option<Array1<f64>>,
     /// Exit design for threshold block (always present; used as main design).
     x_threshold: DesignMatrix,
     /// Entry design for threshold block when time-varying.
@@ -1623,7 +1627,7 @@ impl SurvivalLocationScaleFamily {
     ///
     /// `L''' = f'''/f - 3 f'f''/f² + 2(f')³/f³`.
     ///
-    /// This is the exact `d³(log f)/du³` term used in the survival exact-Newton
+    /// This is the branchwise-exact `d³(log f)/du³` term used in the survival exact-Newton
     /// Hessian directional derivative. If it is dropped, the event contribution
     /// to `d³ℓ/dq³` is wrong, which then corrupts the block Hessian drift
     /// `D H[u]`.
@@ -1669,7 +1673,8 @@ impl SurvivalLocationScaleFamily {
             - 6.0 * fp2 * fp2 / f4
     }
 
-    /// Clamp-aware survival value and derivatives of `-log(clamp(S, MIN_PROB, 1))`
+    /// Clamp-aware survival value and branchwise-exact derivatives of
+    /// `-log(clamp(S, MIN_PROB, 1))`
     /// through **4th order**.
     ///
     /// Returns `(S_clamped, r, dr, ddr, dddr)` where dddr = d⁴/du⁴[-log S].
@@ -1698,7 +1703,8 @@ impl SurvivalLocationScaleFamily {
     /// Clamp-aware `log(max(x, floor))` value and first three derivatives.
     ///
     /// Once `x <= floor`, the active branch is constant so every derivative is
-    /// zero. This keeps the exact-Newton derivatives aligned with the objective.
+    /// zero. This keeps the exact-Newton derivatives aligned with the
+    /// piecewise objective rather than claiming global smoothness.
     fn clamped_logwith_derivatives(raw_x: f64, floor: f64) -> (f64, f64, f64, f64) {
         let x = raw_x.max(floor);
         if raw_x <= floor {
@@ -1816,9 +1822,9 @@ impl SurvivalLocationScaleFamily {
             (g_val, log_g, d1, d2, d3)
         } else {
             // Keep the likelihood/derivative surface finite when line-search
-            // probes an invalid time-derivative state. Treat this as an active
-            // floor branch: finite objective contribution with zero local
-            // derivative curvature in d_eta/dt.
+            // probes an invalid time-derivative state. This is a separate
+            // active floor branch of the objective, so the derivatives are
+            // only exact within that branch and drop to zero locally there.
             let g_floor = 0.0;
             let log_g = soft.max(1e-12).ln();
             (g_floor, log_g, 0.0, 0.0, 0.0)
@@ -2841,6 +2847,24 @@ fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> Blockwise
 }
 
 fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Result<(), String> {
+    if spec.linkwiggle_block.is_some() {
+        return Err(
+            "fit_survival_location_scale: survival linkwiggle is disabled until the family is rebuilt around the exact dynamic q = m(q0) model"
+                .to_string(),
+        );
+    }
+    if matches!(spec.threshold_block, CovariateBlockKind::TimeVarying(_)) {
+        return Err(
+            "fit_survival_location_scale: time-varying threshold is disabled because the current survival location-scale exact-Newton path does not model the required event Jacobian term"
+                .to_string(),
+        );
+    }
+    if matches!(spec.log_sigma_block, CovariateBlockKind::TimeVarying(_)) {
+        return Err(
+            "fit_survival_location_scale: time-varying sigma is disabled because the current survival location-scale exact-Newton path does not model the required event Jacobian term"
+                .to_string(),
+        );
+    }
     let n = spec.event_target.len();
     if n == 0 {
         return Err("fit_survival_location_scale: empty dataset".to_string());
@@ -3085,6 +3109,8 @@ fn prepare_survival_location_scale_model(
         x_time_exit: time_prepared.design_exit.clone(),
         x_time_deriv: time_prepared.design_derivative_exit.clone(),
         offset_time_deriv: spec.time_block.derivative_offset_exit.clone(),
+        x_time_deriv_constraints: time_prepared.constraint_design_derivative.clone(),
+        offset_time_deriv_constraints: time_prepared.constraint_derivative_offset.clone(),
         x_threshold: threshold_prep.design_exit.clone(),
         x_threshold_entry: threshold_prep.design_entry.clone(),
         x_log_sigma: DesignMatrix::Dense(Arc::new(log_sigma_design)),
@@ -3250,6 +3276,29 @@ fn validate_time_block(n: usize, b: &TimeBlockInput) -> Result<(), String> {
     if b.design_entry.ncols() != p || b.design_derivative_exit.ncols() != p {
         return Err("time_block design column mismatch across entry/exit/derivative".to_string());
     }
+    if let Some(rows) = b.constraint_design_derivative.as_ref() {
+        if rows.ncols() != p {
+            return Err(format!(
+                "time_block monotonicity constraint width mismatch: got {}, expected {p}",
+                rows.ncols()
+            ));
+        }
+        let offsets = b.constraint_derivative_offset.as_ref().ok_or_else(|| {
+            "time_block monotonicity constraints are missing derivative offsets".to_string()
+        })?;
+        if offsets.len() != rows.nrows() {
+            return Err(format!(
+                "time_block monotonicity constraint row mismatch: rows={} offsets={}",
+                rows.nrows(),
+                offsets.len()
+            ));
+        }
+    } else if b.constraint_derivative_offset.is_some() {
+        return Err(
+            "time_block monotonicity derivative offsets were provided without constraint rows"
+                .to_string(),
+        );
+    }
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
@@ -3300,6 +3349,8 @@ struct TimeBlockPrepared {
     design_entry: Array2<f64>,
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
+    constraint_design_derivative: Option<Array2<f64>>,
+    constraint_derivative_offset: Option<Array1<f64>>,
     penalties: Vec<Array2<f64>>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
@@ -3310,6 +3361,29 @@ fn prepare_identified_time_block(
     anchorrow: usize,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
+    if let Some(rows) = input.constraint_design_derivative.as_ref() {
+        if rows.ncols() != p {
+            return Err(format!(
+                "time_block monotonicity constraint width mismatch: got {}, expected {p}",
+                rows.ncols()
+            ));
+        }
+        let offsets = input.constraint_derivative_offset.as_ref().ok_or_else(|| {
+            "time_block monotonicity constraints are missing derivative offsets".to_string()
+        })?;
+        if offsets.len() != rows.nrows() {
+            return Err(format!(
+                "time_block monotonicity constraint row mismatch: rows={} offsets={}",
+                rows.nrows(),
+                offsets.len()
+            ));
+        }
+    } else if input.constraint_derivative_offset.is_some() {
+        return Err(
+            "time_block monotonicity derivative offsets were provided without constraint rows"
+                .to_string(),
+        );
+    }
     if p < 2 {
         return Err(format!(
             "time_block needs at least 2 columns for identifiability, got {p}"
@@ -3351,6 +3425,10 @@ fn prepare_identified_time_block(
     let design_entry = input.design_entry.dot(&z);
     let design_exit = input.design_exit.dot(&z);
     let design_derivative_exit = input.design_derivative_exit.dot(&z);
+    let constraint_design_derivative = input
+        .constraint_design_derivative
+        .as_ref()
+        .map(|rows| rows.dot(&z));
     let penalties = input
         .penalties
         .iter()
@@ -3362,6 +3440,8 @@ fn prepare_identified_time_block(
         design_entry,
         design_exit,
         design_derivative_exit,
+        constraint_design_derivative,
+        constraint_derivative_offset: input.constraint_derivative_offset.clone(),
         penalties,
         initial_beta,
         transform: TimeIdentifiabilityTransform { z },
@@ -6954,23 +7034,31 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if block_idx != Self::BLOCK_TIME {
             return Ok(None);
         }
-        let n = self.x_time_deriv.nrows();
-        let p = self.x_time_deriv.ncols();
-        if self.offset_time_deriv.len() != n {
+        let constraint_rows = self
+            .x_time_deriv_constraints
+            .as_ref()
+            .unwrap_or(&self.x_time_deriv);
+        let constraint_offsets = self
+            .offset_time_deriv_constraints
+            .as_ref()
+            .unwrap_or(&self.offset_time_deriv);
+        let n = constraint_rows.nrows();
+        let p = constraint_rows.ncols();
+        if constraint_offsets.len() != n {
             return Err(format!(
                 "time derivative offset length mismatch: got {}, expected {n}",
-                self.offset_time_deriv.len()
+                constraint_offsets.len()
             ));
         }
-        if n == 0 || p == 0 || self.derivative_guard <= 0.0 {
+        if n == 0 || p == 0 {
             return Ok(None);
         }
         let mut a = Array2::<f64>::zeros((n, p));
-        a.assign(&self.x_time_deriv);
+        a.assign(constraint_rows);
         let mut b = Array1::<f64>::zeros(n);
         let guard = self.derivative_guard;
         for i in 0..n {
-            b[i] = guard - self.offset_time_deriv[i];
+            b[i] = guard - constraint_offsets[i];
         }
         Ok(Some(LinearInequalityConstraints { a, b }))
     }
@@ -7205,9 +7293,11 @@ pub(crate) fn fit_survival_location_scale_terms(
                 design_entry: spec.time_block.design_entry.clone(),
                 design_exit: spec.time_block.design_exit.clone(),
                 design_derivative_exit: spec.time_block.design_derivative_exit.clone(),
+                constraint_design_derivative: spec.time_block.constraint_design_derivative.clone(),
                 offset_entry: spec.time_block.offset_entry.clone(),
                 offset_exit: spec.time_block.offset_exit.clone(),
                 derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
+                constraint_derivative_offset: spec.time_block.constraint_derivative_offset.clone(),
                 penalties: spec.time_block.penalties.clone(),
                 nullspace_dims: spec.time_block.nullspace_dims.clone(),
                 initial_log_lambdas: Some(layout.time_from(rho)),
@@ -8001,9 +8091,11 @@ mod tests {
             design_entry,
             design_exit,
             design_derivative_exit,
+            constraint_design_derivative: None,
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
+            constraint_derivative_offset: None,
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
             initial_log_lambdas: None,
@@ -8042,9 +8134,11 @@ mod tests {
             design_entry,
             design_exit,
             design_derivative_exit,
+            constraint_design_derivative: None,
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
+            constraint_derivative_offset: None,
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
             initial_log_lambdas: None,
@@ -8087,9 +8181,11 @@ mod tests {
             design_entry,
             design_exit,
             design_derivative_exit,
+            constraint_design_derivative: None,
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
+            constraint_derivative_offset: None,
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
             initial_log_lambdas: None,
@@ -9673,9 +9769,11 @@ mod tests {
                 design_entry,
                 design_exit,
                 design_derivative_exit,
+                constraint_design_derivative: None,
                 offset_entry,
                 offset_exit,
                 derivative_offset_exit,
+                constraint_derivative_offset: None,
                 penalties: vec![penalty.clone()],
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(array![0.0]),

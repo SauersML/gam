@@ -1550,36 +1550,112 @@ impl PenaltyCoordinate {
             Self::BlockRoot {
                 root, start, end, ..
             } => root.dot(&beta.slice(ndarray::s![*start..*end])),
+            Self::KroneckerMarginal { .. } => {
+                // No single root for Kronecker — use apply_penalty instead.
+                panic!("apply_root not supported for KroneckerMarginal; use apply_penalty directly");
+            }
         }
     }
 
     pub fn apply_penalty(&self, beta: &Array1<f64>, scale: f64) -> Array1<f64> {
         debug_assert_eq!(beta.len(), self.dim());
-        let root_beta = self.apply_root(beta);
         match self {
-            Self::DenseRoot(root) => {
-                let mut out = root.t().dot(&root_beta);
-                out *= scale;
-                out
+            Self::DenseRoot(_) | Self::BlockRoot { .. } => {
+                let root_beta = self.apply_root(beta);
+                match self {
+                    Self::DenseRoot(root) => {
+                        let mut out = root.t().dot(&root_beta);
+                        out *= scale;
+                        out
+                    }
+                    Self::BlockRoot {
+                        root,
+                        start,
+                        end,
+                        total_dim,
+                    } => {
+                        let mut out = Array1::<f64>::zeros(*total_dim);
+                        let mut block = root.t().dot(&root_beta);
+                        block *= scale;
+                        out.slice_mut(ndarray::s![*start..*end]).assign(&block);
+                        out
+                    }
+                    _ => unreachable!(),
+                }
             }
-            Self::BlockRoot {
-                root,
-                start,
-                end,
+            Self::KroneckerMarginal {
+                eigenvalues,
+                dim_index,
+                marginal_dims,
                 total_dim,
             } => {
+                // Apply (I ⊗ ... ⊗ Λ_k ⊗ ... ⊗ I) β via mode-k scaling.
+                // In the eigenbasis, Λ_k is diagonal, so this is element-wise.
+                let d = marginal_dims.len();
+                let k = *dim_index;
+                let q_k = marginal_dims[k];
+                let stride_k: usize = marginal_dims[k + 1..].iter().copied().product::<usize>().max(1);
+                let outer_size: usize = marginal_dims[..k].iter().copied().product::<usize>().max(1);
+                let inner_size = stride_k;
+                let eigs = &eigenvalues[k];
+
                 let mut out = Array1::<f64>::zeros(*total_dim);
-                let mut block = root.t().dot(&root_beta);
-                block *= scale;
-                out.slice_mut(ndarray::s![*start..*end]).assign(&block);
+                for outer in 0..outer_size {
+                    for j in 0..q_k {
+                        let mu = eigs[j] * scale;
+                        if mu == 0.0 {
+                            continue;
+                        }
+                        let base = outer * q_k * stride_k + j * stride_k;
+                        for inner in 0..inner_size {
+                            let idx = base + inner;
+                            out[idx] = mu * beta[idx];
+                        }
+                    }
+                }
                 out
             }
         }
     }
 
     pub fn quadratic(&self, beta: &Array1<f64>, scale: f64) -> f64 {
-        let root_beta = self.apply_root(beta);
-        scale * root_beta.dot(&root_beta)
+        match self {
+            Self::DenseRoot(_) | Self::BlockRoot { .. } => {
+                let root_beta = self.apply_root(beta);
+                scale * root_beta.dot(&root_beta)
+            }
+            Self::KroneckerMarginal {
+                eigenvalues,
+                dim_index,
+                marginal_dims,
+                ..
+            } => {
+                // β' (I ⊗ ... ⊗ Λ_k ⊗ ... ⊗ I) β = Σ μ_{k,j} β[...]²
+                let d = marginal_dims.len();
+                let k = *dim_index;
+                let q_k = marginal_dims[k];
+                let stride_k: usize = marginal_dims[k + 1..].iter().copied().product::<usize>().max(1);
+                let outer_size: usize = marginal_dims[..k].iter().copied().product::<usize>().max(1);
+                let inner_size = stride_k;
+                let eigs = &eigenvalues[k];
+
+                let mut sum = 0.0;
+                for outer in 0..outer_size {
+                    for j in 0..q_k {
+                        let mu = eigs[j];
+                        if mu == 0.0 {
+                            continue;
+                        }
+                        let base = outer * q_k * stride_k + j * stride_k;
+                        for inner in 0..inner_size {
+                            let v = beta[base + inner];
+                            sum += mu * v * v;
+                        }
+                    }
+                }
+                sum * scale
+            }
+        }
     }
 
     pub fn scaled_dense_matrix(&self, scale: f64) -> Array2<f64> {
@@ -1600,6 +1676,33 @@ impl PenaltyCoordinate {
                 block *= scale;
                 out.slice_mut(ndarray::s![*start..*end, *start..*end])
                     .assign(&block);
+                out
+            }
+            Self::KroneckerMarginal {
+                eigenvalues,
+                dim_index,
+                marginal_dims,
+                total_dim,
+            } => {
+                // Materialize diagonal penalty in eigenbasis.
+                let d = marginal_dims.len();
+                let k = *dim_index;
+                let q_k = marginal_dims[k];
+                let stride_k: usize = marginal_dims[k + 1..].iter().copied().product::<usize>().max(1);
+                let outer_size: usize = marginal_dims[..k].iter().copied().product::<usize>().max(1);
+                let eigs = &eigenvalues[k];
+
+                let mut out = Array2::<f64>::zeros((*total_dim, *total_dim));
+                for outer in 0..outer_size {
+                    for j in 0..q_k {
+                        let mu = eigs[j] * scale;
+                        let base = outer * q_k * stride_k + j * stride_k;
+                        for inner in 0..stride_k {
+                            let idx = base + inner;
+                            out[[idx, idx]] = mu;
+                        }
+                    }
+                }
                 out
             }
         }
@@ -1623,12 +1726,17 @@ impl PenaltyCoordinate {
                 block *= scale;
                 (block, *start, *end)
             }
+            Self::KroneckerMarginal { total_dim, .. } => {
+                // Fallback: materialize full matrix.
+                let mat = self.scaled_dense_matrix(scale);
+                (mat, 0, *total_dim)
+            }
         }
     }
 
     /// Whether this coordinate has block structure (not full-rank dense).
     pub fn is_block_local(&self) -> bool {
-        matches!(self, Self::BlockRoot { .. })
+        matches!(self, Self::BlockRoot { .. } | Self::KroneckerMarginal { .. })
     }
 
     /// Apply λ_k S_k to a vector v without materializing the full matrix.
@@ -1652,6 +1760,10 @@ impl PenaltyCoordinate {
                 out.slice_mut(ndarray::s![*start..*end])
                     .assign(&block_result);
                 out
+            }
+            Self::KroneckerMarginal { .. } => {
+                // Reuse apply_penalty which handles mode-k contraction.
+                self.apply_penalty(v, scale)
             }
         }
     }
@@ -1679,6 +1791,32 @@ impl PenaltyCoordinate {
                         .zip(root.iter())
                         .map(|(&a, &b)| a * b)
                         .sum::<f64>()
+            }
+            Self::KroneckerMarginal {
+                eigenvalues,
+                dim_index,
+                marginal_dims,
+                ..
+            } => {
+                // tr(M · diag(μ)) = Σ_i μ_i M_{ii}  (penalty is diagonal in eigenbasis)
+                let k = *dim_index;
+                let q_k = marginal_dims[k];
+                let stride_k: usize = marginal_dims[k + 1..].iter().copied().product::<usize>().max(1);
+                let outer_size: usize = marginal_dims[..k].iter().copied().product::<usize>().max(1);
+                let eigs = &eigenvalues[k];
+
+                let mut trace = 0.0;
+                for outer in 0..outer_size {
+                    for j in 0..q_k {
+                        let mu = eigs[j];
+                        let base = outer * q_k * stride_k + j * stride_k;
+                        for inner in 0..stride_k {
+                            let idx = base + inner;
+                            trace += mu * m[[idx, idx]];
+                        }
+                    }
+                }
+                trace * scale
             }
         }
     }
@@ -2296,9 +2434,9 @@ fn trace_hinv_drift_cross(
 /// This is correct because the inner algorithm is just a solver; only the
 /// outer log|H| and trace terms define the Laplace approximation.
 ///
-/// For canonical links (logit-Binomial, log-Poisson, log-Gamma), observed
+/// For canonical links (for example logit-Binomial and log-Poisson), observed
 /// equals expected, so no correction is needed. For non-canonical links
-/// (probit, cloglog, SAS, mixture/flexible), the observed weight includes a
+/// (including probit, cloglog, SAS, mixture/flexible, and Gamma-log), the observed weight includes a
 /// residual-dependent correction:
 ///   W_obs = W_Fisher - (y - mu) * B,
 ///   B = (h'' V - h'^2 V') / (phi V^2)

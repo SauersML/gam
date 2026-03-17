@@ -43,7 +43,7 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, stat
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
-    Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState,
+    Coefficients, GlmLikelihoodFamily, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState,
     RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
@@ -758,6 +758,7 @@ fn map_hessian_to_original_basis(
 
 #[derive(Clone)]
 pub(crate) struct RemlConfig {
+    likelihood: GlmLikelihoodFamily,
     link_kind: InverseLink,
     convergence_tolerance: f64,
     max_iterations: usize,
@@ -767,9 +768,14 @@ pub(crate) struct RemlConfig {
 }
 
 impl RemlConfig {
-    fn external(link_function: LinkFunction, reml_tol: f64, firth_bias_reduction: bool) -> Self {
+    fn external(
+        likelihood: GlmLikelihoodFamily,
+        reml_tol: f64,
+        firth_bias_reduction: bool,
+    ) -> Self {
         Self {
-            link_kind: InverseLink::Standard(link_function),
+            likelihood,
+            link_kind: InverseLink::Standard(likelihood.link_function()),
             convergence_tolerance: reml_tol,
             max_iterations: 500,
             reml_convergence_tolerance: reml_tol,
@@ -782,8 +788,13 @@ impl RemlConfig {
         self.link_kind.link_function()
     }
 
+    fn likelihood(&self) -> GlmLikelihoodFamily {
+        self.likelihood
+    }
+
     fn as_pirls_config(&self) -> pirls::PirlsConfig {
         pirls::PirlsConfig {
+            likelihood: self.likelihood,
             link_kind: self.link_kind.clone(),
             max_iterations: self.max_iterations,
             convergence_tolerance: self.convergence_tolerance,
@@ -1229,7 +1240,7 @@ pub struct ExternalOptimOptions {
 fn resolve_external_family(
     family: crate::types::LikelihoodFamily,
     firth_override: Option<bool>,
-) -> Result<(LinkFunction, bool), EstimationError> {
+) -> Result<(GlmLikelihoodFamily, bool), EstimationError> {
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
         return Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
@@ -1246,7 +1257,11 @@ fn resolve_external_family(
     }
 
     Ok((
-        family.link_function(),
+        GlmLikelihoodFamily::try_from(family).map_err(|msg| {
+            EstimationError::InvalidInput(format!(
+                "optimize_external_design requires a GLM family; {msg}"
+            ))
+        })?,
         firth_override.unwrap_or_else(|| family.supports_firth()) && family.supports_firth(),
     ))
 }
@@ -1308,8 +1323,10 @@ fn resolved_external_config(
         ));
     }
     let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let (likelihood, firth_active) =
+        resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let mut cfg = RemlConfig::external(likelihood, opts.tol, firth_active);
+    let link = likelihood.link_function();
     cfg.link_kind =
         resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
     Ok((cfg, effective_sas_link))
@@ -2557,7 +2574,7 @@ fn validate_and_build_reml_state<X, T, F>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<BlockwisePenalty>,
+    s_list: Vec<PenaltySpec>,
     theta: &Array1<f64>,
     rho_dim: usize,
     mut hyper_dirs: Vec<DirectionalHyperParam>,
@@ -2582,9 +2599,9 @@ where
         )));
     }
     let p = x.ncols();
-    validate_blockwise_penalties(&s_list, p, context)?;
-    let (s_list, active_nullspace_dims) =
-        canonicalize_active_blockwise_penalties(s_list, &opts.nullspace_dims, context)?;
+    validate_penalty_specs(&s_list, p, context)?;
+    let (canonical, active_nullspace_dims) =
+        crate::construction::canonicalize_penalty_specs(&s_list, &opts.nullspace_dims, p, context)?;
     if rho_dim != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
             "rho_dim mismatch: rho_dim={}, active_penalties={}",
@@ -2602,11 +2619,11 @@ where
     }
     for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
         for component in hyper_dir.penalty_first_components() {
-            if component.penalty_index >= s_list.len() {
+            if component.penalty_index >= canonical.len() {
                 return Err(EstimationError::InvalidInput(format!(
                     "penalty_index for dir {idx} out of bounds: {} >= {}",
                     component.penalty_index,
-                    s_list.len()
+                    canonical.len()
                 )));
             }
         }
@@ -2668,7 +2685,7 @@ where
         }
     }
 
-    let conditioning = ParametricColumnConditioning::infer_from_blockwise_penalties(&x, &s_list);
+    let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(&x, &s_list);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
@@ -2702,7 +2719,7 @@ where
         x_fit,
         w_o.view(),
         offset_o.view(),
-        s_list,
+        canonical,
         p,
         &cfg,
         Some(active_nullspace_dims),
@@ -4109,7 +4126,7 @@ pub fn fit_gamwith_heuristic_lambdas<X>(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    s_list: &[BlockwisePenalty],
+    s_list: &[PenaltySpec],
     heuristic_lambdas: Option<&[f64]>,
     family: crate::types::LikelihoodFamily,
     opts: &FitOptions,

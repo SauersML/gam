@@ -37,10 +37,8 @@ impl<'a> RemlState<'a> {
         }
 
         // Build S_k = R_k^T R_k for each penalty component.
-        let s_k_matrices: Vec<Array2<f64>> = rs_transformed
-            .iter()
-            .map(|r_k| r_k.t().dot(r_k))
-            .collect();
+        let s_k_matrices: Vec<Array2<f64>> =
+            rs_transformed.iter().map(|r_k| r_k.t().dot(r_k)).collect();
 
         let lambdas_slice = lambdas.as_slice().unwrap();
 
@@ -51,7 +49,7 @@ impl<'a> RemlState<'a> {
         Ok((det1, det2))
     }
 
-    /// Block-local penalty logdet derivatives using the `Penalty` representation.
+    /// Block-local penalty logdet derivatives using `CanonicalPenalty`.
     ///
     /// When all penalties are block-disjoint, the eigendecomposition factorizes
     /// per-block at O(block_p³) instead of O(p³). Falls back to the dense path
@@ -61,7 +59,7 @@ impl<'a> RemlState<'a> {
         lambdas: &Array1<f64>,
         ridge: f64,
     ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
-        let k_count = self.penalties.len();
+        let k_count = self.canonical_penalties.len();
         if k_count == 0 || lambdas.len() != k_count {
             return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
         }
@@ -69,23 +67,15 @@ impl<'a> RemlState<'a> {
         let lambdas_slice = lambdas.as_slice().unwrap();
 
         let pld = PenaltyPseudologdet::from_penalties(
-            &self.penalties,
+            &self.canonical_penalties,
             lambdas_slice,
             ridge,
             self.p,
         )
         .map_err(|e| EstimationError::LayoutError(e))?;
 
-        // Build S_k matrices (block-local, but we need them as p×p for rho_derivatives).
-        // TODO: Add a block-local rho_derivatives method to PenaltyPseudologdet
-        // that avoids materializing the full p×p S_k matrices.
-        let s_k_matrices: Vec<Array2<f64>> = self
-            .penalties
-            .iter()
-            .map(|pen| pen.to_global_matrix(self.p))
-            .collect();
-
-        let (det1, det2) = pld.rho_derivatives(&s_k_matrices, lambdas_slice);
+        let (det1, det2) =
+            pld.rho_derivatives_from_penalties(&self.canonical_penalties, lambdas_slice);
         Ok((det1, det2))
     }
 

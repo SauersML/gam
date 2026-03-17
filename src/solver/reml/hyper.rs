@@ -714,11 +714,6 @@ impl<'a> RemlState<'a> {
             p_dim,
         )
         .map_err(EstimationError::InvalidInput)?;
-        let s_k_unscaled: Vec<Array2<f64>> = self
-            .canonical_penalties
-            .iter()
-            .map(|cp| cp.global_penalty())
-            .collect();
 
         let x_dense = self
             .x()
@@ -757,7 +752,8 @@ impl<'a> RemlState<'a> {
             .map(|dir| dir.penalty_first_components().to_vec())
             .collect();
         let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
-        let mut ds_k_dtau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
+        let mut ds_k_dtau_j_mats: Vec<Vec<Option<Array2<f64>>>> =
+            vec![vec![None; k_count]; psi_dim];
         for j in 0..psi_dim {
             for component in &penalty_components_per_dir[j] {
                 let k = component.penalty_index;
@@ -770,7 +766,6 @@ impl<'a> RemlState<'a> {
 
         let s_tau_tau = std::sync::Arc::new(s_tau_tau);
         let pld = std::sync::Arc::new(pld);
-        let s_k_unscaled = std::sync::Arc::new(s_k_unscaled);
         let beta_eval = std::sync::Arc::new(beta_eval);
         let x_dense = std::sync::Arc::new(x_dense);
         let x_tau_list = std::sync::Arc::new(x_tau_list);
@@ -895,7 +890,7 @@ impl<'a> RemlState<'a> {
         };
 
         let pld_rt = std::sync::Arc::clone(&pld);
-        let s_k_unscaled_rt = std::sync::Arc::clone(&s_k_unscaled);
+        let canonical_penalties_rt = std::sync::Arc::new(self.canonical_penalties.as_ref().clone());
         let s_tau_list_rt = std::sync::Arc::clone(&s_tau_list);
         let ds_k_dtau_j_rt = std::sync::Arc::clone(&ds_k_dtau_j_mats);
         let lambdas_rt = lambdas.clone();
@@ -904,9 +899,9 @@ impl<'a> RemlState<'a> {
         let p_dim_rt = p_dim;
 
         let rho_tau_pair_fn = move |k: usize, j: usize| -> super::unified::HyperCoordPair {
-            let ld_s_kj = if k < s_k_unscaled_rt.len() {
-                pld_rt.rho_tau_hessian_component(
-                    &s_k_unscaled_rt[k],
+            let ld_s_kj = if k < canonical_penalties_rt.len() {
+                pld_rt.rho_tau_hessian_component_block_local(
+                    &canonical_penalties_rt[k],
                     lambdas_rt[k],
                     &s_tau_list_rt[j],
                     ds_k_dtau_j_rt[j][k].as_ref().map(|m| m as &Array2<f64>),
@@ -1076,10 +1071,7 @@ impl<'a> RemlState<'a> {
             .map_err(EstimationError::InvalidInput)?;
 
         // Unscaled penalty component matrices S_k = R_k^T R_k for ρ-τ pairs.
-        let s_k_unscaled: Vec<Array2<f64>> = rs_eval
-            .iter()
-            .map(|r| r.t().dot(r))
-            .collect();
+        let s_k_unscaled: Vec<Array2<f64>> = rs_eval.iter().map(|r| r.t().dot(r)).collect();
 
         // Pre-compute transformed design matrices X_{τ_j} for each τ direction.
         let x_dense_arc = pirls_result
@@ -1169,7 +1161,8 @@ impl<'a> RemlState<'a> {
         // Build A_{k,τ_j} = λ_k * (component of S_{τ_j} at penalty k).
         // Stored as a_k_tau_j[j][k]: Option<Array2<f64>>.
         let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
-        let mut ds_k_dtau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
+        let mut ds_k_dtau_j_mats: Vec<Vec<Option<Array2<f64>>>> =
+            vec![vec![None; k_count]; psi_dim];
         for j in 0..psi_dim {
             for component in &penalty_components_per_dir[j] {
                 let k = component.penalty_index;

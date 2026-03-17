@@ -68,9 +68,11 @@ struct SurvivalMarginalSlopeFamily {
     design_entry: Array2<f64>,
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
+    constraint_design_derivative: Option<Array2<f64>>,
     offset_entry: Array1<f64>,
     offset_exit: Array1<f64>,
     derivative_offset_exit: Array1<f64>,
+    constraint_derivative_offset: Option<Array1<f64>>,
     /// Log-slope block: standard single design.
     logslope_design: Array2<f64>,
 }
@@ -1352,13 +1354,21 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_idx: usize,
         _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        if block_idx == 0 && self.derivative_guard > 0.0 {
+        if block_idx == 0 {
+            let constraint_rows = self
+                .constraint_design_derivative
+                .as_ref()
+                .unwrap_or(&self.design_derivative_exit);
+            let constraint_offsets = self
+                .constraint_derivative_offset
+                .as_ref()
+                .unwrap_or(&self.derivative_offset_exit);
             // Monotonicity constraint: design_derivative_exit @ beta_time + offset >= guard
             // i.e. design_derivative_exit @ beta_time >= guard - offset
             Ok(Some(LinearInequalityConstraints {
-                a: self.design_derivative_exit.clone(),
+                a: constraint_rows.clone(),
                 b: Array1::from_iter(
-                    self.derivative_offset_exit
+                    constraint_offsets
                         .iter()
                         .map(|&o| self.derivative_guard - o),
                 ),
@@ -1496,6 +1506,34 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             "survival-marginal-slope time block design column mismatch: entry={p_entry}, exit={p_exit}, deriv={p_deriv}"
         ));
     }
+    if let Some(rows) = spec.time_block.constraint_design_derivative.as_ref() {
+        if rows.ncols() != p_entry {
+            return Err(format!(
+                "survival-marginal-slope time monotonicity constraint width mismatch: got {}, expected {p_entry}",
+                rows.ncols()
+            ));
+        }
+        let offsets = spec
+            .time_block
+            .constraint_derivative_offset
+            .as_ref()
+            .ok_or_else(|| {
+                "survival-marginal-slope monotonicity constraints are missing derivative offsets"
+                    .to_string()
+            })?;
+        if offsets.len() != rows.nrows() {
+            return Err(format!(
+                "survival-marginal-slope monotonicity constraint row mismatch: rows={} offsets={}",
+                rows.nrows(),
+                offsets.len()
+            ));
+        }
+    } else if spec.time_block.constraint_derivative_offset.is_some() {
+        return Err(
+            "survival-marginal-slope monotonicity derivative offsets were provided without constraint rows"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1578,9 +1616,11 @@ pub fn fit_survival_marginal_slope_terms(
     let design_entry = spec.time_block.design_entry.clone();
     let design_exit = spec.time_block.design_exit.clone();
     let design_derivative_exit = spec.time_block.design_derivative_exit.clone();
+    let constraint_design_derivative = spec.time_block.constraint_design_derivative.clone();
     let offset_entry = spec.time_block.offset_entry.clone();
     let offset_exit = spec.time_block.offset_exit.clone();
     let derivative_offset_exit = spec.time_block.derivative_offset_exit.clone();
+    let constraint_derivative_offset = spec.time_block.constraint_derivative_offset.clone();
     let time_block_ref = spec.time_block.clone();
 
     let make_family = |logslope_design: &TermCollectionDesign| -> SurvivalMarginalSlopeFamily {
@@ -1593,9 +1633,11 @@ pub fn fit_survival_marginal_slope_terms(
             design_entry: design_entry.clone(),
             design_exit: design_exit.clone(),
             design_derivative_exit: design_derivative_exit.clone(),
+            constraint_design_derivative: constraint_design_derivative.clone(),
             offset_entry: offset_entry.clone(),
             offset_exit: offset_exit.clone(),
             derivative_offset_exit: derivative_offset_exit.clone(),
+            constraint_derivative_offset: constraint_derivative_offset.clone(),
             logslope_design: logslope_design.design.to_dense(),
         }
     };
