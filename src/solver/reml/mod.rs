@@ -1975,4 +1975,7 @@ pub(crate) struct RemlState<'a> {
     /// the REML evaluator can use O(∏q_j) logdet instead of O(p³) eigendecomposition.
     /// Populated via `set_kronecker_penalty_system` after construction.
     pub(crate) kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
+    /// Full Kronecker factored basis (marginal designs + penalties + dims).
+    /// Used by P-IRLS for factored reparameterization.
+    pub(crate) kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
 }

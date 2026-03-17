@@ -55,6 +55,7 @@ fn default_logit_opts() -> ExternalOptimOptions {
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     }
 }
 
@@ -269,6 +270,7 @@ fn conditioned_helpercost_matches_fittedobjective() {
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     };
 
     let result = optimize_external_design(

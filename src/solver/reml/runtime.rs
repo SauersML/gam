@@ -1048,19 +1048,28 @@ impl<'a> RemlState<'a> {
             warm_start_enabled: AtomicBool::new(true),
             screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
             kronecker_penalty_system: None,
+            kronecker_factored: None,
         })
     }
 
     /// Inject Kronecker penalty system metadata for tensor-product smooth terms.
     ///
-    /// When set, the REML evaluator will use `KroneckerMarginal` penalty
-    /// coordinates and `PenaltyPseudologdet::from_kronecker_system` for
-    /// O(∏q_j) logdet instead of O(p³) eigendecomposition.
+    /// When set, the REML evaluator will use O(∏q_j) logdet instead of O(p³)
+    /// eigendecomposition.  Also stores the full factored basis so that P-IRLS
+    /// can use factored reparameterization (Qs = U_1 ⊗ ... ⊗ U_d).
     pub(crate) fn set_kronecker_penalty_system(
         &mut self,
         system: crate::smooth::KroneckerPenaltySystem,
     ) {
         self.kronecker_penalty_system = Some(system);
+    }
+
+    /// Inject the full Kronecker factored basis for P-IRLS factored reparameterization.
+    pub(crate) fn set_kronecker_factored(
+        &mut self,
+        factored: crate::basis::KroneckerFactoredBasis,
+    ) {
+        self.kronecker_factored = Some(factored);
     }
 
     /// Sets the shrinkage floor for penalized block eigenvalues.
@@ -1830,6 +1839,7 @@ impl<'a> RemlState<'a> {
                 coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
                 linear_constraints_original: self.linear_constraints.as_ref(),
                 penalty_shrinkage_floor: self.penalty_shrinkage_floor,
+                kronecker_factored: self.kronecker_factored.as_ref(),
             };
             let pirls_start = std::time::Instant::now();
             let result = pirls::fit_model_for_fixed_rho(
@@ -2855,18 +2865,51 @@ impl<'a> RemlState<'a> {
         let n_observations = self.y.len();
         let p_dim = beta.len();
 
-        // Build PenaltyCoordinates from canonical penalties (block-local).
-        // NOTE: KroneckerMarginal penalty coordinates require factored
-        // reparameterization (Qs = U_1 ⊗ ... ⊗ U_d) to be valid in the
-        // reparameterized basis.  Until kronecker_reparameterization_engine
-        // is wired into P-IRLS, we use standard block-local coordinates.
-        // The Kronecker fast path for penalty logdet (in eval.rs) is still
-        // active — eigenvalues are coordinate-frame-invariant.
-        let penalty_coords: Vec<super::unified::PenaltyCoordinate> = self
-            .canonical_penalties
-            .iter()
-            .map(|cp| cp.to_penalty_coordinate())
-            .collect();
+        // Build PenaltyCoordinates.  When Kronecker structure is available AND
+        // factored reparameterization is active (kronecker_factored is set), the
+        // reparameterized basis is the Kronecker eigenbasis, so KroneckerMarginal
+        // penalty coordinates are valid and give O(p) apply/trace operations.
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
+            if let Some(ref kron) = self.kronecker_penalty_system {
+                if self.kronecker_factored.is_some() {
+                    // Factored reparameterization is active — penalty is diagonal
+                    // in the eigenbasis.  Use KroneckerMarginal coordinates.
+                    let d = kron.ndim();
+                    let total_dim = kron.p_total();
+                    let eigenvalues: Vec<ndarray::Array1<f64>> = kron
+                        .marginal_eigensystems
+                        .iter()
+                        .map(|(evals, _)| evals.clone())
+                        .collect();
+                    let mut coords = Vec::with_capacity(kron.num_penalties());
+                    for k in 0..d {
+                        coords.push(super::unified::PenaltyCoordinate::KroneckerMarginal {
+                            eigenvalues: eigenvalues.clone(),
+                            dim_index: k,
+                            marginal_dims: kron.marginal_dims.clone(),
+                            total_dim,
+                        });
+                    }
+                    if kron.has_double_penalty {
+                        // Global ridge penalty: identity in eigenbasis.
+                        let identity_root = ndarray::Array2::<f64>::eye(total_dim);
+                        coords.push(super::unified::PenaltyCoordinate::from_dense_root(identity_root));
+                    }
+                    coords
+                } else {
+                    // Kronecker system known but standard reparameterization used —
+                    // fall back to block-local coordinates.
+                    self.canonical_penalties
+                        .iter()
+                        .map(|cp| cp.to_penalty_coordinate())
+                        .collect()
+                }
+            } else {
+                self.canonical_penalties
+                    .iter()
+                    .map(|cp| cp.to_penalty_coordinate())
+                    .collect()
+            };
 
         let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,

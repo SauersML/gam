@@ -161,6 +161,7 @@ fn test_lamlgradient_nonfirthwell_conditioned() {
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     };
     let rho = array![0.0];
     let (analytic, _) = evaluate_externalgradients(
@@ -235,6 +236,7 @@ fn test_lamlgradient_logitwith_firthwell_conditioned() {
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     };
     let rho = array![0.0];
     let (analytic, _) = evaluate_externalgradients(

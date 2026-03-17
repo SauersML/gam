@@ -4513,4 +4513,135 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn tensor_product_design_operator_matches_dense_2d() {
+        use super::{DesignOperator, TensorProductDesignOperator};
+
+        // Two marginal B-spline-like bases: 10 rows, 4 and 3 columns.
+        let n = 10;
+        let q1 = 4;
+        let q2 = 3;
+        let mut b1 = Array2::<f64>::zeros((n, q1));
+        let mut b2 = Array2::<f64>::zeros((n, q2));
+        // Fill with simple hat-function-like patterns (sparse per row).
+        for i in 0..n {
+            let t1 = i as f64 / (n - 1) as f64 * (q1 - 1) as f64;
+            let j1 = (t1.floor() as usize).min(q1 - 2);
+            let frac1 = t1 - j1 as f64;
+            b1[[i, j1]] = 1.0 - frac1;
+            b1[[i, j1 + 1]] = frac1;
+
+            let t2 = i as f64 / (n - 1) as f64 * (q2 - 1) as f64;
+            let j2 = (t2.floor() as usize).min(q2 - 2);
+            let frac2 = t2 - j2 as f64;
+            b2[[i, j2]] = 1.0 - frac2;
+            b2[[i, j2 + 1]] = frac2;
+        }
+
+        let op = TensorProductDesignOperator::new(vec![
+            Arc::new(b1.clone()),
+            Arc::new(b2.clone()),
+        ])
+        .unwrap();
+
+        // Build dense reference via explicit Kronecker row products.
+        let p = q1 * q2;
+        let mut dense = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j1 in 0..q1 {
+                for j2 in 0..q2 {
+                    dense[[i, j1 * q2 + j2]] = b1[[i, j1]] * b2[[i, j2]];
+                }
+            }
+        }
+
+        // Test to_dense.
+        let op_dense = op.to_dense();
+        let max_diff = (&op_dense - &dense).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-14, "to_dense mismatch: max_diff={max_diff}");
+
+        // Test apply.
+        let beta = Array1::from_vec((0..p).map(|j| (j as f64 + 1.0) * 0.1).collect());
+        let ref_result = dense.dot(&beta);
+        let op_result = op.apply(&beta);
+        let max_diff = (&op_result - &ref_result).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-12, "apply mismatch: max_diff={max_diff}");
+
+        // Test apply_transpose.
+        let v = Array1::from_vec((0..n).map(|i| (i as f64 + 1.0) * 0.3).collect());
+        let ref_xt_v = dense.t().dot(&v);
+        let op_xt_v = op.apply_transpose(&v);
+        let max_diff = (&op_xt_v - &ref_xt_v).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-12, "apply_transpose mismatch: max_diff={max_diff}");
+
+        // Test diag_xtw_x.
+        let w = Array1::from_vec((0..n).map(|i| 1.0 + i as f64 * 0.1).collect());
+        let ref_xtwx = {
+            let mut out = Array2::<f64>::zeros((p, p));
+            for i in 0..n {
+                for a in 0..p {
+                    for b in 0..p {
+                        out[[a, b]] += w[i] * dense[[i, a]] * dense[[i, b]];
+                    }
+                }
+            }
+            out
+        };
+        let op_xtwx = op.diag_xtw_x(&w).unwrap();
+        let max_diff = (&op_xtwx - &ref_xtwx).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-10, "diag_xtw_x mismatch: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn tensor_product_design_operator_3d() {
+        use super::{DesignOperator, TensorProductDesignOperator};
+
+        let n = 8;
+        let dims = [3, 2, 2];
+        let mut marginals: Vec<Array2<f64>> = Vec::new();
+        for &q in &dims {
+            let mut b = Array2::<f64>::zeros((n, q));
+            for i in 0..n {
+                let t = i as f64 / (n - 1) as f64 * (q - 1) as f64;
+                let j = (t.floor() as usize).min(q - 2);
+                let frac = t - j as f64;
+                b[[i, j]] = 1.0 - frac;
+                b[[i, j + 1]] = frac;
+            }
+            marginals.push(b);
+        }
+
+        let op = TensorProductDesignOperator::new(
+            marginals.iter().map(|m| Arc::new(m.clone())).collect(),
+        )
+        .unwrap();
+
+        // Dense reference.
+        let p: usize = dims.iter().copied().product();
+        let mut dense = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j0 in 0..dims[0] {
+                for j1 in 0..dims[1] {
+                    for j2 in 0..dims[2] {
+                        let col = j0 * dims[1] * dims[2] + j1 * dims[2] + j2;
+                        dense[[i, col]] =
+                            marginals[0][[i, j0]] * marginals[1][[i, j1]] * marginals[2][[i, j2]];
+                    }
+                }
+            }
+        }
+
+        let op_dense = op.to_dense();
+        let max_diff = (&op_dense - &dense).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-14, "3D to_dense mismatch: max_diff={max_diff}");
+
+        // Test round-trip: apply then apply_transpose.
+        let beta = Array1::from_vec((0..p).map(|j| (j as f64).sin()).collect());
+        let xb = op.apply(&beta);
+        let xtxb = op.apply_transpose(&xb);
+        let ref_xtxb = dense.t().dot(&dense.dot(&beta));
+        let max_diff = (&xtxb - &ref_xtxb).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-10, "3D X'Xβ mismatch: max_diff={max_diff}");
+    }
 }

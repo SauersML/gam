@@ -552,13 +552,6 @@ impl BlockwisePenalty {
     }
 }
 
-/// Expand a full set of blockwise penalties into global `p_total × p_total`
-/// dense matrices. This is a compatibility shim for code paths that still
-/// consume `&[Array2<f64>]`.
-pub fn penalties_to_global(penalties: &[BlockwisePenalty], p_total: usize) -> Vec<Array2<f64>> {
-    penalties.iter().map(|bp| bp.to_global(p_total)).collect()
-}
-
 /// Compute `Σ_k λ_k S_k` directly from blockwise penalties, accumulating
 /// into a pre-allocated `p_total × p_total` output without ever materializing
 /// individual global matrices.
@@ -1464,6 +1457,40 @@ impl LinearFitConditioning {
             .map(|penalty| {
                 let right = self.transform_matrix_columnswith_a(penalty);
                 self.transform_matrixrowswith_a_transpose(&right)
+            })
+            .collect()
+    }
+
+    /// Transform blockwise penalties through the conditioning.
+    ///
+    /// For block-local penalties whose `col_range` does not overlap with any
+    /// conditioning column, the transform is identity (the conditioning only
+    /// affects unpenalized linear columns). In that common case the penalty
+    /// passes through unchanged, avoiding O(p²) materialization entirely.
+    fn transform_blockwise_penalties_to_internal(
+        &self,
+        penalties: &[BlockwisePenalty],
+        p: usize,
+    ) -> Vec<PenaltySpec> {
+        let conditioning_cols: std::collections::HashSet<usize> =
+            self.columns.iter().map(|c| c.col_idx).collect();
+        penalties
+            .iter()
+            .map(|bp| {
+                let overlaps = (bp.col_range.start..bp.col_range.end)
+                    .any(|j| conditioning_cols.contains(&j));
+                if overlaps {
+                    // Rare: penalty block overlaps conditioning columns.
+                    // Fall back to dense transform.
+                    let global = bp.to_global(p);
+                    let right = self.transform_matrix_columnswith_a(&global);
+                    let transformed = self.transform_matrixrowswith_a_transpose(&right);
+                    PenaltySpec::Dense(transformed)
+                } else {
+                    // Common: smooth penalty block doesn't touch linear columns.
+                    // The conditioning is identity on this block.
+                    PenaltySpec::from_blockwise(bp.clone())
+                }
             })
             .collect()
     }
@@ -5446,6 +5473,11 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
         adaptive_regularization: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
         kronecker_penalty_system: design.kronecker_penalty_system(),
+        kronecker_factored: design
+            .smooth
+            .terms
+            .iter()
+            .find_map(|t| t.kronecker_factored.clone()),
     }
 }
 
@@ -7223,7 +7255,7 @@ fn trace_of_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> Result<f64, Strin
 }
 
 fn exact_bounded_edf(
-    penalties: &[Array2<f64>],
+    penalties: &[PenaltySpec],
     lambdas: &Array1<f64>,
     latent_cov: &Array2<f64>,
 ) -> Result<(Vec<f64>, f64), EstimationError> {
@@ -7245,22 +7277,21 @@ fn exact_bounded_edf(
     let mut edf_by_block = Vec::with_capacity(penalties.len());
     let mut trace_sum = 0.0;
 
-    for (k, penalty) in penalties.iter().enumerate() {
-        if penalty.nrows() != p || penalty.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "bounded EDF penalty {k} has shape {}x{}, expected {}x{}",
-                penalty.nrows(),
-                penalty.ncols(),
-                p,
-                p
-            )));
-        }
+    for (k, ps) in penalties.iter().enumerate() {
         let lambda_k = lambdas[k];
-        s_lambda.scaled_add(lambda_k, penalty);
+        match ps {
+            PenaltySpec::Block { local, col_range } => {
+                s_lambda
+                    .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
+                    .scaled_add(lambda_k, local);
+            }
+            PenaltySpec::Dense(m) => {
+                s_lambda.scaled_add(lambda_k, m);
+            }
+        }
+        let penalty_dense = ps.to_global(p);
         let penalty_rank =
-            penalty
-                .nrows()
-                .saturating_sub(estimate_penalty_nullity(penalty).map_err(|e| {
+            p.saturating_sub(estimate_penalty_nullity(&penalty_dense).map_err(|e| {
                     EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
                 })?);
         let trace_k = lambda_k
@@ -7298,8 +7329,10 @@ fn fit_bounded_term_collection_with_design(
     let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
     let dense_design = design.design.as_dense_cow();
     let fit_design = conditioning.apply_to_design(&dense_design);
-    let global_penalties = penalties_to_global(&design.penalties, design.design.ncols());
-    let fit_penalties = conditioning.transform_penalties_to_internal(&global_penalties);
+    let fit_penalties = conditioning.transform_blockwise_penalties_to_internal(
+        &design.penalties,
+        design.design.ncols(),
+    );
     if design.linear_constraints.is_some() {
         return Err(EstimationError::InvalidInput(
             "bounded() terms are not yet compatible with explicit linear constraints".to_string(),
@@ -7388,8 +7421,14 @@ fn fit_bounded_term_collection_with_design(
         offset: offset.to_owned(),
         penalties: fit_penalties
             .iter()
-            .cloned()
-            .map(PenaltyMatrix::Dense)
+            .map(|ps| match ps {
+                PenaltySpec::Block { local, col_range } => PenaltyMatrix::Blockwise {
+                    local: local.clone(),
+                    col_range: col_range.clone(),
+                    total_dim: design.design.ncols(),
+                },
+                PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
+            })
             .collect(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas,
@@ -7426,9 +7465,19 @@ fn fit_bounded_term_collection_with_design(
     let (eta_state, h_data, _, _) = family_adapter
         .evaluation_from_latent(&latent_beta)
         .map_err(EstimationError::InvalidInput)?;
-    let mut s_lambda_internal = Array2::<f64>::zeros((fit_design.ncols(), fit_design.ncols()));
+    let p_fit = fit_design.ncols();
+    let mut s_lambda_internal = Array2::<f64>::zeros((p_fit, p_fit));
     for (k, penalty) in fit_penalties.iter().enumerate() {
-        s_lambda_internal.scaled_add(fit.lambdas[k], penalty);
+        match penalty {
+            PenaltySpec::Block { local, col_range } => {
+                s_lambda_internal
+                    .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
+                    .scaled_add(fit.lambdas[k], local);
+            }
+            PenaltySpec::Dense(m) => {
+                s_lambda_internal.scaled_add(fit.lambdas[k], m);
+            }
+        }
     }
     let mut penalized_hessian = h_data.clone();
     penalized_hessian += &s_lambda_internal;

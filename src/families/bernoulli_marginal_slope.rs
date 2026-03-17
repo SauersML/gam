@@ -377,6 +377,7 @@ fn pooled_probit_baseline(
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
             kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .map_err(|e| format!("failed to fit pooled bernoulli-marginal-slope pilot probit: {e}"))?;

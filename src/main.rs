@@ -938,6 +938,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         adaptive_regularization: adaptive_opts,
         penalty_shrinkage_floor: Some(1e-6),
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     };
     let standard_wiggle = if learn_linkwiggle
         && args.predict_noise.is_none()
@@ -1004,6 +1005,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 firth_bias_reduction: Some(true),
                 penalty_shrinkage_floor: Some(1e-6),
                 kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
         )
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
@@ -3281,6 +3283,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: Some(1e-6),
                 kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
         )
         .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
@@ -5066,6 +5069,7 @@ fn run_sample_standard(
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
             kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;

@@ -1263,6 +1263,8 @@ pub struct ExternalOptimOptions {
     pub penalty_shrinkage_floor: Option<f64>,
     /// Kronecker-factored penalty system for tensor-product smooth terms.
     pub kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
+    /// Full Kronecker factored basis for P-IRLS factored reparameterization.
+    pub kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
 }
 
 fn resolve_external_family(
@@ -1531,6 +1533,9 @@ where
     reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
     if let Some(kron) = opts.kronecker_penalty_system.clone() {
         reml_state.set_kronecker_penalty_system(kron);
+    }
+    if let Some(kf) = opts.kronecker_factored.clone() {
+        reml_state.set_kronecker_factored(kf);
     }
     reml_state.setwarm_start_original_beta(warm_start_beta);
 
@@ -2130,6 +2135,7 @@ where
             coefficient_lower_bounds: None,
             linear_constraints_original: fit_linear_constraints.as_ref(),
             penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+            kronecker_factored: None,
         },
         &pirls::PirlsConfig {
             link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -2347,6 +2353,7 @@ where
                                     coefficient_lower_bounds: None,
                                     linear_constraints_original: fit_linear_constraints.as_ref(),
                                     penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+                                    kronecker_factored: None,
                                 },
                                 &pirls::PirlsConfig {
                                     link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -2849,6 +2856,8 @@ pub struct FitOptions {
     /// When set, the REML evaluator uses O(∏q_j) logdet and KroneckerMarginal
     /// penalty coordinates instead of O(p³) eigendecomposition.
     pub kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
+    /// Full Kronecker factored basis for P-IRLS factored reparameterization.
+    pub kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4337,6 +4346,7 @@ where
         firth_bias_reduction: None,
         penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
         kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
+        kronecker_factored: opts.kronecker_factored.clone(),
     };
 
     let result = if matches!(
@@ -4788,6 +4798,7 @@ mod fd_policy_tests {
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
             kronecker_penalty_system: None,
+            kronecker_factored: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];
@@ -4995,6 +5006,7 @@ mod fd_policy_tests {
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
             kronecker_penalty_system: None,
+            kronecker_factored: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];
@@ -5145,6 +5157,7 @@ mod fd_policy_tests {
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
             kronecker_penalty_system: None,
+            kronecker_factored: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];

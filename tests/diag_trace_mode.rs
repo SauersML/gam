@@ -65,6 +65,7 @@ fn tracethird_auto_correction_againstfd() {
         firth_bias_reduction: Some(false),
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     };
     let rho = Array1::from_vec(vec![1.0, 1.5]);
 

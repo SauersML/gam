@@ -1272,6 +1272,19 @@ impl CanonicalPenalty {
         }
     }
 
+    /// Embed the block-local root into a full-width `rank × total_dim` matrix.
+    /// For dense penalties (col_range = 0..p), returns the root unchanged.
+    pub fn full_width_root(&self) -> Array2<f64> {
+        if self.col_range.start == 0 && self.col_range.end == self.total_dim {
+            return self.root.clone();
+        }
+        let rank = self.root.nrows();
+        let mut full = Array2::<f64>::zeros((rank, self.total_dim));
+        full.slice_mut(ndarray::s![.., self.col_range.clone()])
+            .assign(&self.root);
+        full
+    }
+
     /// Numerical rank of this penalty.
     pub fn rank(&self) -> usize {
         self.root.nrows()
@@ -1430,12 +1443,16 @@ pub fn canonicalize_penalty_spec(
         for i in 0..block_dim {
             root[[i, i]] = sqrt_scale;
         }
+        // Ridge penalties are diagonal ⟹ already symmetric, but symmetrize
+        // for consistency with the generic path.
+        let local_owned = local_matrix.to_owned();
+        let local_sym = (&local_owned + &local_owned.t()) * 0.5;
         return Ok(Some(CanonicalPenalty {
             root,
             col_range,
             total_dim: p,
             nullity: 0,
-            local: local_matrix.to_owned(),
+            local: local_sym,
             positive_eigenvalues: vec![*scale; block_dim],
         }));
     }
@@ -2197,13 +2214,8 @@ pub fn stable_reparameterizationwith_invariant(
     if !invariant.has_nonzero {
         let qs = invariant.split.compose_qs();
         let u_truncated = qs.t().dot(&invariant.split.q_null);
-        // Derive full-width roots from block-local canonical penalties.
-        let global_roots: Vec<Array2<f64>> =
-            penalties.iter().map(|cp| cp.global_root()).collect();
-        let canonical_transformed: Vec<CanonicalPenalty> = global_roots
-            .iter()
-            .map(|r| CanonicalPenalty::from_dense_root(r.clone(), p))
-            .collect();
+        // All penalties are zero — canonical_transformed = originals (no rotation needed).
+        let canonical_transformed: Vec<CanonicalPenalty> = penalties.to_vec();
         return Ok(ReparamResult {
             s_transformed: Array2::zeros((p, p)),
             log_det: 0.0,
