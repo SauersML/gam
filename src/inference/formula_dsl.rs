@@ -1,10 +1,22 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use ndarray::ArrayView1;
 use pest::Parser;
 use pest::iterators::Pair;
 use pest_derive::Parser;
 
-use crate::smooth::BoundedCoefficientPriorSpec;
+use crate::basis::{
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy,
+    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    SpatialIdentifiability, ThinPlateBasisSpec, default_num_centers,
+};
+use crate::inference::data::EncodedDataset as Dataset;
+use crate::inference::model::ColumnKindTag;
+use crate::smooth::{
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec,
+    RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
+};
 use crate::types::{InverseLink, LinkComponent, LinkFunction};
 
 #[derive(Parser)]

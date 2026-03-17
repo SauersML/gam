@@ -21,30 +21,28 @@
 //! each smooth term directly from the data.
 
 use self::reml::{DirectionalHyperParam, RemlState};
-use crate::basis::analyze_penalty_block;
 // BlockwiseFitResult and SurvivalLocationScaleFitResult are now type aliases
 // for UnifiedFitResult, defined in their respective modules.
 use std::fmt;
 use std::time::Instant;
 
 // Crate-level imports
-use crate::construction::{
-    ReparamInvariant, compute_penalty_square_roots, create_balanced_penalty_root,
-    precompute_reparam_invariant,
-};
+use crate::construction::ReparamInvariant;
 use crate::diagnostics::should_emit_h_min_eig_diag;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
-    KahanSum, RidgePlanner, StableSolver, add_relative_diag_ridge, addridge, enforce_symmetry,
-    matrix_inversewith_regularization, row_mismatch_message,
+    KahanSum, add_relative_diag_ridge, enforce_symmetry, matrix_inversewith_regularization,
+    row_mismatch_message,
 };
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
+use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
-    Coefficients, GlmLikelihoodFamily, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState,
-    RidgePassport, SasLinkState,
+    Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodFamily,
+    LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
+    MixtureLinkState, RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -58,6 +56,9 @@ use faer::{MatRef, Side};
 use rayon::prelude::*;
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+use crate::linalg::utils::StableSolver;
 
 // Note: deflateweights_by_se was removed. We now use integrated (GHQ)
 // family-dispatched likelihood updates in PIRLS instead of weight deflation.
@@ -87,10 +88,13 @@ pub enum PenaltySpec {
 impl PenaltySpec {
     /// The column range this penalty covers.
     /// For `Dense`, this is `0..p` where `p = m.ncols()`.
-    pub fn col_range(&self, _p: usize) -> Range<usize> {
+    pub fn col_range(&self, p: usize) -> Range<usize> {
         match self {
             PenaltySpec::Block { col_range, .. } => col_range.clone(),
-            PenaltySpec::Dense(m) => 0..m.ncols(),
+            PenaltySpec::Dense(m) => {
+                debug_assert_eq!(m.ncols(), p);
+                0..p
+            }
         }
     }
 
@@ -758,7 +762,7 @@ fn map_hessian_to_original_basis(
 
 #[derive(Clone)]
 pub(crate) struct RemlConfig {
-    likelihood: GlmLikelihoodFamily,
+    likelihood: GlmLikelihoodSpec,
     link_kind: InverseLink,
     convergence_tolerance: f64,
     max_iterations: usize,
@@ -769,7 +773,7 @@ pub(crate) struct RemlConfig {
 
 impl RemlConfig {
     fn external(
-        likelihood: GlmLikelihoodFamily,
+        likelihood: GlmLikelihoodSpec,
         reml_tol: f64,
         firth_bias_reduction: bool,
     ) -> Self {
@@ -788,7 +792,7 @@ impl RemlConfig {
         self.link_kind.link_function()
     }
 
-    fn likelihood(&self) -> GlmLikelihoodFamily {
+    fn likelihood(&self) -> GlmLikelihoodSpec {
         self.likelihood
     }
 
@@ -1195,11 +1199,15 @@ impl core::fmt::Debug for EstimationError {
 pub struct ExternalOptimResult {
     pub beta: Array1<f64>,
     pub lambdas: Array1<f64>,
+    pub likelihood_family: LikelihoodFamily,
+    pub likelihood_scale: LikelihoodScaleMetadata,
+    pub log_likelihood_normalization: LogLikelihoodNormalization,
+    pub log_likelihood: f64,
     /// Residual scale on the response scale.
     ///
     /// Contract: Gaussian identity models store the residual standard
-    /// deviation sigma here. Non-Gaussian families keep the canonical fixed
-    /// scale (currently 1.0).
+    /// deviation sigma here. Non-Gaussian families keep the response-scale
+    /// summary used by their explicit likelihood-scale metadata.
     pub standard_deviation: f64,
     pub iterations: usize,
     pub finalgrad_norm: f64,
@@ -1240,7 +1248,7 @@ pub struct ExternalOptimOptions {
 fn resolve_external_family(
     family: crate::types::LikelihoodFamily,
     firth_override: Option<bool>,
-) -> Result<(GlmLikelihoodFamily, bool), EstimationError> {
+) -> Result<(GlmLikelihoodSpec, bool), EstimationError> {
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
         return Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
@@ -1257,11 +1265,11 @@ fn resolve_external_family(
     }
 
     Ok((
-        GlmLikelihoodFamily::try_from(family).map_err(|msg| {
+        GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::try_from(family).map_err(|msg| {
             EstimationError::InvalidInput(format!(
                 "optimize_external_design requires a GLM family; {msg}"
             ))
-        })?,
+        })?),
         firth_override.unwrap_or_else(|| family.supports_firth()) && family.supports_firth(),
     ))
 }
@@ -1397,13 +1405,16 @@ pub fn optimize_external_design<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<PenaltySpec>,
+    s_list: Vec<BlockwisePenalty>,
     opts: &ExternalOptimOptions,
 ) -> Result<ExternalOptimResult, EstimationError>
 where
     X: Into<DesignMatrix>,
 {
-    optimize_external_designwith_heuristic_lambdas(y, w, x, offset, s_list, None, opts)
+    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from).collect();
+    optimize_external_designwith_heuristic_lambdas_andwarm_start(
+        y, w, x, offset, specs, None, None, opts,
+    )
 }
 
 /// Same as `optimize_external_design`, but allows heuristic λ warm-start seeds
@@ -1413,19 +1424,20 @@ pub fn optimize_external_designwith_heuristic_lambdas<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<PenaltySpec>,
+    s_list: Vec<BlockwisePenalty>,
     heuristic_lambdas: Option<&[f64]>,
     opts: &ExternalOptimOptions,
 ) -> Result<ExternalOptimResult, EstimationError>
 where
     X: Into<DesignMatrix>,
 {
+    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from).collect();
     optimize_external_designwith_heuristic_lambdas_andwarm_start(
         y,
         w,
         x,
         offset,
-        s_list,
+        specs,
         heuristic_lambdas,
         None,
         opts,
@@ -2088,7 +2100,7 @@ where
             covariate_se: None,
         },
         pirls::PenaltyConfig {
-            rs_original: &rs_list,
+            rs_original: &reml_state.rs_list,
             balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
             reparam_invariant: None,
             p,
@@ -2306,7 +2318,7 @@ where
                                     covariate_se: None,
                                 },
                                 pirls::PenaltyConfig {
-                                    rs_original: &rs_list,
+                                    rs_original: &reml_state.rs_list,
                                     balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
                                     reparam_invariant: None,
                                     p,
@@ -2526,10 +2538,21 @@ where
     });
 
     let pirls_status = pirls_res.status;
+    let likelihood_spec = cfg.likelihood();
+    let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
+        y_o.view(),
+        &pirls_res.finalmu,
+        likelihood_spec,
+        w_o.view(),
+    );
 
     let result = ExternalOptimResult {
         beta: beta_orig_internal,
         lambdas: lambdas.to_owned(),
+        likelihood_family: likelihood_spec.response_family(),
+        likelihood_scale: likelihood_spec.scale,
+        log_likelihood_normalization: LogLikelihoodNormalization::OmittingResponseConstants,
+        log_likelihood,
         standard_deviation,
         iterations: iters,
         finalgrad_norm,
@@ -2750,12 +2773,13 @@ pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
 where
     X: Into<DesignMatrix>,
 {
+    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from).collect();
     validate_and_build_reml_state(
         y,
         w,
         x,
         offset,
-        s_list,
+        specs,
         theta,
         rho_dim,
         hyper_dirs,
@@ -2972,7 +2996,11 @@ pub struct UnifiedFitResultParts {
     pub blocks: Vec<FittedBlock>,
     pub log_lambdas: Array1<f64>,
     pub lambdas: Array1<f64>,
+    pub likelihood_family: Option<LikelihoodFamily>,
+    pub likelihood_scale: LikelihoodScaleMetadata,
+    pub log_likelihood_normalization: LogLikelihoodNormalization,
     pub log_likelihood: f64,
+    pub deviance: f64,
     pub reml_score: f64,
     pub stable_penalty_term: f64,
     pub penalized_objective: f64,
@@ -3016,9 +3044,15 @@ pub struct UnifiedFitResult {
     pub log_lambdas: Array1<f64>,
     /// Smoothing parameters (exp of log_lambdas).
     pub lambdas: Array1<f64>,
+    /// Explicit engine-level family, when the fit uses a built-in family.
+    pub likelihood_family: Option<LikelihoodFamily>,
+    /// Fixed-scale metadata for the fitted likelihood.
+    pub likelihood_scale: LikelihoodScaleMetadata,
+    /// Whether `log_likelihood` includes response-only normalization constants.
+    pub log_likelihood_normalization: LogLikelihoodNormalization,
     /// Log-likelihood at the converged mode.
     pub log_likelihood: f64,
-    /// Deviance = -2 * log_likelihood.
+    /// Explicit deviance reported by the fitting path.
     pub deviance: f64,
     /// REML/LAML score (penalized objective used for smoothing selection).
     pub reml_score: f64,
@@ -3035,7 +3069,8 @@ pub struct UnifiedFitResult {
     /// Residual scale on the response scale.
     ///
     /// Contract: Gaussian identity models store residual standard deviation
-    /// sigma here. Non-Gaussian families keep the canonical fixed scale (1.0).
+    /// sigma here. Non-Gaussian families keep the response-scale summary used
+    /// by their explicit likelihood-scale metadata.
     pub standard_deviation: f64,
     /// Conditional covariance Var(β | λ) for the joint coefficient vector.
     pub covariance_conditional: Option<Array2<f64>>,
@@ -3091,6 +3126,34 @@ pub(crate) fn ensure_finite_scalar_estimation(
         Err(EstimationError::InvalidInput(format!(
             "{name} must be finite, got {value}"
         )))
+    }
+}
+
+fn validate_likelihood_scale_estimation(
+    scale: LikelihoodScaleMetadata,
+) -> Result<(), EstimationError> {
+    match scale {
+        LikelihoodScaleMetadata::ProfiledGaussian | LikelihoodScaleMetadata::Unspecified => Ok(()),
+        LikelihoodScaleMetadata::FixedDispersion { phi } => {
+            ensure_finite_scalar_estimation("fit_result.likelihood_scale.phi", phi)?;
+            if phi > 0.0 {
+                Ok(())
+            } else {
+                Err(EstimationError::InvalidInput(format!(
+                    "fit_result.likelihood_scale.phi must be > 0, got {phi}"
+                )))
+            }
+        }
+        LikelihoodScaleMetadata::FixedGammaShape { shape } => {
+            ensure_finite_scalar_estimation("fit_result.likelihood_scale.shape", shape)?;
+            if shape > 0.0 {
+                Ok(())
+            } else {
+                Err(EstimationError::InvalidInput(format!(
+                    "fit_result.likelihood_scale.shape must be > 0, got {shape}"
+                )))
+            }
+        }
     }
 }
 
@@ -3195,7 +3258,11 @@ impl UnifiedFitResult {
             blocks,
             log_lambdas,
             lambdas,
+            likelihood_family,
+            likelihood_scale,
+            log_likelihood_normalization,
             log_likelihood,
+            deviance,
             reml_score,
             stable_penalty_term,
             penalized_objective,
@@ -3241,7 +3308,9 @@ impl UnifiedFitResult {
         }
         validate_all_finite_estimation("fit_result.log_lambdas", log_lambdas.iter().copied())?;
         validate_all_finite_estimation("fit_result.lambdas", lambdas.iter().copied())?;
+        validate_likelihood_scale_estimation(likelihood_scale)?;
         ensure_finite_scalar_estimation("fit_result.log_likelihood", log_likelihood)?;
+        ensure_finite_scalar_estimation("fit_result.deviance", deviance)?;
         ensure_finite_scalar_estimation("fit_result.reml_score", reml_score)?;
         ensure_finite_scalar_estimation("fit_result.stable_penalty_term", stable_penalty_term)?;
         ensure_finite_scalar_estimation("fit_result.penalized_objective", penalized_objective)?;
@@ -3332,8 +3401,11 @@ impl UnifiedFitResult {
             blocks,
             log_lambdas,
             lambdas,
+            likelihood_family,
+            likelihood_scale,
+            log_likelihood_normalization,
             log_likelihood,
-            deviance: -2.0 * log_likelihood,
+            deviance,
             reml_score,
             stable_penalty_term,
             penalized_objective,
@@ -3361,7 +3433,11 @@ impl UnifiedFitResult {
             blocks: self.blocks.clone(),
             log_lambdas: self.log_lambdas.clone(),
             lambdas: self.lambdas.clone(),
+            likelihood_family: self.likelihood_family,
+            likelihood_scale: self.likelihood_scale,
+            log_likelihood_normalization: self.log_likelihood_normalization,
             log_likelihood: self.log_likelihood,
+            deviance: self.deviance,
             reml_score: self.reml_score,
             stable_penalty_term: self.stable_penalty_term,
             penalized_objective: self.penalized_objective,
@@ -4126,7 +4202,7 @@ pub fn fit_gamwith_heuristic_lambdas<X>(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    s_list: &[PenaltySpec],
+    s_list: &[BlockwisePenalty],
     heuristic_lambdas: Option<&[f64]>,
     family: crate::types::LikelihoodFamily,
     opts: &FitOptions,
@@ -4161,6 +4237,7 @@ pub(crate) fn fit_gamwith_heuristic_lambdas_andwarm_start<X>(
 where
     X: Into<DesignMatrix>,
 {
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from).collect();
     let x = x.into();
     if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
         && opts.mixture_link.is_none()
@@ -4219,7 +4296,7 @@ where
             "fit_gam external design path does not support RoystonParmar; use survival training APIs".to_string(),
         ));
     }
-    validate_blockwise_penalties(s_list, x.ncols(), "fit_gam")?;
+    validate_penalty_specs(&specs, x.ncols(), "fit_gam")?;
     let mut ext_opts = ExternalOptimOptions {
         family: resolved_family,
         mixture_link: opts.mixture_link.clone(),
@@ -4256,7 +4333,7 @@ where
             weights,
             &x,
             offset,
-            s_list.to_vec(),
+            specs.clone(),
             heuristic_lambdas,
             warm_start_beta,
             &ext_opts,
@@ -4277,7 +4354,7 @@ where
                         weights,
                         &x,
                         offset,
-                        s_list.to_vec(),
+                        specs.clone(),
                         heuristic_lambdas,
                         warm_start_beta,
                         &ext_opts,
@@ -4296,7 +4373,7 @@ where
                     weights,
                     &x,
                     offset,
-                    s_list.to_vec(),
+                    specs.clone(),
                     heuristic_lambdas,
                     warm_start_beta,
                     &ext_opts,
@@ -4309,7 +4386,7 @@ where
             weights,
             &x,
             offset,
-            s_list.to_vec(),
+            specs.clone(),
             heuristic_lambdas,
             warm_start_beta,
             &ext_opts,
@@ -4335,7 +4412,7 @@ where
         .as_ref()
         .and_then(|inf| inf.beta_covariance_corrected.clone());
     let penalized_objective =
-        -0.5 * result.deviance + result.stable_penalty_term + result.reml_score;
+        -result.log_likelihood + result.stable_penalty_term + result.reml_score;
     UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: result.beta.clone(),
@@ -4345,7 +4422,11 @@ where
         }],
         log_lambdas,
         lambdas: result.lambdas,
-        log_likelihood: -0.5 * result.deviance,
+        likelihood_family: Some(result.likelihood_family),
+        likelihood_scale: result.likelihood_scale,
+        log_likelihood_normalization: result.log_likelihood_normalization,
+        log_likelihood: result.log_likelihood,
+        deviance: result.deviance,
         reml_score: result.reml_score,
         stable_penalty_term: result.stable_penalty_term,
         penalized_objective,
@@ -4465,16 +4546,18 @@ pub fn evaluate_externalgradients<X>(
 where
     X: Into<DesignMatrix>,
 {
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
         return Err(EstimationError::InvalidInput(message));
     }
 
     let p = x.ncols();
-    validate_blockwise_penalties(s_list, p, "evaluate_externalgradients")?;
-    let (svec, active_nullspace_dims) = canonicalize_active_blockwise_penalties(
-        s_list.to_vec(),
+    validate_penalty_specs(&specs, p, "evaluate_externalgradients")?;
+    let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
+        &specs,
         &opts.nullspace_dims,
+        p,
         "evaluate_externalgradients",
     )?;
     if rho.len() != active_nullspace_dims.len() {
@@ -4490,7 +4573,7 @@ where
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
-    let conditioning = ParametricColumnConditioning::infer_from_blockwise_penalties(&x, &svec);
+    let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(&x, &specs);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
@@ -4500,7 +4583,7 @@ where
         x_fit,
         w_o.view(),
         offset_o.view(),
-        svec,
+        canonical,
         p,
         &cfg,
         Some(active_nullspace_dims),
@@ -4533,16 +4616,18 @@ pub fn evaluate_externalcost_andridge<X>(
 where
     X: Into<DesignMatrix>,
 {
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
         return Err(EstimationError::InvalidInput(message));
     }
 
     let p = x.ncols();
-    validate_blockwise_penalties(s_list, p, "evaluate_externalcost_andridge")?;
-    let (svec, active_nullspace_dims) = canonicalize_active_blockwise_penalties(
-        s_list.to_vec(),
+    validate_penalty_specs(&specs, p, "evaluate_externalcost_andridge")?;
+    let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
+        &specs,
         &opts.nullspace_dims,
+        p,
         "evaluate_externalcost_andridge",
     )?;
     if rho.len() != active_nullspace_dims.len() {
@@ -4558,7 +4643,7 @@ where
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
-    let conditioning = ParametricColumnConditioning::infer_from_blockwise_penalties(&x, &svec);
+    let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(&x, &specs);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
@@ -4568,7 +4653,7 @@ where
         x_fit,
         w_o.view(),
         offset_o.view(),
-        svec,
+        canonical,
         p,
         &cfg,
         Some(active_nullspace_dims),

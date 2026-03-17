@@ -12,7 +12,9 @@ use crate::families::bernoulli_marginal_slope::{
     MultiDirJet, unary_derivatives_exp, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
-use crate::families::survival_location_scale::TimeBlockInput;
+use crate::families::survival_location_scale::{
+    TimeBlockInput, structural_nonnegative_time_constraints,
+};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
@@ -1365,6 +1367,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 .unwrap_or(&self.derivative_offset_exit);
             // Monotonicity constraint: design_derivative_exit @ beta_time + offset >= guard
             // i.e. design_derivative_exit @ beta_time >= guard - offset
+            if let Some(structural) = structural_nonnegative_time_constraints(
+                constraint_rows,
+                constraint_offsets,
+                self.derivative_guard,
+            ) {
+                return Ok(Some(structural));
+            }
             Ok(Some(LinearInequalityConstraints {
                 a: constraint_rows.clone(),
                 b: Array1::from_iter(

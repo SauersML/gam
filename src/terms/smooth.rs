@@ -5165,7 +5165,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 }],
                 log_lambdas,
                 lambdas: full_lambdas,
-                log_likelihood: -0.5 * deviance,
+                likelihood_family: Some(family),
+                likelihood_scale: family.default_scale_metadata(),
+                log_likelihood_normalization:
+                    crate::types::LogLikelihoodNormalization::UserProvided,
+                log_likelihood: final_eval.obs.log_likelihood,
+                deviance,
                 reml_score: final_fit.penalized_objective,
                 stable_penalty_term,
                 penalized_objective: final_fit.penalized_objective,
@@ -7317,7 +7322,12 @@ fn fit_bounded_term_collection_with_design(
                 }],
                 log_lambdas,
                 lambdas: fit.lambdas,
-                log_likelihood: -0.5 * deviance,
+                likelihood_family: Some(family),
+                likelihood_scale: family.default_scale_metadata(),
+                log_likelihood_normalization:
+                    crate::types::LogLikelihoodNormalization::UserProvided,
+                log_likelihood: eta_state.log_likelihood,
+                deviance,
                 reml_score: fit.penalized_objective,
                 stable_penalty_term: penalty_term,
                 penalized_objective: fit.penalized_objective,
@@ -11823,6 +11833,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                pilot_subsample_threshold: 0,
             },
         )
         .expect("optimized fit should succeed");
@@ -12651,6 +12662,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                pilot_subsample_threshold: 0,
             },
         )
         .expect("optimized fit should succeed");
@@ -12746,6 +12758,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                pilot_subsample_threshold: 0,
             },
         )
         .expect("binomial-logit Matérn spatial κ optimization should succeed");

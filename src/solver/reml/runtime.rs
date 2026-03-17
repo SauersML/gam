@@ -5,7 +5,6 @@ use crate::construction::{
 use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
 use crate::linalg::utils::{boundary_hit_indices, symmetric_spectrum_condition_number};
 use crate::pirls::PirlsWorkspace;
-use crate::terms::smooth::{BlockwisePenalty, penalties_to_global, weighted_blockwise_penalty_sum};
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -2672,7 +2671,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
-            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root,
+            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator,
         };
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
@@ -2711,10 +2710,10 @@ impl<'a> RemlState<'a> {
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
 
         // Penalty logdet second derivatives (for outer Hessian).
+        // Use block-local path to avoid O(p³) eigendecomposition.
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             let lambdas = rho.mapv(f64::exp);
-            let (_, det2) = self.structural_penalty_logdet_derivatives(
-                &penalty_roots,
+            let (_, det2) = self.structural_penalty_logdet_derivatives_block_local(
                 &lambdas,
                 bundle.ridge_passport.penalty_logdet_ridge(),
             )?;
@@ -2767,7 +2766,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         use super::unified::{
-            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator, penalty_matrix_root,
+            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator,
         };
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
@@ -3169,7 +3168,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         use super::unified::{
             HessianOperator, InnerSolutionBuilder, PenaltyLogdetDerivs, SparseCholeskyOperator,
-            penalty_matrix_root, reml_laml_evaluate,
+            reml_laml_evaluate,
         };
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
@@ -3196,8 +3195,7 @@ impl<'a> RemlState<'a> {
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             let lambdas = rho.mapv(f64::exp);
-            let (_, det2) = self.structural_penalty_logdet_derivatives(
-                &penalty_roots,
+            let (_, det2) = self.structural_penalty_logdet_derivatives_block_local(
                 &lambdas,
                 bundle.ridge_passport.penalty_logdet_ridge(),
             )?;

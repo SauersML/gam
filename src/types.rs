@@ -181,6 +181,22 @@ impl LikelihoodFamily {
                 | Self::BinomialMixture
         )
     }
+
+    #[inline]
+    pub fn default_scale_metadata(self) -> LikelihoodScaleMetadata {
+        match self {
+            Self::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
+            Self::GammaLog => LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 },
+            Self::BinomialLogit
+            | Self::BinomialProbit
+            | Self::BinomialCLogLog
+            | Self::BinomialSas
+            | Self::BinomialBetaLogistic
+            | Self::BinomialMixture
+            | Self::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            Self::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
+        }
+    }
 }
 
 /// GLM-compatible likelihood families (survival families excluded by type).
@@ -206,6 +222,91 @@ impl GlmLikelihoodFamily {
     #[inline]
     pub fn supports_firth(self) -> bool {
         LikelihoodFamily::from(self).supports_firth()
+    }
+}
+
+/// How a likelihood's scale parameter is handled by the fit/result contract.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum LikelihoodScaleMetadata {
+    /// Gaussian identity fits profile sigma outside the fixed-scale GLM machinery.
+    ProfiledGaussian,
+    /// Fixed exponential-dispersion parameter `phi`.
+    FixedDispersion { phi: f64 },
+    /// Fixed Gamma shape `k`, equivalent to `phi = 1 / k`.
+    FixedGammaShape { shape: f64 },
+    /// The engine does not expose fixed-scale semantics for this family.
+    Unspecified,
+}
+
+impl LikelihoodScaleMetadata {
+    #[inline]
+    pub fn fixed_phi(self) -> Option<f64> {
+        match self {
+            Self::FixedDispersion { phi } => Some(phi),
+            Self::FixedGammaShape { shape } => Some(1.0 / shape),
+            Self::ProfiledGaussian | Self::Unspecified => None,
+        }
+    }
+
+    #[inline]
+    pub fn gamma_shape(self) -> Option<f64> {
+        match self {
+            Self::FixedGammaShape { shape } => Some(shape),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a stored log-likelihood includes response-only normalization constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogLikelihoodNormalization {
+    Full,
+    OmittingResponseConstants,
+    UserProvided,
+}
+
+/// Explicit GLM likelihood specification: family plus scale semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GlmLikelihoodSpec {
+    pub family: GlmLikelihoodFamily,
+    pub scale: LikelihoodScaleMetadata,
+}
+
+impl GlmLikelihoodSpec {
+    #[inline]
+    pub fn canonical(family: GlmLikelihoodFamily) -> Self {
+        let scale = match family {
+            GlmLikelihoodFamily::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
+            GlmLikelihoodFamily::GammaLog => LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 },
+            GlmLikelihoodFamily::BinomialLogit
+            | GlmLikelihoodFamily::BinomialProbit
+            | GlmLikelihoodFamily::BinomialCLogLog
+            | GlmLikelihoodFamily::BinomialSas
+            | GlmLikelihoodFamily::BinomialBetaLogistic
+            | GlmLikelihoodFamily::BinomialMixture
+            | GlmLikelihoodFamily::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+        };
+        Self { family, scale }
+    }
+
+    #[inline]
+    pub fn link_function(self) -> LinkFunction {
+        self.family.link_function()
+    }
+
+    #[inline]
+    pub fn response_family(self) -> LikelihoodFamily {
+        self.family.into()
+    }
+
+    #[inline]
+    pub fn fixed_phi(self) -> Option<f64> {
+        self.scale.fixed_phi()
+    }
+
+    #[inline]
+    pub fn gamma_shape(self) -> Option<f64> {
+        self.scale.gamma_shape()
     }
 }
 

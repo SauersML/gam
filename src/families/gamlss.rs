@@ -1,7 +1,7 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
-    create_difference_penalty_matrix, evaluate_bspline_fourth_derivative_scalar,
-    evaluate_bsplinethird_derivative_scalar,
+    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    evaluate_bspline_derivative_scalar, evaluate_bspline_fourth_derivative_scalar,
+    evaluate_bsplinesecond_derivative_scalar, evaluate_bsplinethird_derivative_scalar,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -42,8 +42,9 @@ use std::sync::Arc;
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
-const WIGGLE_MONOTONICITY_GUARD: f64 = 1e-8;
 const WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL: usize = 8;
+const WIGGLE_MONOTONICITY_GUARD_FRACTION: f64 = 1e-6;
+const WIGGLE_MONOTONICITY_GUARD: f64 = 1e-10;
 
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
@@ -353,32 +354,23 @@ pub fn buildwiggle_block_input_from_knots(
     penalty_order: usize,
     double_penalty: bool,
 ) -> Result<ParameterBlockInput, String> {
-    let (basis, _) = create_basis::<Dense>(
-        seed,
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::value(),
-    )
-    .map_err(|e| e.to_string())?;
-    let full = (*basis).clone();
-    if full.ncols() < 3 {
-        return Err("wiggle basis has fewer than three columns".to_string());
-    }
-    let (z, s_constrained) = compute_geometric_constraint_transform(knots, degree, penalty_order)
-        .map_err(|e| e.to_string())?;
-    if full.ncols() != z.nrows() {
-        return Err(format!(
-            "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
-            full.ncols(),
-            z.nrows()
-        ));
-    }
-    let design = full.dot(&z);
+    let design = monotone_wiggle_basis_from_knots(seed, knots, degree)?;
     let p = design.ncols();
-    let mut penalties = vec![s_constrained];
-    // After geometric constraint transform (removing intercept + linear),
-    // the constrained penalty has nullity 0. Ridge is also full rank.
-    let mut nullspace_dims = vec![0usize];
+    if p == 0 {
+        return Err("wiggle basis has no free monotone columns".to_string());
+    }
+    let mut penalties = Vec::new();
+    let mut nullspace_dims = Vec::new();
+    if p == 1 {
+        penalties.push(Array2::<f64>::eye(1));
+        nullspace_dims.push(0);
+    } else {
+        let effective_order = penalty_order.max(1).min(p - 1);
+        penalties.push(
+            create_difference_penalty_matrix(p, effective_order, None).map_err(|e| e.to_string())?,
+        );
+        nullspace_dims.push(effective_order);
+    }
     if double_penalty {
         penalties.push(Array2::<f64>::eye(p));
         nullspace_dims.push(0);
@@ -389,7 +381,7 @@ pub fn buildwiggle_block_input_from_knots(
         penalties,
         nullspace_dims,
         initial_log_lambdas: None,
-        initial_beta: None,
+        initial_beta: Some(Array1::zeros(p)),
     })
 }
 
@@ -408,69 +400,150 @@ pub fn buildwiggle_block_input_from_seed(
     Ok((block, knots))
 }
 
-pub(crate) fn wiggle_monotonicity_collocation_points(knots: &Array1<f64>) -> Array1<f64> {
-    let mut breaks: Vec<f64> = knots.iter().copied().filter(|v| v.is_finite()).collect();
-    breaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    breaks.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
-    if breaks.len() <= 1 {
-        return Array1::from_vec(breaks);
+pub(crate) fn monotone_wiggle_basis_from_knots(
+    seed: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+) -> Result<Array2<f64>, String> {
+    let (basis, _) = create_basis::<Dense>(
+        seed,
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::i_spline(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(basis.as_ref().clone())
+}
+
+pub(crate) fn monotone_wiggle_basis_with_derivative_order(
+    seed: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    derivative_order: usize,
+) -> Result<Array2<f64>, String> {
+    if derivative_order == 0 {
+        return monotone_wiggle_basis_from_knots(seed, knots, degree);
+    }
+    if derivative_order > 4 {
+        return Err(format!(
+            "unsupported monotone wiggle derivative order {derivative_order}"
+        ));
     }
 
-    let mut grid = Vec::new();
-    for (idx, window) in breaks.windows(2).enumerate() {
-        let left = window[0];
-        let right = window[1];
-        if (right - left).abs() <= 1e-12 {
-            continue;
+    let _ = create_basis::<Dense>(
+        seed,
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::i_spline(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let bs_degree = degree + 1;
+    let num_bspline_basis = knots.len().saturating_sub(bs_degree + 1);
+    let num_ispline_basis = num_bspline_basis.saturating_sub(1);
+    let mut out = Array2::<f64>::zeros((seed.len(), num_ispline_basis));
+    if derivative_order > bs_degree || num_ispline_basis == 0 {
+        return Ok(out);
+    }
+
+    let knot_view = knots.view();
+    let mut raw = vec![0.0; num_bspline_basis];
+    for (row_idx, &x) in seed.iter().enumerate() {
+        raw.fill(0.0);
+        match derivative_order {
+            1 => evaluate_bspline_derivative_scalar(x, knot_view, bs_degree, &mut raw),
+            2 => evaluate_bsplinesecond_derivative_scalar(x, knot_view, bs_degree, &mut raw),
+            3 => evaluate_bsplinethird_derivative_scalar(x, knot_view, bs_degree, &mut raw),
+            4 => evaluate_bspline_fourth_derivative_scalar(x, knot_view, bs_degree, &mut raw),
+            _ => unreachable!(),
         }
-        if idx == 0 {
-            grid.push(left);
-        }
-        for step in 1..=WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL {
-            let frac = step as f64 / WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL as f64;
-            grid.push(left + frac * (right - left));
+        .map_err(|e| format!("failed to evaluate monotone wiggle derivative basis: {e}"))?;
+        let mut running = 0.0_f64;
+        for j in (1..num_bspline_basis).rev() {
+            running += raw[j];
+            out[[row_idx, j - 1]] = if running.abs() <= 1e-12 { 0.0 } else { running };
         }
     }
-    grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    grid.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
+    Ok(out)
+}
+
+pub(crate) fn monotone_wiggle_nonnegative_constraints(
+    beta_dim: usize,
+) -> Option<LinearInequalityConstraints> {
+    if beta_dim == 0 {
+        return None;
+    }
+    let mut a = Array2::<f64>::zeros((beta_dim, beta_dim));
+    for i in 0..beta_dim {
+        a[[i, i]] = 1.0;
+    }
+    Some(LinearInequalityConstraints {
+        a,
+        b: Array1::zeros(beta_dim),
+    })
+}
+
+pub fn wiggle_monotonicity_collocation_points(knots: &Array1<f64>) -> Array1<f64> {
+    if knots.len() < 2 {
+        return Array1::zeros(0);
+    }
+
+    let mut grid = Vec::<f64>::new();
+    let mut last_point = None::<f64>;
+    for interval_idx in 0..knots.len() - 1 {
+        let left = knots[interval_idx];
+        let right = knots[interval_idx + 1];
+        if !left.is_finite() || !right.is_finite() || right <= left {
+            continue;
+        }
+
+        let width = right - left;
+        let guard = (width * WIGGLE_MONOTONICITY_GUARD_FRACTION)
+            .max(WIGGLE_MONOTONICITY_GUARD)
+            .min(0.5 * width);
+        let start = left + guard;
+        let end = right - guard;
+        if end <= start {
+            continue;
+        }
+
+        for step in 1..=WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL {
+            let frac = step as f64 / (WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL + 1) as f64;
+            let point = start + frac * (end - start);
+            if last_point.is_none_or(|prev| (point - prev).abs() > 1e-12) {
+                grid.push(point);
+                last_point = Some(point);
+            }
+        }
+    }
+
     Array1::from_vec(grid)
 }
 
-pub(crate) fn wiggle_monotonicity_linear_constraints(
-    knots: &Array1<f64>,
-    degree: usize,
-    beta_dim: usize,
-) -> Result<LinearInequalityConstraints, String> {
-    let grid = wiggle_monotonicity_collocation_points(knots);
-    let (basis, _) = create_basis::<Dense>(
-        grid.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::first_derivative(),
-    )
-    .map_err(|e| format!("failed to build wiggle monotonicity derivative basis: {e}"))?;
-    let full = basis.as_ref().clone();
-    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
-        .map_err(|e| format!("failed to build wiggle monotonicity transform: {e}"))?;
-    if full.ncols() != z.nrows() {
-        return Err(format!(
-            "wiggle monotonicity basis/constraint mismatch: basis has {} columns but transform has {} rows",
-            full.ncols(),
-            z.nrows()
-        ));
+pub(crate) fn project_monotone_wiggle_beta(mut beta: Array1<f64>) -> Array1<f64> {
+    for value in beta.iter_mut() {
+        if !value.is_finite() || *value < 0.0 {
+            *value = 0.0;
+        }
     }
-    let a = full.dot(&z);
-    if a.ncols() != beta_dim {
-        return Err(format!(
-            "wiggle monotonicity constraint width mismatch: basis has {} columns but wiggle block has {} coefficients",
-            a.ncols(),
-            beta_dim
-        ));
+    beta
+}
+
+pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
+    beta: &[f64],
+    context: &str,
+) -> Result<(), String> {
+    for (idx, &value) in beta.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!("{context} coefficient {idx} is non-finite"));
+        }
+        if value < -1e-12 {
+            return Err(format!(
+                "{context} coefficient {idx} is negative ({value:.3e}); monotone wiggle coefficients must be non-negative"
+            ));
+        }
     }
-    Ok(LinearInequalityConstraints {
-        a,
-        b: Array1::from_elem(grid.len(), WIGGLE_MONOTONICITY_GUARD - 1.0),
-    })
+    Ok(())
 }
 
 fn append_selected_wiggle_penalty_orders(
@@ -488,6 +561,7 @@ fn append_selected_wiggle_penalty_orders(
         let penalty =
             create_difference_penalty_matrix(p, order, None).map_err(|e| e.to_string())?;
         block.penalties.push(penalty);
+        block.nullspace_dims.push(order);
     }
     Ok(())
 }
@@ -6172,41 +6246,17 @@ impl GaussianLocationScaleWiggleFamily {
         self.mu_design.is_some() && self.log_sigma_design.is_some()
     }
 
-    fn wiggle_constraint_transform(&self) -> Result<Array2<f64>, String> {
-        let (z, _) =
-            compute_geometric_constraint_transform(&self.wiggle_knots, self.wiggle_degree, 2)
-                .map_err(|e| e.to_string())?;
-        Ok(z)
-    }
-
-    fn constrainwiggle_basis(&self, full: Array2<f64>) -> Result<Array2<f64>, String> {
-        if full.ncols() < 3 {
-            return Err("wiggle basis has fewer than three columns".to_string());
-        }
-        let z = self.wiggle_constraint_transform()?;
-        if full.ncols() != z.nrows() {
-            return Err(format!(
-                "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
-                full.ncols(),
-                z.nrows()
-            ));
-        }
-        Ok(full.dot(&z))
-    }
-
     fn wiggle_basiswith_options(
         &self,
         q0: ArrayView1<'_, f64>,
         options: BasisOptions,
     ) -> Result<Array2<f64>, String> {
-        let (basis, _) = create_basis::<Dense>(
+        monotone_wiggle_basis_with_derivative_order(
             q0,
-            KnotSource::Provided(self.wiggle_knots.view()),
+            &self.wiggle_knots,
             self.wiggle_degree,
-            options,
+            options.derivative_order,
         )
-        .map_err(|e| e.to_string())?;
-        self.constrainwiggle_basis((*basis).clone())
     }
 
     fn wiggle_design(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
@@ -6246,42 +6296,7 @@ impl GaussianLocationScaleWiggleFamily {
     }
 
     fn wiggle_d3basis_constrained(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        if self.wiggle_degree < 3 {
-            let z = self.wiggle_constraint_transform()?;
-            return Ok(Array2::zeros((q0.len(), z.ncols())));
-        }
-        let z = self.wiggle_constraint_transform()?;
-        let num_basis = self
-            .wiggle_knots
-            .len()
-            .checked_sub(self.wiggle_degree + 1)
-            .ok_or_else(|| "wiggle knot vector too short for third derivative".to_string())?;
-        if z.nrows() != num_basis {
-            return Err(format!(
-                "wiggle third-derivative/constraint mismatch: basis has {} columns but transform has {} rows",
-                num_basis,
-                z.nrows()
-            ));
-        }
-        let mut raw = vec![0.0; num_basis];
-        let mut out = Array2::<f64>::zeros((q0.len(), z.ncols()));
-        for (i, &q0_i) in q0.iter().enumerate() {
-            evaluate_bsplinethird_derivative_scalar(
-                q0_i,
-                self.wiggle_knots.view(),
-                self.wiggle_degree,
-                &mut raw,
-            )
-            .map_err(|e| format!("failed to evaluate wiggle third derivative basis: {e}"))?;
-            for constrained_j in 0..z.ncols() {
-                let mut basis_j = 0.0;
-                for raw_k in 0..num_basis {
-                    basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
-                }
-                out[[i, constrained_j]] = basis_j;
-            }
-        }
-        Ok(out)
+        monotone_wiggle_basis_with_derivative_order(q0, &self.wiggle_knots, self.wiggle_degree, 3)
     }
 
     fn wiggle_d3q_dq03(
@@ -6305,50 +6320,20 @@ impl GaussianLocationScaleWiggleFamily {
         q0: ArrayView1<'_, f64>,
         beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
-        if self.wiggle_degree < 4 {
-            return Ok(Array1::zeros(q0.len()));
-        }
-        let z = self.wiggle_constraint_transform()?;
-        let num_basis = self
-            .wiggle_knots
-            .len()
-            .checked_sub(self.wiggle_degree + 1)
-            .ok_or_else(|| "wiggle knot vector too short for fourth derivative".to_string())?;
-        if z.nrows() != num_basis {
-            return Err(format!(
-                "wiggle fourth-derivative/constraint mismatch: basis has {} columns but transform has {} rows",
-                num_basis,
-                z.nrows()
-            ));
-        }
-        if z.ncols() != beta_link_wiggle.len() {
+        let d4 = monotone_wiggle_basis_with_derivative_order(
+            q0,
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            4,
+        )?;
+        if d4.ncols() != beta_link_wiggle.len() {
             return Err(format!(
                 "wiggle fourth-derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
-                z.ncols(),
+                d4.ncols(),
                 beta_link_wiggle.len()
             ));
         }
-        let mut raw = vec![0.0; num_basis];
-        let mut out = Array1::<f64>::zeros(q0.len());
-        for (i, &q0_i) in q0.iter().enumerate() {
-            evaluate_bspline_fourth_derivative_scalar(
-                q0_i,
-                self.wiggle_knots.view(),
-                self.wiggle_degree,
-                &mut raw,
-            )
-            .map_err(|e| format!("failed to evaluate wiggle fourth derivative basis: {e}"))?;
-            let mut acc = 0.0;
-            for constrained_j in 0..beta_link_wiggle.len() {
-                let mut basis_j = 0.0;
-                for raw_k in 0..num_basis {
-                    basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
-                }
-                acc += basis_j * beta_link_wiggle[constrained_j];
-            }
-            out[i] = acc;
-        }
-        Ok(out)
+        Ok(d4.dot(&beta_link_wiggle))
     }
 
     fn wiggle_geometry(
@@ -7764,11 +7749,20 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(None);
         }
-        Ok(Some(wiggle_monotonicity_linear_constraints(
-            &self.wiggle_knots,
-            self.wiggle_degree,
-            spec.design.ncols(),
-        )?))
+        Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()))
+    }
+
+    fn post_update_block_beta(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        _: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        if block_idx != Self::BLOCK_WIGGLE {
+            return Ok(beta);
+        }
+        Ok(project_monotone_wiggle_beta(beta))
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -8193,35 +8187,17 @@ impl BinomialMeanWiggleFamily {
     pub const BLOCK_ETA: usize = 0;
     pub const BLOCK_WIGGLE: usize = 1;
 
-    fn wiggle_constraint_transform(&self) -> Result<Array2<f64>, String> {
-        let (z, _) =
-            compute_geometric_constraint_transform(&self.wiggle_knots, self.wiggle_degree, 2)
-                .map_err(|e| e.to_string())?;
-        Ok(z)
-    }
-
     fn wiggle_basiswith_options(
         &self,
         q0: ArrayView1<'_, f64>,
         options: BasisOptions,
     ) -> Result<Array2<f64>, String> {
-        let (basis, _) = create_basis::<Dense>(
+        monotone_wiggle_basis_with_derivative_order(
             q0,
-            KnotSource::Provided(self.wiggle_knots.view()),
+            &self.wiggle_knots,
             self.wiggle_degree,
-            options,
+            options.derivative_order,
         )
-        .map_err(|e| e.to_string())?;
-        let full = (*basis).clone();
-        let z = self.wiggle_constraint_transform()?;
-        if full.ncols() != z.nrows() {
-            return Err(format!(
-                "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
-                full.ncols(),
-                z.nrows()
-            ));
-        }
-        Ok(full.dot(&z))
     }
 
     fn wiggle_design(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
@@ -8261,42 +8237,7 @@ impl BinomialMeanWiggleFamily {
     }
 
     fn wiggle_d3basis_constrained(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        if self.wiggle_degree < 3 {
-            let z = self.wiggle_constraint_transform()?;
-            return Ok(Array2::zeros((q0.len(), z.ncols())));
-        }
-        let z = self.wiggle_constraint_transform()?;
-        let num_basis = self
-            .wiggle_knots
-            .len()
-            .checked_sub(self.wiggle_degree + 1)
-            .ok_or_else(|| "wiggle knot vector too short for third derivative".to_string())?;
-        if z.nrows() != num_basis {
-            return Err(format!(
-                "wiggle third-derivative/constraint mismatch: basis has {} columns but transform has {} rows",
-                num_basis,
-                z.nrows()
-            ));
-        }
-        let mut raw = vec![0.0; num_basis];
-        let mut out = Array2::<f64>::zeros((q0.len(), z.ncols()));
-        for (i, &q0_i) in q0.iter().enumerate() {
-            evaluate_bsplinethird_derivative_scalar(
-                q0_i,
-                self.wiggle_knots.view(),
-                self.wiggle_degree,
-                &mut raw,
-            )
-            .map_err(|e| format!("failed to evaluate wiggle third derivative basis: {e}"))?;
-            for constrained_j in 0..z.ncols() {
-                let mut basis_j = 0.0;
-                for raw_k in 0..num_basis {
-                    basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
-                }
-                out[[i, constrained_j]] = basis_j;
-            }
-        }
-        Ok(out)
+        monotone_wiggle_basis_with_derivative_order(q0, &self.wiggle_knots, self.wiggle_degree, 3)
     }
 
     fn wiggle_d3q_dq03(
@@ -8320,50 +8261,20 @@ impl BinomialMeanWiggleFamily {
         q0: ArrayView1<'_, f64>,
         beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
-        if self.wiggle_degree < 4 {
-            return Ok(Array1::zeros(q0.len()));
-        }
-        let z = self.wiggle_constraint_transform()?;
-        let num_basis = self
-            .wiggle_knots
-            .len()
-            .checked_sub(self.wiggle_degree + 1)
-            .ok_or_else(|| "wiggle knot vector too short for fourth derivative".to_string())?;
-        if z.nrows() != num_basis {
-            return Err(format!(
-                "wiggle fourth-derivative/constraint mismatch: basis has {} columns but transform has {} rows",
-                num_basis,
-                z.nrows()
-            ));
-        }
-        if z.ncols() != beta_link_wiggle.len() {
+        let d4 = monotone_wiggle_basis_with_derivative_order(
+            q0,
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            4,
+        )?;
+        if d4.ncols() != beta_link_wiggle.len() {
             return Err(format!(
                 "wiggle fourth-derivative/beta mismatch: basis has {} columns but beta_link_wiggle has {} coefficients",
-                z.ncols(),
+                d4.ncols(),
                 beta_link_wiggle.len()
             ));
         }
-        let mut raw = vec![0.0; num_basis];
-        let mut out = Array1::<f64>::zeros(q0.len());
-        for (i, &q0_i) in q0.iter().enumerate() {
-            evaluate_bspline_fourth_derivative_scalar(
-                q0_i,
-                self.wiggle_knots.view(),
-                self.wiggle_degree,
-                &mut raw,
-            )
-            .map_err(|e| format!("failed to evaluate wiggle fourth derivative basis: {e}"))?;
-            let mut acc = 0.0;
-            for constrained_j in 0..beta_link_wiggle.len() {
-                let mut basis_j = 0.0;
-                for raw_k in 0..num_basis {
-                    basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
-                }
-                acc += basis_j * beta_link_wiggle[constrained_j];
-            }
-            out[i] = acc;
-        }
-        Ok(out)
+        Ok(d4.dot(&beta_link_wiggle))
     }
 
     fn wiggle_geometry(
@@ -8545,11 +8456,20 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(None);
         }
-        Ok(Some(wiggle_monotonicity_linear_constraints(
-            &self.wiggle_knots,
-            self.wiggle_degree,
-            spec.design.ncols(),
-        )?))
+        Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()))
+    }
+
+    fn post_update_block_beta(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        _: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        if block_idx != Self::BLOCK_WIGGLE {
+            return Ok(beta);
+        }
+        Ok(project_monotone_wiggle_beta(beta))
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -12124,43 +12044,17 @@ impl BinomialLocationScaleWiggleFamily {
         initializewiggle_knots_from_seed(q_seed, degree, num_internal_knots)
     }
 
-    fn wiggle_constraint_transform(&self) -> Result<Array2<f64>, String> {
-        let (z, _) =
-            compute_geometric_constraint_transform(&self.wiggle_knots, self.wiggle_degree, 2)
-                .map_err(|e| e.to_string())?;
-        Ok(z)
-    }
-
-    fn constrainwiggle_basis(&self, full: Array2<f64>) -> Result<Array2<f64>, String> {
-        if full.ncols() < 3 {
-            return Err("wiggle basis has fewer than three columns".to_string());
-        }
-        let z = self.wiggle_constraint_transform()?;
-        if full.ncols() != z.nrows() {
-            return Err(format!(
-                "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
-                full.ncols(),
-                z.nrows()
-            ));
-        }
-        // Keep all value/derivative evaluations in the same constrained subspace:
-        // d(BZ)/dx = B'Z, d²(BZ)/dx² = B''Z.
-        Ok(full.dot(&z))
-    }
-
     fn wiggle_basiswith_options(
         &self,
         q0: ArrayView1<'_, f64>,
         basis_options: BasisOptions,
     ) -> Result<Array2<f64>, String> {
-        let (basis, _) = create_basis::<Dense>(
+        monotone_wiggle_basis_with_derivative_order(
             q0,
-            KnotSource::Provided(self.wiggle_knots.view()),
+            &self.wiggle_knots,
             self.wiggle_degree,
-            basis_options,
+            basis_options.derivative_order,
         )
-        .map_err(|e| e.to_string())?;
-        self.constrainwiggle_basis((*basis).clone())
     }
 
     fn wiggle_design(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
@@ -12217,42 +12111,7 @@ impl BinomialLocationScaleWiggleFamily {
     }
 
     fn wiggle_d3basis_constrained(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        if self.wiggle_degree < 3 {
-            let z = self.wiggle_constraint_transform()?;
-            return Ok(Array2::zeros((q0.len(), z.ncols())));
-        }
-        let z = self.wiggle_constraint_transform()?;
-        let num_basis = self
-            .wiggle_knots
-            .len()
-            .checked_sub(self.wiggle_degree + 1)
-            .ok_or_else(|| "wiggle knot vector too short for third derivative".to_string())?;
-        if z.nrows() != num_basis {
-            return Err(format!(
-                "wiggle third-derivative/constraint mismatch: basis has {} columns but transform has {} rows",
-                num_basis,
-                z.nrows()
-            ));
-        }
-        let mut raw = vec![0.0; num_basis];
-        let mut out = Array2::<f64>::zeros((q0.len(), z.ncols()));
-        for (i, &q0_i) in q0.iter().enumerate() {
-            evaluate_bsplinethird_derivative_scalar(
-                q0_i,
-                self.wiggle_knots.view(),
-                self.wiggle_degree,
-                &mut raw,
-            )
-            .map_err(|e| format!("failed to evaluate wiggle third derivative basis: {e}"))?;
-            for constrained_j in 0..z.ncols() {
-                let mut basis_j = 0.0;
-                for raw_k in 0..num_basis {
-                    basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
-                }
-                out[[i, constrained_j]] = basis_j;
-            }
-        }
-        Ok(out)
+        monotone_wiggle_basis_with_derivative_order(q0, &self.wiggle_knots, self.wiggle_degree, 3)
     }
 
     fn wiggle_d4q_dq04(
@@ -12260,50 +12119,20 @@ impl BinomialLocationScaleWiggleFamily {
         q0: ArrayView1<'_, f64>,
         beta_link_wiggle: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
-        if self.wiggle_degree < 4 {
-            return Ok(Array1::zeros(q0.len()));
-        }
-        let z = self.wiggle_constraint_transform()?;
-        let num_basis = self
-            .wiggle_knots
-            .len()
-            .checked_sub(self.wiggle_degree + 1)
-            .ok_or_else(|| "wiggle knot vector too short for fourth derivative".to_string())?;
-        if z.nrows() != num_basis {
-            return Err(format!(
-                "wiggle fourth-derivative/constraint mismatch: basis has {} columns but transform has {} rows",
-                num_basis,
-                z.nrows()
-            ));
-        }
-        if z.ncols() != beta_link_wiggle.len() {
+        let d4 = monotone_wiggle_basis_with_derivative_order(
+            q0,
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            4,
+        )?;
+        if d4.ncols() != beta_link_wiggle.len() {
             return Err(format!(
                 "wiggle fourth-derivative col mismatch: got {}, expected {}",
-                z.ncols(),
+                d4.ncols(),
                 beta_link_wiggle.len()
             ));
         }
-        let mut raw = vec![0.0; num_basis];
-        let mut out = Array1::<f64>::zeros(q0.len());
-        for (i, &q0_i) in q0.iter().enumerate() {
-            evaluate_bspline_fourth_derivative_scalar(
-                q0_i,
-                self.wiggle_knots.view(),
-                self.wiggle_degree,
-                &mut raw,
-            )
-            .map_err(|e| format!("failed to evaluate wiggle fourth derivative basis: {e}"))?;
-            let mut acc = 0.0;
-            for constrained_j in 0..beta_link_wiggle.len() {
-                let mut basis_j = 0.0;
-                for raw_k in 0..num_basis {
-                    basis_j += raw[raw_k] * z[[raw_k, constrained_j]];
-                }
-                acc += basis_j * beta_link_wiggle[constrained_j];
-            }
-            out[i] = acc;
-        }
-        Ok(out)
+        Ok(d4.dot(&beta_link_wiggle))
     }
 
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
@@ -14439,11 +14268,20 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(None);
         }
-        Ok(Some(wiggle_monotonicity_linear_constraints(
-            &self.wiggle_knots,
-            self.wiggle_degree,
-            spec.design.ncols(),
-        )?))
+        Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()))
+    }
+
+    fn post_update_block_beta(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        _: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        if block_idx != Self::BLOCK_WIGGLE {
+            return Ok(beta);
+        }
+        Ok(project_monotone_wiggle_beta(beta))
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
