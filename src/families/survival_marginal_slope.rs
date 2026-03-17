@@ -3,14 +3,14 @@ use crate::custom_family::{
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    build_block_spatial_psi_derivatives, custom_family_outer_capability,
+    PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_capability,
     evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
     second_psi_linear_map,
 };
 use crate::estimate::{FitOptions, UnifiedFitResult, fit_gam};
 use crate::families::bernoulli_marginal_slope::{
-    MultiDirJet, unary_derivatives_exp, unary_derivatives_sqrt, unary_derivatives_neglog_phi,
-    unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    MultiDirJet, unary_derivatives_exp, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::survival_location_scale::TimeBlockInput;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
@@ -264,16 +264,17 @@ impl SurvivalMarginalSlopeFamily {
         Ok((nll, grad, hess))
     }
 
-    fn build_eval_cache(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<EvalCache, String> {
+    fn build_eval_cache(&self, block_states: &[ParameterBlockState]) -> Result<EvalCache, String> {
         let slices = block_slices(block_states);
         let row_bases = (0..self.n)
             .map(|row| {
                 let (nll, gradient, hessian) =
                     self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                Ok(RowPrimaryBase { nll, gradient, hessian })
+                Ok(RowPrimaryBase {
+                    nll,
+                    gradient,
+                    hessian,
+                })
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(EvalCache { slices, row_bases })
@@ -515,10 +516,7 @@ impl SurvivalMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn joint_hessian_diagonal_from_cache(
-        &self,
-        cache: &EvalCache,
-    ) -> Result<Array1<f64>, String> {
+    fn joint_hessian_diagonal_from_cache(&self, cache: &EvalCache) -> Result<Array1<f64>, String> {
         let slices = &cache.slices;
         let mut diagonal = Array1::<f64>::zeros(slices.total);
         for row in 0..self.n {
@@ -672,14 +670,19 @@ impl SurvivalMarginalSlopeFamily {
         match block_idx {
             1 => {
                 let x_row = self.psi_design_row_vector(
-                    row, deriv, self.n, self.logslope_design.ncols(),
+                    row,
+                    deriv,
+                    self.n,
+                    self.logslope_design.ncols(),
                     "SurvivalMarginalSlope logslope",
                 )?;
                 out[3] = x_row.dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned());
             }
-            _ => return Err(format!(
-                "survival marginal-slope psi action: only logslope block (1) has spatial terms, got block {block_idx}"
-            )),
+            _ => {
+                return Err(format!(
+                    "survival marginal-slope psi action: only logslope block (1) has spatial terms, got block {block_idx}"
+                ));
+            }
         }
         Ok(Some(out))
     }
@@ -706,14 +709,21 @@ impl SurvivalMarginalSlopeFamily {
         match block_i {
             1 => {
                 let x_row = self.psi_second_design_row_vector(
-                    row, deriv_i, &derivative_blocks[block_j][local_j], local_j,
-                    self.n, self.logslope_design.ncols(), "SurvivalMarginalSlope logslope",
+                    row,
+                    deriv_i,
+                    &derivative_blocks[block_j][local_j],
+                    local_j,
+                    self.n,
+                    self.logslope_design.ncols(),
+                    "SurvivalMarginalSlope logslope",
                 )?;
                 out[3] = x_row.dot(&block_states[1].beta);
             }
-            _ => return Err(format!(
-                "survival marginal-slope psi second: only logslope block (1) has spatial terms, got block {block_i}"
-            )),
+            _ => {
+                return Err(format!(
+                    "survival marginal-slope psi second: only logslope block (1) has spatial terms, got block {block_i}"
+                ));
+            }
         }
         Ok(Some(out))
     }
@@ -732,15 +742,20 @@ impl SurvivalMarginalSlopeFamily {
         let deriv = &derivative_blocks[block_idx][local_idx];
         let mut out = Array1::<f64>::zeros(slices.total);
         match block_idx {
-            1 => out.slice_mut(s![slices.logslope.clone()]).assign(
-                &self.psi_design_row_vector(
-                    row, deriv, self.n, self.logslope_design.ncols(),
+            1 => out
+                .slice_mut(s![slices.logslope.clone()])
+                .assign(&self.psi_design_row_vector(
+                    row,
+                    deriv,
+                    self.n,
+                    self.logslope_design.ncols(),
                     "SurvivalMarginalSlope logslope",
-                )?,
-            ),
-            _ => return Err(format!(
-                "survival marginal-slope psi embedding: only logslope block (1) has spatial terms, got block {block_idx}"
-            )),
+                )?),
+            _ => {
+                return Err(format!(
+                    "survival marginal-slope psi embedding: only logslope block (1) has spatial terms, got block {block_idx}"
+                ));
+            }
         }
         Ok(Some((block_idx, out)))
     }
@@ -767,13 +782,20 @@ impl SurvivalMarginalSlopeFamily {
         match block_i {
             1 => out.slice_mut(s![slices.logslope.clone()]).assign(
                 &self.psi_second_design_row_vector(
-                    row, deriv_i, &derivative_blocks[block_j][local_j], local_j,
-                    self.n, self.logslope_design.ncols(), "SurvivalMarginalSlope logslope",
+                    row,
+                    deriv_i,
+                    &derivative_blocks[block_j][local_j],
+                    local_j,
+                    self.n,
+                    self.logslope_design.ncols(),
+                    "SurvivalMarginalSlope logslope",
                 )?,
             ),
-            _ => return Err(format!(
-                "survival marginal-slope psi second embedding: only logslope block (1) has spatial terms, got block {block_i}"
-            )),
+            _ => {
+                return Err(format!(
+                    "survival marginal-slope psi second embedding: only logslope block (1) has spatial terms, got block {block_i}"
+                ));
+            }
         }
         Ok(Some((block_i, out)))
     }
@@ -860,12 +882,10 @@ impl SurvivalMarginalSlopeFamily {
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let slices = block_slices(block_states);
-        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_i)?
-        else {
+        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_i)? else {
             return Ok(None);
         };
-        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_j)?
-        else {
+        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_j)? else {
             return Ok(None);
         };
         let idx_i = 3usize;
@@ -1001,8 +1021,7 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let slices = block_slices(block_states);
-        let Some((_, _)) =
-            self.embedded_psi_vector(0, &slices, derivative_blocks, psi_index)?
+        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_index)?
         else {
             return Ok(None);
         };
@@ -1069,7 +1088,11 @@ impl SurvivalMarginalSlopeHessianWorkspace {
         block_states: Vec<ParameterBlockState>,
     ) -> Result<Self, String> {
         let cache = family.build_eval_cache(&block_states)?;
-        Ok(Self { family, block_states, cache })
+        Ok(Self {
+            family,
+            block_states,
+            cache,
+        })
     }
 }
 
@@ -1080,7 +1103,12 @@ impl SurvivalMarginalSlopePsiWorkspace {
         derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
         let cache = family.build_eval_cache(&block_states)?;
-        Ok(Self { family, block_states, derivative_blocks, cache })
+        Ok(Self {
+            family,
+            block_states,
+            derivative_blocks,
+            cache,
+        })
     }
 }
 
@@ -1351,7 +1379,12 @@ fn build_time_blockspec(
         name: "time_surface".to_string(),
         design: DesignMatrix::Dense(Arc::new(design_exit.clone())),
         offset: Array1::zeros(design_exit.nrows()),
-        penalties: time_block.penalties.clone(),
+        penalties: time_block
+            .penalties
+            .iter()
+            .cloned()
+            .map(PenaltyMatrix::Dense)
+            .collect(),
         nullspace_dims: time_block.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
@@ -1368,7 +1401,11 @@ fn build_logslope_blockspec(
         name: "logslope_surface".to_string(),
         design: DesignMatrix::Dense(Arc::new(design.design.clone())),
         offset: Array1::from_elem(design.design.nrows(), baseline),
-        penalties: design.global_penalties(),
+        penalties: design
+            .global_penalties()
+            .into_iter()
+            .map(PenaltyMatrix::Dense)
+            .collect(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,

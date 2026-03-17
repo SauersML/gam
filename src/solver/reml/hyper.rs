@@ -715,25 +715,18 @@ impl<'a> RemlState<'a> {
                 }
             },
         );
-        let (s_eigs, svecs) = s_eval
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-        // Pseudoinverse S⁺ restricted to the positive eigenspace.
-        let threshold =
-            super::unified::positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
-        let mut s_reg_inv = Array2::<f64>::zeros((p_dim, p_dim));
-        for idx in 0..p_dim {
-            if s_eigs[idx] > threshold {
-                let inv_ev = 1.0 / s_eigs[idx];
-                let ucol = svecs.column(idx).to_owned();
-                let outer = ucol
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&ucol.view().insert_axis(Axis(0)));
-                s_reg_inv += &outer.mapv(|v| v * inv_ev);
-            }
-        }
+        let s_eigenspace = super::unified::build_penalty_logdet_eigenspace(
+            &s_eval,
+            None,
+            "sparse exact tau pair callbacks",
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        let s_reg_inv = s_eigenspace.pseudoinverse.clone();
         let sdag_s_tau: Vec<Array2<f64>> = s_tau_list.iter().map(|s| s_reg_inv.dot(s)).collect();
+        let s_leak_tau: Vec<Array2<f64>> = s_tau_list
+            .iter()
+            .map(|s| super::unified::scaled_penalty_logdet_nullspace_leakage(&s_eigenspace, s))
+            .collect();
         let a_k_mats: Vec<Array2<f64>> = self
             .s_full_list
             .iter()
@@ -791,6 +784,7 @@ impl<'a> RemlState<'a> {
         let s_tau_tau = std::sync::Arc::new(s_tau_tau);
         let s_reg_inv = std::sync::Arc::new(s_reg_inv);
         let sdag_s_tau = std::sync::Arc::new(sdag_s_tau);
+        let s_leak_tau = std::sync::Arc::new(s_leak_tau);
         let sdag_a_k = std::sync::Arc::new(sdag_a_k);
         let beta_eval = std::sync::Arc::new(beta_eval);
         let x_dense = std::sync::Arc::new(x_dense);
@@ -806,6 +800,7 @@ impl<'a> RemlState<'a> {
         let s_tau_tau_tt = std::sync::Arc::clone(&s_tau_tau);
         let s_reg_inv_tt = std::sync::Arc::clone(&s_reg_inv);
         let sdag_s_tau_tt = std::sync::Arc::clone(&sdag_s_tau);
+        let s_leak_tau_tt = std::sync::Arc::clone(&s_leak_tau);
         let beta_tt = std::sync::Arc::clone(&beta_eval);
         let x_dense_tt = std::sync::Arc::clone(&x_dense);
         let x_tau_list_tt = std::sync::Arc::clone(&x_tau_list);
@@ -824,7 +819,15 @@ impl<'a> RemlState<'a> {
                 .as_ref()
                 .map(|s_ij| Self::trace_product(&s_reg_inv_tt, s_ij))
                 .unwrap_or(0.0);
-            let ld_s_ij = ld_s_linear - ld_s_quad;
+            let ld_s_leak = if s_leak_tau_tt[i].is_empty() {
+                0.0
+            } else {
+                2.0 * super::unified::frobenius_inner_same_shape(
+                    &s_leak_tau_tt[j],
+                    &s_leak_tau_tt[i],
+                )
+            };
+            let ld_s_ij = ld_s_linear - ld_s_quad + ld_s_leak;
 
             let x_tau_i_beta = &x_tau_beta_tt[i];
             let x_tau_j_beta = &x_tau_beta_tt[j];
@@ -970,7 +973,7 @@ impl<'a> RemlState<'a> {
     /// | `a`     | `β̂^T S_{τ_i} β_{τ_j} + 0.5 β̂^T S_{τ_i τ_j} β̂` |
     /// | `g`     | second score involving X_{τ_i}, X_{τ_j}, X_{τ_i τ_j}, S_{τ_i τ_j}` |
     /// | `B`     | cross-design + cross-curvature + second-design + S_{τ_i τ_j}` |
-    /// | `ld_s`  | `tr(S⁺ S_{τ_i τ_j}) − tr(S⁺ S_{τ_i} S⁺ S_{τ_j})` |
+    /// | `ld_s`  | `tr(S⁺ S_{τ_i τ_j}) − tr(S⁺ S_{τ_i} S⁺ S_{τ_j}) + 2 tr(Σ₊⁻² L_i L_jᵀ)` |
     ///
     /// # Notes
     ///
@@ -1086,28 +1089,21 @@ impl<'a> RemlState<'a> {
             .fold(Array2::<f64>::zeros((p_dim, p_dim)), |acc, (k, r)| {
                 acc + r.t().dot(r).mapv(|v| lambdas[k] * v)
             });
-        let (s_eigs, svecs) = s_eval
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
+        let s_eigenspace = super::unified::build_penalty_logdet_eigenspace(
+            &s_eval,
+            None,
+            "build_tau_pair_callbacks",
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        let s_reg_inv = s_eigenspace.pseudoinverse.clone();
 
-        // Pseudoinverse S⁺ restricted to the positive eigenspace.
-        let threshold =
-            super::unified::positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
-        let mut s_reg_inv = Array2::<f64>::zeros((p_dim, p_dim));
-        for idx in 0..p_dim {
-            if s_eigs[idx] > threshold {
-                let inv_ev = 1.0 / s_eigs[idx];
-                let ucol = svecs.column(idx).to_owned();
-                let outer = ucol
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&ucol.view().insert_axis(Axis(0)));
-                s_reg_inv += &outer.mapv(|v| v * inv_ev);
-            }
-        }
-
-        // Pre-compute S⁺ S_{τ_j} products for the trace terms.
+        // Pre-compute S⁺ S_{τ_j} products and nullspace-leakage matrices for
+        // the exact τ-τ penalty pseudologdet Hessian.
         let sdag_s_tau: Vec<Array2<f64>> = s_tau_list.iter().map(|s| s_reg_inv.dot(s)).collect();
+        let s_leak_tau: Vec<Array2<f64>> = s_tau_list
+            .iter()
+            .map(|s| super::unified::scaled_penalty_logdet_nullspace_leakage(&s_eigenspace, s))
+            .collect();
 
         // Pre-compute A_k = λ_k R_k^T R_k for ρ-τ pairs.
         let a_k_mats: Vec<Array2<f64>> = rs_eval
@@ -1221,6 +1217,7 @@ impl<'a> RemlState<'a> {
         let s_tau_tau = Arc::new(s_tau_tau);
         let s_reg_inv = Arc::new(s_reg_inv);
         let sdag_s_tau = Arc::new(sdag_s_tau);
+        let s_leak_tau = Arc::new(s_leak_tau);
         let sdag_a_k = Arc::new(sdag_a_k);
         let beta_eval = Arc::new(beta_eval);
         let x_dense = Arc::new(x_dense);
@@ -1239,6 +1236,7 @@ impl<'a> RemlState<'a> {
         let s_tau_tau_tt = Arc::clone(&s_tau_tau);
         let s_reg_inv_tt = Arc::clone(&s_reg_inv);
         let sdag_s_tau_tt = Arc::clone(&sdag_s_tau);
+        let s_leak_tau_tt = Arc::clone(&s_leak_tau);
         let beta_tt = Arc::clone(&beta_eval);
         let x_dense_tt = Arc::clone(&x_dense);
         let x_tau_list_tt = Arc::clone(&x_tau_list);
@@ -1252,17 +1250,26 @@ impl<'a> RemlState<'a> {
         let is_gaussian_tt = is_gaussian_identity;
 
         let tau_tau_pair_fn = move |i: usize, j: usize| -> super::unified::HyperCoordPair {
-            // ld_s_{ij}: second derivative of log|S|₊ w.r.t. τ_i, τ_j.
+            // ld_s_{ij}: exact second derivative of log|S|₊ w.r.t. τ_i, τ_j.
             //
             //   ∂²_ij L = tr(S⁺ S_ij) − tr(S⁺ S_i S⁺ S_j)
+            //            + 2 tr(Σ₊⁻² L_i L_jᵀ)
             //
-            // Uses the exact pseudoinverse S⁺ on the positive eigenspace.
+            // where L_i = U₊ᵀ S_i U₀ captures nullspace rotation.
             let ld_s_quad = Self::trace_product(&sdag_s_tau_tt[j], &sdag_s_tau_tt[i]);
             let ld_s_linear = s_tau_tau_tt[i][j]
                 .as_ref()
                 .map(|s_ij| Self::trace_product(&s_reg_inv_tt, s_ij))
                 .unwrap_or(0.0);
-            let ld_s_ij = ld_s_linear - ld_s_quad;
+            let ld_s_leak = if s_leak_tau_tt[i].is_empty() {
+                0.0
+            } else {
+                2.0 * super::unified::frobenius_inner_same_shape(
+                    &s_leak_tau_tt[j],
+                    &s_leak_tau_tt[i],
+                )
+            };
+            let ld_s_ij = ld_s_linear - ld_s_quad + ld_s_leak;
 
             // a_ij — fixed-β second-order cost derivative.
             //

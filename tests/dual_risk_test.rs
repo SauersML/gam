@@ -11,8 +11,8 @@ fn run_constant_hazard_crude(
     let lambda_m = log_lambda_m.exp();
     let h_dis_t0 = lambda_d * (t0 + 1.0);
     let h_mor_t0 = lambda_m * (t0 + 1.0);
-    let design_d_t0 = array![h_dis_t0.ln()];
-    let design_m_t0 = array![h_mor_t0.ln()];
+    let design_d_t0 = array![1.0];
+    let design_m_t0 = array![1.0];
 
     calculate_crude_risk_quadrature(
         t0,
@@ -25,9 +25,9 @@ fn run_constant_hazard_crude(
         |u, design_d, deriv_d, design_m| {
             let h_d = lambda_d * (u + 1.0);
             let h_m = lambda_m * (u + 1.0);
-            design_d[0] = h_d.ln();
-            deriv_d[0] = 1.0 / (u + 1.0);
-            design_m[0] = h_m.ln();
+            design_d[0] = 1.0;
+            deriv_d[0] = 0.0;
+            design_m[0] = 1.0;
             Ok((lambda_d, h_d, h_m))
         },
     )

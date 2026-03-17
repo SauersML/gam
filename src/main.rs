@@ -4210,9 +4210,10 @@ fn build_survival_time_basis(
                     }
                     match s.eigh(faer::Side::Lower) {
                         Ok((evals, _)) => {
-                            let threshold = gam::estimate::reml::unified::positive_eigenvalue_threshold(
-                                evals.as_slice().unwrap(),
-                            );
+                            let threshold =
+                                gam::estimate::reml::unified::positive_eigenvalue_threshold(
+                                    evals.as_slice().unwrap(),
+                                );
                             evals.iter().filter(|&&e| e <= threshold).count()
                         }
                         Err(_) => 0,
@@ -4881,15 +4882,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let baseline_cfg = match likelihood_mode {
         SurvivalLikelihoodMode::Transformation
         | SurvivalLikelihoodMode::LocationScale
-        | SurvivalLikelihoodMode::MarginalSlope => {
-            parse_survival_baseline_config(
-                &effective_args.baseline_target,
-                effective_args.baseline_scale,
-                effective_args.baseline_shape,
-                effective_args.baseline_rate,
-                effective_args.baseline_makeham,
-            )?
-        }
+        | SurvivalLikelihoodMode::MarginalSlope => parse_survival_baseline_config(
+            &effective_args.baseline_target,
+            effective_args.baseline_scale,
+            effective_args.baseline_shape,
+            effective_args.baseline_rate,
+            effective_args.baseline_makeham,
+        )?,
         SurvivalLikelihoodMode::Weibull if learn_timewiggle => parse_survival_baseline_config(
             "weibull",
             effective_args.baseline_scale,
@@ -5229,19 +5228,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
 
     if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-        let logslope_formula_raw = args
-            .logslope_formula
-            .as_deref()
-            .ok_or_else(|| {
-                "--logslope-formula is required with --survival-likelihood marginal-slope"
-                    .to_string()
-            })?;
-        let z_column_name = args
-            .z_column
-            .as_ref()
-            .ok_or_else(|| {
-                "--z-column is required with --survival-likelihood marginal-slope".to_string()
-            })?;
+        let logslope_formula_raw = args.logslope_formula.as_deref().ok_or_else(|| {
+            "--logslope-formula is required with --survival-likelihood marginal-slope".to_string()
+        })?;
+        let z_column_name = args.z_column.as_ref().ok_or_else(|| {
+            "--z-column is required with --survival-likelihood marginal-slope".to_string()
+        })?;
         let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
         let (_, parsed_logslope) = parse_matching_auxiliary_formula(
             logslope_formula_raw,

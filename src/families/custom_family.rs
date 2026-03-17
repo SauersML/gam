@@ -13,9 +13,11 @@ use crate::smooth::{
 };
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair,
-    HyperOperator, InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
-    compute_block_penalty_logdet_derivs, penalty_matrix_root, reml_laml_evaluate,
+    HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
+    InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate, PenaltyLogdetEigenspace,
+    build_penalty_logdet_eigenspace, compute_block_penalty_logdet_derivs,
+    exact_intersection_nullity, frobenius_inner_same_shape, penalty_matrix_root,
+    reml_laml_evaluate, scaled_penalty_logdet_nullspace_leakage,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -99,11 +101,9 @@ impl PenaltyMatrix {
                 let p_left = left.nrows();
                 let p_right = right.nrows();
                 // v is (p_left * p_right,).  Reshape as (p_right, p_left).
-                let v_mat = ndarray::ArrayView2::from_shape(
-                    (p_right, p_left),
-                    v.as_slice().unwrap(),
-                )
-                .unwrap();
+                let v_mat =
+                    ndarray::ArrayView2::from_shape((p_right, p_left), v.as_slice().unwrap())
+                        .unwrap();
                 // result = B V A' then flatten.
                 let bv = right.dot(&v_mat);
                 let bva = bv.dot(&left.t());
@@ -1182,25 +1182,51 @@ impl CustomFamilyBlockPsiDerivative {
 pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync {
     fn n_data(&self) -> usize;
     fn p_out(&self) -> usize;
-    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
-    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
-    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn transpose_mul(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn forward_mul(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn transpose_mul_second_diag(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
     fn transpose_mul_second_cross(
         &self,
         axis_d: usize,
         axis_e: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
-    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn forward_mul_second_diag(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
     fn forward_mul_second_cross(
         &self,
         axis_d: usize,
         axis_e: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
-    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
-    fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
-    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
+    fn materialize_first(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
+    fn materialize_second_diag(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
+    fn materialize_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
 }
 
 impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
@@ -1212,15 +1238,27 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         crate::terms::basis::ImplicitDesignPsiDerivative::p_out(self)
     }
 
-    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+    fn transpose_mul(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::transpose_mul(self, axis, v)
     }
 
-    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+    fn forward_mul(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul(self, axis, u)
     }
 
-    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+    fn transpose_mul_second_diag(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::transpose_mul_second_diag(self, axis, v)
     }
 
@@ -1235,7 +1273,11 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         )
     }
 
-    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+    fn forward_mul_second_diag(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul_second_diag(self, axis, u)
     }
 
@@ -1250,15 +1292,25 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         )
     }
 
-    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+    fn materialize_first(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::materialize_first(self, axis)
     }
 
-    fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+    fn materialize_second_diag(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::materialize_second_diag(self, axis)
     }
 
-    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+    fn materialize_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::materialize_second_cross(
             self, axis_d, axis_e,
         )
@@ -1299,6 +1351,263 @@ fn stack_dense_row_blocks(blocks: &[Array2<f64>]) -> Array2<f64> {
         row_start = row_end;
     }
     stacked
+}
+
+struct EmbeddedDensePsiDerivativeOperator {
+    axis: usize,
+    total_p: usize,
+    global_range: Range<usize>,
+    first_local: Array2<f64>,
+    second_diag_local: Array2<f64>,
+    second_cross_local: HashMap<usize, Array2<f64>>,
+}
+
+impl EmbeddedDensePsiDerivativeOperator {
+    fn new(
+        axis: usize,
+        total_p: usize,
+        global_range: Range<usize>,
+        first_local: Array2<f64>,
+        second_diag_local: Array2<f64>,
+        second_cross_local: HashMap<usize, Array2<f64>>,
+    ) -> Result<Self, String> {
+        let local_p = global_range.len();
+        if first_local.ncols() != local_p {
+            return Err(format!(
+                "embedded dense psi operator first-derivative width mismatch: got {}, expected {local_p}",
+                first_local.ncols()
+            ));
+        }
+        if second_diag_local.ncols() != local_p {
+            return Err(format!(
+                "embedded dense psi operator second-diag width mismatch: got {}, expected {local_p}",
+                second_diag_local.ncols()
+            ));
+        }
+        for (cross_axis, local) in &second_cross_local {
+            if local.ncols() != local_p {
+                return Err(format!(
+                    "embedded dense psi operator cross axis {cross_axis} width mismatch: got {}, expected {local_p}",
+                    local.ncols()
+                ));
+            }
+        }
+        Ok(Self {
+            axis,
+            total_p,
+            global_range,
+            first_local,
+            second_diag_local,
+            second_cross_local,
+        })
+    }
+
+    fn validate_axis(
+        &self,
+        axis: usize,
+        context: &str,
+    ) -> Result<(), crate::terms::basis::BasisError> {
+        if axis == self.axis {
+            Ok(())
+        } else {
+            Err(crate::terms::basis::BasisError::Other(format!(
+                "{context} expected axis {}, got {axis}",
+                self.axis
+            )))
+        }
+    }
+
+    fn embed_vector(&self, local: Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.total_p);
+        out.slice_mut(ndarray::s![self.global_range.clone()])
+            .assign(&local);
+        out
+    }
+
+    fn local_coeffs(
+        &self,
+        u: &ArrayView1<'_, f64>,
+        context: &str,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        if u.len() != self.total_p {
+            return Err(crate::terms::basis::BasisError::Other(format!(
+                "{context} expected coefficient length {}, got {}",
+                self.total_p,
+                u.len()
+            )));
+        }
+        Ok(u.slice(ndarray::s![self.global_range.clone()]).to_owned())
+    }
+
+    fn cross_local(
+        &self,
+        axis_e: usize,
+        context: &str,
+    ) -> Result<&Array2<f64>, crate::terms::basis::BasisError> {
+        self.second_cross_local.get(&axis_e).ok_or_else(|| {
+            crate::terms::basis::BasisError::Other(format!(
+                "{context} is missing cross-derivative data for axis {}",
+                axis_e
+            ))
+        })
+    }
+}
+
+impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
+    fn n_data(&self) -> usize {
+        self.first_local.nrows()
+    }
+
+    fn p_out(&self) -> usize {
+        self.total_p
+    }
+
+    fn transpose_mul(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi transpose_mul")?;
+        if v.len() != self.n_data() {
+            return Err(crate::terms::basis::BasisError::Other(format!(
+                "embedded dense psi transpose_mul expected {} rows, got {}",
+                self.n_data(),
+                v.len()
+            )));
+        }
+        Ok(self.embed_vector(self.first_local.t().dot(v)))
+    }
+
+    fn forward_mul(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi forward_mul")?;
+        Ok(self
+            .first_local
+            .dot(&self.local_coeffs(u, "embedded dense psi forward_mul")?))
+    }
+
+    fn transpose_mul_second_diag(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi transpose_mul_second_diag")?;
+        if v.len() != self.second_diag_local.nrows() {
+            return Err(crate::terms::basis::BasisError::Other(format!(
+                "embedded dense psi transpose_mul_second_diag expected {} rows, got {}",
+                self.second_diag_local.nrows(),
+                v.len()
+            )));
+        }
+        Ok(self.embed_vector(self.second_diag_local.t().dot(v)))
+    }
+
+    fn transpose_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis_d, "embedded dense psi transpose_mul_second_cross")?;
+        let local = self.cross_local(axis_e, "embedded dense psi transpose_mul_second_cross")?;
+        if v.len() != local.nrows() {
+            return Err(crate::terms::basis::BasisError::Other(format!(
+                "embedded dense psi transpose_mul_second_cross expected {} rows, got {}",
+                local.nrows(),
+                v.len()
+            )));
+        }
+        Ok(self.embed_vector(local.t().dot(v)))
+    }
+
+    fn forward_mul_second_diag(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi forward_mul_second_diag")?;
+        Ok(self
+            .second_diag_local
+            .dot(&self.local_coeffs(u, "embedded dense psi forward_mul_second_diag")?))
+    }
+
+    fn forward_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis_d, "embedded dense psi forward_mul_second_cross")?;
+        Ok(self
+            .cross_local(axis_e, "embedded dense psi forward_mul_second_cross")?
+            .dot(&self.local_coeffs(u, "embedded dense psi forward_mul_second_cross")?))
+    }
+
+    fn materialize_first(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi materialize_first")?;
+        Ok(
+            EmbeddedColumnBlock::new(&self.first_local, self.global_range.clone(), self.total_p)
+                .materialize(),
+        )
+    }
+
+    fn materialize_second_diag(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi materialize_second_diag")?;
+        Ok(EmbeddedColumnBlock::new(
+            &self.second_diag_local,
+            self.global_range.clone(),
+            self.total_p,
+        )
+        .materialize())
+    }
+
+    fn materialize_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis_d, "embedded dense psi materialize_second_cross")?;
+        Ok(EmbeddedColumnBlock::new(
+            self.cross_local(axis_e, "embedded dense psi materialize_second_cross")?,
+            self.global_range.clone(),
+            self.total_p,
+        )
+        .materialize())
+    }
+}
+
+pub(crate) fn build_embedded_dense_psi_operator(
+    first_local: &Array2<f64>,
+    second_diag_local: &Array2<f64>,
+    second_cross_local: Option<&Vec<(usize, Array2<f64>)>>,
+    global_range: Range<usize>,
+    total_p: usize,
+    axis: usize,
+) -> Result<Arc<dyn CustomFamilyPsiDerivativeOperator>, String> {
+    let second_cross_local = second_cross_local
+        .map(|rows| {
+            rows.iter()
+                .map(|(axis, local)| (*axis, local.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Arc::new(EmbeddedDensePsiDerivativeOperator::new(
+        axis,
+        total_p,
+        global_range,
+        first_local.clone(),
+        second_diag_local.clone(),
+        second_cross_local,
+    )?))
 }
 
 struct RowwiseKroneckerPsiDerivativeOperator {
@@ -1367,7 +1676,11 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         self.p_out
     }
 
-    fn transpose_mul(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+    fn transpose_mul(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         assert_eq!(v.len(), self.n_data());
         let p_base = self.base.p_out();
         let mut out = Array1::<f64>::zeros(self.p_out);
@@ -1387,7 +1700,11 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         Ok(out)
     }
 
-    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+    fn forward_mul(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let time_cols = self.split_time_columns(u);
         let mut out = Array1::<f64>::zeros(self.n_data());
         for (t, coeffs) in time_cols.iter().enumerate() {
@@ -1403,7 +1720,11 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         Ok(out)
     }
 
-    fn transpose_mul_second_diag(&self, axis: usize, v: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+    fn transpose_mul_second_diag(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         assert_eq!(v.len(), self.n_data());
         let p_base = self.base.p_out();
         let mut out = Array1::<f64>::zeros(self.p_out);
@@ -1414,7 +1735,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
                 let row_end = row_start + self.n_per_block;
                 let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
                     * &time_basis.column(t).to_owned();
-                accum += &self.base.transpose_mul_second_diag(axis, &weighted.view())?;
+                accum += &self
+                    .base
+                    .transpose_mul_second_diag(axis, &weighted.view())?;
             }
             for j in 0..p_base {
                 out[j * self.p_time + t] = accum[j];
@@ -1450,7 +1773,11 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         Ok(out)
     }
 
-    fn forward_mul_second_diag(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+    fn forward_mul_second_diag(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let time_cols = self.split_time_columns(u);
         let mut out = Array1::<f64>::zeros(self.n_data());
         for (t, coeffs) in time_cols.iter().enumerate() {
@@ -1489,7 +1816,10 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         Ok(out)
     }
 
-    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+    fn materialize_first(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         let base = self.base.materialize_first(axis)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
@@ -1499,7 +1829,10 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         Ok(stack_dense_row_blocks(&blocks))
     }
 
-    fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+    fn materialize_second_diag(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         let base = self.base.materialize_second_diag(axis)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
@@ -1509,7 +1842,11 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         Ok(stack_dense_row_blocks(&blocks))
     }
 
-    fn materialize_second_cross(&self, axis_d: usize, axis_e: usize) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+    fn materialize_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         let base = self.base.materialize_second_cross(axis_d, axis_e)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
@@ -1590,7 +1927,21 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                     .implicit_operator
                     .as_ref()
                     .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op)));
-                let dense_row_count = implicit_operator
+                let dense_operator = if implicit_operator.is_none() && !info.x_psi_local.is_empty()
+                {
+                    Some(build_embedded_dense_psi_operator(
+                        &info.x_psi_local,
+                        &info.x_psi_psi_local,
+                        info.aniso_cross_designs.as_ref(),
+                        info.global_range.clone(),
+                        info.total_p,
+                        info.implicit_axis,
+                    )?)
+                } else {
+                    None
+                };
+                let design_operator = implicit_operator.or(dense_operator);
+                let dense_row_count = design_operator
                     .as_ref()
                     .map_or_else(|| info.x_psi_local.nrows(), |op| op.n_data());
                 let materialize_dense_design = !info.x_psi_local.is_empty()
@@ -1598,7 +1949,7 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                         dense_row_count,
                         info.total_p,
                         psi_dim,
-                        implicit_operator.is_some(),
+                        design_operator.is_some(),
                     );
                 let x_full = if materialize_dense_design {
                     EmbeddedColumnBlock::new(
@@ -1610,12 +1961,6 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                 } else {
                     Array2::<f64>::zeros((0, 0))
                 };
-                let s_full = EmbeddedSquareBlock::new(
-                    &info.s_psi_local,
-                    info.global_range.clone(),
-                    info.total_p,
-                )
-                .materialize();
                 let penalty_indices = info.penalty_indices.clone();
                 let embed_penalty = |local: &Array2<f64>| -> Array2<f64> {
                     EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
@@ -1682,25 +2027,15 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                         }
                     }
                 }
-                // Derive s_psi_psi by summing components per row
-                let s_psi_psi_rows: Vec<Array2<f64>> = s_psi_psi_comp_rows
-                    .iter()
-                    .map(|components| {
-                        components.iter().fold(
-                            Array2::<f64>::zeros((info.total_p, info.total_p)),
-                            |acc, (_, matrix)| acc + matrix,
-                        )
-                    })
-                    .collect();
                 CustomFamilyBlockPsiDerivative {
                     penalty_index: Some(info.penalty_index),
-                    x_psi: x_full.clone(),
-                    s_psi: s_full,
+                    x_psi: x_full,
+                    s_psi: Array2::<f64>::zeros((0, 0)),
                     s_psi_components: Some(s_components),
                     x_psi_psi: x_psi_psi_rows,
-                    s_psi_psi: Some(s_psi_psi_rows),
+                    s_psi_psi: None,
                     s_psi_psi_components: Some(s_psi_psi_comp_rows),
-                    implicit_operator,
+                    implicit_operator: design_operator,
                     implicit_axis: info.implicit_axis,
                     implicit_group_id: info.aniso_group_id,
                 }
@@ -1788,14 +2123,16 @@ impl CustomFamilyPsiDesignAction {
     pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         assert_eq!(v.len(), self.row_range.end - self.row_range.start);
         if self.row_range.start == 0 && self.row_range.end == self.operator.n_data() {
-            self.operator.transpose_mul(self.axis, &v)
+            self.operator
+                .transpose_mul(self.axis, &v)
                 .expect("radial scalar evaluation failed during implicit psi transpose_mul")
         } else {
             let mut expanded = Array1::<f64>::zeros(self.operator.n_data());
             expanded
                 .slice_mut(ndarray::s![self.row_range.clone()])
                 .assign(&v);
-            self.operator.transpose_mul(self.axis, &expanded.view())
+            self.operator
+                .transpose_mul(self.axis, &expanded.view())
                 .expect("radial scalar evaluation failed during implicit psi transpose_mul")
         }
     }
@@ -1882,14 +2219,14 @@ impl CustomFamilyPsiSecondDesignAction {
     pub(crate) fn forward_mul(&self, u: ArrayView1<'_, f64>) -> Array1<f64> {
         assert_eq!(u.len(), self.p);
         let out = match self.level {
-            CustomFamilyPsiSecondDesignLevel::Diag(axis) => {
-                self.operator.forward_mul_second_diag(axis, &u)
-                    .expect("radial scalar evaluation failed during implicit psi second forward_mul")
-            }
-            CustomFamilyPsiSecondDesignLevel::Cross(axis_d, axis_e) => {
-                self.operator.forward_mul_second_cross(axis_d, axis_e, &u)
-                    .expect("radial scalar evaluation failed during implicit psi second forward_mul")
-            }
+            CustomFamilyPsiSecondDesignLevel::Diag(axis) => self
+                .operator
+                .forward_mul_second_diag(axis, &u)
+                .expect("radial scalar evaluation failed during implicit psi second forward_mul"),
+            CustomFamilyPsiSecondDesignLevel::Cross(axis_d, axis_e) => self
+                .operator
+                .forward_mul_second_cross(axis_d, axis_e, &u)
+                .expect("radial scalar evaluation failed during implicit psi second forward_mul"),
         };
         out.slice(ndarray::s![self.row_range.clone()]).to_owned()
     }
@@ -1908,10 +2245,10 @@ impl CustomFamilyPsiSecondDesignAction {
         };
         let full_v = expanded.as_ref().map_or(v, |arr| arr.view());
         match self.level {
-            CustomFamilyPsiSecondDesignLevel::Diag(axis) => {
-                self.operator.transpose_mul_second_diag(axis, &full_v)
-                    .expect("radial scalar evaluation failed during implicit psi second transpose_mul")
-            }
+            CustomFamilyPsiSecondDesignLevel::Diag(axis) => self
+                .operator
+                .transpose_mul_second_diag(axis, &full_v)
+                .expect("radial scalar evaluation failed during implicit psi second transpose_mul"),
             CustomFamilyPsiSecondDesignLevel::Cross(axis_d, axis_e) => self
                 .operator
                 .transpose_mul_second_cross(axis_d, axis_e, &full_v)
@@ -2295,7 +2632,8 @@ pub(crate) fn resolve_custom_family_x_psi(
                 n, p
             ));
         }
-        let x = op.materialize_first(deriv.implicit_axis)
+        let x = op
+            .materialize_first(deriv.implicit_axis)
             .map_err(|e| format!("{label} implicit materialize_first failed: {e}"))?;
         if x.nrows() != n || x.ncols() != p {
             return Err(format!(
@@ -2644,7 +2982,7 @@ fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, Strin
             ));
         }
         for (k, s) in spec.penalties.iter().enumerate() {
-            let (r, c) = s.dim();
+            let (r, c) = s.shape();
             if r != p || c != p {
                 return Err(format!(
                     "block {b} penalty {k} must be {p}x{p}, got {r}x{c}"
@@ -3909,49 +4247,6 @@ fn strict_logdet_spd_with_semidefinite_option(
     strict_logdet_spd(matrix)
 }
 
-/// Compute the smooth δ-regularized inverse (S + δI)⁻¹ of a symmetric matrix.
-///
-/// Replaces the hard-truncated pseudoinverse `pinv_positive_part_with_floor`.
-/// The regularization parameter δ is chosen proportional to machine epsilon
-/// times the spectral scale, ensuring the inverse is always full rank and
-/// C∞ smooth in the matrix entries.
-///
-/// Reference: response.md Section 7.
-fn delta_regularized_inverse(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
-    use crate::estimate::reml::unified::smooth_logdet_delta;
-
-    let (evals, evecs) = match FaerEigh::eigh(matrix, Side::Lower) {
-        Ok(ok) => ok,
-        Err(_) => {
-            // Fallback: diagonal approximation with δ-regularization.
-            let p = matrix.nrows();
-            let max_diag = (0..p)
-                .map(|i| matrix[[i, i]].abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
-            let delta = 1e-10 * max_diag;
-            let mut inv = Array2::<f64>::zeros((p, p));
-            for i in 0..p {
-                inv[[i, i]] = 1.0 / (matrix[[i, i]] + delta);
-            }
-            return Ok(inv);
-        }
-    };
-    let p = matrix.nrows();
-    let delta = smooth_logdet_delta(evals.as_slice().unwrap());
-    let mut inv = Array2::<f64>::zeros((p, p));
-    for k in 0..p {
-        let inv_ev = 1.0 / (evals[k] + delta);
-        for i in 0..p {
-            let uik = evecs[(i, k)];
-            for j in 0..p {
-                inv[[i, j]] += inv_ev * uik * evecs[(j, k)];
-            }
-        }
-    }
-    Ok(inv)
-}
-
 fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
     // SVD-based pseudoinverse: unconditionally convergent, unlike eigh which
     // can fail on pathological matrices from degenerate GAMLSS Hessians.
@@ -4055,7 +4350,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
         let lambdas = block_log_lambdas[b].mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((p, p));
         for (k, s) in spec.penalties.iter().enumerate() {
-            s_lambda.scaled_add(lambdas[k], s);
+            s.add_scaled_to(lambdas[k], &mut s_lambda);
         }
         if include_logdet_s {
             // Exact pseudo-logdet on the positive eigenspace, consistent with
@@ -4073,18 +4368,22 @@ fn blockwise_logdet_terms<F: CustomFamily>(
                     s_for_logdet[[i, i]] += ridge;
                 }
             }
-            let (evals, _) = s_for_logdet
-                .eigh(faer::Side::Lower)
-                .map_err(|e| format!("penalty logdet eigendecomposition failed for block {b}: {e}"))?;
+            let (evals, _) = s_for_logdet.eigh(faer::Side::Lower).map_err(|e| {
+                format!("penalty logdet eigendecomposition failed for block {b}: {e}")
+            })?;
             // Structural nullity determines the split: bottom m₀ eigenvalues
             // are structural zeros, top (p - m₀) are the positive subspace.
             let m0 = if !spec.nullspace_dims.is_empty()
                 && spec.nullspace_dims.len() == spec.penalties.len()
             {
-                crate::estimate::reml::unified::exact_intersection_nullity(
-                    &spec.penalties,
-                    &spec.nullspace_dims,
-                )
+                {
+                    let penalties_dense: Vec<Array2<f64>> =
+                        spec.penalties.iter().map(|p| p.to_dense()).collect();
+                    crate::estimate::reml::unified::exact_intersection_nullity(
+                        &penalties_dense,
+                        &spec.nullspace_dims,
+                    )
+                }
             } else {
                 let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(
                     evals.as_slice().unwrap(),
@@ -4116,25 +4415,20 @@ fn blockwise_logdet_terms<F: CustomFamily>(
     } else {
         None
     };
-    if let Some(h_joint_source) = exact_joint_source {
-        match h_joint_source {
-            JointHessianSource::Operator { apply, diagonal } => {
-                let mut h = materialize_joint_hessian_source(
-                    &JointHessianSource::Operator { apply, diagonal },
-                    total,
-                    "joint exact-newton Hessian materialization in logdet terms",
-                )?;
-                for (b, s_lambda) in s_lambdas.iter().enumerate() {
-                    let (start, end) = ranges[b];
-                    h.slice_mut(ndarray::s![start..end, start..end])
-                        .scaled_add(1.0, s_lambda);
-                }
-                let logdet_h_total =
-                    stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
-                return Ok((logdet_h_total, penalty_logdet_s_total));
-            }
-            JointHessianSource::Dense(_) => {}
+    if let Some(JointHessianSource::Operator { apply, diagonal }) = exact_joint_source {
+        let mut h = materialize_joint_hessian_source(
+            &JointHessianSource::Operator { apply, diagonal },
+            total,
+            "joint exact-newton Hessian materialization in logdet terms",
+        )?;
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            h.slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(1.0, s_lambda);
         }
+        let logdet_h_total =
+            stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
+        return Ok((logdet_h_total, penalty_logdet_s_total));
     }
     if let Some(mut h_joint) = exact_newton_joint_hessian_symmetrized(
         family,
@@ -4313,7 +4607,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
         let lambdas = block_log_lambdas[b].mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((p, p));
         for (k, s) in spec.penalties.iter().enumerate() {
-            s_lambda.scaled_add(lambdas[k], s);
+            s.add_scaled_to(lambdas[k], &mut s_lambda);
         }
         s_lambdas.push(s_lambda);
     }
@@ -4982,14 +5276,21 @@ fn unified_joint_cost_gradient(
     for (b, spec) in specs.iter().enumerate() {
         let (start, end) = ranges[b];
         for s_k in spec.penalties.iter() {
-            let root = penalty_matrix_root(s_k)?;
+            let s_dense = s_k.as_dense_cow();
+            let root = penalty_matrix_root(&s_dense)?;
             penalty_coords.push(PenaltyCoordinate::from_block_root(root, start, end, total));
         }
     }
 
     // Compute penalty logdet derivatives (exact pseudo-logdet on positive eigenspace).
-    let per_block_penalties: Vec<&[Array2<f64>]> =
-        specs.iter().map(|s| s.penalties.as_slice()).collect();
+    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = specs
+        .iter()
+        .map(|s| s.penalties.iter().map(|p| p.to_dense()).collect())
+        .collect();
+    let per_block_penalties: Vec<&[Array2<f64>]> = per_block_penalties_dense
+        .iter()
+        .map(|v| v.as_slice())
+        .collect();
     let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
         ridge
     } else {
@@ -5769,7 +6070,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
-    s_pinv_blocks: Option<&[Array2<f64>]>,
+    s_logdet_blocks: Option<&[PenaltyLogdetEigenspace]>,
     hessian_beta_independent: bool,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Result<Vec<HyperCoord>, String> {
@@ -5823,8 +6124,8 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
                 .slice_mut(ndarray::s![start..end])
                 .assign(&s_psi_beta_local);
             let g = &psi_terms.score_psi + &s_psi_beta;
-            let ld_s = if let Some(blocks) = s_pinv_blocks {
-                trace_product(&blocks[block_idx], &s_psi_local)
+            let ld_s = if let Some(blocks) = s_logdet_blocks {
+                trace_product(&blocks[block_idx].pseudoinverse, &s_psi_local)
             } else {
                 0.0
             };
@@ -5888,7 +6189,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
 /// * `beta_flat` - Flattened joint coefficient vector at the inner mode.
 /// * `rho` - Current log-smoothing parameters (flat).
 /// * `penalty_counts` - Number of penalties per block.
-/// * `s_pinv_blocks` - Optional block-local `(S_b + δI)⁻¹` slices (for ld_s).
+/// * `s_logdet_blocks` - Optional exact block-local pseudologdet eigenspaces.
 pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     synced_states: &[ParameterBlockState],
@@ -5897,7 +6198,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
-    s_pinv_blocks: Option<&[Array2<f64>]>,
+    s_logdet_blocks: Option<&[PenaltyLogdetEigenspace]>,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Result<
     (
@@ -5920,7 +6221,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     let ranges_arc = Arc::new(ranges);
     let family_arc = Arc::new(family.clone());
 
-    let s_pinv_block_cache = Arc::new(s_pinv_blocks.map(|blocks| blocks.to_vec()));
+    let s_logdet_block_cache = Arc::new(s_logdet_blocks.map(|blocks| blocks.to_vec()));
 
     struct PsiPenaltyCacheEntry {
         block_idx: usize,
@@ -5928,6 +6229,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         start: usize,
         end: usize,
         spinv_s_local: Option<Array2<f64>>,
+        scaled_leak_local: Option<Array2<f64>>,
     }
 
     struct RhoPenaltyCacheEntry {
@@ -5947,16 +6249,20 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let p_block = end - start;
         for (local_idx, deriv) in block_derivs.iter().enumerate() {
             let s_local = assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
-            let spinv_s_local = s_pinv_block_cache
+            let spinv_s_local = s_logdet_block_cache
                 .as_ref()
                 .as_ref()
-                .map(|blocks| blocks[block_idx].dot(&s_local));
+                .map(|blocks| blocks[block_idx].pseudoinverse.dot(&s_local));
+            let scaled_leak_local = s_logdet_block_cache.as_ref().as_ref().map(|blocks| {
+                scaled_penalty_logdet_nullspace_leakage(&blocks[block_idx], &s_local)
+            });
             psi_penalty_cache.push(PsiPenaltyCacheEntry {
                 block_idx,
                 local_idx,
                 start,
                 end,
                 spinv_s_local,
+                scaled_leak_local,
             });
         }
     }
@@ -5967,11 +6273,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let (start, end) = ranges_arc[block_idx];
         for penalty_idx in 0..count {
             let s_local = specs_arc[block_idx].penalties[penalty_idx]
+                .to_dense()
                 .mapv(|v| per_block[block_idx][penalty_idx].exp() * v);
-            let spinv_s_local = s_pinv_block_cache
+            let spinv_s_local = s_logdet_block_cache
                 .as_ref()
                 .as_ref()
-                .map(|blocks| blocks[block_idx].dot(&s_local));
+                .map(|blocks| blocks[block_idx].pseudoinverse.dot(&s_local));
             rho_penalty_cache.push(RhoPenaltyCacheEntry {
                 block_idx,
                 penalty_idx,
@@ -5983,18 +6290,6 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     }
     let rho_penalty_cache = Arc::new(rho_penalty_cache);
 
-    // ── Smooth δ-regularized inverse for ld_s pair computations ──
-    //
-    // Instead of the pseudoinverse S⁺ with hard eigenvalue threshold and
-    // explicit moving-nullspace correction (U₊, U₀, Σ⁺² leakage), we use
-    // the smooth δ-regularized inverse (S + δI)⁻¹.
-    //
-    // This is C∞ in all outer parameters and automatically captures the
-    // leakage correction that was previously needed when ψ coordinates
-    // rotated the penalty nullspace.
-    //
-    // Reference: response.md Section 7.
-
     // ψ-ψ pair callback
     let ext_ext = {
         let per_block = Arc::clone(&per_block);
@@ -6002,7 +6297,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let specs_arc = Arc::clone(&specs_arc);
         let beta_arc = Arc::clone(&beta_arc);
         let synced_arc = Arc::clone(&synced_arc);
-        let s_pinv_block_cache = Arc::clone(&s_pinv_block_cache);
+        let s_logdet_block_cache = Arc::clone(&s_logdet_block_cache);
         let psi_penalty_cache = Arc::clone(&psi_penalty_cache);
         let family_arc = Arc::clone(&family_arc);
         let psi_workspace = psi_workspace.clone();
@@ -6061,18 +6356,28 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     b_local += &s_local;
                 }
 
-                if let Some(ref spinv_blocks) = *s_pinv_block_cache {
-                    let tr_spinv_sij = trace_product(&spinv_blocks[cache_i.block_idx], &s_local);
-                    let tr_quad =
-                        trace_product(
-                            cache_j.spinv_s_local.as_ref().expect(
-                                "psi cache should include (S+δI)^-1 S_psi when s_pinv exists",
+                if let Some(ref logdet_blocks) = *s_logdet_block_cache {
+                    let tr_spinv_sij =
+                        trace_product(&logdet_blocks[cache_i.block_idx].pseudoinverse, &s_local);
+                    let tr_quad = trace_product(
+                        cache_j.spinv_s_local.as_ref().expect(
+                            "psi cache should include S⁺ S_psi when penalty logdet is active",
+                        ),
+                        cache_i.spinv_s_local.as_ref().expect(
+                            "psi cache should include S⁺ S_psi when penalty logdet is active",
+                        ),
+                    );
+                    let leak = if let Some(ref scaled_i) = cache_i.scaled_leak_local {
+                        2.0 * frobenius_inner_same_shape(
+                            scaled_i,
+                            cache_j.scaled_leak_local.as_ref().expect(
+                                "psi cache should include scaled leakage blocks when penalty logdet is active",
                             ),
-                            cache_i.spinv_s_local.as_ref().expect(
-                                "psi cache should include (S+δI)^-1 S_psi when s_pinv exists",
-                            ),
-                        );
-                    tr_spinv_sij - tr_quad
+                        )
+                    } else {
+                        0.0
+                    };
+                    tr_spinv_sij - tr_quad + leak
                 } else {
                     0.0
                 }
@@ -6091,7 +6396,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let beta_arc = Arc::clone(&beta_arc);
         let psi_penalty_cache = Arc::clone(&psi_penalty_cache);
         let rho_penalty_cache = Arc::clone(&rho_penalty_cache);
-        let s_pinv_block_cache = Arc::clone(&s_pinv_block_cache);
+        let s_logdet_block_cache = Arc::clone(&s_logdet_block_cache);
         let total = total;
 
         Box::new(move |rho_k: usize, psi_j: usize| -> HyperCoordPair {
@@ -6139,17 +6444,17 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     b_local += &local;
                 }
 
-                if let Some(ref spinv_blocks) = *s_pinv_block_cache {
-                    let tr_spinv_skj = trace_product(&spinv_blocks[rho_cache.block_idx], &local);
-                    let tr_quad =
-                        trace_product(
-                            psi_cache.spinv_s_local.as_ref().expect(
-                                "psi cache should include (S+δI)^-1 S_psi when s_pinv exists",
-                            ),
-                            rho_cache.spinv_s_local.as_ref().expect(
-                                "rho cache should include (S+δI)^-1 S_rho when s_pinv exists",
-                            ),
-                        );
+                if let Some(ref logdet_blocks) = *s_logdet_block_cache {
+                    let tr_spinv_skj =
+                        trace_product(&logdet_blocks[rho_cache.block_idx].pseudoinverse, &local);
+                    let tr_quad = trace_product(
+                        psi_cache.spinv_s_local.as_ref().expect(
+                            "psi cache should include S⁺ S_psi when penalty logdet is active",
+                        ),
+                        rho_cache.spinv_s_local.as_ref().expect(
+                            "rho cache should include S⁺ S_rho when penalty logdet is active",
+                        ),
+                    );
                     tr_spinv_skj - tr_quad
                 } else {
                     0.0
@@ -6338,27 +6643,43 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
                 .into()
         })?;
 
-        // Compute smooth δ-regularized inverse (S + δI)⁻¹ for the ψ builders.
-        //
-        // Replaces the hard-truncated pseudoinverse S⁺, making the objective C∞
-        // and eliminating the need for leakage/moving-nullspace corrections.
-        //
-        // Reference: response.md Section 7.
-        let s_pinv_blocks = if include_logdet_s {
+        // Build the exact pseudologdet eigenspace for each penalty block so
+        // the value, ψ gradient, ψψ Hessian, and ρψ mixed block all
+        // differentiate the same log|S|_+ objective.
+        let s_logdet_blocks = if include_logdet_s {
             let mut blocks = Vec::with_capacity(specs.len());
             for (b, spec) in specs.iter().enumerate() {
                 let p = spec.design.ncols();
                 let lambdas = per_block[b].mapv(f64::exp);
                 let mut s_lambda = Array2::<f64>::zeros((p, p));
                 for (k, s) in spec.penalties.iter().enumerate() {
-                    s_lambda.scaled_add(lambdas[k], s);
+                    s.add_scaled_to(lambdas[k], &mut s_lambda);
                 }
                 if options.ridge_policy.include_penalty_logdet {
                     for d in 0..p {
                         s_lambda[[d, d]] += ridge;
                     }
                 }
-                blocks.push(delta_regularized_inverse(&s_lambda)?);
+                let structural_nullity = if !spec.nullspace_dims.is_empty()
+                    && spec.nullspace_dims.len() == spec.penalties.len()
+                {
+                    let penalties_dense: Vec<Array2<f64>> = spec
+                        .penalties
+                        .iter()
+                        .map(|penalty| penalty.to_dense())
+                        .collect();
+                    Some(exact_intersection_nullity(
+                        &penalties_dense,
+                        &spec.nullspace_dims,
+                    ))
+                } else {
+                    None
+                };
+                blocks.push(build_penalty_logdet_eigenspace(
+                    &s_lambda,
+                    structural_nullity,
+                    &format!("custom-family penalty logdet block {b}"),
+                )?);
             }
             Some(blocks)
         } else {
@@ -6386,7 +6707,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             &beta_flat,
             rho_current.as_slice().unwrap(),
             &penalty_counts,
-            s_pinv_blocks.as_deref(),
+            s_logdet_blocks.as_deref(),
             hessian_beta_independent,
             psi_workspace.clone(),
         )?;
@@ -6400,7 +6721,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
                 &beta_flat,
                 rho_current.as_slice().unwrap(),
                 &penalty_counts,
-                s_pinv_blocks.as_deref(),
+                s_logdet_blocks.as_deref(),
                 psi_workspace.clone(),
             )?;
             let drift_fn = build_psi_drift_deriv_callback(
@@ -7008,7 +7329,7 @@ fn compute_joint_covariance<F: CustomFamily>(
             let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
             let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
             for (k, s) in spec.penalties.iter().enumerate() {
-                s_lambda.scaled_add(lambdas[k], s);
+                s.add_scaled_to(lambdas[k], &mut s_lambda);
             }
             h.slice_mut(ndarray::s![start..end, start..end])
                 .scaled_add(1.0, &s_lambda);
@@ -7084,8 +7405,9 @@ fn compute_joint_geometry<F: CustomFamily>(
             .assign(&xtw);
         let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
         for (k, s) in spec.penalties.iter().enumerate() {
+            let s_dense = s.as_dense_cow();
             h.slice_mut(ndarray::s![start..end, start..end])
-                .scaled_add(lambdas[k], s);
+                .scaled_add(lambdas[k], &*s_dense);
         }
     }
     let n = all_working_weights[0].len();
@@ -7441,7 +7763,7 @@ mod tests {
             name: "x".to_string(),
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
-            penalties: vec![array![[1.0]]],
+            penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
@@ -7594,14 +7916,16 @@ mod tests {
         );
 
         let s_cross_01 = derivs[0]
-            .s_psi_psi
+            .s_psi_psi_components
             .as_ref()
-            .expect("psi0 penalty second-derivative rows")[1]
+            .expect("psi0 penalty second-derivative rows")[1][0]
+            .1
             .clone();
         let s_cross_10 = derivs[1]
-            .s_psi_psi
+            .s_psi_psi_components
             .as_ref()
-            .expect("psi1 penalty second-derivative rows")[0]
+            .expect("psi1 penalty second-derivative rows")[0][0]
+            .1
             .clone();
         assert_eq!(
             s_cross_01.dim(),
@@ -7782,10 +8106,7 @@ mod tests {
     struct PreferJointExactFamily;
 
     impl CustomFamily for PreferJointExactFamily {
-        fn evaluate(
-            &self,
-            _: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -7947,10 +8268,7 @@ mod tests {
     struct OneBlockExactPsiHookFamily;
 
     impl CustomFamily for OneBlockExactPsiHookFamily {
-        fn evaluate(
-            &self,
-            _: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -8008,10 +8326,7 @@ mod tests {
     struct OneBlockIndefinitePseudoLaplaceFamily;
 
     impl CustomFamily for OneBlockIndefinitePseudoLaplaceFamily {
-        fn evaluate(
-            &self,
-            _: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -8073,10 +8388,7 @@ mod tests {
     struct OneBlockAlwaysErrorFamily;
 
     impl CustomFamily for OneBlockAlwaysErrorFamily {
-        fn evaluate(
-            &self,
-            _: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
             Err("synthetic outer objective failure: block[0] evaluate()".to_string())
         }
     }
@@ -8160,7 +8472,7 @@ mod tests {
             name: "b0".to_string(),
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
-            penalties: vec![array![[1.0]]],
+            penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
             nullspace_dims: vec![],
             initial_log_lambdas: array![10.0_f64.ln()],
             initial_beta: Some(array![1.0]),
@@ -8201,7 +8513,7 @@ mod tests {
             name: "b0".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.2],
             initial_beta: None,
@@ -8270,7 +8582,7 @@ mod tests {
             name: "joint_exact".to_string(),
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
@@ -8304,7 +8616,7 @@ mod tests {
             name: "block0".to_string(),
             design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
@@ -8313,7 +8625,7 @@ mod tests {
             name: "block1".to_string(),
             design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
@@ -8506,7 +8818,7 @@ mod tests {
             name: "threshold".to_string(),
             design: threshold_design.clone(),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
@@ -8515,7 +8827,7 @@ mod tests {
             name: "log_sigma".to_string(),
             design: log_sigma_design.clone(),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![-0.2],
             initial_beta: Some(array![-0.1]),
@@ -8621,7 +8933,7 @@ mod tests {
             name: "threshold".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
@@ -8630,7 +8942,7 @@ mod tests {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
@@ -8716,7 +9028,7 @@ mod tests {
             name: "threshold".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
@@ -8725,7 +9037,7 @@ mod tests {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
@@ -8811,7 +9123,7 @@ mod tests {
             name: "threshold".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.15]),
@@ -8820,7 +9132,7 @@ mod tests {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.05]),
@@ -8984,7 +9296,7 @@ mod tests {
             name: "threshold".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
@@ -8993,7 +9305,7 @@ mod tests {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
@@ -9217,7 +9529,7 @@ mod tests {
             name: "err_block".to_string(),
             design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
-            penalties: vec![Array2::eye(1)],
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
