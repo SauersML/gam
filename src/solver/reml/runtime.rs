@@ -402,7 +402,7 @@ impl<'a> RemlState<'a> {
             z,
             c_array,
             d_array,
-            penalties,
+            penalty_roots,
             lambdas,
             &x_vks,
             h_inv_solve,
