@@ -2927,13 +2927,15 @@ fn run_predict_gaussian_location_scale(
         &model.noise_scale,
         model.noise_non_intercept_start,
     )?;
+    let dense_design_mu = design_mu.design.to_dense();
+    let dense_design_noise_gauss = design_noise.design.to_dense();
     let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
-        apply_scale_deviation_transform(&design_mu.design, &design_noise.design, transform)?
+        apply_scale_deviation_transform(&dense_design_mu, &dense_design_noise_gauss, transform)?
     } else {
-        design_noise.design.clone()
+        dense_design_noise_gauss.clone()
     };
 
-    let eta_mu_base = design_mu.design.dot(&beta_mu);
+    let eta_mu_base = dense_design_mu.dot(&beta_mu);
     let eta_noise = prepared_noise_design.dot(&beta_noise);
     let response_scale = gaussian_response_scale_from_saved_model(model)?;
     let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
@@ -2962,7 +2964,7 @@ fn run_predict_gaussian_location_scale(
         for i in 0..eta.len() {
             let scale = dq_dq0[i];
             for j in 0..p_mu {
-                grad[[i, j]] = scale * design_mu.design[[i, j]];
+                grad[[i, j]] = scale * dense_design_mu[[i, j]];
             }
             if let Some(wd) = wiggle_design.as_ref() {
                 for j in 0..p_w {
