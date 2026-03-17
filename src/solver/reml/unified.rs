@@ -1481,6 +1481,22 @@ pub enum PenaltyCoordinate {
         end: usize,
         total_dim: usize,
     },
+    /// Kronecker-factored penalty coordinate for tensor-product smooths.
+    ///
+    /// In the reparameterized (eigenbasis) representation, the penalty
+    /// `I ⊗ ... ⊗ S_k ⊗ ... ⊗ I` becomes `I ⊗ ... ⊗ Λ_k ⊗ ... ⊗ I`
+    /// where `Λ_k = diag(μ_{k,0}, ..., μ_{k,q_k-1})`.  This is diagonal
+    /// in each mode, so apply/quadratic/trace operations avoid O(p²).
+    KroneckerMarginal {
+        /// Marginal eigenvalues for ALL dimensions: `eigenvalues[j]` has length `q_j`.
+        eigenvalues: Vec<Array1<f64>>,
+        /// Which marginal dimension this penalty coordinate corresponds to.
+        dim_index: usize,
+        /// Marginal basis dimensions: `[q_0, ..., q_{d-1}]`.
+        marginal_dims: Vec<usize>,
+        /// Total joint dimension: `∏ q_j`.
+        total_dim: usize,
+    },
 }
 
 impl PenaltyCoordinate {
@@ -1502,18 +1518,29 @@ impl PenaltyCoordinate {
     pub fn rank(&self) -> usize {
         match self {
             Self::DenseRoot(root) | Self::BlockRoot { root, .. } => root.nrows(),
+            Self::KroneckerMarginal { eigenvalues, dim_index, .. } => {
+                // Rank = number of nonzero marginal eigenvalues for this dim,
+                // times the product of all other dims.
+                let nz = eigenvalues[*dim_index].iter().filter(|&&v| v.abs() > 1e-12).count();
+                let other: usize = eigenvalues.iter().enumerate()
+                    .filter(|&(j, _)| j != *dim_index)
+                    .map(|(_, e)| e.len())
+                    .product::<usize>()
+                    .max(1);
+                nz * other
+            }
         }
     }
 
     pub fn dim(&self) -> usize {
         match self {
             Self::DenseRoot(root) => root.ncols(),
-            Self::BlockRoot { total_dim, .. } => *total_dim,
+            Self::BlockRoot { total_dim, .. } | Self::KroneckerMarginal { total_dim, .. } => *total_dim,
         }
     }
 
     pub fn uses_operator_fast_path(&self) -> bool {
-        matches!(self, Self::BlockRoot { .. })
+        matches!(self, Self::BlockRoot { .. } | Self::KroneckerMarginal { .. })
     }
 
     fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
