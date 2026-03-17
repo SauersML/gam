@@ -1,22 +1,28 @@
 # gam
 
-`gam` is a formula-first CLI and Rust engine for penalized regression models.
+`gam` is a formula-first CLI and Rust engine for generalized additive models.
 
 The current CLI supports:
 
-- Standard mean models with penalized linear terms, random effects, and smooths
-- A surfaced location-scale fitting path via `--predict-noise`
-- Survival models via `Surv(entry, exit, event)`
-- An advanced Bernoulli marginal-slope workflow via `--logslope-formula` and `--z-column`
-- Prediction, HTML reports, ALO diagnostics, posterior sampling, and synthetic-data generation
+- Standard models with linear terms, random effects, and smooths
+- Location-scale models (which jointly predict noise)
+- Survival models
+- Various surface models
+- Various 
+- Posterior sampling
+- Rich penalty structures
+- And more
 
-The CLI is the primary interface. The Rust modules exported by the crate are used internally and can change without compatibility guarantees.
+## Differences from other GAM libraries
+- We primarily use REML and LAML.
+- We aim to automatically support all sizes of data.
+- The default penalty structure has seperate penalties for magnitude, gradient, and curvature, instead of the common approach of having one (curvature) or two (curvature, and magnitude + gradient combined).
+- Support for using smooths as offsets from a known function, such that the known function acts as a prior. For example, you may choose to select a probit link with a spline offset, allowing the data to fix link misspecification, while still encoding the belief that probit is approximately correct. This is particularly useful because a flexible link function can fix arbitrary miscalibration of the model, similar to a post-hoc calibration step (but jointly fit). There's also support for smooth offsets from surival model time basis functions.
+- Support for surface smooths, such as multidimensional Duchon splines.
+- Adaptive length scaling: the ability to shrink each axis or feature separately, even when they are part of a single, joint smooth.
+- Support for a locally adaptive smoothness penalty, so certain regions can demand faster transitions, while still remaining smooth overall.
+- The ability to mix aspects of different splines categories together. For example, you can have the kernel basis of a Duchon spline, but also have the global kappa scaling of a Matérn spline (if you for some reason wanted to).
 
-## Requirements
-
-- Rust `1.93+` for local source builds
-- CSV input data with a header row
-- A shell that supports quoted formulas (`bash`/`zsh` examples below)
 
 ## Install
 
