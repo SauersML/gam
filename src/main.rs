@@ -4022,14 +4022,12 @@ fn build_survival_time_basis(
                 }
             }
 
-            // B-spline with penalty_order=2: nullspace is {constant, linear}, dim=2.
-            let n_penalties = entry_basis.penalties.len();
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time: entry_basis.design,
                 x_exit_time: exit_basis.design,
                 x_derivative_time,
+                nullspace_dims: entry_basis.nullspace_dims,
                 penalties: entry_basis.penalties,
-                nullspace_dims: vec![2; n_penalties],
                 basisname: "bspline".to_string(),
                 degree: Some(degree),
                 knots: Some(knotvec.to_vec()),
@@ -4202,16 +4200,31 @@ fn build_survival_time_basis(
                 penalties.push(local);
             }
 
-            // I-spline penalties are column-subsetted from B-spline penalties
-            // after monotonicity constraint projection. The subsetting removes
-            // the polynomial null directions, so nullity = 0.
-            let n_penalties = penalties.len();
+            // Compute structural nullspace dims from the subsetted penalty matrices.
+            let nullspace_dims: Vec<usize> = penalties
+                .iter()
+                .map(|s| {
+                    let p = s.nrows();
+                    if p == 0 {
+                        return 0;
+                    }
+                    match s.eigh(faer::Side::Lower) {
+                        Ok((evals, _)) => {
+                            let threshold = gam::estimate::reml::unified::positive_eigenvalue_threshold(
+                                evals.as_slice().unwrap(),
+                            );
+                            evals.iter().filter(|&&e| e <= threshold).count()
+                        }
+                        Err(_) => 0,
+                    }
+                })
+                .collect();
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time,
                 x_exit_time,
                 x_derivative_time,
                 penalties,
-                nullspace_dims: vec![0; n_penalties],
+                nullspace_dims,
                 basisname: "ispline".to_string(),
                 degree: Some(degree),
                 knots: Some(knotvec.to_vec()),
@@ -5950,13 +5963,13 @@ fn run_sample_survival(
             wiggle_cfg.double_penalty,
         )?;
         augmentwiggle_penaltieswith_orders(&mut block, &wiggle_cfg.penalty_orders)?;
-        for s in &block.penalties {
+        for (widx, s) in block.penalties.iter().enumerate() {
             if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
                 penalty_blocks.push(PenaltyBlock {
                     matrix: s.clone(),
                     lambda: time_build.smooth_lambda.unwrap_or(1e-2),
                     range: start..end,
-                    nullspace_dim: 2, // B-spline wiggle, penalty_order=2
+                    nullspace_dim: block.nullspace_dims.get(widx).copied().unwrap_or(0),
                 });
             }
         }

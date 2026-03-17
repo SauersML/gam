@@ -99,6 +99,10 @@ pub(crate) fn design_row_chunk(
             }
             Ok(out)
         }
+        DesignMatrix::Operator(op) => {
+            let dense = op.to_dense();
+            Ok(dense.slice(s![rows, ..]).to_owned())
+        }
     }
 }
 

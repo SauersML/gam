@@ -223,7 +223,7 @@ impl<'a> RemlState<'a> {
     /// | `a`     | `−u^T X_{τ_j} β̂ + 0.5 β̂^T S_{τ_j} β̂ [+ Φ_{τ_j}\|_β]` |
     /// | `g`     | `X_{τ_j}^T u − X^T diag(w) X_{τ_j} β̂ − S_{τ_j} β̂ [− (g_φ)_{τ_j}]` |
     /// | `B`     | `X_{τ_j}^T W X + X^T W X_{τ_j} + X^T diag(c ⊙ X_{τ_j} β̂) X + S_{τ_j} [− Firth drifts]` |
-    /// | `ld_s`  | `tr((S + δI)⁻¹ S_{τ_j})` |
+    /// | `ld_s`  | `tr(S⁺ S_{τ_j})` |
     ///
     /// For Gaussian identity link, `c = 0` and W is constant, so the
     /// third-derivative correction in B vanishes and `b_depends_on_beta = false`.
@@ -824,7 +824,7 @@ impl<'a> RemlState<'a> {
                 .as_ref()
                 .map(|s_ij| Self::trace_product(&s_reg_inv_tt, s_ij))
                 .unwrap_or(0.0);
-            let ld_s_ij = ld_s_quad - ld_s_linear;
+            let ld_s_ij = ld_s_linear - ld_s_quad;
 
             let x_tau_i_beta = &x_tau_beta_tt[i];
             let x_tau_j_beta = &x_tau_beta_tt[j];
@@ -970,7 +970,7 @@ impl<'a> RemlState<'a> {
     /// | `a`     | `β̂^T S_{τ_i} β_{τ_j} + 0.5 β̂^T S_{τ_i τ_j} β̂` |
     /// | `g`     | second score involving X_{τ_i}, X_{τ_j}, X_{τ_i τ_j}, S_{τ_i τ_j}` |
     /// | `B`     | cross-design + cross-curvature + second-design + S_{τ_i τ_j}` |
-    /// | `ld_s`  | `tr((S+δI)⁻¹ S_{τ_j} (S+δI)⁻¹ S_{τ_i}) − tr((S+δI)⁻¹ S_{τ_i τ_j})` |
+    /// | `ld_s`  | `tr(S⁺ S_{τ_i τ_j}) − tr(S⁺ S_{τ_i} S⁺ S_{τ_j})` |
     ///
     /// # Notes
     ///
@@ -1066,20 +1066,11 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        // ── Build (S + δI)⁻¹ for ld_s pair computations ──
+        // ── Build S⁺ for ld_s pair computations ──
         //
-        // Smooth δ-regularization (response.md Section 7): instead of computing
-        // the pseudoinverse S⁺ with hard eigenvalue thresholding (which creates
-        // non-smooth derivatives and requires explicit leakage/moving-nullspace
-        // corrections), we use the full-rank regularized inverse (S + δI)⁻¹.
-        //
-        // This is C∞ in all outer parameters and automatically captures what
-        // previously required:
-        //   - Eigenspace partitioning (U₊/U₀ split)
-        //   - Leakage matrices L_j = U₊ᵀ S_{τ_j} U₀
-        //   - Moving-nullspace correction tr(Σ⁺² L_i L_jᵀ)
-        //
-        // All of these are now subsumed by the single (S + δI)⁻¹ computation.
+        // Exact pseudoinverse on the positive eigenspace: eigendecompose S,
+        // threshold small eigenvalues, and invert only on the positive subspace.
+        // This gives S⁺ used in the log|S|₊ gradient and Hessian traces.
         let rs_eval: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
             reparam_result
                 .rs_transformed
@@ -1125,7 +1116,7 @@ impl<'a> RemlState<'a> {
             .map(|(k, r)| r.t().dot(r).mapv(|v| lambdas[k] * v))
             .collect();
 
-        // Precompute (S + δI)⁻¹ A_k for ρ-τ pairs.
+        // Precompute S⁺ A_k for ρ-τ pairs.
         let sdag_a_k: Vec<Array2<f64>> = a_k_mats.iter().map(|a| s_reg_inv.dot(a)).collect();
 
         // Pre-compute transformed design matrices X_{τ_j} for each τ direction.
@@ -1263,7 +1254,7 @@ impl<'a> RemlState<'a> {
         let tau_tau_pair_fn = move |i: usize, j: usize| -> super::unified::HyperCoordPair {
             // ld_s_{ij}: second derivative of log|S|₊ w.r.t. τ_i, τ_j.
             //
-            //   ∂²_ij L = tr(S⁺ S_j S⁺ S_i) − tr(S⁺ S_ij)
+            //   ∂²_ij L = tr(S⁺ S_ij) − tr(S⁺ S_i S⁺ S_j)
             //
             // Uses the exact pseudoinverse S⁺ on the positive eigenspace.
             let ld_s_quad = Self::trace_product(&sdag_s_tau_tt[j], &sdag_s_tau_tt[i]);
@@ -1271,7 +1262,7 @@ impl<'a> RemlState<'a> {
                 .as_ref()
                 .map(|s_ij| Self::trace_product(&s_reg_inv_tt, s_ij))
                 .unwrap_or(0.0);
-            let ld_s_ij = ld_s_quad - ld_s_linear;
+            let ld_s_ij = ld_s_linear - ld_s_quad;
 
             // a_ij — fixed-β second-order cost derivative.
             //
@@ -1460,19 +1451,16 @@ impl<'a> RemlState<'a> {
         let p_dim_rt = p_dim;
 
         let rho_tau_pair_fn = move |k: usize, j: usize| -> super::unified::HyperCoordPair {
-            // ld_s_{k,τ_j}: second derivative of L_δ(S) w.r.t. ρ_k, τ_j.
+            // ld_s_{k,τ_j}: second derivative of log|S|₊ w.r.t. ρ_k, τ_j.
             //
-            // Using smooth δ-regularized inverse (S + δI)⁻¹:
-            //   ∂²_{k,τ_j} L_δ = tr((S+δI)⁻¹ A_{k,τ_j}) − tr((S+δI)⁻¹ S_{τ_j} (S+δI)⁻¹ A_k)
+            // Using exact pseudoinverse S⁺ on the positive eigenspace:
+            //   ∂²_{k,τ_j} L = tr(S⁺ A_{k,τ_j}) − tr(S⁺ S_{τ_j} S⁺ A_k)
             //
             // A_{k,τ_j} = λ_k * (dS_k/dτ_j) — the cross derivative.
             //
-            // No leakage correction needed: (S + δI) is full rank.
-            // Reference: response.md Section 7.
-            //
             // Quadratic trace term:
             let ld_s_quad = Self::trace_product(&sdag_s_tau_rt[j], &sdag_a_k_rt[k]);
-            // Linear trace term: tr((S + δI)⁻¹ A_{k,τ_j}).
+            // Linear trace term: tr(S⁺ A_{k,τ_j}).
             let ld_s_linear = a_k_tau_j_rt[j][k]
                 .as_ref()
                 .map(|a_kt| Self::trace_product(&s_reg_inv_rt, a_kt))

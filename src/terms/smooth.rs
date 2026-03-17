@@ -4693,8 +4693,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &Array1<f64>,
             ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
         >,
-        screening_enter_fn: None,
-        screening_exit_fn: None,
     };
 
     let outer_result = crate::solver::outer_strategy::run_outer(
@@ -8323,8 +8321,6 @@ fn try_exact_joint_spatial_aniso_optimization(
         efs_fn: None::<
             fn(&mut &mut AnisoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
-        screening_enter_fn: None,
-        screening_exit_fn: None,
     };
 
     let result =
@@ -8605,8 +8601,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
         efs_fn: None::<
             fn(&mut &mut IsoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
-        screening_enter_fn: None,
-        screening_exit_fn: None,
     };
 
     let result =
@@ -9743,7 +9737,6 @@ where
     };
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
-    let all_dims_ref = &all_dims;
 
     use crate::solver::outer_strategy::{
         ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
@@ -9775,6 +9768,7 @@ where
         cache.designs().into_iter().cloned().collect()
     }
 
+    let result = {
     let mut obj = ClosureObjective {
         state: &mut state,
         cap: OuterCapability {
@@ -9895,19 +9889,15 @@ where
                 &Array1<f64>,
             ) -> Result<EfsEval, EstimationError>,
         >,
-        screening_enter_fn: None,
-        screening_exit_fn: None,
     };
 
-    let result = crate::solver::outer_strategy::run_outer(
+    crate::solver::outer_strategy::run_outer(
         &mut obj,
         &outer_config,
         "n-block exact-joint spatial",
     )
-    .map_err(|e| e.to_string())?;
-
-    // Drop the ClosureObjective to release the mutable borrow on state.
-    drop(obj);
+    .map_err(|e| e.to_string())?
+    }; // obj dropped here, releasing mutable borrow on state
 
     let theta_star = result.rho;
 

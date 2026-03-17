@@ -543,6 +543,11 @@ pub fn leverages_from_factor(
             }
             Ok(out)
         }
+        DesignMatrix::Operator(op) => {
+            // Materialize and follow the Dense path.
+            let matrix = Arc::new(op.to_dense());
+            leverages_from_factor(factor, &DesignMatrix::Dense(matrix))
+        }
     }
 }
 

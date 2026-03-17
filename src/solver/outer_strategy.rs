@@ -525,9 +525,6 @@ pub struct ClosureObjective<
     /// Optional EFS evaluation closure. When `None`, the default
     /// `OuterObjective::eval_efs` returns an error.
     pub efs_fn: Option<Fefs>,
-    /// Optional screening mode callbacks for cheap seed evaluation.
-    pub screening_enter_fn: Option<Box<dyn FnMut(&mut S, usize)>>,
-    pub screening_exit_fn: Option<Box<dyn FnMut(&mut S)>>,
 }
 
 impl<S, Fc, Fe, Fr, Fefs> OuterObjective for ClosureObjective<S, Fc, Fe, Fr, Fefs>
@@ -560,18 +557,6 @@ where
 
     fn reset(&mut self) {
         if let Some(f) = self.reset_fn.as_mut() {
-            f(&mut self.state);
-        }
-    }
-
-    fn enter_screening_mode(&mut self, max_inner_iterations: usize) {
-        if let Some(f) = self.screening_enter_fn.as_mut() {
-            f(&mut self.state, max_inner_iterations);
-        }
-    }
-
-    fn exit_screening_mode(&mut self) {
-        if let Some(f) = self.screening_exit_fn.as_mut() {
             f(&mut self.state);
         }
     }
@@ -1596,8 +1581,6 @@ mod tests {
                 *st = 42;
             }),
             efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-            screening_enter_fn: None,
-            screening_exit_fn: None,
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);

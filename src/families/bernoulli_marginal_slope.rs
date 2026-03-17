@@ -3083,6 +3083,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         .as_ref()
         .and_then(|p| match &p.block.design {
             DesignMatrix::Dense(x) => Some((**x).clone()),
+            DesignMatrix::Operator(op) => Some(op.to_dense()),
             DesignMatrix::Sparse(_) => None,
         });
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());

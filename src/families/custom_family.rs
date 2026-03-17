@@ -30,6 +30,144 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
 
+/// A penalty matrix that may be stored in Kronecker-factored form.
+///
+/// For tensor-product terms (e.g. time-varying survival covariates), the penalty
+/// has the structure `S = left ⊗ right` (Kronecker product). Keeping this
+/// factored avoids materializing (p_left × p_right)² dense entries and enables
+/// exact log-determinant computation via `log|A ⊗ B| = n_B log|A| + n_A log|B|`.
+///
+/// Dense penalties are stored as-is.  Callers that need a raw `Array2<f64>` can
+/// call `as_dense()` (zero-cost for Dense, lazy-materialized for KroneckerFactored).
+#[derive(Clone)]
+pub enum PenaltyMatrix {
+    Dense(Array2<f64>),
+    KroneckerFactored {
+        left: Array2<f64>,
+        right: Array2<f64>,
+    },
+}
+
+impl PenaltyMatrix {
+    /// Number of rows (= number of columns, since penalties are square).
+    pub fn dim(&self) -> usize {
+        match self {
+            Self::Dense(m) => m.nrows(),
+            Self::KroneckerFactored { left, right } => left.nrows() * right.nrows(),
+        }
+    }
+
+    /// Returns (nrows, ncols) like Array2::dim().
+    pub fn shape(&self) -> (usize, usize) {
+        let d = self.dim();
+        (d, d)
+    }
+
+    /// Materialize the full dense matrix.
+    pub fn to_dense(&self) -> Array2<f64> {
+        match self {
+            Self::Dense(m) => m.clone(),
+            Self::KroneckerFactored { left, right } => {
+                crate::terms::construction::kronecker_product(left, right)
+            }
+        }
+    }
+
+    /// Borrow the inner dense matrix if Dense, otherwise materialize.
+    pub fn as_dense_cow(&self) -> std::borrow::Cow<'_, Array2<f64>> {
+        match self {
+            Self::Dense(m) => std::borrow::Cow::Borrowed(m),
+            Self::KroneckerFactored { .. } => std::borrow::Cow::Owned(self.to_dense()),
+        }
+    }
+
+    /// Returns a reference to the inner matrix if this is a Dense variant.
+    pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
+        match self {
+            Self::Dense(m) => Some(m),
+            Self::KroneckerFactored { .. } => None,
+        }
+    }
+
+    /// Compute S * v using the Kronecker vec trick when factored:
+    ///   (A ⊗ B) vec(V) = vec(B V Aᵀ)
+    /// where V = reshape(v, (p_right, p_left)).
+    pub fn dot(&self, v: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(m) => m.dot(v),
+            Self::KroneckerFactored { left, right } => {
+                let p_left = left.nrows();
+                let p_right = right.nrows();
+                // v is (p_left * p_right,).  Reshape as (p_right, p_left).
+                let v_mat = ndarray::ArrayView2::from_shape(
+                    (p_right, p_left),
+                    v.as_slice().unwrap(),
+                )
+                .unwrap();
+                // result = B V A' then flatten.
+                let bv = right.dot(&v_mat);
+                let bva = bv.dot(&left.t());
+                Array1::from_iter(bva.iter().copied())
+            }
+        }
+    }
+
+    /// Add λ * self to a mutable dense accumulator.
+    pub fn add_scaled_to(&self, lambda: f64, target: &mut Array2<f64>) {
+        match self {
+            Self::Dense(m) => {
+                target.scaled_add(lambda, m);
+            }
+            Self::KroneckerFactored { left, right } => {
+                let p_left = left.nrows();
+                let p_right = right.nrows();
+                for i1 in 0..p_left {
+                    for j1 in 0..p_left {
+                        let a_ij = left[[i1, j1]];
+                        if a_ij == 0.0 {
+                            continue;
+                        }
+                        let scaled_a = lambda * a_ij;
+                        for i2 in 0..p_right {
+                            let row = i1 * p_right + i2;
+                            for j2 in 0..p_right {
+                                let col = j1 * p_right + j2;
+                                target[[row, col]] += scaled_a * right[[i2, j2]];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute the quadratic form β' S β.
+    pub fn quadratic_form(&self, beta: &Array1<f64>) -> f64 {
+        match self {
+            Self::Dense(m) => beta.dot(&m.dot(beta)),
+            Self::KroneckerFactored { left, right } => {
+                let sv = self.dot(beta);
+                beta.dot(&sv)
+            }
+        }
+    }
+
+    /// Access dimensions like an Array2.
+    pub fn nrows(&self) -> usize {
+        self.dim()
+    }
+
+    pub fn ncols(&self) -> usize {
+        self.dim()
+    }
+}
+
+impl From<Array2<f64>> for PenaltyMatrix {
+    fn from(m: Array2<f64>) -> Self {
+        Self::Dense(m)
+    }
+}
+
 /// Static specification for one parameter block in a custom family.
 #[derive(Clone)]
 pub struct ParameterBlockSpec {
@@ -37,7 +175,7 @@ pub struct ParameterBlockSpec {
     pub design: DesignMatrix,
     pub offset: Array1<f64>,
     /// Block-local penalty matrices (all p_block x p_block).
-    pub penalties: Vec<Array2<f64>>,
+    pub penalties: Vec<PenaltyMatrix>,
     /// Structural nullspace dimension of each penalty matrix (same length as `penalties`).
     /// Used by the penalty pseudo-logdet to determine rank without numerical thresholds.
     /// If empty, falls back to eigenvalue-based rank detection.
@@ -7169,8 +7307,6 @@ pub fn fit_custom_family<F: CustomFamily>(
             )
                 -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
         >,
-        screening_enter_fn: None,
-        screening_exit_fn: None,
     };
 
     let outer_result =

@@ -4780,7 +4780,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                             + t * s_a * sum_metric_weights
                             + 2.0 * q * w_a
                     } else {
-                        0.0
+                        2.0 * q * w_a
                     };
                     d2_raw_eta[a][[k, col]] += dlap_deta * z_jc;
 
@@ -4819,7 +4819,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
                         dt1 + dt2 + dt3 + dt4
                     } else {
-                        0.0
+                        4.0 * q * w_a
                     };
                     d2_raw_eta2[a][[k, col]] += d2lap_deta2 * z_jc;
                 }

@@ -2382,6 +2382,7 @@ fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> Des
     // If covariate design is also sparse: even sparser.
     // Use sparse when estimated density < 50%.
     let cov_is_sparse = matches!(cov_design, DesignMatrix::Sparse(_));
+    // Operator variant follows the dense path for sparsity estimation.
     let max_time_nnz_per_row = p_time.min(8); // B-spline degree 3 → 4 nonzero
     let estimated_nnz_per_row = if cov_is_sparse {
         // Conservative estimate
@@ -2434,6 +2435,24 @@ fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> Des
                     }
                 }
             }
+            DesignMatrix::Operator(op) => {
+                let x_cov = op.to_dense();
+                for i in 0..n {
+                    for jc in 0..p_cov {
+                        let cv = x_cov[[i, jc]];
+                        if cv == 0.0 {
+                            continue;
+                        }
+                        for jt in 0..p_time {
+                            let tv = time_basis[[i, jt]];
+                            if tv == 0.0 {
+                                continue;
+                            }
+                            triplets.push(faer::sparse::Triplet::new(i, jc * p_time + jt, cv * tv));
+                        }
+                    }
+                }
+            }
         }
         DesignMatrix::from(
             faer::sparse::SparseColMat::try_new_from_triplets(n, p_tensor, &triplets)
@@ -2465,6 +2484,20 @@ fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> Des
                     for ptr in row_ptr[i]..row_ptr[i + 1] {
                         let jc = col_idx[ptr];
                         let cv = vals[ptr];
+                        for jt in 0..p_time {
+                            out[[i, jc * p_time + jt]] = cv * time_basis[[i, jt]];
+                        }
+                    }
+                }
+            }
+            DesignMatrix::Operator(op) => {
+                let x_cov = op.to_dense();
+                for i in 0..n {
+                    for jc in 0..p_cov {
+                        let cv = x_cov[[i, jc]];
+                        if cv == 0.0 {
+                            continue;
+                        }
                         for jt in 0..p_time {
                             out[[i, jc * p_time + jt]] = cv * time_basis[[i, jt]];
                         }
