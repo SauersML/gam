@@ -64,6 +64,45 @@ use serde::{Deserialize, Serialize};
 // The SE is passed through to PIRLS which integrates over uncertainty
 // in the likelihood, rather than using ad-hoc weight adjustment.
 
+use std::ops::Range;
+
+/// A penalty specification for the public estimate API.
+///
+/// `Block` stores only the active sub-block and its column range, avoiding
+/// the O(p^2) cost of embedding into a full penalty matrix.
+/// `Dense` stores a full `p x p` penalty matrix for callers that already
+/// have one.
+#[derive(Debug, Clone)]
+pub enum PenaltySpec {
+    /// Block-local penalty: `local` is `block_dim x block_dim`,
+    /// applied to columns `col_range` of the coefficient vector.
+    Block {
+        local: Array2<f64>,
+        col_range: Range<usize>,
+    },
+    /// Full dense penalty matrix (`p x p`).
+    Dense(Array2<f64>),
+}
+
+impl PenaltySpec {
+    /// The column range this penalty covers.
+    /// For `Dense`, this is `0..p` where `p = m.ncols()`.
+    pub fn col_range(&self, _p: usize) -> Range<usize> {
+        match self {
+            PenaltySpec::Block { col_range, .. } => col_range.clone(),
+            PenaltySpec::Dense(m) => 0..m.ncols(),
+        }
+    }
+
+    /// Convert from a `BlockwisePenalty` (lossless).
+    pub fn from_blockwise(bp: crate::terms::smooth::BlockwisePenalty) -> Self {
+        PenaltySpec::Block {
+            local: bp.local,
+            col_range: bp.col_range,
+        }
+    }
+}
+
 const KAHAN_SWITCH_ELEMS: usize = 10_000;
 const FD_REL_GAP_THRESHOLD: f64 = 0.2;
 const FD_MIN_BASE_STEP: f64 = 1e-6;
@@ -1247,17 +1286,36 @@ fn ensure_exact_directional_hyper_supported(
     Ok(())
 }
 
-fn validate_full_size_penalties(
-    s_list: &[Array2<f64>],
+fn validate_penalty_specs(
+    specs: &[PenaltySpec],
     p: usize,
     context: &str,
 ) -> Result<(), EstimationError> {
-    for (idx, s) in s_list.iter().enumerate() {
-        let (rows, cols) = s.dim();
-        if rows != p || cols != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "{context}: penalty matrix {idx} must be {p}x{p}, got {rows}x{cols}"
-            )));
+    for (idx, spec) in specs.iter().enumerate() {
+        match spec {
+            PenaltySpec::Block { local, col_range } => {
+                let bd = col_range.len();
+                if local.nrows() != bd || local.ncols() != bd {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context}: block penalty {idx} local matrix must be {bd}x{bd}, got {}x{}",
+                        local.nrows(), local.ncols()
+                    )));
+                }
+                if col_range.end > p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
+                        col_range.start, col_range.end
+                    )));
+                }
+            }
+            PenaltySpec::Dense(m) => {
+                if m.nrows() != p || m.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
+                        m.nrows(), m.ncols()
+                    )));
+                }
+            }
         }
     }
     Ok(())
