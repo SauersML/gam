@@ -3,7 +3,7 @@ use gam::estimate::{
 };
 use gam::inference::model::{FittedFamily, FittedModel, FittedModelPayload, ModelKind};
 use gam::pirls::PirlsStatus;
-use gam::types::{LikelihoodFamily, LinkFunction, SasLinkState};
+use gam::types::{LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization, SasLinkState};
 use ndarray::{Array1, Array2};
 use tempfile::tempdir;
 
@@ -17,7 +17,11 @@ fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
         }],
         log_lambdas: Array1::zeros(0),
         lambdas: Array1::zeros(0),
+        likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+        likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+        log_likelihood_normalization: LogLikelihoodNormalization::Full,
         log_likelihood: 0.0,
+        deviance: 0.0,
         reml_score: 0.0,
         stable_penalty_term: 0.0,
         penalized_objective: 0.0,

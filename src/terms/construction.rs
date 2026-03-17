@@ -1340,8 +1340,14 @@ impl CanonicalPenalty {
         self.col_range.start != 0 || self.col_range.end != self.total_dim
     }
 
-    /// Return the cached local penalty matrix.
+    /// Return a reference to the cached local penalty matrix.
     /// Shape: `block_dim x block_dim`.
+    pub fn local_ref(&self) -> &Array2<f64> {
+        &self.local
+    }
+
+    /// Return an owned copy of the local penalty matrix.
+    /// Prefer `local_ref()` when a reference suffices.
     pub fn local_penalty(&self) -> Array2<f64> {
         self.local.clone()
     }
@@ -1395,13 +1401,12 @@ impl CanonicalPenalty {
     /// Global penalty: `p x p` matrix (embeds into full space). Use sparingly.
     pub fn global_penalty(&self) -> Array2<f64> {
         if !self.is_block_local() {
-            return self.local_penalty();
+            return self.local.clone();
         }
-        let local = self.local_penalty();
         let mut g = Array2::zeros((self.total_dim, self.total_dim));
         let r = &self.col_range;
         g.slice_mut(s![r.start..r.end, r.start..r.end])
-            .assign(&local);
+            .assign(&self.local);
         g
     }
 
@@ -1585,13 +1590,13 @@ pub fn create_balanced_penalty_root_from_canonical(
             if cp.rank() == 0 {
                 continue;
             }
-            let local = cp.local_penalty();
+            let local = cp.local_ref();
             let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
             if frob_norm > 1e-12 {
                 let r = &cp.col_range;
                 s_balanced
                     .slice_mut(s![r.start..r.end, r.start..r.end])
-                    .scaled_add(1.0 / frob_norm, &local);
+                    .scaled_add(1.0 / frob_norm, local);
             }
         }
         let (eigenvalues, eigenvectors) =
@@ -1628,10 +1633,10 @@ pub fn create_balanced_penalty_root_from_canonical(
         let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
 
         for cp in cps {
-            let local = cp.local_penalty();
+            let local = cp.local_ref();
             let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
             if frob_norm > 1e-12 {
-                s_balanced_local.scaled_add(1.0 / frob_norm, &local);
+                s_balanced_local.scaled_add(1.0 / frob_norm, local);
             }
         }
 
@@ -1905,7 +1910,7 @@ pub fn precompute_reparam_invariant_from_canonical(
         if cp.rank() == 0 {
             continue;
         }
-        let local = cp.local_penalty();
+        let local = cp.local_ref();
         let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
         if frob_norm > 1e-12 {
             has_nonzero = true;
@@ -1945,7 +1950,7 @@ pub fn precompute_reparam_invariant_from_canonical(
             if cp.rank() == 0 {
                 continue;
             }
-            let local = cp.local_penalty();
+            let local = cp.local_ref();
             let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
             if frob_norm > 1e-12 {
                 let scale = 1.0 / frob_norm;
@@ -2044,10 +2049,10 @@ pub fn precompute_reparam_invariant_from_canonical(
         let mut block_has_nonzero = false;
         for pref in refs {
             let cp = &penalties[pref.penalty_index];
-            let local = cp.local_penalty();
+            let local = cp.local_ref();
             let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
             if frob_norm > 1e-12 {
-                s_balanced_local.scaled_add(1.0 / frob_norm, &local);
+                s_balanced_local.scaled_add(1.0 / frob_norm, local);
                 block_has_nonzero = true;
             }
         }

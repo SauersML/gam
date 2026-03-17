@@ -3291,6 +3291,8 @@ mod survival_hmc {
                     x_entry,
                     x_exit,
                     x_derivative,
+                    monotonicity_constraint_rows: None,
+                    monotonicity_constraint_offsets: None,
                 },
                 Some(crate::survival::SurvivalBaselineOffsets {
                     eta_entry: off_eta_entry.view(),
@@ -3338,7 +3340,7 @@ mod survival_hmc {
                 .base_model
                 .update_state(&sampler_position)
                 .map_err(|e| format!("Survival state update failed: {:?}", e))?;
-            let logp = -0.5 * (state.deviance + state.penalty_term);
+            let logp = state.log_likelihood - 0.5 * state.penalty_term;
             let grad_beta = state.gradient.mapv(|g| -g);
             let gradz = self.chol_t.dot(&grad_beta);
             Ok((logp, gradz))

@@ -1,6 +1,5 @@
 use super::*;
 use crate::matrix::DenseRightProductView;
-use crate::terms::smooth::{BlockwisePenalty, penalties_to_global, weighted_blockwise_penalty_sum};
 
 // ─── Binomial auxiliary terms for link-parameter ext_coord construction ───
 //

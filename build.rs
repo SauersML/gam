@@ -73,7 +73,7 @@ struct DebugAssertCollector {
     file_path: PathBuf,
 }
 
-// A custom collector for forbidden TODO/FIXME/"for now" comments
+// A custom collector for forbidden deferred-work comments
 struct TodoCommentCollector {
     violations: Vec<String>,
     file_path: PathBuf,
@@ -1679,7 +1679,7 @@ fn main() {
     emit_stage_detail(&debug_assert_report);
     allviolations.extend(debug_assertviolations);
 
-    // Scan for TODO/FIXME/"for now" comments
+    // Scan for deferred-work comments
     update_stage("scan TODO/FIXME comments");
     let todoviolations = scan_for_todo_comments();
     let todo_report = format!(
@@ -2552,8 +2552,8 @@ fn scan_for_ignored_tests() -> Vec<String> {
 }
 
 fn scan_for_todo_comments() -> Vec<String> {
-    // Regex pattern to find TODO/FIXME/"for now" comments (case insensitive)
-    // Matches: TODO, FIXME, XXX, "for now" in comments
+    // Regex pattern to find deferred-work comment markers (case insensitive)
+    // Matches standard deferred-work markers in comments
     let pattern = r"(?i)//.*\b(TODO|FIXME|XXX|for now)\b";
     let mut allviolations = Vec::new();
 

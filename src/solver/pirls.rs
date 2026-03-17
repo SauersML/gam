@@ -1,5 +1,4 @@
 use crate::construction::ReparamResult;
-use std::sync::Arc;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_matmut,
@@ -16,8 +15,8 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    GlmLikelihoodFamily, InverseLink, LinkFunction, MixtureLinkState, RidgePassport, RidgePolicy,
-    SasLinkState,
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, MixtureLinkState,
+    RidgePassport, RidgePolicy, SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
@@ -468,7 +467,7 @@ pub(crate) trait WorkingLikelihood {
     ) -> Result<f64, EstimationError>;
 }
 
-impl WorkingLikelihood for GlmLikelihoodFamily {
+impl WorkingLikelihood for GlmLikelihoodSpec {
     fn irls_update(
         &self,
         y: ArrayView1<f64>,
@@ -480,7 +479,7 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
         integrated: Option<IntegratedWorkingInput<'_>>,
         derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
     ) -> Result<(), EstimationError> {
-        match (self, integrated) {
+        match (self.family, integrated) {
             (
                 GlmLikelihoodFamily::BinomialLogit
                 | GlmLikelihoodFamily::BinomialProbit
@@ -495,7 +494,7 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                     y,
                     eta,
                     integ.se,
-                    *self,
+                    self.family,
                     priorweights,
                     mu,
                     weights,
@@ -551,6 +550,7 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                     y,
                     eta,
                     priorweights,
+                    self.gamma_shape().unwrap_or(1.0),
                     mu,
                     weights,
                     z,
@@ -621,6 +621,7 @@ pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
     pub hessian: crate::linalg::matrix::SymmetricMatrix,
+    pub log_likelihood: f64,
     pub deviance: f64,
     pub penalty_term: f64,
     pub firth: FirthDiagnostics,
@@ -1034,7 +1035,7 @@ struct GamWorkingModel<'a> {
     s_transformed: Array2<f64>,
     e_transformed: Array2<f64>,
     workspace: PirlsWorkspace,
-    likelihood: GlmLikelihoodFamily,
+    likelihood: GlmLikelihoodSpec,
     link_kind: InverseLink,
     firth_bias_reduction: bool,
     lastmu: Array1<f64>,
@@ -1083,7 +1084,7 @@ impl<'a> GamWorkingModel<'a> {
         s_transformed: Array2<f64>,
         e_transformed: Array2<f64>,
         workspace: PirlsWorkspace,
-        likelihood: GlmLikelihoodFamily,
+        likelihood: GlmLikelihoodSpec,
         link_kind: InverseLink,
         firth_bias_reduction: bool,
         qs: Option<Array2<f64>>,
@@ -1232,9 +1233,18 @@ impl<'a> GamWorkingModel<'a> {
                 }
                 out.assign(&x_transformed.matrixvectormultiply(beta));
             }
-            _ => {
-                // Sparse-native and implicit paths: fall back to allocating version.
-                out.assign(&self.transformed_matvec(beta));
+            WorkingCoordinateDesign::TransformedImplicit { qs } => {
+                // Composed: X · (Qs · beta).  Qs·beta is p-dim (cheap),
+                // then write X·(Qs·beta) directly into out when X is dense.
+                let beta_orig = qs.dot(beta.as_ref());
+                if let Some(dense) = self.x_original.as_dense() {
+                    fast_av_into(dense, &beta_orig, out);
+                } else {
+                    out.assign(&self.x_original.apply(&beta_orig));
+                }
+            }
+            WorkingCoordinateDesign::OriginalSparseNative => {
+                out.assign(&self.x_original.matrixvectormultiply(beta));
             }
         }
     }
@@ -1574,8 +1584,21 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                         )?
                     }
                 }
-                WorkingCoordinateDesign::OriginalSparseNative
-                | WorkingCoordinateDesign::TransformedImplicit { .. } => {
+                WorkingCoordinateDesign::TransformedImplicit { qs } => {
+                    // Firth MUST use a consistent basis.  TransformedImplicit
+                    // stores s_transformed in the Qs basis, so we need X in that
+                    // same basis.  Materialize X·Qs on demand (Firth models are
+                    // typically small clinical logistic regressions).
+                    let x_t_dense = fast_ab(&self.x_original.to_dense(), qs);
+                    compute_firth_hat_and_half_logdet(
+                        x_t_dense.view(),
+                        weights.view(),
+                        &mut self.workspace,
+                        Some(&self.s_transformed),
+                    )?
+                }
+                WorkingCoordinateDesign::OriginalSparseNative => {
+                    // s_transformed is in original coords here (qs = I).
                     if self.x_original.as_sparse().is_some() {
                         let csr = self.x_original_csr.as_ref().ok_or_else(|| {
                             EstimationError::InvalidInput(
@@ -1669,6 +1692,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let deviance = self
             .likelihood
             .loglik_deviance(self.y, &mu, self.priorweights)?;
+        let log_likelihood = calculate_loglikelihood_omitting_constants(
+            self.y,
+            &mu,
+            self.likelihood,
+            self.priorweights,
+        );
 
         let mut penalty_term = beta.as_ref().dot(&s_beta);
         if ridge_used > 0.0 {
@@ -1690,6 +1719,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 None => crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian),
             },
 
+            log_likelihood,
             deviance,
             penalty_term,
             firth,
@@ -4069,7 +4099,7 @@ impl PirlsResult {
         y: ArrayView1<'_, f64>,
         priorweights: ArrayView1<'_, f64>,
         offset: ArrayView1<'_, f64>,
-        likelihood: GlmLikelihoodFamily,
+        likelihood: GlmLikelihoodSpec,
         inverse_link: &InverseLink,
     ) -> Result<Self, EstimationError> {
         if !self.cache_compacted {
@@ -4545,12 +4575,15 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
         let gradient_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         let max_abs_eta = finalmu.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        let log_likelihood =
+            calculate_loglikelihood_omitting_constants(y, &finalmu, likelihood, priorweights);
 
         let working_state = WorkingState {
             eta: LinearPredictor::new(finalmu.clone()),
             gradient: gradient.clone(),
             hessian: penalized_hessian.clone(),
 
+            log_likelihood,
             deviance,
             penalty_term,
             firth: FirthDiagnostics::Inactive,
@@ -4818,7 +4851,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
 #[derive(Clone)]
 pub struct PirlsConfig {
-    pub likelihood: GlmLikelihoodFamily,
+    pub likelihood: GlmLikelihoodSpec,
     pub link_kind: InverseLink,
     pub max_iterations: usize,
     pub convergence_tolerance: f64,
@@ -5334,15 +5367,16 @@ fn write_poisson_log_working_state(
     }
 }
 
-/// Working state for Gamma(shape = 1) with a log link.
+/// Working state for Gamma(shape = k) with a log link.
 ///
 /// With `mu = exp(eta)` and `V(mu) = mu^2`, the Fisher weight is the
-/// prior/sample weight itself, independent of `eta`.
+/// prior/sample weight scaled by the fixed Gamma shape, independent of `eta`.
 #[inline]
 fn write_gamma_log_working_state(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
+    shape: f64,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
@@ -5353,7 +5387,7 @@ fn write_gamma_log_working_state(
         let eta_i = eta[i].clamp(-700.0, 700.0);
         let mu_i = eta_i.exp().max(MIN_MU);
         mu[i] = mu_i;
-        weights[i] = priorweights[i].max(0.0);
+        weights[i] = priorweights[i].max(0.0) * shape;
         z[i] = eta_i + (y[i] - mu_i) / mu_i;
         if let Some(derivs) = derivatives.as_mut() {
             derivs.dmu_deta[i] = mu_i;
@@ -5495,13 +5529,13 @@ pub fn update_glmvectors(
 pub fn update_glmvectors_by_family(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
-    family: GlmLikelihoodFamily,
+    likelihood: GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
-    family.irls_update(y, eta, priorweights, mu, weights, z, None, None)
+    likelihood.irls_update(y, eta, priorweights, mu, weights, z, None, None)
 }
 
 fn integrated_inverse_link_from_family(
@@ -5748,7 +5782,7 @@ pub fn update_glmvectors_integrated_by_family(
 ///   In that regime analytic and central-FD gradients can diverge because FD may
 ///   straddle a kink.
 fn computeworkingweight_derivatives_from_eta(
-    likelihood: GlmLikelihoodFamily,
+    likelihood: GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -5768,7 +5802,7 @@ fn computeworkingweight_derivatives_from_eta(
     let mut dmu_deta = Array1::<f64>::zeros(n);
     let mut d2mu_deta2 = Array1::<f64>::zeros(n);
     let mut d3mu_deta3 = Array1::<f64>::zeros(n);
-    match likelihood {
+    match likelihood.family {
         GlmLikelihoodFamily::GaussianIdentity => {
             dmu_deta.fill(1.0);
         }
@@ -5944,16 +5978,13 @@ const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
 const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
 
 #[inline]
-fn fixed_glm_dispersion(likelihood: GlmLikelihoodFamily) -> f64 {
-    match likelihood {
-        GlmLikelihoodFamily::GammaLog => 1.0,
-        _ => 1.0,
-    }
+fn fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
+    likelihood.fixed_phi().unwrap_or(1.0)
 }
 
 #[inline]
-fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodFamily) -> WeightFamily {
-    match likelihood {
+fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodSpec) -> WeightFamily {
+    match likelihood.family {
         GlmLikelihoodFamily::GaussianIdentity => WeightFamily::Gaussian,
         GlmLikelihoodFamily::PoissonLog => WeightFamily::Poisson,
         GlmLikelihoodFamily::GammaLog => WeightFamily::Gamma,
@@ -5984,11 +6015,11 @@ fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
 
 #[inline]
 fn supports_observed_hessian_curvature_for_likelihood(
-    likelihood: GlmLikelihoodFamily,
+    likelihood: GlmLikelihoodSpec,
     _: &InverseLink,
 ) -> bool {
     matches!(
-        likelihood,
+        likelihood.family,
         GlmLikelihoodFamily::GammaLog
             | GlmLikelihoodFamily::BinomialProbit
             | GlmLikelihoodFamily::BinomialCLogLog
@@ -6031,7 +6062,7 @@ fn observed_hessian_weight_floor(fisher_weight: f64) -> f64 {
 /// response.md Section 3 for the mathematical justification of why observed
 /// (not Fisher) information is required.
 fn compute_observed_hessian_curvature_arrays(
-    likelihood: GlmLikelihoodFamily,
+    likelihood: GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     y: ArrayView1<'_, f64>,
@@ -6599,11 +6630,11 @@ pub fn directionalworking_curvature_from_c_array(
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
-    likelihood: GlmLikelihoodFamily,
+    likelihood: GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
     const EPS: f64 = 1e-8;
-    match likelihood {
+    match likelihood.family {
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
         | GlmLikelihoodFamily::BinomialCLogLog
@@ -6656,6 +6687,7 @@ pub fn calculate_deviance(
             2.0 * total
         }
         GlmLikelihoodFamily::GammaLog => {
+            let shape = likelihood.gamma_shape().unwrap_or(1.0);
             let total =
                 ndarray::Zip::from(y)
                     .and(mu)
@@ -6664,7 +6696,7 @@ pub fn calculate_deviance(
                         let yi_c = yi.max(EPS);
                         let mui_c = mui.max(EPS);
                         let ratio = yi_c / mui_c;
-                        acc + wi * (ratio - 1.0 - ratio.ln())
+                        acc + wi * shape * (ratio - 1.0 - ratio.ln())
                     });
             2.0 * total
         }
@@ -6675,11 +6707,11 @@ pub fn calculate_deviance(
 pub(crate) fn calculate_loglikelihood_omitting_constants(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
-    likelihood: GlmLikelihoodFamily,
+    likelihood: GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
     const EPS: f64 = 1e-8;
-    match likelihood {
+    match likelihood.family {
         GlmLikelihoodFamily::GaussianIdentity => ndarray::Zip::from(y)
             .and(mu)
             .and(priorweights)
@@ -6712,7 +6744,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
             .and(priorweights)
             .fold(0.0, |acc, &yi, &mui, &wi| {
                 let mui_c = mui.max(EPS);
-                acc + wi * (-mui_c.ln() - yi / mui_c)
+                acc + wi * likelihood.gamma_shape().unwrap_or(1.0) * (-mui_c.ln() - yi / mui_c)
             }),
     }
 }
@@ -7050,7 +7082,8 @@ mod tests {
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
     use crate::types::{
-        Coefficients, GlmLikelihoodFamily, InverseLink, LinkFunction, LogSmoothingParamsView,
+        Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction,
+        LogSmoothingParamsView,
     };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
@@ -7355,7 +7388,7 @@ mod tests {
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let rs = vec![array![[1.0]]];
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodFamily::BinomialLogit,
+            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -7447,7 +7480,12 @@ mod tests {
         let y = array![2.0, 5.0];
         let mu = array![1.0, 4.0];
         let w = array![1.5, 0.75];
-        let dev = calculate_deviance(y.view(), &mu, GlmLikelihoodFamily::GammaLog, w.view());
+        let dev = calculate_deviance(
+            y.view(),
+            &mu,
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GammaLog),
+            w.view(),
+        );
         let expected = 2.0
             * (1.5 * (2.0_f64 / 1.0 - 1.0 - (2.0_f64 / 1.0).ln())
                 + 0.75 * (5.0_f64 / 4.0 - 1.0 - (5.0_f64 / 4.0).ln()));
@@ -7466,7 +7504,7 @@ mod tests {
         let fisher = w.clone();
 
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
-            GlmLikelihoodFamily::GammaLog,
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GammaLog),
             &InverseLink::Standard(LinkFunction::Log),
             &eta,
             y.view(),
@@ -7496,7 +7534,7 @@ mod tests {
         let rho = array![0.0];
         let rs = vec![array![[1.0]]];
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodFamily::PoissonLog,
+            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::PoissonLog),
             link_kind: InverseLink::Standard(LinkFunction::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -7534,7 +7572,7 @@ mod tests {
                 y.view(),
                 w.view(),
                 offset.view(),
-                GlmLikelihoodFamily::PoissonLog,
+                GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::PoissonLog),
                 &InverseLink::Standard(LinkFunction::Log),
             )
             .expect("rehydration should succeed");
@@ -7861,7 +7899,7 @@ mod root_cause_tests {
         // Penalty on the second coefficient only (leave intercept unpenalized).
         let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodFamily::GaussianIdentity,
+            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
             link_kind: InverseLink::Standard(LinkFunction::Identity),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -7923,7 +7961,7 @@ mod root_cause_tests {
         let rho = array![0.0];
         let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodFamily::BinomialLogit,
+            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -8005,7 +8043,7 @@ mod root_cause_tests {
                 array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
             ];
             let config = PirlsConfig {
-                likelihood: GlmLikelihoodFamily::BinomialLogit,
+                likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
                 link_kind: InverseLink::Standard(LinkFunction::Logit),
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,

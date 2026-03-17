@@ -42,6 +42,12 @@ pub struct SurvivalEngineInputs<'a> {
     pub x_entry: ArrayView2<'a, f64>,
     pub x_exit: ArrayView2<'a, f64>,
     pub x_derivative: ArrayView2<'a, f64>,
+    /// Optional global monotonicity collocation rows for the full coefficient vector.
+    /// Non-structural survival models should pass these explicitly instead of
+    /// relying on observed derivative rows.
+    pub monotonicity_constraint_rows: Option<ArrayView2<'a, f64>>,
+    /// Baseline offsets corresponding to `monotonicity_constraint_rows`.
+    pub monotonicity_constraint_offsets: Option<ArrayView1<'a, f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +61,12 @@ pub struct SurvivalTimeCovarInputs<'a> {
     pub time_exit: ArrayView2<'a, f64>,
     pub time_derivative: ArrayView2<'a, f64>,
     pub covariates: ArrayView2<'a, f64>,
+    /// Optional global monotonicity collocation rows for the full coefficient vector.
+    /// Non-structural survival models should pass these explicitly instead of
+    /// relying on observed derivative rows.
+    pub monotonicity_constraint_rows: Option<ArrayView2<'a, f64>>,
+    /// Baseline offsets corresponding to `monotonicity_constraint_rows`.
+    pub monotonicity_constraint_offsets: Option<ArrayView1<'a, f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -405,35 +417,6 @@ impl WorkingModelSurvival {
         self.derivative_guard()
     }
 
-    pub fn set_monotonicity_constraint_rows(
-        &mut self,
-        rows: Array2<f64>,
-        offsets: Array1<f64>,
-    ) -> Result<(), EstimationError> {
-        if rows.ncols() != self.coefficient_dim() {
-            return Err(EstimationError::InvalidInput(format!(
-                "survival monotonicity constraint width mismatch: got {}, expected {}",
-                rows.ncols(),
-                self.coefficient_dim()
-            )));
-        }
-        if rows.nrows() != offsets.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "survival monotonicity constraint row mismatch: rows={} offsets={}",
-                rows.nrows(),
-                offsets.len()
-            )));
-        }
-        if rows.iter().any(|v| !v.is_finite()) || offsets.iter().any(|v| !v.is_finite()) {
-            return Err(EstimationError::InvalidInput(
-                "survival monotonicity constraints must be finite".to_string(),
-            ));
-        }
-        self.monotonicity_constraint_rows = Some(rows);
-        self.monotonicity_constraint_offsets = Some(offsets);
-        Ok(())
-    }
-
     fn coefficient_dim(&self) -> usize {
         self.design.p_total()
     }
@@ -725,34 +708,33 @@ impl WorkingModelSurvival {
                 Some(compress_positive_collinear_constraints(&a, &b))
             };
         }
-        let mut derivative_row = vec![0.0_f64; p];
-        let activerows: Vec<usize> = (0..self.nrows())
-            .filter(|&i| {
-                self.fill_derivative_row(i, &mut derivative_row);
-                self.sampleweight[i] > 0.0
-                    && derivative_row
-                        .iter()
-                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-                        > DERIVATIVE_ROW_NORM_TOL
-            })
-            .collect();
-        if activerows.is_empty() {
-            return None;
-        }
-        let mut a = Array2::<f64>::zeros((activerows.len(), p));
-        let mut b = Array1::<f64>::zeros(activerows.len());
-        for (r, &i) in activerows.iter().enumerate() {
-            self.fill_derivative_row(i, &mut derivative_row);
-            for j in 0..p {
-                a[[r, j]] = derivative_row[j];
-            }
-            b[r] = self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
-        }
         if self.structurally_monotonic {
-            Some(LinearInequalityConstraints { a, b })
-        } else {
-            Some(compress_positive_collinear_constraints(&a, &b))
+            let mut derivative_row = vec![0.0_f64; p];
+            let activerows: Vec<usize> = (0..self.nrows())
+                .filter(|&i| {
+                    self.fill_derivative_row(i, &mut derivative_row);
+                    self.sampleweight[i] > 0.0
+                        && derivative_row
+                            .iter()
+                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                            > DERIVATIVE_ROW_NORM_TOL
+                })
+                .collect();
+            if activerows.is_empty() {
+                return None;
+            }
+            let mut a = Array2::<f64>::zeros((activerows.len(), p));
+            let mut b = Array1::<f64>::zeros(activerows.len());
+            for (r, &i) in activerows.iter().enumerate() {
+                self.fill_derivative_row(i, &mut derivative_row);
+                for j in 0..p {
+                    a[[r, j]] = derivative_row[j];
+                }
+                b[r] = self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
+            }
+            return Some(LinearInequalityConstraints { a, b });
         }
+        None
     }
 
     pub fn from_engine_inputs(
@@ -811,6 +793,27 @@ impl WorkingModelSurvival {
         Ok(())
     }
 
+    fn validate_monotonicity_constraints(
+        rows: Option<ArrayView2<'_, f64>>,
+        offsets: Option<ArrayView1<'_, f64>>,
+        coefficient_dim: usize,
+    ) -> Result<(Option<Array2<f64>>, Option<Array1<f64>>), SurvivalError> {
+        match (rows, offsets) {
+            (None, None) => Ok((None, None)),
+            (Some(rows), Some(offsets)) => {
+                if rows.ncols() != coefficient_dim
+                    || rows.nrows() != offsets.len()
+                    || rows.iter().any(|v| !v.is_finite())
+                    || offsets.iter().any(|v| !v.is_finite())
+                {
+                    return Err(SurvivalError::DimensionMismatch);
+                }
+                Ok((Some(rows.to_owned()), Some(offsets.to_owned())))
+            }
+            _ => Err(SurvivalError::DimensionMismatch),
+        }
+    }
+
     fn finish_construction(
         age_entry: ArrayView1<f64>,
         age_exit: ArrayView1<f64>,
@@ -822,6 +825,8 @@ impl WorkingModelSurvival {
         offset_derivative_exit: Array1<f64>,
         penalties: PenaltyBlocks,
         monotonicity: MonotonicityPenalty,
+        monotonicity_constraint_rows: Option<Array2<f64>>,
+        monotonicity_constraint_offsets: Option<Array1<f64>>,
     ) -> Self {
         let n = age_entry.len();
         Self {
@@ -838,8 +843,8 @@ impl WorkingModelSurvival {
             monotonicity,
             structurally_monotonic: false,
             structural_time_columns: 0,
-            monotonicity_constraint_rows: None,
-            monotonicity_constraint_offsets: None,
+            monotonicity_constraint_rows,
+            monotonicity_constraint_offsets,
             workspace: std::sync::Mutex::new(SurvivalWorkspace::new(n)),
         }
     }
@@ -884,6 +889,12 @@ impl WorkingModelSurvival {
         }
         let (offset_eta_entry, offset_eta_exit, offset_derivative_exit) =
             Self::validate_offsets(offsets, n)?;
+        let (monotonicity_constraint_rows, monotonicity_constraint_offsets) =
+            Self::validate_monotonicity_constraints(
+                inputs.monotonicity_constraint_rows,
+                inputs.monotonicity_constraint_offsets,
+                p,
+            )?;
 
         Ok(Self::finish_construction(
             inputs.age_entry,
@@ -900,6 +911,8 @@ impl WorkingModelSurvival {
             offset_derivative_exit,
             penalties,
             monotonicity,
+            monotonicity_constraint_rows,
+            monotonicity_constraint_offsets,
         ))
     }
 
@@ -947,6 +960,12 @@ impl WorkingModelSurvival {
         }
         let (offset_eta_entry, offset_eta_exit, offset_derivative_exit) =
             Self::validate_offsets(offsets, n)?;
+        let (monotonicity_constraint_rows, monotonicity_constraint_offsets) =
+            Self::validate_monotonicity_constraints(
+                inputs.monotonicity_constraint_rows,
+                inputs.monotonicity_constraint_offsets,
+                p,
+            )?;
 
         Ok(Self::finish_construction(
             inputs.age_entry,
@@ -964,6 +983,8 @@ impl WorkingModelSurvival {
             offset_derivative_exit,
             penalties,
             monotonicity,
+            monotonicity_constraint_rows,
+            monotonicity_constraint_offsets,
         ))
     }
 
@@ -1179,12 +1200,14 @@ impl WorkingModelSurvival {
         // which correspond to 0.5 * ridge * ||beta||^2.
         let ridge_penalty = 0.5 * ridge_used * beta.dot(beta);
 
+        let log_likelihood = -nll;
         let deviance = 2.0 * nll;
 
         Ok(WorkingState {
             eta: LinearPredictor::new(eta_exit),
             gradient: totalgrad,
             hessian: crate::linalg::matrix::SymmetricMatrix::Dense(h),
+            log_likelihood,
             deviance,
             penalty_term: penalty_dev + ridge_penalty,
             firth: crate::pirls::FirthDiagnostics::Inactive,
@@ -1412,9 +1435,6 @@ impl WorkingModelSurvival {
             }
         };
 
-        // --- Sign conventions ---
-        // state.deviance = 2 * NLL => log_likelihood = -NLL = -deviance/2.
-        let log_likelihood = -0.5 * state.deviance;
         // The unified evaluator computes: -log_lik + 0.5 * penalty_quadratic.
         // The existing code computes:     0.5 * deviance + penalty_term.
         // Matching: penalty_quadratic = 2 * penalty_term.
@@ -1427,7 +1447,7 @@ impl WorkingModelSurvival {
         let provider = SurvivalDerivProvider::new(self.clone(), beta.clone());
 
         let builder = InnerSolutionBuilder::new(
-            log_likelihood,
+            state.log_likelihood,
             penalty_quadratic,
             beta.clone(),
             n_observations,
@@ -1743,6 +1763,8 @@ mod tests {
             x_entry: x_entry.view(),
             x_exit: x_exit.view(),
             x_derivative: x_derivative.view(),
+            monotonicity_constraint_rows: None,
+            monotonicity_constraint_offsets: None,
         }
     }
 
@@ -1914,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn monotonicity_constraints_cover_allweightedrows() {
+    fn nonstructural_models_require_explicit_monotonicity_collocation() {
         let age_entry = array![1.0_f64, 1.5_f64];
         let age_exit = array![2.0_f64, 2.5_f64];
         let event_target = array![0u8, 0u8];
@@ -1941,19 +1963,10 @@ mod tests {
         )
         .expect("construct censored survival model");
 
-        let constraints = model
-            .monotonicity_linear_constraints()
-            .expect("all weighted rows should contribute monotonicity constraints");
-        assert_eq!(constraints.a.nrows(), 1);
-        assert!(constraints.b[0].abs() < 1e-18);
-        for i in 0..x_derivative.nrows() {
-            let row = x_derivative.row(i);
-            let original_rhs = model.derivative_guard();
-            let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-            let normalized_rhs = original_rhs / scale;
-            let lhs = constraints.a.row(0).dot(&array![1.0]);
-            assert!(lhs >= normalized_rhs - 1e-18);
-        }
+        assert!(
+            model.monotonicity_linear_constraints().is_none(),
+            "non-structural survival models must not fabricate rowwise monotonicity constraints"
+        );
     }
 
     #[test]
@@ -2903,17 +2916,22 @@ mod tests {
         let penalties = PenaltyBlocks::new(Vec::new());
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
 
+        let collocation_offsets = Array1::zeros(x_derivative.nrows());
+        let mut inputs = survival_inputs(
+            &age_entry,
+            &age_exit,
+            &event_target,
+            &event_competing,
+            &sampleweight,
+            &x_entry,
+            &x_exit,
+            &x_derivative,
+        );
+        inputs.monotonicity_constraint_rows = Some(x_derivative.view());
+        inputs.monotonicity_constraint_offsets = Some(collocation_offsets.view());
+
         let model = survival_model(
-            survival_inputs(
-                &age_entry,
-                &age_exit,
-                &event_target,
-                &event_competing,
-                &sampleweight,
-                &x_entry,
-                &x_exit,
-                &x_derivative,
-            ),
+            inputs,
             penalties,
             mono,
             SurvivalSpec::Net,
@@ -2939,17 +2957,22 @@ mod tests {
         let x_exit = x_entry.clone();
         let x_derivative = array![[0.0, 0.0], [0.0, 1e-16], [0.0, 0.25]];
 
+        let collocation_offsets = Array1::zeros(x_derivative.nrows());
+        let mut inputs = survival_inputs(
+            &age_entry,
+            &age_exit,
+            &event_target,
+            &event_competing,
+            &sampleweight,
+            &x_entry,
+            &x_exit,
+            &x_derivative,
+        );
+        inputs.monotonicity_constraint_rows = Some(x_derivative.view());
+        inputs.monotonicity_constraint_offsets = Some(collocation_offsets.view());
+
         let model = survival_model(
-            survival_inputs(
-                &age_entry,
-                &age_exit,
-                &event_target,
-                &event_competing,
-                &sampleweight,
-                &x_entry,
-                &x_exit,
-                &x_derivative,
-            ),
+            inputs,
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
@@ -3009,17 +3032,22 @@ mod tests {
         let x_exit = array![[0.0], [0.0]];
         let x_derivative = array![[0.5], [0.25]];
 
+        let collocation_offsets = Array1::zeros(x_derivative.nrows());
+        let mut inputs = survival_inputs(
+            &age_entry,
+            &age_exit,
+            &event_target,
+            &event_competing,
+            &sampleweight,
+            &x_entry,
+            &x_exit,
+            &x_derivative,
+        );
+        inputs.monotonicity_constraint_rows = Some(x_derivative.view());
+        inputs.monotonicity_constraint_offsets = Some(collocation_offsets.view());
+
         let model = survival_model(
-            survival_inputs(
-                &age_entry,
-                &age_exit,
-                &event_target,
-                &event_competing,
-                &sampleweight,
-                &x_entry,
-                &x_exit,
-                &x_derivative,
-            ),
+            inputs,
             PenaltyBlocks::new(Vec::new()),
             MonotonicityPenalty { tolerance: 1e-8 },
             SurvivalSpec::Net,

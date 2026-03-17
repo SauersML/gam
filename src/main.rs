@@ -34,7 +34,7 @@ use gam::families::scale_design::{
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
     ParameterBlockInput, WiggleBlockConfig, buildwiggle_block_input_from_knots,
-    buildwiggle_block_input_from_seed,
+    buildwiggle_block_input_from_seed, monotone_wiggle_basis_with_derivative_order,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
@@ -81,8 +81,8 @@ use gam::survival_location_scale::{
 use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
-    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
-    SasLinkSpec, SasLinkState,
+    InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
+    LogLikelihoodNormalization, MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
@@ -4283,24 +4283,8 @@ fn build_survival_timewiggle_derivative_design(
     knots: &Array1<f64>,
     degree: usize,
 ) -> Result<Array2<f64>, String> {
-    let (basis_derivative, _) = create_basis::<Dense>(
-        eta_exit.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::first_derivative(),
-    )
-    .map_err(|e| format!("failed to build baseline-timewiggle derivative basis: {e}"))?;
-    let full_derivative = basis_derivative.as_ref();
-    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
-        .map_err(|e| format!("failed to build baseline-timewiggle constraint transform: {e}"))?;
-    if full_derivative.ncols() != z.nrows() {
-        return Err(format!(
-            "baseline-timewiggle derivative basis/constraint mismatch: basis has {} columns but transform has {} rows",
-            full_derivative.ncols(),
-            z.nrows()
-        ));
-    }
-    let mut design_derivative_exit = full_derivative.dot(&z);
+    let mut design_derivative_exit =
+        monotone_wiggle_basis_with_derivative_order(eta_exit.view(), knots, degree, 1)?;
     for i in 0..design_derivative_exit.nrows() {
         let chain = derivative_exit[i];
         for j in 0..design_derivative_exit.ncols() {
@@ -4568,39 +4552,17 @@ fn saved_linkwiggle_basis(
 ) -> Result<Option<Array2<f64>>, String> {
     match model.saved_link_wiggle()? {
         None => Ok(None),
-        Some(runtime) => match basis_options.derivative_order {
-            0 => Ok(Some(runtime.design(q0)?)),
-            1 => {
-                runtime
-                    .derivative_q0(q0)
-                    .map(|_| ())?;
-                let knot_arr = Array1::from_vec(runtime.knots.clone());
-                let (basis, _) = create_basis::<Dense>(
-                    q0.view(),
-                    KnotSource::Provided(knot_arr.view()),
-                    runtime.degree,
-                    basis_options,
-                )
-                .map_err(|e| format!("failed to evaluate saved link-wiggle basis: {e}"))?;
-                let full = basis.as_ref().clone();
-                let (z, _) = compute_geometric_constraint_transform(&knot_arr, runtime.degree, 2)
-                    .map_err(|e| {
-                    format!("failed to build saved link-wiggle constraint transform: {e}")
-                })?;
-                if full.ncols() != z.nrows() {
-                    return Err(format!(
-                        "saved link-wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
-                        full.ncols(),
-                        z.nrows()
-                    ));
-                }
-                Ok(Some(full.dot(&z)))
-            }
-            _ => Err(format!(
-                "unsupported saved link-wiggle derivative order {}",
-                basis_options.derivative_order
-            )),
-        },
+        Some(runtime) => {
+            runtime.derivative_q0(q0).map(|_| ())?;
+            let knot_arr = Array1::from_vec(runtime.knots.clone());
+            let basis = monotone_wiggle_basis_with_derivative_order(
+                q0.view(),
+                &knot_arr,
+                runtime.degree,
+                basis_options.derivative_order,
+            )?;
+            Ok(Some(basis))
+        }
     }
 }
 
@@ -4928,12 +4890,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     parse_survival_distribution(&effective_survival_distribution)?;
     let survival_inverse_link = parse_survival_inverse_link(&effective_args)?;
-    if learn_linkwiggle && !inverse_link_supports_joint_wiggle(&survival_inverse_link) {
-        return Err(
-            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
-                .to_string(),
-        );
-    }
     if likelihood_mode == SurvivalLikelihoodMode::Weibull {
         let baseline_args_requested = !effective_args
             .baseline_target
@@ -5054,9 +5010,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_args.ridge_lambda,
         )),
     )?;
-    let time_monotonicity_collocation = if learn_timewiggle
-        || !survival_basis_supports_structural_monotonicity(&time_build.basisname)
-    {
+    let time_monotonicity_collocation =
+        if !survival_basis_supports_structural_monotonicity(&time_build.basisname) {
         Some(build_survival_time_monotonicity_collocation(
             &age_entry,
             &age_exit,
@@ -5070,7 +5025,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         None
     };
     progress.advance_workflow(2);
-    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         require_structural_survival_time_basis(&time_build.basisname, "survival fitting")?;
     }
     let mut time_design_entry = time_build.x_entry_time.clone();
@@ -5158,11 +5113,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     constraint_derivative_offset: time_monotonicity_collocation
                         .as_ref()
                         .map(|(_, offsets)| offsets.clone()),
-                    penalties: time_penalties.clone(),
-                    nullspace_dims: time_nullspace_dims.clone(),
-                    initial_log_lambdas: time_initial_log_lambdas.clone(),
-                    initial_beta: None,
-                },
+                penalties: time_penalties.clone(),
+                nullspace_dims: time_nullspace_dims.clone(),
+                initial_log_lambdas: time_initial_log_lambdas.clone(),
+                initial_beta: Some(Array1::zeros(time_design_exit.ncols())),
+            },
                 thresholdspec: termspec.clone(),
                 log_sigmaspec: log_sigmaspec.clone(),
                 threshold_template: threshold_template.clone(),
@@ -5389,7 +5344,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 penalties: time_penalties.clone(),
                 nullspace_dims: time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
-                initial_beta: None,
+                initial_beta: Some(Array1::zeros(time_design_exit.ncols())),
             },
             logslopespec,
         };
@@ -5469,6 +5424,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let penalties = PenaltyBlocks::new(penalty_blocks.clone());
 
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
+    let full_time_monotonicity_collocation = time_monotonicity_collocation
+        .as_ref()
+        .map(|(time_rows, offsets)| {
+            let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
+            full_rows
+                .slice_mut(s![.., 0..time_rows.ncols()])
+                .assign(time_rows);
+            (full_rows, offsets.clone())
+        });
 
     let dense_cov_design = cov_design.design.to_dense();
     let mut model = gam::families::royston_parmar::working_model_from_time_covariateshared(
@@ -5485,22 +5449,19 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             time_exit: time_design_exit.view(),
             time_derivative: time_design_derivative_exit.view(),
             covariates: dense_cov_design.view(),
+            monotonicity_constraint_rows: full_time_monotonicity_collocation
+                .as_ref()
+                .map(|(rows, _)| rows.view()),
+            monotonicity_constraint_offsets: full_time_monotonicity_collocation
+                .as_ref()
+                .map(|(_, offsets)| offsets.view()),
             eta_offset_entry: Some(eta_offset_entry.view()),
             eta_offset_exit: Some(eta_offset_exit.view()),
             derivative_offset_exit: Some(derivative_offset_exit.view()),
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
-    if let Some((time_rows, offsets)) = time_monotonicity_collocation.as_ref() {
-        let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
-        full_rows
-            .slice_mut(s![.., 0..time_rows.ncols()])
-            .assign(time_rows);
-        model
-            .set_monotonicity_constraint_rows(full_rows, offsets.clone())
-            .map_err(|e| format!("failed to install survival monotonicity collocation: {e}"))?;
-    }
-    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         model
             .set_structural_monotonicity(true, p_time_total)
             .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
@@ -5512,7 +5473,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     // O(n) derivative constraints (which explode at biobank scale via the KKT
     // augmented system), we simply enforce non-negativity on the time coefficients.
     let structural_lower_bounds = if likelihood_mode != SurvivalLikelihoodMode::Weibull
-        && !learn_timewiggle
         && p_time_total > 0
     {
         let mut lb = Array1::from_elem(p, f64::NEG_INFINITY);
@@ -5552,7 +5512,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         );
     };
     let (summary, beta, state, constraint_mode, surv_model) =
-        if learn_timewiggle || likelihood_mode == SurvivalLikelihoodMode::Weibull {
+        if likelihood_mode == SurvivalLikelihoodMode::Weibull {
             let mut plain_model = model;
             let summary = gam::pirls::runworking_model_pirls(
                 &mut plain_model,
@@ -6011,9 +5971,8 @@ fn run_sample_survival(
     let saved_timewiggle_knots = saved_timewiggle_runtime
         .as_ref()
         .map(|wiggle| Array1::from_vec(wiggle.knots.clone()));
-    let time_monotonicity_collocation = if saved_timewiggle_runtime.is_some()
-        || !survival_basis_supports_structural_monotonicity(&time_build.basisname)
-    {
+    let time_monotonicity_collocation =
+        if !survival_basis_supports_structural_monotonicity(&time_build.basisname) {
         Some(build_survival_time_monotonicity_collocation(
             &age_entry,
             &age_exit,
@@ -6154,6 +6113,15 @@ fn run_sample_survival(
         other => return Err(format!("unsupported saved survival spec '{other}'")),
     };
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
+    let full_time_monotonicity_collocation = time_monotonicity_collocation
+        .as_ref()
+        .map(|(time_rows, offsets)| {
+            let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
+            full_rows
+                .slice_mut(s![.., 0..time_rows.ncols()])
+                .assign(time_rows);
+            (full_rows, offsets.clone())
+        });
     let mut model_surv = gam::families::royston_parmar::working_model_from_flattened(
         penalties.clone(),
         monotonicity,
@@ -6167,26 +6135,21 @@ fn run_sample_survival(
             x_entry: x_entry.view(),
             x_exit: x_exit.view(),
             x_derivative: x_derivative.view(),
+            monotonicity_constraint_rows: full_time_monotonicity_collocation
+                .as_ref()
+                .map(|(rows, _)| rows.view()),
+            monotonicity_constraint_offsets: full_time_monotonicity_collocation
+                .as_ref()
+                .map(|(_, offsets)| offsets.view()),
             eta_offset_entry: Some(eta_offset_entry.view()),
             eta_offset_exit: Some(eta_offset_exit.view()),
             derivative_offset_exit: Some(derivative_offset_exit.view()),
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
-    if let Some((time_rows, offsets)) = time_monotonicity_collocation.as_ref() {
-        let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
-        full_rows
-            .slice_mut(s![.., 0..time_rows.ncols()])
-            .assign(time_rows);
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull {
         model_surv
-            .set_monotonicity_constraint_rows(full_rows, offsets.clone())
-            .map_err(|e| format!("failed to install survival monotonicity collocation: {e}"))?;
-    }
-    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
-        && !baseline_timewiggle_is_present(model)
-    {
-        model_surv
-            .set_structural_monotonicity(true, p_time)
+            .set_structural_monotonicity(true, p_time + p_timewiggle)
             .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
     }
     let beta0 = fit_saved.beta.clone();
@@ -6211,9 +6174,8 @@ fn run_sample_survival(
         penalties,
         monotonicity,
         survivalspec,
-        saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
-            && !baseline_timewiggle_is_present(model),
-        p_time,
+        saved_likelihood_mode != SurvivalLikelihoodMode::Weibull,
+        p_time + p_timewiggle,
         beta0.view(),
         hessian.view(),
         cfg,
@@ -6419,20 +6381,7 @@ fn run_sample_standard_link_wiggle(
     let wiggle_lambdas = wiggle_lambdas_owned.view();
     let degree = wiggle_runtime.degree;
 
-    // Build wiggle penalty matrices (constrained difference penalties)
-    let knot_arr = Array1::from_vec(wiggle_runtime.knots.clone());
-    let (z_transform, _) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
-        .map_err(|e| format!("wiggle constraint transform failed: {e}"))?;
-    let p_constrained = z_transform.ncols();
-    if p_constrained != p_wiggle {
-        return Err(format!(
-            "wiggle constraint dimension mismatch: transform gives {} but wiggle runtime has {} coefficients",
-            p_constrained, p_wiggle,
-        ));
-    }
-
-    // Build difference penalty matrices in the constrained basis
-    let n_raw = knot_arr.len().saturating_sub(degree + 1);
+    // Build wiggle penalty matrices in the structural monotone basis.
     let mut wiggle_penalties = Vec::new();
     let default_orders = [2usize]; // standard 2nd-order difference penalty
     let n_wiggle_lambdas = wiggle_lambdas.len();
@@ -6442,14 +6391,12 @@ fn run_sample_standard_link_wiggle(
         } else {
             k + 1
         };
-        if order >= n_raw {
+        if order >= p_wiggle {
             continue;
         }
-        let raw_penalty = create_difference_penalty_matrix(n_raw, order, None)
+        let penalty = create_difference_penalty_matrix(p_wiggle, order, None)
             .map_err(|e| format!("wiggle difference penalty failed: {e}"))?;
-        // Transform to constrained space: Z^T S Z
-        let constrained_penalty = z_transform.t().dot(&raw_penalty).dot(&z_transform);
-        wiggle_penalties.push(constrained_penalty);
+        wiggle_penalties.push(penalty);
     }
 
     // If we have more lambdas than penalties, pad with zero matrices
@@ -7978,8 +7925,9 @@ fn core_saved_fit_result(
     validate_all_finite("fit_result.lambdas", lambdas.iter().copied())
         .expect("core_saved_fit_result called with non-finite lambdas");
     // Saved-model contract: fit_result.standard_deviation is residual
-    // standard deviation sigma for Gaussian identity models and the canonical
-    // fixed scale for non-Gaussian models.
+    // standard deviation sigma for Gaussian identity models and the
+    // response-scale summary paired with explicit likelihood-scale metadata
+    // for non-Gaussian models.
     ensure_finite_scalar("fit_result.standard_deviation", standard_deviation)
         .expect("core_saved_fit_result called with non-finite standard_deviation");
     if let Some(cov) = beta_covariance.as_ref() {
@@ -8008,7 +7956,7 @@ fn core_saved_fit_result(
         let covariance_conditional = inf.beta_covariance.clone();
         let covariance_corrected = inf.beta_covariance_corrected.clone();
         let penalized_objective =
-            -0.5 * summary.deviance + summary.stable_penalty_term + summary.reml_score;
+            -summary.log_likelihood + summary.stable_penalty_term + summary.reml_score;
         UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
             blocks: vec![gam::estimate::FittedBlock {
                 beta: beta.clone(),
@@ -8018,7 +7966,11 @@ fn core_saved_fit_result(
             }],
             log_lambdas,
             lambdas,
-            log_likelihood: -0.5 * summary.deviance,
+            likelihood_family: summary.likelihood_family,
+            likelihood_scale: summary.likelihood_scale,
+            log_likelihood_normalization: summary.log_likelihood_normalization,
+            log_likelihood: summary.log_likelihood,
+            deviance: summary.deviance,
             reml_score: summary.reml_score,
             stable_penalty_term: summary.stable_penalty_term,
             penalized_objective,
@@ -8044,6 +7996,10 @@ fn core_saved_fit_result(
 
 #[derive(Clone, Copy)]
 struct SavedFitSummary {
+    likelihood_family: Option<LikelihoodFamily>,
+    likelihood_scale: LikelihoodScaleMetadata,
+    log_likelihood_normalization: LogLikelihoodNormalization,
+    log_likelihood: f64,
     iterations: usize,
     finalgrad_norm: f64,
     pirls_status: gam::pirls::PirlsStatus,
@@ -8055,6 +8011,7 @@ struct SavedFitSummary {
 
 impl SavedFitSummary {
     fn validated(self) -> Result<Self, String> {
+        ensure_finite_scalar("fit_result.log_likelihood", self.log_likelihood)?;
         ensure_finite_scalar("fit_result.finalgrad_norm", self.finalgrad_norm)?;
         ensure_finite_scalar("fit_result.deviance", self.deviance)?;
         ensure_finite_scalar("fit_result.stable_penalty_term", self.stable_penalty_term)?;
@@ -8064,7 +8021,6 @@ impl SavedFitSummary {
     }
 
     fn from_blockwise_fit(fit: &gam::estimate::UnifiedFitResult) -> Result<Self, String> {
-        let deviance = -2.0 * fit.log_likelihood;
         let stable_penalty_term = fit.stable_penalty_term;
         let max_abs_eta = fit
             .block_states
@@ -8072,6 +8028,10 @@ impl SavedFitSummary {
             .flat_map(|b| b.eta.iter())
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         Self {
+            likelihood_family: fit.likelihood_family,
+            likelihood_scale: fit.likelihood_scale,
+            log_likelihood_normalization: fit.log_likelihood_normalization,
+            log_likelihood: fit.log_likelihood,
             iterations: fit.outer_iterations,
             finalgrad_norm: fit.outer_gradient_norm,
             pirls_status: if fit.outer_converged {
@@ -8079,7 +8039,7 @@ impl SavedFitSummary {
             } else {
                 gam::pirls::PirlsStatus::StalledAtValidMinimum
             },
-            deviance,
+            deviance: fit.deviance,
             stable_penalty_term,
             max_abs_eta,
             reml_score: fit.reml_score,
@@ -8094,6 +8054,7 @@ impl SavedFitSummary {
     ) -> Result<Self, String> {
         let n = nobs as f64;
         let log_scale = response_scale.max(1e-12).ln();
+        self.log_likelihood -= n * log_scale;
         self.deviance += 2.0 * n * log_scale;
         self.reml_score += n * log_scale;
         self.max_abs_eta *= response_scale;
@@ -8103,9 +8064,11 @@ impl SavedFitSummary {
     fn from_survival_location_scale_fit(
         fit: &gam::estimate::UnifiedFitResult,
     ) -> Result<Self, String> {
-        let deviance = -2.0 * fit.log_likelihood;
-        let stable_penalty_term = 2.0 * fit.penalized_objective - deviance;
         Self {
+            likelihood_family: fit.likelihood_family,
+            likelihood_scale: fit.likelihood_scale,
+            log_likelihood_normalization: fit.log_likelihood_normalization,
+            log_likelihood: fit.log_likelihood,
             iterations: fit.outer_iterations,
             finalgrad_norm: fit.outer_gradient_norm,
             pirls_status: if fit.outer_converged {
@@ -8113,10 +8076,10 @@ impl SavedFitSummary {
             } else {
                 gam::pirls::PirlsStatus::StalledAtValidMinimum
             },
-            deviance,
-            stable_penalty_term,
+            deviance: fit.deviance,
+            stable_penalty_term: fit.stable_penalty_term,
             max_abs_eta: 0.0,
-            reml_score: fit.penalized_objective,
+            reml_score: fit.reml_score,
         }
         .validated()
     }
@@ -8127,6 +8090,10 @@ impl SavedFitSummary {
     ) -> Result<Self, String> {
         let reml_score = 0.5 * (state.deviance + state.penalty_term);
         Self {
+            likelihood_family: Some(LikelihoodFamily::RoystonParmar),
+            likelihood_scale: LikelihoodScaleMetadata::Unspecified,
+            log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
+            log_likelihood: state.log_likelihood,
             iterations: summary.iterations,
             finalgrad_norm: summary.lastgradient_norm,
             pirls_status: summary.status,
@@ -9030,12 +8997,19 @@ fn build_model_summary(
         }
     };
     let null_dev = if let Ok(glm_family) = crate::types::GlmLikelihoodFamily::try_from(family) {
-        gam::pirls::calculate_deviance(y, &nullmu, glm_family, weights)
+        gam::pirls::calculate_deviance(
+            y,
+            &nullmu,
+            gam::types::GlmLikelihoodSpec::canonical(glm_family),
+            weights,
+        )
     } else {
         gam::pirls::calculate_deviance(
             y,
             &nullmu,
-            crate::types::GlmLikelihoodFamily::GaussianIdentity,
+            gam::types::GlmLikelihoodSpec::canonical(
+                crate::types::GlmLikelihoodFamily::GaussianIdentity,
+            ),
             weights,
         )
     };
@@ -9484,7 +9458,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
         .inference
         .as_ref()
         .and_then(|inf| inf.beta_covariance_corrected.clone());
-    let penalized_objective = -0.5 * ext.deviance + ext.stable_penalty_term + ext.reml_score;
+    let penalized_objective = -ext.log_likelihood + ext.stable_penalty_term + ext.reml_score;
     UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
         blocks: vec![gam::estimate::FittedBlock {
             beta: ext.beta.clone(),
@@ -9494,7 +9468,11 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
         }],
         log_lambdas,
         lambdas: ext.lambdas,
-        log_likelihood: -0.5 * ext.deviance,
+        likelihood_family: Some(ext.likelihood_family),
+        likelihood_scale: ext.likelihood_scale,
+        log_likelihood_normalization: ext.log_likelihood_normalization,
+        log_likelihood: ext.log_likelihood,
+        deviance: ext.deviance,
         reml_score: ext.reml_score,
         stable_penalty_term: ext.stable_penalty_term,
         penalized_objective,
@@ -9776,6 +9754,10 @@ mod tests {
 
     fn saved_fit_summary_stub() -> SavedFitSummary {
         SavedFitSummary {
+            likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
             iterations: 0,
             finalgrad_norm: 0.0,
             pirls_status: gam::pirls::PirlsStatus::Converged,
@@ -10760,6 +10742,10 @@ mod tests {
             None,
             None,
             SavedFitSummary {
+                likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+                likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+                log_likelihood_normalization: LogLikelihoodNormalization::Full,
+                log_likelihood: -0.75,
                 iterations: 3,
                 finalgrad_norm: 0.25,
                 pirls_status: gam::pirls::PirlsStatus::Converged,
@@ -12692,6 +12678,8 @@ mod tests {
                         x_entry: time_build.x_entry_time.view(),
                         x_exit: time_build.x_exit_time.view(),
                         x_derivative: time_build.x_derivative_time.view(),
+                        monotonicity_constraint_rows: None,
+                        monotonicity_constraint_offsets: None,
                         eta_offset_entry: Some(eta_offset_entry.view()),
                         eta_offset_exit: Some(eta_offset_exit.view()),
                         derivative_offset_exit: Some(derivative_offset_exit.view()),
@@ -12953,6 +12941,8 @@ mod tests {
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
+                monotonicity_constraint_rows: None,
+                monotonicity_constraint_offsets: None,
             },
             gam::survival::PenaltyBlocks::new(Vec::new()),
             gam::survival::MonotonicityPenalty { tolerance: 0.0 },

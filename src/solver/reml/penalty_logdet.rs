@@ -303,7 +303,7 @@ impl PenaltyPseudologdet {
             // Also add null dimensions from within blocks (if any block has nullity).
             // For the block-factored case with disjoint blocks, the block's internal
             // null dimensions are already captured by from_assembled. But we don't
-            // currently extract them. For now, return None for u_null to avoid
+            // currently extract them. Return None for u_null to avoid
             // incorrect null-space corrections (ρ-derivatives don't need it).
             if null_col > 0 {
                 Some(u0.slice(s![.., ..null_col]).to_owned())

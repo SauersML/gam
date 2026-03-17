@@ -41,7 +41,7 @@ zip = { version = "8.2.0", default-features = false, features = ["deflate"] }
 statrs = "0.18.0"
 pest = "2.8.6"
 pest_derive = "2.8.6"
-arrow = { version = "54", default-features = false, features = ["ffi", "cast"] }
+arrow = { version = "54", default-features = false, features = ["ffi"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 
 [dependencies.general-mcmc]
