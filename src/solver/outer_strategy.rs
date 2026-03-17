@@ -23,8 +23,8 @@ use ::opt::{
     ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,7 +497,6 @@ pub trait OuterObjective {
 
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
-
 }
 
 /// Closure-based adapter for [`OuterObjective`].

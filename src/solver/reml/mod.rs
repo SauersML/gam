@@ -11,6 +11,7 @@ use faer::Side;
 use faer::linalg::solvers::Solve as FaerSolve;
 use ndarray::s;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 mod cache;
@@ -1940,6 +1941,7 @@ pub(crate) struct RemlState<'a> {
     pub(crate) warm_start_beta: RwLock<Option<Coefficients>>,
     warm_start_enabled: AtomicBool,
     /// When nonzero, caps PIRLS max_iterations for cheap seed screening.
-    /// Set via `set_screening_max_inner_iterations` / `clear_screening_max_inner_iterations`.
-    screening_max_inner_iterations: AtomicUsize,
+    /// Shared with `OuterConfig.screening_cap` so the screening loop can
+    /// set/clear it atomically without accessing `RemlState` directly.
+    pub(crate) screening_max_inner_iterations: Arc<AtomicUsize>,
 }

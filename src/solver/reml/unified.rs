@@ -4889,6 +4889,21 @@ impl HessianOperator for SparseCholeskyOperator {
     }
 
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+        // When Takahashi is available, use direct entry lookup for tr(H^{-1} A).
+        // This is O(p^2) via dense A iteration but avoids p column solves.
+        if let Some(ref taka) = self.takahashi {
+            let mut trace = 0.0;
+            for i in 0..a.nrows() {
+                for j in 0..a.ncols() {
+                    let a_ij = a[[i, j]];
+                    if a_ij.abs() > 1e-30 {
+                        trace += taka.get(i, j) * a_ij;
+                    }
+                }
+            }
+            return trace;
+        }
+        // Fallback: column-by-column solve
         let mut trace = 0.0;
         for j in 0..a.ncols() {
             let col = a.column(j).to_owned();

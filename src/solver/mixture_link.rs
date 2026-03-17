@@ -869,9 +869,7 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
 ) -> Result<f64, EstimationError> {
     match link {
         InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
-        InverseLink::Standard(LinkFunction::Log) => {
-            Ok(eta.clamp(-700.0, 700.0).exp())
-        }
+        InverseLink::Standard(LinkFunction::Log) => Ok(eta.clamp(-700.0, 700.0).exp()),
         InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdffourth_derivative(eta)),
         InverseLink::Standard(LinkFunction::Logit) => Ok(
             component_inverse_link_pdffourth_derivative(LinkComponent::Logit, eta),
@@ -890,13 +888,11 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
         InverseLink::Standard(LinkFunction::BetaLogistic) => Ok(
             beta_logistic_inverse_link_pdffourth_derivative(eta, 0.0, 0.0),
         ),
-        InverseLink::BetaLogistic(state) => Ok(
-            beta_logistic_inverse_link_pdffourth_derivative(
-                eta,
-                state.log_delta,
-                state.epsilon,
-            ),
-        ),
+        InverseLink::BetaLogistic(state) => Ok(beta_logistic_inverse_link_pdffourth_derivative(
+            eta,
+            state.log_delta,
+            state.epsilon,
+        )),
         InverseLink::Mixture(state) => Ok(state
             .components
             .iter()

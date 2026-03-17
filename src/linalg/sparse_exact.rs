@@ -690,9 +690,9 @@ pub fn build_sparse_penalty_blocks(
 
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::linalg::cholesky::llt::factor::LltRegularization;
+use faer::sparse::SymbolicSparseColMat;
 use faer::sparse::linalg::amd;
 use faer::sparse::linalg::cholesky::simplicial;
-use faer::sparse::SymbolicSparseColMat;
 
 /// A simplicial Cholesky factorization with raw access to L's CSC pattern and
 /// values, plus the AMD permutation.  Built using faer's low-level simplicial
@@ -756,16 +756,16 @@ pub fn factorize_simplicial(
         })?;
     }
 
-    let perm =
-        unsafe { faer::perm::PermRef::new_unchecked(&perm_fwd, &perm_inv, n) };
+    let perm = unsafe { faer::perm::PermRef::new_unchecked(&perm_fwd, &perm_inv, n) };
 
     // 2. Permute to P A Pᵀ (upper-triangular, unsorted)
     let a_perm_upper = {
         let mut col_ptrs = vec![0usize; n + 1];
         let mut row_indices = vec![0usize; a_nnz];
         let mut values = vec![0.0f64; a_nnz];
-        let mut mem =
-            MemBuffer::new(faer::sparse::utils::permute_self_adjoint_scratch::<usize>(n));
+        let mut mem = MemBuffer::new(faer::sparse::utils::permute_self_adjoint_scratch::<usize>(
+            n,
+        ));
         faer::sparse::utils::permute_self_adjoint_to_unsorted(
             &mut values,
             &mut col_ptrs,
@@ -777,9 +777,7 @@ pub fn factorize_simplicial(
             MemStack::new(&mut mem),
         );
         SparseColMat::<usize, f64>::new(
-            unsafe {
-                SymbolicSparseColMat::new_unchecked(n, n, col_ptrs, None, row_indices)
-            },
+            unsafe { SymbolicSparseColMat::new_unchecked(n, n, col_ptrs, None, row_indices) },
             values,
         )
     };
@@ -813,9 +811,10 @@ pub fn factorize_simplicial(
     // 4. Numeric LLᵀ factorization
     let mut l_values = vec![0.0f64; symbolic.len_val()];
     {
-        let mut mem = MemBuffer::new(
-            simplicial::factorize_simplicial_numeric_llt_scratch::<usize, f64>(n),
-        );
+        let mut mem = MemBuffer::new(simplicial::factorize_simplicial_numeric_llt_scratch::<
+            usize,
+            f64,
+        >(n));
         simplicial::factorize_simplicial_numeric_llt::<usize, f64>(
             &mut l_values,
             a_perm_upper.as_ref(),
@@ -879,12 +878,7 @@ pub struct TakahashiInverse {
 impl TakahashiInverse {
     /// Binary search for entry (row, col) in lower-triangular CSC.
     /// Returns the value-array index if the entry exists.
-    fn find_entry(
-        col_ptr: &[usize],
-        row_idx: &[usize],
-        row: usize,
-        col: usize,
-    ) -> Option<usize> {
+    fn find_entry(col_ptr: &[usize], row_idx: &[usize], row: usize, col: usize) -> Option<usize> {
         let start = col_ptr[col];
         let end = col_ptr[col + 1];
         let slice = &row_idx[start..end];
@@ -945,8 +939,7 @@ impl TakahashiInverse {
                     let k = row_idx[idx_b];
                     let l_kj = factor.l_values[idx_b];
                     // Z[k,i] is at row=k, col=i in lower-triangular CSC
-                    if let Some(z_pos) = Self::find_entry(&col_ptr, &row_idx, k, i)
-                    {
+                    if let Some(z_pos) = Self::find_entry(&col_ptr, &row_idx, k, i) {
                         off_sum += l_kj * z_values[z_pos];
                     }
                     // If not in pattern, Z[k,i] = 0 (not in selected inverse)
@@ -1032,10 +1025,7 @@ impl TakahashiInverse {
 }
 
 /// Compute tr(H⁻¹ Sₖ) using a precomputed Takahashi selected inverse.
-pub fn trace_hinv_sk_takahashi(
-    taka: &TakahashiInverse,
-    penalty: &SparsePenaltyBlock,
-) -> f64 {
+pub fn trace_hinv_sk_takahashi(taka: &TakahashiInverse, penalty: &SparsePenaltyBlock) -> f64 {
     if penalty.block_support_strict {
         // Fast: block-local trace
         let block = taka.block(penalty.p_start, penalty.p_end);
@@ -1166,10 +1156,9 @@ mod tests {
         ];
         let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
 
-        // Dense logdet
-        use crate::faer_ndarray::FaerCholesky;
-        let chol = h.cholesky(Side::Lower).unwrap();
-        let logdet_dense = 2.0 * chol.diag().mapv(f64::ln).sum();
+        // Dense logdet via existing factor
+        let existing = factorize_sparse_spd(&h_sparse).unwrap();
+        let logdet_dense = existing.logdet;
 
         let sfactor = factorize_simplicial(&h_sparse).unwrap();
         approx_eq(sfactor.logdet, logdet_dense, 1e-10);
