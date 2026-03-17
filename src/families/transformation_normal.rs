@@ -1512,7 +1512,7 @@ pub fn fit_transformation_normal(
             freeze_spatial_length_scale_terms_from_design(covariate_spec, &cov_design)
                 .map_err(|e| format!("failed to freeze covariate spatial basis centers: {e}"))?;
 
-        let cov_global_penalties: Vec<Array2<f64>> = {
+        let cov_dense_for_tensor: Vec<Array2<f64>> = {
             let p_cov = cov_design.design.ncols();
             cov_design.penalties.iter().map(|bp| bp.to_global(p_cov)).collect()
         };
@@ -1525,7 +1525,7 @@ pub fn fit_transformation_normal(
             config.response_degree,
             resp_transform,
             &cov_dense,
-            &cov_global_penalties,
+            &cov_dense_for_tensor,
             config,
             warm_start,
         )?;
@@ -1572,7 +1572,7 @@ pub fn fit_transformation_normal(
         build_block_spatial_psi_derivatives(covariate_data, &boot_spec, &boot_design)?.is_some();
 
     // Build an initial family + blocks for capability probing.
-    let boot_global_penalties: Vec<Array2<f64>> = {
+    let boot_dense_for_tensor: Vec<Array2<f64>> = {
         let p_cov = boot_design.design.ncols();
         boot_design.penalties.iter().map(|bp| bp.to_global(p_cov)).collect()
     };
@@ -1585,7 +1585,7 @@ pub fn fit_transformation_normal(
         config.response_degree,
         resp_transform.clone(),
         &boot_dense,
-        &boot_global_penalties,
+        &boot_dense_for_tensor,
         config,
         warm_start,
     )?;

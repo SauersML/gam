@@ -2604,10 +2604,10 @@ fn build_survival_covariate_block_from_design(
             let design_covariates = cov_design.design.clone();
             let i_cov = Array2::<f64>::eye(p_cov);
             let i_time = Array2::<f64>::eye(p_time);
-            let cov_global_penalties: Vec<Array2<f64>> = cov_design.penalties.iter().map(|bp| bp.to_global(p_cov)).collect();
+            let cov_dense_for_kronecker: Vec<Array2<f64>> = cov_design.penalties.iter().map(|bp| bp.to_global(p_cov)).collect();
             let mut penalties =
-                Vec::with_capacity(cov_global_penalties.len() + time_penalties.len());
-            for s_cov in &cov_global_penalties {
+                Vec::with_capacity(cov_dense_for_kronecker.len() + time_penalties.len());
+            for s_cov in &cov_dense_for_kronecker {
                 penalties.push(PenaltyMatrix::KroneckerFactored {
                     left: s_cov.clone(),
                     right: i_time.clone(),
