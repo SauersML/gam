@@ -4693,6 +4693,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &Array1<f64>,
             ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
         >,
+        screening_enter_fn: None,
+        screening_exit_fn: None,
     };
 
     let outer_result = crate::solver::outer_strategy::run_outer(
@@ -8321,6 +8323,8 @@ fn try_exact_joint_spatial_aniso_optimization(
         efs_fn: None::<
             fn(&mut &mut AnisoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
+        screening_enter_fn: None,
+        screening_exit_fn: None,
     };
 
     let result =
@@ -8403,132 +8407,6 @@ fn enforce_psi_sum_to_zero(
                         theta[rho_idx] += mean;
                     }
                 }
-            }
-        }
-        offset += d;
-    }
-}
-
-/// Project the ψ-block gradient onto the tangent space of the sum-to-zero
-/// constraint manifold: g_ψ ← P g_ψ where P = I − (1/D)·11^T.
-///
-/// This removes the component along the gauge direction 1 (the all-ones vector),
-/// ensuring the optimizer never sees the flat (gauge) direction. The ρ block
-/// of the gradient is left unchanged.
-///
-/// See response.md §4b: the intrinsic gradient on the constraint manifold
-/// M = {ψ : 1^T ψ = 0} is ∇_M V = P g_ψ.
-pub(crate) fn project_psi_gradient(
-    gradient: &mut Array1<f64>,
-    rho_dim: usize,
-    dims_per_term: &[usize],
-) {
-    let mut offset = rho_dim;
-    for &d in dims_per_term {
-        if d > 1 {
-            let psi_grad = gradient.slice(s![offset..offset + d]);
-            let mean = psi_grad.mean().unwrap_or(0.0);
-            for a in 0..d {
-                gradient[offset + a] -= mean;
-            }
-        }
-        offset += d;
-    }
-}
-
-/// Project the ψ-block of a Hessian onto the constraint tangent space:
-/// H_M = P H_ψψ P, where P = I − (1/D)·11^T.
-///
-/// This removes the gauge direction from both rows and columns of the ψψ block,
-/// making the Hessian non-singular on the constraint manifold. The ρ-ρ block
-/// is left unchanged. Cross-blocks (ρ-ψ and ψ-ρ) are also projected to
-/// maintain consistency.
-///
-/// See response.md §4b: after removing the all-ones gauge direction, the
-/// intrinsic Hessian on the zero-sum tangent space is P H_ψψ P.
-pub(crate) fn project_psi_hessian(
-    hessian: &mut Array2<f64>,
-    rho_dim: usize,
-    dims_per_term: &[usize],
-) {
-    let n = hessian.nrows();
-    debug_assert_eq!(n, hessian.ncols(), "Hessian must be square");
-    let mut offset = rho_dim;
-    for &d in dims_per_term {
-        if d > 1 {
-            let df = d as f64;
-            // Project: H_block ← P H_block P where P = I − (1/D)·11^T.
-            // P H P = H − (1/D)·1·(1^T H) − (1/D)·(H 1)·1^T + (1/D^2)·1·(1^T H 1)·1^T
-
-            // ── ψψ sub-block: rows [offset..offset+d] × cols [offset..offset+d] ──
-            let mut row_means = vec![0.0_f64; d];
-            let mut col_means = vec![0.0_f64; d];
-            let mut grand_mean = 0.0_f64;
-            for a in 0..d {
-                for b in 0..d {
-                    let val = hessian[[offset + a, offset + b]];
-                    row_means[a] += val;
-                    col_means[b] += val;
-                    grand_mean += val;
-                }
-            }
-            for a in 0..d {
-                row_means[a] /= df;
-                col_means[a] /= df;
-            }
-            grand_mean /= df * df;
-            for a in 0..d {
-                for b in 0..d {
-                    hessian[[offset + a, offset + b]] += -row_means[a] - col_means[b] + grand_mean;
-                }
-            }
-
-            // ── Cross-blocks with the ρ block (rows/cols 0..rho_dim) ──
-            // Project ψ rows/cols: subtract the mean along the ψ dimension.
-            for c in 0..rho_dim {
-                let mut mean_col = 0.0_f64;
-                for a in 0..d {
-                    mean_col += hessian[[offset + a, c]];
-                }
-                mean_col /= df;
-                for a in 0..d {
-                    hessian[[offset + a, c]] -= mean_col;
-                }
-                // Symmetric: also project ρ-ψ columns
-                let mut mean_row = 0.0_f64;
-                for a in 0..d {
-                    mean_row += hessian[[c, offset + a]];
-                }
-                mean_row /= df;
-                for a in 0..d {
-                    hessian[[c, offset + a]] -= mean_row;
-                }
-            }
-
-            // ── Cross-blocks with other ψ groups ──
-            let mut other_offset = rho_dim;
-            for &other_d in dims_per_term {
-                if other_offset != offset {
-                    for c in other_offset..other_offset + other_d {
-                        let mut mean_col = 0.0_f64;
-                        for a in 0..d {
-                            mean_col += hessian[[offset + a, c]];
-                        }
-                        mean_col /= df;
-                        for a in 0..d {
-                            hessian[[offset + a, c]] -= mean_col;
-                        }
-                        let mut mean_row = 0.0_f64;
-                        for a in 0..d {
-                            mean_row += hessian[[c, offset + a]];
-                        }
-                        mean_row /= df;
-                        for a in 0..d {
-                            hessian[[c, offset + a]] -= mean_row;
-                        }
-                    }
-                }
-                other_offset += other_d;
             }
         }
         offset += d;
@@ -8727,6 +8605,8 @@ fn try_exact_joint_spatial_isotropic_optimization(
         efs_fn: None::<
             fn(&mut &mut IsoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
+        screening_enter_fn: None,
+        screening_exit_fn: None,
     };
 
     let result =
@@ -10015,6 +9895,8 @@ where
                 &Array1<f64>,
             ) -> Result<EfsEval, EstimationError>,
         >,
+        screening_enter_fn: None,
+        screening_exit_fn: None,
     };
 
     let result = crate::solver::outer_strategy::run_outer(

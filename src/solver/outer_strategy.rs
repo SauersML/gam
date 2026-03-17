@@ -495,6 +495,13 @@ pub trait OuterObjective {
 
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
+
+    /// Enter cheap screening mode: cap inner iterations for `eval_cost()` calls.
+    /// Default is a no-op (objectives that don't support screening ignore this).
+    fn enter_screening_mode(&mut self, _max_inner_iterations: usize) {}
+
+    /// Exit screening mode and restore normal inner iteration limits.
+    fn exit_screening_mode(&mut self) {}
 }
 
 /// Closure-based adapter for [`OuterObjective`].
@@ -518,6 +525,9 @@ pub struct ClosureObjective<
     /// Optional EFS evaluation closure. When `None`, the default
     /// `OuterObjective::eval_efs` returns an error.
     pub efs_fn: Option<Fefs>,
+    /// Optional screening mode callbacks for cheap seed evaluation.
+    pub screening_enter_fn: Option<Box<dyn FnMut(&mut S, usize)>>,
+    pub screening_exit_fn: Option<Box<dyn FnMut(&mut S)>>,
 }
 
 impl<S, Fc, Fe, Fr, Fefs> OuterObjective for ClosureObjective<S, Fc, Fe, Fr, Fefs>
@@ -550,6 +560,18 @@ where
 
     fn reset(&mut self) {
         if let Some(f) = self.reset_fn.as_mut() {
+            f(&mut self.state);
+        }
+    }
+
+    fn enter_screening_mode(&mut self, max_inner_iterations: usize) {
+        if let Some(f) = self.screening_enter_fn.as_mut() {
+            f(&mut self.state, max_inner_iterations);
+        }
+    }
+
+    fn exit_screening_mode(&mut self) {
+        if let Some(f) = self.screening_exit_fn.as_mut() {
             f(&mut self.state);
         }
     }
@@ -980,26 +1002,41 @@ fn run_outer_with_plan(
     };
 
     // Screen seeds by cost-only evaluation.
+    // Use cheap partial-PIRLS (capped inner iterations) when available.
     let budget = config.seed_config.screening_budget.max(1);
+    let screen_max = config.seed_config.screen_max_inner_iterations;
     let screened = if seeds.len() <= budget {
         seeds
     } else {
-        let mut scored: Vec<(usize, f64)> = seeds
-            .iter()
-            .enumerate()
-            .map(|(i, rho)| {
-                obj.reset();
-                let cost = obj.eval_cost(rho).unwrap_or(f64::INFINITY);
-                (
-                    i,
-                    if cost.is_finite() {
-                        cost
-                    } else {
-                        f64::INFINITY
-                    },
-                )
-            })
-            .collect();
+        log::info!(
+            "[OUTER] {context}: screening {}/{} seeds (budget={budget}, pirls_cap={screen_max})",
+            seeds.len(),
+            seeds.len(),
+        );
+        let screen_start = std::time::Instant::now();
+        if screen_max > 0 {
+            obj.enter_screening_mode(screen_max);
+        }
+        let mut scored: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
+        for (i, rho) in seeds.iter().enumerate() {
+            obj.reset();
+            let cost = obj.eval_cost(rho).unwrap_or(f64::INFINITY);
+            scored.push((
+                i,
+                if cost.is_finite() {
+                    cost
+                } else {
+                    f64::INFINITY
+                },
+            ));
+        }
+        if screen_max > 0 {
+            obj.exit_screening_mode();
+        }
+        log::info!(
+            "[OUTER] {context}: screening done in {:.3}s",
+            screen_start.elapsed().as_secs_f64(),
+        );
         scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         scored.truncate(budget);
         scored.iter().map(|&(i, _)| seeds[i].clone()).collect()
@@ -1559,6 +1596,8 @@ mod tests {
                 *st = 42;
             }),
             efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+            screening_enter_fn: None,
+            screening_exit_fn: None,
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);

@@ -297,7 +297,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "sigma must be positive")]
     fn exp_sigma_inverse_rejects_non_positive_sigma() {
-        let _ = exp_sigma_eta_for_sigma_scalar(0.0);
+        exp_sigma_eta_for_sigma_scalar(0.0);
     }
 
     #[test]

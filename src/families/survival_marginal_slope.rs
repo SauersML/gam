@@ -1352,7 +1352,7 @@ fn build_time_blockspec(
         design: DesignMatrix::Dense(Arc::new(design_exit.clone())),
         offset: Array1::zeros(design_exit.nrows()),
         penalties: time_block.penalties.clone(),
-        nullspace_dims: vec![],
+        nullspace_dims: time_block.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }
@@ -1369,7 +1369,7 @@ fn build_logslope_blockspec(
         design: DesignMatrix::Dense(Arc::new(design.design.clone())),
         offset: Array1::from_elem(design.design.nrows(), baseline),
         penalties: design.global_penalties(),
-        nullspace_dims: vec![],
+        nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }
