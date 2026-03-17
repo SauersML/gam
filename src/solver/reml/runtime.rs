@@ -933,12 +933,11 @@ impl<'a> RemlState<'a> {
         &self,
         pr: &PirlsResult,
     ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
-        // Convert to dense: this path is only used by the dense spectral
-        // evaluator which needs a full eigendecomposition.
-        let base = pr.stabilizedhessian_transformed.to_dense();
-
-        if base.cholesky(Side::Lower).is_ok() {
-            return Ok((base, pr.ridge_passport));
+        // Verify PD via SymmetricMatrix::factorize() (sparse-aware),
+        // then densify for the spectral evaluator which needs eigh().
+        let h = &pr.stabilizedhessian_transformed;
+        if h.factorize().is_ok() {
+            return Ok((h.to_dense(), pr.ridge_passport));
         }
 
         Err(EstimationError::ModelIsIllConditioned {
