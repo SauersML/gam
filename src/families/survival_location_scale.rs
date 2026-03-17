@@ -319,6 +319,8 @@ pub struct CovariateBlockInput {
     pub design: DesignMatrix,
     pub offset: Array1<f64>,
     pub penalties: Vec<Array2<f64>>,
+    /// Structural nullspace dimension of each penalty matrix.
+    pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,
     pub initial_beta: Option<Array1<f64>>,
 }
@@ -361,6 +363,8 @@ pub enum CovariateBlockKind {
 pub struct LinkWiggleBlockInput {
     pub design: DesignMatrix,
     pub penalties: Vec<Array2<f64>>,
+    /// Structural nullspace dimension of each penalty matrix.
+    pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,
     pub initial_beta: Option<Array1<f64>>,
 }
