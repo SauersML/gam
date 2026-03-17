@@ -293,7 +293,8 @@ fn inverse_link_pdffourth_derivative(inverse_link: &InverseLink, eta: f64) -> f6
             // Delegate to the generic dispatcher which covers SAS,
             // BetaLogistic, and Mixture inverse links.
             crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                inverse_link, eta,
+                inverse_link,
+                eta,
             )
             .unwrap_or(0.0)
         }
@@ -346,7 +347,7 @@ pub struct TimeDependentCovariateBlockInput {
     /// B-spline time basis at exit times (n x p_time).
     pub time_basis_exit: Array2<f64>,
     /// Combined Kronecker penalties for the tensor product.
-    pub penalties: Vec<Array2<f64>>,
+    pub penalties: Vec<PenaltyMatrix>,
     pub initial_log_lambdas: Option<Array1<f64>>,
     pub initial_beta: Option<Array1<f64>>,
     pub offset: Array1<f64>,
@@ -2346,7 +2347,7 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
                 ));
             }
             for (idx, s) in tv.penalties.iter().enumerate() {
-                let (r, c) = s.dim();
+                let (r, c) = s.shape();
                 if r != p_tensor || c != p_tensor {
                     return Err(format!(
                         "{name} time-varying penalty {idx} must be {p_tensor}x{p_tensor}, got {r}x{c}"
@@ -2375,7 +2376,7 @@ struct PreparedCovBlock {
     design_entry: Option<DesignMatrix>,
     /// Offset (same for both entry/exit since it comes from other terms).
     offset: Array1<f64>,
-    penalties: Vec<Array2<f64>>,
+    penalties: Vec<PenaltyMatrix>,
     nullspace_dims: Vec<usize>,
     initial_log_lambdas: Option<Array1<f64>>,
     initial_beta: Option<Array1<f64>>,
@@ -2387,14 +2388,31 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
             design_exit: b.design.clone(),
             design_entry: None,
             offset: b.offset.clone(),
-            penalties: b.penalties.clone(),
+            penalties: b
+                .penalties
+                .iter()
+                .cloned()
+                .map(PenaltyMatrix::Dense)
+                .collect(),
             nullspace_dims: b.nullspace_dims.clone(),
             initial_log_lambdas: b.initial_log_lambdas.clone(),
             initial_beta: b.initial_beta.clone(),
         }),
         CovariateBlockKind::TimeVarying(tv) => {
-            let design_exit = rowwise_kronecker(&tv.design_covariates, &tv.time_basis_exit);
-            let design_entry = rowwise_kronecker(&tv.design_covariates, &tv.time_basis_entry);
+            let design_exit = DesignMatrix::Operator(Arc::new(
+                RowwiseKroneckerOperator::new(
+                    tv.design_covariates.clone(),
+                    Arc::new(tv.time_basis_exit.clone()),
+                )
+                .map_err(|e| format!("RowwiseKronecker exit: {e}"))?,
+            ));
+            let design_entry = DesignMatrix::Operator(Arc::new(
+                RowwiseKroneckerOperator::new(
+                    tv.design_covariates.clone(),
+                    Arc::new(tv.time_basis_entry.clone()),
+                )
+                .map_err(|e| format!("RowwiseKronecker entry: {e}"))?,
+            ));
             Ok(PreparedCovBlock {
                 design_exit,
                 design_entry: Some(design_entry),
@@ -2439,10 +2457,16 @@ fn build_survival_covariate_block_from_design(
             let mut penalties =
                 Vec::with_capacity(cov_global_penalties.len() + time_penalties.len());
             for s_cov in &cov_global_penalties {
-                penalties.push(kronecker_product(s_cov, &i_time));
+                penalties.push(PenaltyMatrix::KroneckerFactored {
+                    left: s_cov.clone(),
+                    right: i_time.clone(),
+                });
             }
             for s_time in time_penalties {
-                penalties.push(kronecker_product(&i_cov, s_time));
+                penalties.push(PenaltyMatrix::KroneckerFactored {
+                    left: i_cov.clone(),
+                    right: s_time.clone(),
+                });
             }
             Ok(CovariateBlockKind::TimeVarying(
                 TimeDependentCovariateBlockInput {
@@ -2953,12 +2977,7 @@ fn prepare_survival_location_scale_model(
         name: "threshold".to_string(),
         design: threshold_solver_design,
         offset: threshold_solver_offset,
-        penalties: threshold_prep
-            .penalties
-            .iter()
-            .cloned()
-            .map(PenaltyMatrix::Dense)
-            .collect(),
+        penalties: threshold_prep.penalties.clone(),
         nullspace_dims: threshold_prep.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &threshold_prep.penalties,
@@ -3023,12 +3042,7 @@ fn prepare_survival_location_scale_model(
         name: "log_sigma".to_string(),
         design: log_sigma_solver_design,
         offset: log_sigma_solver_offset,
-        penalties: log_sigma_prep
-            .penalties
-            .iter()
-            .cloned()
-            .map(PenaltyMatrix::Dense)
-            .collect(),
+        penalties: log_sigma_prep.penalties.clone(),
         nullspace_dims: log_sigma_prep.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &log_sigma_prep.penalties,
@@ -3351,8 +3365,8 @@ fn prepare_identified_time_block(
     })
 }
 
-fn initial_log_lambdas(
-    penalties: &[Array2<f64>],
+fn initial_log_lambdas<T>(
+    penalties: &[T],
     rho0: Option<Array1<f64>>,
 ) -> Result<Array1<f64>, String> {
     let k = penalties.len();

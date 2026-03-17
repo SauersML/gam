@@ -745,26 +745,8 @@ impl<'a> RemlState<'a> {
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
-            screening_max_inner_iterations: AtomicUsize::new(0),
+            screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
         })
-    }
-
-    /// Cap PIRLS max_iterations for cheap seed screening.
-    /// When `max_iters > 0`, every PIRLS solve uses `min(config.max_iterations, max_iters)`.
-    /// Call `clear_screening_max_inner_iterations()` to restore normal behaviour.
-    pub(crate) fn set_screening_max_inner_iterations(&self, max_iters: usize) {
-        self.screening_max_inner_iterations
-            .store(max_iters, Ordering::Relaxed);
-        // Invalidate cached bundles so re-screening doesn't reuse a full-iteration result.
-        self.cache_manager.invalidate_eval_bundle();
-    }
-
-    /// Restore normal PIRLS iteration limits after screening.
-    pub(crate) fn clear_screening_max_inner_iterations(&self) {
-        self.screening_max_inner_iterations
-            .store(0, Ordering::Relaxed);
-        // Invalidate cached bundles so the real solver doesn't reuse a screening result.
-        self.cache_manager.invalidate_eval_bundle();
     }
 
     /// Sets the shrinkage floor for penalized block eigenvalues.
@@ -1455,15 +1437,14 @@ impl<'a> RemlState<'a> {
                 // Compute Takahashi selected inverse from simplicial factorization.
                 // This precomputes H^{-1} entries on the filled pattern of L, enabling
                 // O(nnz) trace computations instead of O(p) column solves.
-                let takahashi = crate::linalg::sparse_exact::factorize_simplicial(
-                    &sparse_system.h_sparse,
-                )
-                .ok()
-                .map(|sfactor| {
-                    Arc::new(crate::linalg::sparse_exact::TakahashiInverse::compute(
-                        &sfactor,
-                    ))
-                });
+                let takahashi =
+                    crate::linalg::sparse_exact::factorize_simplicial(&sparse_system.h_sparse)
+                        .ok()
+                        .map(|sfactor| {
+                            Arc::new(crate::linalg::sparse_exact::TakahashiInverse::compute(
+                                &sfactor,
+                            ))
+                        });
                 SparseExactEvalData {
                     factor,
                     takahashi,
@@ -2433,12 +2414,19 @@ impl<'a> RemlState<'a> {
         let beta = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta.len();
 
-        // Build HessianOperator from the sparse Cholesky factor.
-        let hessian_op = Box::new(SparseCholeskyOperator::new(
-            sparse.factor.clone(),
-            sparse.logdet_h,
-            p_dim,
-        ));
+        // Build HessianOperator from the sparse Cholesky factor, with Takahashi
+        // selected inverse for O(nnz) trace computations when available.
+        let hessian_op: Box<dyn HessianOperator> = {
+            let mut op = SparseCholeskyOperator::new(
+                sparse.factor.clone(),
+                sparse.logdet_h,
+                p_dim,
+            );
+            if let Some(ref taka) = sparse.takahashi {
+                op = op.with_takahashi(taka.clone());
+            }
+            Box::new(op)
+        };
 
         log::trace!(
             "SparseCholeskyOperator: dim={}, active_rank={}",
@@ -2530,12 +2518,19 @@ impl<'a> RemlState<'a> {
         let beta = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta.len();
 
-        // Build HessianOperator from the sparse Cholesky factor.
-        let hessian_op = Box::new(SparseCholeskyOperator::new(
-            sparse.factor.clone(),
-            sparse.logdet_h,
-            p_dim,
-        ));
+        // Build HessianOperator from the sparse Cholesky factor, with Takahashi
+        // selected inverse for O(nnz) trace computations when available.
+        let hessian_op: Box<dyn HessianOperator> = {
+            let mut op = SparseCholeskyOperator::new(
+                sparse.factor.clone(),
+                sparse.logdet_h,
+                p_dim,
+            );
+            if let Some(ref taka) = sparse.takahashi {
+                op = op.with_takahashi(taka.clone());
+            }
+            Box::new(op)
+        };
 
         // Penalty roots from s_full_list via eigendecomposition.
         let penalty_roots: Vec<Array2<f64>> = self
@@ -2916,11 +2911,17 @@ impl<'a> RemlState<'a> {
 
         let beta = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta.len();
-        let hessian_op: Box<dyn HessianOperator> = Box::new(SparseCholeskyOperator::new(
-            sparse.factor.clone(),
-            sparse.logdet_h,
-            p_dim,
-        ));
+        let hessian_op: Box<dyn HessianOperator> = {
+            let mut op = SparseCholeskyOperator::new(
+                sparse.factor.clone(),
+                sparse.logdet_h,
+                p_dim,
+            );
+            if let Some(ref taka) = sparse.takahashi {
+                op = op.with_takahashi(taka.clone());
+            }
+            Box::new(op)
+        };
 
         let penalty_roots: Vec<Array2<f64>> = self
             .s_full_list
@@ -3279,7 +3280,8 @@ impl<'a> RemlState<'a> {
             pirls_result.stable_penalty_term,
             barrier_config,
         )?;
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly)?;
+        let tk_terms =
+            self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly)?;
         Ok(self.apply_tk_cost_to_efs(result, tk_terms.value))
     }
 
