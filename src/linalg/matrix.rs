@@ -2600,6 +2600,40 @@ pub trait FactorizedSystem: Send + Sync {
     fn logdet(&self) -> f64;
 }
 
+#[derive(Clone)]
+struct MatrixFreeNormalFactor {
+    design: DesignMatrix,
+    weights: Array1<f64>,
+    penalty: Option<Array2<f64>>,
+}
+
+impl FactorizedSystem for MatrixFreeNormalFactor {
+    fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
+        self.design
+            .solve_system(&self.weights, rhs, self.penalty.as_ref())
+    }
+
+    fn solvemulti(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+        if rhs.nrows() != self.design.ncols() {
+            return Err(format!(
+                "MatrixFreeNormalFactor::solvemulti rhs rows {} != design cols {}",
+                rhs.nrows(),
+                self.design.ncols()
+            ));
+        }
+        let mut out = Array2::<f64>::zeros((rhs.nrows(), rhs.ncols()));
+        for col in 0..rhs.ncols() {
+            let solved = self.solve(&rhs.column(col).to_owned())?;
+            out.column_mut(col).assign(&solved);
+        }
+        Ok(out)
+    }
+
+    fn logdet(&self) -> f64 {
+        f64::NAN
+    }
+}
+
 pub trait LinearOperator {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
@@ -3078,17 +3112,11 @@ impl LinearOperator for DesignMatrix {
                     .map_err(|e| format!("factorize_system failed: {e:?}"))?;
                 Ok(Box::new(factor))
             }
-            Self::Operator(_) => {
-                // Delegate to the default trait method which assembles dense X'WX.
-                let mut system = self.diag_xtw_x(weights)?;
-                if let Some(pen) = penalty {
-                    system += pen;
-                }
-                let factor = crate::linalg::utils::StableSolver::new("operator system")
-                    .factorize(&system)
-                    .map_err(|e| format!("factorize_system (operator) failed: {e:?}"))?;
-                Ok(Box::new(factor))
-            }
+            Self::Operator(_) => Ok(Box::new(MatrixFreeNormalFactor {
+                design: self.clone(),
+                weights: weights.clone(),
+                penalty: penalty.cloned(),
+            })),
         }
     }
 
