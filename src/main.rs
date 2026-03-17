@@ -8,11 +8,10 @@ use faer::Mat as FaerMat;
 use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions,
-    CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec,
-    MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
-    build_bspline_basis_1d, compute_geometric_constraint_transform, create_basis,
-    create_difference_penalty_matrix, default_num_centers, evaluate_bspline_derivative_scalar,
+    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, CenterStrategy, Dense,
+    DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec, MaternIdentifiability,
+    MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
+    create_difference_penalty_matrix,
 };
 use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
@@ -33,8 +32,7 @@ use gam::families::scale_design::{
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
-    ParameterBlockInput, WiggleBlockConfig, append_selected_wiggle_penalty_orders,
-    buildwiggle_block_input_from_knots, buildwiggle_block_input_from_seed,
+    append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
     monotone_wiggle_basis_with_derivative_order,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
@@ -47,13 +45,15 @@ use gam::inference::data::{
     load_datasetwith_schema as load_dataset_auto_with_schema,
 };
 use gam::inference::formula_dsl::{
-    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, build_termspec,
-    effectivelinkwiggle_formulaspec, enable_scale_dimensions, formula_rhs_text, heuristic_knots,
-    heuristic_knots_for_column, inverse_link_supports_joint_wiggle,
-    linkchoice_supports_joint_wiggle, linkname, option_usize, parse_duchon_order,
-    parse_duchon_power, parse_formula, parse_link_choice, parse_linkwiggle_formulaspec,
-    parse_matching_auxiliary_formula, parse_surv_response, unique_count_column,
+    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
+    effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
+    linkchoice_supports_joint_wiggle, linkname, parse_formula, parse_link_choice,
+    parse_linkwiggle_formulaspec, parse_matching_auxiliary_formula, parse_surv_response,
     validate_auxiliary_formula_controls,
+};
+use gam::term_builder::{
+    build_termspec, enable_scale_dimensions, heuristic_knots, heuristic_knots_for_column,
+    parse_duchon_order, parse_duchon_power, unique_count_column,
 };
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
@@ -66,10 +66,10 @@ use gam::mixture_link::{
 };
 use gam::probability::{normal_cdf, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
-    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
-    TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
-    build_term_collection_design, weighted_blockwise_penalty_sum,
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint,
+    SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
+    TensorBSplineIdentifiability, TermCollectionSpec, build_term_collection_design,
+    weighted_blockwise_penalty_sum,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
@@ -85,7 +85,7 @@ use gam::survival_construction::{
     survival_basis_supports_structural_monotonicity, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
-    ResidualDistribution, SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
+    SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
     SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
     residual_distribution_inverse_link,
 };
@@ -1003,6 +1003,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 linear_constraints: design.linear_constraints.clone(),
                 firth_bias_reduction: Some(true),
                 penalty_shrinkage_floor: Some(1e-6),
+                kronecker_penalty_system: None,
             },
         )
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;

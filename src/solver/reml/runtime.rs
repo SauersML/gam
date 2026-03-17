@@ -2031,7 +2031,7 @@ impl<'a> RemlState<'a> {
 
             if !p.is_empty() {
                 let k_lambda = p.len();
-                let k_r = pirls_result.reparam_result.rs_transformed.len();
+                let k_r = pirls_result.reparam_result.canonical_transformed.len();
                 let k_d = pirls_result.reparam_result.det1.len();
                 if !(k_lambda == k_r && k_r == k_d) {
                     return Err(EstimationError::LayoutError(format!(
