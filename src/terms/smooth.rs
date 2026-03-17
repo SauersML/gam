@@ -10219,6 +10219,55 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         ));
     }
 
+    let pilot_threshold = kappa_options.pilot_subsample_threshold;
+    if pilot_threshold > 0 && n > pilot_threshold * 2 {
+        let indices = stratified_spatial_subsample(data, spec, pilot_threshold);
+        let pilot_n = indices.len();
+        log::info!(
+            "[spatial-kappa] n={n} exceeds pilot threshold {}; optimizing on \
+             {pilot_n}-observation spatially stratified subsample",
+            pilot_threshold * 2,
+        );
+        let mut data_pilot = Array2::<f64>::zeros((pilot_n, data.ncols()));
+        for (new_row, &orig_row) in indices.iter().enumerate() {
+            data_pilot.row_mut(new_row).assign(&data.row(orig_row));
+        }
+        let y_pilot: Array1<f64> = indices.iter().map(|&i| y[i]).collect();
+        let weights_pilot: Array1<f64> = indices.iter().map(|&i| weights[i]).collect();
+        let offset_pilot: Array1<f64> = indices.iter().map(|&i| offset[i]).collect();
+        let mut pilot_kappa = kappa_options.clone();
+        pilot_kappa.pilot_subsample_threshold = 0;
+        let pilot_result = fit_term_collectionwith_spatial_length_scale_optimization(
+            data_pilot.view(),
+            y_pilot,
+            weights_pilot,
+            offset_pilot,
+            spec,
+            family,
+            options,
+            &pilot_kappa,
+        )?;
+        log::info!(
+            "[spatial-kappa] pilot complete; fitting full n={n} with frozen geometry"
+        );
+        let frozen_spec = pilot_result.resolvedspec;
+        let full_result = fit_term_collection_forspec(
+            data,
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &frozen_spec,
+            family,
+            options,
+        )?;
+        return Ok(FittedTermCollectionWithSpec {
+            fit: full_result.fit,
+            design: full_result.design,
+            resolvedspec: frozen_spec,
+            adaptive_diagnostics: full_result.adaptive_diagnostics,
+        });
+    }
+
     let best = fit_term_collection_forspec(
         data,
         y.view(),
@@ -10527,9 +10576,10 @@ mod tests {
         // contributes two blocks (bending + nullspace ridge).
         assert_eq!(sd.penalties.len(), 4);
         assert_eq!(sd.nullspace_dims.len(), 4);
-        for s in &sd.penalties {
-            assert_eq!(s.nrows(), sd.total_smooth_cols());
-            assert_eq!(s.ncols(), sd.total_smooth_cols());
+        for bp in &sd.penalties {
+            assert_eq!(bp.local.nrows(), bp.block_size());
+            assert_eq!(bp.local.ncols(), bp.block_size());
+            assert!(bp.col_range.end <= sd.total_smooth_cols());
         }
     }
 
@@ -11479,8 +11529,8 @@ mod tests {
         // one Kronecker penalty per marginal + optional ridge
         assert_eq!(sd.penalties.len(), 3);
         assert_eq!(sd.nullspace_dims.len(), 3);
-        assert!(sd.penalties.iter().all(|s| s.nrows() == sd.total_smooth_cols()));
-        assert!(sd.penalties.iter().all(|s| s.ncols() == sd.total_smooth_cols()));
+        assert!(sd.penalties.iter().all(|bp| bp.local.nrows() == bp.block_size()));
+        assert!(sd.penalties.iter().all(|bp| bp.col_range.end <= sd.total_smooth_cols()));
     }
 
     #[test]

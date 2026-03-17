@@ -1420,7 +1420,7 @@ fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<BlockwisePenalty>,
+    s_list: Vec<PenaltySpec>,
     heuristic_lambdas: Option<&[f64]>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     opts: &ExternalOptimOptions,
@@ -1441,22 +1441,14 @@ where
     }
 
     let p = x.ncols();
-    validate_blockwise_penalties(&s_list, p, "optimize_external_design")?;
-    // Convert BlockwisePenalty → PenaltySpec::Block for the canonical pipeline.
-    let specs: Vec<PenaltySpec> = s_list
-        .into_iter()
-        .map(PenaltySpec::from_blockwise)
-        .collect();
+    validate_penalty_specs(&s_list, p, "optimize_external_design")?;
     let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
-        &specs,
+        &s_list,
         &opts.nullspace_dims,
         p,
         "optimize_external_design",
     )?;
-    // Derive legacy global roots for PIRLS compatibility.
-    let rs_list: Vec<Array2<f64>> = canonical.iter().map(|cp| cp.global_root()).collect();
-    let conditioning =
-        ParametricColumnConditioning::infer_from_canonical_penalties(&x, &canonical);
+    let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(&x, &s_list);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
@@ -1481,7 +1473,6 @@ where
         w_o.view(),
         offset_o.view(),
         Arc::clone(&canonical_shared),
-        rs_list,
         p,
         &cfg,
         Some(active_nullspace_dims.clone()),
@@ -2087,7 +2078,7 @@ where
             coefficient_lower_bounds: None,
             linear_constraints_original: fit_linear_constraints.as_ref(),
             penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
-            penalties: None,
+            canonical_penalties: None,
         },
         &pirls::PirlsConfig {
             link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -2305,7 +2296,7 @@ where
                                     coefficient_lower_bounds: None,
                                     linear_constraints_original: fit_linear_constraints.as_ref(),
                                     penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
-                                    penalties: None,
+                                    canonical_penalties: None,
                                 },
                                 &pirls::PirlsConfig {
                                     link_kind: if let Some(state) = final_mixture_state.clone() {
