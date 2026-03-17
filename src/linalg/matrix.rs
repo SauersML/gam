@@ -436,9 +436,6 @@ impl MultiChannelOperator {
         })
     }
 
-    pub fn num_channels(&self) -> usize {
-        self.channels.len()
-    }
 }
 
 impl DesignOperator for MultiChannelOperator {
