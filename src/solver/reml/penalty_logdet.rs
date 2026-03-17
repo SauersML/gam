@@ -63,6 +63,7 @@ use crate::faer_ndarray::FaerEigh;
 ///
 /// Holds the eigendecomposition and precomputed W-factor so that derivative
 /// queries are efficient without redundant factorizations.
+#[derive(Clone)]
 pub struct PenaltyPseudologdet {
     /// W factor: p × rank, with W W^T = S⁺.
     w_factor: Array2<f64>,

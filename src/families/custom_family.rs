@@ -3823,19 +3823,6 @@ fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> Rid
     }
 }
 
-fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-    // tr(A B) = sum_ij A_ij B_ji.
-    // Row-sum approach: for each row i of A and column i of B (= row i of B^T),
-    // compute the dot product. This keeps A row-contiguous and B column access
-    // is sequential when B is row-major (B column i = B^T row i).
-    let n = a.nrows();
-    let mut t = 0.0;
-    for i in 0..n {
-        t += a.row(i).dot(&b.column(i));
-    }
-    t
-}
-
 fn inverse_spdwith_retry(
     matrix: &Array2<f64>,
     baseridge: f64,
@@ -6253,20 +6240,19 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let p_block = end - start;
         for (local_idx, deriv) in block_derivs.iter().enumerate() {
             let s_local = assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
-            let spinv_s_local = s_logdet_block_cache
-                .as_ref()
-                .as_ref()
-                .map(|blocks| blocks[block_idx].pseudoinverse.dot(&s_local));
-            let scaled_leak_local = s_logdet_block_cache.as_ref().as_ref().map(|blocks| {
-                scaled_penalty_logdet_nullspace_leakage(&blocks[block_idx], &s_local)
-            });
+            // Store the block-local S_ψ matrix when penalty logdet is active;
+            // PenaltyPseudologdet methods will handle pseudoinverse and leakage internally.
+            let s_local_opt = if s_logdet_block_cache.is_some() {
+                Some(s_local)
+            } else {
+                None
+            };
             psi_penalty_cache.push(PsiPenaltyCacheEntry {
                 block_idx,
                 local_idx,
                 start,
                 end,
-                spinv_s_local,
-                scaled_leak_local,
+                s_local: s_local_opt,
             });
         }
     }
@@ -6276,19 +6262,15 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     for (block_idx, &count) in penalty_counts.iter().enumerate() {
         let (start, end) = ranges_arc[block_idx];
         for penalty_idx in 0..count {
-            let s_local = specs_arc[block_idx].penalties[penalty_idx]
-                .to_dense()
-                .mapv(|v| per_block[block_idx][penalty_idx].exp() * v);
-            let spinv_s_local = s_logdet_block_cache
-                .as_ref()
-                .as_ref()
-                .map(|blocks| blocks[block_idx].pseudoinverse.dot(&s_local));
+            let s_k_unscaled = specs_arc[block_idx].penalties[penalty_idx].to_dense();
+            let lambda_k = per_block[block_idx][penalty_idx].exp();
             rho_penalty_cache.push(RhoPenaltyCacheEntry {
                 block_idx,
                 penalty_idx,
                 start,
                 end,
-                spinv_s_local,
+                s_k_unscaled,
+                lambda_k,
             });
         }
     }
@@ -6361,27 +6343,15 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 }
 
                 if let Some(ref logdet_blocks) = *s_logdet_block_cache {
-                    let tr_spinv_sij =
-                        trace_product(&logdet_blocks[cache_i.block_idx].pseudoinverse, &s_local);
-                    let tr_quad = trace_product(
-                        cache_j.spinv_s_local.as_ref().expect(
-                            "psi cache should include S⁺ S_psi when penalty logdet is active",
-                        ),
-                        cache_i.spinv_s_local.as_ref().expect(
-                            "psi cache should include S⁺ S_psi when penalty logdet is active",
-                        ),
+                    let pld = &logdet_blocks[cache_i.block_idx];
+                    let s_psi_i = cache_i.s_local.as_ref().expect(
+                        "psi cache should include S_psi when penalty logdet is active",
                     );
-                    let leak = if let Some(ref scaled_i) = cache_i.scaled_leak_local {
-                        2.0 * frobenius_inner_same_shape(
-                            scaled_i,
-                            cache_j.scaled_leak_local.as_ref().expect(
-                                "psi cache should include scaled leakage blocks when penalty logdet is active",
-                            ),
-                        )
-                    } else {
-                        0.0
-                    };
-                    tr_spinv_sij - tr_quad + leak
+                    let s_psi_j = cache_j.s_local.as_ref().expect(
+                        "psi cache should include S_psi when penalty logdet is active",
+                    );
+                    // τ-Hessian: tr(S⁺ S_{ψi ψj}) − tr(S⁺ S_ψi S⁺ S_ψj) + 2 tr(Σ₊⁻² L_i L_j^T)
+                    pld.tau_hessian_component(s_psi_i, s_psi_j, Some(&s_local))
                 } else {
                     0.0
                 }
@@ -6449,17 +6419,23 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 }
 
                 if let Some(ref logdet_blocks) = *s_logdet_block_cache {
-                    let tr_spinv_skj =
-                        trace_product(&logdet_blocks[rho_cache.block_idx].pseudoinverse, &local);
-                    let tr_quad = trace_product(
-                        psi_cache.spinv_s_local.as_ref().expect(
-                            "psi cache should include S⁺ S_psi when penalty logdet is active",
-                        ),
-                        rho_cache.spinv_s_local.as_ref().expect(
-                            "rho cache should include S⁺ S_rho when penalty logdet is active",
-                        ),
+                    let pld = &logdet_blocks[rho_cache.block_idx];
+                    let s_psi_j = psi_cache.s_local.as_ref().expect(
+                        "psi cache should include S_psi when penalty logdet is active",
                     );
-                    tr_spinv_skj - tr_quad
+                    // ∂S_k/∂ψ_j (unscaled): extract from local by dividing out λ_k.
+                    let ds_k_dpsi = if lambda_k.abs() > 1e-300 {
+                        Some(local.mapv(|v| v / lambda_k))
+                    } else {
+                        None
+                    };
+                    // Mixed ρ×τ Hessian: λ_k [tr(S⁺ ∂S_k/∂ψ_j) − tr(S⁺ S_k S⁺ S_ψj)]
+                    pld.rho_tau_hessian_component(
+                        &rho_cache.s_k_unscaled,
+                        lambda_k,
+                        s_psi_j,
+                        ds_k_dpsi.as_ref(),
+                    )
                 } else {
                     0.0
                 }
@@ -6679,10 +6655,9 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
                 } else {
                     None
                 };
-                blocks.push(build_penalty_logdet_eigenspace(
-                    &s_lambda,
+                blocks.push(PenaltyPseudologdet::from_assembled_with_nullity(
+                    s_lambda,
                     structural_nullity,
-                    &format!("custom-family penalty logdet block {b}"),
                 )?);
             }
             Some(blocks)

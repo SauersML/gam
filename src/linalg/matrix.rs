@@ -607,54 +607,50 @@ impl DesignOperator for RowwiseKroneckerOperator {
 
     /// X β where β is reshaped as (p_cov, p_time):
     ///   result[i] = Σⱼ cov[i,j] * Σₜ time[i,t] * β[j*p_time + t]
-    ///             = Σⱼ cov[i,j] * (time[i,:] · β_j[:])
+    ///
+    /// Computed via p_time calls to cov.apply() to stay sparse-native:
+    ///   For each t: result += time[:,t] ⊙ cov · β[:,t]
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         let p_cov = self.p_cov;
         let p_time = self.p_time;
         let n = self.n;
-        // Reshape β as (p_cov, p_time).
-        let beta_mat = ArrayView2::from_shape((p_cov, p_time), vector.as_slice().unwrap()).unwrap();
-        // Compute T = time_basis · β_matᵀ: (n, p_cov).
-        // T[i, j] = time[i,:] · β[j,:].
-        let t_mat = self.time_basis.dot(&beta_mat.t());
-        // Result[i] = Σⱼ cov[i,j] * T[i,j] = rowwise dot of cov and T.
+        let time = self.time_basis.as_ref();
         let mut out = Array1::<f64>::zeros(n);
-        let cov_dense = self.cov.as_dense_cow();
-        for i in 0..n {
-            let mut acc = 0.0_f64;
+        // For each time column t, extract β[:,t] = [β[0*pt+t], β[1*pt+t], ...],
+        // compute cov · β[:,t], then weight by time[:,t].
+        let mut beta_slice = Array1::<f64>::zeros(p_cov);
+        for t in 0..p_time {
             for j in 0..p_cov {
-                acc += cov_dense[[i, j]] * t_mat[[i, j]];
+                beta_slice[j] = vector[j * p_time + t];
             }
-            out[i] = acc;
+            let cov_beta_t = self.cov.matrixvectormultiply(&beta_slice);
+            for i in 0..n {
+                out[i] += cov_beta_t[i] * time[[i, t]];
+            }
         }
         out
     }
 
     /// X' v where the result is (p_cov * p_time):
     ///   result[j*p_time + t] = Σᵢ v[i] * cov[i,j] * time[i,t]
+    ///
+    /// Computed via p_time calls to cov.apply_transpose() to stay sparse-native:
+    ///   For each t: result[:,t] = cov' · (v ⊙ time[:,t])
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         let p_cov = self.p_cov;
         let p_time = self.p_time;
         let n = self.n;
+        let time = self.time_basis.as_ref();
         let mut out = Array1::<f64>::zeros(p_cov * p_time);
-        let cov_dense = self.cov.as_dense_cow();
-        // Build weighted covariate: W[i,j] = v[i] * cov[i,j].
-        let mut weighted_cov = Array2::<f64>::zeros((n, p_cov));
-        for i in 0..n {
-            let vi = vector[i];
-            if vi == 0.0 {
-                continue;
+        // For each time column t, form w_t = v ⊙ time[:,t], compute cov' · w_t.
+        let mut w_t = Array1::<f64>::zeros(n);
+        for t in 0..p_time {
+            for i in 0..n {
+                w_t[i] = vector[i] * time[[i, t]];
             }
+            let col_t = self.cov.transpose_vector_multiply(&w_t);
             for j in 0..p_cov {
-                weighted_cov[[i, j]] = vi * cov_dense[[i, j]];
-            }
-        }
-        // result_mat[j, t] = Σᵢ W[i,j] * time[i,t] = Wᵀ · time_basis.
-        let result_mat = weighted_cov.t().dot(self.time_basis.as_ref());
-        // Flatten (p_cov, p_time) -> (p_cov * p_time).
-        for j in 0..p_cov {
-            for t in 0..p_time {
-                out[j * p_time + t] = result_mat[[j, t]];
+                out[j * p_time + t] = col_t[j];
             }
         }
         out
@@ -684,42 +680,19 @@ impl DesignOperator for RowwiseKroneckerOperator {
             ));
         }
         let mut xtwx = Array2::<f64>::zeros((p_total, p_total));
-        let cov_dense = self.cov.as_dense_cow();
         let time = self.time_basis.as_ref();
 
-        // For each time-basis pair (t1, t2), compute the weighted covariate Gram
-        // and scatter into the correct block of xtwx.
+        // For each time-basis pair (t1, t2), the (p_cov, p_cov) block is
+        //   cov' diag(γ_{t1,t2}) cov
+        // where γ[i] = w[i] * time[i,t1] * time[i,t2].
+        // We delegate to cov.compute_xtwx(γ) which stays sparse-native.
         let mut gamma = Array1::<f64>::zeros(n);
         for t1 in 0..p_time {
             for t2 in 0..=t1 {
-                // γ[i] = w[i] * time[i,t1] * time[i,t2]
                 for i in 0..n {
                     gamma[i] = weights[i].max(0.0) * time[[i, t1]] * time[[i, t2]];
                 }
-                // Block (j1, j2) = cov' diag(γ) cov — a (p_cov, p_cov) matrix.
-                let mut block = Array2::<f64>::zeros((p_cov, p_cov));
-                for i in 0..n {
-                    let g = gamma[i];
-                    if g == 0.0 {
-                        continue;
-                    }
-                    for j1 in 0..p_cov {
-                        let cij1 = cov_dense[[i, j1]];
-                        if cij1 == 0.0 {
-                            continue;
-                        }
-                        let scaled = g * cij1;
-                        for j2 in 0..=j1 {
-                            block[[j1, j2]] += scaled * cov_dense[[i, j2]];
-                        }
-                    }
-                }
-                // Symmetrize block.
-                for j1 in 0..p_cov {
-                    for j2 in 0..j1 {
-                        block[[j2, j1]] = block[[j1, j2]];
-                    }
-                }
+                let block = self.cov.compute_xtwx(&gamma)?;
                 // Scatter block into xtwx for both (t1, t2) and (t2, t1).
                 for j1 in 0..p_cov {
                     for j2 in 0..p_cov {
@@ -732,6 +705,34 @@ impl DesignOperator for RowwiseKroneckerOperator {
             }
         }
         Ok(xtwx)
+    }
+
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let n = self.n;
+        let p_cov = self.p_cov;
+        let p_time = self.p_time;
+        if weights.len() != n {
+            return Err(format!(
+                "RowwiseKroneckerOperator::diag_gram: weights {} != n {}",
+                weights.len(),
+                n
+            ));
+        }
+        let time = self.time_basis.as_ref();
+        // diag(X'WX)[j*pt+t] = Σᵢ w[i] * cov[i,j]² * time[i,t]²
+        // Use cov.diag_gram(w ⊙ time[:,t]²) which stays sparse-native.
+        let mut out = Array1::<f64>::zeros(p_cov * p_time);
+        let mut gamma = Array1::<f64>::zeros(n);
+        for t in 0..p_time {
+            for i in 0..n {
+                gamma[i] = weights[i].max(0.0) * time[[i, t]] * time[[i, t]];
+            }
+            let cov_diag = <DesignMatrix as LinearOperator>::diag_gram(&self.cov, &gamma)?;
+            for j in 0..p_cov {
+                out[j * p_time + t] = cov_diag[j];
+            }
+        }
+        Ok(out)
     }
 
     fn uses_matrix_free_pcg(&self) -> bool {
