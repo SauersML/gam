@@ -71,7 +71,7 @@ pub trait ResidualDistributionOps {
     /// This is the m4 ingredient for the outer REML Hessian's Q[v_k, v_l] term.
     /// The second directional derivative of the inner Hessian (used by the outer
     /// Hessian drift) requires the 4th derivative of the composed likelihood
-    /// F_αβγδ via the Faà di Bruno chain rule. That chain rule's leading term
+    /// F_αβγδ via the Arbogast chain rule. That chain rule's leading term
     /// m4·u_α·u_β·u_γ·u_δ needs this quantity.
     ///
     /// See response.md Section 6 for the mathematical derivation.
@@ -270,7 +270,7 @@ pub fn residual_distribution_inverse_link(distribution: ResidualDistribution) ->
 /// Fourth derivative of the inverse-link PDF (= 5th derivative of the CDF).
 ///
 /// This is the f'''' quantity used in the 4th derivative of log f(u), which
-/// in turn enters the m4 ingredient of the Faà di Bruno chain rule for
+/// in turn enters the m4 ingredient of the Arbogast chain rule for
 /// the outer REML Hessian Q[v_k, v_l] term.
 ///
 /// For the three standard survival residual distributions (Probit, Logit,
@@ -1581,7 +1581,7 @@ impl SurvivalLocationScaleFamily {
     ///
     /// This is needed for d⁴ℓ/dq0⁴ (the entry-side 4th likelihood derivative)
     /// and d⁴ℓ/dq1⁴ (the exit-side 4th likelihood derivative), which enter the
-    /// outer REML Hessian's Q[v_k, v_l] term via the Faà di Bruno formula.
+    /// outer REML Hessian's Q[v_k, v_l] term via the Arbogast formula.
     fn survival_ratio_third_derivative(
         r: f64,
         dr: f64,
@@ -1863,7 +1863,7 @@ impl SurvivalLocationScaleFamily {
         //   ell_h1q1 = -w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
         //
         // The 4th-order derivatives d4_q0 and d4_q1 are the m4 quantities
-        // needed by the Faà di Bruno chain rule for the outer REML Hessian.
+        // needed by the Arbogast chain rule for the outer REML Hessian.
         // They enter F_αβγδ = m4·u_α·u_β·u_γ·u_δ + ... in the (s,s,s,s)
         // and (ϑ,s,s,s) blocks. See response.md Section 6.
         let d1_q0 = w * r0;
@@ -1967,7 +1967,7 @@ pub(crate) fn q_chain_derivs_scalar(
 /// # Why 4th order is needed (see response.md Section 6)
 ///
 /// The outer REML Hessian's Q[v_k, v_l] term requires the 4th derivative
-/// of the composed likelihood via the Faà di Bruno formula:
+/// of the composed likelihood via the Arbogast formula:
 ///
 /// ```text
 ///   F_αβγδ = m4·u_α·u_β·u_γ·u_δ
@@ -2037,7 +2037,7 @@ pub(crate) fn q_chain_derivs_fourth_scalar(
     //   u_ϑssss = 4th s-deriv of u_ϑ   = -σ⁻¹  ← this is what we compute here
     //
     // The formula above gives -σ⁻¹ for exp link, which matches the 4th
-    // s-derivative (even count → negative). The Faà di Bruno entry for the
+    // s-derivative (even count → negative). The Arbogast entry for the
     // (ϑ,s,s,s) block uses u_ϑsss (3rd s-deriv = +σ⁻¹), NOT u_ϑssss.
     // But response.md Section 6 labels the needed quantity as u_ϑsss = σ⁻¹,
     // meaning the partial with indices (ϑ,s,s,s) = 3 s-slots = +σ⁻¹.
@@ -2073,7 +2073,7 @@ pub(crate) fn q_chain_derivs_fourth_scalar(
     //
     // So the 4th-order q chain derivatives that are introduced here are:
     //   (a) u_ϑsss = 3rd s-partial of u_ϑ — already computed as q_ll_ls/eta_t
-    //       but stored explicitly for the Faà di Bruno formula
+    //       but stored explicitly for the Arbogast formula
     //   (b) u_ssss = 4th s-partial of q — needs σ''''
     // Recompute cleanly to avoid division issues when eta_t ≈ 0:
     let q_tl_ls_ls_clean = d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * ds2 * dsigma / s4;
@@ -2114,7 +2114,7 @@ struct QChainDerivs {
     /// For exp link: +σ⁻¹ (alternating-sign pattern, 3rd s-derivative of u_ϑ).
     /// General formula: σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴.
     ///
-    /// This enters the (ϑ,s,s,s) block of the 4th-order Faà di Bruno formula
+    /// This enters the (ϑ,s,s,s) block of the 4th-order Arbogast formula
     /// via the m1·u_αβγδ term. See response.md Section 6.
     d4q_tls_ls_ls: Array1<f64>,
 
@@ -2124,7 +2124,7 @@ struct QChainDerivs {
     /// General formula: η_ϑ · (σ''''/σ² - 8σ'σ'''/σ³ - 6(σ'')²/σ³
     ///                         + 36(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵).
     ///
-    /// This enters the (s,s,s,s) block of the 4th-order Faà di Bruno formula
+    /// This enters the (s,s,s,s) block of the 4th-order Arbogast formula
     /// via the m1·u_αβγδ term. See response.md Section 6.
     d4q_ls: Array1<f64>,
 }
@@ -6573,7 +6573,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // d4q_ls = u_ssss) enter the bilinear derivatives of the 2nd-order
         // chain quantities: D²_{ψ}(d2q_tls) and D²_{ψ}(d2q_ls).
         //
-        // Together these provide the complete 4th-order Faà di Bruno formula
+        // Together these provide the complete 4th-order Arbogast formula
         // for the (ϑ,s,s,s) and (s,s,s,s) blocks of the outer Hessian drift
         // Q[v_k, v_l]. See response.md Section 6.
         //

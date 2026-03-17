@@ -862,7 +862,7 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
 ///
 /// Extends `inverse_link_pdfthird_derivative_for_inverse_link` by one order.
 /// Used for the outer REML Hessian Q[v_k, v_l] term in survival models,
-/// specifically the `m1 * u_{abcd}` Faa di Bruno contribution.
+/// specifically the `m1 * u_{abcd}` Arbogast contribution.
 pub fn inverse_link_pdffourth_derivative_for_inverse_link(
     link: &InverseLink,
     eta: f64,
@@ -1375,7 +1375,7 @@ pub fn sas_inverse_link_pdfthird_derivative(eta: f64, epsilon: f64, log_delta: f
     //
     //   u4 = g'''' r1^4 + 6 g''' r1² r2 + 3 g'' r2² + 4 g'' r1 r3 + g' r4,
     //
-    // which is the standard scalar Faà di Bruno expansion for order four.
+    // which is the standard scalar Arbogast expansion for order four.
     let e = if eta.is_finite() { eta } else { 0.0 };
     let a = e.asinh();
     let delta = sas_delta_from_raw_log_delta(log_delta);
@@ -1426,11 +1426,11 @@ pub fn sas_inverse_link_pdfthird_derivative(eta: f64, epsilon: f64, log_delta: f
 /// Extends `sas_inverse_link_pdfthird_derivative` by one more derivative order,
 /// using the same composition chain u(eta) = g(r(eta)), z = sinh(u), mu = Phi(z).
 ///
-/// The Faà di Bruno expansion at order 5 for u(eta) = g(r(eta)) is:
+/// The Arbogast expansion at order 5 for u(eta) = g(r(eta)) is:
 ///   u5 = g5 r1^5 + 10 g4 r1^3 r2 + 15 g3 r1 r2^2 + 10 g3 r1^2 r3
 ///        + 10 g2 r2 r3 + 5 g2 r1 r4 + g1 r5
 ///
-/// The z = sinh(u) expansion at order 5 is the standard Faà di Bruno for sinh:
+/// The z = sinh(u) expansion at order 5 is the standard Arbogast for sinh:
 ///   z5 = c*u1^5 + 10*s*u1^3*u2 + 15*c*u1*u2^2 + 10*c*u1^2*u3
 ///        + 10*s*u2*u3 + 5*s*u1*u4 + c*u5
 ///
@@ -1472,7 +1472,7 @@ pub fn sas_inverse_link_pdffourth_derivative(eta: f64, epsilon: f64, log_delta: 
     let r4 = delta * e * (9.0 - 6.0 * e * e) * inv_q7;
     let r5 = delta * (9.0 - 72.0 * e * e + 24.0 * e * e * e * e) * inv_q9;
 
-    // u1..u5 via Faà di Bruno for g(r(eta)).
+    // u1..u5 via Arbogast for g(r(eta)).
     let u1 = g1 * r1;
     let u2 = g2 * r1 * r1 + g1 * r2;
     let u3 = g3 * r1 * r1 * r1 + 3.0 * g2 * r1 * r2 + g1 * r3;
@@ -1489,7 +1489,7 @@ pub fn sas_inverse_link_pdffourth_derivative(eta: f64, epsilon: f64, log_delta: 
         + 5.0 * g2 * r1 * r4
         + g1 * r5;
 
-    // z1..z5 via Faà di Bruno for sinh(u(eta)).
+    // z1..z5 via Arbogast for sinh(u(eta)).
     let z1 = c * u1;
     let z2 = s * u1 * u1 + c * u2;
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
