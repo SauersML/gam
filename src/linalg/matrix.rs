@@ -19,6 +19,9 @@ const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
+/// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
+/// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
+const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
 
 pub use crate::linalg::utils::PcgSolveInfo;
 
@@ -1774,34 +1777,57 @@ impl TensorProductDesignOperator {
 
         let tail_dims: Vec<usize> = self.marginals[1..].iter().map(|m| m.ncols()).collect();
         let tail_total: usize = tail_dims.iter().product();
-        let mut tail_indices = vec![0usize; tail_dims.len()];
+        let intermediate_bytes = n * tail_total * std::mem::size_of::<f64>();
 
-        let mut out = Array1::<f64>::zeros(n);
-        let mut beta_slice = Array1::<f64>::zeros(q0);
-        let mut contrib = Array1::<f64>::zeros(n);
+        if intermediate_bytes <= TENSOR_GEMM_MAX_INTERMEDIATE_BYTES {
+            // ── GEMM path: one BLAS3 call for the B₁ contraction ────────
+            //
+            // Reshape β to (q₁, tail_total), compute B₁ · β_mat → (n, tail_total)
+            // via a single GEMM.  Then elementwise-multiply each column by the
+            // corresponding tail marginal products and row-sum.
+            let beta_mat = Array2::from_shape_vec(
+                (q0, tail_total),
+                vector.as_slice().unwrap().to_vec(),
+            )
+            .expect("β reshape for GEMM");
+            let temp = fast_ab(b0.as_ref(), &beta_mat); // (n, tail_total)
 
-        for t_flat in 0..tail_total {
-            decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
-
-            // Extract β[:, t₂, …, tₖ] from the flat coefficient vector.
-            for j1 in 0..q0 {
-                beta_slice[j1] = vector[j1 * tail_total + t_flat];
-            }
-
-            // BLAS matvec into pre-allocated buffer: B₁ · β_slice → contrib
-            fast_av_into(b0.as_ref(), &beta_slice, &mut contrib);
-
-            // Elementwise scale by remaining marginal columns.
-            for (dim_idx, &ti) in tail_indices.iter().enumerate() {
-                let m = &self.marginals[dim_idx + 1];
+            let mut out = Array1::<f64>::zeros(n);
+            let mut tail_indices = vec![0usize; tail_dims.len()];
+            for t_flat in 0..tail_total {
+                decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
                 for i in 0..n {
-                    contrib[i] *= m[[i, ti]];
+                    let mut val = temp[[i, t_flat]];
+                    for (dim_idx, &ti) in tail_indices.iter().enumerate() {
+                        val *= self.marginals[dim_idx + 1][[i, ti]];
+                    }
+                    out[i] += val;
                 }
             }
+            out
+        } else {
+            // ── GEMV fallback: one BLAS2 call per tail column ───────────
+            let mut tail_indices = vec![0usize; tail_dims.len()];
+            let mut out = Array1::<f64>::zeros(n);
+            let mut beta_slice = Array1::<f64>::zeros(q0);
+            let mut contrib = Array1::<f64>::zeros(n);
 
-            out += &contrib;
+            for t_flat in 0..tail_total {
+                decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
+                for j1 in 0..q0 {
+                    beta_slice[j1] = vector[j1 * tail_total + t_flat];
+                }
+                fast_av_into(b0.as_ref(), &beta_slice, &mut contrib);
+                for (dim_idx, &ti) in tail_indices.iter().enumerate() {
+                    let m = &self.marginals[dim_idx + 1];
+                    for i in 0..n {
+                        contrib[i] *= m[[i, ti]];
+                    }
+                }
+                out += &contrib;
+            }
+            out
         }
-        out
     }
 
     /// Compute X'v via column-wise BLAS transpose matvecs across all n observations.
@@ -1825,33 +1851,58 @@ impl TensorProductDesignOperator {
 
         let tail_dims: Vec<usize> = self.marginals[1..].iter().map(|m| m.ncols()).collect();
         let tail_total: usize = tail_dims.iter().product();
-        let mut tail_indices = vec![0usize; tail_dims.len()];
+        let intermediate_bytes = n * tail_total * std::mem::size_of::<f64>();
 
-        let mut out = Array1::<f64>::zeros(self.total_cols);
-        let mut scaled_v = Array1::<f64>::zeros(n);
-        let mut col_result = Array1::<f64>::zeros(q0);
-
-        for t_flat in 0..tail_total {
-            decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
-
-            // Form scaled_v = v ⊙ B₂[:,t₂] ⊙ … ⊙ Bₖ[:,tₖ]
-            scaled_v.assign(vector);
-            for (dim_idx, &ti) in tail_indices.iter().enumerate() {
-                let m = &self.marginals[dim_idx + 1];
+        if intermediate_bytes <= TENSOR_GEMM_MAX_INTERMEDIATE_BYTES {
+            // ── GEMM path: build W matrix, one BLAS3 call ───────────────
+            //
+            // W[i, t_flat] = v[i] · ∏_{d>1} Bᵈ[i, tᵈ]
+            // Then B₁' · W → (q₁, tail_total) via one GEMM.
+            let mut w_mat = Array2::<f64>::zeros((n, tail_total));
+            let mut tail_indices = vec![0usize; tail_dims.len()];
+            for t_flat in 0..tail_total {
+                decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
                 for i in 0..n {
-                    scaled_v[i] *= m[[i, ti]];
+                    let mut val = vector[i];
+                    for (dim_idx, &ti) in tail_indices.iter().enumerate() {
+                        val *= self.marginals[dim_idx + 1][[i, ti]];
+                    }
+                    w_mat[[i, t_flat]] = val;
                 }
             }
+            let result_mat = fast_atb(b0.as_ref(), &w_mat); // (q₁, tail_total)
 
-            // BLAS transpose matvec into pre-allocated buffer: B₁' · scaled_v → col_result
-            fast_atv_into(b0.as_ref(), &scaled_v, &mut col_result);
-
-            // Scatter into output: out[j₁ * tail_total + t_flat] = col_result[j₁]
+            // Scatter from (q₁, tail_total) matrix into flat output.
+            let mut out = Array1::<f64>::zeros(self.total_cols);
             for j1 in 0..q0 {
-                out[j1 * tail_total + t_flat] = col_result[j1];
+                for t_flat in 0..tail_total {
+                    out[j1 * tail_total + t_flat] = result_mat[[j1, t_flat]];
+                }
             }
+            out
+        } else {
+            // ── GEMV fallback ───────────────────────────────────────────
+            let mut tail_indices = vec![0usize; tail_dims.len()];
+            let mut out = Array1::<f64>::zeros(self.total_cols);
+            let mut scaled_v = Array1::<f64>::zeros(n);
+            let mut col_result = Array1::<f64>::zeros(q0);
+
+            for t_flat in 0..tail_total {
+                decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
+                scaled_v.assign(vector);
+                for (dim_idx, &ti) in tail_indices.iter().enumerate() {
+                    let m = &self.marginals[dim_idx + 1];
+                    for i in 0..n {
+                        scaled_v[i] *= m[[i, ti]];
+                    }
+                }
+                fast_atv_into(b0.as_ref(), &scaled_v, &mut col_result);
+                for j1 in 0..q0 {
+                    out[j1 * tail_total + t_flat] = col_result[j1];
+                }
+            }
+            out
         }
-        out
     }
 }
 
