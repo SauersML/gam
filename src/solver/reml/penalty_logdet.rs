@@ -174,7 +174,7 @@ impl PenaltyPseudologdet {
     ///
     /// When `structural_nullity` is provided, the bottom `m0` eigenvalues are
     /// treated as the nullspace even if ridge regularization makes them
-    /// numerically positive.  This mirrors `build_penalty_logdet_eigenspace`.
+    /// numerically positive.
     pub fn from_assembled_with_nullity(
         s_total: Array2<f64>,
         structural_nullity: Option<usize>,

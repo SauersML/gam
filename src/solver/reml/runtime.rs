@@ -463,9 +463,8 @@ impl<'a> RemlState<'a> {
                 let i1 = (i0 + TK_BLOCK_SIZE).min(n);
                 let x_block_i = x_dense.slice(s![i0..i1, ..]);
                 let c_i = c_array.slice(s![i0..i1]);
-                let z_block_i = z.slice(s![.., i0..i1]);
-                // Gram: G[bi, bj] = x_{i0+bi}^T z_{j0+bj} = X_block_i · z_block_j
-                let gram = x_block_i.dot(&z_block_j.t().to_owned().t());
+                // Gram: G[bi, bj] = x_{i0+bi}^T H⁻¹ x_{j0+bj}
+                let gram = x_block_i.dot(&z_block_j.to_owned());
 
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
@@ -729,105 +728,114 @@ impl<'a> RemlState<'a> {
             });
         }
 
-        let value = self.tierney_kadane_exact_value_from_bundle(bundle)?;
-        if mode == super::unified::EvalMode::ValueOnly {
+        let pirls_result = bundle.pirls_result.as_ref();
+        let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+        let c_array = Self::tk_sanitized_array(&c_array);
+        let d_array = Self::tk_sanitized_array(&d_array);
+        if c_array.is_empty() || d_array.is_empty() {
             return Ok(TkCorrectionTerms {
-                value,
-                gradient: None,
+                value: 0.0,
+                gradient: if mode != super::unified::EvalMode::ValueOnly {
+                    Some(Array1::zeros(rho.len()))
+                } else {
+                    None
+                },
                 hessian: None,
             });
         }
 
-        let k = rho.len();
-        let mut steps = Vec::with_capacity(k);
-        let mut plus = vec![0.0_f64; k];
-        let mut minus = vec![0.0_f64; k];
-        let mut gradient = Array1::<f64>::zeros(k);
-        let mut hessian = if mode == super::unified::EvalMode::ValueGradientHessian {
-            Some(Array2::<f64>::zeros((k, k)))
+        let compute_gradient = mode != super::unified::EvalMode::ValueOnly;
+
+        // Sparse path: value-only (analytic gradient not yet wired for sparse).
+        if let Some(sparse) = bundle.sparse_exact.as_ref() {
+            let x_dense = self
+                .x()
+                .try_to_dense_arc("exact TK correction requires dense design access")
+                .map_err(EstimationError::InvalidInput)?;
+            let value = self.tierney_kadane_exact_value_from_sparse(
+                x_dense.as_ref(),
+                sparse.factor.as_ref(),
+                &c_array,
+                &d_array,
+            )?;
+            // For sparse, fall back to FD gradient for now.
+            if !compute_gradient {
+                return Ok(TkCorrectionTerms {
+                    value,
+                    gradient: None,
+                    hessian: None,
+                });
+            }
+            let k = rho.len();
+            let mut gradient = Array1::<f64>::zeros(k);
+            for i in 0..k {
+                let h = self.tk_fd_step(rho[i])?;
+                let mut rho_p = rho.clone();
+                rho_p[i] += h;
+                let vp = self.tierney_kadane_exact_value_from_bundle(
+                    &self.obtain_eval_bundle(&rho_p)?,
+                )?;
+                let mut rho_m = rho.clone();
+                rho_m[i] -= h;
+                let vm = self.tierney_kadane_exact_value_from_bundle(
+                    &self.obtain_eval_bundle(&rho_m)?,
+                )?;
+                gradient[i] = (vp - vm) / (2.0 * h);
+            }
+            for g in gradient.iter_mut() {
+                if !g.is_finite() {
+                    *g = 0.0;
+                }
+            }
+            return Ok(TkCorrectionTerms {
+                value,
+                gradient: Some(gradient),
+                hessian: None,
+            });
+        }
+
+        // Dense path: analytic value + gradient.
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
+            Self::projectwith_basis(bundle.h_eff.as_ref(), z)
         } else {
-            None
+            bundle.h_eff.as_ref().clone()
+        };
+        let x_eff_dense = if let Some(z) = free_basis_opt.as_ref() {
+            pirls_result.x_transformed.to_dense().dot(z)
+        } else {
+            pirls_result.x_transformed.to_dense()
         };
 
-        for i in 0..k {
-            let h = self.tk_fd_step(rho[i])?;
-            steps.push(h);
+        // Penalty roots (possibly projected) and lambdas.
+        let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
+            pirls_result
+                .reparam_result
+                .rs_transformed
+                .iter()
+                .map(|r| r.dot(z))
+                .collect()
+        } else {
+            pirls_result.reparam_result.rs_transformed.clone()
+        };
+        let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+        let beta = if let Some(z) = free_basis_opt.as_ref() {
+            z.t()
+                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
+        } else {
+            pirls_result.beta_transformed.as_ref().clone()
+        };
 
-            let mut rho_p = rho.clone();
-            rho_p[i] += h;
-            plus[i] =
-                self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_p)?)?;
-
-            let mut rho_m = rho.clone();
-            rho_m[i] -= h;
-            minus[i] =
-                self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_m)?)?;
-
-            gradient[i] = (plus[i] - minus[i]) / (2.0 * h);
-            if let Some(ref mut tk_hess) = hessian {
-                tk_hess[[i, i]] = (plus[i] - 2.0 * value + minus[i]) / (h * h);
-            }
-        }
-
-        if let Some(ref mut tk_hess) = hessian {
-            for i in 0..k {
-                for j in 0..i {
-                    let hi = steps[i];
-                    let hj = steps[j];
-
-                    let mut rho_pp = rho.clone();
-                    rho_pp[i] += hi;
-                    rho_pp[j] += hj;
-                    let f_pp = self.tierney_kadane_exact_value_from_bundle(
-                        &self.obtain_eval_bundle(&rho_pp)?,
-                    )?;
-
-                    let mut rho_pm = rho.clone();
-                    rho_pm[i] += hi;
-                    rho_pm[j] -= hj;
-                    let f_pm = self.tierney_kadane_exact_value_from_bundle(
-                        &self.obtain_eval_bundle(&rho_pm)?,
-                    )?;
-
-                    let mut rho_mp = rho.clone();
-                    rho_mp[i] -= hi;
-                    rho_mp[j] += hj;
-                    let f_mp = self.tierney_kadane_exact_value_from_bundle(
-                        &self.obtain_eval_bundle(&rho_mp)?,
-                    )?;
-
-                    let mut rho_mm = rho.clone();
-                    rho_mm[i] -= hi;
-                    rho_mm[j] -= hj;
-                    let f_mm = self.tierney_kadane_exact_value_from_bundle(
-                        &self.obtain_eval_bundle(&rho_mm)?,
-                    )?;
-
-                    let val = (f_pp - f_pm - f_mp + f_mm) / (4.0 * hi * hj);
-                    tk_hess[[i, j]] = val;
-                    tk_hess[[j, i]] = val;
-                }
-            }
-        }
-
-        for g in gradient.iter_mut() {
-            if !g.is_finite() {
-                *g = 0.0;
-            }
-        }
-        if let Some(ref mut tk_hess) = hessian {
-            for val in tk_hess.iter_mut() {
-                if !val.is_finite() {
-                    *val = 0.0;
-                }
-            }
-        }
-
-        Ok(TkCorrectionTerms {
-            value,
-            gradient: Some(gradient),
-            hessian,
-        })
+        self.tierney_kadane_analytic_from_dense(
+            &x_eff_dense,
+            &h_eff_eval,
+            &c_array,
+            &d_array,
+            &penalty_roots,
+            &lambdas,
+            &beta,
+            compute_gradient,
+        )
     }
 
     fn apply_tk_to_result(
