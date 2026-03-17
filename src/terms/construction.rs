@@ -570,10 +570,16 @@ pub struct ReparamResult {
     pub det1: Array1<f64>,
     /// Orthogonal transformation matrix Qs
     pub qs: Array2<f64>,
-    /// Transformed penalty square roots rS (each is rank_k x p)
+    /// Transformed penalty square roots rS (each is rank_k x p).
+    /// These are the original block-local roots multiplied by QS.
     pub rs_transformed: Vec<Array2<f64>>,
     /// Cached transposes of rS (each is p x rank_k) to avoid repeated transposes in hot paths
     pub rs_transposed: Vec<Array2<f64>>,
+    /// Canonical penalties in the TRANSFORMED coordinate frame.
+    /// Built once from `rs_transformed` so downstream consumers (TK correction,
+    /// ext-coord paths) can use block-local `PenaltyCoordinate` construction
+    /// without re-cloning the global roots.
+    pub canonical_transformed: Vec<CanonicalPenalty>,
     /// Lambda-dependent penalty square root in TRANSFORMED coordinates (rank x p matrix).
     /// This is used for applying the actual penalty in the least squares solve.
     pub e_transformed: Array2<f64>,
@@ -1245,6 +1251,22 @@ pub struct CanonicalPenalty {
 }
 
 impl CanonicalPenalty {
+    /// Construct a dense (full-width) canonical penalty from a `rank x p` root.
+    /// Used to wrap reparam-transformed roots for consumers that expect
+    /// `&[CanonicalPenalty]`.
+    pub fn from_dense_root(root: Array2<f64>, p: usize) -> Self {
+        let local = root.t().dot(&root);
+        let positive_eigenvalues = Vec::new(); // not needed for TK paths
+        Self {
+            root,
+            col_range: 0..p,
+            total_dim: p,
+            nullity: 0,
+            local,
+            positive_eigenvalues,
+        }
+    }
+
     /// Numerical rank of this penalty.
     pub fn rank(&self) -> usize {
         self.root.nrows()
@@ -1361,8 +1383,8 @@ pub fn canonicalize_penalty_spec(
 ) -> Result<Option<CanonicalPenalty>, EstimationError> {
     use crate::estimate::PenaltySpec;
 
-    let (local_matrix, col_range) = match spec {
-        PenaltySpec::Block { local, col_range } => {
+    let (local_matrix, col_range, hint) = match spec {
+        PenaltySpec::Block { local, col_range, structure_hint } => {
             let bd = col_range.len();
             if local.nrows() != bd || local.ncols() != bd {
                 return Err(EstimationError::InvalidInput(format!(
@@ -1377,7 +1399,7 @@ pub fn canonicalize_penalty_spec(
                     col_range.start, col_range.end
                 )));
             }
-            (local.view(), col_range.clone())
+            (local.view(), col_range.clone(), structure_hint.as_ref())
         }
         PenaltySpec::Dense(m) => {
             if m.nrows() != p || m.ncols() != p {
@@ -1387,10 +1409,66 @@ pub fn canonicalize_penalty_spec(
                     m.ncols()
                 )));
             }
-            (m.view(), 0..p)
+            (m.view(), 0..p, None)
         }
     };
 
+    let block_dim = col_range.len();
+
+    // ── Ridge fast path: closed-form, no eigendecomposition ──
+    if let Some(PenaltyStructureHint::Ridge(scale)) = hint {
+        if *scale <= 0.0 {
+            return Ok(None);
+        }
+        let sqrt_scale = scale.sqrt();
+        let mut root = Array2::zeros((block_dim, block_dim));
+        for i in 0..block_dim {
+            root[[i, i]] = sqrt_scale;
+        }
+        return Ok(Some(CanonicalPenalty {
+            root,
+            col_range,
+            total_dim: p,
+            nullity: 0,
+            local: local_matrix.to_owned(),
+            positive_eigenvalues: vec![*scale; block_dim],
+        }));
+    }
+
+    // ── Kronecker fast path: per-factor eigendecomposition ──
+    if let Some(PenaltyStructureHint::Kronecker(factors)) = hint {
+        let kron_global = kronecker_root(&col_range, factors, p)?;
+        let rank_k = kron_global.nrows();
+        if rank_k == 0 {
+            return Ok(None);
+        }
+        let root = kron_global
+            .slice(s![.., col_range.start..col_range.end])
+            .to_owned();
+        // Still need eigenvalues for REML logdet — eigendecompose the local block.
+        let local_owned = local_matrix.to_owned();
+        let analysis = analyze_penalty_block(&local_owned).map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "{context}: Kronecker penalty eigenvalue extraction at index {idx}: {err}"
+            ))
+        })?;
+        let positive_eigenvalues: Vec<f64> = analysis
+            .eigenvalues
+            .iter()
+            .copied()
+            .filter(|&ev| ev > analysis.tol)
+            .collect();
+        return Ok(Some(CanonicalPenalty {
+            root,
+            col_range,
+            total_dim: p,
+            nullity: analysis.nullity,
+            local: analysis.sym_penalty,
+            positive_eigenvalues,
+        }));
+    }
+
+    // ── Generic block-local path: eigendecompose at O(block_dim³) ──
     let local_owned = local_matrix.to_owned();
     let analysis = analyze_penalty_block(&local_owned).map_err(|err| {
         EstimationError::InvalidInput(format!(
@@ -1413,7 +1491,6 @@ pub fn canonicalize_penalty_spec(
     // Reuse eigendecomposition from analyze_penalty_block — no double eigendecomp.
     let tolerance = analysis.tol;
     let rank_k = analysis.rank;
-    let block_dim = local_owned.nrows();
 
     let mut root = Array2::zeros((rank_k, block_dim));
     let mut positive_eigenvalues = Vec::with_capacity(rank_k);
@@ -1951,9 +2028,8 @@ pub fn precompute_reparam_invariant_from_canonical(
 
     struct BlockResult {
         col_range: Range<usize>,
-        q_pen_local: Array2<f64>,
-        q_null_local: Array2<f64>,
-        qs_local: Array2<f64>,
+        q_pen_local: Array2<f64>,   // block_dim × pen_rank
+        q_null_local: Array2<f64>,  // block_dim × null_rank
         max_bal: f64,
         penalty_indices: Vec<usize>,
         /// Column offset of this block's penalized directions within global Q_pen.
@@ -1988,7 +2064,6 @@ pub fn precompute_reparam_invariant_from_canonical(
                 col_range: start..end,
                 q_pen_local: Array2::zeros((block_dim, 0)),
                 q_null_local: Array2::eye(block_dim),
-                qs_local: Array2::eye(block_dim),
                 max_bal: 0.0,
                 penalty_indices,
                 pen_col_offset: 0, // set later
@@ -2035,23 +2110,11 @@ pub fn precompute_reparam_invariant_from_canonical(
             }
         }
 
-        // Local Q_s = [Q_pen | Q_null]
-        let mut qs_local = Array2::zeros((block_dim, block_dim));
-        for i in 0..block_dim {
-            for j in 0..penalized_rank {
-                qs_local[[i, j]] = q_pen_local[[i, j]];
-            }
-            for j in 0..null_count {
-                qs_local[[i, penalized_rank + j]] = q_null_local[[i, j]];
-            }
-        }
-
         global_max_bal = global_max_bal.max(max_bal);
         block_results.push(BlockResult {
             col_range: start..end,
             q_pen_local,
             q_null_local,
-            qs_local,
             max_bal,
             penalty_indices,
             pen_col_offset: 0, // set later
@@ -2116,26 +2179,30 @@ pub fn precompute_reparam_invariant_from_canonical(
 
         for &pi in &br.penalty_indices {
             let cp = &penalties[pi];
-            let local_root = &cp.root;
+            let local_root = &cp.root; // rank_k × block_dim
+
             let rank_k = local_root.nrows();
-
-            // Transform: rs_local_transformed = local_root * qs_local
-            // Columns [0..pen_r] are penalized, [pen_r..block_dim] are null.
-            let rs_transformed_local = local_root.dot(&br.qs_local);
-
-            // Scatter into Q_s-rotated global layout.
             let mut rs_global = Array2::zeros((rank_k, p));
+
+            // Penalized part: R_local * Q_pen_local → rank_k × pen_r
+            // Scatter to global columns pen_col_offset .. + pen_r
             if pen_r > 0 {
+                let pen_part = local_root.dot(&br.q_pen_local);
                 rs_global
                     .slice_mut(s![.., br.pen_col_offset..(br.pen_col_offset + pen_r)])
-                    .assign(&rs_transformed_local.slice(s![.., ..pen_r]));
+                    .assign(&pen_part);
             }
+
+            // Null part: R_local * Q_null_local → rank_k × null_r
+            // Scatter to global columns (total_pen_rank + null_col_offset) .. + null_r
             if null_r > 0 {
+                let null_part = local_root.dot(&br.q_null_local);
                 let null_global_start = total_pen_rank + br.null_col_offset;
                 rs_global
                     .slice_mut(s![.., null_global_start..(null_global_start + null_r)])
-                    .assign(&rs_transformed_local.slice(s![.., pen_r..(pen_r + null_r)]));
+                    .assign(&null_part);
             }
+
             rs_transformed_base[pi] = rs_global;
         }
     }
@@ -2194,6 +2261,7 @@ pub fn stable_reparameterizationwith_invariant(
             qs: Array2::eye(p),
             rs_transformed: vec![],
             rs_transposed: vec![],
+            canonical_transformed: vec![],
             e_transformed: Array2::zeros((0, p)),
             // All modes truncated when no penalties; already in transformed frame.
             u_truncated: Array2::eye(p),
@@ -2207,6 +2275,10 @@ pub fn stable_reparameterizationwith_invariant(
         // Derive full-width roots from block-local canonical penalties.
         let global_roots: Vec<Array2<f64>> =
             penalties.iter().map(|cp| cp.global_root()).collect();
+        let canonical_transformed: Vec<CanonicalPenalty> = global_roots
+            .iter()
+            .map(|r| CanonicalPenalty::from_dense_root(r.clone(), p))
+            .collect();
         return Ok(ReparamResult {
             s_transformed: Array2::zeros((p, p)),
             log_det: 0.0,
@@ -2214,6 +2286,7 @@ pub fn stable_reparameterizationwith_invariant(
             qs,
             rs_transposed: global_roots.iter().map(|r| r.t().to_owned()).collect(),
             rs_transformed: global_roots,
+            canonical_transformed,
             e_transformed: Array2::zeros((0, p)),
             // Stored in transformed frame for downstream trace/correction math.
             u_truncated, // All modes truncated when zero penalty
@@ -2496,16 +2569,23 @@ pub fn stable_reparameterizationwith_invariant(
         );
     }
 
+    let rs_transformed_arr: Vec<Array2<f64>> =
+        rs_transformed.iter().map(mat_to_array).collect();
+    let canonical_transformed: Vec<CanonicalPenalty> = rs_transformed_arr
+        .iter()
+        .map(|r| CanonicalPenalty::from_dense_root(r.clone(), p))
+        .collect();
     Ok(ReparamResult {
         s_transformed: mat_to_array(&s_truncated),
         log_det,
         det1: Array1::from(det1vec),
         qs: mat_to_array(&qs),
-        rs_transformed: rs_transformed.iter().map(mat_to_array).collect(),
-        rs_transposed: rs_transformed
+        rs_transposed: rs_transformed_arr
             .iter()
-            .map(|mat| Array2::from_shape_fn((mat.ncols(), mat.nrows()), |(i, j)| mat[(j, i)]))
+            .map(|r| r.t().to_owned())
             .collect(),
+        rs_transformed: rs_transformed_arr,
+        canonical_transformed,
         e_transformed: mat_to_array(&e_transformed_mat),
         u_truncated: mat_to_array(&u_truncated_mat),
         penalty_shrinkage_ridge: shrinkage_ridge,
@@ -2712,6 +2792,10 @@ impl KroneckerReparamResult {
             }
         }
 
+        let canonical_transformed: Vec<CanonicalPenalty> = rs_transformed
+            .iter()
+            .map(|r| CanonicalPenalty::from_dense_root(r.clone(), p))
+            .collect();
         Ok(ReparamResult {
             s_transformed,
             log_det: self.log_det,
@@ -2719,6 +2803,7 @@ impl KroneckerReparamResult {
             qs,
             rs_transformed,
             rs_transposed,
+            canonical_transformed,
             e_transformed,
             u_truncated,
             penalty_shrinkage_ridge: self.penalty_shrinkage_ridge,

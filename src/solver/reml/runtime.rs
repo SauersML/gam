@@ -87,19 +87,25 @@ impl<'a> RemlState<'a> {
             self.fixed_subspace_penalty_rank_and_logdet(e_for_logdet, ridge_passport)?;
         let lambdas = rho.mapv(f64::exp);
 
-        // Prefer the block-local path when canonical penalties are available
-        // and match the penalty count (i.e., we're not in a projected subspace).
-        let (det1, det2_full) = if self.canonical_penalties.len() == penalty_roots.len() {
+        // Use block-local path from canonical penalties (basis-invariant logdet).
+        // The penalty logdet log|Σ λ_k S_k|₊ is invariant under orthogonal
+        // transformation, so the original-basis canonical penalties give the
+        // same result as transformed-basis roots.
+        let (det1, det2_full) = if !self.canonical_penalties.is_empty()
+            && self.canonical_penalties.len() == rho.len()
+        {
             self.structural_penalty_logdet_derivatives_block_local(
                 &lambdas,
                 ridge_passport.penalty_logdet_ridge(),
             )?
-        } else {
+        } else if !penalty_roots.is_empty() {
             self.structural_penalty_logdet_derivatives(
                 penalty_roots,
                 &lambdas,
                 ridge_passport.penalty_logdet_ridge(),
             )?
+        } else {
+            (Array1::zeros(rho.len()), Array2::zeros((rho.len(), rho.len())))
         };
 
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
@@ -155,7 +161,7 @@ impl<'a> RemlState<'a> {
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
-        penalty_roots: &[Array2<f64>],
+        tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
@@ -163,7 +169,7 @@ impl<'a> RemlState<'a> {
     ) -> Array1<f64> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
-        let k = penalty_roots.len();
+        let k = tk_penalties.len();
         let xt = x_dense.t();
 
         // Hat leverages
@@ -274,11 +280,14 @@ impl<'a> RemlState<'a> {
             let trace_ak_p = if let Some(coords) = penalty_coords {
                 coords[idx].trace_with_dense(&p_total, lambdas[idx])
             } else {
-                let r_k = &penalty_roots[idx];
-                let rk_p = r_k.dot(&p_total);
+                // Block-local: tr(λ_k S_k P) = λ_k tr(R_k P[block,block] R_k^T)
+                let cp = &tk_penalties[idx];
+                let r = &cp.col_range;
+                let p_block = p_total.slice(s![r.start..r.end, r.start..r.end]);
+                let rk_p = cp.root.dot(&p_block);
                 lambdas[idx]
-                    * (0..r_k.nrows())
-                        .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
+                    * (0..cp.rank())
+                        .map(|row| rk_p.row(row).dot(&cp.root.row(row).to_owned()))
                         .sum::<f64>()
             };
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
@@ -299,7 +308,7 @@ impl<'a> RemlState<'a> {
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
-        penalty_roots: &[Array2<f64>],
+        tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         beta: &Array1<f64>,
         compute_gradient: bool,
@@ -308,7 +317,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<TkCorrectionTerms, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
-        let k = penalty_roots.len();
+        let k = tk_penalties.len();
         let xt = x_dense.t();
 
         // ── Hat leverages h_i = x_i^T H⁻¹ x_i ──
@@ -379,12 +388,15 @@ impl<'a> RemlState<'a> {
         let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
         let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k);
         for idx in 0..k {
-            let r_k = &penalty_roots[idx];
-            let r_beta = r_k.dot(beta);
+            // Block-local: A_k β = λ_k R^T (R β[block]), embedded into p-vector.
+            let cp = &tk_penalties[idx];
+            let r = &cp.col_range;
+            let beta_block = beta.slice(s![r.start..r.end]);
+            let r_beta = cp.root.dot(&beta_block);
             let mut s_k_beta = Array1::<f64>::zeros(p);
-            for a in 0..p {
-                s_k_beta[a] = (0..r_k.nrows())
-                    .map(|row| r_k[[row, a]] * r_beta[row])
+            for a in 0..cp.block_dim() {
+                s_k_beta[r.start + a] = (0..cp.rank())
+                    .map(|row| cp.root[[row, a]] * r_beta[row])
                     .sum::<f64>();
             }
             let a_k_beta = &s_k_beta * lambdas[idx];
@@ -402,7 +414,7 @@ impl<'a> RemlState<'a> {
             z,
             c_array,
             d_array,
-            penalty_roots,
+            tk_penalties,
             lambdas,
             &x_vks,
             h_inv_solve,
@@ -428,21 +440,23 @@ impl<'a> RemlState<'a> {
             for l in 0..k {
                 // Compute Ḣ_l Z = A_l Z + X^T diag(c ⊙ x_vl) X Z, column by column.
                 // Then δZ_l = H⁻¹(Ḣ_l Z).
-                let r_l = &penalty_roots[l];
+                let cp_l = &tk_penalties[l];
+                let rl = &cp_l.col_range;
                 let x_vl = &x_vks[l];
 
-                // A_l Z: for each column j, A_l z_j = λ_l R_l^T (R_l z_j)
+                // A_l Z: block-local A_l z_j = λ_l R^T (R z_j[block])
                 // C_l Z: for each column j, X^T(c ⊙ x_vl ⊙ (X z_j))
                 let mut h_dot_l_z = Array2::<f64>::zeros((p, n));
                 for j in 0..n {
                     let z_j = z.column(j).to_owned();
-                    // A_l z_j
-                    let rl_zj = r_l.dot(&z_j);
+                    // A_l z_j — block-local
+                    let z_j_block = z_j.slice(s![rl.start..rl.end]);
+                    let rl_zj = cp_l.root.dot(&z_j_block);
                     let mut col = Array1::<f64>::zeros(p);
-                    for a in 0..p {
-                        col[a] = lambdas[l]
-                            * (0..r_l.nrows())
-                                .map(|row| r_l[[row, a]] * rl_zj[row])
+                    for a in 0..cp_l.block_dim() {
+                        col[rl.start + a] = lambdas[l]
+                            * (0..cp_l.rank())
+                                .map(|row| cp_l.root[[row, a]] * rl_zj[row])
                                 .sum::<f64>();
                     }
                     // C_l z_j = X^T(c ⊙ x_vl ⊙ (X z_j))
@@ -523,7 +537,7 @@ impl<'a> RemlState<'a> {
                     &z_plus,
                     c_array,
                     d_array,
-                    penalty_roots,
+                    tk_penalties,
                     &lambdas_plus,
                     &x_vks_plus,
                     h_inv_solve,
@@ -534,7 +548,7 @@ impl<'a> RemlState<'a> {
                     &z_minus,
                     c_array,
                     d_array,
-                    penalty_roots,
+                    tk_penalties,
                     &lambdas_minus,
                     &x_vks_minus,
                     h_inv_solve,
@@ -708,17 +722,20 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        // Penalty roots (possibly projected) and lambdas.
-        let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
-            pirls_result
-                .reparam_result
-                .rs_transformed
-                .iter()
-                .map(|r| r.dot(z))
-                .collect()
-        } else {
-            pirls_result.reparam_result.rs_transformed.clone()
-        };
+        // Use pre-built canonical penalties in the transformed coordinate frame.
+        // When constraint projection is active, project the roots into the free subspace.
+        let p_eff = x_eff_dense.ncols();
+        let tk_penalties: Vec<crate::construction::CanonicalPenalty> =
+            if let Some(z) = free_basis_opt.as_ref() {
+                pirls_result
+                    .reparam_result
+                    .canonical_transformed
+                    .iter()
+                    .map(|cp| crate::construction::CanonicalPenalty::from_dense_root(cp.root.dot(z), p_eff))
+                    .collect()
+            } else {
+                pirls_result.reparam_result.canonical_transformed.clone()
+            };
         let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
         let beta = if let Some(z) = free_basis_opt.as_ref() {
             z.t()
@@ -732,7 +749,7 @@ impl<'a> RemlState<'a> {
             &z_mat,
             &c_array,
             &d_array,
-            &penalty_roots,
+            &tk_penalties,
             &lambdas,
             &beta,
             compute_gradient,
@@ -3035,20 +3052,12 @@ impl<'a> RemlState<'a> {
             })?,
         );
 
-        let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
-            pirls_result
-                .reparam_result
-                .rs_transformed
-                .iter()
-                .map(|r| r.dot(z))
-                .collect()
-        } else {
-            pirls_result.reparam_result.rs_transformed.clone()
-        };
+        // Penalty logdet uses block-local canonical penalties (basis-invariant).
+        // No need to clone or project rs_transformed.
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             &e_for_logdet,
-            &penalty_roots,
+            &[],  // block-local path via canonical_penalties is preferred
             ridge_passport,
             mode,
         )?;
@@ -3285,7 +3294,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         hessian_op: Box<dyn super::unified::HessianOperator>,
         beta: Array1<f64>,
-        penalty_roots: Vec<Array2<f64>>,
+        _penalty_roots: Vec<Array2<f64>>,
         penalty_logdet: super::unified::PenaltyLogdetDerivs,
         deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
         tk_correction: f64,
@@ -3303,18 +3312,11 @@ impl<'a> RemlState<'a> {
 
         let n_observations = self.y.len();
         let beta_for_barrier = beta.clone();
-        let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
-            if self.canonical_penalties.len() == penalty_roots.len() {
-                self.canonical_penalties
-                    .iter()
-                    .map(|cp| cp.to_penalty_coordinate())
-                    .collect()
-            } else {
-                penalty_roots
-                    .into_iter()
-                    .map(super::unified::PenaltyCoordinate::from_dense_root)
-                    .collect()
-            };
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> = self
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.to_penalty_coordinate())
+            .collect();
         let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,
             penalty_quadratic,
@@ -3475,21 +3477,10 @@ impl<'a> RemlState<'a> {
         let (penalty_rank, ..) =
             self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
 
-        let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
-            pirls_result
-                .reparam_result
-                .rs_transformed
-                .iter()
-                .map(|r| r.dot(z))
-                .collect()
-        } else {
-            pirls_result.reparam_result.rs_transformed.clone()
-        };
-
         let (_, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             &e_for_logdet,
-            &penalty_roots,
+            &[], // Block-local path via canonical_penalties handles logdet
             ridge_passport,
             super::unified::EvalMode::ValueOnly,
         )?;
@@ -3526,7 +3517,7 @@ impl<'a> RemlState<'a> {
             rho,
             hessian_op,
             beta,
-            penalty_roots,
+            Vec::new(), // canonical_penalties used directly inside
             penalty_logdet,
             deriv_provider,
             tk_correction,
