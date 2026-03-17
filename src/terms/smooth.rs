@@ -1090,9 +1090,10 @@ fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f6
 impl LinearFitConditioning {
     fn from_columns(design: &TermCollectionDesign, selected_cols: &[usize]) -> Self {
         const SCALE_EPS: f64 = 1e-12;
+        let dense = design.design.as_dense_cow();
         let mut columns = Vec::with_capacity(selected_cols.len());
         for &col_idx in selected_cols {
-            let col = design.design.column(col_idx);
+            let col = dense.column(col_idx);
             let n = col.len();
             if n == 0 {
                 continue;
@@ -2493,6 +2494,71 @@ pub fn build_term_collection_design(
             .slice_mut(s![.., (p_intercept + p_lin)..])
             .assign(&smooth.design);
     }
+
+    // Track random-effect column ranges in the global coordinate system.
+    // Global layout: [intercept(1) | linear(p_lin) | RE_0(q0) | RE_1(q1) | … | smooth(p_smooth)]
+    let mut random_effect_ranges =
+        Vec::<(String, Range<usize>)>::with_capacity(random_blocks.len());
+    let mut random_effect_levels =
+        Vec::<(String, Vec<u64>)>::with_capacity(random_blocks.len());
+    let mut col_cursor = p_intercept + p_lin;
+    for block in &random_blocks {
+        let q = block.num_groups;
+        let end = col_cursor + q;
+        random_effect_ranges.push((block.name.clone(), col_cursor..end));
+        random_effect_levels.push((block.name.clone(), block.kept_levels.clone()));
+        col_cursor = end;
+    }
+
+    // Assemble the full DesignMatrix.
+    //
+    // When random effects are present, use a BlockDesignOperator that composes
+    // the dense core (intercept + linear) with O(n) random-effect operators and
+    // the dense smooth block.  This avoids materializing the n × q one-hot
+    // matrices — the dominant memory cost for biobank-scale random intercepts.
+    //
+    // When there are no random effects, the dense core already contains all
+    // columns and is wrapped directly.
+    let design: DesignMatrix = if random_blocks.is_empty() {
+        // No RE — dense_core already has [intercept | linear | smooth].
+        DesignMatrix::Dense(Arc::new(dense_core))
+    } else {
+        // Build the block operator.
+        //
+        // Global column layout:
+        //   [intercept + linear] | [RE_0] | [RE_1] | … | [smooth]
+        //
+        // dense_core has [intercept + linear + smooth] columns.  We split it
+        // into two dense blocks (pre-RE and post-RE) with RE operators in between.
+        let p_pre_re = p_intercept + p_lin; // intercept + linear columns
+        let mut blocks = Vec::<DesignBlock>::new();
+
+        // Block 0: intercept + linear (dense).
+        if p_pre_re > 0 {
+            let pre_re = dense_core.slice(s![.., ..p_pre_re]).to_owned();
+            blocks.push(DesignBlock::Dense(Arc::new(pre_re)));
+        }
+
+        // Blocks 1..k: random-effect operators.
+        for block in &random_blocks {
+            let re_op = RandomEffectOperator::new(
+                block.group_ids.clone(),
+                block.num_groups,
+            );
+            blocks.push(DesignBlock::RandomEffect(Arc::new(re_op)));
+        }
+
+        // Final block: smooth (dense), if present.
+        if p_smooth > 0 {
+            let smooth_part = dense_core.slice(s![.., p_pre_re..]).to_owned();
+            blocks.push(DesignBlock::Dense(Arc::new(smooth_part)));
+        }
+
+        let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
+            BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
+        })?;
+        DesignMatrix::Operator(Arc::new(block_op))
+    };
 
     let mut penalties = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims = Vec::<usize>::new();
