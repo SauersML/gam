@@ -4466,13 +4466,32 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     };
     let eb: &Array2<f64> = eb_cow.as_ref();
 
-    let reparam_result = stable_reparameterization_engine_canonical(
-        penalty.canonical_penalties,
-        lambdas_slice,
-        EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
-        penalty.reparam_invariant,
-        penalty.penalty_shrinkage_floor,
-    )?;
+    // Kronecker fast path: factored reparameterization via marginal eigensystems.
+    // Qs = U_1 ⊗ ... ⊗ U_d, avoiding O(p³) eigendecomposition of the balanced penalty.
+    let reparam_result = if let Some(kron) = penalty.kronecker_factored {
+        let rs_list: Vec<Array2<f64>> = penalty
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.full_width_root())
+            .collect();
+        let kron_result = crate::construction::kronecker_reparameterization_engine(
+            &kron.marginal_designs,
+            &kron.marginal_penalties,
+            &kron.marginal_dims,
+            lambdas_slice,
+            kron.has_double_penalty,
+            penalty.penalty_shrinkage_floor,
+        )?;
+        kron_result.to_standard_reparam_result(&rs_list, lambdas_slice, penalty.p)?
+    } else {
+        stable_reparameterization_engine_canonical(
+            penalty.canonical_penalties,
+            lambdas_slice,
+            EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
+            penalty.reparam_invariant,
+            penalty.penalty_shrinkage_floor,
+        )?
+    };
     let transformed_bounds = build_transformed_lower_bound_constraints(
         &reparam_result.qs,
         penalty.coefficient_lower_bounds,
@@ -7439,6 +7458,7 @@ mod tests {
                 coefficient_lower_bounds: None,
                 linear_constraints_original: None,
                 penalty_shrinkage_floor: None,
+                kronecker_factored: None,
             },
             &config,
             Some(&Coefficients::new(array![0.0])),
@@ -7595,6 +7615,7 @@ mod tests {
                 coefficient_lower_bounds: None,
                 linear_constraints_original: None,
                 penalty_shrinkage_floor: None,
+                kronecker_factored: None,
             },
             &config,
             None,
@@ -7971,6 +7992,7 @@ mod root_cause_tests {
                     coefficient_lower_bounds: None,
                     linear_constraints_original: None,
                     penalty_shrinkage_floor: None,
+                    kronecker_factored: None,
                 },
                 &config,
                 None,
@@ -8043,6 +8065,7 @@ mod root_cause_tests {
                     coefficient_lower_bounds: None,
                     linear_constraints_original: None,
                     penalty_shrinkage_floor: None,
+                    kronecker_factored: None,
                 },
                 &config,
                 None,
@@ -8135,6 +8158,7 @@ mod root_cause_tests {
                         coefficient_lower_bounds: None,
                         linear_constraints_original: None,
                         penalty_shrinkage_floor: None,
+                        kronecker_factored: None,
                     },
                     &config,
                     None,

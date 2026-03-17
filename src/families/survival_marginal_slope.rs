@@ -1575,6 +1575,7 @@ fn pooled_survival_baseline(event: &Array1<f64>, z: &Array1<f64>, weights: &Arra
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
             kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     );
     match fit {

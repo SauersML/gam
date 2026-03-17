@@ -82,6 +82,7 @@ fn fit_beta_norm(
             coefficient_lower_bounds: None,
             linear_constraints_original: None,
             penalty_shrinkage_floor: None,
+            kronecker_factored: None,
         },
         &cfg,
         None,
@@ -126,6 +127,7 @@ fn proxycostwith_pirls(
             coefficient_lower_bounds: None,
             linear_constraints_original: None,
             penalty_shrinkage_floor: None,
+            kronecker_factored: None,
         },
         &cfg,
         None,
@@ -155,6 +157,7 @@ fn firthfd_step_size_sensitivity() {
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     };
     let base_rho = 12.0;
     let cost_at = |rho: f64| -> f64 {

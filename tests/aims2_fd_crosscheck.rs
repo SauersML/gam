@@ -115,6 +115,7 @@ fn gaussian_opts(nullspace_dim: usize) -> ExternalOptimOptions {
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     }
 }
 
@@ -219,6 +220,7 @@ fn profiled_gaussian_reml_gradient_matches_fd_two_penalties() {
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     };
 
     let rho = array![1.5, -0.5];
@@ -305,6 +307,7 @@ fn profiled_gaussian_reml_hessian_fd_symmetric_and_finite() {
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
         kronecker_penalty_system: None,
+        kronecker_factored: None,
     };
 
     let rho = array![1.5, -0.5];
