@@ -338,7 +338,8 @@ pub trait DesignOperator: Send + Sync {
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        // Default: diag(X M X') computed row-by-row via matvecs.
+        // Default: diag(X M X') computed in chunks via row_chunk — avoids
+        // materializing the full n×p dense matrix at once.
         if middle.nrows() != self.ncols() || middle.ncols() != self.ncols() {
             return Err(format!(
                 "DesignOperator::quadratic_form_diag dimension mismatch: {}x{} vs expected {}x{}",
@@ -348,12 +349,21 @@ pub trait DesignOperator: Send + Sync {
                 self.ncols()
             ));
         }
-        // Fallback via materialization.  Operator impls should override for efficiency.
-        let x = self.to_dense();
-        let xm = fast_ab(&x, middle);
-        let mut out = Array1::<f64>::zeros(self.nrows());
-        for i in 0..self.nrows() {
-            out[i] = x.row(i).dot(&xm.row(i)).max(0.0);
+        let n = self.nrows();
+        let mut out = Array1::<f64>::zeros(n);
+        // Process in chunks to bound memory: ~8 MB working set.
+        let chunk_size = (8 * 1024 * 1024 / (self.ncols().max(1) * 8 * 2))
+            .max(16)
+            .min(n.max(1));
+        let mut start = 0;
+        while start < n {
+            let end = (start + chunk_size).min(n);
+            let x_chunk = self.row_chunk(start..end);
+            let xm_chunk = fast_ab(&x_chunk, middle);
+            for i in 0..(end - start) {
+                out[start + i] = x_chunk.row(i).dot(&xm_chunk.row(i)).max(0.0);
+            }
+            start = end;
         }
         Ok(out)
     }
@@ -390,6 +400,13 @@ pub trait DesignOperator: Send + Sync {
     /// requested rows.  Concrete operators should override this with O(chunk)
     /// implementations; the default falls back through `to_dense()`.
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        // Fallback: materializes the full dense matrix.  Every concrete operator
+        // should override this with an O(chunk) implementation.
+        log::debug!(
+            "DesignOperator::row_chunk default fallback (full materialization) for {}x{} operator",
+            self.nrows(),
+            self.ncols()
+        );
         self.to_dense().slice(s![rows, ..]).to_owned()
     }
 
@@ -532,9 +549,23 @@ impl DesignOperator for ReparamOperator {
                 fast_ab(&chunk.to_owned(), &self.qs)
             }
             DesignMatrix::Sparse(sdm) => {
-                let x_dense = sdm.to_dense_arc();
-                let chunk = x_dense.slice(s![rows, ..]);
-                fast_ab(&chunk.to_owned(), &self.qs)
+                // Extract rows directly from CSR without densifying the full matrix.
+                let csr = sdm
+                    .to_csr_arc()
+                    .expect("ReparamOperator::row_chunk: CSR conversion");
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                let chunk_rows = rows.end - rows.start;
+                let p_inner = sdm.ncols();
+                let mut chunk = Array2::<f64>::zeros((chunk_rows, p_inner));
+                for (local, global) in (rows.start..rows.end).enumerate() {
+                    for ptr in row_ptr[global]..row_ptr[global + 1] {
+                        chunk[[local, col_idx[ptr]]] = vals[ptr];
+                    }
+                }
+                fast_ab(&chunk, &self.qs)
             }
             DesignMatrix::Operator(op) => {
                 let chunk = op.row_chunk(rows);
@@ -1408,6 +1439,19 @@ impl DesignOperator for ReparamDesignOperator {
 
     fn uses_matrix_free_pcg(&self) -> bool {
         self.inner.uses_matrix_free_pcg()
+    }
+
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let inner_chunk = self.inner.row_chunk(rows);
+        fast_ab(&inner_chunk, &self.q)
+    }
+
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        // diag(X_new M X_new') = diag(X_inner Q M Q' X_inner')
+        // Let M' = Q M Q', then delegate to inner.
+        let qm = fast_ab(&self.q, middle);
+        let qmqt = fast_ab(&qm, &self.q.t().to_owned());
+        self.inner.quadratic_form_diag(&qmqt)
     }
 
     fn to_dense(&self) -> Array2<f64> {

@@ -1411,7 +1411,7 @@ pub fn optimize_external_design<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from).collect();
+    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from_blockwise).collect();
     optimize_external_designwith_heuristic_lambdas_andwarm_start(
         y, w, x, offset, specs, None, None, opts,
     )
@@ -1431,7 +1431,7 @@ pub fn optimize_external_designwith_heuristic_lambdas<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from).collect();
+    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from_blockwise).collect();
     optimize_external_designwith_heuristic_lambdas_andwarm_start(
         y,
         w,
@@ -2773,7 +2773,7 @@ pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from).collect();
+    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from_blockwise).collect();
     validate_and_build_reml_state(
         y,
         w,
@@ -4237,7 +4237,7 @@ pub(crate) fn fit_gamwith_heuristic_lambdas_andwarm_start<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from).collect();
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise).collect();
     let x = x.into();
     if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
         && opts.mixture_link.is_none()
@@ -4546,7 +4546,7 @@ pub fn evaluate_externalgradients<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from).collect();
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
         return Err(EstimationError::InvalidInput(message));
@@ -4616,7 +4616,7 @@ pub fn evaluate_externalcost_andridge<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from).collect();
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
         return Err(EstimationError::InvalidInput(message));
