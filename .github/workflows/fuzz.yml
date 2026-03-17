@@ -60,6 +60,9 @@ jobs:
         with:
           r-version: "4.4.3"
 
+      - name: Install R packages
+        run: Rscript -e 'install.packages(c("mgcv","jsonlite"), repos="https://cloud.r-project.org", Ncpus=max(1L, parallel::detectCores()-1L))'
+
       - name: Run fuzzer
         run: |
           set -o pipefail

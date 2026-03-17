@@ -146,6 +146,7 @@ impl<'a> RemlState<'a> {
         lambdas: &[f64],
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
+        penalty_coords: Option<&[&super::unified::PenaltyCoordinate]>,
     ) -> Array1<f64> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
@@ -257,12 +258,16 @@ impl<'a> RemlState<'a> {
 
         let mut gradient = Array1::<f64>::zeros(k);
         for idx in 0..k {
-            let r_k = &penalty_roots[idx];
-            let rk_p = r_k.dot(&p_total);
-            let trace_ak_p = lambdas[idx]
-                * (0..r_k.nrows())
-                    .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
-                    .sum::<f64>();
+            let trace_ak_p = if let Some(coords) = penalty_coords {
+                coords[idx].trace_with_dense(&p_total, lambdas[idx])
+            } else {
+                let r_k = &penalty_roots[idx];
+                let rk_p = r_k.dot(&p_total);
+                lambdas[idx]
+                    * (0..r_k.nrows())
+                        .map(|row| rk_p.row(row).dot(&r_k.row(row).to_owned()))
+                        .sum::<f64>()
+            };
             let correction_trace: f64 = (0..n)
                 .map(|i| c_array[i] * x_vks[idx][i] * lev_p[i])
                 .sum();
