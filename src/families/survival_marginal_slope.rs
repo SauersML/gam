@@ -1318,11 +1318,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
 
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_idx: usize,
-        spec: &ParameterBlockSpec,
+        _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        let _ = (block_states, spec);
         if block_idx == 0 && self.derivative_guard > 0.0 {
             // Monotonicity constraint: design_derivative_exit @ beta_time + offset >= guard
             // i.e. design_derivative_exit @ beta_time >= guard - offset
@@ -1353,6 +1352,7 @@ fn build_time_blockspec(
         design: DesignMatrix::Dense(Arc::new(design_exit.clone())),
         offset: Array1::zeros(design_exit.nrows()),
         penalties: time_block.penalties.clone(),
+        nullspace_dims: vec![],
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }
@@ -1369,6 +1369,7 @@ fn build_logslope_blockspec(
         design: DesignMatrix::Dense(Arc::new(design.design.clone())),
         offset: Array1::from_elem(design.design.nrows(), baseline),
         penalties: design.global_penalties(),
+        nullspace_dims: vec![],
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }
@@ -1645,8 +1646,7 @@ pub fn fit_survival_marginal_slope_terms(
         &setup,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let _ = specs;
+        |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let blocks = build_blocks(rho, &designs[0])?;
             let family = make_family(&designs[0]);
             let fit = inner_fit(&family, &blocks, options)?;

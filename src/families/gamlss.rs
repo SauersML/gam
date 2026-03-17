@@ -200,6 +200,9 @@ pub struct ParameterBlockInput {
     pub design: DesignMatrix,
     pub offset: Array1<f64>,
     pub penalties: Vec<Array2<f64>>,
+    /// Structural nullspace dimension per penalty (same length as `penalties`).
+    /// Empty means "use eigenvalue-based rank detection."
+    pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,
     pub initial_beta: Option<Array1<f64>>,
 }
@@ -266,7 +269,9 @@ impl ParameterBlockInput {
             name: name.to_string(),
             design: self.design,
             offset: self.offset,
+            nullspace_dims: self.nullspace_dims,
             penalties: self.penalties,
+            nullspace_dims: vec![],
             initial_log_lambdas,
             initial_beta: self.initial_beta,
         })
@@ -372,6 +377,7 @@ pub fn buildwiggle_block_input_from_knots(
         design: DesignMatrix::Dense(Arc::new(design)),
         offset: Array1::zeros(seed.len()),
         penalties,
+        nullspace_dims: vec![],
         initial_log_lambdas: None,
         initial_beta: None,
     })
@@ -610,6 +616,7 @@ fn solve_penalizedweighted_projection(
     target_eta: &Array1<f64>,
     weights: &Array1<f64>,
     penalties: &[Array2<f64>],
+    nullspace_dims: vec![],
     log_lambdas: &Array1<f64>,
     ridge_floor: f64,
 ) -> Result<Array1<f64>, String> {
@@ -797,6 +804,7 @@ fn binomial_location_scalewarm_start(
             design: threshold_block.design.clone(),
             offset: threshold_block.offset.clone(),
             penalties: threshold_block.penalties.clone(),
+            nullspace_dims: vec![],
             initial_log_lambdas: threshold_block.initial_log_lambdas.clone(),
             initial_beta: mean_beta_hint.cloned(),
         },
@@ -805,6 +813,7 @@ fn binomial_location_scalewarm_start(
             design: log_sigma_block.design.clone(),
             offset: log_sigma_block.offset.clone(),
             penalties: log_sigma_block.penalties.clone(),
+            nullspace_dims: vec![],
             initial_log_lambdas: log_sigma_block.initial_log_lambdas.clone(),
             initial_beta: noise_beta_hint.cloned(),
         },
@@ -1482,6 +1491,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.global_penalties(),
+            nullspace_dims: vec![],
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
         };
@@ -1498,6 +1508,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             )?)),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design.global_penalties(),
+            nullspace_dims: vec![],
             initial_log_lambdas: noise_log_lambdas,
             initial_beta: noise_beta_hint,
         };
@@ -1634,6 +1645,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.global_penalties(),
+            nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -1650,6 +1662,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             )?)),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design.global_penalties(),
+            nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
         };
@@ -1678,6 +1691,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                 design: self.wiggle_block.design.clone(),
                 offset: self.wiggle_block.offset.clone(),
                 penalties: self.wiggle_block.penalties.clone(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
             },
@@ -1811,6 +1825,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.global_penalties(),
+            nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -1819,6 +1834,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             design: DesignMatrix::Dense(Arc::new(identifiednoise_design)),
             offset: Array1::zeros(self.y.len()),
             penalties: log_sigma_penalties,
+            nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
         };
@@ -1965,6 +1981,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.global_penalties(),
+            nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
@@ -1973,6 +1990,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             design: DesignMatrix::Dense(Arc::new(identifiednoise_design)),
             offset: Array1::zeros(self.y.len()),
             penalties: log_sigma_penalties,
+            nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
         };
@@ -2001,6 +2019,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                 design: self.wiggle_block.design.clone(),
                 offset: self.wiggle_block.offset.clone(),
                 penalties: self.wiggle_block.penalties.clone(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
             },
@@ -2331,6 +2350,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     design: DesignMatrix::Dense(Arc::new(pilot_design.design.clone())),
                     offset: Array1::zeros(y.len()),
                     penalties: pilot_design.global_penalties(),
+                    nullspace_dims: vec![],
                     initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
                     initial_beta: Some(pilot_fit.beta.clone()),
                 },
@@ -2431,6 +2451,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y_cloned.len()),
                 penalties: design.global_penalties(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),
             },
@@ -2439,6 +2460,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 design: wiggle_design.clone(),
                 offset: wiggle_offset.clone(),
                 penalties: wiggle_penalties.clone(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 initial_beta: wiggle_initial_beta.clone(),
             },
@@ -2594,6 +2616,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 design: DesignMatrix::Dense(Arc::new(design.design.clone())),
                 offset: Array1::zeros(y.len()),
                 penalties: design.global_penalties(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
                 initial_beta: Some(pilot_beta),
             },
@@ -2601,6 +2624,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 design: wiggle_design,
                 offset: wiggle_offset,
                 penalties: wiggle_penalties,
+                nullspace_dims: vec![],
                 initial_log_lambdas: Some(
                     theta_star.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 ),
@@ -2804,7 +2828,7 @@ fn binomial_neglog_q_derivatives_logit_closed_form(y: f64, weight: f64, q: f64) 
 }
 
 #[inline]
-fn binomial_neglog_q_fourth_derivative_logit_closed_form(y: f64, weight: f64, q: f64) -> f64 {
+fn binomial_neglog_q_fourth_derivative_logit_closed_form(_: f64, weight: f64, q: f64) -> f64 {
     // Returns m4 = d^4F/dq^4 for logit link.
     // m4 = ws(1 - 6s) = ws(1 - 6p(1-p)).
     //
@@ -2812,7 +2836,6 @@ fn binomial_neglog_q_fourth_derivative_logit_closed_form(y: f64, weight: f64, q:
     // even-order derivatives of the canonical Bernoulli NLL are functions
     // of p alone. The y-dependence cancels out in the chain rule because
     // the logit is the canonical link.
-    let _ = y; // m4 is independent of y for canonical logit
     if weight == 0.0 || !q.is_finite() {
         return 0.0;
     }
@@ -15290,6 +15313,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: Vec::new(),
+            nullspace_dims: vec![],
             initial_log_lambdas: None,
             initial_beta: None,
         }
@@ -15380,9 +15404,8 @@ mod tests {
         knots: &Array1<f64>,
         degree: usize,
     ) -> Array1<D> {
-        let (z, penalty) = compute_geometric_constraint_transform(knots, degree, 2)
+        let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
             .expect("wiggle constraint transform");
-        let _ = penalty;
         let full = bspline_basis_scalar_numdual(x, knots, degree);
         let mut constrained = Array1::from_elem(z.ncols(), D::zero());
         for j in 0..z.nrows() {
@@ -15547,6 +15570,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(design)),
             offset: Array1::zeros(n),
             penalties: Vec::new(),
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
         }
@@ -17122,7 +17146,7 @@ mod tests {
         let dq_dq0 = family
             .wiggle_dq_dq0(core.q0.view(), beta_link_wiggle.view())
             .expect("dq/dq0");
-        let (tws, lsws, w) = binomial_location_scale_working_sets(
+        let (tws, lsws, _) = binomial_location_scale_working_sets(
             &y,
             &weights,
             &eta_t,
@@ -17133,7 +17157,6 @@ mod tests {
             &core,
         )
         .expect("working sets");
-        let _ = w;
         let tw = match &tws {
             BlockWorkingSet::Diagonal {
                 working_response: _,

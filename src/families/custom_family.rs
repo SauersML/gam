@@ -38,6 +38,10 @@ pub struct ParameterBlockSpec {
     pub offset: Array1<f64>,
     /// Block-local penalty matrices (all p_block x p_block).
     pub penalties: Vec<Array2<f64>>,
+    /// Structural nullspace dimension of each penalty matrix (same length as `penalties`).
+    /// Used by the penalty pseudo-logdet to determine rank without numerical thresholds.
+    /// If empty, falls back to eigenvalue-based rank detection.
+    pub nullspace_dims: Vec<usize>,
     /// Initial log-smoothing parameters for this block (same length as `penalties`).
     pub initial_log_lambdas: Array1<f64>,
     /// Optional initial coefficients (defaults to zeros if omitted).
@@ -3916,11 +3920,42 @@ fn blockwise_logdet_terms<F: CustomFamily>(
             s_lambda.scaled_add(lambdas[k], s);
         }
         if include_logdet_s {
-            penalty_logdet_s_total += stable_logdet_with_ridge_policy(
-                &s_lambda,
-                options.ridge_floor,
-                options.ridge_policy,
-            )?;
+            // Exact pseudo-logdet on the positive eigenspace, consistent with
+            // the derivatives in compute_block_penalty_logdet_derivs.
+            // Uses structural nullity from spec.nullspace_dims to partition
+            // the eigenspace exactly, avoiding numerical thresholds.
+            let ridge = if options.ridge_policy.include_penalty_logdet {
+                effective_solverridge(options.ridge_floor)
+            } else {
+                0.0
+            };
+            let mut s_for_logdet = s_lambda.clone();
+            if ridge > 0.0 {
+                for i in 0..p {
+                    s_for_logdet[[i, i]] += ridge;
+                }
+            }
+            let (evals, _) = s_for_logdet
+                .eigh(faer::Side::Lower)
+                .map_err(|e| format!("penalty logdet eigendecomposition failed for block {b}: {e}"))?;
+            // Structural nullity determines the split: bottom m₀ eigenvalues
+            // are structural zeros, top (p - m₀) are the positive subspace.
+            let m0 = if !spec.nullspace_dims.is_empty()
+                && spec.nullspace_dims.len() == spec.penalties.len()
+            {
+                spec.nullspace_dims.iter().copied().min().unwrap_or(0)
+            } else {
+                let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(
+                    evals.as_slice().unwrap(),
+                );
+                evals.iter().filter(|&&e| e <= threshold).count()
+            };
+            let block_logdet: f64 = evals
+                .iter()
+                .skip(m0)
+                .map(|&e| e.max(f64::MIN_POSITIVE).ln())
+                .sum();
+            penalty_logdet_s_total += block_logdet;
         }
         s_lambdas.push(s_lambda);
     }
@@ -4819,9 +4854,12 @@ fn unified_joint_cost_gradient(
     } else {
         0.0
     };
+    let per_block_nullspace_dims: Vec<&[usize]> =
+        specs.iter().map(|s| s.nullspace_dims.as_slice()).collect();
     let penalty_logdet = compute_block_penalty_logdet_derivs(
         per_block,
         &per_block_penalties,
+        &per_block_nullspace_dims,
         penalty_logdet_ridge,
     )?;
 
@@ -7244,6 +7282,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![array![[1.0]]],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
         }];
@@ -7925,6 +7964,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         };
@@ -7961,6 +8001,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![array![[1.0]]],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![10.0_f64.ln()],
             initial_beta: Some(array![1.0]),
         };
@@ -8001,6 +8042,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.2],
             initial_beta: None,
         };
@@ -8069,6 +8111,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         };
@@ -8102,6 +8145,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         };
@@ -8110,6 +8154,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         };
@@ -8144,6 +8189,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         };
@@ -8175,6 +8221,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         };
@@ -8219,6 +8266,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         };
@@ -8266,6 +8314,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0, 0.0]),
         };
@@ -8298,6 +8347,7 @@ mod tests {
             design: threshold_design.clone(),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
         };
@@ -8306,6 +8356,7 @@ mod tests {
             design: log_sigma_design.clone(),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![-0.2],
             initial_beta: Some(array![-0.1]),
         };
@@ -8325,6 +8376,7 @@ mod tests {
             design: wiggle_block.design.clone(),
             offset: wiggle_block.offset.clone(),
             penalties: wiggle_block.penalties.clone(),
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.1],
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
         };
@@ -8410,6 +8462,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         };
@@ -8418,6 +8471,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         };
@@ -8503,6 +8557,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
         };
@@ -8511,6 +8566,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
         };
@@ -8596,6 +8652,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.15]),
         };
@@ -8604,6 +8661,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.05]),
         };
@@ -8626,7 +8684,7 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
 
-        let (f0, g0, h0_opt, _) = outerobjectivegradienthessian(
+        let (_, _, h0_opt, _) = outerobjectivegradienthessian(
             &family,
             &specs,
             &options,
@@ -8646,7 +8704,7 @@ mod tests {
             let mut rho_m = rho.clone();
             rho_p[l] += h;
             rho_m[l] -= h;
-            let (fp, gp, _, _) = outerobjectivegradienthessian(
+            let (_, gp, _, _) = outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,
@@ -8656,7 +8714,7 @@ mod tests {
                 false,
             )
             .expect("objective/gradient +");
-            let (fm, gm, _, _) = outerobjectivegradienthessian(
+            let (_, gm, _, _) = outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,
@@ -8666,8 +8724,6 @@ mod tests {
                 false,
             )
             .expect("objective/gradient -");
-            let _ = fp;
-            let _ = fm;
 
             for k in 0..rho.len() {
                 let hfd = (gp[k] - gm[k]) / (2.0 * h);
@@ -8692,7 +8748,6 @@ mod tests {
                 );
             }
         }
-        let _ = f0;
 
         for i in 0..h0.nrows() {
             for j in 0..i {
@@ -8703,7 +8758,6 @@ mod tests {
                 );
             }
         }
-        let _ = g0;
     }
 
     #[test]
@@ -8771,6 +8825,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
         };
@@ -8779,6 +8834,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
             offset: Array1::zeros(n),
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
         };
@@ -8799,7 +8855,7 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
 
-        let (f0, g0, h0_opt, _) = outerobjectivegradienthessian(
+        let (_, _, h0_opt, _) = outerobjectivegradienthessian(
             &family,
             &specs,
             &options,
@@ -8819,7 +8875,7 @@ mod tests {
             let mut rho_m = rho.clone();
             rho_p[l] += h;
             rho_m[l] -= h;
-            let (fp, gp, _, _) = outerobjectivegradienthessian(
+            let (_, gp, _, _) = outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,
@@ -8829,7 +8885,7 @@ mod tests {
                 false,
             )
             .expect("objective/gradient +");
-            let (fm, gm, _, _) = outerobjectivegradienthessian(
+            let (_, gm, _, _) = outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,
@@ -8839,8 +8895,6 @@ mod tests {
                 false,
             )
             .expect("objective/gradient -");
-            let _ = fp;
-            let _ = fm;
 
             for k in 0..rho.len() {
                 let hfd = (gp[k] - gm[k]) / (2.0 * h);
@@ -8865,8 +8919,6 @@ mod tests {
                 );
             }
         }
-        let _ = f0;
-        let _ = g0;
     }
 
     #[test]
@@ -8904,6 +8956,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.5]),
         };
@@ -9005,6 +9058,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![Array2::eye(1)],
+            nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         };
@@ -9031,6 +9085,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         };
@@ -9156,6 +9211,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
+                nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.0]),
             },
@@ -9164,6 +9220,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
+                nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.0, 0.0]),
             },
@@ -9270,19 +9327,16 @@ mod tests {
 
             fn exact_newton_joint_hessian(
                 &self,
-                block_states: &[ParameterBlockState],
+                _: &[ParameterBlockState],
             ) -> Result<Option<Array2<f64>>, String> {
-                let _ = block_states;
                 Ok(Some(array![[1.0]]))
             }
 
             fn exact_newton_joint_hessian_directional_derivative(
                 &self,
-                block_states: &[ParameterBlockState],
-                d_beta_flat: &Array1<f64>,
+                _: &[ParameterBlockState],
+                _: &Array1<f64>,
             ) -> Result<Option<Array2<f64>>, String> {
-                let _ = block_states;
-                let _ = d_beta_flat;
                 Ok(Some(array![[f64::NAN]]))
             }
         }
@@ -9293,6 +9347,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::from_elem((2, 1), 1.0))),
             offset: Array1::zeros(2),
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         }];
@@ -9441,6 +9496,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(Array2::from_elem((3 * n, p0), 1.0))),
                 offset: Array1::zeros(3 * n),
                 penalties: vec![],
+                nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(p0, 1.0)),
             },
@@ -9450,6 +9506,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, p1), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
+                nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(p1, 1.0)),
             },
@@ -9494,6 +9551,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
+                nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
             },
@@ -9502,6 +9560,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
                 offset: Array1::zeros(n),
                 penalties: vec![],
+                nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
             },

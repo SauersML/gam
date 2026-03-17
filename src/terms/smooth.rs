@@ -485,6 +485,7 @@ pub fn penalties_to_global(penalties: &[BlockwisePenalty], p_total: usize) -> Ve
 /// individual global matrices.
 pub fn weighted_blockwise_penalty_sum(
     penalties: &[BlockwisePenalty],
+    nullspace_dims: vec![],
     lambdas: &[f64],
     p_total: usize,
 ) -> Array2<f64> {
@@ -4344,6 +4345,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let adaptive_penalty_indices = exact_spatial_adaptive_penalty_index_set(runtime_caches);
     let p_total = baseline.design.design.ncols();
     let mut retained_penalties = Vec::<Array2<f64>>::new();
+    let mut retained_nullspace_dims = Vec::<usize>::new();
     let mut retained_log_lambdas = Vec::<f64>::new();
     let mut retained_global_indices = Vec::<usize>::new();
     let mut fixed_quadratichessian = Array2::<f64>::zeros((p_total, p_total));
@@ -4352,6 +4354,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             continue;
         }
         retained_penalties.push(bp.to_global(p_total));
+        retained_nullspace_dims.push(
+            baseline.design.nullspace_dims.get(idx).copied().unwrap_or(0),
+        );
         retained_log_lambdas.push(baseline.fit.lambdas[idx].max(1e-12).ln());
         retained_global_indices.push(idx);
         let r = &bp.col_range;
@@ -4477,6 +4482,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
         offset: offset.to_owned(),
         penalties: retained_penalties.clone(),
+        nullspace_dims: retained_nullspace_dims.clone(),
         initial_log_lambdas: Array1::from_vec(retained_log_lambdas.clone()),
         initial_beta: Some(baseline.fit.beta.clone()),
     };
@@ -4736,6 +4742,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
         offset: offset.to_owned(),
         penalties: vec![],
+        nullspace_dims: vec![],
         initial_log_lambdas: Array1::zeros(0),
         initial_beta: Some(baseline.fit.beta.clone()),
     };
@@ -6812,6 +6819,7 @@ fn trace_of_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> Result<f64, Strin
 
 fn exact_bounded_edf(
     penalties: &[Array2<f64>],
+    nullspace_dims: vec![],
     lambdas: &Array1<f64>,
     latent_cov: &Array2<f64>,
 ) -> Result<(Vec<f64>, f64), EstimationError> {
@@ -6974,6 +6982,7 @@ fn fit_bounded_term_collection_with_design(
         design: DesignMatrix::Dense(Arc::new(designzeroed)),
         offset: offset.to_owned(),
         penalties: fit_penalties.clone(),
+        nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas,
         initial_beta: Some(initial_beta),
     };
@@ -13019,6 +13028,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]])),
             offset: array![0.0, 0.0],
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0, 0.0]),
         };
@@ -13464,6 +13474,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
             offset: Array1::zeros(n),
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(baseline.fit.beta.clone()),
         };
@@ -13655,6 +13666,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
             offset: Array1::zeros(n),
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(baseline.fit.beta.clone()),
         };

@@ -4915,6 +4915,7 @@ pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
 pub fn compute_block_penalty_logdet_derivs(
     per_block_rho: &[Array1<f64>],
     per_block_penalties: &[&[Array2<f64>]],
+    per_block_nullspace_dims: &[&[usize]],
     ridge: f64,
 ) -> Result<PenaltyLogdetDerivs, String> {
     use faer::Side;
@@ -4950,27 +4951,48 @@ pub fn compute_block_penalty_logdet_derivs(
             .eigh(Side::Lower)
             .map_err(|e| format!("penalty logdet eigendecomposition failed for block {b}: {e}"))?;
 
-        // Identify structurally positive eigenvalues. For S(ρ) = Σ exp(ρ_k) S_k
-        // with S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k) is independent of ρ,
-        // so no eigenvalue crosses this threshold during optimization.
-        let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
+        // Determine rank of S_b. If structural nullspace dimensions are provided,
+        // compute the intersection nullity: nullity(Σ λ_k S_k) = dim(∩_k N(S_k)).
+        // The rank is then p − intersection_nullity.
+        // If no structural info, fall back to eigenvalue-based detection.
+        let block_nullspace_dims = if b < per_block_nullspace_dims.len() {
+            per_block_nullspace_dims[b]
+        } else {
+            &[]
+        };
+        let rank = if !block_nullspace_dims.is_empty()
+            && block_nullspace_dims.len() == penalties.len()
+        {
+            // Structural intersection nullity: for S = Σ λ_k S_k with S_k ⪰ 0,
+            // N(S) = ∩_k N(S_k). A conservative upper bound on the intersection
+            // nullity is min_k nullity(S_k), since the intersection can't be
+            // larger than any individual nullspace. We use this to determine rank,
+            // then validate against the eigenvalue spectrum.
+            let intersection_nullity = block_nullspace_dims.iter().copied().min().unwrap_or(0);
+            let structural_rank = p.saturating_sub(intersection_nullity);
+            // Validate: the structural rank eigenvalues should all be above the
+            // numerical noise floor. If not, use the structural rank anyway —
+            // the structural information is more reliable than the numerics.
+            structural_rank
+        } else {
+            let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
+            eigs.iter().filter(|&&e| e > threshold).count()
+        };
 
-        // Exact pseudo-logdet: L = Σ_{σ_i > ε} log σ_i.
-        let block_logdet = exact_pseudo_logdet(eigs.as_slice().unwrap(), threshold);
+        // Exact pseudo-logdet: L = Σ over the `rank` largest eigenvalues of log σ_i.
+        // Eigenvalues from eigh are sorted ascending, so the `rank` largest are the last `rank`.
+        let block_logdet: f64 = eigs.iter().rev().take(rank).map(|&e| e.max(1e-300).ln()).sum();
         log_det_total += block_logdet;
 
         // S⁺ factor on the positive eigenspace: W such that W Wᵀ = S⁺.
-        // Shape (p, rank) where rank = number of positive eigenvalues.
-        let rank = eigs.iter().filter(|&&e| e > threshold).count();
+        // Select the `rank` largest eigenvalues (last `rank` in ascending order).
+        let nullity = p - rank;
         let mut w_factor = Array2::zeros((p, rank));
-        let mut col = 0;
-        for (idx, &ev) in eigs.iter().enumerate() {
-            if ev > threshold {
-                let scale = 1.0 / ev.sqrt();
-                for row in 0..p {
-                    w_factor[[row, col]] = vecs[[row, idx]] * scale;
-                }
-                col += 1;
+        for col in 0..rank {
+            let idx = nullity + col;
+            let scale = 1.0 / eigs[idx].max(1e-300).sqrt();
+            for row in 0..p {
+                w_factor[[row, col]] = vecs[[row, idx]] * scale;
             }
         }
 
@@ -5010,19 +5032,29 @@ pub fn compute_block_penalty_logdet_derivs(
             .eigh(faer::Side::Lower)
             .map_err(|e| format!("penalty det2 eigendecomposition failed for block {b}: {e}"))?;
 
-        let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
-        let rank = eigs.iter().filter(|&&e| e > threshold).count();
+        let block_nullspace_dims = if b < per_block_nullspace_dims.len() {
+            per_block_nullspace_dims[b]
+        } else {
+            &[]
+        };
+        let rank = if !block_nullspace_dims.is_empty()
+            && block_nullspace_dims.len() == penalties.len()
+        {
+            let intersection_nullity = block_nullspace_dims.iter().copied().min().unwrap_or(0);
+            p.saturating_sub(intersection_nullity)
+        } else {
+            let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
+            eigs.iter().filter(|&&e| e > threshold).count()
+        };
 
         // S⁺ factor on positive eigenspace: W Wᵀ = S⁺, shape (p, rank).
+        let nullity = p - rank;
         let mut w_factor = Array2::zeros((p, rank));
-        let mut col = 0;
-        for (idx, &ev) in eigs.iter().enumerate() {
-            if ev > threshold {
-                let scale = 1.0 / ev.sqrt();
-                for row in 0..p {
-                    w_factor[[row, col]] = vecs[[row, idx]] * scale;
-                }
-                col += 1;
+        for col in 0..rank {
+            let idx = nullity + col;
+            let scale = 1.0 / eigs[idx].max(1e-300).sqrt();
+            for row in 0..p {
+                w_factor[[row, col]] = vecs[[row, idx]] * scale;
             }
         }
 

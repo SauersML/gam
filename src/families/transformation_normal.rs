@@ -354,6 +354,7 @@ impl TransformationNormalFamily {
             design: DesignMatrix::Dense(self.x_val.clone()),
             offset: Array1::zeros(self.x_val.nrows()),
             penalties: self.tensor_penalties.clone(),
+            nullspace_dims: vec![],
             initial_log_lambdas: self.initial_log_lambdas.clone(),
             initial_beta: Some(self.initial_beta.clone()),
         }

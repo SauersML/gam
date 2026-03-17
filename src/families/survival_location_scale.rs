@@ -2479,6 +2479,7 @@ struct PreparedCovBlock {
     /// Offset (same for both entry/exit since it comes from other terms).
     offset: Array1<f64>,
     penalties: Vec<Array2<f64>>,
+    nullspace_dims: vec![],
     initial_log_lambdas: Option<Array1<f64>>,
     initial_beta: Option<Array1<f64>>,
 }
@@ -2490,6 +2491,7 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
             design_entry: None,
             offset: b.offset.clone(),
             penalties: b.penalties.clone(),
+            nullspace_dims: vec![],
             initial_log_lambdas: b.initial_log_lambdas.clone(),
             initial_beta: b.initial_beta.clone(),
         }),
@@ -2501,6 +2503,7 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
                 design_entry: Some(design_entry),
                 offset: tv.offset.clone(),
                 penalties: tv.penalties.clone(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: tv.initial_log_lambdas.clone(),
                 initial_beta: tv.initial_beta.clone(),
             })
@@ -2520,6 +2523,7 @@ fn build_survival_covariate_block_from_design(
                 design: DesignMatrix::Dense(Arc::new(cov_design.design.clone())),
                 offset: Array1::zeros(cov_design.design.nrows()),
                 penalties: cov_design.global_penalties(),
+                nullspace_dims: vec![],
                 initial_log_lambdas,
                 initial_beta,
             }))
@@ -3007,6 +3011,7 @@ fn prepare_survival_location_scale_model(
         offset_exit: spec.time_block.offset_exit.clone(),
         derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
         penalties: time_prepared.penalties.clone(),
+        nullspace_dims: vec![],
         initial_log_lambdas: spec.time_block.initial_log_lambdas.clone(),
         initial_beta: time_prepared.initial_beta.clone(),
     });
@@ -3016,6 +3021,7 @@ fn prepare_survival_location_scale_model(
         design: DesignMatrix::Dense(Arc::new(time_stacked_design)),
         offset: time_stacked_offset,
         penalties: time_prepared.penalties.clone(),
+        nullspace_dims: vec![],
         initial_log_lambdas: initial_log_lambdas(
             &time_prepared.penalties,
             spec.time_block.initial_log_lambdas.clone(),
@@ -3051,6 +3057,7 @@ fn prepare_survival_location_scale_model(
         design: threshold_solver_design,
         offset: threshold_solver_offset,
         penalties: threshold_prep.penalties.clone(),
+        nullspace_dims: vec![],
         initial_log_lambdas: initial_log_lambdas(
             &threshold_prep.penalties,
             threshold_prep.initial_log_lambdas.clone(),
@@ -3120,6 +3127,7 @@ fn prepare_survival_location_scale_model(
         design: log_sigma_solver_design,
         offset: log_sigma_solver_offset,
         penalties: log_sigma_prep.penalties.clone(),
+        nullspace_dims: vec![],
         initial_log_lambdas: initial_log_lambdas(
             &log_sigma_prep.penalties,
             log_sigma_prep.initial_log_lambdas.clone(),
@@ -3132,6 +3140,7 @@ fn prepare_survival_location_scale_model(
             design: w.design.clone(),
             offset: Array1::zeros(n),
             penalties: w.penalties.clone(),
+            nullspace_dims: vec![],
             initial_log_lambdas: initial_log_lambdas(&w.penalties, w.initial_log_lambdas.clone())?,
             initial_beta: w.initial_beta.clone(),
         })
@@ -3375,6 +3384,7 @@ struct TimeBlockPrepared {
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
     penalties: Vec<Array2<f64>>,
+    nullspace_dims: vec![],
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
 }
@@ -3444,6 +3454,7 @@ fn prepare_identified_time_block(
 
 fn initial_log_lambdas(
     penalties: &[Array2<f64>],
+    nullspace_dims: vec![],
     rho0: Option<Array1<f64>>,
 ) -> Result<Array1<f64>, String> {
     let k = penalties.len();
@@ -7150,6 +7161,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             .map(|wiggle| LinkWiggleBlockInput {
                 design: wiggle.design.clone(),
                 penalties: wiggle.penalties.clone(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(rho),
                 initial_beta: filtered_initial_beta(
                     wiggle_beta_hint.borrow().as_ref(),
@@ -7175,6 +7187,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 offset_exit: spec.time_block.offset_exit.clone(),
                 derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
                 penalties: spec.time_block.penalties.clone(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: Some(layout.time_from(rho)),
                 initial_beta: time_beta,
             },
@@ -7902,6 +7915,7 @@ mod tests {
                 ])),
                 offset: Array1::zeros(9),
                 penalties: vec![Array2::eye(1)],
+                nullspace_dims: vec![],
                 initial_log_lambdas: array![0.0],
                 initial_beta: Some(array![0.2]),
             },
@@ -7910,6 +7924,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(array![[1.0], [0.4], [-0.6]])),
                 offset: Array1::zeros(3),
                 penalties: Vec::new(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.35]),
             },
@@ -7918,6 +7933,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(array![[1.0], [-0.3], [0.5]])),
                 offset: Array1::zeros(3),
                 penalties: Vec::new(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![-0.15]),
             },
@@ -7979,6 +7995,7 @@ mod tests {
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
             penalties: vec![Array2::eye(3)],
+            nullspace_dims: vec![],
             initial_log_lambdas: None,
             initial_beta: None,
         };
@@ -8019,6 +8036,7 @@ mod tests {
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
             penalties: vec![Array2::eye(3)],
+            nullspace_dims: vec![],
             initial_log_lambdas: None,
             initial_beta: None,
         };
@@ -8063,6 +8081,7 @@ mod tests {
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
             penalties: vec![Array2::eye(3)],
+            nullspace_dims: vec![],
             initial_log_lambdas: None,
             initial_beta: None,
         };
@@ -9648,6 +9667,7 @@ mod tests {
                 offset_exit,
                 derivative_offset_exit,
                 penalties: vec![penalty.clone()],
+                nullspace_dims: vec![],
                 initial_log_lambdas: Some(array![0.0]),
                 initial_beta: None,
             },
@@ -9655,6 +9675,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: None,
                 initial_beta: None,
             }),
@@ -9662,6 +9683,7 @@ mod tests {
                 design: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
+                nullspace_dims: vec![],
                 initial_log_lambdas: None,
                 initial_beta: None,
             }),

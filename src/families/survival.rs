@@ -1319,10 +1319,15 @@ impl WorkingModelSurvival {
             .iter()
             .map(|v| v.as_slice())
             .collect();
+        // Survival penalties: no structural nullspace info available here,
+        // pass empty slices to fall back to eigenvalue-based rank detection.
+        let per_block_nullspace_empty: Vec<&[usize]> =
+            vec![&[] as &[usize]; per_block_penalty_refs.len()];
         let penalty_logdet = if k_count > 0 {
             compute_block_penalty_logdet_derivs(
                 &per_block_rho,
                 &per_block_penalty_refs,
+                &per_block_nullspace_empty,
                 0.0,
             )
             .map_err(EstimationError::InvalidInput)?
@@ -2587,8 +2592,7 @@ mod tests {
             0.2,
             array![1.0].view(),
             array![1.0].view(),
-            |u, design_d, deriv_d, design_m| {
-                let _ = u;
+            |_, design_d, deriv_d, design_m| {
                 design_d[0] = 1.0;
                 deriv_d[0] = 0.0;
                 design_m[0] = 1.0;
@@ -2609,8 +2613,7 @@ mod tests {
             0.2,
             array![1.0].view(),
             array![1.0].view(),
-            |u, design_d, deriv_d, design_m| {
-                let _ = u;
+            |_, design_d, deriv_d, design_m| {
                 design_d[0] = 1.0;
                 deriv_d[0] = 0.0;
                 design_m[0] = 1.0;

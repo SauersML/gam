@@ -309,6 +309,7 @@ fn build_deviation_block_from_seed(
             design: DesignMatrix::Dense(Arc::new(design)),
             offset: Array1::zeros(seed.len()),
             penalties,
+            nullspace_dims: vec![],
             initial_log_lambdas: None,
             initial_beta: Some(Array1::zeros(dim)),
         },
@@ -2958,6 +2959,7 @@ fn build_blockspec(
         design: DesignMatrix::Dense(Arc::new(design.design.clone())),
         offset: Array1::from_elem(design.design.nrows(), baseline),
         penalties: design.global_penalties(),
+        nullspace_dims: vec![],
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }
@@ -3318,6 +3320,7 @@ mod tests {
             design: DesignMatrix::Dense(Arc::new(Array2::<f64>::zeros((n_rows, p)))),
             offset: Array1::zeros(n_rows),
             penalties: vec![],
+            nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(Array1::zeros(p)),
         }
