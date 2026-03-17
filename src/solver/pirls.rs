@@ -1,14 +1,15 @@
 use crate::construction::ReparamResult;
+use std::sync::Arc;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_matmut,
-    array2_to_matmut, fast_ab, fast_atv, fast_av_into,
+    array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
 };
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
-use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
+use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
 use crate::mixture_link::{
     InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
 };
@@ -4098,10 +4099,8 @@ impl PirlsResult {
                     score_d_array.clone(),
                 )
             };
-        let x_dense = x_original
-            .try_to_dense_arc("rehydrating compact REML PIRLS cache entry requires dense design")
-            .map_err(EstimationError::InvalidInput)?;
-        let x_transformed_dense = x_dense.dot(&self.reparam_result.qs);
+        // Lazy rehydration: wrap in ReparamOperator instead of materializing X·Qs.
+        let qs_arc = Arc::new(self.reparam_result.qs.clone());
         Ok(Self {
             beta_transformed: self.beta_transformed.clone(),
             penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
@@ -4134,7 +4133,10 @@ impl PirlsResult {
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
-            x_transformed: maybe_sparse_design(&x_transformed_dense),
+            x_transformed: DesignMatrix::Operator(Arc::new(ReparamOperator::new(
+                x_original.clone(),
+                qs_arc,
+            ))),
             coordinate_frame: self.coordinate_frame.clone(),
             cache_compacted: false,
         })
@@ -4449,7 +4451,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     let qs_arc = Arc::new(reparam_result.qs.clone());
 
-    let (x_active, coordinate_frame, reparam_result_active) = if use_sparse_native {
+    let (coordinate_frame, reparam_result_active) = if use_sparse_native {
         let sparse_reparam = build_sparse_native_reparam_result(
             reparam_result.clone(),
             penalty.rs_original,
@@ -4457,7 +4459,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             penalty.p,
         );
         (
-            x_original.clone(),
             PirlsCoordinateFrame::OriginalSparseNative,
             sparse_reparam,
         )
@@ -4465,7 +4466,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         // Lazy composition: do NOT materialize X·Qs.  The GamWorkingModel
         // will use TransformedImplicit to apply Qs on the coefficient side.
         (
-            x_original.clone(),
             PirlsCoordinateFrame::TransformedQs,
             reparam_result.clone(),
         )
@@ -4518,13 +4518,14 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
         let deviance = calculate_deviance(y, &finalmu, link_function, priorweights);
-        let mut stabilizedhessian = penalized_hessian.clone();
         let ridge_used = baseridge;
-        if ridge_used > 0.0 {
-            for i in 0..stabilizedhessian.nrows() {
-                stabilizedhessian[[i, i]] += ridge_used;
-            }
-        }
+        let stabilizedhessian = if ridge_used > 0.0 {
+            penalized_hessian.addridge(ridge_used).map_err(|e| {
+                EstimationError::InvalidInput(format!("ridge addition failed: {e}"))
+            })?
+        } else {
+            penalized_hessian.clone()
+        };
         if ridge_used > 0.0 {
             let ridge_penalty =
                 ridge_used * beta_transformed.as_ref().dot(beta_transformed.as_ref());
@@ -4538,7 +4539,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let working_state = WorkingState {
             eta: LinearPredictor::new(finalmu.clone()),
             gradient: gradient.clone(),
-            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian.clone()),
+            hessian: penalized_hessian.clone(),
 
             deviance,
             penalty_term,
@@ -4570,8 +4571,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             )?;
         let pirls_result = PirlsResult {
             beta_transformed,
-            penalized_hessian_transformed: SymmetricMatrix::Dense(penalized_hessian),
-            stabilizedhessian_transformed: SymmetricMatrix::Dense(stabilizedhessian),
+            penalized_hessian_transformed: penalized_hessian,
+            stabilizedhessian_transformed: stabilizedhessian,
             ridge_passport: RidgePassport::scaled_identity(
                 ridge_used,
                 RidgePolicy::explicit_stabilization_full(),
@@ -4846,6 +4847,201 @@ fn debug_assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
         max_asym,
         tol
     );
+}
+
+/// Build a DesignMatrix wrapping a lazy ReparamOperator (or the original for sparse-native).
+fn make_reparam_operator(
+    x_original: &DesignMatrix,
+    qs_arc: &Arc<Array2<f64>>,
+    use_sparse_native: bool,
+) -> DesignMatrix {
+    if use_sparse_native {
+        x_original.clone()
+    } else {
+        DesignMatrix::Operator(Arc::new(ReparamOperator::new(
+            x_original.clone(),
+            Arc::clone(qs_arc),
+        )))
+    }
+}
+
+/// Identity-link solver that operates in original or QS-transformed coordinates
+/// without materializing X·Qs.  When the design is sparse and `qs` is `None`
+/// (sparse-native path), uses sparse Cholesky for O(nnz^{1.5}) cost instead
+/// of the O(p³) dense Cholesky.
+fn solve_penalized_least_squares_implicit(
+    x_original: &DesignMatrix,
+    qs: Option<&Arc<Array2<f64>>>,
+    z: ArrayView1<f64>,
+    weights: ArrayView1<f64>,
+    offset: ArrayView1<f64>,
+    e_transformed: &Array2<f64>,
+    s_transformed: &Array2<f64>,
+    workspace: &mut PirlsWorkspace,
+    y: ArrayView1<f64>,
+    link_function: LinkFunction,
+) -> Result<(StablePLSResult, usize), EstimationError> {
+    let p_dim = s_transformed.ncols();
+
+    // ── Sparse-native fast path ──────────────────────────────────────────
+    // When design is sparse and we are in original coordinates (qs = None),
+    // assemble the penalized Hessian in sparse format and solve with sparse
+    // Cholesky.  This avoids O(p²) dense X'WX and O(p³) dense factorization.
+    if qs.is_none() {
+        if let Some(x_sparse) = x_original.as_sparse() {
+            let weights_owned = weights.to_owned();
+
+            // 1. Sparse penalized Hessian: H = X'diag(w)X + S_λ + ridge·I
+            let (h_sparse, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
+                let ridge = if ridge == 0.0 { FIXED_STABILIZATION_RIDGE } else { ridge };
+                workspace.assemble_sparse_penalized_hessian(
+                    x_sparse, &weights_owned, s_transformed, ridge,
+                )
+            })?;
+
+            // 2. RHS = X'W(z - offset)
+            let mut wz = z.to_owned();
+            wz -= &offset;
+            wz *= &weights_owned;
+            let rhs = x_original.transpose_vector_multiply(&wz);
+
+            // 3. Sparse Cholesky solve
+            let factor = factorize_sparse_spd(&h_sparse)?;
+            let betavec = solve_sparse_spd(&factor, &rhs)?;
+
+            // 4. EDF via sparse factorization
+            let h_sym = SymmetricMatrix::Sparse(h_sparse);
+            let edf = calculate_edf(&h_sym, e_transformed)?;
+
+            // 5. Fitted values and scale
+            let fitted_vals = {
+                let xb = x_original.apply(&betavec);
+                let mut f = xb;
+                f += &offset;
+                f
+            };
+            let standard_deviation = match link_function {
+                LinkFunction::Identity => {
+                    let residuals = &y - &fitted_vals;
+                    let weighted_rss: f64 = weights.iter().zip(residuals.iter())
+                        .map(|(&w, &r)| w * r * r).sum();
+                    let effective_n = y.len() as f64;
+                    (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
+                }
+                _ => 1.0,
+            };
+
+            return Ok((
+                StablePLSResult {
+                    beta: Coefficients::new(betavec),
+                    penalized_hessian: h_sym,
+                    edf,
+                    standard_deviation,
+                    ridge_used,
+                },
+                p_dim,
+            ));
+        }
+    }
+
+    // ── Dense / QS-rotated path ──────────────────────────────────────────
+
+    // 1. Prepare weighted buffers
+    workspace.fill_sqrtweights(&weights);
+    if workspace.wz.len() != z.len() {
+        workspace.wz = Array1::zeros(z.len());
+    }
+    workspace.wz.assign(&z);
+    workspace.wz -= &offset;
+    workspace.wz *= &weights;
+
+    // 2. Form X'WX: compute in original coordinates, then rotate by Qs.
+    let xtwx_orig = GamWorkingModel::compute_xtwx_blas(workspace, x_original, &weights.to_owned())?;
+    let mut penalized_hessian = s_transformed.clone();
+    if let Some(qs) = qs {
+        let tmp = fast_atb(qs, &xtwx_orig);
+        penalized_hessian += &fast_ab(&tmp, qs);
+    } else {
+        penalized_hessian += &xtwx_orig;
+    }
+
+    // 3. Form X'Wz: compute in original coordinates, then rotate.
+    let xtwy_orig = x_original.transpose_vector_multiply(&workspace.wz);
+    if workspace.vec_buf_p.len() != p_dim {
+        workspace.vec_buf_p = Array1::zeros(p_dim);
+    }
+    if let Some(qs) = qs {
+        workspace.vec_buf_p.assign(&fast_atv(qs, &xtwy_orig));
+    } else {
+        workspace.vec_buf_p.assign(&xtwy_orig);
+    }
+
+    #[cfg(debug_assertions)]
+    debug_assert_symmetric_tol(&penalized_hessian, "implicit PLS penalized Hessian", 1e-8);
+
+    // 4. Ridge stabilization
+    let nugget = FIXED_STABILIZATION_RIDGE;
+    let mut regularizedhessian = penalized_hessian.clone();
+    if nugget > 0.0 {
+        for i in 0..p_dim {
+            regularizedhessian[[i, i]] += nugget;
+        }
+    }
+    let ridge_used = nugget;
+
+    // 5. Solve
+    if workspace.rhs_full.len() != p_dim {
+        workspace.rhs_full = Array1::zeros(p_dim);
+    }
+    workspace.rhs_full.assign(&workspace.vec_buf_p);
+    let factor = StableSolver::new("pirls implicit pls")
+        .factorize(&regularizedhessian)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+    let mut rhsview = array1_to_col_matmut(&mut workspace.rhs_full);
+    factor.solve_in_place(rhsview.as_mut());
+    if !array1_is_finite(&workspace.rhs_full) {
+        return Err(EstimationError::LinearSystemSolveFailed(
+            FaerLinalgError::FactorizationFailed,
+        ));
+    }
+    let betavec = workspace.rhs_full.clone();
+
+    // 6. EDF
+    let edf = calculate_edfwithworkspace(&regularizedhessian, e_transformed, workspace)?;
+
+    // 7. Scale (composed: eta = offset + X Qs beta)
+    let qbeta = if let Some(qs) = qs {
+        qs.dot(&betavec)
+    } else {
+        betavec.clone()
+    };
+    let xqbeta = x_original.apply(&qbeta);
+    let mut fitted = xqbeta;
+    fitted += &offset;
+    let standard_deviation = match link_function {
+        LinkFunction::Identity => {
+            let residuals = &y - &fitted;
+            let weighted_rss: f64 = weights
+                .iter()
+                .zip(residuals.iter())
+                .map(|(&w, &r)| w * r * r)
+                .sum();
+            let effective_n = y.len() as f64;
+            (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
+        }
+        _ => 1.0,
+    };
+
+    Ok((
+        StablePLSResult {
+            beta: Coefficients::new(betavec),
+            penalized_hessian: SymmetricMatrix::Dense(penalized_hessian),
+            edf,
+            standard_deviation,
+            ridge_used,
+        },
+        p_dim,
+    ))
 }
 
 fn design_dot_dense_rhs(x: &DesignMatrix, rhs: &Array2<f64>) -> Array2<f64> {
@@ -6354,8 +6550,8 @@ pub fn calculate_deviance(
 pub struct StablePLSResult {
     /// Solution vector beta
     pub beta: Coefficients,
-    /// Final penalized Hessian matrix
-    pub penalized_hessian: Array2<f64>,
+    /// Final penalized Hessian matrix (sparse or dense depending on solve path)
+    pub penalized_hessian: SymmetricMatrix,
     /// Effective degrees of freedom
     pub edf: f64,
     /// Residual standard deviation estimate.
@@ -6515,7 +6711,7 @@ pub fn solve_penalized_least_squares(
     Ok((
         StablePLSResult {
             beta: Coefficients::new(betavec),
-            penalized_hessian, // Return original H for derivatives
+            penalized_hessian: SymmetricMatrix::Dense(penalized_hessian),
             edf,
             standard_deviation,
             ridge_used,
@@ -7541,6 +7737,7 @@ mod root_cause_tests {
                         coefficient_lower_bounds: None,
                         linear_constraints_original: None,
                         penalty_shrinkage_floor: None,
+                        penalties: None,
                     },
                     &config,
                     None,

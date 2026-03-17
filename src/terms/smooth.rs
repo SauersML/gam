@@ -2230,6 +2230,13 @@ pub fn build_smooth_design_withworkspace(
 
         let p_local = built.design.ncols();
         let mut metadata = built.metadata.clone();
+        // Extract factored Kronecker representation before consuming fields.
+        // Invalidate it if shape transforms will be applied (they break structure).
+        let kron_factored = if term.shape == ShapeConstraint::None {
+            built.kronecker_factored
+        } else {
+            None
+        };
         let mut design_t = built.design;
         let mut penalties_t: Vec<Array2<f64>> = built.penalties;
         if matches!(
@@ -2318,6 +2325,7 @@ pub fn build_smooth_design_withworkspace(
         local_metadata.push(metadata);
         local_linear_constraints.push(linear_constraints_local);
         local_box_reparam.push(use_box_reparam);
+        local_kronecker_factored.push(kron_factored);
     }
 
     let total_p: usize = local_dims.iter().sum();
@@ -2396,6 +2404,7 @@ pub fn build_smooth_design_withworkspace(
             metadata: local_metadata[idx].clone(),
             lower_bounds_local: lb_local.clone(),
             linear_constraints_local: local_linear_constraints[idx].clone(),
+            kronecker_factored: local_kronecker_factored[idx].take(),
         });
         if let Some(lin_local) = &local_linear_constraints[idx] {
             for r in 0..lin_local.a.nrows() {
@@ -2644,9 +2653,8 @@ pub fn build_term_collection_design(
             continue;
         }
         let block_size = range.len();
-        let s_local = Array2::<f64>::eye(block_size);
         let global_index = penalties.len();
-        penalties.push(BlockwisePenalty::new(range.clone(), s_local));
+        penalties.push(BlockwisePenalty::ridge(range.clone(), 1.0));
         nullspace_dims.push(0);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
@@ -2655,10 +2663,11 @@ pub fn build_term_collection_design(
                 source: PenaltySource::Other(format!("RandomEffectRidge({name})")),
                 original_index: re_idx,
                 active: true,
-                effective_rank: range.len(),
+                effective_rank: block_size,
                 dropped_reason: None,
                 nullspace_dim_hint: 0,
                 normalization_scale: 1.0,
+                kronecker_factors: None,
             },
         });
     }
@@ -2678,10 +2687,26 @@ pub fn build_term_collection_design(
     {
         let start = p_intercept + p_lin + p_rand;
         let global_index = penalties.len();
-        penalties.push(BlockwisePenalty::new(
-            start..(start + p_smooth),
-            s_local.clone(),
-        ));
+        // Propagate structural hints from PenaltyInfo to BlockwisePenalty
+        // for efficient block-scale spectral decomposition.
+        let bp = {
+            let col_range = start..(start + p_smooth);
+            let local = s_local.clone();
+            if let Some(factors) = localinfo.penalty.kronecker_factors.as_ref() {
+                BlockwisePenalty::kronecker(col_range, local, factors.clone())
+            } else if matches!(localinfo.penalty.source, PenaltySource::TensorGlobalRidge)
+                || matches!(
+                    localinfo.penalty.source,
+                    PenaltySource::Other(ref s) if s.starts_with("RandomEffectRidge")
+                )
+            {
+                // Detect identity/ridge penalties from their source tag.
+                BlockwisePenalty::ridge(col_range, 1.0)
+            } else {
+                BlockwisePenalty::new(col_range, local)
+            }
+        };
+        penalties.push(bp);
         nullspace_dims.push(ns);
         let mut penalty = localinfo.penalty.clone();
         penalty.nullspace_dim_hint = ns;

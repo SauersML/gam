@@ -39,14 +39,20 @@ mod tests {
         s: &Array2<f64>,
         cfg: &'a RemlConfig,
     ) -> RemlState<'a> {
+        use crate::estimate::PenaltySpec;
+        let p = x.ncols();
         let offset = Array1::<f64>::zeros(y.len());
+        let spec = PenaltySpec::Dense(s.clone());
+        let (canonical, _nulls) =
+            crate::construction::canonicalize_penalty_specs(&[spec], &[1], p, "test")
+                .expect("canonicalize");
         RemlState::newwith_offset(
             y.view(),
             x.clone(),
             w.view(),
             offset.view(),
-            vec![s.clone()],
-            x.ncols(),
+            canonical,
+            p,
             cfg,
             Some(vec![1]),
             None,
@@ -282,13 +288,17 @@ mod tests {
         ];
         let offset = Array1::<f64>::zeros(y.len());
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-9, true);
+        let p = x.ncols();
         let state = RemlState::newwith_offset(
             y.view(),
             x.clone(),
             w.view(),
             offset.view(),
-            vec![s0, s1],
-            x.ncols(),
+            vec![
+                crate::terms::smooth::BlockwisePenalty::new(0..p, s0),
+                crate::terms::smooth::BlockwisePenalty::new(0..p, s1),
+            ],
+            p,
             &cfg,
             Some(vec![1, 1]),
             None,

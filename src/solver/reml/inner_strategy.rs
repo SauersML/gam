@@ -84,9 +84,9 @@ impl<'a> RemlState<'a> {
 
         let lambdas = rho.mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
-        for (k, s_k) in self.s_full_list.iter().enumerate() {
+        for (k, cp) in self.canonical_penalties.iter().enumerate() {
             if k < lambdas.len() && lambdas[k] != 0.0 {
-                s_lambda.scaled_add(lambdas[k], s_k);
+                cp.accumulate_weighted(&mut s_lambda, lambdas[k]);
             }
         }
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);

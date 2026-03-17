@@ -55,9 +55,21 @@
 //! - U₀ (null eigenvectors) and Σ₊⁻² for the moving-nullspace correction
 
 use faer::Side;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, s};
 
 use crate::faer_ndarray::FaerEigh;
+
+/// Check whether a set of penalties have mutually disjoint column ranges.
+fn are_penalties_disjoint(penalties: &[crate::terms::smooth::Penalty]) -> bool {
+    for (i, a) in penalties.iter().enumerate() {
+        for b in &penalties[i + 1..] {
+            if a.start() < b.end() && b.start() < a.end() {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 /// Result of a penalty pseudo-logdet computation.
 ///
@@ -80,6 +92,232 @@ pub struct PenaltyPseudologdet {
 }
 
 impl PenaltyPseudologdet {
+    /// Build from block-local `Penalty` values and current lambdas.
+    ///
+    /// When all penalties have disjoint column ranges, the eigendecomposition
+    /// factorizes per-block: each block is at most `block_p × block_p` instead
+    /// of a single `p × p` spectral solve. When blocks overlap, falls back
+    /// to assembling the full combined penalty and eigendecomposing once.
+    ///
+    /// This is the preferred entry point for REML logdet computation.
+    pub fn from_penalties(
+        penalties: &[crate::terms::smooth::Penalty],
+        lambdas: &[f64],
+        ridge: f64,
+        p_total: usize,
+    ) -> Result<Self, String> {
+        if penalties.is_empty() {
+            return Ok(Self {
+                w_factor: Array2::zeros((0, 0)),
+                u_null: None,
+                inv_evals_sq: Array1::zeros(0),
+                rank: 0,
+                value: 0.0,
+            });
+        }
+
+        // Check if all penalty blocks are disjoint.
+        let disjoint = are_penalties_disjoint(penalties);
+
+        if disjoint {
+            // Block-factored path: assemble and eigendecompose per-block.
+            // Group penalties by overlapping column ranges.
+            Self::from_penalties_block_factored(penalties, lambdas, ridge, p_total)
+        } else {
+            // Fallback: assemble full p×p combined penalty.
+            let mut s_total = Array2::<f64>::zeros((p_total, p_total));
+            for (k, pen) in penalties.iter().enumerate() {
+                if k < lambdas.len() {
+                    pen.add_to(&mut s_total, lambdas[k]);
+                }
+            }
+            if ridge > 0.0 {
+                for i in 0..p_total {
+                    s_total[[i, i]] += ridge;
+                }
+            }
+            Self::from_assembled(s_total)
+        }
+    }
+
+    /// Block-factored logdet: eigendecompose each disjoint block independently.
+    ///
+    /// The total logdet is the sum of per-block logdets. The W-factor is
+    /// block-diagonal (embedded in p_total space).
+    fn from_penalties_block_factored(
+        penalties: &[crate::terms::smooth::Penalty],
+        lambdas: &[f64],
+        ridge: f64,
+        p_total: usize,
+    ) -> Result<Self, String> {
+        use ndarray::s;
+
+        // Collect block ranges and assemble per-block combined penalties.
+        // Each penalty contributes to its own block (disjoint assumption).
+        struct BlockData {
+            start: usize,
+            end: usize,
+            local: Array2<f64>,
+        }
+
+        // Group penalties by their exact block range.
+        let mut blocks: Vec<BlockData> = Vec::new();
+        for (k, pen) in penalties.iter().enumerate() {
+            let lambda = if k < lambdas.len() { lambdas[k] } else { 0.0 };
+            // Find or create block with matching range.
+            if let Some(bd) = blocks.iter_mut().find(|bd| bd.start == pen.start() && bd.end == pen.end()) {
+                bd.local.scaled_add(lambda, &pen.local);
+            } else {
+                let mut local = Array2::<f64>::zeros((pen.block_size(), pen.block_size()));
+                local.scaled_add(lambda, &pen.local);
+                blocks.push(BlockData {
+                    start: pen.start(),
+                    end: pen.end(),
+                    local,
+                });
+            }
+        }
+
+        // Add ridge to each block diagonal.
+        if ridge > 0.0 {
+            for bd in &mut blocks {
+                let bs = bd.end - bd.start;
+                for i in 0..bs {
+                    bd.local[[i, i]] += ridge;
+                }
+            }
+        }
+
+        // Eigendecompose each block and collect results.
+        let mut total_value = 0.0_f64;
+        let mut total_rank = 0usize;
+        let mut w_factor = Array2::<f64>::zeros((p_total, 0)); // will be rebuilt
+        let mut inv_evals_sq_vec: Vec<f64> = Vec::new();
+
+        // For the unpenalized dimensions (not covered by any block), add ridge.
+        // Those dimensions have eigenvalue = ridge if ridge > 0, otherwise 0 (null).
+        let mut covered = vec![false; p_total];
+        for bd in &blocks {
+            for i in bd.start..bd.end {
+                covered[i] = true;
+            }
+        }
+        let uncovered_count = covered.iter().filter(|&&c| !c).count();
+
+        // Each uncovered dimension has eigenvalue = ridge.
+        if ridge > 0.0 && uncovered_count > 0 {
+            total_value += uncovered_count as f64 * ridge.ln();
+            total_rank += uncovered_count;
+            for (idx, &c) in covered.iter().enumerate() {
+                if !c {
+                    inv_evals_sq_vec.push(1.0 / (ridge * ridge));
+                    // W-factor column for this dimension: e_idx / sqrt(ridge)
+                    // We'll build the full W-factor after collecting all columns.
+                }
+            }
+        }
+
+        // Process each block.
+        struct BlockResult {
+            w_cols: Array2<f64>, // p_total × block_rank
+            inv_evals_sq: Vec<f64>,
+            value: f64,
+            rank: usize,
+        }
+
+        let mut block_results: Vec<BlockResult> = Vec::new();
+
+        for bd in &blocks {
+            let block_pld = Self::from_assembled(bd.local.clone())?;
+            block_results.push(BlockResult {
+                w_cols: {
+                    // Embed block W-factor into p_total space.
+                    let bs = bd.end - bd.start;
+                    let mut embedded = Array2::<f64>::zeros((p_total, block_pld.rank));
+                    if block_pld.rank > 0 {
+                        embedded
+                            .slice_mut(s![bd.start..bd.end, ..])
+                            .assign(&block_pld.w_factor.slice(s![..bs, ..]));
+                    }
+                    embedded
+                },
+                inv_evals_sq: block_pld.inv_evals_sq.to_vec(),
+                value: block_pld.value,
+                rank: block_pld.rank,
+            });
+        }
+
+        // Also add uncovered dimensions as trivial "block results".
+        if ridge > 0.0 {
+            let inv_ridge_sq = 1.0 / (ridge * ridge);
+            let scale = 1.0 / ridge.sqrt();
+            for (idx, &c) in covered.iter().enumerate() {
+                if !c {
+                    let mut w_col = Array2::<f64>::zeros((p_total, 1));
+                    w_col[[idx, 0]] = scale;
+                    block_results.push(BlockResult {
+                        w_cols: w_col,
+                        inv_evals_sq: vec![inv_ridge_sq],
+                        value: ridge.ln(),
+                        rank: 1,
+                    });
+                }
+            }
+        }
+
+        // Assemble combined W-factor and other arrays.
+        total_rank = block_results.iter().map(|br| br.rank).sum();
+        total_value = block_results.iter().map(|br| br.value).sum();
+
+        let mut w_factor_combined = Array2::<f64>::zeros((p_total, total_rank));
+        let mut inv_evals_sq_combined = Array1::<f64>::zeros(total_rank);
+        let mut col_offset = 0;
+        for br in &block_results {
+            if br.rank > 0 {
+                w_factor_combined
+                    .slice_mut(s![.., col_offset..col_offset + br.rank])
+                    .assign(&br.w_cols);
+                for (i, &v) in br.inv_evals_sq.iter().enumerate() {
+                    inv_evals_sq_combined[col_offset + i] = v;
+                }
+                col_offset += br.rank;
+            }
+        }
+
+        // Null space: the dimensions where eigenvalue == 0 (ridge == 0, no penalty).
+        let total_nullity = p_total - total_rank;
+        let u_null = if total_nullity > 0 {
+            let mut u0 = Array2::<f64>::zeros((p_total, total_nullity));
+            let mut null_col = 0;
+            for (idx, &c) in covered.iter().enumerate() {
+                if !c && ridge <= 0.0 {
+                    u0[[idx, null_col]] = 1.0;
+                    null_col += 1;
+                }
+            }
+            // Also add null dimensions from within blocks (if any block has nullity).
+            // For the block-factored case with disjoint blocks, the block's internal
+            // null dimensions are already captured by from_assembled. But we don't
+            // currently extract them. For now, return None for u_null to avoid
+            // incorrect null-space corrections (ρ-derivatives don't need it).
+            if null_col > 0 {
+                Some(u0.slice(s![.., ..null_col]).to_owned())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            w_factor: w_factor_combined,
+            u_null,
+            inv_evals_sq: inv_evals_sq_combined,
+            rank: total_rank,
+            value: total_value,
+        })
+    }
+
     /// Build from unscaled penalty component matrices and current lambdas.
     ///
     /// Constructs S = Σ_k λ_k S_k + ridge·I, eigendecomposes once, and

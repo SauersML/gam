@@ -51,6 +51,44 @@ impl<'a> RemlState<'a> {
         Ok((det1, det2))
     }
 
+    /// Block-local penalty logdet derivatives using the `Penalty` representation.
+    ///
+    /// When all penalties are block-disjoint, the eigendecomposition factorizes
+    /// per-block at O(block_p³) instead of O(p³). Falls back to the dense path
+    /// when blocks overlap.
+    pub(super) fn structural_penalty_logdet_derivatives_block_local(
+        &self,
+        lambdas: &Array1<f64>,
+        ridge: f64,
+    ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
+        let k_count = self.penalties.len();
+        if k_count == 0 || lambdas.len() != k_count {
+            return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
+        }
+
+        let lambdas_slice = lambdas.as_slice().unwrap();
+
+        let pld = PenaltyPseudologdet::from_penalties(
+            &self.penalties,
+            lambdas_slice,
+            ridge,
+            self.p,
+        )
+        .map_err(|e| EstimationError::LayoutError(e))?;
+
+        // Build S_k matrices (block-local, but we need them as p×p for rho_derivatives).
+        // TODO: Add a block-local rho_derivatives method to PenaltyPseudologdet
+        // that avoids materializing the full p×p S_k matrices.
+        let s_k_matrices: Vec<Array2<f64>> = self
+            .penalties
+            .iter()
+            .map(|pen| pen.to_global_matrix(self.p))
+            .collect();
+
+        let (det1, det2) = pld.rho_derivatives(&s_k_matrices, lambdas_slice);
+        Ok((det1, det2))
+    }
+
     pub(super) fn compute_lamlhessian_analytic_fallback(
         &self,
         rho: &Array1<f64>,

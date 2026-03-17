@@ -1606,6 +1606,10 @@ pub struct PenaltyInfo {
     pub nullspace_dim_hint: usize,
     #[serde(default = "default_normalization_scale")]
     pub normalization_scale: f64,
+    /// Kronecker factors preserved from tensor penalty construction.
+    /// When present, spectral decomposition can use per-factor eigendecomposition.
+    #[serde(skip)]
+    pub kronecker_factors: Option<Vec<Array2<f64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1623,6 +1627,10 @@ pub struct PenaltyCandidate {
 #[derive(Debug, Clone)]
 pub struct CanonicalPenaltyBlock {
     pub sym_penalty: Array2<f64>,
+    /// Eigenvalues from spectral decomposition (retained to avoid recomputation).
+    pub eigenvalues: Array1<f64>,
+    /// Eigenvectors from spectral decomposition (retained to avoid recomputation).
+    pub eigenvectors: Array2<f64>,
     pub rank: usize,
     pub nullity: usize,
     pub tol: f64,
@@ -3391,6 +3399,8 @@ pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBl
     if penalty.nrows() == 0 {
         return Ok(CanonicalPenaltyBlock {
             sym_penalty: Array2::<f64>::zeros((0, 0)),
+            eigenvalues: Array1::<f64>::zeros(0),
+            eigenvectors: Array2::<f64>::zeros((0, 0)),
             rank: 0,
             nullity: 0,
             tol: 1e-10,
@@ -3398,7 +3408,7 @@ pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBl
         });
     }
 
-    let (sym, evals, _) = spectral_summary(penalty)?;
+    let (sym, evals, evecs) = spectral_summary(penalty)?;
     let tol = spectral_tolerance(&sym, &evals);
     let rank = evals.iter().filter(|&&ev| ev > tol).count();
     let nullity = sym.nrows().saturating_sub(rank);
@@ -3408,6 +3418,8 @@ pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBl
         .fold(0.0_f64, |acc, v| acc.max(v.abs()));
     Ok(CanonicalPenaltyBlock {
         sym_penalty: sym,
+        eigenvalues: evals,
+        eigenvectors: evecs,
         rank,
         nullity,
         tol,
@@ -3460,6 +3472,7 @@ pub fn filter_active_penalty_candidates(
             dropped_reason,
             nullspace_dim_hint: candidate.nullspace_dim_hint,
             normalization_scale: candidate.normalization_scale,
+            kronecker_factors: candidate.kronecker_factors,
         });
     }
 
@@ -5299,18 +5312,21 @@ fn operator_penalty_candidates_from_collocation(
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s1,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s2,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
+            kronecker_factors: None,
         },
     ]
 }
@@ -5422,6 +5438,7 @@ fn normalize_penalty_candidate(
         nullspace_dim_hint,
         source,
         normalization_scale,
+        kronecker_factors: None,
     }
 }
 
@@ -7419,18 +7436,21 @@ fn build_matern_operator_penalty_psi_derivatives(
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s1_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s2_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
+            kronecker_factors: None,
         },
     ];
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
@@ -7642,18 +7662,21 @@ fn build_duchon_operator_penalty_psi_derivatives(
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s1_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s2_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
+            kronecker_factors: None,
         },
     ];
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
