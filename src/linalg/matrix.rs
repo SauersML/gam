@@ -1462,15 +1462,9 @@ impl DesignOperator for ReparamDesignOperator {
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        // diag(X_new M X_new') = diag(X_inner Q M Q' X_inner')
-        // Let M_inner = Q M Q', then delegate to inner.
-        let qm = fast_ab(&self.q, middle);  // (p_inner, p_new)
-        let qmqt = {
-            // Q M Q' = (Q M) · Q' without allocating the transpose.
-            let qt = self.q.t();
-            let qt_owned = qt.to_owned();
-            fast_ab(&qm, &qt_owned)
-        };
+        // diag(X_new M X_new') = diag(X_inner (Q M Q') X_inner')
+        let qm = fast_ab(&self.q, middle);   // (p_inner, p_new)
+        let qmqt = fast_ab(&qm, &self.q.t()); // (p_inner, p_inner)
         self.inner.quadratic_form_diag(&qmqt)
     }
 
@@ -1687,6 +1681,19 @@ pub struct RowwiseKroneckerOperator {
 
 /// Generic rowwise Kronecker operator for dense marginal designs.
 ///
+/// Decode a flat index into per-dimension indices for a row-major tensor
+/// with the given dimension sizes.
+///
+///   decode_multi_index(flat, &[3, 4]) → [flat / 4, flat % 4]
+fn decode_multi_index(mut flat: usize, dims: &[usize]) -> Vec<usize> {
+    let mut indices = vec![0usize; dims.len()];
+    for d in (0..dims.len()).rev() {
+        indices[d] = flat % dims[d];
+        flat /= dims[d];
+    }
+    indices
+}
+
 /// Each row is the Kronecker product of the corresponding marginal rows:
 /// `X[i, :] = B_1[i, :] ⊗ ... ⊗ B_d[i, :]`.
 ///
@@ -1722,6 +1729,9 @@ impl TensorProductDesignOperator {
         })
     }
 
+    /// Materialize the full Kronecker row for observation `row`.
+    /// Only used by fallback paths (quadratic_form_diag, row_chunk);
+    /// the hot-path apply/apply_transpose use sequential contraction instead.
     fn row_values(&self, row: usize) -> Vec<f64> {
         let mut values = vec![1.0_f64];
         for marginal in &self.marginals {
@@ -1736,6 +1746,111 @@ impl TensorProductDesignOperator {
         }
         values
     }
+
+    /// Compute Xβ via sequential contraction through marginal dimensions.
+    ///
+    /// β is conceptually a (q₁, q₂, …, qₖ) tensor.  For each observation i,
+    /// we contract β with marginal row vectors one dimension at a time:
+    ///
+    ///   temp₀ = β                         (∏qⱼ values)
+    ///   temp₁ = contract dim k with Bₖ[i,:] → (∏_{j<k} qⱼ values)
+    ///   temp₂ = contract dim k-1           → (∏_{j<k-1} qⱼ values)
+    ///   …
+    ///   result[i] = final scalar
+    ///
+    /// Per-observation cost: O(∏qⱼ + ∏_{j<k}qⱼ + ⋯ + q₁) with zero heap allocation
+    /// (reuses two fixed buffers).
+    fn apply_contracted(&self, vector: &[f64]) -> Array1<f64> {
+        let d = self.marginals.len();
+        if d == 0 {
+            return Array1::zeros(self.n);
+        }
+
+        // Two alternating buffers for the contraction chain.
+        let mut buf_a = vec![0.0_f64; self.total_cols];
+        let mut buf_b = vec![0.0_f64; self.total_cols];
+
+        let mut out = Array1::<f64>::zeros(self.n);
+        for row in 0..self.n {
+            // Start: copy β into working buffer.
+            buf_a[..self.total_cols].copy_from_slice(&vector[..self.total_cols]);
+            let mut current_len = self.total_cols;
+
+            // Contract from the last marginal backwards.
+            for dim in (0..d).rev() {
+                let q = self.marginals[dim].ncols();
+                let contracted_len = current_len / q;
+                let dst = if dim % 2 == 0 { &mut buf_b } else { &mut buf_a };
+                let src = if dim % 2 == 0 { &buf_a } else { &buf_b };
+                for c in 0..contracted_len {
+                    let mut acc = 0.0_f64;
+                    for t in 0..q {
+                        acc += src[c * q + t] * self.marginals[dim][[row, t]];
+                    }
+                    dst[c] = acc;
+                }
+                current_len = contracted_len;
+            }
+
+            // After d contractions, result is a scalar in the appropriate buffer.
+            out[row] = if d % 2 == 0 { buf_b[0] } else { buf_a[0] };
+        }
+        out
+    }
+
+    /// Compute X'v via sequential outer-product accumulation.
+    ///
+    /// For each observation i with v[i] ≠ 0, accumulates into the coefficient
+    /// tensor by expanding through marginal dimensions one at a time.
+    fn apply_transpose_contracted(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let d = self.marginals.len();
+        if d == 0 {
+            return Array1::zeros(self.total_cols);
+        }
+
+        let mut out = vec![0.0_f64; self.total_cols];
+        let mut buf_a = vec![0.0_f64; self.total_cols];
+        let mut buf_b = vec![0.0_f64; self.total_cols];
+
+        for row in 0..self.n {
+            let scale = vector[row];
+            if scale == 0.0 {
+                continue;
+            }
+
+            // Build the Kronecker row incrementally via sequential outer products.
+            // Start with the first marginal's row, then expand with each subsequent marginal.
+            let q0 = self.marginals[0].ncols();
+            for t in 0..q0 {
+                buf_a[t] = self.marginals[0][[row, t]];
+            }
+            let mut current_len = q0;
+
+            for dim in 1..d {
+                let q = self.marginals[dim].ncols();
+                let new_len = current_len * q;
+                let (src, dst) = if dim % 2 == 1 {
+                    (&buf_a as &[f64], &mut buf_b)
+                } else {
+                    (&buf_b as &[f64], &mut buf_a)
+                };
+                for prefix in 0..current_len {
+                    let base = src[prefix];
+                    for t in 0..q {
+                        dst[prefix * q + t] = base * self.marginals[dim][[row, t]];
+                    }
+                }
+                current_len = new_len;
+            }
+
+            // Accumulate scaled row into output.
+            let final_buf = if d % 2 == 1 { &buf_a } else { &buf_b };
+            for j in 0..self.total_cols {
+                out[j] += scale * final_buf[j];
+            }
+        }
+        Array1::from_vec(out)
+    }
 }
 
 impl DesignOperator for TensorProductDesignOperator {
@@ -1748,31 +1863,11 @@ impl DesignOperator for TensorProductDesignOperator {
     }
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.n);
-        for row in 0..self.n {
-            let row_values = self.row_values(row);
-            let mut acc = 0.0_f64;
-            for (j, &value) in row_values.iter().enumerate() {
-                acc += value * vector[j];
-            }
-            out[row] = acc;
-        }
-        out
+        self.apply_contracted(vector.as_slice().unwrap())
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.total_cols);
-        for row in 0..self.n {
-            let scale = vector[row];
-            if scale == 0.0 {
-                continue;
-            }
-            let row_values = self.row_values(row);
-            for (j, &value) in row_values.iter().enumerate() {
-                out[j] += scale * value;
-            }
-        }
-        out
+        self.apply_transpose_contracted(vector)
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -1783,27 +1878,101 @@ impl DesignOperator for TensorProductDesignOperator {
                 self.n
             ));
         }
+        let d = self.marginals.len();
+        if d == 0 {
+            return Ok(Array2::zeros((0, 0)));
+        }
+        let n = self.n;
+        let q0 = self.marginals[0].ncols();
+
+        // ── Factored Gram computation ──────────────────────────────────
+        //
+        // Generalizes RowwiseKroneckerOperator's gamma approach to k factors.
+        //
+        // X'WX[multi_a, multi_b] =
+        //   Σ_i w[i] · B₁[i,a₁]·B₂[i,a₂]·…·Bₖ[i,aₖ] · B₁[i,b₁]·B₂[i,b₂]·…·Bₖ[i,bₖ]
+        //
+        // Factor out B₁:
+        //   = Σ_i (w[i] · B₂[i,a₂]·B₂[i,b₂] · … · Bₖ[i,aₖ]·Bₖ[i,bₖ]) · B₁[i,a₁]·B₁[i,b₁]
+        //
+        // For each tuple (a₂,b₂,…,aₖ,bₖ), form γ[i] = w[i]·∏_{d>1} Bd[i,ad]·Bd[i,bd],
+        // then the (a₁,b₁) block = B₁'·diag(γ)·B₁  which is a q₁×q₁ gram.
+        //
+        // This avoids per-row allocation and computes many small BLAS grams
+        // instead of one huge (∏qⱼ)×(∏qⱼ) outer product.
+
         let mut xtwx = Array2::<f64>::zeros((self.total_cols, self.total_cols));
-        for row in 0..self.n {
-            let wi = weights[row].max(0.0);
-            if wi == 0.0 {
-                continue;
-            }
-            let row_values = self.row_values(row);
-            for a in 0..self.total_cols {
-                let va = row_values[a];
-                if va == 0.0 {
-                    continue;
-                }
-                for b in a..self.total_cols {
-                    let vb = row_values[b];
-                    if vb == 0.0 {
+        let b0 = &self.marginals[0];
+
+        // Collect tail marginal dimensions.
+        let tail_dims: Vec<usize> = self.marginals[1..].iter().map(|m| m.ncols()).collect();
+        let tail_total: usize = tail_dims.iter().product();
+
+        // Iterate over all (a_tail, b_tail) index pairs in the tail dimensions.
+        // For symmetry, only iterate a_flat <= b_flat and mirror.
+        let mut gamma = Array1::<f64>::zeros(n);
+
+        for a_flat in 0..tail_total {
+            // Decode a_flat into per-dimension indices.
+            let a_indices = decode_multi_index(a_flat, &tail_dims);
+
+            for b_flat in a_flat..tail_total {
+                let b_indices = decode_multi_index(b_flat, &tail_dims);
+
+                // Form γ[i] = w[i] · ∏_{d=1..k-1} B_{d+1}[i, a_d] · B_{d+1}[i, b_d]
+                for i in 0..n {
+                    let mut prod = weights[i].max(0.0);
+                    if prod == 0.0 {
+                        gamma[i] = 0.0;
                         continue;
                     }
-                    let value = wi * va * vb;
-                    xtwx[[a, b]] += value;
-                    if a != b {
-                        xtwx[[b, a]] += value;
+                    for (dim_idx, (&ai, &bi)) in
+                        a_indices.iter().zip(b_indices.iter()).enumerate()
+                    {
+                        let m = &self.marginals[dim_idx + 1];
+                        prod *= m[[i, ai]] * m[[i, bi]];
+                        if prod == 0.0 {
+                            break;
+                        }
+                    }
+                    gamma[i] = prod;
+                }
+
+                // Compute B₁' · diag(γ) · B₁ → (q₀ × q₀) block.
+                let mut block = Array2::<f64>::zeros((q0, q0));
+                for i in 0..n {
+                    let g = gamma[i];
+                    if g == 0.0 {
+                        continue;
+                    }
+                    for a1 in 0..q0 {
+                        let scaled = g * b0[[i, a1]];
+                        if scaled == 0.0 {
+                            continue;
+                        }
+                        for b1 in a1..q0 {
+                            let val = scaled * b0[[i, b1]];
+                            block[[a1, b1]] += val;
+                            if a1 != b1 {
+                                block[[b1, a1]] += val;
+                            }
+                        }
+                    }
+                }
+
+                // Scatter block into the full xtwx.
+                // Global column for (j₁, tail_flat) = j₁ * tail_total + tail_flat.
+                for a1 in 0..q0 {
+                    let ga = a1 * tail_total + a_flat;
+                    for b1 in 0..q0 {
+                        let gb = b1 * tail_total + b_flat;
+                        xtwx[[ga, gb]] += block[[a1, b1]];
+                        if a_flat != b_flat {
+                            // Mirror the tail symmetry.
+                            let ga_mirror = a1 * tail_total + b_flat;
+                            let gb_mirror = b1 * tail_total + a_flat;
+                            xtwx[[ga_mirror, gb_mirror]] += block[[a1, b1]];
+                        }
                     }
                 }
             }
