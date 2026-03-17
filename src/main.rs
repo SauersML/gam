@@ -33,8 +33,9 @@ use gam::families::scale_design::{
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
-    ParameterBlockInput, WiggleBlockConfig, buildwiggle_block_input_from_knots,
-    buildwiggle_block_input_from_seed, monotone_wiggle_basis_with_derivative_order,
+    ParameterBlockInput, WiggleBlockConfig, append_selected_wiggle_penalty_orders,
+    buildwiggle_block_input_from_knots, buildwiggle_block_input_from_seed,
+    monotone_wiggle_basis_with_derivative_order,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
@@ -4871,7 +4872,7 @@ fn run_sample_survival(
             2,
             wiggle_cfg.double_penalty,
         )?;
-        augmentwiggle_penaltieswith_orders(&mut block, &wiggle_cfg.penalty_orders)?;
+        append_selected_wiggle_penalty_orders(&mut block, &wiggle_cfg.penalty_orders)?;
         for (widx, s) in block.penalties.iter().enumerate() {
             if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
                 penalty_blocks.push(PenaltyBlock {

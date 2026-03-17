@@ -546,7 +546,7 @@ pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
     Ok(())
 }
 
-fn append_selected_wiggle_penalty_orders(
+pub(crate) fn append_selected_wiggle_penalty_orders(
     block: &mut ParameterBlockInput,
     penalty_orders: &[usize],
 ) -> Result<(), String> {
@@ -4049,6 +4049,10 @@ struct GaussianJointRowScalars {
     w: Array1<f64>,
     m: Array1<f64>,
     n: Array1<f64>,
+    /// κ = (dσ/dη_ls)/σ: 1 in the active exp region, 0 on the safe_exp
+    /// plateau (|η_ls| ≥ 700).  The cross Hessian block H_{μ,ls} carries an
+    /// overall κ factor and the scale-scale block H_{ls,ls} carries κ².
+    kappa: Array1<f64>,
 }
 
 struct GaussianJointPsiFirstWeights {
@@ -4096,19 +4100,24 @@ fn gaussian_jointrow_scalars(
     let mut w = Array1::<f64>::uninit(nobs);
     let mut m = Array1::<f64>::uninit(nobs);
     let mut n = Array1::<f64>::uninit(nobs);
+    let mut kappa = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
-        let s = safe_exp(eta_ls[i]).max(1e-12);
+        let jet = crate::families::sigma_link::exp_sigma_jet1_scalar(eta_ls[i]);
+        let s = jet.sigma.max(1e-12);
+        let ki = jet.d1 / s; // κ = (dσ/dη_ls)/σ
         let wi = weights[i] / (s * s);
         let ri = y[i] - etamu[i];
         w[i].write(wi);
         m[i].write(ri * wi);
         n[i].write(ri * ri * wi);
+        kappa[i].write(ki);
     }
     // SAFETY: all elements written in the loop above.
     let w = unsafe { w.assume_init() };
     let m = unsafe { m.assume_init() };
     let n = unsafe { n.assume_init() };
-    Ok(GaussianJointRowScalars { w, m, n })
+    let kappa = unsafe { kappa.assume_init() };
+    Ok(GaussianJointRowScalars { w, m, n, kappa })
 }
 
 fn gaussian_joint_first_directionalweights(
@@ -4902,12 +4911,15 @@ impl GaussianLocationScaleFamily {
         }
 
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
+        // Cross block carries overall κ; scale-scale block carries κ².
+        let cross = 2.0 * &rows.kappa * &rows.m;
+        let scale = 2.0 * &rows.kappa * &rows.kappa * &rows.n;
         Ok(Some(gaussian_joint_hessian_from_coeffs(
             xmu,
             x_ls,
             &rows.w,
-            &(2.0 * &rows.m),
-            &(2.0 * &rows.n),
+            &cross,
+            &scale,
         )?))
     }
 
@@ -10288,8 +10300,9 @@ impl BinomialLocationScaleFamily {
             let sb = s * b;
             let du = -r * a - q * sb;
             coeff_tt[i] = r * r * (m3 * du - 2.0 * m2 * sb);
-            coeff_tl[i] = r * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
-            coeff_ll[i] = (m1 + 3.0 * q * m2 + q * q * m3) * du;
+            // Cross block carries overall κ; scale-scale block carries κ².
+            coeff_tl[i] = s * r * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
+            coeff_ll[i] = s * s * (m1 + 3.0 * q * m2 + q * q * m3) * du;
         }
 
         let d_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
@@ -10430,15 +10443,17 @@ impl BinomialLocationScaleFamily {
             let d2 = r * (a * d + b * c) + q * b * d;
             coeff_tt[i] =
                 r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
-            coeff_tl[i] = r
+            // Cross block carries overall κ; scale-scale block carries κ².
+            coeff_tl[i] = s * r
                 * (q * m4 * du * dv
                     + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
                     + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
                     + m1 * b * d);
-            coeff_ll[i] = q * q * m4 * du * dv
-                + m3 * (q * q * d2 + 5.0 * q * du * dv)
-                + m2 * (3.0 * q * d2 + 4.0 * du * dv)
-                + m1 * d2;
+            coeff_ll[i] = s * s
+                * (q * q * m4 * du * dv
+                    + m3 * (q * q * d2 + 5.0 * q * du * dv)
+                    + m2 * (3.0 * q * d2 + 4.0 * du * dv)
+                    + m1 * d2);
         }
 
         let d2_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;

@@ -661,54 +661,6 @@ pub fn create_balanced_penalty_root(
     Ok(eb.t().to_owned())
 }
 
-/// Computes penalty square roots from full penalty matrices using eigendecomposition
-/// Returns "skinny" matrices of dimension rank_k x p where rank_k is the rank of each penalty
-/// STANDARDIZED: All penalty roots use rank x p convention with S = R^T * R
-pub fn compute_penalty_square_roots(
-    s_list: &[Array2<f64>],
-) -> Result<Vec<Array2<f64>>, EstimationError> {
-    let mut rs_list = Vec::with_capacity(s_list.len());
-
-    for s in s_list {
-        let p = s.nrows();
-        let analysis = analyze_penalty_block(s).map_err(|err| {
-            EstimationError::InvalidInput(format!("penalty canonicalization failed: {err}"))
-        })?;
-        assert!(
-            analysis.rank > 0 || s.iter().all(|v| v.abs() <= analysis.tol),
-            "inactive penalty block reached square-root construction"
-        );
-
-        // Reuse eigendecomposition from analyze_penalty_block — no double eigendecomp.
-        let tolerance = analysis.tol;
-        let rank_k = analysis.rank;
-
-        if rank_k == 0 {
-            // Zero penalty matrix - return 0 x p matrix (STANDARDIZED: rank x p)
-            rs_list.push(Array2::zeros((0, p)));
-            continue;
-        }
-
-        // STANDARDIZED: Create rank x p square root matrix where S = rs^T * rs
-        // Each row is sqrt(eigenvalue) * eigenvector^T
-        let mut rs = Array2::zeros((rank_k, p));
-        let mut row_idx = 0;
-
-        for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
-            if eigenval > tolerance {
-                let sqrt_eigenval = eigenval.sqrt();
-                let eigenvec = analysis.eigenvectors.column(i);
-                // Each row of rs is sqrt(eigenvalue) * eigenvector^T
-                rs.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
-                row_idx += 1;
-            }
-        }
-
-        rs_list.push(rs);
-    }
-
-    Ok(rs_list)
-}
 
 // ---------------------------------------------------------------------------
 // Block-scale spectral decomposition
@@ -896,38 +848,6 @@ fn kronecker_root(
     Ok(rs)
 }
 
-/// Compute penalty square roots from blockwise penalties at block scale.
-///
-/// This is the block-aware replacement for `compute_penalty_square_roots`.
-/// Each penalty is eigendecomposed at its natural block size (p_local × p_local)
-/// rather than the global size (p_total × p_total), with fast paths for
-/// Ridge (closed-form) and Kronecker (per-factor) structures.
-///
-/// Returns `Vec<Array2<f64>>` of `rank_k × p_total` matrices — same format
-/// as the existing `compute_penalty_square_roots`.
-pub fn compute_penalty_square_roots_blockwise(
-    penalties: &[BlockwisePenalty],
-    p_total: usize,
-) -> Result<Vec<Array2<f64>>, EstimationError> {
-    let mut rs_list = Vec::with_capacity(penalties.len());
-
-    for bp in penalties {
-        let rs = match &bp.structure_hint {
-            Some(PenaltyStructureHint::Ridge(scale)) => {
-                ridge_root(&bp.col_range, *scale, p_total)
-            }
-            Some(PenaltyStructureHint::Kronecker(factors)) => {
-                kronecker_root(&bp.col_range, factors, p_total)?
-            }
-            None => {
-                block_local_root(&bp.col_range, &bp.local, p_total)?
-            }
-        };
-        rs_list.push(rs);
-    }
-
-    Ok(rs_list)
-}
 
 /// Create a balanced penalty root from blockwise penalties at block scale.
 ///

@@ -11259,8 +11259,9 @@ mod tests {
         assert_eq!(design.penalties.len(), 1);
         assert_eq!(design.nullspace_dims, vec![0]);
         let (_, range) = &design.random_effect_ranges[0];
-        for i in 0..design.design.nrows() {
-            let row_sum: f64 = design.design.slice(s![i, range.clone()]).sum();
+        let dense = design.design.as_dense_cow();
+        for i in 0..dense.nrows() {
+            let row_sum: f64 = dense.slice(s![i, range.clone()]).sum();
             assert!((row_sum - 1.0).abs() < 1e-12);
         }
     }
@@ -11910,6 +11911,7 @@ mod tests {
             log_step: std::f64::consts::LN_2,
             min_length_scale: 1e-3,
             max_length_scale: 1e3,
+            pilot_subsample_threshold: 0,
         };
         let joint_setup =
             isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
@@ -12152,6 +12154,7 @@ mod tests {
             log_step: std::f64::consts::LN_2,
             min_length_scale: 1e-3,
             max_length_scale: 1e3,
+            pilot_subsample_threshold: 0,
         };
         let joint_setup =
             isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
@@ -12914,6 +12917,7 @@ mod tests {
             log_step: std::f64::consts::LN_2,
             min_length_scale: 1e-3,
             max_length_scale: 1e3,
+            pilot_subsample_threshold: 0,
         };
         let joint_setup =
             isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
