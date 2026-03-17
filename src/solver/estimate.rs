@@ -2828,6 +2828,10 @@ pub struct FitOptions {
     /// Typical value: `Some(1e-6)`. Set to `None` or `Some(0.0)` to disable.
     /// Default: `Some(1e-6)`.
     pub penalty_shrinkage_floor: Option<f64>,
+    /// Kronecker-factored penalty system for tensor-product smooth terms.
+    /// When set, the REML evaluator uses O(∏q_j) logdet and KroneckerMarginal
+    /// penalty coordinates instead of O(p³) eigendecomposition.
+    pub kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
