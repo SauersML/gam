@@ -390,6 +390,43 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     out
 }
 
+/// Compute A^T * v into a pre-allocated output buffer.
+/// `out` must be length p where A is (n, p) and v is length n.
+#[inline]
+pub fn fast_atv_into<S: Data<Elem = f64>>(
+    a: &ArrayBase<S, Ix2>,
+    v: &Array1<f64>,
+    out: &mut Array1<f64>,
+) {
+    use faer::Accum;
+    use faer::linalg::matmul::matmul;
+
+    let (n, p) = a.dim();
+    debug_assert_eq!(v.len(), n, "vector length must match A rows");
+    debug_assert_eq!(out.len(), p, "output length must match A cols");
+
+    if !should_use_faer_matmul(p, 1, n) {
+        out.assign(&a.t().dot(v));
+        return;
+    }
+
+    let mut outview = array1_to_col_matmut(out);
+
+    let aview = FaerArrayView::new(a);
+    let vview = FaerColView::new(v);
+    let a_ref = aview.as_ref();
+    let v_ref = vview.as_ref();
+    let par = matmul_parallelism(p, 1, n);
+    matmul(
+        outview.as_mut(),
+        Accum::Replace,
+        a_ref.transpose(),
+        v_ref,
+        1.0,
+        par,
+    );
+}
+
 /// Compute A^T * diag(W) * A using streaming chunks to avoid O(n*p) allocation.
 #[inline]
 pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
