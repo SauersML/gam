@@ -383,10 +383,164 @@ pub trait DesignOperator: Send + Sync {
         false
     }
 
+    /// Extract a dense row chunk without materializing the full matrix.
+    ///
+    /// Returns a `(rows.len(), ncols())` dense matrix containing only the
+    /// requested rows.  Concrete operators should override this with O(chunk)
+    /// implementations; the default falls back through `to_dense()`.
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        self.to_dense().slice(s![rows, ..]).to_owned()
+    }
+
     /// Materialize the full dense matrix.  Operators that exist precisely to
     /// avoid materialization should still support this for fallback paths,
     /// diagnostics, and prediction.
     fn to_dense(&self) -> Array2<f64>;
+}
+
+// ---------------------------------------------------------------------------
+// ReparamOperator — lazy X·Qs composition without materialization
+// ---------------------------------------------------------------------------
+
+/// Lazy composed operator for reparameterized design: X_transformed = X_original · Qs.
+///
+/// Instead of materializing the dense n×p product X·Qs, this operator applies
+/// the p×p orthogonal transform Qs on the coefficient side:
+///
+///   apply(v)           → X · (Qs · v)
+///   apply_transpose(v) → Qs^T · (X^T · v)
+///   diag_xtw_x(w)      → Qs^T · (X^T W X) · Qs
+///
+/// This preserves the sparsity of X and avoids an O(n·p) dense allocation.
+pub struct ReparamOperator {
+    x_original: DesignMatrix,
+    qs: Arc<Array2<f64>>,
+    n: usize,
+    p: usize,
+}
+
+impl ReparamOperator {
+    pub fn new(x_original: DesignMatrix, qs: Arc<Array2<f64>>) -> Self {
+        let n = x_original.nrows();
+        let p = qs.ncols();
+        debug_assert_eq!(
+            x_original.ncols(),
+            qs.nrows(),
+            "ReparamOperator: X cols ({}) must match Qs rows ({})",
+            x_original.ncols(),
+            qs.nrows()
+        );
+        Self {
+            x_original,
+            qs,
+            n,
+            p,
+        }
+    }
+
+    /// Access the underlying original design matrix.
+    pub fn x_original(&self) -> &DesignMatrix {
+        &self.x_original
+    }
+
+    /// Access the Qs orthogonal transform.
+    pub fn qs(&self) -> &Array2<f64> {
+        &self.qs
+    }
+}
+
+impl DesignOperator for ReparamOperator {
+    fn nrows(&self) -> usize {
+        self.n
+    }
+
+    fn ncols(&self) -> usize {
+        self.p
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        // X · (Qs · v): apply Qs on the p-dimensional side first, then sparse/dense X.
+        let qv = self.qs.dot(vector);
+        self.x_original.apply(&qv)
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        // Qs^T · (X^T · v): apply X^T first (sparse matvec), then small dense Qs^T.
+        let xtv = self.x_original.apply_transpose(vector);
+        fast_atv(&self.qs, &xtv)
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        // Qs^T · (X^T W X) · Qs: compute X^TWX in original basis (sparse-friendly),
+        // then two small p×p multiplications.
+        let xtwx = self.x_original.diag_xtw_x(weights)?;
+        let tmp = fast_atb(&self.qs, &xtwx);
+        Ok(fast_ab(&tmp, &self.qs))
+    }
+
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        // Qs^T · X^T(w ⊙ y)
+        let xtwy = self.x_original.compute_xtwy(weights, y)?;
+        Ok(fast_atv(&self.qs, &xtwy))
+    }
+
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        // diag(X Qs M Qs^T X^T) = diag(X · (Qs M Qs^T) · X^T)
+        // Compute M_orig = Qs · M · Qs^T (p×p), then delegate to x_original.
+        let qm = fast_ab(&self.qs, middle);
+        let m_orig = fast_ab(&qm, &self.qs.t().to_owned());
+        self.x_original.quadratic_form_diag(&m_orig)
+    }
+
+    fn apply_weighted_normal(
+        &self,
+        weights: &Array1<f64>,
+        vector: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge: f64,
+    ) -> Array1<f64> {
+        // Qs^T X^T W X Qs v + S v + ridge v
+        let qv = self.qs.dot(vector);
+        let xqv = self.x_original.apply(&qv);
+        let mut wxqv = xqv;
+        for i in 0..wxqv.len() {
+            wxqv[i] *= weights[i].max(0.0);
+        }
+        let xtw = self.x_original.apply_transpose(&wxqv);
+        let mut out = fast_atv(&self.qs, &xtw);
+        if let Some(pen) = penalty {
+            out += &pen.dot(vector);
+        }
+        if ridge > 0.0 {
+            out += &vector.mapv(|x| ridge * x);
+        }
+        out
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        // Fallback materialization for consumers that truly need dense access.
+        let x_dense = self.x_original.to_dense();
+        fast_ab(&x_dense, &self.qs)
+    }
+
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        // Materialize only the requested rows: X[rows, :] · Qs
+        match &self.x_original {
+            DesignMatrix::Dense(x) => {
+                let chunk = x.slice(s![rows, ..]);
+                fast_ab(&chunk.to_owned(), &self.qs)
+            }
+            DesignMatrix::Sparse(sdm) => {
+                let x_dense = sdm.to_dense_arc();
+                let chunk = x_dense.slice(s![rows, ..]);
+                fast_ab(&chunk.to_owned(), &self.qs)
+            }
+            DesignMatrix::Operator(op) => {
+                let chunk = op.row_chunk(rows);
+                fast_ab(&chunk, &self.qs)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +733,17 @@ impl DesignOperator for RandomEffectOperator {
         true
     }
 
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let chunk_rows = rows.end - rows.start;
+        let mut out = Array2::<f64>::zeros((chunk_rows, self.num_groups));
+        for (local, global) in rows.enumerate() {
+            if let Some(g) = self.group_ids[global] {
+                out[[local, g]] = 1.0;
+            }
+        }
+        out
+    }
+
     /// Materialize the full n × q one-hot matrix (fallback for diagnostics).
     fn to_dense(&self) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((self.n, self.num_groups));
@@ -600,6 +765,10 @@ impl DesignOperator for RandomEffectOperator {
 pub enum DesignBlock {
     Dense(Arc<Array2<f64>>),
     RandomEffect(Arc<RandomEffectOperator>),
+    /// Implicit all-ones intercept column: n rows, 1 column, zero storage.
+    Intercept(usize),
+    /// Generic operator block (tensor products, multi-channel, etc.).
+    Operator(Arc<dyn DesignOperator>),
 }
 
 impl DesignBlock {
@@ -607,6 +776,8 @@ impl DesignBlock {
         match self {
             Self::Dense(d) => d.nrows(),
             Self::RandomEffect(op) => op.nrows(),
+            Self::Intercept(n) => *n,
+            Self::Operator(op) => op.nrows(),
         }
     }
 
@@ -614,6 +785,8 @@ impl DesignBlock {
         match self {
             Self::Dense(d) => d.ncols(),
             Self::RandomEffect(op) => op.ncols(),
+            Self::Intercept(_) => 1,
+            Self::Operator(op) => op.ncols(),
         }
     }
 
@@ -621,6 +794,8 @@ impl DesignBlock {
         match self {
             Self::Dense(d) => dense_matvec(d, vector),
             Self::RandomEffect(op) => op.apply(vector),
+            Self::Intercept(n) => Array1::from_elem(*n, vector[0]),
+            Self::Operator(op) => op.apply(vector),
         }
     }
 
@@ -628,6 +803,20 @@ impl DesignBlock {
         match self {
             Self::Dense(d) => dense_transpose_matvec(d, vector),
             Self::RandomEffect(op) => op.apply_transpose(vector),
+            Self::Intercept(_) => {
+                let sum: f64 = vector.iter().sum();
+                Array1::from_vec(vec![sum])
+            }
+            Self::Operator(op) => op.apply_transpose(vector),
+        }
+    }
+
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        match self {
+            Self::Dense(d) => d.slice(s![rows, ..]).to_owned(),
+            Self::RandomEffect(op) => op.row_chunk(rows),
+            Self::Intercept(_) => Array2::ones((rows.end - rows.start, 1)),
+            Self::Operator(op) => op.row_chunk(rows),
         }
     }
 
@@ -639,6 +828,11 @@ impl DesignBlock {
                 Ok(xtwx)
             }
             Self::RandomEffect(op) => op.diag_xtw_x(weights),
+            Self::Intercept(_) => {
+                let sum: f64 = weights.iter().map(|w| w.max(0.0)).sum();
+                Ok(Array2::from_elem((1, 1), sum))
+            }
+            Self::Operator(op) => op.diag_xtw_x(weights),
         }
     }
 
@@ -660,6 +854,21 @@ impl DesignBlock {
                 Ok(diag)
             }
             Self::RandomEffect(op) => op.diag_gram(weights),
+            Self::Intercept(_) => {
+                let sum: f64 = weights.iter().map(|w| w.max(0.0)).sum();
+                Ok(Array1::from_vec(vec![sum]))
+            }
+            Self::Operator(op) => op.diag_gram(weights),
+        }
+    }
+
+    /// Materialize this block as a dense (n, p_k) matrix.
+    fn to_dense(&self) -> Array2<f64> {
+        match self {
+            Self::Dense(d) => d.as_ref().clone(),
+            Self::RandomEffect(op) => op.to_dense(),
+            Self::Intercept(n) => Array2::ones((*n, 1)),
+            Self::Operator(op) => op.to_dense(),
         }
     }
 }
@@ -715,8 +924,8 @@ impl BlockDesignOperator {
         weights: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         match (&self.blocks[i], &self.blocks[j]) {
+            // ── Dense × Dense ───────────────────────────────────────────
             (DesignBlock::Dense(d_i), DesignBlock::Dense(d_j)) => {
-                // Dense × Dense: O(n × p_i × p_j)
                 let pi = d_i.ncols();
                 let pj = d_j.ncols();
                 let mut cross = Array2::<f64>::zeros((pi, pj));
@@ -737,16 +946,183 @@ impl BlockDesignOperator {
                 }
                 Ok(cross)
             }
+
+            // ── Dense × RandomEffect ────────────────────────────────────
             (DesignBlock::Dense(d), DesignBlock::RandomEffect(re)) => {
                 Ok(re.weighted_cross_with_dense(d, weights))
             }
             (DesignBlock::RandomEffect(re), DesignBlock::Dense(d)) => {
-                // Transpose of the dense×RE case.
                 let cross_t = re.weighted_cross_with_dense(d, weights);
                 Ok(cross_t.t().to_owned())
             }
+
+            // ── RandomEffect × RandomEffect ─────────────────────────────
             (DesignBlock::RandomEffect(re_a), DesignBlock::RandomEffect(re_b)) => {
                 Ok(re_a.weighted_cross_with_re(re_b, weights))
+            }
+
+            // ── Intercept × anything ────────────────────────────────────
+            // 1'·diag(w)·B_j  →  (1 × p_j) where entry [0,c] = Σ_i w[i] * B_j[i,c]
+            (DesignBlock::Intercept(_), other) => {
+                let pj = other.ncols();
+                let mut cross = Array2::<f64>::zeros((1, pj));
+                let ones = Array1::from_elem(self.n, 1.0);
+                let weighted = Array1::from_shape_fn(self.n, |idx| {
+                    ones[idx] * weights[idx].max(0.0)
+                });
+                let row = other.apply_transpose(&weighted);
+                cross.row_mut(0).assign(&row);
+                Ok(cross)
+            }
+            (other, DesignBlock::Intercept(_)) => {
+                let pi = other.ncols();
+                let mut cross = Array2::<f64>::zeros((pi, 1));
+                let weighted = Array1::from_shape_fn(self.n, |idx| weights[idx].max(0.0));
+                let col = other.apply_transpose(&weighted);
+                cross.column_mut(0).assign(&col);
+                Ok(cross)
+            }
+
+            // ── Generic fallback for Operator × anything ────────────────
+            // Compute column-by-column: cross[:, c] = block_i' · (w ⊙ block_j · e_c)
+            _ => {
+                let bi = &self.blocks[i];
+                let bj = &self.blocks[j];
+                let pi = bi.ncols();
+                let pj = bj.ncols();
+                let mut cross = Array2::<f64>::zeros((pi, pj));
+                let mut e_c = Array1::<f64>::zeros(pj);
+                for c in 0..pj {
+                    e_c[c] = 1.0;
+                    let col_j = bj.apply(&e_c);
+                    let weighted = Array1::from_shape_fn(self.n, |idx| {
+                        col_j[idx] * weights[idx].max(0.0)
+                    });
+                    let cross_col = bi.apply_transpose(&weighted);
+                    cross.column_mut(c).assign(&cross_col);
+                    e_c[c] = 0.0;
+                }
+                Ok(cross)
+            }
+        }
+    }
+
+    /// Diagonal contribution diag(X_k M X_k') for a single block.
+    fn quadratic_form_diag_block(
+        &self,
+        block: &DesignBlock,
+        m_kk: &Array2<f64>,
+    ) -> Result<Array1<f64>, String> {
+        match block {
+            DesignBlock::Dense(d) => {
+                let xm = fast_ab(d, m_kk);
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    out[i] = d.row(i).dot(&xm.row(i));
+                }
+                Ok(out)
+            }
+            DesignBlock::RandomEffect(re) => {
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    if let Some(g) = re.group_ids[i] {
+                        out[i] = m_kk[[g, g]];
+                    }
+                }
+                Ok(out)
+            }
+            DesignBlock::Intercept(_) => {
+                // Row i of intercept block is [1], so contribution = M[0,0] for all i.
+                Ok(Array1::from_elem(self.n, m_kk[[0, 0]]))
+            }
+            DesignBlock::Operator(op) => op.quadratic_form_diag(m_kk),
+        }
+    }
+
+    /// Cross-block contribution diag(X_a M_ab X_b') for two distinct blocks.
+    fn quadratic_form_diag_cross(
+        &self,
+        block_a: &DesignBlock,
+        block_b: &DesignBlock,
+        m_ab: &Array2<f64>,
+    ) -> Result<Array1<f64>, String> {
+        match (block_a, block_b) {
+            (DesignBlock::Dense(da), DesignBlock::Dense(db)) => {
+                let da_m = fast_ab(da, m_ab);
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    out[i] = da_m.row(i).dot(&db.row(i));
+                }
+                Ok(out)
+            }
+            (DesignBlock::Dense(d), DesignBlock::RandomEffect(re)) => {
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    if let Some(g) = re.group_ids[i] {
+                        let mut val = 0.0;
+                        for j in 0..d.ncols() {
+                            val += d[[i, j]] * m_ab[[j, g]];
+                        }
+                        out[i] = val;
+                    }
+                }
+                Ok(out)
+            }
+            (DesignBlock::RandomEffect(re), DesignBlock::Dense(d)) => {
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    if let Some(g) = re.group_ids[i] {
+                        let mut val = 0.0;
+                        for j in 0..d.ncols() {
+                            val += m_ab[[g, j]] * d[[i, j]];
+                        }
+                        out[i] = val;
+                    }
+                }
+                Ok(out)
+            }
+            (DesignBlock::RandomEffect(re_a), DesignBlock::RandomEffect(re_b)) => {
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    if let (Some(ga), Some(gb)) = (re_a.group_ids[i], re_b.group_ids[i]) {
+                        out[i] = m_ab[[ga, gb]];
+                    }
+                }
+                Ok(out)
+            }
+
+            // Intercept × anything: contribution at row i = m_ab[0, :] · row_i(B_b)
+            (DesignBlock::Intercept(_), other) => {
+                // m_ab is (1, p_b).  For each i: m_ab[0,:] · row_i(other).
+                let dense_b = other.to_dense();
+                let m_row = m_ab.row(0);
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    out[i] = dense_b.row(i).dot(&m_row);
+                }
+                Ok(out)
+            }
+            (other, DesignBlock::Intercept(_)) => {
+                // m_ab is (p_a, 1).  For each i: row_i(other) · m_ab[:,0].
+                let dense_a = other.to_dense();
+                let m_col = m_ab.column(0);
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    out[i] = dense_a.row(i).dot(&m_col);
+                }
+                Ok(out)
+            }
+
+            // Generic fallback: materialize both blocks.
+            _ => {
+                let da = block_a.to_dense();
+                let db = block_b.to_dense();
+                let da_m = fast_ab(&da, m_ab);
+                let mut out = Array1::<f64>::zeros(self.n);
+                for i in 0..self.n {
+                    out[i] = da_m.row(i).dot(&db.row(i));
+                }
+                Ok(out)
             }
         }
     }
@@ -858,10 +1234,7 @@ impl DesignOperator for BlockDesignOperator {
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         // diag(X M X'): for each observation i, compute row_i(X) · M · row_i(X)'.
-        // With block structure, this involves cross terms between blocks.
-        // For one-hot RE blocks, the contribution is simple: M[g_i, g_i] for
-        // diagonal blocks, and 2·M[col_a, col_b] for cross terms where one block
-        // is RE.
+        // With block structure, this decomposes into diagonal and cross-block terms.
         let mut out = Array1::<f64>::zeros(self.n);
         let nb = self.blocks.len();
 
@@ -869,23 +1242,9 @@ impl DesignOperator for BlockDesignOperator {
         for k in 0..nb {
             let sk = self.col_offsets[k];
             let ek = self.col_offsets[k + 1];
-            let m_kk = middle.slice(s![sk..ek, sk..ek]);
-            match &self.blocks[k] {
-                DesignBlock::Dense(d) => {
-                    let m_owned = m_kk.to_owned();
-                    let xm = fast_ab(d, &m_owned);
-                    for i in 0..self.n {
-                        out[i] += d.row(i).dot(&xm.row(i));
-                    }
-                }
-                DesignBlock::RandomEffect(re) => {
-                    for i in 0..self.n {
-                        if let Some(g) = re.group_ids[i] {
-                            out[i] += m_kk[[g, g]];
-                        }
-                    }
-                }
-            }
+            let m_kk = middle.slice(s![sk..ek, sk..ek]).to_owned();
+            let block_diag = self.quadratic_form_diag_block(&self.blocks[k], &m_kk)?;
+            out += &block_diag;
         }
 
         // Cross-block contributions: 2·diag(X_a M_ab X_b')
@@ -897,45 +1256,13 @@ impl DesignOperator for BlockDesignOperator {
                 let eb = self.col_offsets[b + 1];
                 let m_ab = middle.slice(s![sa..ea, sb..eb]);
 
-                match (&self.blocks[a], &self.blocks[b]) {
-                    (DesignBlock::Dense(da), DesignBlock::Dense(db)) => {
-                        let m_owned = m_ab.to_owned();
-                        let da_m = fast_ab(da, &m_owned);
-                        for i in 0..self.n {
-                            out[i] += 2.0 * da_m.row(i).dot(&db.row(i));
-                        }
-                    }
-                    (DesignBlock::Dense(d), DesignBlock::RandomEffect(re)) => {
-                        // Row i contribution: d_row[i] · m_ab_col[g_i]
-                        for i in 0..self.n {
-                            if let Some(g) = re.group_ids[i] {
-                                let mut val = 0.0;
-                                for j in 0..d.ncols() {
-                                    val += d[[i, j]] * m_ab[[j, g]];
-                                }
-                                out[i] += 2.0 * val;
-                            }
-                        }
-                    }
-                    (DesignBlock::RandomEffect(re), DesignBlock::Dense(d)) => {
-                        // Row i contribution: m_ab[g_i, :] · d_row[i]
-                        for i in 0..self.n {
-                            if let Some(g) = re.group_ids[i] {
-                                let mut val = 0.0;
-                                for j in 0..d.ncols() {
-                                    val += m_ab[[g, j]] * d[[i, j]];
-                                }
-                                out[i] += 2.0 * val;
-                            }
-                        }
-                    }
-                    (DesignBlock::RandomEffect(re_a), DesignBlock::RandomEffect(re_b)) => {
-                        for i in 0..self.n {
-                            if let (Some(ga), Some(gb)) = (re_a.group_ids[i], re_b.group_ids[i]) {
-                                out[i] += 2.0 * m_ab[[ga, gb]];
-                            }
-                        }
-                    }
+                let cross_diag = self.quadratic_form_diag_cross(
+                    &self.blocks[a],
+                    &self.blocks[b],
+                    &m_ab.to_owned(),
+                )?;
+                for i in 0..self.n {
+                    out[i] += 2.0 * cross_diag[i];
                 }
             }
         }
@@ -948,10 +1275,27 @@ impl DesignOperator for BlockDesignOperator {
     }
 
     fn uses_matrix_free_pcg(&self) -> bool {
-        // Enable PCG when any block is an operator (large RE).
-        self.blocks
-            .iter()
-            .any(|b| matches!(b, DesignBlock::RandomEffect(_)))
+        // Enable PCG when any block is non-dense (RE, Operator, or Intercept).
+        self.blocks.iter().any(|b| {
+            matches!(
+                b,
+                DesignBlock::RandomEffect(_)
+                    | DesignBlock::Operator(_)
+                    | DesignBlock::Intercept(_)
+            )
+        })
+    }
+
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let chunk_rows = rows.end - rows.start;
+        let mut out = Array2::<f64>::zeros((chunk_rows, self.total_cols));
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let cs = self.col_offsets[idx];
+            let ce = self.col_offsets[idx + 1];
+            let block_chunk = block.row_chunk(rows.clone());
+            out.slice_mut(s![.., cs..ce]).assign(&block_chunk);
+        }
+        out
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -959,18 +1303,8 @@ impl DesignOperator for BlockDesignOperator {
         for (idx, block) in self.blocks.iter().enumerate() {
             let start = self.col_offsets[idx];
             let end = self.col_offsets[idx + 1];
-            match block {
-                DesignBlock::Dense(d) => {
-                    out.slice_mut(s![.., start..end]).assign(d.as_ref());
-                }
-                DesignBlock::RandomEffect(re) => {
-                    for i in 0..self.n {
-                        if let Some(g) = re.group_ids[i] {
-                            out[[i, start + g]] = 1.0;
-                        }
-                    }
-                }
-            }
+            let dense_block = block.to_dense();
+            out.slice_mut(s![.., start..end]).assign(&dense_block);
         }
         out
     }
@@ -1131,6 +1465,26 @@ impl DesignOperator for MultiChannelOperator {
         for (i, ch) in self.channels.iter().enumerate() {
             let dense = ch.to_dense();
             out.slice_mut(s![i * n..(i + 1) * n, ..]).assign(&dense);
+        }
+        out
+    }
+
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let n = self.n_per_channel;
+        let chunk_rows = rows.end - rows.start;
+        let mut out = Array2::<f64>::zeros((chunk_rows, self.p));
+        let mut local = 0usize;
+        let mut global = rows.start;
+        while global < rows.end {
+            let ch_idx = global / n;
+            let ch_local_start = global % n;
+            let ch_local_end = ((ch_idx + 1) * n).min(rows.end) - ch_idx * n;
+            let segment_len = ch_local_end - ch_local_start;
+            let ch_chunk = self.channels[ch_idx].row_chunk(ch_local_start..ch_local_end);
+            out.slice_mut(s![local..local + segment_len, ..])
+                .assign(&ch_chunk);
+            local += segment_len;
+            global += segment_len;
         }
         out
     }
@@ -1323,6 +1677,28 @@ impl DesignOperator for RowwiseKroneckerOperator {
         true
     }
 
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let p_cov = self.p_cov;
+        let p_time = self.p_time;
+        let chunk_rows = rows.end - rows.start;
+        let cov_chunk = self.cov.row_chunk(rows.clone());
+        let time = self.time_basis.as_ref();
+        let mut out = Array2::<f64>::zeros((chunk_rows, p_cov * p_time));
+        for local in 0..chunk_rows {
+            let global = rows.start + local;
+            for j in 0..p_cov {
+                let cij = cov_chunk[[local, j]];
+                if cij == 0.0 {
+                    continue;
+                }
+                for t in 0..p_time {
+                    out[[local, j * p_time + t]] = cij * time[[global, t]];
+                }
+            }
+        }
+        out
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         let n = self.n;
         let p_cov = self.p_cov;
@@ -1342,6 +1718,185 @@ impl DesignOperator for RowwiseKroneckerOperator {
             }
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConditionedDesign — lazy per-column affine transform
+// ---------------------------------------------------------------------------
+
+/// A design matrix wrapper that lazily applies per-column centering and scaling
+/// without materializing a new dense matrix.
+///
+/// For each conditioned column `j`, the effective column is
+/// `(X[:,j] - mean_j) / scale_j`.  All other columns pass through unchanged.
+/// Algebraically this is `X·diag(a) - 1·d'` where `a[j] = 1/scale` for
+/// conditioned columns (1 otherwise) and `d[j] = mean/scale` for conditioned
+/// columns (0 otherwise).
+pub struct ConditionedDesign {
+    inner: DesignMatrix,
+    /// Per-conditioned-column: (global_col_idx, mean, scale).
+    columns: Vec<(usize, f64, f64)>,
+}
+
+impl ConditionedDesign {
+    pub fn new(inner: DesignMatrix, columns: Vec<(usize, f64, f64)>) -> Self {
+        Self { inner, columns }
+    }
+}
+
+impl DesignOperator for ConditionedDesign {
+    fn nrows(&self) -> usize {
+        self.inner.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.inner.ncols()
+    }
+
+    /// X_c v = X(a⊙v) - (d·v)·1
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut scaled = vector.clone();
+        let mut shift = 0.0;
+        for &(j, mean, scale) in &self.columns {
+            scaled[j] /= scale;
+            shift += mean * scaled[j];
+        }
+        let mut result = self.inner.apply(&scaled);
+        if shift != 0.0 {
+            result.mapv_inplace(|v| v - shift);
+        }
+        result
+    }
+
+    /// X_c'u = a⊙(X'u) - d·Σu
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut result = self.inner.apply_transpose(vector);
+        let sum_u: f64 = vector.iter().sum();
+        for &(j, mean, scale) in &self.columns {
+            result[j] = (result[j] - mean * sum_u) / scale;
+        }
+        result
+    }
+
+    /// X_c'WX_c = D_a(X'WX)D_a - D_a(X'w)d' - d(X'w)'D_a + Σw·dd'
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        let mut base = self.inner.diag_xtw_x(weights)?;
+        if self.columns.is_empty() {
+            return Ok(base);
+        }
+        let p = base.ncols();
+        let w_pos: Array1<f64> = weights.mapv(|w| w.max(0.0));
+        let sum_w: f64 = w_pos.sum();
+        let cw = self.inner.apply_transpose(&w_pos);
+
+        // Precompute a[j] and d[j] for all columns.
+        let mut a = vec![1.0_f64; p];
+        let mut d = vec![0.0_f64; p];
+        for &(j, mean, scale) in &self.columns {
+            a[j] = 1.0 / scale;
+            d[j] = mean / scale;
+        }
+
+        // Apply the full transformation in one pass (symmetric).
+        for i in 0..p {
+            for j in i..p {
+                let val = a[i] * base[[i, j]] * a[j]
+                    - a[i] * cw[i] * d[j]
+                    - d[i] * cw[j] * a[j]
+                    + sum_w * d[i] * d[j];
+                base[[i, j]] = val;
+                base[[j, i]] = val;
+            }
+        }
+        Ok(base)
+    }
+
+    /// Diagonal of X_c'WX_c — only conditioned columns change.
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let mut result = self.inner.diag_gram(weights)?;
+        if self.columns.is_empty() {
+            return Ok(result);
+        }
+        let w_pos: Array1<f64> = weights.mapv(|w| w.max(0.0));
+        let sum_w: f64 = w_pos.sum();
+        let cw = self.inner.apply_transpose(&w_pos);
+        for &(j, mean, scale) in &self.columns {
+            let a_j = 1.0 / scale;
+            let d_j = mean / scale;
+            result[j] = a_j * a_j * result[j] - 2.0 * a_j * cw[j] * d_j + sum_w * d_j * d_j;
+        }
+        Ok(result)
+    }
+
+    /// X_c'(w⊙y) = a⊙(X'(w⊙y)) - d·Σ(w⊙y)
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let mut result = self.inner.compute_xtwy(weights, y)?;
+        if self.columns.is_empty() {
+            return Ok(result);
+        }
+        let sum_wy: f64 = weights
+            .iter()
+            .zip(y.iter())
+            .map(|(&w, &yi)| w.max(0.0) * yi)
+            .sum();
+        for &(j, mean, scale) in &self.columns {
+            result[j] = (result[j] - mean * sum_wy) / scale;
+        }
+        Ok(result)
+    }
+
+    /// diag(X_c M X_c') = diag(X(D_a M D_a)X') - 2·X(D_a M d) + d'Md
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        if self.columns.is_empty() {
+            return self.inner.quadratic_form_diag(middle);
+        }
+        let p = self.ncols();
+        let mut d = Array1::zeros(p);
+        for &(j, mean, scale) in &self.columns {
+            d[j] = mean / scale;
+        }
+
+        // D_a M D_a: scale rows and columns for conditioned indices.
+        let mut ama = middle.clone();
+        for &(j, _, scale) in &self.columns {
+            for k in 0..p {
+                ama[[j, k]] /= scale;
+                ama[[k, j]] /= scale;
+            }
+        }
+
+        // D_a M d
+        let md = middle.dot(&d);
+        let mut amd = md;
+        for &(j, _, scale) in &self.columns {
+            amd[j] /= scale;
+        }
+
+        let dtmd: f64 = d.dot(&middle.dot(&d));
+
+        let mut result = self.inner.quadratic_form_diag(&ama)?;
+        let x_amd = self.inner.apply(&amd);
+        for i in 0..result.len() {
+            result[i] = (result[i] - 2.0 * x_amd[i] + dtmd).max(0.0);
+        }
+        Ok(result)
+    }
+
+    fn uses_matrix_free_pcg(&self) -> bool {
+        match &self.inner {
+            DesignMatrix::Dense(_) => true,
+            DesignMatrix::Sparse(_) => false,
+            DesignMatrix::Operator(op) => op.uses_matrix_free_pcg(),
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut dense = self.inner.to_dense();
+        for &(j, mean, scale) in &self.columns {
+            dense.column_mut(j).mapv_inplace(|v| (v - mean) / scale);
+        }
+        dense
     }
 }
 
@@ -1572,6 +2127,73 @@ impl SymmetricMatrix {
                 out
             }
         }
+    }
+
+    /// Maximum absolute value on the diagonal.
+    pub fn max_abs_diag(&self) -> f64 {
+        match self {
+            Self::Dense(mat) => {
+                let n = mat.nrows().min(mat.ncols());
+                (0..n).map(|i| mat[[i, i]].abs()).fold(0.0_f64, f64::max)
+            }
+            Self::Sparse(mat) => {
+                let (symbolic, values) = mat.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                let mut max_val = 0.0_f64;
+                for col in 0..mat.ncols() {
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        if row_idx[idx] == col {
+                            max_val = max_val.max(values[idx].abs());
+                        }
+                    }
+                }
+                max_val
+            }
+        }
+    }
+
+    /// Multiply on the right by a dense matrix: self * rhs.
+    /// Returns a dense Array2.
+    pub fn dot_matrix(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        match self {
+            Self::Dense(mat) => mat.dot(rhs),
+            Self::Sparse(mat) => {
+                let n = mat.nrows();
+                let k = rhs.ncols();
+                let mut out = Array2::<f64>::zeros((n, k));
+                let (symbolic, values) = mat.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..mat.ncols() {
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        let row = row_idx[idx];
+                        let value = values[idx];
+                        for c in 0..k {
+                            out[[row, c]] += value * rhs[[col, c]];
+                            if row != col {
+                                out[[col, c]] += value * rhs[[row, c]];
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Left-multiply by a dense matrix: lhs * self.
+    /// Returns a dense Array2.
+    pub fn left_dot_matrix(&self, lhs: &Array2<f64>) -> Array2<f64> {
+        // (lhs * S)^T = S^T * lhs^T = S * lhs^T  (S is symmetric)
+        // So lhs * S = (S * lhs^T)^T
+        let lhs_t = lhs.t().to_owned();
+        let result_t = self.dot_matrix(&lhs_t);
+        result_t.t().to_owned()
     }
 }
 
@@ -2643,6 +3265,36 @@ impl DesignMatrix {
         <Self as LinearOperator>::ncols(self)
     }
 
+    /// Extract a dense row chunk without materializing the full matrix.
+    ///
+    /// Returns a `(rows.len(), ncols())` dense `Array2` for the requested row
+    /// range.  For `Operator` variants this delegates to the operator's
+    /// `row_chunk`, which is O(chunk) for all concrete operators.
+    pub fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        match self {
+            Self::Dense(matrix) => matrix.slice(s![rows, ..]).to_owned(),
+            Self::Sparse(matrix) => {
+                let csr = matrix
+                    .to_csr_arc()
+                    .unwrap_or_else(|| panic!("DesignMatrix::row_chunk: failed to obtain CSR view"));
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                let chunk_rows = rows.end - rows.start;
+                let ncols = self.ncols();
+                let mut out = Array2::<f64>::zeros((chunk_rows, ncols));
+                for (local_row, row) in rows.enumerate() {
+                    for ptr in row_ptr[row]..row_ptr[row + 1] {
+                        out[[local_row, col_idx[ptr]]] = vals[ptr];
+                    }
+                }
+                out
+            }
+            Self::Operator(op) => op.row_chunk(rows),
+        }
+    }
+
     /// Element access: returns the value at row `i`, column `j`.
     ///
     /// For dense matrices this is O(1). For sparse matrices, this converts to
@@ -2662,6 +3314,35 @@ impl DesignMatrix {
                 // Fallback: materialize and index.  Callers doing bulk access
                 // should call to_dense() once instead.
                 op.to_dense()[[i, j]]
+            }
+        }
+    }
+
+    /// Extract a single column as a dense vector without full densification.
+    ///
+    /// - `Dense`: O(n) column copy.
+    /// - `Sparse` (CSC): O(nnz_j) using the column pointer structure.
+    /// - `Operator`: O(matvec) via unit-vector application.
+    pub fn extract_column(&self, j: usize) -> Array1<f64> {
+        match self {
+            Self::Dense(m) => m.column(j).to_owned(),
+            Self::Sparse(sp) => {
+                let n = sp.nrows();
+                let mut col = Array1::zeros(n);
+                let (symbolic, values) = sp.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                let start = col_ptr[j];
+                let end = col_ptr[j + 1];
+                for idx in start..end {
+                    col[row_idx[idx]] = values[idx];
+                }
+                col
+            }
+            Self::Operator(op) => {
+                let mut e_j = Array1::zeros(op.ncols());
+                e_j[j] = 1.0;
+                op.apply(&e_j)
             }
         }
     }

@@ -770,9 +770,11 @@ fn identified_binomial_log_sigma_design(
     log_sigma_design: &TermCollectionDesign,
     weights: &Array1<f64>,
 ) -> Result<Array2<f64>, String> {
+    let threshold_dense = threshold_design.design.as_dense_cow();
+    let log_sigma_dense = log_sigma_design.design.as_dense_cow();
     prepared_scale_design(
-        &threshold_design.design,
-        &log_sigma_design.design,
+        &threshold_dense,
+        &log_sigma_dense,
         weights,
         log_sigma_design
             .intercept_range
@@ -962,7 +964,8 @@ fn validate_term_collection_design(
     design: &TermCollectionDesign,
 ) -> Result<(), String> {
     let p = design.design.ncols();
-    validate_all_finite_estimation(&format!("{label}.design"), design.design.iter().copied())
+    let design_dense = design.design.as_dense_cow();
+    validate_all_finite_estimation(&format!("{label}.design"), design_dense.iter().copied())
         .map_err(|e| e.to_string())?;
     if design.nullspace_dims.len() != design.penalties.len() {
         return Err(format!(
@@ -1492,7 +1495,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         let noise_log_lambdas = layout.noise_from(theta);
         let mut meanspec = ParameterBlockSpec {
             name: "mu".to_string(),
-            design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
+            design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design
                 .global_penalties()
@@ -1503,11 +1506,13 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
         };
+        let mean_dense = mean_design.design.as_dense_cow();
+        let noise_dense = noise_design.design.as_dense_cow();
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(Arc::new(prepared_gaussian_log_sigma_design(
-                &mean_design.design,
-                &noise_design.design,
+                &mean_dense,
+                &noise_dense,
                 &self.weights,
                 noise_design
                     .intercept_range
@@ -1549,9 +1554,11 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
+        let mean_dense = mean_design.design.as_dense_cow();
+        let noise_dense = noise_design.design.as_dense_cow();
         let preparednoise_design = prepared_gaussian_log_sigma_design(
-            &mean_design.design,
-            &noise_design.design,
+            &mean_dense,
+            &noise_dense,
             &self.weights,
             noise_design
                 .intercept_range
@@ -1562,7 +1569,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         GaussianLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
-            mu_design: Some(DesignMatrix::Dense(Arc::new(mean_design.design.clone()))),
+            mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(DesignMatrix::Dense(Arc::new(preparednoise_design))),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
@@ -1654,7 +1661,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         layout.validate_theta_len(theta.len(), "gaussian location-scale wiggle")?;
         let mut meanspec = ParameterBlockSpec {
             name: "mu".to_string(),
-            design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
+            design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design
                 .global_penalties()
@@ -1665,11 +1672,13 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
+        let mean_dense = mean_design.design.as_dense_cow();
+        let noise_dense = noise_design.design.as_dense_cow();
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(Arc::new(prepared_gaussian_log_sigma_design(
-                &mean_design.design,
-                &noise_design.design,
+                &mean_dense,
+                &noise_dense,
                 &self.weights,
                 noise_design
                     .intercept_range
@@ -1729,9 +1738,11 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
+        let mean_dense = mean_design.design.as_dense_cow();
+        let noise_dense = noise_design.design.as_dense_cow();
         let preparednoise_design = prepared_gaussian_log_sigma_design(
-            &mean_design.design,
-            &noise_design.design,
+            &mean_dense,
+            &noise_dense,
             &self.weights,
             noise_design
                 .intercept_range
@@ -1742,7 +1753,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         GaussianLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
-            mu_design: Some(DesignMatrix::Dense(Arc::new(mean_design.design.clone()))),
+            mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(DesignMatrix::Dense(Arc::new(preparednoise_design))),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
@@ -1848,7 +1859,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
+            design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design
                 .global_penalties()
@@ -1903,7 +1914,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(Arc::new(mean_design.design.clone()))),
+            threshold_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(DesignMatrix::Dense(Arc::new(identifiednoise_design))),
         }
     }
@@ -2011,7 +2022,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         log_sigma_penalties.push(identity_penalty(identifiednoise_design.ncols()));
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Arc::new(mean_design.design.clone())),
+            design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design
                 .global_penalties()
@@ -2084,7 +2095,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(Arc::new(mean_design.design.clone()))),
+            threshold_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(DesignMatrix::Dense(Arc::new(identifiednoise_design))),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
@@ -2393,7 +2404,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 wiggle_knots: wiggle_knots.clone(),
                 wiggle_degree,
                 eta_block: ParameterBlockInput {
-                    design: DesignMatrix::Dense(Arc::new(pilot_design.design.clone())),
+                    design: pilot_design.design.clone(),
                     offset: Array1::zeros(y.len()),
                     penalties: pilot_design.global_penalties(),
                     nullspace_dims: vec![],
@@ -2494,7 +2505,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         let blocks = vec![
             ParameterBlockSpec {
                 name: "eta".to_string(),
-                design: DesignMatrix::Dense(Arc::new(design.design.clone())),
+                design: design.design.clone(),
                 offset: Array1::zeros(y_cloned.len()),
                 penalties: design.global_penalties().into_iter().map(|m| PenaltyMatrix::Dense(m)).collect(),
                 nullspace_dims: vec![],
@@ -2660,7 +2671,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             wiggle_knots: wiggle_knots.clone(),
             wiggle_degree,
             eta_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(Arc::new(design.design.clone())),
+                design: design.design.clone(),
                 offset: Array1::zeros(y.len()),
                 penalties: design.global_penalties(),
                 nullspace_dims: vec![],
@@ -10234,6 +10245,10 @@ impl BinomialLocationScaleFamily {
         for i in 0..n {
             let q = core.q0[i];
             let r = 1.0 / core.sigma[i].max(1e-12);
+            // s = (dσ/dη_ls) / σ: equals 1 when sigma is actively changing
+            // (standard exp link), 0 on the safe_exp plateau (|η_ls| ≥ 700).
+            // Every eta_ls chain-rule term must be scaled by s.
+            let s = core.dsigma_deta[i] / core.sigma[i].max(1e-12);
             let (m1, m2, m3) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
@@ -10243,9 +10258,10 @@ impl BinomialLocationScaleFamily {
             );
             let a = d_eta_t[i];
             let b = d_eta_ls[i];
-            let du = -r * a - q * b;
-            coeff_tt[i] = r * r * (m3 * du - 2.0 * m2 * b);
-            coeff_tl[i] = r * (q * m3 * du + m2 * (2.0 * du - q * b) - m1 * b);
+            let sb = s * b;
+            let du = -r * a - q * sb;
+            coeff_tt[i] = r * r * (m3 * du - 2.0 * m2 * sb);
+            coeff_tl[i] = r * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
             coeff_ll[i] = (m1 + 3.0 * q * m2 + q * q * m3) * du;
         }
 
@@ -10377,10 +10393,11 @@ impl BinomialLocationScaleFamily {
                 core.mu[i],
                 &self.link_kind,
             );
+            let s = core.dsigma_deta[i] / core.sigma[i].max(1e-12);
             let a = d_eta_t_u[i];
-            let b = d_eta_ls_u[i];
+            let b = s * d_eta_ls_u[i];
             let c = d_eta_tv[i];
-            let d = d_eta_lsv[i];
+            let d = s * d_eta_lsv[i];
             let du = -r * a - q * b;
             let dv = -r * c - q * d;
             let d2 = r * (a * d + b * c) + q * b * d;
@@ -11378,9 +11395,12 @@ impl BinomialLocationScaleFamily {
         for row in 0..n {
             let q = core.q0[row];
             let r = 1.0 / core.sigma[row].max(1e-12);
-            let du = -r * xi_t[row] - q * xi_ls[row];
-            let q_a = -r * dir_a.z_t_psi[row] - q * dir_a.z_ls_psi[row];
-            let q_au = r * dir_a.z_t_psi[row] * xi_ls[row] - du * dir_a.z_ls_psi[row];
+            let s = core.dsigma_deta[row] / core.sigma[row].max(1e-12);
+            let xi_ls_s = s * xi_ls[row];
+            let z_ls_psi_s = s * dir_a.z_ls_psi[row];
+            let du = -r * xi_t[row] - q * xi_ls_s;
+            let q_a = -r * dir_a.z_t_psi[row] - q * z_ls_psi_s;
+            let q_au = r * dir_a.z_t_psi[row] * xi_ls_s - du * z_ls_psi_s;
             let (a, b, c) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[row],
                 self.weights[row],
@@ -11396,18 +11416,18 @@ impl BinomialLocationScaleFamily {
                 &self.link_kind,
             );
             let u = a + q * b;
-            h_tt_u[row] = r * r * (c * du - 2.0 * b * xi_ls[row]);
-            h_tl_u[row] = r * ((2.0 * b + q * c) * du - u * xi_ls[row]);
+            h_tt_u[row] = r * r * (c * du - 2.0 * b * xi_ls_s);
+            h_tl_u[row] = r * ((2.0 * b + q * c) * du - u * xi_ls_s);
             h_ll_u[row] = (a + 3.0 * q * b + q * q * c) * du;
             dh_tt_u[row] = r
                 * r
                 * (d * du * q_a + c * q_au
-                    - 2.0 * c * (q_a * xi_ls[row] + du * dir_a.z_ls_psi[row])
-                    + 4.0 * b * xi_ls[row] * dir_a.z_ls_psi[row]);
+                    - 2.0 * c * (q_a * xi_ls_s + du * z_ls_psi_s)
+                    + 4.0 * b * xi_ls_s * z_ls_psi_s);
             dh_tl_u[row] = r
                 * (((3.0 * c + q * d) * q_a) * du + (2.0 * b + q * c) * q_au
-                    - (2.0 * b + q * c) * (q_a * xi_ls[row] + du * dir_a.z_ls_psi[row])
-                    + u * xi_ls[row] * dir_a.z_ls_psi[row]);
+                    - (2.0 * b + q * c) * (q_a * xi_ls_s + du * z_ls_psi_s)
+                    + u * xi_ls_s * z_ls_psi_s);
             dh_ll_u[row] = (4.0 * b + 5.0 * q * c + q * q * d) * du * q_a
                 + (a + 3.0 * q * b + q * q * c) * q_au;
         }

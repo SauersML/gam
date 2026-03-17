@@ -2440,7 +2440,7 @@ fn build_survival_covariate_block_from_design(
     match template {
         SurvivalCovariateTermBlockTemplate::Static => {
             Ok(CovariateBlockKind::Static(CovariateBlockInput {
-                design: DesignMatrix::Dense(Arc::new(cov_design.design.clone())),
+                design: cov_design.design.clone(),
                 offset: Array1::zeros(cov_design.design.nrows()),
                 penalties: cov_design.global_penalties(),
                 nullspace_dims: cov_design.nullspace_dims.clone(),
@@ -2455,7 +2455,7 @@ fn build_survival_covariate_block_from_design(
         } => {
             let p_cov = cov_design.design.ncols();
             let p_time = time_basis_exit.ncols();
-            let design_covariates = DesignMatrix::Dense(Arc::new(cov_design.design.clone()));
+            let design_covariates = cov_design.design.clone();
             let i_cov = Array2::<f64>::eye(p_cov);
             let i_time = Array2::<f64>::eye(p_time);
             let cov_global_penalties = cov_design.global_penalties();

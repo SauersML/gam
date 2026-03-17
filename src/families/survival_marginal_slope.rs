@@ -1401,7 +1401,7 @@ fn build_logslope_blockspec(
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "logslope_surface".to_string(),
-        design: DesignMatrix::Dense(Arc::new(design.design.clone())),
+        design: design.design.clone(),
         offset: Array1::from_elem(design.design.nrows(), baseline),
         penalties: design
             .global_penalties()
@@ -1596,7 +1596,7 @@ pub fn fit_survival_marginal_slope_terms(
             offset_entry: offset_entry.clone(),
             offset_exit: offset_exit.clone(),
             derivative_offset_exit: derivative_offset_exit.clone(),
-            logslope_design: logslope_design.design.clone(),
+            logslope_design: logslope_design.design.to_dense(),
         }
     };
 

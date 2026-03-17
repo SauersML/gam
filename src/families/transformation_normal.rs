@@ -1513,6 +1513,7 @@ pub fn fit_transformation_normal(
                 .map_err(|e| format!("failed to freeze covariate spatial basis centers: {e}"))?;
 
         let cov_global_penalties = cov_design.global_penalties();
+        let cov_dense = cov_design.design.as_dense_cow();
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             resp_val,
             resp_deriv,
@@ -1520,7 +1521,7 @@ pub fn fit_transformation_normal(
             resp_knots.clone(),
             config.response_degree,
             resp_transform,
-            &cov_design.design,
+            &cov_dense,
             &cov_global_penalties,
             config,
             warm_start,
@@ -1569,6 +1570,7 @@ pub fn fit_transformation_normal(
 
     // Build an initial family + blocks for capability probing.
     let boot_global_penalties = boot_design.global_penalties();
+    let boot_dense = boot_design.design.as_dense_cow();
     let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
         resp_val.clone(),
         resp_deriv.clone(),
@@ -1576,7 +1578,7 @@ pub fn fit_transformation_normal(
         resp_knots.clone(),
         config.response_degree,
         resp_transform.clone(),
-        &boot_design.design,
+        &boot_dense,
         &boot_global_penalties,
         config,
         warm_start,
@@ -1618,6 +1620,7 @@ pub fn fit_transformation_normal(
     let make_family =
         |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
             let gp = cov_design.global_penalties();
+            let cov_dense = cov_design.design.as_dense_cow();
             TransformationNormalFamily::from_prebuilt_response_basis(
                 rv.clone(),
                 rd.clone(),
@@ -1625,7 +1628,7 @@ pub fn fit_transformation_normal(
                 rk.clone(),
                 rdeg,
                 rt.clone(),
-                &cov_design.design,
+                &cov_dense,
                 &gp,
                 &cfg,
                 ws.as_ref(),

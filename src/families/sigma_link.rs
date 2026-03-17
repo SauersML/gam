@@ -316,9 +316,22 @@ mod tests {
 
     #[test]
     fn exp_sigma_derivatives_follow_the_clamped_safe_exp_definition() {
-        let h = 1e-3;
+        // Test deep in the plateau (η=±710) so every FD stencil point is also
+        // clamped.  Use h=1.0 so the FD denominator is O(1), keeping the
+        // cancellation noise from exp(700) ≈ 1e304 well below any reasonable
+        // tolerance.  (With h=1e-3, the denominator h^4=1e-12 amplifies the
+        // roundoff in (1−4+6−4+1)*exp(700) ≈ eps*exp(700) to ~1e300.)
+        let h = 1.0;
+        // Tolerance: all stencil points return the same exp(±700), so the
+        // FD numerator is exactly 0 in exact arithmetic.  In FP the residual
+        // is bounded by ~10 * eps * exp(700) / h^k for the k-th derivative.
+        let plateau_val = safe_exp(710.0); // = exp(700)
+        let tol_d1 = 10.0 * f64::EPSILON * plateau_val / h;
+        let tol_d2 = 10.0 * f64::EPSILON * plateau_val / (h * h);
+        let tol_d3 = 10.0 * f64::EPSILON * plateau_val / (h * h * h);
+        let tol_d4 = 10.0 * f64::EPSILON * plateau_val / (h * h * h * h);
 
-        for &eta in &[701.0, -701.0] {
+        for &eta in &[710.0, -710.0] {
             let (_, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth_scalar(eta);
             let f = |x: f64| exp_sigma_from_eta_scalar(x);
             let d1fd = (f(eta + h) - f(eta - h)) / (2.0 * h);
@@ -329,21 +342,28 @@ mod tests {
                 + f(eta - 2.0 * h))
                 / h.powi(4);
 
+            // Analytic derivatives must be exactly 0 on the plateau.
+            assert_eq!(d1, 0.0, "d1 should be exactly 0 at eta={eta}");
+            assert_eq!(d2, 0.0, "d2 should be exactly 0 at eta={eta}");
+            assert_eq!(d3, 0.0, "d3 should be exactly 0 at eta={eta}");
+            assert_eq!(d4, 0.0, "d4 should be exactly 0 at eta={eta}");
+
+            // FD should also be ~0, up to floating-point cancellation noise.
             assert!(
-                (d1 - d1fd).abs() < 1e-12,
-                "safe_exp is constant beyond the clamp, so d/deta should be zero at eta={eta}; got analytic d1={d1} but FD={d1fd}"
+                d1fd.abs() < tol_d1,
+                "FD d1 should be ~0 at eta={eta}; got {d1fd} (tol={tol_d1})"
             );
             assert!(
-                (d2 - d2fd).abs() < 1e-12,
-                "safe_exp is constant beyond the clamp, so d2/deta2 should be zero at eta={eta}; got analytic d2={d2} but FD={d2fd}"
+                d2fd.abs() < tol_d2,
+                "FD d2 should be ~0 at eta={eta}; got {d2fd} (tol={tol_d2})"
             );
             assert!(
-                (d3 - d3fd).abs() < 1e-12,
-                "safe_exp is constant beyond the clamp, so d3/deta3 should be zero at eta={eta}; got analytic d3={d3} but FD={d3fd}"
+                d3fd.abs() < tol_d3,
+                "FD d3 should be ~0 at eta={eta}; got {d3fd} (tol={tol_d3})"
             );
             assert!(
-                (d4 - d4fd).abs() < 1e-12,
-                "safe_exp is constant beyond the clamp, so d4/deta4 should be zero at eta={eta}; got analytic d4={d4} but FD={d4fd}"
+                d4fd.abs() < tol_d4,
+                "FD d4 should be ~0 at eta={eta}; got {d4fd} (tol={tol_d4})"
             );
         }
     }

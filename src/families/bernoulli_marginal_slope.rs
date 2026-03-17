@@ -2917,7 +2917,7 @@ fn build_blockspec(
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: name.to_string(),
-        design: DesignMatrix::Dense(Arc::new(design.design.clone())),
+        design: design.design.clone(),
         offset: Array1::from_elem(design.design.nrows(), baseline),
         penalties: design
             .global_penalties()
@@ -2979,8 +2979,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         y: spec.y.clone(),
         weights: spec.weights.clone(),
         z: spec.z.clone(),
-        marginal_design: marginal_design.design.clone(),
-        logslope_design: logslope_design.design.clone(),
+        marginal_design: marginal_design.design.to_dense(),
+        logslope_design: logslope_design.design.to_dense(),
         quadrature_nodes: quad_nodes.clone(),
         quadrature_weights: quad_weights.clone(),
         score_warp: None,
@@ -3118,8 +3118,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
             y: y.clone(),
             weights: weights.clone(),
             z: z.clone(),
-            marginal_design: marginal_design.design.clone(),
-            logslope_design: logslope_design.design.clone(),
+            marginal_design: marginal_design.design.to_dense(),
+            logslope_design: logslope_design.design.to_dense(),
             quadrature_nodes: quad_nodes.clone(),
             quadrature_weights: quad_weights.clone(),
             score_warp: score_warp_runtime.clone(),
