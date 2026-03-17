@@ -3008,6 +3008,7 @@ impl JointBetaRhoPosterior {
         let penalty_logdet = compute_block_penalty_logdet_derivs(
             &[rho.clone()],
             &[self.penalty_matrices.as_slice()],
+            &[&[] as &[usize]], // no structural nullspace info in HMC path
             0.0,
         );
         let (log_det_s, logdet_grad) = match penalty_logdet {
