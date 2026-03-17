@@ -49,6 +49,14 @@ pub enum PenaltyMatrix {
         left: Array2<f64>,
         right: Array2<f64>,
     },
+    /// Block-local penalty: `local` is `block_dim × block_dim`, embedded at
+    /// `col_range` in the full parameter space of dimension `total_dim`.
+    /// Avoids materializing the full `total_dim × total_dim` matrix.
+    Blockwise {
+        local: Array2<f64>,
+        col_range: std::ops::Range<usize>,
+        total_dim: usize,
+    },
 }
 
 impl PenaltyMatrix {
@@ -57,6 +65,7 @@ impl PenaltyMatrix {
         match self {
             Self::Dense(m) => m.nrows(),
             Self::KroneckerFactored { left, right } => left.nrows() * right.nrows(),
+            Self::Blockwise { total_dim, .. } => *total_dim,
         }
     }
 
@@ -73,6 +82,19 @@ impl PenaltyMatrix {
             Self::KroneckerFactored { left, right } => {
                 crate::terms::construction::kronecker_product(left, right)
             }
+            Self::Blockwise {
+                local,
+                col_range,
+                total_dim,
+            } => {
+                let mut g = Array2::zeros((*total_dim, *total_dim));
+                g.slice_mut(ndarray::s![
+                    col_range.start..col_range.end,
+                    col_range.start..col_range.end
+                ])
+                .assign(local);
+                g
+            }
         }
     }
 
@@ -80,7 +102,18 @@ impl PenaltyMatrix {
     pub fn as_dense_cow(&self) -> std::borrow::Cow<'_, Array2<f64>> {
         match self {
             Self::Dense(m) => std::borrow::Cow::Borrowed(m),
-            Self::KroneckerFactored { .. } => std::borrow::Cow::Owned(self.to_dense()),
+            Self::KroneckerFactored { .. } | Self::Blockwise { .. } => {
+                std::borrow::Cow::Owned(self.to_dense())
+            }
+        }
+    }
+
+    /// Convert from a `BlockwisePenalty` without expanding to full dimensions.
+    pub fn from_blockwise(bp: crate::terms::smooth::BlockwisePenalty, total_dim: usize) -> Self {
+        Self::Blockwise {
+            local: bp.local,
+            col_range: bp.col_range,
+            total_dim,
         }
     }
 
