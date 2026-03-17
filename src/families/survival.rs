@@ -78,6 +78,9 @@ pub struct PenaltyBlock {
     pub matrix: Array2<f64>,
     pub lambda: f64,
     pub range: Range<usize>,
+    /// Structural nullspace dimension of this penalty matrix.
+    /// Used for exact pseudo-logdet computation. 0 means full rank.
+    pub nullspace_dim: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1319,15 +1322,23 @@ impl WorkingModelSurvival {
             .iter()
             .map(|v| v.as_slice())
             .collect();
-        // Survival penalties: no structural nullspace info available here,
-        // pass empty slices to fall back to eigenvalue-based rank detection.
-        let per_block_nullspace_empty: Vec<&[usize]> =
-            vec![&[] as &[usize]; per_block_penalty_refs.len()];
+        // Each survival PenaltyBlock carries its structural nullspace_dim.
+        // Wrap each as a single-element slice for the per-block interface.
+        let per_block_nullspace_vecs: Vec<Vec<usize>> = self
+            .penalties
+            .blocks
+            .iter()
+            .map(|b| vec![b.nullspace_dim])
+            .collect();
+        let per_block_nullspace_refs: Vec<&[usize]> = per_block_nullspace_vecs
+            .iter()
+            .map(|v| v.as_slice())
+            .collect();
         let penalty_logdet = if k_count > 0 {
             compute_block_penalty_logdet_derivs(
                 &per_block_rho,
                 &per_block_penalty_refs,
-                &per_block_nullspace_empty,
+                &per_block_nullspace_refs,
                 0.0,
             )
             .map_err(EstimationError::InvalidInput)?
@@ -1635,6 +1646,7 @@ mod tests {
             matrix: s,
             lambda: 1.7,
             range: 1..3,
+            nullspace_dim: 0,
         }])
     }
 
@@ -1969,6 +1981,7 @@ mod tests {
             matrix: array![[2.0]],
             lambda: 1.7,
             range: 1..2,
+            nullspace_dim: 0,
         }]);
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.2, 0.4];
@@ -2014,6 +2027,7 @@ mod tests {
             matrix: array![[1.0]],
             lambda: -0.1,
             range: 1..2,
+            nullspace_dim: 0,
         }]);
 
         let err = survival_model(
@@ -2050,6 +2064,7 @@ mod tests {
             matrix: array![[1.0]],
             lambda: 0.5,
             range: 0..2,
+            nullspace_dim: 0,
         }]);
 
         let err = survival_model(
@@ -2263,6 +2278,7 @@ mod tests {
             matrix: array![[1.0]],
             lambda: 0.7,
             range: 1..2,
+            nullspace_dim: 0,
         }]);
         let beta = array![0.2, 0.2, 0.1];
         let state = model.update_state(&beta).expect("state at structural beta");

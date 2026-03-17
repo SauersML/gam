@@ -1086,6 +1086,7 @@ mod tests {
             mode: mode.view(),
             hessian: hessian.view(),
             penalty_roots: vec![penalty_root],
+            penalty_nullspace_dims: vec![0],
             rho_mode: rho_mode.view(),
             nuts_family: NutsFamily::PoissonLog,
             firth_bias_reduction: true,
@@ -2847,6 +2848,8 @@ struct JointBetaRhoPosterior {
     penalty_roots: Vec<Array2<f64>>,
     /// Precomputed penalty matrices S_k = R_k' R_k (avoids recomputation each gradient eval)
     penalty_matrices: Vec<Array2<f64>>,
+    /// Structural nullspace dimension of each penalty matrix.
+    penalty_nullspace_dims: Vec<usize>,
     /// Prior std dev on ρ (weakly informative Gaussian)
     rho_prior_sd: f64,
     /// LAML-converged ρ (used as centering for ρ prior)
@@ -2863,6 +2866,7 @@ impl JointBetaRhoPosterior {
         mode: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
         penalty_roots: Vec<Array2<f64>>,
+        penalty_nullspace_dims: Vec<usize>,
         rho_mode: ArrayView1<f64>,
         nuts_family: NutsFamily,
         firth_enabled: bool,
@@ -2925,6 +2929,7 @@ impl JointBetaRhoPosterior {
             n_rho,
             penalty_roots,
             penalty_matrices,
+            penalty_nullspace_dims,
             rho_prior_sd,
             rho_mode: rho_mode.to_owned(),
             firth_enabled,
@@ -3008,7 +3013,7 @@ impl JointBetaRhoPosterior {
         let penalty_logdet = compute_block_penalty_logdet_derivs(
             &[rho.clone()],
             &[self.penalty_matrices.as_slice()],
-            &[&[] as &[usize]], // no structural nullspace info in HMC path
+            &[self.penalty_nullspace_dims.as_slice()],
             0.0,
         );
         let (log_det_s, logdet_grad) = match penalty_logdet {
@@ -3068,6 +3073,7 @@ pub struct JointBetaRhoInputs<'a> {
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
     pub penalty_roots: Vec<Array2<f64>>,
+    pub penalty_nullspace_dims: Vec<usize>,
     pub rho_mode: ArrayView1<'a, f64>,
     pub nuts_family: NutsFamily,
     pub firth_bias_reduction: bool,
@@ -3111,6 +3117,7 @@ pub fn run_joint_beta_rho_sampling(
         inputs.mode,
         inputs.hessian,
         inputs.penalty_roots.clone(),
+        inputs.penalty_nullspace_dims.clone(),
         inputs.rho_mode,
         inputs.nuts_family,
         inputs.firth_bias_reduction,

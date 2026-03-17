@@ -3451,6 +3451,8 @@ struct SurvivalTimeBuildOutput {
     x_exit_time: Array2<f64>,
     x_derivative_time: Array2<f64>,
     penalties: Vec<Array2<f64>>,
+    /// Structural nullspace dimension of each penalty matrix.
+    nullspace_dims: Vec<usize>,
     basisname: String,
     degree: Option<usize>,
     knots: Option<Vec<f64>>,
@@ -3928,6 +3930,7 @@ fn build_survival_time_basis(
             x_exit_time: Array2::zeros((n, 0)),
             x_derivative_time: Array2::zeros((n, 0)),
             penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
             basisname: "none".to_string(),
             degree: None,
             knots: None,
@@ -3950,6 +3953,7 @@ fn build_survival_time_basis(
                 x_exit_time,
                 x_derivative_time,
                 penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
                 basisname: "linear".to_string(),
                 degree: None,
                 knots: None,
@@ -4018,11 +4022,14 @@ fn build_survival_time_basis(
                 }
             }
 
+            // B-spline with penalty_order=2: nullspace is {constant, linear}, dim=2.
+            let n_penalties = entry_basis.penalties.len();
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time: entry_basis.design,
                 x_exit_time: exit_basis.design,
                 x_derivative_time,
                 penalties: entry_basis.penalties,
+                nullspace_dims: vec![2; n_penalties],
                 basisname: "bspline".to_string(),
                 degree: Some(degree),
                 knots: Some(knotvec.to_vec()),
@@ -4195,11 +4202,16 @@ fn build_survival_time_basis(
                 penalties.push(local);
             }
 
+            // I-spline penalties are column-subsetted from B-spline penalties
+            // after monotonicity constraint projection. The subsetting removes
+            // the polynomial null directions, so nullity = 0.
+            let n_penalties = penalties.len();
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time,
                 x_exit_time,
                 x_derivative_time,
                 penalties,
+                nullspace_dims: vec![0; n_penalties],
                 basisname: "ispline".to_string(),
                 degree: Some(degree),
                 knots: Some(knotvec.to_vec()),
@@ -4968,6 +4980,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut time_design_exit = time_build.x_exit_time.clone();
     let mut time_design_derivative_exit = time_build.x_derivative_time.clone();
     let mut time_penalties = time_build.penalties.clone();
+    let mut time_nullspace_dims = time_build.nullspace_dims.clone();
     if let Some(wiggle) = timewiggle_build.as_ref() {
         append_survival_timewiggle_columns(
             &mut time_design_entry,
@@ -4976,6 +4989,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             wiggle,
         );
         time_penalties.extend(wiggle.penalties.clone());
+        time_nullspace_dims.extend(wiggle.nullspace_dims.clone());
     }
 
     if likelihood_mode == SurvivalLikelihoodMode::LocationScale {
@@ -5038,6 +5052,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     offset_exit: eta_offset_exit.clone(),
                     derivative_offset_exit: derivative_offset_exit.clone(),
                     penalties: time_penalties.clone(),
+                    nullspace_dims: time_nullspace_dims.clone(),
                     initial_log_lambdas: time_initial_log_lambdas.clone(),
                     initial_beta: None,
                 },
@@ -5264,6 +5279,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 offset_exit: eta_offset_exit.clone(),
                 derivative_offset_exit: derivative_offset_exit.clone(),
                 penalties: time_penalties.clone(),
+                nullspace_dims: time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
                 initial_beta: None,
             },
@@ -5310,12 +5326,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let p_time_total = time_design_exit.ncols();
     let p = p_time_total + p_cov;
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
-    for s in &time_penalties {
+    for (idx, s) in time_penalties.iter().enumerate() {
         if s.nrows() == p_time_total && s.ncols() == p_time_total {
             penalty_blocks.push(PenaltyBlock {
                 matrix: s.clone(),
                 lambda: time_build.smooth_lambda.unwrap_or(1e-2),
                 range: 0..p_time_total,
+                nullspace_dim: time_nullspace_dims.get(idx).copied().unwrap_or(0),
             });
         }
     }
@@ -5334,6 +5351,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             matrix: ridge,
             lambda: effective_args.ridge_lambda,
             range: ridge_range_start..p,
+            nullspace_dim: 0, // ridge is full rank
         });
     }
     let penalties = PenaltyBlocks::new(penalty_blocks.clone());
@@ -5896,12 +5914,13 @@ fn run_sample_survival(
         }
     }
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
-    for s in &time_build.penalties {
+    for (idx, s) in time_build.penalties.iter().enumerate() {
         if s.nrows() == p_time && s.ncols() == p_time {
             penalty_blocks.push(PenaltyBlock {
                 matrix: s.clone(),
                 lambda: time_build.smooth_lambda.unwrap_or(1e-2),
                 range: 0..p_time,
+                nullspace_dim: time_build.nullspace_dims.get(idx).copied().unwrap_or(0),
             });
         }
     }
@@ -5937,6 +5956,7 @@ fn run_sample_survival(
                     matrix: s.clone(),
                     lambda: time_build.smooth_lambda.unwrap_or(1e-2),
                     range: start..end,
+                    nullspace_dim: 2, // B-spline wiggle, penalty_order=2
                 });
             }
         }
@@ -5966,6 +5986,7 @@ fn run_sample_survival(
             matrix: ridge,
             lambda: ridge_lambda,
             range: ridge_range_start..p,
+            nullspace_dim: 0,
         });
     }
     for (idx, block) in penalty_blocks.iter_mut().enumerate() {
@@ -13863,11 +13884,13 @@ mod tests {
                     time_build
                         .penalties
                         .iter()
-                        .filter(|s| s.nrows() == p_time && s.ncols() == p_time)
-                        .map(|s| gam::survival::PenaltyBlock {
+                        .enumerate()
+                        .filter(|(_, s)| s.nrows() == p_time && s.ncols() == p_time)
+                        .map(|(idx, s)| gam::survival::PenaltyBlock {
                             matrix: s.clone(),
                             lambda: 5e-1,
                             range: 0..p_time,
+                            nullspace_dim: time_build.nullspace_dims.get(idx).copied().unwrap_or(0),
                         })
                         .collect(),
                 );

@@ -1522,6 +1522,16 @@ where
                     state.compute_efs_steps(rho)
                 },
             ),
+            screening_enter_fn: Some(Box::new(
+                |state: &mut &mut self::reml::RemlState<'_>, max_iters: usize| {
+                    state.set_screening_max_inner_iterations(max_iters);
+                },
+            )),
+            screening_exit_fn: Some(Box::new(
+                |state: &mut &mut self::reml::RemlState<'_>| {
+                    state.clear_screening_max_inner_iterations();
+                },
+            )),
         };
 
         let strategy_result =
@@ -1813,6 +1823,16 @@ where
                     &Array1<f64>,
                 ) -> Result<EfsEval, EstimationError>,
             >,
+            screening_enter_fn: Some(Box::new(
+                |state: &mut &mut self::reml::RemlState<'_>, max_iters: usize| {
+                    state.set_screening_max_inner_iterations(max_iters);
+                },
+            )),
+            screening_exit_fn: Some(Box::new(
+                |state: &mut &mut self::reml::RemlState<'_>| {
+                    state.clear_screening_max_inner_iterations();
+                },
+            )),
         };
         let strategy_result = crate::solver::outer_strategy::run_outer(
             &mut obj,
@@ -2146,6 +2166,7 @@ where
                             mode: selected_pirls_res.beta_transformed.view(),
                             hessian: selected_pirls_res.stabilizedhessian_transformed.view(),
                             penalty_roots: selected_pirls_res.reparam_result.rs_transformed.clone(),
+                            penalty_nullspace_dims: opts.nullspace_dims.clone(),
                             rho_mode: selected_rho.view(),
                             nuts_family: match opts.family {
                                 crate::types::LikelihoodFamily::GaussianIdentity => {

@@ -6,6 +6,7 @@ use crate::linalg::utils::{
 use crate::pirls::PirlsWorkspace;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 impl<'a> RemlState<'a> {
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
@@ -602,7 +603,26 @@ impl<'a> RemlState<'a> {
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
+            screening_max_inner_iterations: AtomicUsize::new(0),
         })
+    }
+
+    /// Cap PIRLS max_iterations for cheap seed screening.
+    /// When `max_iters > 0`, every PIRLS solve uses `min(config.max_iterations, max_iters)`.
+    /// Call `clear_screening_max_inner_iterations()` to restore normal behaviour.
+    pub(crate) fn set_screening_max_inner_iterations(&self, max_iters: usize) {
+        self.screening_max_inner_iterations
+            .store(max_iters, Ordering::Relaxed);
+        // Invalidate cached bundles so re-screening doesn't reuse a full-iteration result.
+        self.cache_manager.invalidate_eval_bundle();
+    }
+
+    /// Restore normal PIRLS iteration limits after screening.
+    pub(crate) fn clear_screening_max_inner_iterations(&self) {
+        self.screening_max_inner_iterations
+            .store(0, Ordering::Relaxed);
+        // Invalidate cached bundles so the real solver doesn't reuse a screening result.
+        self.cache_manager.invalidate_eval_bundle();
     }
 
     /// Sets the shrinkage floor for penalized block eigenvalues.
@@ -1057,10 +1077,19 @@ impl<'a> RemlState<'a> {
                     "dense REML eval bundle requires dense transformed design for Firth operator",
                 )
                 .map_err(EstimationError::InvalidInput)?;
+            let firth_build_start = std::time::Instant::now();
             let firth_op = Arc::new(Self::build_firth_dense_operator(
                 x_dense.as_ref(),
                 &pirls_result.final_eta,
             )?);
+            log::info!(
+                "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
+                firth_op.x_dense.nrows(),
+                firth_op.x_dense.ncols(),
+                firth_op.k_reduced.nrows(),
+                firth_op.half_log_det,
+                firth_build_start.elapsed().as_secs_f64(),
+            );
             // Firth-adjusted inner Jacobian for implicit differentiation:
             //   H_total = Xᵀ W X + S - H_φ,
             //   H_φ     = ∇²_β Φ
@@ -1346,6 +1375,13 @@ impl<'a> RemlState<'a> {
                 None
             };
             let mut pirls_config = self.config.as_pirls_config();
+            // Apply screening cap when active (seed screening uses cheap partial PIRLS).
+            let screen_cap = self
+                .screening_max_inner_iterations
+                .load(Ordering::Relaxed);
+            if screen_cap > 0 {
+                pirls_config.max_iterations = pirls_config.max_iterations.min(screen_cap);
+            }
             pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
                 InverseLink::Mixture(state)
             } else if let Some(state) = self.runtime_sas_link_state {
@@ -1373,13 +1409,30 @@ impl<'a> RemlState<'a> {
                 linear_constraints_original: self.linear_constraints.as_ref(),
                 penalty_shrinkage_floor: self.penalty_shrinkage_floor,
             };
-            pirls::fit_model_for_fixed_rho(
+            let pirls_start = std::time::Instant::now();
+            let result = pirls::fit_model_for_fixed_rho(
                 LogSmoothingParamsView::new(rho.view()),
                 problem,
                 penalty,
                 &pirls_config,
                 warm_start_ref,
-            )
+            );
+            let pirls_elapsed = pirls_start.elapsed();
+            let screen_cap = self
+                .screening_max_inner_iterations
+                .load(Ordering::Relaxed);
+            if let Ok((ref res, _)) = result {
+                log::info!(
+                    "[PIRLS-timing] iters={} status={:?} max_eta={:.1} firth_logdet={} elapsed={:.3}s screening={}",
+                    res.iterations,
+                    res.status,
+                    res.max_abs_eta,
+                    res.firth_log_det().map(|v| format!("{v:.3e}")).unwrap_or_else(|| "none".to_string()),
+                    pirls_elapsed.as_secs_f64(),
+                    if screen_cap > 0 { format!("cap={screen_cap}") } else { "off".to_string() },
+                );
+            }
+            result
         };
 
         if let Err(e) = &pirls_result {

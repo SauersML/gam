@@ -2575,6 +2575,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 &Array1<f64>,
             ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
         >,
+        screening_enter_fn: None,
+        screening_exit_fn: None,
     };
 
     let outer_config = OuterConfig {
@@ -18038,12 +18040,10 @@ mod tests {
             BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
             BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton threshold block"),
         };
-        let (value_ad, grad_ad, hess_ad) = second_derivative(
+        let (_, _, hess_ad) = second_derivative(
             |bt| wiggle_negloglik_threshold_numdual(bt, beta_ls0, &betaw, &y, &weights, &knots, 3),
             beta_t0,
         );
-        let _ = value_ad;
-        let _ = grad_ad;
         assert!(
             (blockhessian[[0, 0]] - hess_ad).abs() <= 5e-6,
             "wiggle threshold exact hessian mismatch: evaluate()={} autodiff={}",
@@ -19352,10 +19352,9 @@ mod tests {
             false,
         )
         .expect("wiggle block");
-        let (z, s_constrained) =
+        let (z, _) =
             compute_geometric_constraint_transform(&knots, degree, penalty_order)
                 .expect("constraint transform");
-        let _ = s_constrained;
         let g = compute_greville_abscissae(&knots, degree).expect("greville abscissae");
 
         assert_eq!(block.design.ncols(), z.ncols());
@@ -19417,10 +19416,9 @@ mod tests {
         )
         .expect("full basis");
         let full = (*basis).clone();
-        let (z, s_constrained) =
+        let (z, _) =
             compute_geometric_constraint_transform(&knots, degree, penalty_order)
                 .expect("constraint transform");
-        let _ = s_constrained;
         let expected = full.dot(&z);
 
         let got = match &block.design {
@@ -19537,10 +19535,9 @@ mod tests {
             .clone()
             .intospec("wiggle")
             .expect("wiggle spec");
-        let (geom_x, geom_offset) = family
+        let (geom_x, _) = family
             .block_geometry(&states, &wigglespec)
             .expect("block geometry");
-        let _ = geom_offset;
         let geom = match geom_x {
             DesignMatrix::Dense(x) => x,
             DesignMatrix::Sparse(_) => panic!("expected dense wiggle geometry design"),

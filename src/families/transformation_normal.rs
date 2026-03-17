@@ -370,47 +370,6 @@ impl TransformationNormalFamily {
         self.x_val.nrows()
     }
 
-    /// Evaluate the fitted transformation h(y|x) at new data points.
-    ///
-    /// Returns z = h(y|x) for each observation.
-    pub fn predict_transform(
-        &self,
-        response: &Array1<f64>,
-        covariate_design: &Array2<f64>,
-        beta: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        let n = response.len();
-        if covariate_design.nrows() != n {
-            return Err("response and covariate design row counts differ".to_string());
-        }
-        if beta.len() != self.p_total() {
-            return Err(format!(
-                "beta length {} != p_total {}",
-                beta.len(),
-                self.p_total()
-            ));
-        }
-        let resp_val = self.evaluate_response_value_basis_at(response)?;
-        let x_val_new = rowwise_kronecker(&resp_val, covariate_design);
-        Ok(x_val_new.dot(beta))
-    }
-
-    /// Evaluate the derivative h'(y|x) at new data points (for diagnostics).
-    pub fn predict_jacobian(
-        &self,
-        response: &Array1<f64>,
-        covariate_design: &Array2<f64>,
-        beta: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        let n = response.len();
-        if covariate_design.nrows() != n {
-            return Err("response and covariate design row counts differ".to_string());
-        }
-        let resp_deriv = self.evaluate_response_deriv_basis_at(response)?;
-        let x_deriv_new = rowwise_kronecker(&resp_deriv, covariate_design);
-        Ok(x_deriv_new.dot(beta))
-    }
-
     // --- Internal helpers ---
 
     /// Evaluate the response value basis at new response values using stored knots/transform.
