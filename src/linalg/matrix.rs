@@ -1746,144 +1746,110 @@ impl TensorProductDesignOperator {
         values
     }
 
-    /// Compute Xβ via sequential contraction through marginal dimensions.
+    /// Compute Xβ via column-wise BLAS matvecs across all n observations.
     ///
-    /// β is conceptually a (q₁, q₂, …, qₖ) tensor.  For each observation i,
-    /// we contract β with marginal row vectors one dimension at a time:
+    /// β is conceptually a (q₁, q₂, …, qₖ) tensor.  We iterate over all
+    /// "tail columns" (indices into dimensions 2..k), and for each:
     ///
-    ///   temp₀ = β                         (∏qⱼ values)
-    ///   temp₁ = contract dim k with Bₖ[i,:] → (∏_{j<k} qⱼ values)
-    ///   temp₂ = contract dim k-1           → (∏_{j<k-1} qⱼ values)
-    ///   …
-    ///   result[i] = final scalar
+    ///   1. Extract β_slice = β[:, t₂, …, tₖ]          — q₁-vector
+    ///   2. contrib = B₁ · β_slice                       — ONE BLAS matvec, O(n·q₁)
+    ///   3. contrib ⊙= B₂[:,t₂] ⊙ … ⊙ Bₖ[:,tₖ]        — k-1 elementwise O(n) passes
+    ///   4. result += contrib
     ///
-    /// Per-observation cost: O(∏qⱼ + ∏_{j<k}qⱼ + ⋯ + q₁) with zero heap allocation
-    /// (reuses two fixed buffers).
-    fn apply_contracted(&self, vector: &[f64]) -> Array1<f64> {
+    /// Total: ∏_{j>1}qⱼ BLAS matvecs.  Same asymptotic cost as per-row scalar
+    /// contraction, but each operation is a vectorized n-length pass with BLAS
+    /// cache optimization.  Zero per-row allocation.
+    fn apply_vectorized(&self, vector: &Array1<f64>) -> Array1<f64> {
         let d = self.marginals.len();
+        let n = self.n;
         if d == 0 {
-            return Array1::zeros(self.n);
+            return Array1::zeros(n);
         }
+        let b0 = &self.marginals[0];
+        let q0 = b0.ncols();
         if d == 1 {
-            // Single marginal: just B·β, no contraction chain needed.
-            let b = &self.marginals[0];
-            let mut out = Array1::<f64>::zeros(self.n);
-            let q = b.ncols();
-            for i in 0..self.n {
-                let mut acc = 0.0_f64;
-                for t in 0..q {
-                    acc += b[[i, t]] * vector[t];
-                }
-                out[i] = acc;
-            }
-            return out;
+            return fast_av(b0.as_ref(), vector);
         }
 
-        // Two alternating buffers for the contraction chain.
-        // The first contraction reads directly from `vector` (β is immutable),
-        // avoiding an O(∏qⱼ) copy per observation.
-        let max_intermediate = self.total_cols / self.marginals[d - 1].ncols();
-        let mut buf_a = vec![0.0_f64; max_intermediate];
-        let mut buf_b = vec![0.0_f64; max_intermediate];
+        let tail_dims: Vec<usize> = self.marginals[1..].iter().map(|m| m.ncols()).collect();
+        let tail_total: usize = tail_dims.iter().product();
+        let mut tail_indices = vec![0usize; tail_dims.len()];
 
-        let mut out = Array1::<f64>::zeros(self.n);
-        for row in 0..self.n {
-            // First contraction: read from vector, write to buf_a.
-            let q_last = self.marginals[d - 1].ncols();
-            let first_contracted = self.total_cols / q_last;
-            for c in 0..first_contracted {
-                let mut acc = 0.0_f64;
-                for t in 0..q_last {
-                    acc += vector[c * q_last + t] * self.marginals[d - 1][[row, t]];
-                }
-                buf_a[c] = acc;
-            }
-            let mut current_len = first_contracted;
-            let mut src_is_a = true;
+        let mut out = Array1::<f64>::zeros(n);
+        let mut beta_slice = Array1::<f64>::zeros(q0);
 
-            // Remaining contractions: alternate between buf_a and buf_b.
-            for dim in (0..d - 1).rev() {
-                let q = self.marginals[dim].ncols();
-                let contracted_len = current_len / q;
-                if src_is_a {
-                    for c in 0..contracted_len {
-                        let mut acc = 0.0_f64;
-                        for t in 0..q {
-                            acc += buf_a[c * q + t] * self.marginals[dim][[row, t]];
-                        }
-                        buf_b[c] = acc;
-                    }
-                } else {
-                    for c in 0..contracted_len {
-                        let mut acc = 0.0_f64;
-                        for t in 0..q {
-                            acc += buf_b[c * q + t] * self.marginals[dim][[row, t]];
-                        }
-                        buf_a[c] = acc;
-                    }
-                }
-                src_is_a = !src_is_a;
-                current_len = contracted_len;
+        for t_flat in 0..tail_total {
+            decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
+
+            // Extract β[:, t₂, …, tₖ] from the flat coefficient vector.
+            // Column layout: β[j₁ * tail_total + t_flat].
+            for j1 in 0..q0 {
+                beta_slice[j1] = vector[j1 * tail_total + t_flat];
             }
 
-            out[row] = if src_is_a { buf_a[0] } else { buf_b[0] };
+            // BLAS matvec: B₁ · β_slice → (n,)
+            let mut contrib = fast_av(b0.as_ref(), &beta_slice);
+
+            // Elementwise scale by remaining marginal columns.
+            for (dim_idx, &ti) in tail_indices.iter().enumerate() {
+                let m = &self.marginals[dim_idx + 1];
+                for i in 0..n {
+                    contrib[i] *= m[[i, ti]];
+                }
+            }
+
+            out += &contrib;
         }
         out
     }
 
-    /// Compute X'v via sequential outer-product accumulation.
+    /// Compute X'v via column-wise BLAS transpose matvecs across all n observations.
     ///
-    /// For each observation i with v[i] ≠ 0, accumulates into the coefficient
-    /// tensor by expanding through marginal dimensions one at a time.
-    fn apply_transpose_contracted(&self, vector: &Array1<f64>) -> Array1<f64> {
+    /// For each tail column t = (t₂, …, tₖ):
+    ///   1. scaled_v = v ⊙ B₂[:,t₂] ⊙ … ⊙ Bₖ[:,tₖ]   — elementwise O(n)
+    ///   2. out[:, t] = B₁' · scaled_v                   — ONE BLAS transpose matvec
+    ///
+    /// Total: ∏_{j>1}qⱼ BLAS transpose matvecs.
+    fn apply_transpose_vectorized(&self, vector: &Array1<f64>) -> Array1<f64> {
         let d = self.marginals.len();
+        let n = self.n;
         if d == 0 {
             return Array1::zeros(self.total_cols);
         }
+        let b0 = &self.marginals[0];
+        let q0 = b0.ncols();
+        if d == 1 {
+            return fast_atv(b0.as_ref(), vector);
+        }
 
-        let mut out = vec![0.0_f64; self.total_cols];
-        let mut buf_a = vec![0.0_f64; self.total_cols];
-        let mut buf_b = vec![0.0_f64; self.total_cols];
+        let tail_dims: Vec<usize> = self.marginals[1..].iter().map(|m| m.ncols()).collect();
+        let tail_total: usize = tail_dims.iter().product();
+        let mut tail_indices = vec![0usize; tail_dims.len()];
 
-        for row in 0..self.n {
-            let scale = vector[row];
-            if scale == 0.0 {
-                continue;
-            }
+        let mut out = Array1::<f64>::zeros(self.total_cols);
+        let mut scaled_v = Array1::<f64>::zeros(n);
 
-            // Build the Kronecker row incrementally via sequential outer products.
-            // Fold `scale` into the first marginal copy so the final accumulation
-            // is a plain addition (no per-element multiply).
-            let q0 = self.marginals[0].ncols();
-            for t in 0..q0 {
-                buf_a[t] = scale * self.marginals[0][[row, t]];
-            }
-            let mut current_len = q0;
+        for t_flat in 0..tail_total {
+            decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
 
-            for dim in 1..d {
-                let q = self.marginals[dim].ncols();
-                let new_len = current_len * q;
-                let (src, dst) = if dim % 2 == 1 {
-                    (&buf_a as &[f64], &mut buf_b)
-                } else {
-                    (&buf_b as &[f64], &mut buf_a)
-                };
-                for prefix in 0..current_len {
-                    let base = src[prefix];
-                    for t in 0..q {
-                        dst[prefix * q + t] = base * self.marginals[dim][[row, t]];
-                    }
+            // Form scaled_v = v ⊙ B₂[:,t₂] ⊙ … ⊙ Bₖ[:,tₖ]
+            scaled_v.assign(vector);
+            for (dim_idx, &ti) in tail_indices.iter().enumerate() {
+                let m = &self.marginals[dim_idx + 1];
+                for i in 0..n {
+                    scaled_v[i] *= m[[i, ti]];
                 }
-                current_len = new_len;
             }
 
-            // Accumulate pre-scaled row into output.
-            let final_buf = if d % 2 == 1 { &buf_a } else { &buf_b };
-            for j in 0..self.total_cols {
-                out[j] += final_buf[j];
+            // BLAS transpose matvec: B₁' · scaled_v → (q₁,)
+            let col_result = fast_atv(b0.as_ref(), &scaled_v);
+
+            // Scatter into output: out[j₁ * tail_total + t_flat] = col_result[j₁]
+            for j1 in 0..q0 {
+                out[j1 * tail_total + t_flat] = col_result[j1];
             }
         }
-        Array1::from_vec(out)
+        out
     }
 }
 
@@ -1897,11 +1863,11 @@ impl DesignOperator for TensorProductDesignOperator {
     }
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        self.apply_contracted(vector.as_slice().unwrap())
+        self.apply_vectorized(vector)
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        self.apply_transpose_contracted(vector)
+        self.apply_transpose_vectorized(vector)
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
