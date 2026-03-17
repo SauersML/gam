@@ -4489,9 +4489,6 @@ fn blockwise_logdet_terms<F: CustomFamily>(
         } else {
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?
         };
-        if include_logdet_s {
-            // Already accumulated above from the shared penalty blocks.
-        }
     }
     Ok((logdet_h_total, logdet_s_total))
 }

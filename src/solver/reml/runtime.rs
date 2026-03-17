@@ -2298,11 +2298,7 @@ impl<'a> RemlState<'a> {
         &self,
         pirls_result: &PirlsResult,
         bundle: &EvalShared,
-        _mode: super::unified::EvalMode,
-        _rho: &Array1<f64>,
         free_basis_opt: &Option<Array2<f64>>,
-        _penalty_roots: &[Array2<f64>],
-        _beta: &Array1<f64>,
         include_firth_derivs: bool,
     ) -> Result<
         (
@@ -2637,11 +2633,7 @@ impl<'a> RemlState<'a> {
         ) = self.build_dense_derivative_context(
             pirls_result,
             bundle,
-            mode,
-            rho,
             &free_basis_opt,
-            &penalty_roots,
-            &beta,
             true, // include Firth derivatives in deriv_provider
         )?;
 
@@ -3087,11 +3079,7 @@ impl<'a> RemlState<'a> {
         ) = self.build_dense_derivative_context(
             pirls_result,
             bundle,
-            mode,
-            rho,
             &free_basis_opt,
-            &penalty_roots,
-            &beta,
             true, // include Firth derivatives in deriv_provider
         )?;
 
@@ -3530,11 +3518,7 @@ impl<'a> RemlState<'a> {
         ) = self.build_dense_derivative_context(
             pirls_result,
             bundle,
-            super::unified::EvalMode::ValueOnly,
-            rho,
             &free_basis_opt,
-            &penalty_roots,
-            &beta,
             false, // EFS: no Firth derivatives in deriv_provider
         )?;
 
