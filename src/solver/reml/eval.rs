@@ -59,6 +59,17 @@ impl<'a> RemlState<'a> {
         lambdas: &Array1<f64>,
         ridge: f64,
     ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
+        // Kronecker fast path: compute logdet derivatives directly from the
+        // marginal eigenvalue grid.  O(d · ∏q_j) with no coordinate-frame
+        // dependence — eigenvalues of Σ_k λ_k (I⊗...⊗S_k⊗...⊗I) are invariant
+        // under orthogonal reparameterization, so this is correct regardless of
+        // whether P-IRLS uses standard or factored Qs.
+        if let Some(ref kron) = self.kronecker_penalty_system {
+            let lambdas_slice = lambdas.as_slice().unwrap();
+            let (_logdet, det1, det2) = kron.logdet_and_derivatives(lambdas_slice, ridge);
+            return Ok((det1, det2));
+        }
+
         let k_count = self.canonical_penalties.len();
         if k_count == 0 || lambdas.len() != k_count {
             return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));

@@ -34,8 +34,9 @@ use crate::smooth::{
     TermCollectionSpec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::solver::optimize::{CostOnlyOptimizationRequest, optimize_cost_only};
-use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkSpec, SasLinkSpec};
-use ndarray::{Array1, ArrayView2};
+use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec};
+use ndarray::{Array1, ArrayView1, ArrayView2};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct LinkWiggleConfig {
@@ -650,4 +651,478 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
             fit_transformation_normal_model(request).map(FitResult::TransformationNormal)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// High-level formula-to-fit API
+// ---------------------------------------------------------------------------
+
+use crate::families::family_meta::{family_to_string, is_binomial_family};
+use crate::families::survival_construction::{
+    SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeWiggleBuild,
+    append_survival_timewiggle_columns, build_survival_baseline_offsets,
+    build_survival_time_basis, build_survival_time_monotonicity_collocation,
+    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    survival_basis_supports_structural_monotonicity,
+};
+use crate::families::survival_location_scale::{
+    ResidualDistribution, SurvivalCovariateTermBlockTemplate, SurvivalLocationScaleTermSpec,
+    TimeBlockInput, residual_distribution_inverse_link,
+};
+use crate::inference::data::EncodedDataset as Dataset;
+use crate::inference::formula_dsl::{
+    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, effectivelinkwiggle_formulaspec,
+    parse_formula, parse_link_choice, parse_surv_response,
+};
+use crate::term_builder::{build_termspec, enable_scale_dimensions};
+
+/// Non-formula configuration for model fitting. All fields have sensible defaults.
+#[derive(Clone, Debug)]
+pub struct FitConfig {
+    /// Family: "gaussian", "binomial", "poisson", "gamma", or None for auto-detect.
+    pub family: Option<String>,
+    /// Link: "identity", "logit", "probit", "cloglog", "sas", "beta-logistic", or None.
+    pub link: Option<String>,
+    /// Whether to use flexible (wiggle-augmented) link.
+    pub flexible_link: bool,
+
+    // Survival-specific
+    /// Baseline target: "linear", "weibull", "gompertz", "gompertz-makeham".
+    pub baseline_target: String,
+    pub baseline_scale: Option<f64>,
+    pub baseline_shape: Option<f64>,
+    pub baseline_rate: Option<f64>,
+    pub baseline_makeham: Option<f64>,
+    /// Time basis: "ispline" or "none".
+    pub time_basis: String,
+    pub time_degree: usize,
+    pub time_num_internal_knots: usize,
+    pub time_smooth_lambda: f64,
+    /// Survival likelihood mode: "location-scale", "transformation", "weibull", "marginal-slope".
+    pub survival_likelihood: String,
+    /// Residual distribution: "gaussian", "logistic", "gumbel".
+    pub survival_distribution: String,
+    pub threshold_time_k: Option<usize>,
+    pub threshold_time_degree: usize,
+    pub sigma_time_k: Option<usize>,
+    pub sigma_time_degree: usize,
+
+    // Location-scale (GAMLSS)
+    /// If set, fit a location-scale model with this formula for the noise parameter.
+    pub noise_formula: Option<String>,
+
+    // Fitting options
+    pub scale_dimensions: bool,
+    pub ridge_lambda: f64,
+}
+
+impl Default for FitConfig {
+    fn default() -> Self {
+        Self {
+            family: None,
+            link: None,
+            flexible_link: false,
+            baseline_target: "linear".into(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".into(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            survival_likelihood: "location-scale".into(),
+            survival_distribution: "gaussian".into(),
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            noise_formula: None,
+            scale_dimensions: false,
+            ridge_lambda: 1e-6,
+        }
+    }
+}
+
+/// The result of materializing a formula + config against a dataset.
+pub struct MaterializedModel<'a> {
+    pub request: FitRequest<'a>,
+    pub inference_notes: Vec<String>,
+}
+
+/// Parse, materialize, and fit a model in one call.
+pub fn fit_from_formula(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FitResult, String> {
+    let mat = materialize(formula, data, config)?;
+    fit_model(mat.request)
+}
+
+/// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
+pub fn materialize<'a>(
+    formula: &str,
+    data: &'a Dataset,
+    config: &FitConfig,
+) -> Result<MaterializedModel<'a>, String> {
+    let parsed = parse_formula(formula)?;
+    let col_map = build_col_map(data);
+
+    if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
+        materialize_survival(&parsed, data, &col_map, config, &entry_col, &exit_col, &event_col)
+    } else {
+        materialize_standard(&parsed, data, &col_map, config)
+    }
+}
+
+/// Detect whether a response column is binary (0/1 only).
+pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
+    if y.is_empty() {
+        return false;
+    }
+    y.iter()
+        .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
+}
+
+/// Resolve a family from an optional name, optional link choice, and response data.
+pub fn resolve_family(
+    family: Option<&str>,
+    link_choice: Option<&LinkChoice>,
+    y: ArrayView1<'_, f64>,
+) -> Result<LikelihoodFamily, String> {
+    let explicit = family.and_then(|name| match name.to_ascii_lowercase().as_str() {
+        "gaussian" => Some(LikelihoodFamily::GaussianIdentity),
+        "binomial" | "binomial-logit" => Some(LikelihoodFamily::BinomialLogit),
+        "binomial-probit" => Some(LikelihoodFamily::BinomialProbit),
+        "binomial-cloglog" => Some(LikelihoodFamily::BinomialCLogLog),
+        "poisson" => Some(LikelihoodFamily::PoissonLog),
+        "gamma" => Some(LikelihoodFamily::GammaLog),
+        _ => None,
+    });
+
+    if let Some(choice) = link_choice {
+        let from_link = if choice.mixture_components.is_some() {
+            LikelihoodFamily::BinomialMixture
+        } else {
+            match choice.link {
+                LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
+                LinkFunction::Log => {
+                    if y.iter()
+                        .all(|&yi| yi.is_finite() && yi >= 0.0 && (yi - yi.round()).abs() <= 1e-9)
+                    {
+                        LikelihoodFamily::PoissonLog
+                    } else {
+                        LikelihoodFamily::GammaLog
+                    }
+                }
+                LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+                LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+                LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+                LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
+            }
+        };
+        if let Some(explicit_family) = explicit {
+            if explicit_family != from_link {
+                return Err(format!(
+                    "family '{}' conflicts with link",
+                    family_to_string(explicit_family)
+                ));
+            }
+        }
+        return Ok(from_link);
+    }
+
+    if let Some(f) = explicit {
+        return Ok(f);
+    }
+
+    // Auto-detect
+    if is_binary_response(y) {
+        Ok(LikelihoodFamily::BinomialLogit)
+    } else {
+        Ok(LikelihoodFamily::GaussianIdentity)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn build_col_map(data: &Dataset) -> HashMap<String, usize> {
+    data.headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.clone(), i))
+        .collect()
+}
+
+fn materialize_standard<'a>(
+    parsed: &ParsedFormula,
+    data: &'a Dataset,
+    col_map: &HashMap<String, usize>,
+    config: &FitConfig,
+) -> Result<MaterializedModel<'a>, String> {
+    let y_col = *col_map
+        .get(&parsed.response)
+        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y = data.values.column(y_col).to_owned();
+    let mut inference_notes = Vec::new();
+
+    let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
+    let family = resolve_family(config.family.as_deref(), link_choice.as_ref(), y.view())?;
+
+    let effective_linkwiggle = effectivelinkwiggle_formulaspec(
+        parsed.linkwiggle.as_ref(),
+        link_choice.as_ref(),
+    );
+
+    let mut spec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
+    if config.scale_dimensions {
+        enable_scale_dimensions(&mut spec);
+    }
+
+    let n = data.values.nrows();
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let options = FitOptions::default();
+    let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+
+    let wiggle = effective_linkwiggle.as_ref().and_then(|cfg| {
+        if !is_binomial_family(family) {
+            return None;
+        }
+        let link_kind = link_choice.as_ref().map(|c| {
+            InverseLink::Standard(c.link)
+        }).unwrap_or(InverseLink::Standard(LinkFunction::Logit));
+        Some(StandardBinomialWiggleConfig {
+            link_kind,
+            wiggle: LinkWiggleConfig {
+                degree: cfg.degree,
+                num_internal_knots: cfg.num_internal_knots,
+                penalty_orders: cfg.penalty_orders.clone(),
+                double_penalty: cfg.double_penalty,
+            },
+        })
+    });
+
+    Ok(MaterializedModel {
+        request: FitRequest::Standard(StandardFitRequest {
+            data: data.values.view(),
+            y,
+            weights,
+            offset,
+            spec,
+            family,
+            options,
+            kappa_options,
+            wiggle,
+            wiggle_options: None,
+        }),
+        inference_notes,
+    })
+}
+
+fn materialize_survival<'a>(
+    parsed: &ParsedFormula,
+    data: &'a Dataset,
+    col_map: &HashMap<String, usize>,
+    config: &FitConfig,
+    entry_col: &str,
+    exit_col: &str,
+    event_col: &str,
+) -> Result<MaterializedModel<'a>, String> {
+    let mut inference_notes = Vec::new();
+
+    // Extract columns
+    let entry_idx = *col_map.get(entry_col)
+        .ok_or_else(|| format!("entry column '{entry_col}' not found"))?;
+    let exit_idx = *col_map.get(exit_col)
+        .ok_or_else(|| format!("exit column '{exit_col}' not found"))?;
+    let event_idx = *col_map.get(event_col)
+        .ok_or_else(|| format!("event column '{event_col}' not found"))?;
+    let n = data.values.nrows();
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    let event = data.values.column(event_idx).to_owned();
+    for i in 0..n {
+        let (e, x) = normalize_survival_time_pair(
+            data.values[[i, entry_idx]],
+            data.values[[i, exit_idx]],
+            i,
+        )?;
+        age_entry[i] = e;
+        age_exit[i] = x;
+    }
+
+    // Parse survival config
+    let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    let baseline_cfg = parse_survival_baseline_config(
+        &config.baseline_target,
+        config.baseline_scale,
+        config.baseline_shape,
+        config.baseline_rate,
+        config.baseline_makeham,
+    )?;
+    let time_cfg = parse_survival_time_basis_config(
+        &config.time_basis,
+        config.time_degree,
+        config.time_num_internal_knots,
+        config.time_smooth_lambda,
+    )?;
+
+    // Build time basis
+    let time_build = build_survival_time_basis(
+        &age_entry,
+        &age_exit,
+        time_cfg,
+        Some((config.time_num_internal_knots, config.time_smooth_lambda)),
+    )?;
+
+    // Build baseline offsets
+    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+        build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
+
+    // Time wiggles
+    let effective_timewiggle = parsed.timewiggle.clone();
+    let mut time_design_entry = time_build.x_entry_time.clone();
+    let mut time_design_exit = time_build.x_exit_time.clone();
+    let mut time_design_derivative = time_build.x_derivative_time.clone();
+    let mut time_penalties = time_build.penalties.clone();
+    let mut time_nullspace_dims = time_build.nullspace_dims.clone();
+    let mut timewiggle_build: Option<SurvivalTimeWiggleBuild> = None;
+
+    if let Some(tw_cfg) = effective_timewiggle.as_ref() {
+        let tw = build_survival_timewiggle_from_baseline(
+            &eta_offset_entry,
+            &eta_offset_exit,
+            &derivative_offset_exit,
+            tw_cfg,
+        )?;
+        append_survival_timewiggle_columns(
+            &mut time_design_entry,
+            &mut time_design_exit,
+            &mut time_design_derivative,
+            &tw,
+        );
+        for p in &tw.penalties {
+            time_penalties.push(p.clone());
+            time_nullspace_dims.push(1);
+        }
+        timewiggle_build = Some(tw);
+    }
+
+    // Monotonicity collocation
+    let timewiggle_ref = timewiggle_build.as_ref().map(|tw| (&tw.knots, tw.degree));
+    let (mono_rows, mono_offsets) = build_survival_time_monotonicity_collocation(
+        &age_entry,
+        &age_exit,
+        &time_build,
+        &baseline_cfg,
+        timewiggle_ref,
+    )?;
+
+    // Build covariate spec
+    let mut termspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
+    if config.scale_dimensions {
+        enable_scale_dimensions(&mut termspec);
+    }
+
+    // Resolve survival link
+    let residual_dist = parse_survival_distribution(&config.survival_distribution)?;
+    let survival_inverse_link = residual_distribution_inverse_link(residual_dist);
+
+    // Link wiggle config
+    let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
+    let effective_linkwiggle = effectivelinkwiggle_formulaspec(
+        parsed.linkwiggle.as_ref(),
+        link_choice.as_ref(),
+    );
+
+    // Time-varying covariate templates
+    let threshold_template = if let Some(k) = config.threshold_time_k {
+        build_time_varying_survival_covariate_template(
+            &age_entry, &age_exit, k, config.threshold_time_degree, "threshold",
+        )?
+    } else {
+        SurvivalCovariateTermBlockTemplate::Static
+    };
+    let log_sigma_template = if let Some(k) = config.sigma_time_k {
+        build_time_varying_survival_covariate_template(
+            &age_entry, &age_exit, k, config.sigma_time_degree, "sigma",
+        )?
+    } else {
+        SurvivalCovariateTermBlockTemplate::Static
+    };
+
+    // Build the noise spec for location-scale
+    let log_sigmaspec = if let Some(noise) = config.noise_formula.as_deref() {
+        let noise_parsed = parse_formula(&format!("{} ~ {noise}", parsed.response))?;
+        build_termspec(&noise_parsed.terms, data, col_map, &mut inference_notes)?
+    } else {
+        TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        }
+    };
+
+    // Initial time lambdas
+    let time_initial_log_lambdas = if !time_penalties.is_empty() {
+        Some(Array1::from_elem(time_penalties.len(), config.time_smooth_lambda.ln()))
+    } else {
+        None
+    };
+
+    // Assemble SurvivalLocationScaleTermSpec
+    let time_p = time_build.x_exit_time.ncols()
+        + timewiggle_build.as_ref().map_or(0, |tw| tw.design_exit.ncols());
+    let spec = SurvivalLocationScaleTermSpec {
+        age_entry: age_entry.clone(),
+        age_exit: age_exit.clone(),
+        event_target: event,
+        weights: Array1::ones(n),
+        inverse_link: survival_inverse_link,
+        derivative_guard: 1e-6,
+        derivative_softness: 1e-4,
+        time_anchor: None,
+        max_iter: 200,
+        tol: 1e-7,
+        time_block: TimeBlockInput {
+            design_entry: time_design_entry,
+            design_exit: time_design_exit,
+            design_derivative_exit: time_design_derivative,
+            offset_entry: eta_offset_entry,
+            offset_exit: eta_offset_exit,
+            derivative_offset_exit,
+            penalties: time_penalties,
+            nullspace_dims: time_nullspace_dims,
+            initial_log_lambdas: time_initial_log_lambdas,
+            initial_beta: Some(Array1::zeros(time_p)),
+        },
+        thresholdspec: termspec,
+        log_sigmaspec,
+        threshold_template,
+        log_sigma_template,
+        linkwiggle_block: None,
+    };
+
+    Ok(MaterializedModel {
+        request: FitRequest::SurvivalLocationScale(SurvivalLocationScaleFitRequest {
+            data: data.values.view(),
+            spec,
+            wiggle: effective_linkwiggle.map(|cfg| LinkWiggleConfig {
+                degree: cfg.degree,
+                num_internal_knots: cfg.num_internal_knots,
+                penalty_orders: cfg.penalty_orders,
+                double_penalty: cfg.double_penalty,
+            }),
+            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            optimize_inverse_link: true,
+        }),
+        inference_notes,
+    })
 }

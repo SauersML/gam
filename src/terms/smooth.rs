@@ -577,6 +577,146 @@ pub fn weighted_blockwise_penalty_sum(
     out
 }
 
+// ---------------------------------------------------------------------------
+// KroneckerPenaltySystem — factored tensor-product penalty representation
+// ---------------------------------------------------------------------------
+
+/// Factored representation of tensor-product penalties with precomputed
+/// marginal eigensystems for O(∏q_j) logdet and penalty operations.
+#[derive(Debug, Clone)]
+pub struct KroneckerPenaltySystem {
+    /// Marginal penalty matrices: `marginal_penalties[k]` is `(q_k, q_k)`.
+    pub marginal_penalties: Vec<Array2<f64>>,
+    /// Precomputed eigensystems: `(eigenvalues, eigenvectors)` per marginal.
+    pub marginal_eigensystems: Vec<(Array1<f64>, Array2<f64>)>,
+    /// Marginal basis dimensions.
+    pub marginal_dims: Vec<usize>,
+    /// Whether a global ridge (double) penalty is present.
+    pub has_double_penalty: bool,
+}
+
+impl KroneckerPenaltySystem {
+    pub fn new(
+        marginal_penalties: Vec<Array2<f64>>,
+        marginal_dims: Vec<usize>,
+        has_double_penalty: bool,
+    ) -> Result<Self, BasisError> {
+        if marginal_penalties.len() != marginal_dims.len() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "KroneckerPenaltySystem: {} penalties vs {} dims",
+                marginal_penalties.len(),
+                marginal_dims.len()
+            )));
+        }
+        let mut eigensystems = Vec::with_capacity(marginal_penalties.len());
+        for (k, s_k) in marginal_penalties.iter().enumerate() {
+            let (evals, evecs) = s_k
+                .eigh(faer::Side::Lower)
+                .map_err(|e| BasisError::InvalidInput(format!(
+                    "KroneckerPenaltySystem: eigendecomp of marginal {k}: {e}"
+                )))?;
+            eigensystems.push((evals, evecs));
+        }
+        Ok(Self {
+            marginal_penalties,
+            marginal_eigensystems: eigensystems,
+            marginal_dims,
+            has_double_penalty,
+        })
+    }
+
+    pub fn p_total(&self) -> usize {
+        self.marginal_dims.iter().copied().product()
+    }
+
+    pub fn ndim(&self) -> usize {
+        self.marginal_dims.len()
+    }
+
+    pub fn num_penalties(&self) -> usize {
+        self.marginal_dims.len() + if self.has_double_penalty { 1 } else { 0 }
+    }
+
+    /// Compute `log|S|₊` and its first/second derivatives w.r.t. `ρ_k = log(λ_k)`.
+    ///
+    /// Iterates over the ∏q_j multi-index grid. Cost: O(d · ∏q_j), no O(p²) storage.
+    pub fn logdet_and_derivatives(
+        &self,
+        lambdas: &[f64],
+        ridge: f64,
+    ) -> (f64, Array1<f64>, Array2<f64>) {
+        let d = self.ndim();
+        let n_pen = self.num_penalties();
+        assert_eq!(lambdas.len(), n_pen, "lambda count mismatch");
+
+        let mut logdet = 0.0;
+        let mut grad = Array1::<f64>::zeros(n_pen);
+        let mut hess = Array2::<f64>::zeros((n_pen, n_pen));
+        let tol = 1e-12;
+
+        let mut multi_idx = vec![0usize; d];
+        loop {
+            let mut sigma = ridge;
+            for k in 0..d {
+                sigma += lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]];
+            }
+            if self.has_double_penalty {
+                sigma += lambdas[d];
+            }
+
+            if sigma > tol {
+                logdet += sigma.ln();
+                let inv_sigma = 1.0 / sigma;
+                let inv_sigma2 = inv_sigma * inv_sigma;
+
+                for k in 0..d {
+                    let ck = lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]];
+                    grad[k] += ck * inv_sigma;
+                }
+                if self.has_double_penalty {
+                    grad[d] += lambdas[d] * inv_sigma;
+                }
+
+                for k in 0..n_pen {
+                    let ck = if k < d {
+                        lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]]
+                    } else {
+                        lambdas[d]
+                    };
+                    hess[[k, k]] += ck * inv_sigma - ck * ck * inv_sigma2;
+                    for l in (k + 1)..n_pen {
+                        let cl = if l < d {
+                            lambdas[l] * self.marginal_eigensystems[l].0[multi_idx[l]]
+                        } else {
+                            lambdas[d]
+                        };
+                        let off = -ck * cl * inv_sigma2;
+                        hess[[k, l]] += off;
+                        hess[[l, k]] += off;
+                    }
+                }
+            }
+
+            let mut carry = true;
+            for dim in (0..d).rev() {
+                if carry {
+                    multi_idx[dim] += 1;
+                    if multi_idx[dim] < self.marginal_dims[dim] {
+                        carry = false;
+                    } else {
+                        multi_idx[dim] = 0;
+                    }
+                }
+            }
+            if carry {
+                break;
+            }
+        }
+
+        (logdet, grad, hess)
+    }
+}
+
 #[derive(Clone)]
 pub struct TermCollectionDesign {
     /// The full design matrix.  When random effects are present this is an
@@ -601,14 +741,6 @@ pub struct TermCollectionDesign {
 }
 
 impl TermCollectionDesign {
-    /// Expand blockwise penalties to global `p_total × p_total` dense matrices.
-    /// This is a compatibility shim; prefer operating on blockwise penalties
-    /// directly when possible.
-    pub fn global_penalties(&self) -> Vec<Array2<f64>> {
-        let p = self.design.ncols();
-        penalties_to_global(&self.penalties, p)
-    }
-
     /// Convert blockwise penalties to `PenaltyMatrix::Blockwise` without
     /// expanding to `p_total × p_total`. This is the preferred path for
     /// family modules that accept `Vec<PenaltyMatrix>`.
@@ -2044,7 +2176,12 @@ fn build_tensor_bspline_basis(
             identifiability_transform: z_opt,
         },
         kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
-            Some(KroneckerFactoredBasis { marginal_designs })
+            Some(KroneckerFactoredBasis {
+                marginal_designs,
+                marginal_penalties,
+                marginal_dims: marginalnum_basis.clone(),
+                has_double_penalty: spec.double_penalty,
+            })
         } else {
             None
         },
@@ -7161,7 +7298,7 @@ fn fit_bounded_term_collection_with_design(
     let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
     let dense_design = design.design.as_dense_cow();
     let fit_design = conditioning.apply_to_design(&dense_design);
-    let global_penalties = design.global_penalties();
+    let global_penalties = penalties_to_global(&design.penalties, design.design.ncols());
     let fit_penalties = conditioning.transform_penalties_to_internal(&global_penalties);
     if design.linear_constraints.is_some() {
         return Err(EstimationError::InvalidInput(

@@ -347,7 +347,7 @@ pub(crate) fn structural_nonnegative_time_constraints(
 pub struct CovariateBlockInput {
     pub design: DesignMatrix,
     pub offset: Array1<f64>,
-    pub penalties: Vec<Array2<f64>>,
+    pub penalties: Vec<crate::solver::estimate::PenaltySpec>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,
@@ -395,7 +395,7 @@ pub struct LinkWiggleBlockInput {
     pub design: DesignMatrix,
     pub knots: Array1<f64>,
     pub degree: usize,
-    pub penalties: Vec<Array2<f64>>,
+    pub penalties: Vec<crate::solver::estimate::PenaltySpec>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,
@@ -2395,9 +2395,21 @@ fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(
         ));
     }
     for (idx, s) in b.penalties.iter().enumerate() {
-        let (r, c) = s.dim();
-        if r != p || c != p {
-            return Err(format!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}"));
+        match s {
+            crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                if col_range.end > p || local.nrows() != col_range.len() || local.ncols() != col_range.len() {
+                    return Err(format!(
+                        "{name} penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
+                        col_range.start, col_range.end, local.nrows(), local.ncols()
+                    ));
+                }
+            }
+            crate::solver::estimate::PenaltySpec::Dense(m) => {
+                let (r, c) = m.dim();
+                if r != p || c != p {
+                    return Err(format!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}"));
+                }
+            }
         }
     }
     Ok(())
@@ -2528,12 +2540,19 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
             design_entry: None,
             design_derivative_exit: None,
             offset: b.offset.clone(),
-            penalties: b
-                .penalties
-                .iter()
-                .cloned()
-                .map(PenaltyMatrix::Dense)
-                .collect(),
+            penalties: {
+                let p = b.design.ncols();
+                b.penalties.iter().map(|spec| match spec {
+                    crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                        PenaltyMatrix::Blockwise {
+                            local: local.clone(),
+                            col_range: col_range.clone(),
+                            total_dim: p,
+                        }
+                    }
+                    crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
+                }).collect()
+            },
             nullspace_dims: b.nullspace_dims.clone(),
             initial_log_lambdas: b.initial_log_lambdas.clone(),
             initial_beta: b.initial_beta.clone(),
@@ -2568,7 +2587,7 @@ fn build_survival_covariate_block_from_design(
             Ok(CovariateBlockKind::Static(CovariateBlockInput {
                 design: cov_design.design.clone(),
                 offset: Array1::zeros(cov_design.design.nrows()),
-                penalties: cov_design.global_penalties(),
+                penalties: cov_design.penalties.iter().map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp)).collect(),
                 nullspace_dims: cov_design.nullspace_dims.clone(),
                 initial_log_lambdas,
                 initial_beta,
@@ -2585,7 +2604,7 @@ fn build_survival_covariate_block_from_design(
             let design_covariates = cov_design.design.clone();
             let i_cov = Array2::<f64>::eye(p_cov);
             let i_time = Array2::<f64>::eye(p_time);
-            let cov_global_penalties = cov_design.global_penalties();
+            let cov_global_penalties: Vec<Array2<f64>> = cov_design.penalties.iter().map(|bp| bp.to_global(p_cov)).collect();
             let mut penalties =
                 Vec::with_capacity(cov_global_penalties.len() + time_penalties.len());
             for s_cov in &cov_global_penalties {
@@ -3212,12 +3231,19 @@ fn prepare_survival_location_scale_model(
             name: "linkwiggle".to_string(),
             design: w.design.clone(),
             offset: Array1::zeros(n),
-            penalties: w
-                .penalties
-                .iter()
-                .cloned()
-                .map(PenaltyMatrix::Dense)
-                .collect(),
+            penalties: {
+                let p_wiggle = w.design.ncols();
+                w.penalties.iter().map(|spec| match spec {
+                    crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                        PenaltyMatrix::Blockwise {
+                            local: local.clone(),
+                            col_range: col_range.clone(),
+                            total_dim: p_wiggle,
+                        }
+                    }
+                    crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
+                }).collect()
+            },
             nullspace_dims: w.nullspace_dims.clone(),
             initial_log_lambdas: initial_log_lambdas(&w.penalties, w.initial_log_lambdas.clone())?,
             initial_beta: w.initial_beta.clone(),
@@ -3395,11 +3421,23 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), String
         ));
     }
     for (idx, s) in b.penalties.iter().enumerate() {
-        let (r, c) = s.dim();
-        if r != p || c != p {
-            return Err(format!(
-                "linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}"
-            ));
+        match s {
+            crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                if col_range.end > p || local.nrows() != col_range.len() || local.ncols() != col_range.len() {
+                    return Err(format!(
+                        "linkwiggle_block penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
+                        col_range.start, col_range.end, local.nrows(), local.ncols()
+                    ));
+                }
+            }
+            crate::solver::estimate::PenaltySpec::Dense(m) => {
+                let (r, c) = m.dim();
+                if r != p || c != p {
+                    return Err(format!(
+                        "linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}"
+                    ));
+                }
+            }
         }
     }
     Ok(())

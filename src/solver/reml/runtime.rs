@@ -2855,40 +2855,18 @@ impl<'a> RemlState<'a> {
         let n_observations = self.y.len();
         let p_dim = beta.len();
 
-        // Build PenaltyCoordinates.  When Kronecker structure is available,
-        // use KroneckerMarginal variants for O(∏q_j) operations; otherwise
-        // fall back to block-local canonical penalties.
-        let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
-            if let Some(ref kron) = self.kronecker_penalty_system {
-                let d = kron.ndim();
-                let total_dim = kron.p_total();
-                let eigenvalues: Vec<ndarray::Array1<f64>> = kron
-                    .marginal_eigensystems
-                    .iter()
-                    .map(|(evals, _)| evals.clone())
-                    .collect();
-                let mut coords = Vec::with_capacity(kron.num_penalties());
-                for k in 0..d {
-                    coords.push(super::unified::PenaltyCoordinate::KroneckerMarginal {
-                        eigenvalues: eigenvalues.clone(),
-                        dim_index: k,
-                        marginal_dims: kron.marginal_dims.clone(),
-                        total_dim,
-                    });
-                }
-                if kron.has_double_penalty {
-                    // Double penalty (global ridge): eigenvalue = 1 in all modes.
-                    // Use a DenseRoot with identity root as fallback.
-                    let identity_root = ndarray::Array2::<f64>::eye(total_dim);
-                    coords.push(super::unified::PenaltyCoordinate::from_dense_root(identity_root));
-                }
-                coords
-            } else {
-                self.canonical_penalties
-                    .iter()
-                    .map(|cp| cp.to_penalty_coordinate())
-                    .collect()
-            };
+        // Build PenaltyCoordinates from canonical penalties (block-local).
+        // NOTE: KroneckerMarginal penalty coordinates require factored
+        // reparameterization (Qs = U_1 ⊗ ... ⊗ U_d) to be valid in the
+        // reparameterized basis.  Until kronecker_reparameterization_engine
+        // is wired into P-IRLS, we use standard block-local coordinates.
+        // The Kronecker fast path for penalty logdet (in eval.rs) is still
+        // active — eigenvalues are coordinate-frame-invariant.
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> = self
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.to_penalty_coordinate())
+            .collect();
 
         let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,
