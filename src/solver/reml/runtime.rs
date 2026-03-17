@@ -8,9 +8,6 @@ use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-const TK_FD_REL_STEP: f64 = 1e-4;
-const TK_FD_ABS_STEP: f64 = 1e-5;
-const TK_FD_BOUNDARY_GUARD: f64 = 1e-8;
 const TK_BLOCK_SIZE: usize = 128;
 
 struct TkCorrectionTerms {
@@ -108,137 +105,11 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    fn tk_fd_step(&self, rho_i: f64) -> Result<f64, EstimationError> {
-        let base = (TK_FD_REL_STEP * (1.0 + rho_i.abs())).max(TK_FD_ABS_STEP);
-        let symmetric_room = (RHO_BOUND - TK_FD_BOUNDARY_GUARD - rho_i.abs()).max(0.0);
-        let step = base.min(0.5 * symmetric_room);
-        if !step.is_finite() || step <= 0.0 {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "TK finite-difference derivative has no symmetric room at rho={rho_i:.6e}"
-            )));
-        }
-        Ok(step)
-    }
-
     fn tk_sanitized_array(values: &Array1<f64>) -> Array1<f64> {
         values.mapv(|v| if v.is_finite() { v } else { 0.0 })
     }
 
-    fn tierney_kadane_exact_value_from_dense(
-        &self,
-        x_dense: &Array2<f64>,
-        h_eff_eval: &Array2<f64>,
-        c_array: &Array1<f64>,
-        d_array: &Array1<f64>,
-    ) -> Result<f64, EstimationError> {
-        let n = x_dense.nrows();
-        let p = x_dense.ncols();
-        if n == 0 || p == 0 {
-            return Ok(0.0);
-        }
-
-        let xt = x_dense.t().to_owned();
-        let z = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
-            let mut solved = Array2::<f64>::zeros((p, n));
-            for col in 0..n {
-                let rhs = xt.column(col).to_owned();
-                let sol = chol.solvevec(&rhs);
-                solved.column_mut(col).assign(&sol);
-            }
-            solved
-        } else {
-            let (evals, evecs) = h_eff_eval
-                .eigh(Side::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            let floor = 1e-12;
-            let mut solved = Array2::<f64>::zeros((p, n));
-            for m in 0..evals.len() {
-                let ev = evals[m];
-                if ev <= floor {
-                    continue;
-                }
-                let u = evecs.column(m).to_owned();
-                let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
-                for row in 0..p {
-                    let u_row = u[row];
-                    for col in 0..n {
-                        solved[[row, col]] += u_row * coeffs[col];
-                    }
-                }
-            }
-            solved
-        };
-
-        let mut h_diag = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let val = x_dense.row(i).dot(&z.column(i));
-            h_diag[i] = if val.is_finite() { val } else { 0.0 };
-        }
-
-        let q_term = -0.125
-            * d_array
-                .iter()
-                .zip(h_diag.iter())
-                .map(|(&d_i, &h_i)| d_i * h_i * h_i)
-                .sum::<f64>();
-
-        let m = c_array * &h_diag;
-        let x_m = xt.dot(&m);
-        let y = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
-            chol.solvevec(&x_m)
-        } else {
-            let (evals, evecs) = h_eff_eval
-                .eigh(Side::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            let floor = 1e-12;
-            let mut solved = Array1::<f64>::zeros(p);
-            for m_idx in 0..evals.len() {
-                let ev = evals[m_idx];
-                if ev <= floor {
-                    continue;
-                }
-                let u = evecs.column(m_idx).to_owned();
-                let coeff = u.dot(&x_m) / ev;
-                solved.scaled_add(coeff, &u);
-            }
-            solved
-        };
-        let t2_term = 0.125 * x_m.dot(&y);
-
-        let mut t1_sum = 0.0_f64;
-        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
-            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-            let z_block = z.slice(s![.., j0..j1]).to_owned();
-            let c_j = c_array.slice(s![j0..j1]);
-            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
-                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
-                let x_block = x_dense.slice(s![i0..i1, ..]);
-                let c_i = c_array.slice(s![i0..i1]);
-                let gram = x_block.dot(&z_block);
-                let mut block_sum = 0.0_f64;
-                for bi in 0..(i1 - i0) {
-                    let ci = c_i[bi];
-                    if ci == 0.0 {
-                        continue;
-                    }
-                    for bj in 0..(j1 - j0) {
-                        let cj = c_j[bj];
-                        if cj == 0.0 {
-                            continue;
-                        }
-                        let kij = gram[[bi, bj]];
-                        block_sum += ci * cj * kij * kij * kij;
-                    }
-                }
-                t1_sum += if i0 == j0 { block_sum } else { 2.0 * block_sum };
-            }
-        }
-
-        let value = q_term + t1_sum / 12.0 + t2_term;
-        Ok(if value.is_finite() { value } else { 0.0 })
-    }
-
-    /// Analytic TK value + gradient from dense H.
+    /// Analytic TK value + gradient given Z = H⁻¹ X^T.
     ///
     /// Gradient formula (holding c, d fixed, differentiating through Σ = H⁻¹):
     ///
@@ -253,65 +124,30 @@ impl<'a> RemlState<'a> {
     ///   P_{T2b} = y y^T
     ///
     /// and Ḣ_k = A_k + X^T diag(c⊙Xv_k) X is the total Hessian drift.
-    fn tierney_kadane_analytic_from_dense(
+    /// Analytic TK value + gradient given Z = H⁻¹ X^T.
+    ///
+    /// This is the shared core for both dense and sparse paths.
+    /// The caller is responsible for computing Z from whichever factorization
+    /// is available (dense Cholesky/eigen, or sparse Cholesky).
+    ///
+    /// For the gradient, also needs a solver for H⁻¹ v (used to compute
+    /// mode responses v_k = H⁻¹(A_k β̂)). The `h_inv_solve` closure
+    /// provides this.
+    fn tierney_kadane_analytic_core(
         &self,
         x_dense: &Array2<f64>,
-        h_eff_eval: &Array2<f64>,
+        z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
         penalty_roots: &[Array2<f64>],
         lambdas: &[f64],
         beta: &Array1<f64>,
         compute_gradient: bool,
+        h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = penalty_roots.len();
-
-        if n == 0 || p == 0 {
-            return Ok(TkCorrectionTerms {
-                value: 0.0,
-                gradient: if compute_gradient {
-                    Some(Array1::zeros(k))
-                } else {
-                    None
-                },
-                hessian: None,
-            });
-        }
-
-        // ── Z = H⁻¹ X^T (p × n) ──
-        let xt = x_dense.t().to_owned();
-        let z = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
-            let mut solved = Array2::<f64>::zeros((p, n));
-            for col in 0..n {
-                let rhs = xt.column(col).to_owned();
-                let sol = chol.solvevec(&rhs);
-                solved.column_mut(col).assign(&sol);
-            }
-            solved
-        } else {
-            let (evals, evecs) = h_eff_eval
-                .eigh(Side::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            let floor = 1e-12;
-            let mut solved = Array2::<f64>::zeros((p, n));
-            for m in 0..evals.len() {
-                let ev = evals[m];
-                if ev <= floor {
-                    continue;
-                }
-                let u = evecs.column(m).to_owned();
-                let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
-                for row in 0..p {
-                    let u_row = u[row];
-                    for col in 0..n {
-                        solved[[row, col]] += u_row * coeffs[col];
-                    }
-                }
-            }
-            solved
-        };
 
         // ── Hat leverages h_i = x_i^T H⁻¹ x_i ──
         let mut h_diag = Array1::<f64>::zeros(n);
@@ -331,25 +167,7 @@ impl<'a> RemlState<'a> {
         // ── T2 term: ⅛ ‖w‖² where w = X^T(c⊙h), y = H⁻¹ w ──
         let m_vec = c_array * &h_diag; // c ⊙ h (n-vector)
         let x_m = xt.dot(&m_vec); // X^T(c⊙h) (p-vector)
-        let y = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
-            chol.solvevec(&x_m)
-        } else {
-            let (evals, evecs) = h_eff_eval
-                .eigh(Side::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            let floor = 1e-12;
-            let mut solved = Array1::<f64>::zeros(p);
-            for m_idx in 0..evals.len() {
-                let ev = evals[m_idx];
-                if ev <= floor {
-                    continue;
-                }
-                let u = evecs.column(m_idx).to_owned();
-                let coeff = u.dot(&x_m) / ev;
-                solved.scaled_add(coeff, &u);
-            }
-            solved
-        };
+        let y = h_inv_solve(&x_m);
         let t2_term = 0.125 * x_m.dot(&y);
 
         // ── T1 term: 1/12 Σ_{i,j} c_i c_j G_ij³ (blocked) ──
@@ -564,24 +382,7 @@ impl<'a> RemlState<'a> {
                 s_k_beta[a] = (0..r_k.nrows()).map(|row| r_k[[row, a]] * r_beta[row]).sum::<f64>();
             }
             let a_k_beta = &s_k_beta * lambdas[idx];
-            let v_k = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
-                chol.solvevec(&a_k_beta)
-            } else {
-                // Eigendecomposition fallback
-                let (evals, evecs) = h_eff_eval
-                    .eigh(Side::Lower)
-                    .map_err(EstimationError::EigendecompositionFailed)?;
-                let floor = 1e-12;
-                let mut sol = Array1::<f64>::zeros(p);
-                for m in 0..evals.len() {
-                    if evals[m] > floor {
-                        let u = evecs.column(m);
-                        let coeff = u.dot(&a_k_beta) / evals[m];
-                        sol.scaled_add(coeff, &u.to_owned());
-                    }
-                }
-                sol
-            };
+            let v_k = h_inv_solve(&a_k_beta);
 
             // Observation correction: tr(X^T diag(c ⊙ Xv_k) X · P)
             //                       = Σ_i c_i (Xv_k)_i lev_p[i]
@@ -605,113 +406,6 @@ impl<'a> RemlState<'a> {
             gradient: Some(gradient),
             hessian: None,
         })
-    }
-
-    fn tierney_kadane_exact_value_from_sparse(
-        &self,
-        x_dense: &Array2<f64>,
-        factor: &crate::linalg::sparse_exact::SparseCholeskyFactor,
-        c_array: &Array1<f64>,
-        d_array: &Array1<f64>,
-    ) -> Result<f64, EstimationError> {
-        let n = x_dense.nrows();
-        let p = x_dense.ncols();
-        if n == 0 || p == 0 {
-            return Ok(0.0);
-        }
-
-        let xt = x_dense.t().to_owned();
-        let z = crate::linalg::sparse_exact::solve_sparse_spdmulti(factor, &xt)?;
-
-        let mut h_diag = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let val = x_dense.row(i).dot(&z.column(i));
-            h_diag[i] = if val.is_finite() { val } else { 0.0 };
-        }
-
-        let q_term = -0.125
-            * d_array
-                .iter()
-                .zip(h_diag.iter())
-                .map(|(&d_i, &h_i)| d_i * h_i * h_i)
-                .sum::<f64>();
-
-        let m = c_array * &h_diag;
-        let x_m = xt.dot(&m);
-        let y = crate::linalg::sparse_exact::solve_sparse_spd(factor, &x_m)?;
-        let t2_term = 0.125 * x_m.dot(&y);
-
-        let mut t1_sum = 0.0_f64;
-        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
-            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-            let z_block = z.slice(s![.., j0..j1]).to_owned();
-            let c_j = c_array.slice(s![j0..j1]);
-            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
-                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
-                let x_block = x_dense.slice(s![i0..i1, ..]);
-                let c_i = c_array.slice(s![i0..i1]);
-                let gram = x_block.dot(&z_block);
-                let mut block_sum = 0.0_f64;
-                for bi in 0..(i1 - i0) {
-                    let ci = c_i[bi];
-                    if ci == 0.0 {
-                        continue;
-                    }
-                    for bj in 0..(j1 - j0) {
-                        let cj = c_j[bj];
-                        if cj == 0.0 {
-                            continue;
-                        }
-                        let kij = gram[[bi, bj]];
-                        block_sum += ci * cj * kij * kij * kij;
-                    }
-                }
-                t1_sum += if i0 == j0 { block_sum } else { 2.0 * block_sum };
-            }
-        }
-
-        let value = q_term + t1_sum / 12.0 + t2_term;
-        Ok(if value.is_finite() { value } else { 0.0 })
-    }
-
-    fn tierney_kadane_exact_value_from_bundle(
-        &self,
-        bundle: &EvalShared,
-    ) -> Result<f64, EstimationError> {
-        let pirls_result = bundle.pirls_result.as_ref();
-        let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
-        let c_array = Self::tk_sanitized_array(&c_array);
-        let d_array = Self::tk_sanitized_array(&d_array);
-        if c_array.is_empty() || d_array.is_empty() {
-            return Ok(0.0);
-        }
-
-        if let Some(sparse) = bundle.sparse_exact.as_ref() {
-            let x_dense = self
-                .x()
-                .try_to_dense_arc("exact TK correction requires dense design access")
-                .map_err(EstimationError::InvalidInput)?;
-            return self.tierney_kadane_exact_value_from_sparse(
-                x_dense.as_ref(),
-                sparse.factor.as_ref(),
-                &c_array,
-                &d_array,
-            );
-        }
-
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
-            Self::projectwith_basis(bundle.h_eff.as_ref(), z)
-        } else {
-            bundle.h_eff.as_ref().clone()
-        };
-        let x_eff_dense = if let Some(z) = free_basis_opt.as_ref() {
-            pirls_result.x_transformed.to_dense().dot(z)
-        } else {
-            pirls_result.x_transformed.to_dense()
-        };
-
-        self.tierney_kadane_exact_value_from_dense(&x_eff_dense, &h_eff_eval, &c_array, &d_array)
     }
 
     fn tierney_kadane_terms(
@@ -746,57 +440,53 @@ impl<'a> RemlState<'a> {
 
         let compute_gradient = mode != super::unified::EvalMode::ValueOnly;
 
-        // Sparse path: value-only (analytic gradient not yet wired for sparse).
+        // Build Z = H⁻¹ X^T and solve closure, then call shared analytic core.
         if let Some(sparse) = bundle.sparse_exact.as_ref() {
+            // Sparse path: Z and solver from sparse Cholesky factor.
             let x_dense = self
                 .x()
                 .try_to_dense_arc("exact TK correction requires dense design access")
                 .map_err(EstimationError::InvalidInput)?;
-            let value = self.tierney_kadane_exact_value_from_sparse(
-                x_dense.as_ref(),
+            let xt = x_dense.t().to_owned();
+            let z_mat = crate::linalg::sparse_exact::solve_sparse_spdmulti(
                 sparse.factor.as_ref(),
+                &xt,
+            )?;
+            let factor_ref = sparse.factor.clone();
+            let h_inv_solve = |rhs: &Array1<f64>| -> Array1<f64> {
+                crate::linalg::sparse_exact::solve_sparse_spd(&factor_ref, rhs)
+                    .unwrap_or_else(|_| Array1::zeros(rhs.len()))
+            };
+
+            // Penalty roots from s_full_list via eigendecomposition.
+            let penalty_roots: Vec<Array2<f64>> = self
+                .s_full_list
+                .iter()
+                .enumerate()
+                .map(|(idx, s_k)| {
+                    super::unified::penalty_matrix_root(s_k).unwrap_or_else(|_| {
+                        log::warn!("penalty root for S_{idx} failed in sparse TK");
+                        Array2::zeros((0, s_k.ncols()))
+                    })
+                })
+                .collect();
+            let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+            let beta = self.sparse_exact_beta_original(pirls_result);
+
+            return self.tierney_kadane_analytic_core(
+                x_dense.as_ref(),
+                &z_mat,
                 &c_array,
                 &d_array,
-            )?;
-            // Sparse FD gradient: analytic path uses dense Z = H^{-1} X^T which
-            // is not available from the sparse Cholesky factor in observation-level
-            // form. The FD approach re-evaluates the scalar TK at perturbed rho.
-            if !compute_gradient {
-                return Ok(TkCorrectionTerms {
-                    value,
-                    gradient: None,
-                    hessian: None,
-                });
-            }
-            let k = rho.len();
-            let mut gradient = Array1::<f64>::zeros(k);
-            for i in 0..k {
-                let h = self.tk_fd_step(rho[i])?;
-                let mut rho_p = rho.clone();
-                rho_p[i] += h;
-                let vp = self.tierney_kadane_exact_value_from_bundle(
-                    &self.obtain_eval_bundle(&rho_p)?,
-                )?;
-                let mut rho_m = rho.clone();
-                rho_m[i] -= h;
-                let vm = self.tierney_kadane_exact_value_from_bundle(
-                    &self.obtain_eval_bundle(&rho_m)?,
-                )?;
-                gradient[i] = (vp - vm) / (2.0 * h);
-            }
-            for g in gradient.iter_mut() {
-                if !g.is_finite() {
-                    *g = 0.0;
-                }
-            }
-            return Ok(TkCorrectionTerms {
-                value,
-                gradient: Some(gradient),
-                hessian: None,
-            });
+                &penalty_roots,
+                &lambdas,
+                &beta,
+                compute_gradient,
+                &h_inv_solve,
+            );
         }
 
-        // Dense path: analytic value + gradient.
+        // Dense path: Z and solver from dense Cholesky/eigendecomposition.
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
         let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
             Self::projectwith_basis(bundle.h_eff.as_ref(), z)
@@ -807,6 +497,60 @@ impl<'a> RemlState<'a> {
             pirls_result.x_transformed.to_dense().dot(z)
         } else {
             pirls_result.x_transformed.to_dense()
+        };
+
+        let xt = x_eff_dense.t().to_owned();
+        let p = x_eff_dense.ncols();
+        let n = x_eff_dense.nrows();
+        let z_mat = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+            let mut solved = Array2::<f64>::zeros((p, n));
+            for col in 0..n {
+                let rhs = xt.column(col).to_owned();
+                let sol = chol.solvevec(&rhs);
+                solved.column_mut(col).assign(&sol);
+            }
+            solved
+        } else {
+            let (evals, evecs) = h_eff_eval
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let floor = 1e-12;
+            let mut solved = Array2::<f64>::zeros((p, n));
+            for m in 0..evals.len() {
+                let ev = evals[m];
+                if ev <= floor {
+                    continue;
+                }
+                let u = evecs.column(m).to_owned();
+                let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
+                for row in 0..p {
+                    let u_row = u[row];
+                    for col in 0..n {
+                        solved[[row, col]] += u_row * coeffs[col];
+                    }
+                }
+            }
+            solved
+        };
+
+        let h_eff_clone = h_eff_eval.clone();
+        let h_inv_solve = move |rhs: &Array1<f64>| -> Array1<f64> {
+            if let Ok(chol) = h_eff_clone.cholesky(Side::Lower) {
+                chol.solvevec(rhs)
+            } else if let Ok((evals, evecs)) = h_eff_clone.eigh(Side::Lower) {
+                let floor = 1e-12;
+                let mut sol = Array1::<f64>::zeros(rhs.len());
+                for m in 0..evals.len() {
+                    if evals[m] > floor {
+                        let u = evecs.column(m);
+                        let coeff = u.dot(rhs) / evals[m];
+                        sol.scaled_add(coeff, &u.to_owned());
+                    }
+                }
+                sol
+            } else {
+                Array1::zeros(rhs.len())
+            }
         };
 
         // Penalty roots (possibly projected) and lambdas.
@@ -828,15 +572,16 @@ impl<'a> RemlState<'a> {
             pirls_result.beta_transformed.as_ref().clone()
         };
 
-        self.tierney_kadane_analytic_from_dense(
+        self.tierney_kadane_analytic_core(
             &x_eff_dense,
-            &h_eff_eval,
+            &z_mat,
             &c_array,
             &d_array,
             &penalty_roots,
             &lambdas,
             &beta,
             compute_gradient,
+            &h_inv_solve,
         )
     }
 
