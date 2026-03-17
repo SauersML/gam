@@ -379,15 +379,12 @@ impl<'a> RemlState<'a> {
         let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
         let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k);
         for idx in 0..k {
-            // Block-local: S_k beta = root^T (root beta[block]), then embed.
-            let cp = &penalties[idx];
-            let r = &cp.col_range;
-            let beta_block = beta.slice(s![r.start..r.end]);
-            let r_beta = cp.root.dot(&beta_block);
+            let r_k = &penalty_roots[idx];
+            let r_beta = r_k.dot(beta);
             let mut s_k_beta = Array1::<f64>::zeros(p);
-            for a in 0..cp.block_dim() {
-                s_k_beta[r.start + a] = (0..cp.rank())
-                    .map(|row| cp.root[[row, a]] * r_beta[row])
+            for a in 0..p {
+                s_k_beta[a] = (0..r_k.nrows())
+                    .map(|row| r_k[[row, a]] * r_beta[row])
                     .sum::<f64>();
             }
             let a_k_beta = &s_k_beta * lambdas[idx];
@@ -431,23 +428,21 @@ impl<'a> RemlState<'a> {
             for l in 0..k {
                 // Compute Ḣ_l Z = A_l Z + X^T diag(c ⊙ x_vl) X Z, column by column.
                 // Then δZ_l = H⁻¹(Ḣ_l Z).
-                let cp_l = &penalties[l];
-                let rl = &cp_l.col_range;
+                let r_l = &penalty_roots[l];
                 let x_vl = &x_vks[l];
 
-                // A_l Z: for each column j, A_l z_j = λ_l R_l^T (R_l z_j[block])
+                // A_l Z: for each column j, A_l z_j = λ_l R_l^T (R_l z_j)
                 // C_l Z: for each column j, X^T(c ⊙ x_vl ⊙ (X z_j))
                 let mut h_dot_l_z = Array2::<f64>::zeros((p, n));
                 for j in 0..n {
                     let z_j = z.column(j).to_owned();
-                    // A_l z_j — block-local
-                    let z_j_block = z_j.slice(s![rl.start..rl.end]);
-                    let rl_zj = cp_l.root.dot(&z_j_block);
+                    // A_l z_j
+                    let rl_zj = r_l.dot(&z_j);
                     let mut col = Array1::<f64>::zeros(p);
-                    for a in 0..cp_l.block_dim() {
-                        col[rl.start + a] = lambdas[l]
-                            * (0..cp_l.rank())
-                                .map(|row| cp_l.root[[row, a]] * rl_zj[row])
+                    for a in 0..p {
+                        col[a] = lambdas[l]
+                            * (0..r_l.nrows())
+                                .map(|row| r_l[[row, a]] * rl_zj[row])
                                 .sum::<f64>();
                     }
                     // C_l z_j = X^T(c ⊙ x_vl ⊙ (X z_j))
