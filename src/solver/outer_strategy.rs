@@ -498,7 +498,7 @@ pub trait OuterObjective {
 
     /// Enter cheap screening mode: cap inner iterations for `eval_cost()` calls.
     /// Default is a no-op (objectives that don't support screening ignore this).
-    fn enter_screening_mode(&mut self, _max_inner_iterations: usize) {}
+    fn enter_screening_mode(&mut self, _: usize) {}
 
     /// Exit screening mode and restore normal inner iteration limits.
     fn exit_screening_mode(&mut self) {}

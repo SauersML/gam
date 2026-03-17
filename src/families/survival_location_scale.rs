@@ -2485,7 +2485,7 @@ struct PreparedCovBlock {
     /// Offset (same for both entry/exit since it comes from other terms).
     offset: Array1<f64>,
     penalties: Vec<Array2<f64>>,
-    nullspace_dims: vec![],
+    nullspace_dims: Vec<usize>,
     initial_log_lambdas: Option<Array1<f64>>,
     initial_beta: Option<Array1<f64>>,
 }
@@ -2497,7 +2497,7 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
             design_entry: None,
             offset: b.offset.clone(),
             penalties: b.penalties.clone(),
-            nullspace_dims: vec![],
+            nullspace_dims: b.nullspace_dims.clone(),
             initial_log_lambdas: b.initial_log_lambdas.clone(),
             initial_beta: b.initial_beta.clone(),
         }),
@@ -2529,7 +2529,7 @@ fn build_survival_covariate_block_from_design(
                 design: DesignMatrix::Dense(Arc::new(cov_design.design.clone())),
                 offset: Array1::zeros(cov_design.design.nrows()),
                 penalties: cov_design.global_penalties(),
-                nullspace_dims: vec![],
+                nullspace_dims: cov_design.nullspace_dims.clone(),
                 initial_log_lambdas,
                 initial_beta,
             }))
@@ -3063,7 +3063,7 @@ fn prepare_survival_location_scale_model(
         design: threshold_solver_design,
         offset: threshold_solver_offset,
         penalties: threshold_prep.penalties.clone(),
-        nullspace_dims: vec![],
+        nullspace_dims: threshold_prep.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &threshold_prep.penalties,
             threshold_prep.initial_log_lambdas.clone(),
@@ -3133,7 +3133,7 @@ fn prepare_survival_location_scale_model(
         design: log_sigma_solver_design,
         offset: log_sigma_solver_offset,
         penalties: log_sigma_prep.penalties.clone(),
-        nullspace_dims: vec![],
+        nullspace_dims: log_sigma_prep.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &log_sigma_prep.penalties,
             log_sigma_prep.initial_log_lambdas.clone(),
@@ -3146,7 +3146,7 @@ fn prepare_survival_location_scale_model(
             design: w.design.clone(),
             offset: Array1::zeros(n),
             penalties: w.penalties.clone(),
-            nullspace_dims: vec![],
+            nullspace_dims: w.nullspace_dims.clone(),
             initial_log_lambdas: initial_log_lambdas(&w.penalties, w.initial_log_lambdas.clone())?,
             initial_beta: w.initial_beta.clone(),
         })
@@ -3390,7 +3390,7 @@ struct TimeBlockPrepared {
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
     penalties: Vec<Array2<f64>>,
-    nullspace_dims: vec![],
+    nullspace_dims: Vec<usize>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
 }
@@ -3453,6 +3453,7 @@ fn prepare_identified_time_block(
         design_exit,
         design_derivative_exit,
         penalties,
+        nullspace_dims: input.nullspace_dims.clone(),
         initial_beta,
         transform: TimeIdentifiabilityTransform { z },
     })
@@ -3460,7 +3461,6 @@ fn prepare_identified_time_block(
 
 fn initial_log_lambdas(
     penalties: &[Array2<f64>],
-    nullspace_dims: vec![],
     rho0: Option<Array1<f64>>,
 ) -> Result<Array1<f64>, String> {
     let k = penalties.len();
@@ -7090,6 +7090,7 @@ fn linkwiggle_block_input_from_selected_basis(
     let crate::families::gamlss::ParameterBlockInput {
         design,
         penalties,
+        nullspace_dims,
         initial_log_lambdas,
         initial_beta,
         ..
@@ -7097,6 +7098,7 @@ fn linkwiggle_block_input_from_selected_basis(
     LinkWiggleBlockInput {
         design,
         penalties,
+        nullspace_dims,
         initial_log_lambdas,
         initial_beta,
     }
@@ -7253,7 +7255,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             .map(|wiggle| LinkWiggleBlockInput {
                 design: wiggle.design.clone(),
                 penalties: wiggle.penalties.clone(),
-                nullspace_dims: vec![],
+                nullspace_dims: wiggle.nullspace_dims.clone(),
                 initial_log_lambdas: layout.wiggle_from(rho),
                 initial_beta: filtered_initial_beta(
                     wiggle_beta_hint.borrow().as_ref(),
@@ -7279,7 +7281,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 offset_exit: spec.time_block.offset_exit.clone(),
                 derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
                 penalties: spec.time_block.penalties.clone(),
-                nullspace_dims: vec![],
+                nullspace_dims: spec.time_block.nullspace_dims.clone(),
                 initial_log_lambdas: Some(layout.time_from(rho)),
                 initial_beta: time_beta,
             },
