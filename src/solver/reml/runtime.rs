@@ -299,7 +299,7 @@ impl<'a> RemlState<'a> {
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
-        penalties: &[crate::construction::CanonicalPenalty],
+        penalty_roots: &[Array2<f64>],
         lambdas: &[f64],
         beta: &Array1<f64>,
         compute_gradient: bool,
@@ -308,7 +308,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<TkCorrectionTerms, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
-        let k = penalties.len();
+        let k = penalty_roots.len();
         let xt = x_dense.t();
 
         // ── Hat leverages h_i = x_i^T H⁻¹ x_i ──
