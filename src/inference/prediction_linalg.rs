@@ -19,7 +19,7 @@ impl<'a> PredictionCovarianceBackend<'a> {
         Self::Dense(covariance)
     }
 
-    pub(crate) fn from_factorized_hessian(hessian: &Array2<f64>) -> Result<Self, String> {
+    pub(crate) fn from_factorized_hessian(hessian: SymmetricMatrix) -> Result<Self, String> {
         if hessian.nrows() != hessian.ncols() {
             return Err(format!(
                 "prediction precision backend requires a square Hessian, got {}x{}",
@@ -27,11 +27,18 @@ impl<'a> PredictionCovarianceBackend<'a> {
                 hessian.ncols()
             ));
         }
-        if !hessian.iter().any(|value| value.abs() > 0.0) {
+        let has_nonzero = match &hessian {
+            SymmetricMatrix::Dense(m) => m.iter().any(|v| v.abs() > 0.0),
+            SymmetricMatrix::Sparse(m) => {
+                let (_, vals) = m.parts();
+                vals.iter().any(|v| v.abs() > 0.0)
+            }
+        };
+        if !has_nonzero {
             return Err("prediction precision backend requires a non-zero Hessian".to_string());
         }
         let dim = hessian.nrows();
-        let factor = SymmetricMatrix::Dense(hessian.clone()).factorize()?;
+        let factor = hessian.factorize()?;
         Ok(Self::Factorized { factor, dim })
     }
 
@@ -80,30 +87,7 @@ pub(crate) fn design_row_chunk(
             design.nrows()
         ));
     }
-    match design {
-        DesignMatrix::Dense(matrix) => Ok(matrix.slice(s![rows, ..]).to_owned()),
-        DesignMatrix::Sparse(matrix) => {
-            let csr = matrix
-                .to_csr_arc()
-                .ok_or_else(|| "design_row_chunk: failed to obtain CSR view".to_string())?;
-            let sym = csr.symbolic();
-            let row_ptr = sym.row_ptr();
-            let col_idx = sym.col_idx();
-            let vals = csr.val();
-            let chunk_rows = rows.end - rows.start;
-            let mut out = Array2::<f64>::zeros((chunk_rows, design.ncols()));
-            for (local_row, row) in (rows.start..rows.end).enumerate() {
-                for ptr in row_ptr[row]..row_ptr[row + 1] {
-                    out[[local_row, col_idx[ptr]]] = vals[ptr];
-                }
-            }
-            Ok(out)
-        }
-        DesignMatrix::Operator(op) => {
-            let dense = op.to_dense();
-            Ok(dense.slice(s![rows, ..]).to_owned())
-        }
-    }
+    Ok(design.row_chunk(rows))
 }
 
 pub(crate) fn prediction_chunk_rows(
@@ -278,7 +262,7 @@ mod tests {
             .solvemulti(&Array2::eye(p))
             .expect("invert SPD precision via Cholesky");
         let backend =
-            PredictionCovarianceBackend::from_factorized_hessian(&precision).expect("factorize");
+            PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(precision.clone())).expect("factorize");
         let grads = array![[1.0, 0.0, 2.0], [0.5, -1.0, 0.0], [0.0, 1.0, 1.0]];
         let out = rowwise_local_covariances(&backend, 3, 1, |rows| {
             Ok(vec![grads.slice(s![rows, ..]).to_owned()])

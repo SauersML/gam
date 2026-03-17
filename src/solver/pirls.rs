@@ -8,7 +8,7 @@ use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
 };
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
-use crate::matrix::{DesignMatrix, LinearOperator};
+use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::mixture_link::{
     InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
 };
@@ -156,7 +156,7 @@ fn should_log_pirls_decision_summary(repetition_count: usize) -> bool {
     repetition_count > 1 && repetition_count.is_power_of_two()
 }
 
-const SPARSE_NATIVE_MAX_H_DENSITY: f64 = 0.10;
+const SPARSE_NATIVE_MAX_H_DENSITY: f64 = 0.30;
 
 #[derive(Clone, Debug)]
 struct SparsePenaltyPattern {
@@ -3949,9 +3949,9 @@ pub enum PirlsStatus {
 pub struct PirlsResult {
     // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
     pub beta_transformed: Coefficients,
-    pub penalized_hessian_transformed: Array2<f64>,
+    pub penalized_hessian_transformed: SymmetricMatrix,
     // Single stabilized Hessian for consistent cost/gradient computation
-    pub stabilizedhessian_transformed: Array2<f64>,
+    pub stabilizedhessian_transformed: SymmetricMatrix,
     /// Canonical ridge metadata passport consumed by outer objective/gradient code.
     pub ridge_passport: RidgePassport,
     // Ridge added to make the stabilized Hessian positive definite. When > 0,
@@ -4155,8 +4155,8 @@ impl PirlsResult {
 fn assemble_pirls_result(
     working_summary: &WorkingModelPirlsResult,
     offset: ArrayView1<'_, f64>,
-    penalized_hessian_transformed: Array2<f64>,
-    stabilizedhessian_transformed: Array2<f64>,
+    penalized_hessian_transformed: SymmetricMatrix,
+    stabilizedhessian_transformed: SymmetricMatrix,
     edf: f64,
     penalty_term: f64,
     finalmu: &Array1<f64>,
@@ -4452,45 +4452,39 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     let use_sparse_native = matches!(solver_decision.path, PirlsLinearSolvePath::SparseNative);
 
-    let (x_active, coordinate_frame, reparam_result_active, x_transformed_dense) =
-        if use_sparse_native {
-            let sparse_reparam = build_sparse_native_reparam_result(
-                reparam_result.clone(),
-                penalty.rs_original,
-                lambdas_slice,
-                penalty.p,
-            );
-            (
-                x_original.clone(),
-                PirlsCoordinateFrame::OriginalSparseNative,
-                sparse_reparam,
-                None,
-            )
-        } else {
-            let dense_x = x_original
-                .try_to_dense_arc("PIRLS transformed-basis path requires dense original design")
-                .map_err(EstimationError::InvalidInput)?;
-            let x_transformed = dense_x.dot(&reparam_result.qs);
-            (
-                maybe_sparse_design(&x_transformed),
-                PirlsCoordinateFrame::TransformedQs,
-                reparam_result.clone(),
-                Some(x_transformed),
-            )
-        };
+    let qs_arc = Arc::new(reparam_result.qs.clone());
+
+    let (x_active, coordinate_frame, reparam_result_active) = if use_sparse_native {
+        let sparse_reparam = build_sparse_native_reparam_result(
+            reparam_result.clone(),
+            penalty.rs_original,
+            lambdas_slice,
+            penalty.p,
+        );
+        (
+            x_original.clone(),
+            PirlsCoordinateFrame::OriginalSparseNative,
+            sparse_reparam,
+        )
+    } else {
+        // Lazy composition: do NOT materialize X·Qs.  The GamWorkingModel
+        // will use TransformedImplicit to apply Qs on the coefficient side.
+        (
+            x_original.clone(),
+            PirlsCoordinateFrame::TransformedQs,
+            reparam_result.clone(),
+        )
+    };
 
     if matches!(link_function, LinkFunction::Identity) {
-        let x_transformed_dense = x_transformed_dense
-            .as_ref()
-            .expect("explicit transform required for identity link");
-        let x_transformed_design = maybe_sparse_design(x_transformed_dense);
-        let (pls_result, _) = solve_penalized_least_squares(
-            x_transformed_dense.view(),
+        let (pls_result, _) = solve_penalized_least_squares_implicit(
+            &x_original,
+            if use_sparse_native { None } else { Some(&qs_arc) },
             y,
             priorweights,
             offset,
-            &reparam_result.e_transformed,
-            &reparam_result.s_transformed,
+            &reparam_result_active.e_transformed,
+            &reparam_result_active.s_transformed,
             &mut workspace,
             y,
             link_function,
@@ -4502,8 +4496,14 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let baseridge = pls_result.ridge_used;
 
         let priorweights_owned = priorweights.to_owned();
+        // eta = offset + X Qs beta (composed, no materialization)
+        let qbeta = if use_sparse_native {
+            beta_transformed.as_ref().clone()
+        } else {
+            qs_arc.dot(beta_transformed.as_ref())
+        };
         let mut eta = offset.to_owned();
-        eta += &x_transformed_dense.dot(beta_transformed.as_ref());
+        eta += &x_original.apply(&qbeta);
         let final_eta = eta.clone();
         let finalmu = eta.clone();
         let finalz = y.to_owned();
@@ -4511,8 +4511,14 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let mut weighted_residual = finalmu.clone();
         weighted_residual -= &finalz;
         weighted_residual *= &priorweights_owned;
-        let gradient_data = fast_atv(&x_transformed_dense, &weighted_residual);
-        let s_beta = reparam_result.s_transformed.dot(beta_transformed.as_ref());
+        // gradient = Qs^T X^T (w * residual) (composed)
+        let xt_wr = x_original.apply_transpose(&weighted_residual);
+        let gradient_data = if use_sparse_native {
+            xt_wr
+        } else {
+            fast_atv(&qs_arc, &xt_wr)
+        };
+        let s_beta = reparam_result_active.s_transformed.dot(beta_transformed.as_ref());
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
@@ -4569,8 +4575,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             )?;
         let pirls_result = PirlsResult {
             beta_transformed,
-            penalized_hessian_transformed: penalized_hessian,
-            stabilizedhessian_transformed: stabilizedhessian,
+            penalized_hessian_transformed: SymmetricMatrix::Dense(penalized_hessian),
+            stabilizedhessian_transformed: SymmetricMatrix::Dense(stabilizedhessian),
             ridge_passport: RidgePassport::scaled_identity(
                 ridge_used,
                 RidgePolicy::explicit_stabilization_full(),
@@ -4602,8 +4608,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             constraint_kkt: working_summary.constraint_kkt.clone(),
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
-            x_transformed: x_transformed_design,
-            coordinate_frame: PirlsCoordinateFrame::TransformedQs,
+            x_transformed: make_reparam_operator(&x_original, &qs_arc, use_sparse_native),
+            coordinate_frame: coordinate_frame.clone(),
             cache_compacted: false,
         };
 
@@ -4612,11 +4618,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     let x_original_for_result = x_original.clone();
     let mut working_model = GamWorkingModel::new(
-        if use_sparse_native {
-            None
-        } else {
-            Some(x_active.clone())
-        },
+        None, // No pre-materialized x_transformed: use implicit Qs composition
         x_original.clone(),
         coordinate_frame.clone(),
         offset,
@@ -4631,7 +4633,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 &config.link_kind,
                 InverseLink::Standard(LinkFunction::Logit)
             ),
-        None, // We either use explicit dense transform or sparse native without qs
+        if use_sparse_native { None } else { Some((*qs_arc).clone()) },
         quadctx,
     );
 
@@ -4709,10 +4711,11 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         ..
     } = final_state;
 
-    let penalized_hessian_transformed = working_summary.state.hessian.to_dense();
+    // Preserve the Hessian as-is (sparse or dense) — no densification.
     // P-IRLS already folded any stabilization ridge directly into the Hessian.
     // Keep that exact matrix so outer LAML derivatives stay consistent:
     // H_eff = X'W_H X + S_λ + ridge I (if ridge_used > 0).
+    let penalized_hessian_transformed = working_summary.state.hessian.clone();
     let stabilizedhessian_transformed = penalized_hessian_transformed.clone();
 
     let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
@@ -4771,24 +4774,13 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         working_summary.status = status.clone();
     }
 
-    let x_transformed_final = match coordinate_frame {
-        PirlsCoordinateFrame::TransformedQs => {
-            let x_transformed_dense_res = if let Some(xt) = x_transformed_dense {
-                xt
-            } else {
-                design_dot_dense_rhs(&x_original_for_result, &reparam_result.qs)
-            };
-            maybe_sparse_design(&x_transformed_dense_res)
-        }
-        PirlsCoordinateFrame::OriginalSparseNative => {
-            let x_transformed_dense_res = if let Some(xt) = x_transformed_dense {
-                xt
-            } else {
-                design_dot_dense_rhs(&x_original_for_result, &reparam_result.qs)
-            };
-            maybe_sparse_design(&x_transformed_dense_res)
-        }
-    };
+    // Store a lazy ReparamOperator instead of materializing X·Qs.
+    // Consumers that truly need dense access can call .to_dense() on demand.
+    let x_transformed_final = make_reparam_operator(
+        &x_original_for_result,
+        &qs_arc,
+        use_sparse_native,
+    );
 
     let pirls_result = assemble_pirls_result(
         &working_summary,
@@ -6537,7 +6529,7 @@ pub fn solve_penalized_least_squares(
     ))
 }
 fn calculate_edf(
-    penalized_hessian: &Array2<f64>,
+    penalized_hessian: &SymmetricMatrix,
     e_transformed: &Array2<f64>,
 ) -> Result<f64, EstimationError> {
     let p = penalized_hessian.ncols();
@@ -6547,16 +6539,21 @@ fn calculate_edf(
         return Ok(p as f64);
     }
     let rhs_arr = e_transformed.t().to_owned();
-    let rhsview = FaerArrayView::new(&rhs_arr);
-    let factor = StableSolver::new("pirls edf")
-        .factorize(penalized_hessian)
+    // Use SymmetricMatrix::factorize() which dispatches to sparse Cholesky
+    // for sparse Hessians and dense Cholesky for dense ones.
+    let factor = penalized_hessian
+        .factorize()
         .map_err(|_| EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         })?;
-    let sol = factor.solve(rhsview.as_ref());
-    if sol.nrows() == p && sol.ncols() == r && matref_is_finite(sol.as_ref()) {
+    let sol = factor
+        .solvemulti(&rhs_arr)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
         return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
-            sol[(i, j)]
+            sol[[i, j]]
         }));
     }
 

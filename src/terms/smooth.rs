@@ -186,7 +186,9 @@ pub struct DroppedPenaltyBlockInfo {
 #[derive(Debug, Clone)]
 pub struct SmoothDesign {
     pub design: Array2<f64>,
-    pub penalties: Vec<Array2<f64>>,
+    /// Per-term blockwise penalties.  Each entry's `col_range` is relative to
+    /// the smooth block (i.e. columns of `design`).
+    pub penalties: Vec<BlockwisePenalty>,
     pub nullspace_dims: Vec<usize>,
     pub penaltyinfo: Vec<PenaltyBlockInfo>,
     pub dropped_penaltyinfo: Vec<DroppedPenaltyBlockInfo>,
@@ -202,7 +204,9 @@ pub struct SmoothDesign {
 #[derive(Debug, Clone)]
 pub struct RawSmoothDesign {
     pub design: Array2<f64>,
-    pub penalties: Vec<Array2<f64>>,
+    /// Per-term blockwise penalties.  Each entry's `col_range` is relative to
+    /// the smooth block (i.e. columns of `design`).
+    pub penalties: Vec<BlockwisePenalty>,
     pub nullspace_dims: Vec<usize>,
     pub penaltyinfo: Vec<PenaltyBlockInfo>,
     pub dropped_penaltyinfo: Vec<DroppedPenaltyBlockInfo>,
@@ -510,6 +514,60 @@ pub fn weighted_blockwise_penalty_sum(
         slice.scaled_add(lam, &bp.local);
     }
     out
+}
+
+/// A penalty square root stored at its natural block size.
+///
+/// The root satisfies `S_k = root^T root` where root has dimensions
+/// `rank_k × block_p`, with `block_p = col_range.len()`.
+#[derive(Debug, Clone)]
+pub struct BlockwisePenaltyRoot {
+    /// Column range in the global coefficient vector.
+    pub col_range: Range<usize>,
+    /// The local root matrix — dimensions `rank_k × block_p`.
+    pub local_root: Array2<f64>,
+}
+
+impl BlockwisePenaltyRoot {
+    /// Create a new blockwise penalty root.
+    pub fn new(col_range: Range<usize>, local_root: Array2<f64>) -> Self {
+        debug_assert_eq!(col_range.len(), local_root.ncols());
+        Self {
+            col_range,
+            local_root,
+        }
+    }
+
+    /// Expand to a full `rank_k × p_total` root matrix (mostly zeros).
+    /// Use sparingly — the whole point of blockwise storage is to avoid this.
+    pub fn to_global(&self, p_total: usize) -> Array2<f64> {
+        let rank = self.local_root.nrows();
+        let mut g = Array2::<f64>::zeros((rank, p_total));
+        g.slice_mut(s![.., self.col_range.start..self.col_range.end])
+            .assign(&self.local_root);
+        g
+    }
+
+    /// The rank (number of rows) of this root.
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.local_root.nrows()
+    }
+
+    /// The block size of this root.
+    #[inline]
+    pub fn block_size(&self) -> usize {
+        self.col_range.len()
+    }
+}
+
+/// Expand blockwise penalty roots to global `rank_k × p_total` dense matrices.
+/// Compatibility shim for code paths that still consume `&[Array2<f64>]`.
+pub fn penalty_roots_to_global(
+    roots: &[BlockwisePenaltyRoot],
+    p_total: usize,
+) -> Vec<Array2<f64>> {
+    roots.iter().map(|r| r.to_global(p_total)).collect()
 }
 
 #[derive(Clone)]
@@ -1014,6 +1072,15 @@ pub struct SpatialLengthScaleOptimizationOptions {
     pub min_length_scale: f64,
     /// Maximum allowed length_scale during κ search.
     pub max_length_scale: f64,
+    /// When set and n exceeds this threshold, run κ optimization on a
+    /// spatially stratified random subsample of this size, then fit the
+    /// full dataset with frozen length scales. This avoids repeated
+    /// O(n·k) basis rebuilds at biobank scale.
+    ///
+    /// The subsample preserves spatial coverage via cell-based stratification
+    /// on the spatial coordinates used by the first eligible smooth term.
+    /// Set to None to always optimize on full data (the default for small n).
+    pub pilot_subsample_size: Option<usize>,
 }
 
 impl Default for SpatialLengthScaleOptimizationOptions {
@@ -1026,6 +1093,7 @@ impl Default for SpatialLengthScaleOptimizationOptions {
             log_step: std::f64::consts::LN_2,
             min_length_scale: 1e-3,
             max_length_scale: 1e3,
+            pilot_subsample_size: None,
         }
     }
 }
@@ -2303,7 +2371,7 @@ pub fn build_smooth_design_withworkspace(
     let total_p: usize = local_dims.iter().sum();
     let mut design = Array2::<f64>::zeros((n, total_p));
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());
-    let mut penalties_global = Vec::<Array2<f64>>::new();
+    let mut penalties_global = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
     let mut penaltyinfo_global = Vec::<PenaltyBlockInfo>::new();
     let mut dropped_penaltyinfo_global = Vec::<DroppedPenaltyBlockInfo>::new();
@@ -2344,11 +2412,10 @@ pub fn build_smooth_design_withworkspace(
             .zip(activeinfos.into_iter())
         {
             let global_index = penalties_global.len();
-            let mut s_global = Array2::<f64>::zeros((total_p, total_p));
-            s_global
-                .slice_mut(s![col_start..col_end, col_start..col_end])
-                .assign(s_local);
-            penalties_global.push(s_global);
+            penalties_global.push(BlockwisePenalty::new(
+                col_start..col_end,
+                s_local.clone(),
+            ));
             nullspace_dims_global.push(ns);
             let mut penalty = info.clone();
             penalty.nullspace_dim_hint = ns;
@@ -2474,29 +2541,37 @@ pub fn build_term_collection_design(
     let p_smooth = smooth.design.ncols();
     let p_total = p_intercept + p_lin + p_rand + p_smooth;
 
-    // Build the dense core: intercept + linear + smooth columns.
-    let p_dense = p_intercept + p_lin + p_smooth;
-    let mut dense_core = Array2::<f64>::zeros((n, p_dense));
-    dense_core.column_mut(0).fill(1.0);
+    // ── Build per-term DesignBlocks ─────────────────────────────────────
+    //
+    // Global column layout:
+    //   [intercept(1)] | [linear(p_lin)] | [RE_0(q0)] | … | [smooth_0(ps0)] | [smooth_1(ps1)] | …
+    //
+    // Every section becomes its own DesignBlock inside a BlockDesignOperator.
+    // The full (n, p_total) dense matrix is NEVER materialized.  Individual
+    // smooth terms get their own dense blocks so that cross-block grams are
+    // small O(p_i × p_j) operations instead of one monolithic O(p_smooth²)
+    // product.
 
+    let mut blocks = Vec::<DesignBlock>::new();
+
+    // Block 0: intercept — zero storage, implicit all-ones column.
+    blocks.push(DesignBlock::Intercept(n));
+
+    // Block 1: linear terms — extract columns from data.
     let mut linear_ranges = Vec::<(String, Range<usize>)>::with_capacity(p_lin);
-    for (j, linear) in spec.linear_terms.iter().enumerate() {
-        let col = p_intercept + j;
-        dense_core
-            .column_mut(col)
-            .assign(&data.column(linear.feature_col));
-        // Column ranges are in the global (full) coordinate system:
-        // [intercept | linear | random_effects | smooth]
-        linear_ranges.push((linear.name.clone(), col..(col + 1)));
-    }
-    if p_smooth > 0 {
-        dense_core
-            .slice_mut(s![.., (p_intercept + p_lin)..])
-            .assign(&smooth.design);
+    if p_lin > 0 {
+        let mut lin_data = Array2::<f64>::zeros((n, p_lin));
+        for (j, linear) in spec.linear_terms.iter().enumerate() {
+            let col = p_intercept + j;
+            lin_data
+                .column_mut(j)
+                .assign(&data.column(linear.feature_col));
+            linear_ranges.push((linear.name.clone(), col..(col + 1)));
+        }
+        blocks.push(DesignBlock::Dense(Arc::new(lin_data)));
     }
 
-    // Track random-effect column ranges in the global coordinate system.
-    // Global layout: [intercept(1) | linear(p_lin) | RE_0(q0) | RE_1(q1) | … | smooth(p_smooth)]
+    // Blocks: random-effect operators — O(n) implicit one-hot, zero dense storage.
     let mut random_effect_ranges =
         Vec::<(String, Range<usize>)>::with_capacity(random_blocks.len());
     let mut random_effect_levels =
@@ -2508,57 +2583,31 @@ pub fn build_term_collection_design(
         random_effect_ranges.push((block.name.clone(), col_cursor..end));
         random_effect_levels.push((block.name.clone(), block.kept_levels.clone()));
         col_cursor = end;
+        let re_op = RandomEffectOperator::new(block.group_ids.clone(), block.num_groups);
+        blocks.push(DesignBlock::RandomEffect(Arc::new(re_op)));
     }
 
-    // Assemble the full DesignMatrix.
-    //
-    // When random effects are present, use a BlockDesignOperator that composes
-    // the dense core (intercept + linear) with O(n) random-effect operators and
-    // the dense smooth block.  This avoids materializing the n × q one-hot
-    // matrices — the dominant memory cost for biobank-scale random intercepts.
-    //
-    // When there are no random effects, the dense core already contains all
-    // columns and is wrapped directly.
-    let design: DesignMatrix = if random_blocks.is_empty() {
-        // No RE — dense_core already has [intercept | linear | smooth].
-        DesignMatrix::Dense(Arc::new(dense_core))
-    } else {
-        // Build the block operator.
-        //
-        // Global column layout:
-        //   [intercept + linear] | [RE_0] | [RE_1] | … | [smooth]
-        //
-        // dense_core has [intercept + linear + smooth] columns.  We split it
-        // into two dense blocks (pre-RE and post-RE) with RE operators in between.
-        let p_pre_re = p_intercept + p_lin; // intercept + linear columns
-        let mut blocks = Vec::<DesignBlock>::new();
-
-        // Block 0: intercept + linear (dense).
-        if p_pre_re > 0 {
-            let pre_re = dense_core.slice(s![.., ..p_pre_re]).to_owned();
-            blocks.push(DesignBlock::Dense(Arc::new(pre_re)));
+    // Blocks: per-smooth-term dense blocks — each is (n, p_term), typically
+    // small (10-40 columns for a cubic spline basis).  Splitting into per-term
+    // blocks means that cross-block grams are tiny p_i × p_j matrices and the
+    // full p_smooth × p_smooth Gram is assembled from O(k²) small products.
+    if p_smooth > 0 {
+        if smooth.terms.is_empty() {
+            // Fallback: single dense block for the entire smooth design.
+            blocks.push(DesignBlock::Dense(Arc::new(smooth.design.clone())));
+        } else {
+            for term in &smooth.terms {
+                let r = &term.coeff_range;
+                let term_block = smooth.design.slice(s![.., r.clone()]).to_owned();
+                blocks.push(DesignBlock::Dense(Arc::new(term_block)));
+            }
         }
+    }
 
-        // Blocks 1..k: random-effect operators.
-        for block in &random_blocks {
-            let re_op = RandomEffectOperator::new(
-                block.group_ids.clone(),
-                block.num_groups,
-            );
-            blocks.push(DesignBlock::RandomEffect(Arc::new(re_op)));
-        }
-
-        // Final block: smooth (dense), if present.
-        if p_smooth > 0 {
-            let smooth_part = dense_core.slice(s![.., p_pre_re..]).to_owned();
-            blocks.push(DesignBlock::Dense(Arc::new(smooth_part)));
-        }
-
-        let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
-            BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
-        })?;
-        DesignMatrix::Operator(Arc::new(block_op))
-    };
+    let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
+        BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
+    })?;
+    let design = DesignMatrix::Operator(Arc::new(block_op));
 
     let mut penalties = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims = Vec::<usize>::new();
@@ -2649,17 +2698,18 @@ pub fn build_term_collection_design(
             smooth.penaltyinfo.len()
         )));
     }
-    for ((s_local, &ns), localinfo) in smooth
+    let smooth_start = p_intercept + p_lin + p_rand;
+    for ((bp, &ns), localinfo) in smooth
         .penalties
         .iter()
         .zip(smooth.nullspace_dims.iter())
         .zip(smooth.penaltyinfo.iter())
     {
-        let start = p_intercept + p_lin + p_rand;
         let global_index = penalties.len();
+        // Offset the per-term block range from smooth-local to model-global.
         penalties.push(BlockwisePenalty::new(
-            start..(start + p_smooth),
-            s_local.clone(),
+            (bp.col_range.start + smooth_start)..(bp.col_range.end + smooth_start),
+            bp.local.clone(),
         ));
         nullspace_dims.push(ns);
         let mut penalty = localinfo.penalty.clone();
@@ -2916,7 +2966,7 @@ fn apply_spatial_orthogonality_to_parametric(
     let total_p: usize = local_dims.iter().sum();
     let mut design = Array2::<f64>::zeros((n, total_p));
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(smooth.terms.len());
-    let mut penalties_global = Vec::<Array2<f64>>::new();
+    let mut penalties_global = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
     let mut penaltyinfo_global = Vec::<PenaltyBlockInfo>::new();
     let mut dropped_penaltyinfo_global = smooth.dropped_penaltyinfo.clone();
@@ -2951,11 +3001,10 @@ fn apply_spatial_orthogonality_to_parametric(
             .zip(activeinfos.into_iter())
         {
             let global_index = penalties_global.len();
-            let mut s_global = Array2::<f64>::zeros((total_p, total_p));
-            s_global
-                .slice_mut(s![col_start..col_end, col_start..col_end])
-                .assign(s_local);
-            penalties_global.push(s_global);
+            penalties_global.push(BlockwisePenalty::new(
+                col_start..col_end,
+                s_local.clone(),
+            ));
             nullspace_dims_global.push(ns);
             let mut penalty = info.clone();
             penalty.nullspace_dim_hint = ns;
@@ -3261,14 +3310,13 @@ fn fit_term_collection_on_realized_design(
         );
     }
     let base_fit_opts = adaptive_fit_options_base(options, design);
-    let global_penalties = design.global_penalties();
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
-            design.design.view(),
+            design.design.clone(),
             y,
             weights,
             offset,
-            &global_penalties,
+            &design.penalties,
             heuristic_lambdas,
             family,
             &base_fit_opts,
@@ -4527,7 +4575,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .map_err(EstimationError::InvalidInput)?;
     let shared_y = Arc::new(y.to_owned());
     let sharedweights = Arc::new(weights.to_owned());
-    let shared_design = Arc::new(baseline.design.design.clone());
+    let shared_design = baseline.design.design.to_dense_arc();
     let shared_offset = Arc::new(offset.to_owned());
     let shared_runtime_caches = Arc::new(runtime_caches.to_vec());
     let shared_hyperspecs = Arc::new(hyperspecs.clone());
@@ -4568,7 +4616,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     }));
     let blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
+        design: baseline.design.design.clone(),
         offset: offset.to_owned(),
         penalties: retained_penalties.iter().cloned().map(PenaltyMatrix::Dense).collect(),
         nullspace_dims: retained_nullspace_dims.clone(),
@@ -4829,7 +4877,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         base_family.with_adaptive_params(adaptive_params.clone(), Arc::new(fixed_total.clone()));
     let final_blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
+        design: baseline.design.design.clone(),
         offset: offset.to_owned(),
         penalties: vec![],
         nullspace_dims: vec![],
@@ -6981,7 +7029,7 @@ fn fit_bounded_term_collection_with_design(
         })
         .collect();
     let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
-    let fit_design = conditioning.apply_to_design(&design.design);
+    let fit_design = conditioning.apply_to_design(&design.design.as_dense_cow());
     let global_penalties = design.global_penalties();
     let fit_penalties = conditioning.transform_penalties_to_internal(&global_penalties);
     if design.linear_constraints.is_some() {
@@ -7289,6 +7337,167 @@ pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Ve
         .enumerate()
         .filter_map(|(idx, _)| get_spatial_length_scale(spec, idx).map(|_| idx))
         .collect()
+}
+
+/// Extract the feature columns used by the first eligible spatial term.
+/// Returns `None` if no spatial terms exist in the spec.
+fn first_spatial_feature_cols(spec: &TermCollectionSpec) -> Option<Vec<usize>> {
+    for term in &spec.smooth_terms {
+        match &term.basis {
+            SmoothBasisSpec::ThinPlate { feature_cols, .. }
+            | SmoothBasisSpec::Matern { feature_cols, .. }
+            | SmoothBasisSpec::Duchon { feature_cols, .. } => {
+                return Some(feature_cols.clone());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Select a spatially stratified random subsample of size `m` from `n` observations.
+///
+/// Divides the spatial bounding box into a grid of cells, then samples
+/// proportionally from each non-empty cell. This preserves spatial coverage
+/// better than uniform random sampling, which can miss sparse regions.
+///
+/// Falls back to uniform random if the spatial columns cannot be identified.
+fn stratified_spatial_subsample(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    m: usize,
+    seed: u64,
+) -> Vec<usize> {
+    use rand::{SeedableRng, rngs::StdRng};
+
+    let n = data.nrows();
+    assert!(m > 0 && m <= n, "subsample size must be in [1, n]");
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let spatial_cols = match first_spatial_feature_cols(spec) {
+        Some(cols) if !cols.is_empty() => cols,
+        _ => {
+            // No spatial columns found; fall back to uniform random subsample.
+            let mut indices: Vec<usize> = (0..n).collect();
+            fisher_yates_partial_shuffle(&mut indices, m, &mut rng);
+            indices.truncate(m);
+            indices.sort_unstable();
+            return indices;
+        }
+    };
+
+    let d = spatial_cols.len();
+    // Compute bounding box per spatial dimension.
+    let mut mins = vec![f64::INFINITY; d];
+    let mut maxs = vec![f64::NEG_INFINITY; d];
+    for i in 0..n {
+        for (j, &col) in spatial_cols.iter().enumerate() {
+            let v = data[[i, col]];
+            if v < mins[j] {
+                mins[j] = v;
+            }
+            if v > maxs[j] {
+                maxs[j] = v;
+            }
+        }
+    }
+
+    // Number of grid divisions per axis: target ~m total cells spread across d dimensions.
+    let cells_per_axis = ((m as f64).powf(1.0 / d as f64)).ceil().max(1.0) as usize;
+    let total_cells: usize = cells_per_axis.pow(d as u32);
+
+    // Compute cell widths (with epsilon padding to avoid boundary issues).
+    let widths: Vec<f64> = mins
+        .iter()
+        .zip(maxs.iter())
+        .map(|(&lo, &hi)| {
+            let w = hi - lo;
+            if w <= 0.0 { 1.0 } else { w * (1.0 + 1e-10) }
+        })
+        .collect();
+
+    // Assign each observation to a cell.
+    let mut cell_members: Vec<Vec<usize>> = vec![Vec::new(); total_cells];
+    for i in 0..n {
+        let mut cell_idx = 0usize;
+        let mut stride = 1usize;
+        for (j, &col) in spatial_cols.iter().enumerate() {
+            let v = data[[i, col]];
+            let bin = ((v - mins[j]) / widths[j] * cells_per_axis as f64).floor() as usize;
+            let bin = bin.min(cells_per_axis - 1);
+            cell_idx += bin * stride;
+            stride *= cells_per_axis;
+        }
+        cell_members[cell_idx].push(i);
+    }
+
+    // Proportional allocation: each non-empty cell gets at least 1 sample.
+    let non_empty: Vec<usize> = (0..total_cells)
+        .filter(|&c| !cell_members[c].is_empty())
+        .collect();
+
+    let mut selected = Vec::with_capacity(m);
+    let mut quotas: Vec<(usize, usize)> = Vec::with_capacity(non_empty.len());
+    for &c in &non_empty {
+        let count = cell_members[c].len();
+        let raw_quota = ((count as f64 / n as f64) * m as f64).round().max(1.0) as usize;
+        let quota = raw_quota.min(count);
+        quotas.push((c, quota));
+    }
+
+    // If total exceeds m, trim from the largest-quota cells.
+    let total_allocated: usize = quotas.iter().map(|&(_, q)| q).sum();
+    if total_allocated > m {
+        // Sort by quota descending so we trim from the biggest cells first.
+        quotas.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut excess = total_allocated - m;
+        for entry in quotas.iter_mut() {
+            if excess == 0 {
+                break;
+            }
+            let can_trim = entry.1.saturating_sub(1);
+            let trim = can_trim.min(excess);
+            entry.1 -= trim;
+            excess -= trim;
+        }
+    }
+
+    // Sample from each cell.
+    for &(c, quota) in &quotas {
+        let members = &mut cell_members[c];
+        if quota >= members.len() {
+            selected.extend_from_slice(members);
+        } else {
+            fisher_yates_partial_shuffle(members, quota, &mut rng);
+            selected.extend_from_slice(&members[..quota]);
+        }
+    }
+
+    // If total < m, fill remaining by uniform random from unselected observations.
+    if selected.len() < m {
+        let selected_set: std::collections::HashSet<usize> = selected.iter().copied().collect();
+        let mut remaining: Vec<usize> = (0..n).filter(|i| !selected_set.contains(i)).collect();
+        let need = m - selected.len();
+        let take = need.min(remaining.len());
+        fisher_yates_partial_shuffle(&mut remaining, take, &mut rng);
+        selected.extend_from_slice(&remaining[..take]);
+    }
+
+    selected.sort_unstable();
+    selected.truncate(m);
+    selected
+}
+
+/// Fisher-Yates partial shuffle: randomly selects `k` elements by shuffling
+/// the first `k` positions of the slice.
+fn fisher_yates_partial_shuffle(slice: &mut [usize], k: usize, rng: &mut rand::rngs::StdRng) {
+    use rand::Rng;
+    let n = slice.len();
+    let k = k.min(n);
+    for i in 0..k {
+        let j = rng.random_range(i..n);
+        slice.swap(i, j);
+    }
 }
 
 fn fit_score(fit: &UnifiedFitResult) -> f64 {
@@ -10036,6 +10245,64 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         ));
     }
 
+    // Pilot-fit pathway: when n is large and pilot_subsample_size is set,
+    // run κ optimization on a spatially stratified subsample, then fit the
+    // full dataset with the discovered geometry frozen.
+    if let Some(pilot_m) = kappa_options.pilot_subsample_size {
+        if n > pilot_m * 2 {
+            log::info!(
+                "[spatial-kappa] pilot-fit: subsampling {} from {} observations for κ optimization",
+                pilot_m,
+                n,
+            );
+            let indices = stratified_spatial_subsample(data, spec, pilot_m, 42);
+
+            let mut data_pilot = Array2::<f64>::zeros((indices.len(), data.ncols()));
+            for (new_row, &orig_row) in indices.iter().enumerate() {
+                data_pilot.row_mut(new_row).assign(&data.row(orig_row));
+            }
+            let y_pilot = indices.iter().map(|&i| y[i]).collect::<Array1<f64>>();
+            let weights_pilot = indices.iter().map(|&i| weights[i]).collect::<Array1<f64>>();
+            let offset_pilot = indices.iter().map(|&i| offset[i]).collect::<Array1<f64>>();
+
+            let mut pilot_kappa_options = kappa_options.clone();
+            pilot_kappa_options.pilot_subsample_size = None;
+
+            let pilot_result = fit_term_collectionwith_spatial_length_scale_optimization(
+                data_pilot.view(),
+                y_pilot,
+                weights_pilot,
+                offset_pilot,
+                spec,
+                family,
+                options,
+                &pilot_kappa_options,
+            )?;
+
+            log::info!(
+                "[spatial-kappa] pilot-fit complete; fitting full dataset with frozen geometry",
+            );
+
+            let frozen_spec = pilot_result.resolvedspec;
+            let full_result = fit_term_collection_forspec(
+                data,
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &frozen_spec,
+                family,
+                options,
+            )?;
+
+            return Ok(FittedTermCollectionWithSpec {
+                fit: full_result.fit,
+                design: full_result.design,
+                resolvedspec: frozen_spec,
+                adaptive_diagnostics: full_result.adaptive_diagnostics,
+            });
+        }
+    }
+
     let best = fit_term_collection_forspec(
         data,
         y.view(),
@@ -10582,13 +10849,15 @@ mod tests {
         let design = build_term_collection_design(data.view(), &spec).unwrap();
         assert_eq!(design.design.nrows(), data.nrows());
         assert_eq!(design.intercept_range, 0..1);
-        assert!(
-            design
-                .design
-                .column(design.intercept_range.start)
-                .iter()
-                .all(|&v| (v - 1.0).abs() < 1e-12)
-        );
+        {
+            let dense = design.design.as_dense_cow();
+            assert!(
+                dense
+                    .column(design.intercept_range.start)
+                    .iter()
+                    .all(|&v| (v - 1.0).abs() < 1e-12)
+            );
+        }
         assert!(design.design.ncols() >= 2);
         assert_eq!(design.linear_ranges.len(), 1);
         assert_eq!(design.random_effect_ranges.len(), 0);
@@ -10682,13 +10951,13 @@ mod tests {
         // Raw TPS width for k=4,d=2 is 4; we drop intercept + matching x0 linear component.
         assert_eq!(design.smooth.design.ncols(), 2);
 
+        let dense = design.design.as_dense_cow();
         let lin_col = design.linear_ranges[0].1.start;
-        let linvalues = design.design.column(lin_col).to_owned();
+        let linvalues = dense.column(lin_col).to_owned();
         let smooth_start = 1 + spec.linear_terms.len();
         let smooth_end = smooth_start + design.smooth.design.ncols();
         for col in smooth_start..smooth_end {
-            let same_as_linear = design
-                .design
+            let same_as_linear = dense
                 .column(col)
                 .iter()
                 .zip(linvalues.iter())
@@ -10936,8 +11205,9 @@ mod tests {
         assert_eq!(design.penalties.len(), 1);
         assert_eq!(design.nullspace_dims, vec![0]);
         let (_, range) = &design.random_effect_ranges[0];
-        for i in 0..design.design.nrows() {
-            let row_sum: f64 = design.design.slice(s![i, range.clone()]).sum();
+        let dense = design.design.as_dense_cow();
+        for i in 0..dense.nrows() {
+            let row_sum: f64 = dense.slice(s![i, range.clone()]).sum();
             assert!((row_sum - 1.0).abs() < 1e-12);
         }
     }
@@ -13370,7 +13640,7 @@ mod tests {
             sas_link_state: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(Array1::ones(n)),
-            design: Arc::new(baseline.design.design.clone()),
+            design: baseline.design.design.to_dense_arc(),
             offset: Arc::new(Array1::zeros(n)),
             linear_constraints: baseline.design.linear_constraints.clone(),
             runtime_caches: Arc::new(runtime_caches.clone()),
@@ -13383,7 +13653,7 @@ mod tests {
         };
         let blockspec = ParameterBlockSpec {
             name: "eta".to_string(),
-            design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
+            design: baseline.design.design.clone(),
             offset: Array1::zeros(n),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -13562,7 +13832,7 @@ mod tests {
             sas_link_state: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(Array1::ones(n)),
-            design: Arc::new(baseline.design.design.clone()),
+            design: baseline.design.design.to_dense_arc(),
             offset: Arc::new(Array1::zeros(n)),
             linear_constraints: baseline.design.linear_constraints.clone(),
             runtime_caches: Arc::new(runtime_caches.clone()),
@@ -13575,7 +13845,7 @@ mod tests {
         };
         let blockspec = ParameterBlockSpec {
             name: "eta".to_string(),
-            design: DesignMatrix::Dense(Arc::new(baseline.design.design.clone())),
+            design: baseline.design.design.clone(),
             offset: Array1::zeros(n),
             penalties: vec![],
             nullspace_dims: vec![],

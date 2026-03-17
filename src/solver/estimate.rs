@@ -412,37 +412,23 @@ struct ParametricColumnConditioning {
 }
 
 impl ParametricColumnConditioning {
-    fn infer_from_penalties(x: &DesignMatrix, s_list: &[Array2<f64>]) -> Self {
+    /// Build conditioning from explicit unpenalized column indices.
+    ///
+    /// Reads only the specified columns from `x` (via `extract_column`) to
+    /// compute per-column mean/variance — no full-design densification.
+    fn from_column_indices(x: &DesignMatrix, unpenalized_cols: &[usize]) -> Self {
         const SCALE_EPS: f64 = 1e-12;
-        let dense = x.to_dense_arc();
-        let p = dense.ncols();
-        let mut penalized = vec![false; p];
-        for s in s_list {
-            for j in 0..p.min(s.ncols()) {
-                let mut active = false;
-                for i in 0..s.nrows() {
-                    if s[[i, j]] != 0.0 || s[[j, i]] != 0.0 {
-                        active = true;
-                        break;
-                    }
-                }
-                if active {
-                    penalized[j] = true;
-                }
-            }
+        let n = x.nrows();
+        if n == 0 {
+            return Self {
+                intercept_idx: None,
+                columns: Vec::new(),
+            };
         }
-
         let mut intercept_idx = None;
         let mut columns = Vec::new();
-        for j in 0..p {
-            if penalized[j] {
-                continue;
-            }
-            let col = dense.column(j);
-            let n = col.len();
-            if n == 0 {
-                continue;
-            }
+        for &j in unpenalized_cols {
+            let col = x.extract_column(j);
             let first = col[0];
             let is_constant = col.iter().all(|&v| (v - first).abs() <= 1e-12);
             if is_constant {
@@ -476,23 +462,41 @@ impl ParametricColumnConditioning {
         }
     }
 
+    /// Infer unpenalized columns by scanning penalty matrices, then compute
+    /// column statistics via per-column extraction — no full-design densification.
+    fn infer_from_penalties(x: &DesignMatrix, s_list: &[Array2<f64>]) -> Self {
+        let p = x.ncols();
+        let mut penalized = vec![false; p];
+        for s in s_list {
+            for j in 0..p.min(s.ncols()) {
+                for i in 0..s.nrows() {
+                    if s[[i, j]] != 0.0 || s[[j, i]] != 0.0 {
+                        penalized[j] = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
+        Self::from_column_indices(x, &unpenalized)
+    }
+
     fn is_active(&self) -> bool {
         !self.columns.is_empty()
     }
 
+    /// Return a lazily-conditioned design matrix (no materialization).
+    ///
+    /// Wraps `x` in a `ConditionedDesign` operator that applies per-column
+    /// centering and scaling through matvec algebra, avoiding densification.
     fn apply_to_design(&self, x: &DesignMatrix) -> DesignMatrix {
         if !self.is_active() {
             return x.clone();
         }
-        let mut dense = x.to_dense();
-        for &(j, mean, scale) in &self.columns {
-            {
-                let mut col = dense.column_mut(j);
-                col -= mean;
-            }
-            dense.column_mut(j).mapv_inplace(|v| v / scale);
-        }
-        DesignMatrix::Dense(Arc::new(dense))
+        DesignMatrix::Operator(Arc::new(crate::matrix::ConditionedDesign::new(
+            x.clone(),
+            self.columns.clone(),
+        )))
     }
 
     fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
@@ -657,8 +661,8 @@ fn map_hessian_to_original_basis(
     pirls: &crate::pirls::PirlsResult,
 ) -> Result<Array2<f64>, EstimationError> {
     let qs = &pirls.reparam_result.qs;
-    let h_t = &pirls.penalized_hessian_transformed;
-    let tmp = qs.dot(h_t);
+    let h_t = pirls.penalized_hessian_transformed.to_dense();
+    let tmp = qs.dot(&h_t);
     Ok(tmp.dot(&qs.t()))
 }
 
@@ -845,7 +849,7 @@ fn compute_smoothing_correction(
     //   misstate smoothing-parameter uncertainty propagation.
     let h_trans = reml_state
         .objective_innerhessian(final_rho)
-        .unwrap_or_else(|_| final_fit.stabilizedhessian_transformed.clone());
+        .unwrap_or_else(|_| final_fit.stabilizedhessian_transformed.to_dense());
 
     // Factor the Hessian for solving
     let h_chol = match h_trans.cholesky(faer::Side::Lower) {
@@ -2057,12 +2061,14 @@ where
         let h_eff = &pirls_res.stabilizedhessian_transformed;
         let p_eff = h_eff.ncols();
         let h_inv_diag = if p_eff > 0 {
-            if let Ok(chol) = h_eff.cholesky(Side::Lower) {
+            if let Ok(factor) = h_eff.factorize() {
                 let mut diag = Array1::<f64>::zeros(p_eff);
                 for j in 0..p_eff {
                     let mut e_j = Array1::<f64>::zeros(p_eff);
                     e_j[j] = 1.0;
-                    diag[j] = chol.solvevec(&e_j)[j];
+                    if let Ok(sol) = factor.solve(&e_j) {
+                        diag[j] = sol[j];
+                    }
                 }
                 diag
             } else {
@@ -2140,13 +2146,14 @@ where
 
                     let sampling_result = {
                         let x_dense = selected_pirls_res.x_transformed.to_dense_arc();
+                        let hessian_dense = selected_pirls_res.stabilizedhessian_transformed.to_dense();
                         let hmc_inputs = crate::hmc::JointBetaRhoInputs {
                             x: x_dense.view(),
                             y: y_o.view(),
                             weights: w_o.view(),
                             likelihood_family: opts.family,
                             mode: selected_pirls_res.beta_transformed.view(),
-                            hessian: selected_pirls_res.stabilizedhessian_transformed.view(),
+                            hessian: hessian_dense.view(),
                             penalty_roots: selected_pirls_res.reparam_result.rs_transformed.clone(),
                             penalty_nullspace_dims: opts.nullspace_dims.clone(),
                             rho_mode: selected_rho.view(),

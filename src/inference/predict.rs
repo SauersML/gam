@@ -5,7 +5,7 @@ use crate::inference::prediction_linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows, rowwise_local_covariances,
 };
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
-use crate::matrix::DesignMatrix;
+use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
@@ -70,7 +70,7 @@ fn conditional_prediction_backend<'a>(
     label: &str,
 ) -> Option<PredictionCovarianceBackend<'a>> {
     if let Some(hessian) = usable_penalized_hessian(fit, expected_dim, label) {
-        match PredictionCovarianceBackend::from_factorized_hessian(hessian) {
+        match PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(hessian.clone())) {
             Ok(backend) => return Some(backend),
             Err(err) => {
                 log::warn!(
@@ -985,8 +985,15 @@ impl BernoulliMarginalSlopePredictor {
                     .to_string(),
             ));
         }
-        let design_marginal = need_gradient.then(|| input.design.to_dense());
-        let design_logslope_dense = need_gradient.then(|| design_logslope.to_dense());
+        let grad_chunk_size = if need_gradient {
+            prediction_chunk_rows(theta.len(), 1, z.len())
+        } else {
+            z.len().max(1)
+        };
+        let mut marginal_chunk: Option<Array2<f64>> = None;
+        let mut logslope_chunk: Option<Array2<f64>> = None;
+        let mut chunk_start = 0usize;
+        let mut chunk_end = 0usize;
         let marginal_eta = input
             .design
             .dot(&beta_marginal.to_owned())
@@ -1035,6 +1042,12 @@ impl BernoulliMarginalSlopePredictor {
         let score_warp_offset = logslope_offset + logslope_dim;
         let link_dev_offset = score_warp_offset + score_warp_dim;
         for i in 0..z.len() {
+            if need_gradient && i >= chunk_end {
+                chunk_start = i;
+                chunk_end = (i + grad_chunk_size).min(z.len());
+                marginal_chunk = Some(input.design.row_chunk(chunk_start..chunk_end));
+                logslope_chunk = Some(design_logslope.row_chunk(chunk_start..chunk_end));
+            }
             let q = marginal_eta[i];
             let slope = logslope_eta[i].exp();
             let intercept = if flex_active {
@@ -1074,27 +1087,17 @@ impl BernoulliMarginalSlopePredictor {
                     let a_q = crate::probability::normal_pdf(q) / m_a;
                     let m_b = weighted_c1.dot(&warped_nodes);
                     let a_b = -m_b / m_a;
-                    let design_marginal = design_marginal.as_ref().ok_or_else(|| {
-                        EstimationError::InvalidInput(
-                            "bernoulli marginal-slope analytic gradient missing marginal design"
-                                .to_string(),
-                        )
-                    })?;
-                    let design_logslope_dense =
-                        design_logslope_dense.as_ref().ok_or_else(|| {
-                            EstimationError::InvalidInput(
-                                "bernoulli marginal-slope analytic gradient missing logslope design"
-                                    .to_string(),
-                            )
-                        })?;
+                    let mc = marginal_chunk.as_ref().unwrap();
+                    let lc = logslope_chunk.as_ref().unwrap();
+                    let li = i - chunk_start;
 
                     for j in 0..marginal_dim {
-                        row_grad[j] = a_q * design_marginal[[i, j]];
+                        row_grad[j] = a_q * mc[[li, j]];
                     }
 
                     let g_scale = slope * (a_b + warped_z[i]);
                     for j in 0..logslope_dim {
-                        row_grad[logslope_offset + j] = g_scale * design_logslope_dense[[i, j]];
+                        row_grad[logslope_offset + j] = g_scale * lc[[li, j]];
                     }
 
                     if let (Some(obs_design), Some(node_design)) = (
@@ -1130,25 +1133,15 @@ impl BernoulliMarginalSlopePredictor {
                     }
                 } else {
                     let c = (1.0 + slope * slope).sqrt();
-                    let design_marginal = design_marginal.as_ref().ok_or_else(|| {
-                        EstimationError::InvalidInput(
-                            "bernoulli marginal-slope analytic gradient missing marginal design"
-                                .to_string(),
-                        )
-                    })?;
-                    let design_logslope_dense =
-                        design_logslope_dense.as_ref().ok_or_else(|| {
-                            EstimationError::InvalidInput(
-                                "bernoulli marginal-slope analytic gradient missing logslope design"
-                                    .to_string(),
-                            )
-                        })?;
+                    let mc = marginal_chunk.as_ref().unwrap();
+                    let lc = logslope_chunk.as_ref().unwrap();
+                    let li = i - chunk_start;
                     for j in 0..marginal_dim {
-                        row_grad[j] = c * design_marginal[[i, j]];
+                        row_grad[j] = c * mc[[li, j]];
                     }
                     let g_scale = q * slope * slope / c + slope * warped_z[i];
                     for j in 0..logslope_dim {
-                        row_grad[logslope_offset + j] = g_scale * design_logslope_dense[[i, j]];
+                        row_grad[logslope_offset + j] = g_scale * lc[[li, j]];
                     }
                 }
             }

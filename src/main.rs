@@ -46,7 +46,11 @@ use gam::inference::data::{
     load_datasetwith_schema as load_dataset_auto_with_schema,
 };
 use gam::inference::formula_dsl::{
-    CallArgSpec, FunctionCallSpec, parse_formula_dsl, parse_function_call,
+    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, SmoothKind,
+    effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
+    linkchoice_supports_joint_wiggle, linkname, option_bool, option_f64, option_usize,
+    option_usize_any, parse_formula, parse_link_choice, parse_linkwiggle_formulaspec,
+    parse_matching_auxiliary_formula, parse_surv_response, validate_auxiliary_formula_controls,
 };
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
@@ -306,6 +310,12 @@ struct FitArgs {
     /// `scale_dims=true` / `scale_dims=false`, which overrides this global flag.
     #[arg(long = "scale-dimensions", default_value_t = false)]
     scale_dimensions: bool,
+    /// Subsample size for pilot-fit spatial length-scale optimization.
+    /// When set and n exceeds 2x this value, κ/anisotropy optimization
+    /// runs on a spatially stratified subsample, then the full dataset
+    /// is fit with frozen geometry. Recommended: 5000-10000 for biobank data.
+    #[arg(long, value_name = "N")]
+    pilot_subsample_size: Option<usize>,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -356,6 +366,7 @@ struct SurvivalArgs {
     sigma_time_k: Option<usize>,
     sigma_time_degree: usize,
     scale_dimensions: bool,
+    pilot_subsample_size: Option<usize>,
     out: Option<PathBuf>,
     logslope_formula: Option<String>,
     z_column: Option<String>,
@@ -426,137 +437,9 @@ enum PredictModeArg {
 }
 
 #[derive(Clone, Debug)]
-struct LinkWiggleFormulaSpec {
-    degree: usize,
-    num_internal_knots: usize,
-    penalty_orders: Vec<usize>,
-    double_penalty: bool,
-}
-
-fn default_linkwiggle_formulaspec() -> LinkWiggleFormulaSpec {
-    LinkWiggleFormulaSpec {
-        degree: 3,
-        num_internal_knots: 10,
-        penalty_orders: vec![1, 2, 3],
-        double_penalty: true,
-    }
-}
-
-fn effectivelinkwiggle_formulaspec(
-    formula_linkwiggle: Option<&LinkWiggleFormulaSpec>,
-    link_choice: Option<&LinkChoice>,
-) -> Option<LinkWiggleFormulaSpec> {
-    formula_linkwiggle.cloned().or_else(|| {
-        link_choice.and_then(|choice| {
-            if matches!(choice.mode, LinkMode::Flexible) {
-                Some(default_linkwiggle_formulaspec())
-            } else {
-                None
-            }
-        })
-    })
-}
-
-fn linkname_supports_joint_wiggle(link: LinkFunction) -> bool {
-    !matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic)
-}
-
-fn linkchoice_supports_joint_wiggle(choice: &LinkChoice) -> bool {
-    choice.mixture_components.is_none() && linkname_supports_joint_wiggle(choice.link)
-}
-
-fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
-    matches!(
-        link,
-        InverseLink::Standard(LinkFunction::Identity)
-            | InverseLink::Standard(LinkFunction::Log)
-            | InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
-    )
-}
-
-#[derive(Clone, Debug)]
-struct LinkFormulaSpec {
-    link: String,
-    mixture_rho: Option<String>,
-    sas_init: Option<String>,
-    beta_logistic_init: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct SurvivalFormulaSpec {
-    spec: Option<String>,
-    survival_distribution: Option<String>,
-}
 
 const MODEL_VERSION: u32 = 2;
 
-#[derive(Clone, Debug)]
-struct ParsedFormula {
-    response: String,
-    terms: Vec<ParsedTerm>,
-    linkwiggle: Option<LinkWiggleFormulaSpec>,
-    timewiggle: Option<LinkWiggleFormulaSpec>,
-    linkspec: Option<LinkFormulaSpec>,
-    survivalspec: Option<SurvivalFormulaSpec>,
-}
-
-#[derive(Clone, Debug)]
-enum ParsedTerm {
-    Linear {
-        name: String,
-        explicit: bool,
-        coefficient_min: Option<f64>,
-        coefficient_max: Option<f64>,
-    },
-    BoundedLinear {
-        name: String,
-        min: f64,
-        max: f64,
-        prior: BoundedCoefficientPriorSpec,
-    },
-    RandomEffect {
-        name: String,
-    },
-    Smooth {
-        label: String,
-        vars: Vec<String>,
-        kind: SmoothKind,
-        options: BTreeMap<String, String>,
-    },
-    LinkWiggle {
-        options: BTreeMap<String, String>,
-    },
-    TimeWiggle {
-        options: BTreeMap<String, String>,
-    },
-    LinkConfig {
-        options: BTreeMap<String, String>,
-    },
-    SurvivalConfig {
-        options: BTreeMap<String, String>,
-    },
-}
-
-#[derive(Clone, Copy, Debug)]
-enum SmoothKind {
-    S,
-    Te,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum LinkMode {
-    Strict,
-    Flexible,
-}
-
-#[derive(Clone, Debug)]
-struct LinkChoice {
-    mode: LinkMode,
-    link: LinkFunction,
-    mixture_components: Option<Vec<LinkComponent>>,
-}
 
 struct CliFirthValidation<'a> {
     enabled: bool,
@@ -699,6 +582,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             sigma_time_k: args.sigma_time_k,
             sigma_time_degree: args.sigma_time_degree,
             scale_dimensions: args.scale_dimensions,
+            pilot_subsample_size: args.pilot_subsample_size,
             out: args.out.clone(),
             logslope_formula: args.logslope_formula.clone(),
             z_column: args.z_column.clone(),
@@ -959,6 +843,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if args.scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
+    let kappa_options = {
+        let mut opts = SpatialLengthScaleOptimizationOptions::default();
+        if let Some(m) = args.pilot_subsample_size {
+            opts.pilot_subsample_size = Some(m);
+        }
+        opts
+    };
     let route_flexible_through_standard = link_choice.as_ref().is_some_and(|choice| {
         matches!(choice.mode, LinkMode::Flexible) && choice.mixture_components.is_none()
     });
@@ -1119,7 +1010,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             spec: spec.clone(),
             family,
             options: base_fit_options,
-            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            kappa_options: kappa_options.clone(),
             wiggle: standard_wiggle,
             wiggle_options: if learn_linkwiggle
                 && args.predict_noise.is_none()
@@ -1353,7 +1244,7 @@ fn run_fit_bernoulli_marginal_slope(
                 quadrature_points: 20,
             },
             options,
-            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            kappa_options: kappa_options.clone(),
         },
     )) {
         Ok(FitResult::BernoulliMarginalSlope(result)) => result,
@@ -1459,7 +1350,7 @@ fn run_fit_transformation_normal(
             covariate_spec: covariate_spec.clone(),
             config,
             options,
-            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            kappa_options: kappa_options.clone(),
             warm_start: None,
         },
     )) {
@@ -1577,7 +1468,7 @@ fn run_fitwith_predict_noise(
                     double_penalty: cfg.double_penalty,
                 }),
                 options,
-                kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+                kappa_options: kappa_options.clone(),
             },
         )) {
             Ok(FitResult::GaussianLocationScale(result)) => result,
@@ -1749,7 +1640,7 @@ fn run_fitwith_predict_noise(
                 double_penalty: cfg.double_penalty,
             }),
             options,
-            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            kappa_options: kappa_options.clone(),
         },
     )) {
         Ok(FitResult::BinomialLocationScale(result)) => result,
@@ -5046,7 +4937,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             SurvivalCovariateTermBlockTemplate::Static
         };
 
-        let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+        let kappa_options = {
+            let mut opts = SpatialLengthScaleOptimizationOptions::default();
+            if let Some(m) = args.pilot_subsample_size {
+                opts.pilot_subsample_size = Some(m);
+            }
+            opts
+        };
         let buildtermspec = |inverse_link: InverseLink| -> SurvivalLocationScaleTermSpec {
             SurvivalLocationScaleTermSpec {
                 age_entry: age_entry.clone(),
@@ -5293,7 +5190,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             },
             logslopespec,
         };
-        let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+        let kappa_options = {
+            let mut opts = SpatialLengthScaleOptimizationOptions::default();
+            if let Some(m) = args.pilot_subsample_size {
+                opts.pilot_subsample_size = Some(m);
+            }
+            opts
+        };
         let options = gam::families::custom_family::BlockwiseFitOptions {
             compute_covariance: true,
             ..Default::default()
@@ -8230,101 +8133,6 @@ fn write_payload_json(path: &Path, payload: FittedModelPayload) -> Result<(), St
     write_model_json(path, &model)
 }
 
-fn formula_rhs_text(formula: &str) -> Result<String, String> {
-    let parsed = parse_formula_dsl(formula)?;
-    if parsed.rhs_terms.is_empty() {
-        return Err("formula right-hand side cannot be empty".to_string());
-    }
-    Ok(parsed.rhs_terms.join(" + "))
-}
-
-fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>, String> {
-    let trimmed = lhs.trim();
-    let call = match parse_function_call(trimmed) {
-        Ok(call) => call,
-        Err(_) => return Ok(None),
-    };
-    if !call.name.eq_ignore_ascii_case("surv") {
-        return Ok(None);
-    }
-    let vars = call
-        .args
-        .iter()
-        .filter_map(|arg| match arg {
-            CallArgSpec::Positional(v) => Some(v.trim().to_string()),
-            CallArgSpec::Named { .. } => None,
-        })
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-    if vars.len() != 3 {
-        return Err(format!(
-            "Surv(...) expects exactly three columns: Surv(entry, exit, event); got {}",
-            vars.len()
-        ));
-    }
-    Ok(Some((vars[0].clone(), vars[1].clone(), vars[2].clone())))
-}
-
-fn normalizenoise_formula(noise: &str, response: &str) -> String {
-    if noise.contains('~') {
-        noise.to_string()
-    } else {
-        format!("{response} ~ {noise}")
-    }
-}
-
-fn parse_matching_auxiliary_formula(
-    formula: &str,
-    response: &str,
-    flag_name: &str,
-) -> Result<(String, ParsedFormula), String> {
-    let normalized_formula = normalizenoise_formula(formula, response);
-    let parsed_formula = parse_formula(&normalized_formula)?;
-    let responses_match = if parsed_formula.response == response {
-        true
-    } else {
-        match (
-            parse_surv_response(response)?,
-            parse_surv_response(&parsed_formula.response)?,
-        ) {
-            (Some(expected), Some(actual)) => expected == actual,
-            _ => false,
-        }
-    };
-    if !responses_match {
-        return Err(format!(
-            "{flag_name} must use the same response expression as the main formula"
-        ));
-    }
-    Ok((normalized_formula, parsed_formula))
-}
-
-fn validate_auxiliary_formula_controls(
-    parsed_formula: &ParsedFormula,
-    flag_name: &str,
-) -> Result<(), String> {
-    if parsed_formula.linkwiggle.is_some() {
-        return Err(format!(
-            "linkwiggle(...) is only supported in the main formula, not {flag_name}"
-        ));
-    }
-    if parsed_formula.timewiggle.is_some() {
-        return Err(format!(
-            "timewiggle(...) is only supported in the main survival formula, not {flag_name}"
-        ));
-    }
-    if parsed_formula.linkspec.is_some() {
-        return Err(format!(
-            "link(...) is only supported in the main formula, not {flag_name}"
-        ));
-    }
-    if parsed_formula.survivalspec.is_some() {
-        return Err(format!(
-            "survmodel(...) is only supported in the main survival formula, not {flag_name}"
-        ));
-    }
-    Ok(())
-}
 
 fn print_inference_summary(notes: &[String]) {
     if notes.is_empty() {
@@ -8344,593 +8152,6 @@ fn load_datasetwith_schema(path: &Path, schema: &DataSchema) -> Result<Dataset, 
     load_dataset_auto_with_schema(path, schema, UnseenCategoryPolicy::Error)
 }
 
-fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
-    let parsed_dsl = parse_formula_dsl(formula)?;
-    let lhs = parsed_dsl.response_expr.trim();
-    if lhs.is_empty() {
-        return Err("formula response (left-hand side) cannot be empty".to_string());
-    }
-    let mut terms = Vec::<ParsedTerm>::new();
-    let mut linkwiggle: Option<LinkWiggleFormulaSpec> = None;
-    let mut timewiggle: Option<LinkWiggleFormulaSpec> = None;
-    let mut linkspec: Option<LinkFormulaSpec> = None;
-    let mut survivalspec: Option<SurvivalFormulaSpec> = None;
-    for raw in parsed_dsl.rhs_terms {
-        let t = raw.trim();
-        if t.is_empty() || t == "1" {
-            continue;
-        }
-        if t == "0" || t == "-1" {
-            return Err(
-                "formula terms '0'/'-1' (intercept removal) are not supported yet".to_string(),
-            );
-        }
-        match parse_term(t)? {
-            ParsedTerm::LinkWiggle { options } => {
-                if linkwiggle.is_some() {
-                    return Err("formula can include at most one linkwiggle(...) term".to_string());
-                }
-                linkwiggle = Some(parse_linkwiggle_formulaspec(&options, t)?);
-            }
-            ParsedTerm::TimeWiggle { options } => {
-                if timewiggle.is_some() {
-                    return Err("formula can include at most one timewiggle(...) term".to_string());
-                }
-                timewiggle = Some(parse_linkwiggle_formulaspec(&options, t)?);
-            }
-            ParsedTerm::LinkConfig { options } => {
-                if linkspec.is_some() {
-                    return Err("formula can include at most one link(...) term".to_string());
-                }
-                linkspec = Some(parse_link_formulaspec(&options, t)?);
-            }
-            ParsedTerm::SurvivalConfig { options } => {
-                if survivalspec.is_some() {
-                    return Err("formula can include at most one survmodel(...) term".to_string());
-                }
-                survivalspec = Some(parse_survival_formulaspec(&options, t)?);
-            }
-            other => terms.push(other),
-        }
-    }
-
-    Ok(ParsedFormula {
-        response: lhs.to_string(),
-        terms,
-        linkwiggle,
-        timewiggle,
-        linkspec,
-        survivalspec,
-    })
-}
-
-fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
-    fn split_call_args(call: &FunctionCallSpec) -> (Vec<String>, BTreeMap<String, String>) {
-        let mut vars = Vec::<String>::new();
-        let mut options = BTreeMap::<String, String>::new();
-        for arg in &call.args {
-            match arg {
-                CallArgSpec::Positional(v) => vars.push(v.trim().to_string()),
-                CallArgSpec::Named { key, value } => {
-                    options.insert(key.to_ascii_lowercase(), strip_quotes(value).to_string());
-                }
-            }
-        }
-        (vars, options)
-    }
-
-    let call = parse_function_call(raw).ok();
-    if let Some(call) = call {
-        let name = call.name.to_ascii_lowercase();
-        let (vars, mut options) = split_call_args(&call);
-        match name.as_str() {
-            "constrain" | "constraint" | "box" => {
-                if vars.len() != 1 {
-                    return Err(format!(
-                        "constrain()/constraint()/box() expects exactly one variable: {raw}"
-                    ));
-                }
-                let (coefficient_min, coefficient_max) =
-                    parse_linear_constraint_bounds(&options, raw)?;
-                if coefficient_min.is_none() && coefficient_max.is_none() {
-                    return Err(format!(
-                        "constrain()/constraint()/box() requires at least one of min/lower/max/upper: {raw}"
-                    ));
-                }
-                return Ok(ParsedTerm::Linear {
-                    name: vars[0].clone(),
-                    explicit: true,
-                    coefficient_min,
-                    coefficient_max,
-                });
-            }
-            "nonnegative" | "nonnegative_coef" => {
-                if vars.len() != 1 {
-                    return Err(format!("nonnegative() expects exactly one variable: {raw}"));
-                }
-                return Ok(ParsedTerm::Linear {
-                    name: vars[0].clone(),
-                    explicit: true,
-                    coefficient_min: Some(0.0),
-                    coefficient_max: None,
-                });
-            }
-            "nonpositive" | "nonpositive_coef" => {
-                if vars.len() != 1 {
-                    return Err(format!("nonpositive() expects exactly one variable: {raw}"));
-                }
-                return Ok(ParsedTerm::Linear {
-                    name: vars[0].clone(),
-                    explicit: true,
-                    coefficient_min: None,
-                    coefficient_max: Some(0.0),
-                });
-            }
-            "bounded" => {
-                if vars.len() != 1 {
-                    return Err(format!("bounded() expects exactly one variable: {raw}"));
-                }
-                let min = parse_required_f64_option(&options, "min", raw)?;
-                let max = parse_required_f64_option(&options, "max", raw)?;
-                if !min.is_finite() || !max.is_finite() || min >= max {
-                    return Err(format!(
-                        "bounded() requires finite min < max, got min={min}, max={max}: {raw}"
-                    ));
-                }
-                let prior = parse_bounded_priorspec(&options, min, max, raw)?;
-                return Ok(ParsedTerm::BoundedLinear {
-                    name: vars[0].clone(),
-                    min,
-                    max,
-                    prior,
-                });
-            }
-            "group" | "re" => {
-                if vars.len() != 1 {
-                    return Err(format!(
-                        "group()/re() expects exactly one variable, got '{}': {raw}",
-                        vars.join(",")
-                    ));
-                }
-                return Ok(ParsedTerm::RandomEffect {
-                    name: vars[0].clone(),
-                });
-            }
-            "tensor" | "interaction" | "te" => {
-                if vars.len() < 2 {
-                    return Err(format!(
-                        "tensor()/interaction()/te() requires at least two variables: {raw}"
-                    ));
-                }
-                return Ok(ParsedTerm::Smooth {
-                    label: raw.to_string(),
-                    vars,
-                    kind: SmoothKind::Te,
-                    options,
-                });
-            }
-            "thinplate" | "thin_plate" | "tps" => {
-                if vars.len() < 2 {
-                    return Err(format!(
-                        "thinplate()/thin_plate()/tps() requires at least two variables: {raw}"
-                    ));
-                }
-                options.insert("type".to_string(), "tps".to_string());
-                return Ok(ParsedTerm::Smooth {
-                    label: raw.to_string(),
-                    vars,
-                    kind: SmoothKind::S,
-                    options,
-                });
-            }
-            "smooth" | "s" => {
-                if vars.is_empty() {
-                    return Err(format!(
-                        "smooth()/s() requires at least one variable: {raw}"
-                    ));
-                }
-                return Ok(ParsedTerm::Smooth {
-                    label: raw.to_string(),
-                    vars,
-                    kind: SmoothKind::S,
-                    options,
-                });
-            }
-            "matern" => {
-                if vars.is_empty() {
-                    return Err(format!("matern() requires at least one variable: {raw}"));
-                }
-                options.insert("type".to_string(), "matern".to_string());
-                return Ok(ParsedTerm::Smooth {
-                    label: raw.to_string(),
-                    vars,
-                    kind: SmoothKind::S,
-                    options,
-                });
-            }
-            "duchon" => {
-                if vars.is_empty() {
-                    return Err(format!("duchon() requires at least one variable: {raw}"));
-                }
-                options.insert("type".to_string(), "duchon".to_string());
-                return Ok(ParsedTerm::Smooth {
-                    label: raw.to_string(),
-                    vars,
-                    kind: SmoothKind::S,
-                    options,
-                });
-            }
-            "linkwiggle" => {
-                if !vars.is_empty() {
-                    return Err(format!(
-                        "linkwiggle() takes named options only; positional args are not supported: {raw}"
-                    ));
-                }
-                return Ok(ParsedTerm::LinkWiggle { options });
-            }
-            "timewiggle" => {
-                if !vars.is_empty() {
-                    return Err(format!(
-                        "timewiggle() takes named options only; positional args are not supported: {raw}"
-                    ));
-                }
-                return Ok(ParsedTerm::TimeWiggle { options });
-            }
-            "link" => {
-                if !vars.is_empty() {
-                    return Err(format!(
-                        "link() takes named options only; positional args are not supported: {raw}"
-                    ));
-                }
-                return Ok(ParsedTerm::LinkConfig { options });
-            }
-            "survmodel" => {
-                if !vars.is_empty() {
-                    return Err(format!(
-                        "survmodel() takes named options only; positional args are not supported: {raw}"
-                    ));
-                }
-                return Ok(ParsedTerm::SurvivalConfig { options });
-            }
-            "linear" => {
-                if vars.len() != 1 {
-                    return Err(format!("linear() expects exactly one variable: {raw}"));
-                }
-                let (coefficient_min, coefficient_max) =
-                    parse_linear_constraint_bounds(&options, raw)?;
-                return Ok(ParsedTerm::Linear {
-                    name: vars[0].clone(),
-                    explicit: true,
-                    coefficient_min,
-                    coefficient_max,
-                });
-            }
-            _ => {
-                return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
-                ));
-            }
-        }
-    }
-
-    Ok(ParsedTerm::Linear {
-        name: raw.trim().to_string(),
-        explicit: false,
-        coefficient_min: None,
-        coefficient_max: None,
-    })
-}
-
-fn parse_linear_constraint_bounds(
-    options: &BTreeMap<String, String>,
-    raw: &str,
-) -> Result<(Option<f64>, Option<f64>), String> {
-    let min = parse_optional_f64_option_alias(options, &["min", "lower"], raw, "linear")?;
-    let max = parse_optional_f64_option_alias(options, &["max", "upper"], raw, "linear")?;
-    if let (Some(min), Some(max)) = (min, max)
-        && (!min.is_finite() || !max.is_finite() || min > max)
-    {
-        return Err(format!(
-            "linear coefficient constraints require finite min <= max, got min={min}, max={max}: {raw}"
-        ));
-    }
-    Ok((min, max))
-}
-
-fn parse_required_f64_option(
-    options: &BTreeMap<String, String>,
-    key: &str,
-    raw: &str,
-) -> Result<f64, String> {
-    let value = options
-        .get(key)
-        .ok_or_else(|| format!("bounded() is missing required '{key}' argument: {raw}"))?;
-    value.parse::<f64>().map_err(|_| {
-        format!(
-            "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
-            value
-        )
-    })
-}
-
-fn parse_optional_f64_option(
-    options: &BTreeMap<String, String>,
-    key: &str,
-    raw: &str,
-) -> Result<Option<f64>, String> {
-    match options.get(key) {
-        Some(value) => value.parse::<f64>().map(Some).map_err(|_| {
-            format!(
-                "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
-                value
-            )
-        }),
-        None => Ok(None),
-    }
-}
-
-fn parse_optional_f64_option_alias(
-    options: &BTreeMap<String, String>,
-    keys: &[&str],
-    raw: &str,
-    fn_label: &str,
-) -> Result<Option<f64>, String> {
-    let mut found: Option<(&str, f64)> = None;
-    for key in keys {
-        if let Some(value) = options.get(*key) {
-            let parsed = value.parse::<f64>().map_err(|_| {
-                format!(
-                    "{fn_label}() argument '{key}' must be a finite number, got '{}': {raw}",
-                    value
-                )
-            })?;
-            if found.is_some() {
-                return Err(format!(
-                    "{fn_label}() cannot specify both '{}' and '{}': {raw}",
-                    found.expect("present").0,
-                    key
-                ));
-            }
-            found = Some((key, parsed));
-        }
-    }
-    Ok(found.map(|(_, v)| v))
-}
-
-fn parse_linkwiggle_penalty_orders(raw: Option<&str>) -> Result<Vec<usize>, String> {
-    let Some(raw) = raw.map(str::trim) else {
-        return Ok(vec![1, 2, 3]);
-    };
-    if raw.is_empty() {
-        return Ok(vec![1, 2, 3]);
-    }
-    let mut out = Vec::<usize>::new();
-    for token in raw.split(',') {
-        let t = token.trim().to_ascii_lowercase();
-        if t.is_empty() {
-            continue;
-        }
-        match t.as_str() {
-            "all" => {
-                out.extend([1, 2, 3]);
-            }
-            "slope" | "1" => out.push(1),
-            "curvature" | "2" => out.push(2),
-            "curvature-change" | "curvature_change" | "3" => out.push(3),
-            _ => {
-                return Err(format!(
-                    "invalid linkwiggle penalty_order '{t}'; use all|slope|curvature|curvature-change or 1/2/3"
-                ));
-            }
-        }
-    }
-    if out.is_empty() {
-        out.extend([1, 2, 3]);
-    }
-    out.sort_unstable();
-    out.dedup();
-    Ok(out)
-}
-
-fn parse_linkwiggle_formulaspec(
-    options: &BTreeMap<String, String>,
-    raw: &str,
-) -> Result<LinkWiggleFormulaSpec, String> {
-    let degree = option_usize(options, "degree").unwrap_or(3);
-    if degree < 1 {
-        return Err(format!("linkwiggle() requires degree >= 1: {raw}"));
-    }
-    let num_internal_knots = option_usize(options, "internal_knots").unwrap_or(7);
-    if num_internal_knots == 0 {
-        return Err(format!("linkwiggle() requires internal_knots > 0: {raw}"));
-    }
-    let penalty_orders =
-        parse_linkwiggle_penalty_orders(options.get("penalty_order").map(String::as_str))?;
-    let double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
-    Ok(LinkWiggleFormulaSpec {
-        degree,
-        num_internal_knots,
-        penalty_orders,
-        double_penalty,
-    })
-}
-
-fn augmentwiggle_penaltieswith_orders(
-    block: &mut ParameterBlockInput,
-    penalty_orders: &[usize],
-) -> Result<(), String> {
-    let p = block.design.ncols();
-    if p == 0 {
-        return Ok(());
-    }
-    for &ord in penalty_orders {
-        if ord <= 1 {
-            continue;
-        }
-        if ord >= p {
-            continue;
-        }
-        let s = create_difference_penalty_matrix(p, ord, None).map_err(|e| e.to_string())?;
-        block.penalties.push(s);
-    }
-    Ok(())
-}
-
-fn parse_link_formulaspec(
-    options: &BTreeMap<String, String>,
-    raw: &str,
-) -> Result<LinkFormulaSpec, String> {
-    let link = options
-        .get("type")
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| format!("link() requires type=<link-name>: {raw}"))?;
-    if link.is_empty() {
-        return Err(format!("link() requires a non-empty type: {raw}"));
-    }
-    let mixture_rho = options.get("rho").map(|s| s.trim().to_string());
-    let sas_init = options.get("sas_init").map(|s| s.trim().to_string());
-    let beta_logistic_init = options
-        .get("beta_logistic_init")
-        .map(|s| s.trim().to_string());
-    Ok(LinkFormulaSpec {
-        link,
-        mixture_rho,
-        sas_init,
-        beta_logistic_init,
-    })
-}
-
-fn parse_survival_formulaspec(
-    options: &BTreeMap<String, String>,
-    raw: &str,
-) -> Result<SurvivalFormulaSpec, String> {
-    if options.is_empty() {
-        return Err(format!(
-            "survmodel() requires at least one named option (e.g., spec=..., distribution=...): {raw}"
-        ));
-    }
-    Ok(SurvivalFormulaSpec {
-        spec: options.get("spec").map(|s| s.trim().to_string()),
-        survival_distribution: options.get("distribution").map(|s| s.trim().to_string()),
-    })
-}
-
-fn parse_bounded_priorspec(
-    options: &BTreeMap<String, String>,
-    min: f64,
-    max: f64,
-    raw: &str,
-) -> Result<BoundedCoefficientPriorSpec, String> {
-    let prior_mode = options.get("prior").map(|s| s.to_ascii_lowercase());
-    let pull = options.get("pull").map(|s| s.to_ascii_lowercase());
-    let beta_a = parse_optional_f64_option(options, "beta_a", raw)?;
-    let beta_b = parse_optional_f64_option(options, "beta_b", raw)?;
-    let target = parse_optional_f64_option(options, "target", raw)?;
-    let strength = parse_optional_f64_option(options, "strength", raw)?;
-
-    let explicit_beta = beta_a.is_some() || beta_b.is_some();
-    let target_mode = target.is_some() || strength.is_some();
-    if prior_mode.is_some() && pull.is_some() {
-        return Err(format!(
-            "bounded() cannot combine prior=... with pull=...: {raw}"
-        ));
-    }
-    if prior_mode.is_some() && explicit_beta {
-        return Err(format!(
-            "bounded() cannot combine prior=... with beta_a/beta_b: {raw}"
-        ));
-    }
-    if prior_mode.is_some() && target_mode {
-        return Err(format!(
-            "bounded() cannot combine prior=... with target/strength: {raw}"
-        ));
-    }
-    if pull.is_some() && explicit_beta {
-        return Err(format!(
-            "bounded() cannot combine pull=... with beta_a/beta_b: {raw}"
-        ));
-    }
-    if pull.is_some() && target_mode {
-        return Err(format!(
-            "bounded() cannot combine pull=... with target/strength: {raw}"
-        ));
-    }
-    if explicit_beta && target_mode {
-        return Err(format!(
-            "bounded() cannot combine beta_a/beta_b with target/strength: {raw}"
-        ));
-    }
-
-    if let Some(priorname) = prior_mode {
-        return match priorname.as_str() {
-            "none" => Ok(BoundedCoefficientPriorSpec::None),
-            "uniform" | "log-jacobian" | "log_jacobian" | "jacobian" => {
-                Ok(BoundedCoefficientPriorSpec::Uniform)
-            }
-            "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
-            _ => Err(format!(
-                "bounded() prior must currently be one of none|uniform|log-jacobian|center, got '{}': {raw}",
-                priorname
-            )),
-        };
-    }
-
-    if let Some(pull_mode) = pull {
-        return match pull_mode.as_str() {
-            "uniform" | "log-jacobian" | "log_jacobian" | "jacobian" => {
-                Ok(BoundedCoefficientPriorSpec::Uniform)
-            }
-            "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
-            _ => Err(format!(
-                "bounded() pull must currently be 'uniform'/'log-jacobian' or 'center', got '{}': {raw}",
-                pull_mode
-            )),
-        };
-    }
-
-    if explicit_beta {
-        let a = beta_a.ok_or_else(|| format!("bounded() beta_a is required with beta_b: {raw}"))?;
-        let b = beta_b.ok_or_else(|| format!("bounded() beta_b is required with beta_a: {raw}"))?;
-        if !a.is_finite() || !b.is_finite() || a < 1.0 || b < 1.0 {
-            return Err(format!(
-                "bounded() beta_a and beta_b must be finite and >= 1: {raw}"
-            ));
-        }
-        return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
-    }
-
-    if target_mode {
-        let targetvalue =
-            target.ok_or_else(|| format!("bounded() target is required with strength: {raw}"))?;
-        let strengthvalue =
-            strength.ok_or_else(|| format!("bounded() strength is required with target: {raw}"))?;
-        if !(min < targetvalue && targetvalue < max) {
-            return Err(format!(
-                "bounded() target must lie strictly inside ({min}, {max}): {raw}"
-            ));
-        }
-        if !strengthvalue.is_finite() || strengthvalue <= 0.0 {
-            return Err(format!("bounded() strength must be finite and > 0: {raw}"));
-        }
-        let z = (targetvalue - min) / (max - min);
-        let a = 1.0 + strengthvalue * z;
-        let b = 1.0 + strengthvalue * (1.0 - z);
-        return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
-    }
-
-    Ok(BoundedCoefficientPriorSpec::None)
-}
-
-fn strip_quotes(v: &str) -> &str {
-    let b = v.as_bytes();
-    if b.len() >= 2
-        && ((b[0] == b'\'' && b[b.len() - 1] == b'\'') || (b[0] == b'"' && b[b.len() - 1] == b'"'))
-    {
-        &v[1..v.len() - 1]
-    } else {
-        v
-    }
-}
 
 fn spatial_center_strategy_for_dimension(num_centers: usize, d: usize) -> CenterStrategy {
     // For d >= 4, recursive bisection along the widest axis (EqualMass) gives
@@ -9319,19 +8540,6 @@ fn resolve_col(col_map: &HashMap<String, usize>, name: &str) -> Result<usize, St
         .ok_or_else(|| format!("column '{name}' not found in data"))
 }
 
-fn option_usize(map: &BTreeMap<String, String>, key: &str) -> Option<usize> {
-    map.get(key).and_then(|v| v.parse::<usize>().ok())
-}
-
-fn option_usize_any(map: &BTreeMap<String, String>, keys: &[&str]) -> Option<usize> {
-    for key in keys {
-        if let Some(v) = option_usize(map, key) {
-            return Some(v);
-        }
-    }
-    None
-}
-
 fn parse_ps_internal_knots(
     options: &BTreeMap<String, String>,
     degree: usize,
@@ -9376,19 +8584,6 @@ fn parse_countwith_basis_alias(
         ));
     }
     Ok(primary.or(basis_dim).unwrap_or(default_count))
-}
-
-fn option_f64(map: &BTreeMap<String, String>, key: &str) -> Option<f64> {
-    map.get(key).and_then(|v| v.parse::<f64>().ok())
-}
-
-fn option_bool(map: &BTreeMap<String, String>, key: &str) -> Option<bool> {
-    map.get(key)
-        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "y" => Some(true),
-            "false" | "0" | "no" | "n" => Some(false),
-            _ => None,
-        })
 }
 
 fn parse_matern_identifiability(
@@ -9626,119 +8821,6 @@ fn family_from_arg(arg: FamilyArg) -> Option<LikelihoodFamily> {
     }
 }
 
-fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<LinkChoice>, String> {
-    if raw.is_none() && !flexible_flag {
-        return Ok(None);
-    }
-    let Some(v) = raw else {
-        return Ok(Some(LinkChoice {
-            mode: LinkMode::Flexible,
-            link: LinkFunction::Logit,
-            mixture_components: None,
-        }));
-    };
-    let t = v.trim().to_ascii_lowercase();
-    if let Some(inner) = t
-        .strip_prefix("flexible(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        if let Some(components_inner) = inner
-            .strip_prefix("blended(")
-            .and_then(|s| s.strip_suffix(')'))
-            .or_else(|| {
-                inner
-                    .strip_prefix("mixture(")
-                    .and_then(|s| s.strip_suffix(')'))
-            })
-        {
-            parse_link_component_list(components_inner)?;
-            return Err(
-                "flexible(...) does not support blended(...)/mixture(...) links; wiggle is only supported for jointly fit standard links"
-                    .to_string(),
-            );
-        }
-        let link = parse_linkname(inner)?;
-        if !linkname_supports_joint_wiggle(link) {
-            return Err(
-                "flexible(...) does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
-                    .to_string(),
-            );
-        }
-        return Ok(Some(LinkChoice {
-            mode: LinkMode::Flexible,
-            link,
-            mixture_components: None,
-        }));
-    }
-    if let Some(inner) = t
-        .strip_prefix("blended(")
-        .and_then(|s| s.strip_suffix(')'))
-        .or_else(|| t.strip_prefix("mixture(").and_then(|s| s.strip_suffix(')')))
-    {
-        if flexible_flag {
-            return Err(
-                    "--flexible-link cannot be combined with --link blended(...)/mixture(...); blended inverse links are not flexible-link mode"
-                        .to_string(),
-            );
-        }
-        let components = parse_link_component_list(inner)?;
-        return Ok(Some(LinkChoice {
-            mode: LinkMode::Strict,
-            link: LinkFunction::Logit,
-            mixture_components: Some(components),
-        }));
-    }
-
-    let link = parse_linkname(&t)?;
-    if flexible_flag && !linkname_supports_joint_wiggle(link) {
-        return Err(
-            "--flexible-link does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
-                .to_string(),
-        );
-    }
-    Ok(Some(LinkChoice {
-        mode: if flexible_flag {
-            LinkMode::Flexible
-        } else {
-            LinkMode::Strict
-        },
-        link,
-        mixture_components: None,
-    }))
-}
-
-fn parse_link_component(v: &str) -> Result<LinkComponent, String> {
-    match v.trim() {
-        "logit" => Ok(LinkComponent::Logit),
-        "probit" => Ok(LinkComponent::Probit),
-        "cloglog" => Ok(LinkComponent::CLogLog),
-        "loglog" => Ok(LinkComponent::LogLog),
-        "cauchit" => Ok(LinkComponent::Cauchit),
-        other => Err(format!(
-            "unsupported blended-link component '{other}'; use probit|logit|cloglog|loglog|cauchit"
-        )),
-    }
-}
-
-fn parse_link_component_list(v: &str) -> Result<Vec<LinkComponent>, String> {
-    let mut out = Vec::new();
-    for part in v.split(',') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let comp = parse_link_component(trimmed)?;
-        if out.contains(&comp) {
-            return Err("blended(...) cannot contain duplicate components".to_string());
-        }
-        out.push(comp);
-    }
-    if out.len() < 2 {
-        return Err("blended(...) requires at least two components".to_string());
-    }
-    Ok(out)
-}
-
 fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
     let mut out = Vec::new();
     for part in v.split(',') {
@@ -9755,33 +8837,6 @@ fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
         out.push(parsed);
     }
     Ok(out)
-}
-
-fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
-    match v.trim() {
-        "identity" => Ok(LinkFunction::Identity),
-        "log" => Ok(LinkFunction::Log),
-        "logit" | "binomial-logit" => Ok(LinkFunction::Logit),
-        "probit" | "binomial-probit" => Ok(LinkFunction::Probit),
-        "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
-        "sas" => Ok(LinkFunction::Sas),
-        "beta-logistic" => Ok(LinkFunction::BetaLogistic),
-        other => Err(format!(
-            "unsupported --link '{other}'; use identity|log|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
-        )),
-    }
-}
-
-fn linkname(link: LinkFunction) -> &'static str {
-    match link {
-        LinkFunction::Identity => "identity",
-        LinkFunction::Log => "log",
-        LinkFunction::Logit => "logit",
-        LinkFunction::Probit => "probit",
-        LinkFunction::CLogLog => "cloglog",
-        LinkFunction::Sas => "sas",
-        LinkFunction::BetaLogistic => "beta-logistic",
-    }
 }
 
 fn link_choice_to_string(choice: &LinkChoice) -> String {
@@ -11118,6 +10173,7 @@ mod tests {
             sigma_time_degree: 3,
             adaptive_regularization: false,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: Some(out),
         }
     }
@@ -11251,6 +10307,7 @@ mod tests {
             sigma_time_degree: 3,
             adaptive_regularization: false,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: Some(model_path.clone()),
         })
         .expect("survival predict-noise fit should succeed");
@@ -11339,6 +10396,7 @@ mod tests {
             sigma_time_degree: 3,
             adaptive_regularization: true,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: Some(model_path.clone()),
         };
         run_fit(fit_args).expect("fit should succeed");
@@ -11414,6 +10472,7 @@ mod tests {
             sigma_time_degree: 3,
             adaptive_regularization: false,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: Some(model_path.clone()),
         };
         run_fit(fit_args).expect("Firth fit should succeed");
@@ -12810,6 +11869,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12849,6 +11909,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13327,6 +12388,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13374,6 +12436,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13415,6 +12478,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13456,6 +12520,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13503,6 +12568,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13544,6 +12610,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13585,6 +12652,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13654,6 +12722,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13694,6 +12763,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13736,6 +12806,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -14096,6 +13167,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
+            pilot_subsample_size: None,
             out: Some(out_path.clone()),
             logslope_formula: None,
             z_column: None,
