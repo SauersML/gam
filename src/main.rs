@@ -3084,7 +3084,7 @@ fn run_predict_standard(
         .predictor()
         .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
     let pred_input = PredictInput {
-        design: DesignMatrix::Dense(Arc::new(design.design.clone())),
+        design: design.design.clone(),
         offset: offset.clone(),
         design_noise: None,
         offset_noise: None,
