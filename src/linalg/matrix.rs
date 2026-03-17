@@ -2014,6 +2014,56 @@ impl DesignOperator for TensorProductDesignOperator {
         Ok(xtwx)
     }
 
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.n {
+            return Err(format!(
+                "TensorProductDesignOperator::diag_gram: weights length {} != n {}",
+                weights.len(),
+                self.n
+            ));
+        }
+        // diag(X'WX)[j] = Σ_i w[i] · x_{ij}²
+        // For tensor product: x_{i, j₁·tail+j_tail} = B₁[i,j₁] · ∏_{d>1} Bᵈ[i,jᵈ]
+        // So: diag[j] = Σ_i w[i] · B₁[i,j₁]² · ∏_{d>1} Bᵈ[i,jᵈ]²
+        //
+        // O(n · ∏qⱼ) instead of O(n · (∏qⱼ)²) from the full gram.
+        let d = self.marginals.len();
+        if d == 0 {
+            return Ok(Array1::zeros(0));
+        }
+        let mut diag = vec![0.0_f64; self.total_cols];
+        let tail_dims: Vec<usize> = self.marginals[1..].iter().map(|m| m.ncols()).collect();
+        let tail_total: usize = tail_dims.iter().product();
+        let q0 = self.marginals[0].ncols();
+        let mut tail_indices = vec![0usize; tail_dims.len()];
+
+        for t_flat in 0..tail_total {
+            decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
+            for i in 0..self.n {
+                let wi = weights[i].max(0.0);
+                if wi == 0.0 {
+                    continue;
+                }
+                let mut tail_prod_sq = wi;
+                for (dim_idx, &ti) in tail_indices.iter().enumerate() {
+                    let val = self.marginals[dim_idx + 1][[i, ti]];
+                    tail_prod_sq *= val * val;
+                    if tail_prod_sq == 0.0 {
+                        break;
+                    }
+                }
+                if tail_prod_sq == 0.0 {
+                    continue;
+                }
+                for j1 in 0..q0 {
+                    let b1 = self.marginals[0][[i, j1]];
+                    diag[j1 * tail_total + t_flat] += tail_prod_sq * b1 * b1;
+                }
+            }
+        }
+        Ok(Array1::from_vec(diag))
+    }
+
     fn uses_matrix_free_pcg(&self) -> bool {
         true
     }
