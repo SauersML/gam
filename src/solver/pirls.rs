@@ -4370,6 +4370,10 @@ fn build_sparse_native_reparam_result(
     };
     // Derive full-width roots for ReparamResult (required by downstream consumers).
     let global_roots: Vec<Array2<f64>> = penalties.iter().map(|cp| cp.global_root()).collect();
+    let canonical_transformed: Vec<crate::construction::CanonicalPenalty> = global_roots
+        .iter()
+        .map(|r| crate::construction::CanonicalPenalty::from_dense_root(r.clone(), p))
+        .collect();
     ReparamResult {
         penalty_shrinkage_ridge: base.penalty_shrinkage_ridge,
         s_transformed: s_original,
@@ -4378,6 +4382,7 @@ fn build_sparse_native_reparam_result(
         qs: Array2::<f64>::eye(p),
         rs_transposed: global_roots.iter().map(|rs| rs.t().to_owned()).collect(),
         rs_transformed: global_roots,
+        canonical_transformed,
         e_transformed: stack_lambdaweighted_penalty_root_canonical(penalties, lambdas, p),
         u_truncated: u_original,
     }

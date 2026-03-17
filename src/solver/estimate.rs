@@ -80,6 +80,8 @@ pub enum PenaltySpec {
     Block {
         local: Array2<f64>,
         col_range: Range<usize>,
+        /// Optional structural hint for fast-path spectral decomposition.
+        structure_hint: Option<crate::terms::smooth::PenaltyStructureHint>,
     },
     /// Full dense penalty matrix (`p x p`).
     Dense(Array2<f64>),
@@ -98,11 +100,12 @@ impl PenaltySpec {
         }
     }
 
-    /// Convert from a `BlockwisePenalty` (lossless).
+    /// Convert from a `BlockwisePenalty`, preserving the structure hint.
     pub fn from_blockwise(bp: crate::terms::smooth::BlockwisePenalty) -> Self {
         PenaltySpec::Block {
             local: bp.local,
             col_range: bp.col_range,
+            structure_hint: bp.structure_hint,
         }
     }
 
@@ -110,6 +113,7 @@ impl PenaltySpec {
         PenaltySpec::Block {
             local: bp.local.clone(),
             col_range: bp.col_range.clone(),
+            structure_hint: bp.structure_hint.clone(),
         }
     }
 }
@@ -1376,7 +1380,7 @@ fn validate_penalty_specs(
 ) -> Result<(), EstimationError> {
     for (idx, spec) in specs.iter().enumerate() {
         match spec {
-            PenaltySpec::Block { local, col_range } => {
+            PenaltySpec::Block { local, col_range, .. } => {
                 let bd = col_range.len();
                 if local.nrows() != bd || local.ncols() != bd {
                     return Err(EstimationError::InvalidInput(format!(
@@ -4775,6 +4779,7 @@ mod fd_policy_tests {
             linear_constraints: None,
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];
@@ -4981,6 +4986,7 @@ mod fd_policy_tests {
             linear_constraints: None,
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];
@@ -5130,6 +5136,7 @@ mod fd_policy_tests {
             linear_constraints: None,
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
         };
 
         let theta = array![0.10, 0.12, -0.18];

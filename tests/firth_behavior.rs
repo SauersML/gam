@@ -154,6 +154,7 @@ fn firthfd_step_size_sensitivity() {
         linear_constraints: None,
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
+        kronecker_penalty_system: None,
     };
     let base_rho = 12.0;
     let cost_at = |rho: f64| -> f64 {
