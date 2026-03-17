@@ -4567,6 +4567,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         heuristic_lambdas: None,
         initial_rho: Some(initial_theta.clone()),
         fallback_policy: FallbackPolicy::Automatic,
+        screening_cap: None,
     };
 
     let mut obj = ClosureObjective {
@@ -8278,6 +8279,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
         fallback_policy: FallbackPolicy::Automatic,
+        screening_cap: None,
     };
 
     let mut obj = ClosureObjective {
@@ -8494,6 +8496,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
         fallback_policy: FallbackPolicy::Automatic,
+        screening_cap: None,
     };
 
     let mut obj = ClosureObjective {
@@ -9688,6 +9691,7 @@ where
         heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
         initial_rho: Some(theta0.clone()),
         fallback_policy: FallbackPolicy::Automatic,
+        screening_cap: None,
     };
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.

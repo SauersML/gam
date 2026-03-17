@@ -1020,6 +1020,9 @@ fn run_outer_with_plan(
         if let Some(cap) = config.screening_cap.as_ref() {
             cap.store(0, Ordering::Relaxed);
         }
+        // Reset after screening so cached partial-iteration results don't
+        // leak into the real optimizer.
+        obj.reset();
         log::info!(
             "[OUTER] {context}: screening done in {:.3}s",
             screen_start.elapsed().as_secs_f64(),

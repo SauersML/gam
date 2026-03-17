@@ -917,6 +917,13 @@ pub trait HyperOperator: Send + Sync {
     fn as_implicit(&self) -> Option<&ImplicitHyperOperator> {
         None
     }
+
+    /// If this operator is block-local (nonzero only in [start..end, start..end]),
+    /// returns the block range and local matrix. Enables O(p_block²) trace
+    /// computations instead of O(p²).
+    fn block_local_data(&self) -> Option<(&Array2<f64>, usize, usize)> {
+        None
+    }
 }
 
 /// Fixed-β Hessian drift payload for a single hyper coordinate.
@@ -967,6 +974,10 @@ impl HyperOperator for BlockLocalDrift {
 
     fn is_implicit(&self) -> bool {
         false
+    }
+
+    fn block_local_data(&self) -> Option<(&Array2<f64>, usize, usize)> {
+        Some((&self.local, self.start, self.end))
     }
 }
 
@@ -4919,6 +4930,24 @@ impl HessianOperator for SparseCholeskyOperator {
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+        if let Some(ref taka) = self.takahashi {
+            // For block-local operators: O(p_block²) trace via Takahashi block lookup
+            if let Some((local, start, end)) = op.block_local_data() {
+                let z_block = taka.block(start, end);
+                let mut trace = 0.0;
+                for i in 0..z_block.nrows() {
+                    for j in 0..z_block.ncols() {
+                        trace += z_block[[i, j]] * local[[i, j]];
+                    }
+                }
+                return trace;
+            }
+            // For other non-implicit operators: materialize and use Takahashi lookups
+            if !op.is_implicit() {
+                let dense = op.to_dense();
+                return self.trace_hinv_product(&dense);
+            }
+        }
         self.trace_hinv_operator_exact(op)
     }
 
@@ -5342,175 +5371,63 @@ pub fn compute_block_penalty_logdet_derivs(
     per_block_nullspace_dims: &[&[usize]],
     ridge: f64,
 ) -> Result<PenaltyLogdetDerivs, String> {
-    use faer::Side;
+    use super::penalty_logdet::PenaltyPseudologdet;
 
     let total_k: usize = per_block_rho.iter().map(|r| r.len()).sum();
     let mut log_det_total = 0.0;
     let mut first = Array1::zeros(total_k);
+    let mut second = Array2::zeros((total_k, total_k));
     let mut at = 0usize;
 
     for (b, block_rho) in per_block_rho.iter().enumerate() {
         let penalties = per_block_penalties[b];
-        if penalties.is_empty() || block_rho.is_empty() {
-            continue;
-        }
-        let p = penalties[0].nrows();
-        let lambdas = block_rho.mapv(f64::exp);
-
-        // S_b = Σ λ_k S_k
-        let mut s_block = Array2::zeros((p, p));
-        for (k, s_k) in penalties.iter().enumerate() {
-            s_block.scaled_add(lambdas[k], s_k);
-        }
-
-        // Add ridge for logdet stability.
-        if ridge > 0.0 {
-            for d in 0..p {
-                s_block[[d, d]] += ridge;
-            }
-        }
-
-        // Eigendecomposition of S_b.
-        let (eigs, vecs) = s_block
-            .eigh(Side::Lower)
-            .map_err(|e| format!("penalty logdet eigendecomposition failed for block {b}: {e}"))?;
-
-        // Determine rank of S_b. If structural nullspace dimensions are provided,
-        // compute the intersection nullity: nullity(Σ λ_k S_k) = dim(∩_k N(S_k)).
-        // The rank is then p − intersection_nullity.
-        // If no structural info, fall back to eigenvalue-based detection.
-        let block_nullspace_dims = if b < per_block_nullspace_dims.len() {
-            per_block_nullspace_dims[b]
-        } else {
-            &[]
-        };
-        let rank = if !block_nullspace_dims.is_empty()
-            && block_nullspace_dims.len() == penalties.len()
-        {
-            // Exact intersection nullity: dim(∩_k N(S_k)).
-            // For single-penalty blocks this is just nullspace_dims[0].
-            // For multi-penalty blocks, eigendecomposes each S_k and
-            // intersects their nullspace bases via SVD.
-            let intersection_nullity = exact_intersection_nullity(penalties, block_nullspace_dims);
-            p.saturating_sub(intersection_nullity)
-        } else {
-            let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
-            eigs.iter().filter(|&&e| e > threshold).count()
-        };
-
-        // Exact pseudo-logdet: L = Σ over the `rank` largest eigenvalues of log σ_i.
-        // Eigenvalues from eigh are sorted ascending, so the `rank` largest are the last `rank`.
-        let block_logdet: f64 = eigs
-            .iter()
-            .rev()
-            .take(rank)
-            .map(|&e| e.max(1e-300).ln())
-            .sum();
-        log_det_total += block_logdet;
-
-        // S⁺ factor on the positive eigenspace: W such that W Wᵀ = S⁺.
-        // Select the `rank` largest eigenvalues (last `rank` in ascending order).
-        let nullity = p - rank;
-        let mut w_factor = Array2::zeros((p, rank));
-        for col in 0..rank {
-            let idx = nullity + col;
-            let scale = 1.0 / eigs[idx].max(1e-300).sqrt();
-            for row in 0..p {
-                w_factor[[row, col]] = vecs[[row, idx]] * scale;
-            }
-        }
-
-        // First derivatives: ∂/∂ρ_k L = tr(S⁺ A_k) where A_k = λ_k S_k.
-        for (k, s_k) in penalties.iter().enumerate() {
-            let a_k = s_k.mapv(|v| lambdas[k] * v);
-            let aw = a_k.dot(&w_factor);
-            let trace: f64 = aw.iter().zip(w_factor.iter()).map(|(&a, &w)| a * w).sum();
-            first[at + k] = trace;
-        }
-        at += block_rho.len();
-    }
-
-    // Compute second derivatives if any block has penalties.
-    let mut second = Array2::zeros((total_k, total_k));
-    let mut at2 = 0usize;
-    for (b, block_rho) in per_block_rho.iter().enumerate() {
-        let penalties = per_block_penalties[b];
-        if penalties.is_empty() || block_rho.is_empty() {
-            at2 += block_rho.len();
-            continue;
-        }
-        let p = penalties[0].nrows();
-        let lambdas = block_rho.mapv(f64::exp);
-
-        let mut s_block = Array2::zeros((p, p));
-        for (k, s_k) in penalties.iter().enumerate() {
-            s_block.scaled_add(lambdas[k], s_k);
-        }
-        if ridge > 0.0 {
-            for d in 0..p {
-                s_block[[d, d]] += ridge;
-            }
-        }
-
-        let (eigs, vecs) = s_block
-            .eigh(faer::Side::Lower)
-            .map_err(|e| format!("penalty det2 eigendecomposition failed for block {b}: {e}"))?;
-
-        let block_nullspace_dims = if b < per_block_nullspace_dims.len() {
-            per_block_nullspace_dims[b]
-        } else {
-            &[]
-        };
-        let rank = if !block_nullspace_dims.is_empty()
-            && block_nullspace_dims.len() == penalties.len()
-        {
-            let intersection_nullity = exact_intersection_nullity(penalties, block_nullspace_dims);
-            p.saturating_sub(intersection_nullity)
-        } else {
-            let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
-            eigs.iter().filter(|&&e| e > threshold).count()
-        };
-
-        // S⁺ factor on positive eigenspace: W Wᵀ = S⁺, shape (p, rank).
-        let nullity = p - rank;
-        let mut w_factor = Array2::zeros((p, rank));
-        for col in 0..rank {
-            let idx = nullity + col;
-            let scale = 1.0 / eigs[idx].max(1e-300).sqrt();
-            for row in 0..p {
-                w_factor[[row, col]] = vecs[[row, idx]] * scale;
-            }
-        }
-
-        // Y_k = S⁺ A_k in reduced space: Y_k_r = Wᵀ A_k W, shape (rank, rank).
         let kb = block_rho.len();
-        let mut y_k_reduced = Vec::with_capacity(kb);
-        for (k, s_k) in penalties.iter().enumerate() {
-            let a_k = s_k.mapv(|v| lambdas[k] * v);
-            let wt_ak = w_factor.t().dot(&a_k);
-            let y_kr = wt_ak.dot(&w_factor);
-            y_k_reduced.push(y_kr);
+        if penalties.is_empty() || kb == 0 {
+            at += kb;
+            continue;
         }
+        let lambdas: Vec<f64> = block_rho.iter().map(|&r| r.exp()).collect();
 
-        // Second derivatives: ∂²_ρk ρl log|S|_+ = δ_{kl} ∂_ρk log|S|_+ − λ_k λ_l tr(S⁺ S_k S⁺ S_l).
-        // Y_k already contains the lambda scaling (Y_k = Wᵀ (λ_k S_k) W), so
-        // tr(Y_k Y_l^T) = λ_k λ_l tr(S⁺ S_k S⁺ S_l). No extra lambda factor needed.
+        // Compute structural nullity if dimensions are available.
+        let block_nullspace_dims = if b < per_block_nullspace_dims.len() {
+            per_block_nullspace_dims[b]
+        } else {
+            &[]
+        };
+        let structural_nullity = if !block_nullspace_dims.is_empty()
+            && block_nullspace_dims.len() == penalties.len()
+        {
+            Some(exact_intersection_nullity(penalties, block_nullspace_dims))
+        } else {
+            None
+        };
+
+        // Single eigendecomposition via canonical PenaltyPseudologdet.
+        let pld = PenaltyPseudologdet::from_components_with_nullity(
+            penalties,
+            &lambdas,
+            ridge,
+            structural_nullity,
+        )
+        .map_err(|e| format!("penalty logdet failed for block {b}: {e}"))?;
+
+        // Value: log|S_b|₊.
+        log_det_total += pld.value();
+
+        // First and second derivatives w.r.t. ρ, from one eigendecomposition.
+        let (block_first, block_second) = pld.rho_derivatives(penalties, &lambdas);
+
+        // Write into global arrays at the correct offsets.
         for k in 0..kb {
-            for l in 0..=k {
-                let tr_ab: f64 = y_k_reduced[k]
-                    .iter()
-                    .zip(y_k_reduced[l].t().iter())
-                    .map(|(&a, &b)| a * b)
-                    .sum();
-                let mut val = -tr_ab;
-                if k == l {
-                    val += first[at2 + k];
-                }
-                second[[at2 + k, at2 + l]] = val;
-                second[[at2 + l, at2 + k]] = val;
+            first[at + k] = block_first[k];
+        }
+        for k in 0..kb {
+            for l in 0..kb {
+                second[[at + k, at + l]] = block_second[[k, l]];
             }
         }
-        at2 += kb;
+
+        at += kb;
     }
 
     Ok(PenaltyLogdetDerivs {

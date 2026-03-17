@@ -122,8 +122,69 @@ impl PenaltyPseudologdet {
         Self::from_assembled(s_total)
     }
 
+    /// Build from unscaled penalty components with a known structural nullity.
+    ///
+    /// When the intersection nullity dim(∩_k N(S_k)) is known structurally,
+    /// pass it here to override eigenvalue-based rank detection. This is more
+    /// reliable when ridge regularization inflates near-zero eigenvalues.
+    pub fn from_components_with_nullity(
+        s_k_matrices: &[Array2<f64>],
+        lambdas: &[f64],
+        ridge: f64,
+        structural_nullity: Option<usize>,
+    ) -> Result<Self, String> {
+        if s_k_matrices.is_empty() {
+            return Ok(Self {
+                w_factor: Array2::zeros((0, 0)),
+                u_null: None,
+                inv_evals_sq: Array1::zeros(0),
+                rank: 0,
+                p_dim: 0,
+                value: 0.0,
+            });
+        }
+
+        let p_dim = s_k_matrices[0].nrows();
+        debug_assert!(
+            s_k_matrices
+                .iter()
+                .all(|m| m.nrows() == p_dim && m.ncols() == p_dim)
+        );
+
+        let mut s_total = Array2::<f64>::zeros((p_dim, p_dim));
+        for (k, s_k) in s_k_matrices.iter().enumerate() {
+            s_total.scaled_add(lambdas[k], s_k);
+        }
+        if ridge > 0.0 {
+            for i in 0..p_dim {
+                s_total[[i, i]] += ridge;
+            }
+        }
+
+        Self::from_assembled_with_nullity(s_total, structural_nullity)
+    }
+
     /// Build from a pre-assembled penalty matrix S (already = Σ λ_k S_k + ridge·I).
     pub fn from_assembled(s_total: Array2<f64>) -> Result<Self, String> {
+        Self::from_assembled_inner(s_total, None)
+    }
+
+    /// Build from a pre-assembled penalty matrix with a known structural nullity.
+    ///
+    /// When `structural_nullity` is provided, the bottom `m0` eigenvalues are
+    /// treated as the nullspace even if ridge regularization makes them
+    /// numerically positive.  This mirrors `build_penalty_logdet_eigenspace`.
+    pub fn from_assembled_with_nullity(
+        s_total: Array2<f64>,
+        structural_nullity: Option<usize>,
+    ) -> Result<Self, String> {
+        Self::from_assembled_inner(s_total, structural_nullity)
+    }
+
+    fn from_assembled_inner(
+        s_total: Array2<f64>,
+        structural_nullity: Option<usize>,
+    ) -> Result<Self, String> {
         let p_dim = s_total.nrows();
         if p_dim == 0 {
             return Ok(Self {
@@ -141,9 +202,15 @@ impl PenaltyPseudologdet {
             .eigh(Side::Lower)
             .map_err(|e| format!("PenaltyPseudologdet eigendecomposition failed: {e}"))?;
 
-        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-        let rank = evals.iter().filter(|&&e| e > threshold).count();
-        let nullity = p_dim - rank;
+        let (rank, nullity) = if let Some(m0) = structural_nullity {
+            let m0 = m0.min(p_dim);
+            (p_dim - m0, m0)
+        } else {
+            let threshold =
+                super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+            let rank = evals.iter().filter(|&&e| e > threshold).count();
+            (rank, p_dim - rank)
+        };
 
         // Value: log|S|₊ = Σ log σ_i for positive eigenvalues.
         let value: f64 = evals

@@ -1,4 +1,5 @@
 use super::inner_strategy::{GeometryBackendKind, HessianEvalStrategyKind};
+use super::penalty_logdet::PenaltyPseudologdet;
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
 
@@ -35,92 +36,18 @@ impl<'a> RemlState<'a> {
             return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
         }
 
-        // IMPORTANT: dimensions must follow the *actual* transformed coefficient frame
-        // presented by callers (possibly active-constraint projected), not self.p.
-        let p_dim = rs_transformed[0].ncols();
-        for (k, r_k) in rs_transformed.iter().enumerate() {
-            if r_k.ncols() != p_dim {
-                return Err(EstimationError::LayoutError(format!(
-                    "Inconsistent penalty root width at k={k}: got {}, expected {}",
-                    r_k.ncols(),
-                    p_dim
-                )));
-            }
-        }
-        if p_dim == 0 {
-            return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
-        }
+        // Build S_k = R_k^T R_k for each penalty component.
+        let s_k_matrices: Vec<Array2<f64>> = rs_transformed
+            .iter()
+            .map(|r_k| r_k.t().dot(r_k))
+            .collect();
 
-        // Build S(ρ) = Σ λₖ Sₖ in the full p_dim space.
-        let mut s_k_full = Vec::with_capacity(k_count);
-        let mut s_lambda = Array2::<f64>::zeros((p_dim, p_dim));
-        for k in 0..k_count {
-            let r_k = &rs_transformed[k];
-            let s_k = r_k.t().dot(r_k);
-            s_lambda += &s_k.mapv(|v| lambdas[k] * v);
-            s_k_full.push(s_k);
-        }
-        if ridge > 0.0 {
-            for i in 0..p_dim {
-                s_lambda[[i, i]] += ridge;
-            }
-        }
+        let lambdas_slice = lambdas.as_slice().unwrap();
 
-        // Eigendecomposition of S(ρ).
-        let (evals, evecs) = s_lambda
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
+        let pld = PenaltyPseudologdet::from_components(&s_k_matrices, lambdas_slice, ridge)
+            .map_err(|e| EstimationError::LayoutError(e))?;
 
-        // Identify structurally positive eigenvalues. For S(ρ) = Σ λ_k S_k with
-        // S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k) is independent of ρ.
-        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-        let pos_rank = evals.iter().filter(|&&e| e > threshold).count();
-        if pos_rank == 0 {
-            return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
-        }
-
-        // S⁺ factor on positive eigenspace: W (p_dim × pos_rank) with W Wᵀ = S⁺.
-        let mut w_factor = Array2::<f64>::zeros((p_dim, pos_rank));
-        let mut col = 0;
-        for (idx, &ev) in evals.iter().enumerate() {
-            if ev > threshold {
-                let scale = 1.0 / ev.sqrt();
-                for row in 0..p_dim {
-                    w_factor[[row, col]] = evecs[[row, idx]] * scale;
-                }
-                col += 1;
-            }
-        }
-
-        // First derivatives: ∂_k L = tr(S⁺ Aₖ) = λₖ tr(S⁺ Sₖ).
-        // Y_k = S⁺ S_k in reduced space: Y_k_r = Wᵀ S_k W, shape (pos_rank, pos_rank).
-        let mut y_k_reduced = Vec::with_capacity(k_count);
-        let mut det1 = Array1::<f64>::zeros(k_count);
-        for k in 0..k_count {
-            let wt_sk = w_factor.t().dot(&s_k_full[k]);
-            let y_kr = wt_sk.dot(&w_factor);
-            let tr = kahan_sum((0..pos_rank).map(|i| y_kr[[i, i]]));
-            det1[k] = lambdas[k] * tr;
-            y_k_reduced.push(y_kr);
-        }
-
-        // Second derivatives: ∂²_kl L = δ_{kl} ∂_k L − λₖ λₗ tr(S⁺ Sₖ S⁺ Sₗ).
-        let mut det2 = Array2::<f64>::zeros((k_count, k_count));
-        for k in 0..k_count {
-            for l in 0..=k {
-                let tr_ab: f64 = y_k_reduced[k]
-                    .iter()
-                    .zip(y_k_reduced[l].t().iter())
-                    .map(|(&a, &b)| a * b)
-                    .sum();
-                let mut val = -lambdas[k] * lambdas[l] * tr_ab;
-                if k == l {
-                    val += det1[k];
-                }
-                det2[[k, l]] = val;
-                det2[[l, k]] = val;
-            }
-        }
+        let (det1, det2) = pld.rho_derivatives(&s_k_matrices, lambdas_slice);
         Ok((det1, det2))
     }
 

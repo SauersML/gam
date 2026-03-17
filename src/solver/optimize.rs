@@ -52,6 +52,7 @@ impl CostOnlyOptimizationRequest {
             heuristic_lambdas: Some(self.initial_guess.to_vec()),
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
+            screening_cap: None,
         }
     }
 }

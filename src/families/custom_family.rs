@@ -11,13 +11,14 @@ use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, spatial_length_scale_term_indices,
     try_build_spatial_log_kappa_derivativeinfo_list,
 };
+use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate, PenaltyLogdetEigenspace,
-    build_penalty_logdet_eigenspace, compute_block_penalty_logdet_derivs,
-    exact_intersection_nullity, frobenius_inner_same_shape, penalty_matrix_root,
-    reml_laml_evaluate, scaled_penalty_logdet_nullspace_leakage,
+    InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
+    compute_block_penalty_logdet_derivs,
+    exact_intersection_nullity, penalty_matrix_root,
+    reml_laml_evaluate,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -6070,7 +6071,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
-    s_logdet_blocks: Option<&[PenaltyLogdetEigenspace]>,
+    s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
     hessian_beta_independent: bool,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Result<Vec<HyperCoord>, String> {
@@ -6125,7 +6126,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
                 .assign(&s_psi_beta_local);
             let g = &psi_terms.score_psi + &s_psi_beta;
             let ld_s = if let Some(blocks) = s_logdet_blocks {
-                trace_product(&blocks[block_idx].pseudoinverse, &s_psi_local)
+                blocks[block_idx].tau_gradient_component(&s_psi_local)
             } else {
                 0.0
             };
@@ -6198,7 +6199,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
-    s_logdet_blocks: Option<&[PenaltyLogdetEigenspace]>,
+    s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Result<
     (
@@ -6228,8 +6229,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         local_idx: usize,
         start: usize,
         end: usize,
-        spinv_s_local: Option<Array2<f64>>,
-        scaled_leak_local: Option<Array2<f64>>,
+        /// Block-local S_ψ matrix, stored for use with `PenaltyPseudologdet` methods.
+        s_local: Option<Array2<f64>>,
     }
 
     struct RhoPenaltyCacheEntry {
@@ -6237,7 +6238,10 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         penalty_idx: usize,
         start: usize,
         end: usize,
-        spinv_s_local: Option<Array2<f64>>,
+        /// Unscaled penalty matrix S_k for use with `PenaltyPseudologdet::rho_tau_hessian_component`.
+        s_k_unscaled: Array2<f64>,
+        /// Current λ_k = exp(ρ_k).
+        lambda_k: f64,
     }
 
     // Build the psi coordinate cache once. These block-local S_psi matrices are
@@ -7523,6 +7527,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         heuristic_lambdas: None,
         initial_rho: Some(rho0.clone()),
         fallback_policy: FallbackPolicy::Automatic,
+        screening_cap: None,
     };
 
     let mut obj = ClosureObjective {
