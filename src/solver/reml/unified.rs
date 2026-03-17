@@ -5336,7 +5336,9 @@ pub fn compute_block_penalty_logdet_derivs(
             y_k_reduced.push(y_kr);
         }
 
-        // Second derivatives: ∂²_kl L = δ_{kl} ∂_k L − tr(S⁺ A_l S⁺ A_k).
+        // Second derivatives: ∂²_ρk ρl log|S|_+ = δ_{kl} ∂_ρk log|S|_+ − λ_k λ_l tr(S⁺ S_k S⁺ S_l).
+        // Y_k already contains the lambda scaling (Y_k = Wᵀ (λ_k S_k) W), so
+        // tr(Y_k Y_l^T) = λ_k λ_l tr(S⁺ S_k S⁺ S_l). No extra lambda factor needed.
         for k in 0..kb {
             for l in 0..=k {
                 let tr_ab: f64 = y_k_reduced[k]
@@ -5344,7 +5346,7 @@ pub fn compute_block_penalty_logdet_derivs(
                     .zip(y_k_reduced[l].t().iter())
                     .map(|(&a, &b)| a * b)
                     .sum();
-                let mut val = -lambdas[k] * lambdas[l] * tr_ab;
+                let mut val = -tr_ab;
                 if k == l {
                     val += first[at2 + k];
                 }

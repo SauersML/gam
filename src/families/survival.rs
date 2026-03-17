@@ -1503,9 +1503,16 @@ fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
 ///
 /// The adapter provides the domain-specific point evaluator callback `eval_at`,
 /// which fills design rows and returns:
-/// - instantaneous disease hazard at age `u`,
+/// - instantaneous disease hazard h_d(u) at age `u`,
 /// - cumulative disease hazard `H_d(u)`,
 /// - cumulative mortality hazard `H_m(u)`.
+///
+/// The callback must fill the following arrays (one entry per coefficient):
+/// - `design_d[j]`: partial derivative of the linear predictor eta_d w.r.t. beta_j
+///   at time u, i.e. x_j(u) = d eta_d(u) / d beta_j.
+/// - `deriv_d[j]`: partial derivative of the TIME DERIVATIVE of eta_d w.r.t. beta_j
+///   at time u, i.e. x_dot_j(u) = d/d(beta_j) [d eta_d(u)/du].
+/// - `design_m[j]`: same as design_d but for the mortality linear predictor eta_m.
 ///
 /// This keeps biology/data wiring out of `gam` while centralizing the
 /// integration engine in one place.
@@ -1603,10 +1610,13 @@ where
 
             // d Risk / d beta_d:
             //   integral [ d h_d * S_total - h_d * S_total * d H_d ] du
+            // Contract: design_d[j] = x_j(u) = ∂_{β_j} η_d(u)
+            //           deriv_d[j]  = ẋ_j(u) = ∂_{β_j} η̇_d(u)
+            // Then ∂_{β_j} h_d = h_d · x_j + H_d · ẋ_j
             let weight = w * s_total * halfwidth;
             for j in 0..coeff_len_d {
                 let d_inst_hazard =
-                    inst_hazard_d * (1.0 - hazard_d) * design_d[j] + hazard_d * deriv_d[j];
+                    inst_hazard_d * design_d[j] + hazard_d * deriv_d[j];
                 let d_hazard_cond = hazard_d * design_d[j] - h_dis_t0 * design_d_t0[j];
                 let g = d_inst_hazard - inst_hazard_d * d_hazard_cond;
                 diseasegradient[j] += weight * g;
@@ -1933,7 +1943,9 @@ mod tests {
                 let cumulative_m = beta_m.exp() * (1.0 + 0.1 * u);
                 let inst_hazard_d = 0.2 * beta_d.exp();
                 design_d[0] = 1.0;
-                deriv_d[0] = inst_hazard_d;
+                // η_d = β_d + ln(1 + 0.2u), so η̇_d = 0.2/(1+0.2u)
+                // which does not depend on β_d → ∂_{β_d} η̇_d = 0
+                deriv_d[0] = 0.0;
                 design_m[0] = 1.0;
                 Ok((inst_hazard_d, cumulative_d, cumulative_m))
             },

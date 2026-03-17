@@ -370,14 +370,18 @@ pub fn buildwiggle_block_input_from_knots(
     let design = full.dot(&z);
     let p = design.ncols();
     let mut penalties = vec![s_constrained];
+    // After geometric constraint transform (removing intercept + linear),
+    // the constrained penalty has nullity 0. Ridge is also full rank.
+    let mut nullspace_dims = vec![0usize];
     if double_penalty {
         penalties.push(Array2::<f64>::eye(p));
+        nullspace_dims.push(0);
     }
     Ok(ParameterBlockInput {
         design: DesignMatrix::Dense(Arc::new(design)),
         offset: Array1::zeros(seed.len()),
         penalties,
-        nullspace_dims: vec![],
+        nullspace_dims,
         initial_log_lambdas: None,
         initial_beta: None,
     })
@@ -2575,8 +2579,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 &Array1<f64>,
             ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
         >,
-        screening_enter_fn: None,
-        screening_exit_fn: None,
     };
 
     let outer_config = OuterConfig {
@@ -19424,6 +19426,7 @@ mod tests {
         let got = match &block.design {
             DesignMatrix::Dense(x) => x.clone(),
             DesignMatrix::Sparse(_) => panic!("expected dense wiggle design"),
+            DesignMatrix::Operator(_) => panic!("expected dense wiggle design"),
         };
         assert_eq!(got.dim(), expected.dim());
         for i in 0..got.nrows() {
@@ -19541,6 +19544,7 @@ mod tests {
         let geom = match geom_x {
             DesignMatrix::Dense(x) => x,
             DesignMatrix::Sparse(_) => panic!("expected dense wiggle geometry design"),
+            DesignMatrix::Operator(_) => panic!("expected dense wiggle geometry design"),
         };
         let expected_geom = family
             .wiggle_design(core_for_q0.q0.view())
