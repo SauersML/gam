@@ -503,6 +503,7 @@ impl ParametricColumnConditioning {
 
     /// Infer unpenalized columns by scanning penalty matrices, then compute
     /// column statistics via per-column extraction — no full-design densification.
+    /// Legacy: kept for callers that still pass `&[Array2<f64>]`.
     fn infer_from_penalties(x: &DesignMatrix, s_list: &[Array2<f64>]) -> Self {
         let p = x.ncols();
         let mut penalized = vec![false; p];
@@ -514,6 +515,20 @@ impl ParametricColumnConditioning {
                         break;
                     }
                 }
+            }
+        }
+        let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
+        Self::from_column_indices(x, &unpenalized)
+    }
+
+    /// Infer unpenalized columns from `PenaltySpec` slices.
+    fn infer_from_penalty_specs(x: &DesignMatrix, specs: &[PenaltySpec]) -> Self {
+        let p = x.ncols();
+        let mut penalized = vec![false; p];
+        for spec in specs {
+            let range = spec.col_range(p);
+            for j in range {
+                penalized[j] = true;
             }
         }
         let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
@@ -1321,45 +1336,8 @@ fn validate_penalty_specs(
     Ok(())
 }
 
-fn canonicalize_active_penalties(
-    s_list: Vec<Array2<f64>>,
-    nullspace_dims: &[usize],
-    context: &str,
-) -> Result<(Vec<Array2<f64>>, Vec<usize>), EstimationError> {
-    if s_list.len() != nullspace_dims.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "{context}: nullspace_dims length mismatch: penalties={}, nullspace_dims={}",
-            s_list.len(),
-            nullspace_dims.len()
-        )));
-    }
-
-    let mut active_penalties = Vec::with_capacity(s_list.len());
-    let mut active_nullspace_dims = Vec::with_capacity(s_list.len());
-    for (idx, s) in s_list.into_iter().enumerate() {
-        let analysis = analyze_penalty_block(&s).map_err(|err| {
-            EstimationError::InvalidInput(format!(
-                "{context}: penalty canonicalization failed at index {idx}: {err}"
-            ))
-        })?;
-        if analysis.rank == 0 {
-            log::debug!(
-                "Dropped inactive external penalty block idx={} reason={}",
-                idx,
-                if analysis.iszero {
-                    "ZeroMatrix"
-                } else {
-                    "NumericalRankZero"
-                }
-            );
-            continue;
-        }
-        active_penalties.push(analysis.sym_penalty);
-        active_nullspace_dims.push(analysis.nullity);
-    }
-
-    Ok((active_penalties, active_nullspace_dims))
-}
+// canonicalize_active_penalties removed — replaced by
+// crate::construction::canonicalize_penalty_specs.
 
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
 /// Contract: likelihood dispatch is determined by `opts.family`.
@@ -1368,7 +1346,7 @@ pub fn optimize_external_design<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<BlockwisePenalty>,
+    s_list: Vec<PenaltySpec>,
     opts: &ExternalOptimOptions,
 ) -> Result<ExternalOptimResult, EstimationError>
 where
@@ -1384,7 +1362,7 @@ pub fn optimize_external_designwith_heuristic_lambdas<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<BlockwisePenalty>,
+    s_list: Vec<PenaltySpec>,
     heuristic_lambdas: Option<&[f64]>,
     opts: &ExternalOptimOptions,
 ) -> Result<ExternalOptimResult, EstimationError>

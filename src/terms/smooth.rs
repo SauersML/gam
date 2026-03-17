@@ -3006,7 +3006,7 @@ fn apply_spatial_orthogonality_to_parametric(
 
     let total_p: usize = local_dims.iter().sum();
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(smooth.terms.len());
-    let mut penalties_global = Vec::<Array2<f64>>::new();
+    let mut penalties_global = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
     let mut penaltyinfo_global = Vec::<PenaltyBlockInfo>::new();
     let mut dropped_penaltyinfo_global = smooth.dropped_penaltyinfo.clone();
