@@ -54,7 +54,6 @@ impl<'a> RemlState<'a> {
     pub(super) fn compute_lamlhessian_analytic_fallback(
         &self,
         rho: &Array1<f64>,
-        _bundle_hint: Option<&EvalShared>,
     ) -> Result<Array2<f64>, EstimationError> {
         // The old partial analytic fallback omitted the full ½ ∂² log|H| block,
         // so it was not the Hessian of the objective being optimized. When the
@@ -187,7 +186,7 @@ impl<'a> RemlState<'a> {
                 self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
             }
             HessianEvalStrategyKind::AnalyticFallback => {
-                self.compute_lamlhessian_analytic_fallback(rho, Some(&bundle))
+                self.compute_lamlhessian_analytic_fallback(rho)
             }
             HessianEvalStrategyKind::DiagnosticNumeric => {
                 self.compute_lamlhessian_diagnostic_numeric(rho)

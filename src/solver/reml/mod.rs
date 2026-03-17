@@ -322,7 +322,7 @@ mod tests {
             .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
             .expect("exact firth hessian");
         let h_fallback = state
-            .compute_lamlhessian_analytic_fallback(&rho, None)
+            .compute_lamlhessian_analytic_fallback(&rho)
             .expect("analytic fallback hessian");
 
         assert!(h_exact.iter().all(|v: &f64| v.is_finite()));
