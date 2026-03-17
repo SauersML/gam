@@ -1,5 +1,6 @@
 use super::*;
 use crate::matrix::DenseRightProductView;
+use crate::terms::smooth::{BlockwisePenalty, penalties_to_global, weighted_blockwise_penalty_sum};
 
 // ─── Binomial auxiliary terms for link-parameter ext_coord construction ───
 //
@@ -705,19 +706,11 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        let s_eval = self.s_full_list.iter().enumerate().fold(
-            Array2::<f64>::zeros((p_dim, p_dim)),
-            |acc, (idx, s_k)| {
-                if idx < lambdas.len() {
-                    acc + &s_k.mapv(|v| lambdas[idx] * v)
-                } else {
-                    acc
-                }
-            },
-        );
+        let lambdas_slice = lambdas.as_slice().unwrap();
+        let s_eval = weighted_blockwise_penalty_sum(&self.s_full_list, lambdas_slice, p_dim);
         let pld = super::penalty_logdet::PenaltyPseudologdet::from_assembled(s_eval)
             .map_err(EstimationError::InvalidInput)?;
-        let s_k_unscaled: Vec<Array2<f64>> = self.s_full_list.to_vec();
+        let s_k_unscaled: Vec<Array2<f64>> = penalties_to_global(&self.s_full_list, p_dim);
 
         let x_dense = self
             .x()

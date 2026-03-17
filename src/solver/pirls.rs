@@ -2128,9 +2128,7 @@ fn estimate_sparse_native_decision(
     workspace: &mut PirlsWorkspace,
     x_original: &DesignMatrix,
     s_lambda: &Array2<f64>,
-    firth_bias_reduction: bool,
     linear_constraints_original: Option<&LinearInequalityConstraints>,
-    qs_required: bool,
 ) -> SparsePirlsDecision {
     let p = x_original.ncols();
     let nnz_s_lambda = count_dense_upper_nnz(s_lambda, 1e-12);
@@ -2145,14 +2143,9 @@ fn estimate_sparse_native_decision(
         density_h_est: None,
     };
 
-    if firth_bias_reduction {
-        return dense_reject("firth_active", 0);
-    }
+    // Constrained solves require the dense active-set / projected Newton machinery.
     if linear_constraints_original.is_some() {
         return dense_reject("constraints_present", 0);
-    }
-    if qs_required {
-        return dense_reject("transformed_basis_required", 0);
     }
 
     let x_sparse = if let Some(sparse) = x_original.as_sparse() {
@@ -2197,17 +2190,13 @@ fn should_use_sparse_native_pirls(
     workspace: &mut PirlsWorkspace,
     x_original: &DesignMatrix,
     s_lambda: &Array2<f64>,
-    firth_bias_reduction: bool,
     linear_constraints_original: Option<&LinearInequalityConstraints>,
-    qs_required: bool,
 ) -> SparsePirlsDecision {
     estimate_sparse_native_decision(
         workspace,
         x_original,
         s_lambda,
-        firth_bias_reduction,
         linear_constraints_original,
-        qs_required,
     )
 }
 
@@ -4437,6 +4426,14 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let linear_constraints = merge_linear_constraints(transformed_bounds, transformed_linear);
 
     let x_original: DesignMatrix = x.into();
+    // Auto-detect sparse structure in dense designs so the sparse-native path
+    // can engage for structurally sparse models that happen to be stored dense.
+    let x_original = {
+        let auto_sparse = x_original
+            .as_dense()
+            .and_then(|dense| sparse_from_denseview(dense.view()));
+        auto_sparse.unwrap_or(x_original)
+    };
     let ebrows = eb.nrows();
     let erows = reparam_result.e_transformed.nrows();
     let mut workspace = PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), ebrows, erows);
@@ -4444,9 +4441,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         &mut workspace,
         &x_original,
         &reparam_result.s_transformed,
-        config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
         penalty.linear_constraints_original,
-        matches!(link_function, LinkFunction::Identity),
     );
     solver_decision.log_once();
 
@@ -6887,7 +6882,7 @@ mod tests {
         let x = DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]]));
         let s = array![[1.0, 0.0], [0.0, 1.0]];
         let mut workspace = PirlsWorkspace::new(2, 2, 0, 0);
-        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, false, None, false);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
         assert_eq!(decision.reason, "design_not_sparse");
     }
@@ -6910,7 +6905,7 @@ mod tests {
         let x = DesignMatrix::from(x);
         let s = Array2::from_diag(&Array1::ones(300));
         let mut workspace = PirlsWorkspace::new(300, 300, 0, 0);
-        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, false, None, false);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
         assert_eq!(decision.nnz_x, 300);
@@ -6927,7 +6922,7 @@ mod tests {
         let x = DesignMatrix::from(x);
         let s = Array2::from_diag(&Array1::ones(64));
         let mut workspace = PirlsWorkspace::new(64, 64, 0, 0);
-        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, false, None, false);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
         assert_eq!(decision.nnz_x, 64);
@@ -7012,6 +7007,7 @@ mod tests {
                 coefficient_lower_bounds: None,
                 linear_constraints_original: None,
                 penalty_shrinkage_floor: None,
+                penalties: None,
             },
             &config,
             Some(&Coefficients::new(array![0.0])),
@@ -7403,6 +7399,7 @@ mod root_cause_tests {
                     coefficient_lower_bounds: None,
                     linear_constraints_original: None,
                     penalty_shrinkage_floor: None,
+                    penalties: None,
                 },
                 &config,
                 None,
@@ -7463,6 +7460,7 @@ mod root_cause_tests {
                     coefficient_lower_bounds: None,
                     linear_constraints_original: None,
                     penalty_shrinkage_floor: None,
+                    penalties: None,
                 },
                 &config,
                 None,

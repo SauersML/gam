@@ -711,6 +711,272 @@ pub fn compute_penalty_square_roots(
     Ok(rs_list)
 }
 
+// ---------------------------------------------------------------------------
+// CanonicalPenalty — block-local processed penalty for the solver
+// ---------------------------------------------------------------------------
+
+/// A canonicalized penalty with block-local root, ready for the solver.
+///
+/// Instead of storing a full `p x p` penalty matrix, this stores only the
+/// `rank x block_dim` root and the column range, enabling O(p_k^2) operations
+/// instead of O(p^2).
+#[derive(Clone, Debug)]
+pub struct CanonicalPenalty {
+    /// Square root matrix: S_k = root^T * root.
+    /// Shape: `rank x block_dim` for block-local, `rank x p` for dense.
+    pub root: Array2<f64>,
+    /// Column range in the global coefficient vector [start..end).
+    /// For dense penalties this is `0..p`.
+    pub col_range: std::ops::Range<usize>,
+    /// Full parameter dimension p.
+    pub total_dim: usize,
+    /// Structural nullity of the local penalty.
+    pub nullity: usize,
+}
+
+impl CanonicalPenalty {
+    /// Numerical rank of this penalty.
+    pub fn rank(&self) -> usize {
+        self.root.nrows()
+    }
+
+    /// Block dimension (number of columns this penalty covers).
+    pub fn block_dim(&self) -> usize {
+        self.col_range.len()
+    }
+
+    /// Whether this penalty is block-local (col_range != 0..total_dim).
+    pub fn is_block_local(&self) -> bool {
+        self.col_range.start != 0 || self.col_range.end != self.total_dim
+    }
+
+    /// Reconstruct the local penalty matrix: root^T * root.
+    /// Shape: `block_dim x block_dim`.
+    pub fn local_penalty(&self) -> Array2<f64> {
+        self.root.t().dot(&self.root)
+    }
+
+    /// Accumulate lambda * S_k into a pre-allocated `p x p` target matrix.
+    pub fn accumulate_weighted(&self, target: &mut Array2<f64>, lambda: f64) {
+        if lambda == 0.0 || self.rank() == 0 {
+            return;
+        }
+        let local = self.local_penalty();
+        let r = &self.col_range;
+        target
+            .slice_mut(s![r.start..r.end, r.start..r.end])
+            .scaled_add(lambda, &local);
+    }
+
+    /// Global root: `rank x p` matrix (embeds block root into full column space).
+    pub fn global_root(&self) -> Array2<f64> {
+        if !self.is_block_local() {
+            return self.root.clone();
+        }
+        let mut g = Array2::zeros((self.rank(), self.total_dim));
+        g.slice_mut(s![.., self.col_range.start..self.col_range.end])
+            .assign(&self.root);
+        g
+    }
+
+    /// Global penalty: `p x p` matrix (embeds into full space). Use sparingly.
+    pub fn global_penalty(&self) -> Array2<f64> {
+        if !self.is_block_local() {
+            return self.local_penalty();
+        }
+        let local = self.local_penalty();
+        let mut g = Array2::zeros((self.total_dim, self.total_dim));
+        let r = &self.col_range;
+        g.slice_mut(s![r.start..r.end, r.start..r.end])
+            .assign(&local);
+        g
+    }
+
+    /// Convert to a PenaltyCoordinate for the unified REML evaluator.
+    pub fn to_penalty_coordinate(
+        &self,
+    ) -> crate::solver::estimate::reml::unified::PenaltyCoordinate {
+        use crate::solver::estimate::reml::unified::PenaltyCoordinate;
+        if self.is_block_local() {
+            PenaltyCoordinate::BlockRoot {
+                root: self.root.clone(),
+                start: self.col_range.start,
+                end: self.col_range.end,
+                total_dim: self.total_dim,
+            }
+        } else {
+            PenaltyCoordinate::from_dense_root(self.root.clone())
+        }
+    }
+}
+
+/// Canonicalize a single `PenaltySpec` into a `CanonicalPenalty` by computing
+/// the block-local eigendecomposition and extracting the root.
+///
+/// This is O(block_dim^3) instead of O(p^3) for block-local penalties.
+/// Returns `None` if the penalty has rank zero (should be dropped).
+pub fn canonicalize_penalty_spec(
+    spec: &crate::estimate::PenaltySpec,
+    p: usize,
+    idx: usize,
+    context: &str,
+) -> Result<Option<CanonicalPenalty>, EstimationError> {
+    use crate::estimate::PenaltySpec;
+
+    let (local_matrix, col_range) = match spec {
+        PenaltySpec::Block { local, col_range } => {
+            let bd = col_range.len();
+            if local.nrows() != bd || local.ncols() != bd {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{context}: block penalty {idx} local matrix must be {bd}x{bd}, got {}x{}",
+                    local.nrows(),
+                    local.ncols()
+                )));
+            }
+            if col_range.end > p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
+                    col_range.start, col_range.end
+                )));
+            }
+            (local.view(), col_range.clone())
+        }
+        PenaltySpec::Dense(m) => {
+            if m.nrows() != p || m.ncols() != p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
+                    m.nrows(),
+                    m.ncols()
+                )));
+            }
+            (m.view(), 0..p)
+        }
+    };
+
+    let local_owned = local_matrix.to_owned();
+    let analysis = analyze_penalty_block(&local_owned).map_err(|err| {
+        EstimationError::InvalidInput(format!(
+            "{context}: penalty canonicalization failed at index {idx}: {err}"
+        ))
+    })?;
+
+    if analysis.rank == 0 {
+        log::debug!(
+            "Dropped inactive penalty block idx={idx} reason={}",
+            if analysis.iszero {
+                "ZeroMatrix"
+            } else {
+                "NumericalRankZero"
+            }
+        );
+        return Ok(None);
+    }
+
+    // Compute block-local root via eigendecomposition: O(block_dim^3)
+    let (eigenvalues, eigenvectors) =
+        robust_eigh(&analysis.sym_penalty, Side::Lower, "penalty matrix")?;
+    let tolerance = analysis.tol;
+    let rank_k = analysis.rank;
+    let block_dim = local_owned.nrows();
+
+    let mut root = Array2::zeros((rank_k, block_dim));
+    let mut row_idx = 0;
+    for (i, &eigenval) in eigenvalues.iter().enumerate() {
+        if eigenval > tolerance {
+            let sqrt_eigenval = eigenval.sqrt();
+            let eigenvec = eigenvectors.column(i);
+            root.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
+            row_idx += 1;
+        }
+    }
+
+    Ok(Some(CanonicalPenalty {
+        root,
+        col_range,
+        total_dim: p,
+        nullity: analysis.nullity,
+    }))
+}
+
+/// Canonicalize a batch of penalty specs, dropping zero-rank penalties.
+/// Returns (active_penalties, active_nullspace_dims).
+pub fn canonicalize_penalty_specs(
+    specs: &[crate::estimate::PenaltySpec],
+    nullspace_dims: &[usize],
+    p: usize,
+    context: &str,
+) -> Result<(Vec<CanonicalPenalty>, Vec<usize>), EstimationError> {
+    if specs.len() != nullspace_dims.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "{context}: nullspace_dims length mismatch: penalties={}, nullspace_dims={}",
+            specs.len(),
+            nullspace_dims.len()
+        )));
+    }
+
+    let mut active = Vec::with_capacity(specs.len());
+    let mut active_nullspace = Vec::with_capacity(specs.len());
+    for (idx, spec) in specs.iter().enumerate() {
+        if let Some(canonical) = canonicalize_penalty_spec(spec, p, idx, context)? {
+            active_nullspace.push(canonical.nullity);
+            active.push(canonical);
+        }
+    }
+    Ok((active, active_nullspace))
+}
+
+/// Creates a balanced penalty root from canonical penalties.
+/// Same algorithm as `create_balanced_penalty_root`, but avoids materializing
+/// individual p x p penalty matrices.
+pub fn create_balanced_penalty_root_from_canonical(
+    penalties: &[CanonicalPenalty],
+    p: usize,
+) -> Result<Array2<f64>, EstimationError> {
+    if penalties.is_empty() {
+        return Ok(Array2::zeros((0, p)));
+    }
+
+    let mut s_balanced = Array2::zeros((p, p));
+
+    for cp in penalties {
+        if cp.rank() == 0 {
+            continue;
+        }
+        let local = cp.local_penalty();
+        let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+        if frob_norm > 1e-12 {
+            let r = &cp.col_range;
+            s_balanced
+                .slice_mut(s![r.start..r.end, r.start..r.end])
+                .scaled_add(1.0 / frob_norm, &local);
+        }
+    }
+
+    let (eigenvalues, eigenvectors) =
+        robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
+
+    let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+    let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+    let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+
+    if penalty_rank == 0 {
+        return Ok(Array2::zeros((0, p)));
+    }
+
+    let mut eb = Array2::zeros((p, penalty_rank));
+    let mut col_idx = 0;
+    for (i, &eigenval) in eigenvalues.iter().enumerate() {
+        if eigenval > tolerance {
+            let sqrt_eigenval = eigenval.sqrt();
+            let eigenvec = eigenvectors.column(i);
+            eb.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
+            col_idx += 1;
+        }
+    }
+
+    Ok(eb.t().to_owned())
+}
+
 /// Lambda-independent reparameterization invariants derived from penalty structure.
 #[derive(Clone)]
 struct SubspaceSplit {

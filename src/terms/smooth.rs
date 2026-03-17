@@ -1,7 +1,8 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
     BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
-    DuchonBasisSpec, MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo,
+    DuchonBasisSpec, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
+    PenaltyCandidate, PenaltyInfo,
     PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     applyweighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
     build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivative,
@@ -169,6 +170,9 @@ pub struct SmoothTerm {
     /// Optional term-local inequality constraints in local coefficient coordinates.
     /// `A_local * beta_local >= b_local`.
     pub linear_constraints_local: Option<LinearInequalityConstraints>,
+    /// When set, this term has Kronecker (tensor-product) structure and its
+    /// design and penalties can be operated on in factored form.
+    pub kronecker_factored: Option<KroneckerFactoredBasis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +233,25 @@ impl From<RawSmoothDesign> for SmoothDesign {
             linear_constraints: value.linear_constraints,
         }
     }
+}
+
+/// Intermediate representation holding per-term local blocks before global
+/// assembly.  This avoids the double-assembly pattern where a global design
+/// is assembled, sliced back into per-term blocks for identifiability
+/// transforms, then reassembled.
+struct PreAssemblySmoothTerms {
+    n: usize,
+    local_designs: Vec<Array2<f64>>,
+    local_penalties: Vec<Vec<Array2<f64>>>,
+    local_nullspaces: Vec<Vec<usize>>,
+    local_penaltyinfo: Vec<Vec<PenaltyInfo>>,
+    local_dropped_penaltyinfo: Vec<Vec<PenaltyInfo>>,
+    local_metadata: Vec<BasisMetadata>,
+    local_dims: Vec<usize>,
+    local_linear_constraints: Vec<Option<LinearInequalityConstraints>>,
+    local_box_reparam: Vec<bool>,
+    term_names: Vec<String>,
+    term_shapes: Vec<ShapeConstraint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -601,6 +624,16 @@ impl TermCollectionDesign {
     pub fn global_penalties(&self) -> Vec<Array2<f64>> {
         let p = self.design.ncols();
         penalties_to_global(&self.penalties, p)
+    }
+
+    /// Convert blockwise penalties to `PenaltySpec` values for the solver API.
+    /// Unlike `global_penalties()`, this preserves block-local structure and
+    /// avoids allocating `p x p` dense matrices for each penalty.
+    pub fn penalty_specs(&self) -> Vec<crate::estimate::PenaltySpec> {
+        self.penalties
+            .iter()
+            .map(crate::estimate::PenaltySpec::from)
+            .collect()
     }
 
     /// Number of penalty blocks.
@@ -1442,6 +1475,7 @@ fn matern_operator_penalty_triplet_from_metadata(
             nullspace_dim_hint: 0,
             source,
             normalization_scale,
+            kronecker_factors: None,
         });
     }
     filter_active_penalty_candidates(candidates)
@@ -1875,6 +1909,7 @@ fn build_tensor_bspline_basis(
             nullspace_dim_hint: 0,
             source: PenaltySource::TensorMarginal { dim },
             normalization_scale: 1.0,
+            kronecker_factors: None,
         });
     }
 
@@ -1884,6 +1919,7 @@ fn build_tensor_bspline_basis(
             nullspace_dim_hint: 0,
             source: PenaltySource::TensorGlobalRidge,
             normalization_scale: 1.0,
+            kronecker_factors: None,
         });
     }
 
@@ -1923,6 +1959,7 @@ fn build_tensor_bspline_basis(
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale * c_new,
+                    kronecker_factors: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1951,6 +1988,7 @@ fn build_tensor_bspline_basis(
             degrees: marginal_degrees,
             identifiability_transform: z_opt,
         },
+        kronecker_factored: None, // populated in Step 4 for identifiability=None
     })
 }
 
@@ -2117,6 +2155,8 @@ pub fn build_smooth_design_withworkspace(
     let mut local_linear_constraints =
         Vec::<Option<LinearInequalityConstraints>>::with_capacity(terms.len());
     let mut local_box_reparam = Vec::<bool>::with_capacity(terms.len());
+    let mut local_marginal_designs =
+        Vec::<Option<Vec<Arc<Array2<f64>>>>>::with_capacity(terms.len());
 
     for term in terms {
         if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
@@ -2278,6 +2318,7 @@ pub fn build_smooth_design_withworkspace(
         }
 
         let p_local = built.design.ncols();
+        let raw_marginals = built.marginal_designs.take();
         let mut metadata = built.metadata.clone();
         let mut design_t = built.design;
         let mut penalties_t: Vec<Array2<f64>> = built.penalties;
@@ -2335,6 +2376,7 @@ pub fn build_smooth_design_withworkspace(
                     matrix,
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
+                    kronecker_factors: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2367,6 +2409,7 @@ pub fn build_smooth_design_withworkspace(
         local_metadata.push(metadata);
         local_linear_constraints.push(linear_constraints_local);
         local_box_reparam.push(use_box_reparam);
+        local_marginal_designs.push(raw_marginals);
     }
 
     let total_p: usize = local_dims.iter().sum();
@@ -2449,6 +2492,7 @@ pub fn build_smooth_design_withworkspace(
             metadata: local_metadata[idx].clone(),
             lower_bounds_local: lb_local.clone(),
             linear_constraints_local: local_linear_constraints[idx].clone(),
+            kronecker_factored: None,
         });
         if let Some(lin_local) = &local_linear_constraints[idx] {
             for r in 0..lin_local.a.nrows() {
@@ -2513,7 +2557,10 @@ pub fn build_term_collection_design(
 ) -> Result<TermCollectionDesign, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
-    let smooth_raw = build_smooth_design(data, &spec.smooth_terms)?;
+    let mut pre = {
+        let mut ws = crate::basis::BasisWorkspace::new();
+        build_pre_assembly_smooth_terms(data, &spec.smooth_terms, &mut ws)?
+    };
     let random_blocks: Vec<RandomEffectBlock> = spec
         .random_effect_terms
         .iter()
@@ -2529,12 +2576,13 @@ pub fn build_term_collection_design(
         }
     }
 
-    let smooth = apply_spatial_orthogonality_to_parametric(
-        smooth_raw,
+    apply_spatial_orthogonality_pre_assembly(
+        &mut pre,
         data,
         &spec.linear_terms,
         &spec.smooth_terms,
     )?;
+    let smooth = SmoothDesign::from(assemble_raw_smooth_design(pre)?);
 
     let p_intercept = 1usize;
     let p_lin = spec.linear_terms.len();
@@ -2796,40 +2844,25 @@ pub fn build_term_collection_design(
     })
 }
 
-fn apply_spatial_orthogonality_to_parametric(
-    smooth: RawSmoothDesign,
+/// Apply spatial identifiability transforms to pre-assembly smooth terms
+/// in-place.  This operates on per-term local blocks directly, avoiding
+/// the slice-from-global -> transform -> reassemble pattern.
+fn apply_spatial_orthogonality_pre_assembly(
+    pre: &mut PreAssemblySmoothTerms,
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
-) -> Result<SmoothDesign, BasisError> {
-    // Option 5 identifiability policy:
-    //
-    // Build a term-local parametric confounding block C_j = [1 | X_lin,overlap(j)],
-    // then for each spatial smooth basis B_j enforce orthogonality to C_j in the
-    // unweighted inner product:
-    //   B_con^T C = 0.
-    //
-    // Reparameterization derivation:
-    //   M = B^T C.
-    //   If columns of Z span null(M^T), then
-    //      (B Z)^T C = Z^T (B^T C) = Z^T M = 0.
-    //
-    // So B_con = B Z has no component in the parametric column space, eliminating
-    // intercept/linear confounding without hand-picking polynomial columns.
-    //
-    // Penalties transform by congruence:
-    //   S_con = Z^T S Z.
-    // This preserves PSD and keeps curvature geometry consistent in constrained coords.
-    if smoothspecs.len() != smooth.terms.len() {
+) -> Result<(), BasisError> {
+    if smoothspecs.len() != pre.term_names.len() {
         return Err(BasisError::DimensionMismatch(format!(
             "smooth spec count ({}) does not match built term count ({})",
             smoothspecs.len(),
-            smooth.terms.len()
+            pre.term_names.len()
         )));
     }
 
     // Fast-path: if no spatial term participates in Option 5 (orthogonal or frozen),
-    // return the smooth bundle unchanged and skip all matrix work.
+    // return unchanged and skip all matrix work.
     let any_spatial_transform = smoothspecs.iter().any(|t| {
         !matches!(
             spatial_identifiability_policy(t),
@@ -2837,25 +2870,11 @@ fn apply_spatial_orthogonality_to_parametric(
         )
     });
     if !any_spatial_transform {
-        return Ok(smooth.into());
+        return Ok(());
     }
 
-    let n = smooth.design.nrows();
-    let mut local_designs = Vec::<Array2<f64>>::with_capacity(smooth.terms.len());
-    let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(smooth.terms.len());
-    let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());
-    let mut local_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(smooth.terms.len());
-    let mut local_metadata = Vec::<BasisMetadata>::with_capacity(smooth.terms.len());
-    let mut local_dims = Vec::<usize>::with_capacity(smooth.terms.len());
-    let mut local_linear_constraints =
-        Vec::<Option<LinearInequalityConstraints>>::with_capacity(smooth.terms.len());
-
-    for (idx, term) in smooth.terms.iter().enumerate() {
+    for idx in 0..pre.term_names.len() {
         let termspec = &smoothspecs[idx];
-        let design_local = smooth
-            .design
-            .slice(s![.., term.coeff_range.clone()])
-            .to_owned();
         let use_frozen_transform = matches!(
             spatial_identifiability_policy(termspec),
             Some(SpatialIdentifiability::FrozenTransform { .. })
@@ -2873,9 +2892,11 @@ fn apply_spatial_orthogonality_to_parametric(
         } else {
             None
         };
+
+        // Transform the per-term local design directly -- no global slice needed.
         let (design_constrained, z_opt) = maybe_spatial_identifiability_transform(
             termspec,
-            design_local.view(),
+            pre.local_designs[idx].view(),
             c_local.as_ref().map(|mat| mat.view()),
         )?;
 
@@ -2893,28 +2914,28 @@ fn apply_spatial_orthogonality_to_parametric(
             if rel > tol {
                 return Err(BasisError::InvalidInput(format!(
                     "spatial orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
-                    term.name, rel, tol
+                    pre.term_names[idx], rel, tol
                 )));
             }
         }
 
+        // Transform penalties by congruence: S_con = Z^T S Z.
         let mut penalties_constrained =
-            Vec::<Array2<f64>>::with_capacity(term.penalties_local.len());
-        let active_penaltyinfo = term
-            .penaltyinfo_local
+            Vec::<Array2<f64>>::with_capacity(pre.local_penalties[idx].len());
+        let active_penaltyinfo = pre.local_penaltyinfo[idx]
             .iter()
             .filter(|info| info.active)
             .cloned()
             .collect::<Vec<_>>();
-        if active_penaltyinfo.len() != term.penalties_local.len() {
+        if active_penaltyinfo.len() != pre.local_penalties[idx].len() {
             return Err(BasisError::InvalidInput(format!(
                 "internal penalty metadata mismatch for term '{}': activeinfos={}, penalties={}",
-                term.name,
+                pre.term_names[idx],
                 active_penaltyinfo.len(),
-                term.penalties_local.len()
+                pre.local_penalties[idx].len()
             )));
         }
-        for s_local in &term.penalties_local {
+        for s_local in &pre.local_penalties[idx] {
             let s_con = if let Some(z) = z_opt.as_ref() {
                 let zt_s = z.t().dot(s_local);
                 zt_s.dot(z)
@@ -2933,13 +2954,15 @@ fn apply_spatial_orthogonality_to_parametric(
                     matrix,
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
+                    kronecker_factors: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (penalties_constrained, nullspace_constrained, penaltyinfo_constrained) =
             filter_active_penalty_candidates(penalty_candidates)?;
+
         let linear_constraints_constrained =
-            if let Some(lin_local) = term.linear_constraints_local.as_ref() {
+            if let Some(lin_local) = pre.local_linear_constraints[idx].as_ref() {
                 if let Some(z) = z_opt.as_ref() {
                     Some(LinearInequalityConstraints {
                         a: lin_local.a.dot(z),
@@ -2952,145 +2975,22 @@ fn apply_spatial_orthogonality_to_parametric(
                 None
             };
 
-        local_dims.push(design_constrained.ncols());
-        local_designs.push(design_constrained);
-        local_penalties.push(penalties_constrained);
-        local_nullspaces.push(nullspace_constrained);
-        local_penaltyinfo.push(penaltyinfo_constrained);
-        local_linear_constraints.push(linear_constraints_constrained);
-        local_metadata.push(with_spatial_identifiability_transform(
-            &term.metadata,
+        // Update pre-assembly state in-place.
+        pre.local_dims[idx] = design_constrained.ncols();
+        pre.local_designs[idx] = design_constrained;
+        pre.local_penalties[idx] = penalties_constrained;
+        pre.local_nullspaces[idx] = nullspace_constrained;
+        pre.local_penaltyinfo[idx] = penaltyinfo_constrained;
+        pre.local_linear_constraints[idx] = linear_constraints_constrained;
+        pre.local_metadata[idx] = with_spatial_identifiability_transform(
+            &pre.local_metadata[idx],
             z_opt.as_ref(),
-        ));
+        );
     }
 
-    let total_p: usize = local_dims.iter().sum();
-    let mut design = Array2::<f64>::zeros((n, total_p));
-    let mut terms_out = Vec::<SmoothTerm>::with_capacity(smooth.terms.len());
-    let mut penalties_global = Vec::<BlockwisePenalty>::new();
-    let mut nullspace_dims_global = Vec::<usize>::new();
-    let mut penaltyinfo_global = Vec::<PenaltyBlockInfo>::new();
-    let mut dropped_penaltyinfo_global = smooth.dropped_penaltyinfo.clone();
-    let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
-    let mut any_bounds = false;
-    let mut linear_constraintsrows: Vec<Array1<f64>> = Vec::new();
-    let mut linear_constraints_b: Vec<f64> = Vec::new();
-
-    let mut col_start = 0usize;
-    for idx in 0..smooth.terms.len() {
-        let p_local = local_dims[idx];
-        let col_end = col_start + p_local;
-        design
-            .slice_mut(s![.., col_start..col_end])
-            .assign(&local_designs[idx]);
-
-        let activeinfos = local_penaltyinfo[idx]
-            .iter()
-            .filter(|info| info.active)
-            .collect::<Vec<_>>();
-        if activeinfos.len() != local_penalties[idx].len() {
-            return Err(BasisError::InvalidInput(format!(
-                "internal penalty info mismatch for term '{}': activeinfos={}, penalties={}",
-                smooth.terms[idx].name,
-                activeinfos.len(),
-                local_penalties[idx].len()
-            )));
-        }
-        for ((s_local, &ns), info) in local_penalties[idx]
-            .iter()
-            .zip(local_nullspaces[idx].iter())
-            .zip(activeinfos.into_iter())
-        {
-            let global_index = penalties_global.len();
-            penalties_global.push(BlockwisePenalty::new(
-                col_start..col_end,
-                s_local.clone(),
-            ));
-            nullspace_dims_global.push(ns);
-            let mut penalty = info.clone();
-            penalty.nullspace_dim_hint = ns;
-            penaltyinfo_global.push(PenaltyBlockInfo {
-                global_index,
-                termname: Some(smooth.terms[idx].name.clone()),
-                penalty,
-            });
-        }
-        for info in local_penaltyinfo[idx].iter().filter(|info| !info.active) {
-            dropped_penaltyinfo_global.push(DroppedPenaltyBlockInfo {
-                termname: Some(smooth.terms[idx].name.clone()),
-                penalty: info.clone(),
-            });
-        }
-
-        terms_out.push(SmoothTerm {
-            name: smooth.terms[idx].name.clone(),
-            coeff_range: col_start..col_end,
-            shape: smooth.terms[idx].shape,
-            penalties_local: local_penalties[idx].clone(),
-            nullspace_dims: local_nullspaces[idx].clone(),
-            penaltyinfo_local: local_penaltyinfo[idx].clone(),
-            metadata: local_metadata[idx].clone(),
-            lower_bounds_local: smooth.terms[idx].lower_bounds_local.clone(),
-            linear_constraints_local: local_linear_constraints[idx].clone(),
-        });
-        if let Some(lin_local) = &local_linear_constraints[idx] {
-            for r in 0..lin_local.a.nrows() {
-                let mut row = Array1::<f64>::zeros(total_p);
-                row.slice_mut(s![col_start..col_end])
-                    .assign(&lin_local.a.row(r));
-                linear_constraintsrows.push(row);
-                linear_constraints_b.push(lin_local.b[r]);
-            }
-        }
-        if let Some(lb_local) = smooth.terms[idx].lower_bounds_local.as_ref()
-            && lb_local.len() == p_local
-        {
-            coefficient_lower_bounds
-                .slice_mut(s![col_start..col_end])
-                .assign(lb_local);
-            any_bounds = true;
-        }
-
-        col_start = col_end;
-    }
-
-    debug_assert_eq!(
-        penalties_global.len(),
-        nullspace_dims_global.len(),
-        "spatially reparameterized smooth penalty/nullspace bookkeeping diverged"
-    );
-    debug_assert_eq!(
-        penalties_global.len(),
-        penaltyinfo_global.len(),
-        "spatially reparameterized smooth penalty metadata bookkeeping diverged"
-    );
-
-    Ok(SmoothDesign {
-        design,
-        penalties: penalties_global,
-        nullspace_dims: nullspace_dims_global,
-        penaltyinfo: penaltyinfo_global,
-        dropped_penaltyinfo: dropped_penaltyinfo_global,
-        terms: terms_out,
-        coefficient_lower_bounds: if any_bounds {
-            Some(coefficient_lower_bounds)
-        } else {
-            None
-        },
-        linear_constraints: if linear_constraintsrows.is_empty() {
-            None
-        } else {
-            let mut a = Array2::<f64>::zeros((linear_constraintsrows.len(), total_p));
-            for (i, row) in linear_constraintsrows.iter().enumerate() {
-                a.row_mut(i).assign(row);
-            }
-            Some(LinearInequalityConstraints {
-                a,
-                b: Array1::from_vec(linear_constraints_b),
-            })
-        },
-    })
+    Ok(())
 }
+
 
 fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
@@ -10246,19 +10146,20 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         ));
     }
 
-    // Pilot-fit pathway: when n is large and pilot_subsample_size is set,
-    // run κ optimization on a spatially stratified subsample, then fit the
-    // full dataset with the discovered geometry frozen.
-    if let Some(pilot_m) = kappa_options.pilot_subsample_size {
-        if n > pilot_m * 2 {
-            log::info!(
-                "[spatial-kappa] pilot-fit: subsampling {} from {} observations for κ optimization",
-                pilot_m,
-                n,
-            );
-            let indices = stratified_spatial_subsample(data, spec, pilot_m, 42);
+    // Automatic pilot-fit: when n exceeds the threshold, optimize κ on a
+    // spatially stratified subsample, then fit the full dataset once with
+    // frozen geometry. This avoids O(n·k) dense basis rebuilds per κ proposal.
+    if kappa_options.pilot_subsample_threshold > 0 && n > kappa_options.pilot_subsample_threshold * 2 {
+        let pilot_n = kappa_options.pilot_subsample_threshold;
+        log::info!(
+            "[spatial-kappa] n={} exceeds pilot threshold {}; running κ optimization on {}-observation subsample",
+            n, pilot_n * 2, pilot_n
+        );
+        let indices = stratified_spatial_subsample(data, spec, pilot_n, 42);
+        let actual_pilot_n = indices.len();
 
-            let mut data_pilot = Array2::<f64>::zeros((indices.len(), data.ncols()));
+        if actual_pilot_n >= 100 {
+            let mut data_pilot = Array2::<f64>::zeros((actual_pilot_n, data.ncols()));
             for (new_row, &orig_row) in indices.iter().enumerate() {
                 data_pilot.row_mut(new_row).assign(&data.row(orig_row));
             }
@@ -10267,7 +10168,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             let offset_pilot = indices.iter().map(|&i| offset[i]).collect::<Array1<f64>>();
 
             let mut pilot_kappa_options = kappa_options.clone();
-            pilot_kappa_options.pilot_subsample_size = None;
+            pilot_kappa_options.pilot_subsample_threshold = 0;
 
             let pilot_result = fit_term_collectionwith_spatial_length_scale_optimization(
                 data_pilot.view(),
@@ -10281,7 +10182,8 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             )?;
 
             log::info!(
-                "[spatial-kappa] pilot-fit complete; fitting full dataset with frozen geometry",
+                "[spatial-kappa] pilot fit complete; fitting full n={} with frozen geometry",
+                n
             );
 
             let frozen_spec = pilot_result.resolvedspec;
@@ -10302,6 +10204,10 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 adaptive_diagnostics: full_result.adaptive_diagnostics,
             });
         }
+        log::info!(
+            "[spatial-kappa] pilot subsample too small ({}); using full data path",
+            actual_pilot_n
+        );
     }
 
     let best = fit_term_collection_forspec(
