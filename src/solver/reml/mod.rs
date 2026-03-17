@@ -1898,9 +1898,10 @@ pub(crate) struct RemlState<'a> {
     x: DesignMatrix,
     weights: ArrayView1<'a, f64>,
     offset: Array1<f64>,
-    // Original penalty matrices S_k (p × p), ρ-independent basis
-    s_full_list: Arc<Vec<Array2<f64>>>,
-    pub(crate) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
+    /// Canonicalized block-local penalties with pre-computed roots.
+    canonical_penalties: Arc<Vec<crate::construction::CanonicalPenalty>>,
+    /// Legacy global penalty roots (rank_k x p), derived from canonical_penalties.
+    pub(crate) rs_list: Vec<Array2<f64>>,
     balanced_penalty_root: Array2<f64>,
     reparam_invariant: ReparamInvariant,
     sparse_penalty_blocks: Option<Arc<Vec<SparsePenaltyBlock>>>,

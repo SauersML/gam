@@ -47,10 +47,14 @@ use gam::inference::data::{
 };
 use gam::inference::formula_dsl::{
     LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, SmoothKind,
-    effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
+    build_smooth_basis, build_termspec, col_minmax, effectivelinkwiggle_formulaspec,
+    enable_scale_dimensions, formula_rhs_text, heuristic_centers, heuristic_knots,
+    heuristic_knots_for_column, inverse_link_supports_joint_wiggle,
     linkchoice_supports_joint_wiggle, linkname, option_bool, option_f64, option_usize,
-    option_usize_any, parse_formula, parse_link_choice, parse_linkwiggle_formulaspec,
-    parse_matching_auxiliary_formula, parse_surv_response, validate_auxiliary_formula_controls,
+    option_usize_any, parse_countwith_basis_alias, parse_duchon_order, parse_duchon_power,
+    parse_formula, parse_link_choice, parse_linkwiggle_formulaspec, parse_matern_nu,
+    parse_matching_auxiliary_formula, parse_ps_internal_knots, parse_surv_response, resolve_col,
+    unique_count_column, validate_auxiliary_formula_controls,
 };
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
@@ -66,7 +70,7 @@ use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
-    build_term_collection_design,
+    build_term_collection_design, weighted_blockwise_penalty_sum,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale::{
@@ -310,12 +314,12 @@ struct FitArgs {
     /// `scale_dims=true` / `scale_dims=false`, which overrides this global flag.
     #[arg(long = "scale-dimensions", default_value_t = false)]
     scale_dimensions: bool,
-    /// Subsample size for pilot-fit spatial length-scale optimization.
-    /// When set and n exceeds 2x this value, κ/anisotropy optimization
-    /// runs on a spatially stratified subsample, then the full dataset
-    /// is fit with frozen geometry. Recommended: 5000-10000 for biobank data.
-    #[arg(long, value_name = "N")]
-    pilot_subsample_size: Option<usize>,
+    /// Subsample threshold for automatic pilot-fit spatial length-scale optimization.
+    /// When n exceeds 2x this value, κ/anisotropy optimization runs on a
+    /// spatially stratified subsample, then the full dataset is fit with
+    /// frozen geometry. Set to 0 to disable.
+    #[arg(long, value_name = "N", default_value_t = 10_000)]
+    pilot_subsample_threshold: usize,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -366,7 +370,7 @@ struct SurvivalArgs {
     sigma_time_k: Option<usize>,
     sigma_time_degree: usize,
     scale_dimensions: bool,
-    pilot_subsample_size: Option<usize>,
+    pilot_subsample_threshold: usize,
     out: Option<PathBuf>,
     logslope_formula: Option<String>,
     z_column: Option<String>,
@@ -582,7 +586,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             sigma_time_k: args.sigma_time_k,
             sigma_time_degree: args.sigma_time_degree,
             scale_dimensions: args.scale_dimensions,
-            pilot_subsample_size: args.pilot_subsample_size,
+            pilot_subsample_threshold: args.pilot_subsample_threshold,
             out: args.out.clone(),
             logslope_formula: args.logslope_formula.clone(),
             z_column: args.z_column.clone(),
@@ -845,9 +849,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
-        if let Some(m) = args.pilot_subsample_size {
-            opts.pilot_subsample_size = Some(m);
-        }
+        opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
         opts
     };
     let route_flexible_through_standard = link_choice.as_ref().is_some_and(|choice| {
@@ -973,9 +975,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         let ext = optimize_external_design(
             y.view(),
             weights.view(),
-            design.design.view(),
+            design.design.clone(),
             offset.view(),
-            design.global_penalties(),
+            design.penalties.clone(),
             &ExternalOptimOptions {
                 family,
                 mixture_link: None,
@@ -3244,13 +3246,12 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?
     } else {
         progress.set_stage("diagnose", "refitting model for alo");
-        let global_penalties = design.global_penalties();
         let fit = fit_gam(
-            design.design.view(),
+            design.design.clone(),
             y.view(),
             weights.view(),
             offset.view(),
-            &global_penalties,
+            &design.penalties,
             family,
             &FitOptions {
                 mixture_link: None,
@@ -4942,9 +4943,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
         let kappa_options = {
             let mut opts = SpatialLengthScaleOptimizationOptions::default();
-            if let Some(m) = args.pilot_subsample_size {
-                opts.pilot_subsample_size = Some(m);
-            }
+            opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
             opts
         };
         let buildtermspec = |inverse_link: InverseLink| -> SurvivalLocationScaleTermSpec {
@@ -5195,9 +5194,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         let kappa_options = {
             let mut opts = SpatialLengthScaleOptimizationOptions::default();
-            if let Some(m) = args.pilot_subsample_size {
-                opts.pilot_subsample_size = Some(m);
-            }
+            opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
             opts
         };
         let options = gam::families::custom_family::BlockwiseFitOptions {
@@ -6021,13 +6018,13 @@ fn run_sample_standard(
     let weights = Array1::ones(data.nrows());
     let offset = Array1::zeros(data.nrows());
     progress.set_stage("sample", "refitting mode for hmc");
-    let global_penalties = design.global_penalties();
+    let p = design.design.ncols();
     let fit = fit_gam(
         design.design.view(),
         y.view(),
         weights.view(),
         offset.view(),
-        &global_penalties,
+        &design.penalties,
         family,
         &FitOptions {
             mixture_link: None,
@@ -6045,7 +6042,7 @@ fn run_sample_standard(
     )
     .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
     progress.advance_workflow(3);
-    let penalty = weighted_penalty_matrix(&global_penalties, fit.lambdas.view())?;
+    let penalty = weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
 
     run_nuts_sampling_flattened_family(
         family,
@@ -6257,8 +6254,9 @@ fn run_sample_standard_link_wiggle(
     let scale = fit.standard_deviation;
 
     progress.set_stage("sample", "running link-wiggle NUTS");
+    let wiggle_nuts_dense = design.design.as_dense_cow();
     run_link_wiggle_nuts_sampling(
-        design.design.view(),
+        wiggle_nuts_dense.view(),
         y.view(),
         weights.view(),
         penalty_base.view(),

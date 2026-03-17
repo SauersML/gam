@@ -1308,7 +1308,7 @@ pub fn optimize_external_design<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<Array2<f64>>,
+    s_list: Vec<BlockwisePenalty>,
     opts: &ExternalOptimOptions,
 ) -> Result<ExternalOptimResult, EstimationError>
 where
@@ -1324,7 +1324,7 @@ pub fn optimize_external_designwith_heuristic_lambdas<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<Array2<f64>>,
+    s_list: Vec<BlockwisePenalty>,
     heuristic_lambdas: Option<&[f64]>,
     opts: &ExternalOptimOptions,
 ) -> Result<ExternalOptimResult, EstimationError>
@@ -1348,7 +1348,7 @@ fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<Array2<f64>>,
+    s_list: Vec<BlockwisePenalty>,
     heuristic_lambdas: Option<&[f64]>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     opts: &ExternalOptimOptions,
@@ -2300,43 +2300,50 @@ where
     if opts.compute_inference {
         // EDF by block using stabilized H and penalty roots in transformed basis.
         let h = &pirls_res.stabilizedhessian_transformed;
-        let stable_solver = StableSolver::new("edf stabilized hessian");
-        let mut planner = RidgePlanner::new(h);
-        let cond_display = planner
-            .cond_estimate()
-            .map(|c| format!("{c:.2e}"))
-            .unwrap_or_else(|| "unavailable".to_string());
-        let factor = loop {
-            let ridge = planner.ridge();
-            let candidate = addridge(h, ridge);
-            if let Ok(f) = stable_solver.factorize(&candidate) {
-                if ridge > 0.0 {
-                    log::warn!(
-                        "Stabilized Hessian factorized with ridge {:.3e} (cond ≈ {})",
-                        ridge,
-                        cond_display
-                    );
+        // Sparse-aware factorization with ridge retry — no densification.
+        // Uses SymmetricMatrix::factorize() -> sparse Cholesky for sparse,
+        // dense Cholesky for dense.
+        let factor = {
+            let scale = h.max_abs_diag();
+            let min_step = scale * 1e-10;
+            let mut ridge = 0.0_f64;
+            let mut attempts = 0_usize;
+            loop {
+                let candidate = if ridge > 0.0 {
+                    match h.addridge(ridge) {
+                        Ok(c) => c,
+                        Err(_) => h.clone(),
+                    }
+                } else {
+                    h.clone()
+                };
+                if let Ok(f) = candidate.factorize() {
+                    if ridge > 0.0 {
+                        log::warn!(
+                            "Stabilized Hessian factorized with ridge {:.3e}",
+                            ridge,
+                        );
+                    }
+                    break f;
                 }
-                break f;
+                attempts += 1;
+                if attempts >= MAX_FACTORIZATION_ATTEMPTS {
+                    return Err(EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    });
+                }
+                ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
             }
-            if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
-                log::warn!(
-                    "Hessian factorization failed after ridge {:.3e} (cond ≈ {})",
-                    ridge,
-                    cond_display
-                );
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                });
-            }
-            planner.bumpwith_matrix(h);
         };
         let mut traces = vec![0.0f64; k];
         for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
             let ekt_arr = rs.t().to_owned();
-            let ektview = FaerArrayView::new(&ekt_arr);
-            let x_sol = factor.solve(ektview.as_ref());
-            let frob = faer_frob_inner(x_sol.as_ref(), ektview.as_ref());
+            let sol = factor.solvemulti(&ekt_arr).map_err(|_| {
+                EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                }
+            })?;
+            let frob: f64 = sol.iter().zip(ekt_arr.iter()).map(|(&a, &b)| a * b).sum();
             traces[kk] = lambdas[kk] * frob;
         }
         edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
@@ -2501,9 +2508,9 @@ where
         )));
     }
     let p = x.ncols();
-    validate_full_size_penalties(&s_list, p, context)?;
+    validate_blockwise_penalties(&s_list, p, context)?;
     let (s_list, active_nullspace_dims) =
-        canonicalize_active_penalties(s_list, &opts.nullspace_dims, context)?;
+        canonicalize_active_blockwise_penalties(s_list, &opts.nullspace_dims, context)?;
     if rho_dim != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
             "rho_dim mismatch: rho_dim={}, active_penalties={}",
@@ -2587,7 +2594,7 @@ where
         }
     }
 
-    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_list);
+    let conditioning = ParametricColumnConditioning::infer_from_blockwise_penalties(&x, &s_list);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
@@ -4028,7 +4035,7 @@ pub fn fit_gamwith_heuristic_lambdas<X>(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    s_list: &[Array2<f64>],
+    s_list: &[BlockwisePenalty],
     heuristic_lambdas: Option<&[f64]>,
     family: crate::types::LikelihoodFamily,
     opts: &FitOptions,
@@ -4121,7 +4128,7 @@ where
             "fit_gam external design path does not support RoystonParmar; use survival training APIs".to_string(),
         ));
     }
-    validate_full_size_penalties(s_list, x.ncols(), "fit_gam")?;
+    validate_blockwise_penalties(s_list, x.ncols(), "fit_gam")?;
     let mut ext_opts = ExternalOptimOptions {
         family: resolved_family,
         mixture_link: opts.mixture_link.clone(),
@@ -4373,8 +4380,8 @@ where
     }
 
     let p = x.ncols();
-    validate_full_size_penalties(s_list, p, "evaluate_externalgradients")?;
-    let (svec, active_nullspace_dims) = canonicalize_active_penalties(
+    validate_blockwise_penalties(s_list, p, "evaluate_externalgradients")?;
+    let (svec, active_nullspace_dims) = canonicalize_active_blockwise_penalties(
         s_list.to_vec(),
         &opts.nullspace_dims,
         "evaluate_externalgradients",
@@ -4392,7 +4399,7 @@ where
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
-    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &svec);
+    let conditioning = ParametricColumnConditioning::infer_from_blockwise_penalties(&x, &svec);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
@@ -4441,8 +4448,8 @@ where
     }
 
     let p = x.ncols();
-    validate_full_size_penalties(s_list, p, "evaluate_externalcost_andridge")?;
-    let (svec, active_nullspace_dims) = canonicalize_active_penalties(
+    validate_blockwise_penalties(s_list, p, "evaluate_externalcost_andridge")?;
+    let (svec, active_nullspace_dims) = canonicalize_active_blockwise_penalties(
         s_list.to_vec(),
         &opts.nullspace_dims,
         "evaluate_externalcost_andridge",
@@ -4460,7 +4467,7 @@ where
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
-    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &svec);
+    let conditioning = ParametricColumnConditioning::infer_from_blockwise_penalties(&x, &svec);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
@@ -5003,9 +5010,10 @@ mod fd_policy_tests {
             }
         }
 
+        let pht_dense = pirls_result.penalized_hessian_transformed.to_dense();
         let max_abs_diff = true_jacobian
             .iter()
-            .zip(pirls_result.penalized_hessian_transformed.iter())
+            .zip(pht_dense.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         assert!(

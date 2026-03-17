@@ -1614,6 +1614,10 @@ pub struct PenaltyCandidate {
     pub nullspace_dim_hint: usize,
     pub source: PenaltySource,
     pub normalization_scale: f64,
+    /// Optional Kronecker factors whose product equals `matrix`.
+    /// When present, spectral decomposition can be done per-factor
+    /// (O(Σ q_j³) instead of O((Π q_j)³)).
+    pub kronecker_factors: Option<Vec<Array2<f64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3174,6 +3178,7 @@ pub fn build_bspline_basis_1d(
         nullspace_dim_hint: 0,
         source: PenaltySource::Primary,
         normalization_scale: 1.0,
+        kronecker_factors: None,
     }];
     if spec.double_penalty {
         penalties_raw.push(PenaltyCandidate {
@@ -3183,6 +3188,7 @@ pub fn build_bspline_basis_1d(
             nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: 1.0,
+            kronecker_factors: None,
         });
     }
 
@@ -3207,6 +3213,7 @@ pub fn build_bspline_basis_1d(
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale,
+                    kronecker_factors: None,
                 })
             },
         )
@@ -3564,6 +3571,7 @@ pub fn build_thin_plate_basiswithworkspace(
         nullspace_dim_hint: tps.num_polynomial_basis,
         source: PenaltySource::Primary,
         normalization_scale: 1.0,
+        kronecker_factors: None,
     }];
     if spec.double_penalty {
         candidates.push(PenaltyCandidate {
@@ -3571,6 +3579,7 @@ pub fn build_thin_plate_basiswithworkspace(
             nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: 1.0,
+            kronecker_factors: None,
         });
     }
     if let Some(z) = identifiability_transform.as_ref() {
@@ -3584,6 +3593,7 @@ pub fn build_thin_plate_basiswithworkspace(
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale,
+                    kronecker_factors: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3600,6 +3610,7 @@ pub fn build_thin_plate_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
         },
+        kronecker_factored: None,
     })
 }
 
@@ -4575,18 +4586,21 @@ fn build_matern_operator_penalty_aniso_derivatives(
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s1_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s2_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
+            kronecker_factors: None,
         },
     ];
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
@@ -5067,18 +5081,21 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s1_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
+            kronecker_factors: None,
         },
         PenaltyCandidate {
             matrix: s2_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
+            kronecker_factors: None,
         },
     ];
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
@@ -6915,6 +6932,7 @@ pub fn build_matern_basiswithworkspace(
             input_scales: None,
             aniso_log_scales: aniso,
         },
+        kronecker_factored: None,
     })
 }
 
@@ -9940,6 +9958,7 @@ pub fn build_duchon_basiswithworkspace(
             input_scales: None,
             aniso_log_scales: aniso,
         },
+        kronecker_factored: None,
     })
 }
 

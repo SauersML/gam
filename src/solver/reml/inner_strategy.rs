@@ -1,5 +1,6 @@
 use super::*;
 use crate::pirls::PirlsWorkspace;
+use crate::terms::smooth::{BlockwisePenalty, weighted_blockwise_penalty_sum};
 use crate::types::LinkFunction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

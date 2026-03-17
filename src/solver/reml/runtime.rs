@@ -3,11 +3,27 @@ use crate::linalg::utils::{
     boundary_hit_indices, symmetric_spectrum_condition_number,
 };
 use crate::pirls::PirlsWorkspace;
+use crate::terms::smooth::{BlockwisePenalty, penalties_to_global, weighted_blockwise_penalty_sum};
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 const TK_BLOCK_SIZE: usize = 128;
+
+/// Expand a local penalty root (rank_k × block_p) into a global root
+/// (rank_k × p_total) by scattering columns into the correct positions.
+fn root_local_to_global(
+    local_root: Array2<f64>,
+    col_range: Range<usize>,
+    p_total: usize,
+) -> Array2<f64> {
+    let rank = local_root.nrows();
+    let mut global = Array2::<f64>::zeros((rank, p_total));
+    global
+        .slice_mut(s![.., col_range.start..col_range.end])
+        .assign(&local_root);
+    global
+}
 
 struct TkCorrectionTerms {
     value: f64,
@@ -606,16 +622,19 @@ impl<'a> RemlState<'a> {
                     .unwrap_or_else(|_| Array1::zeros(rhs.len()))
             };
 
-            // Penalty roots from s_full_list via eigendecomposition.
+            // Penalty roots from s_full_list via blockwise eigendecomposition.
             let penalty_roots: Vec<Array2<f64>> = self
                 .s_full_list
                 .iter()
                 .enumerate()
-                .map(|(idx, s_k)| {
-                    super::unified::penalty_matrix_root(s_k).unwrap_or_else(|_| {
-                        log::warn!("penalty root for S_{idx} failed in sparse TK");
-                        Array2::zeros((0, s_k.ncols()))
-                    })
+                .map(|(idx, bp)| {
+                    match super::unified::penalty_matrix_root(&bp.local) {
+                        Ok(local_root) => root_local_to_global(local_root, bp.col_range.clone(), self.p),
+                        Err(_) => {
+                            log::warn!("penalty root for S_{idx} failed in sparse TK");
+                            Array2::zeros((0, self.p))
+                        }
+                    }
                 })
                 .collect();
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
@@ -936,7 +955,7 @@ impl<'a> RemlState<'a> {
         x: X,
         weights: ArrayView1<'a, f64>,
         offset: ArrayView1<'_, f64>,
-        s_list: Vec<Array2<f64>>,
+        canonical_penalties: Vec<crate::construction::CanonicalPenalty>,
         p: usize,
         config: &'a RemlConfig,
         nullspace_dims: Option<Vec<usize>>,
@@ -951,7 +970,7 @@ impl<'a> RemlState<'a> {
             x,
             weights,
             offset,
-            Arc::new(s_list),
+            Arc::new(canonical_penalties),
             p,
             config,
             nullspace_dims,
@@ -965,7 +984,7 @@ impl<'a> RemlState<'a> {
         x: X,
         weights: ArrayView1<'a, f64>,
         offset: ArrayView1<'_, f64>,
-        s_list: Arc<Vec<Array2<f64>>>,
+        canonical_penalties: Arc<Vec<crate::construction::CanonicalPenalty>>,
         p: usize,
         config: &'a RemlConfig,
         nullspace_dims: Option<Vec<usize>>,
@@ -975,11 +994,15 @@ impl<'a> RemlState<'a> {
     where
         X: Into<DesignMatrix>,
     {
-        // Pre-compute penalty square roots once
-        let rs_list = compute_penalty_square_roots(&s_list)?;
+        // Derive global roots (rank_k x p) from canonical penalties for backward
+        // compatibility with code paths that need the p-wide form.
+        let rs_list: Vec<Array2<f64>> = canonical_penalties
+            .iter()
+            .map(|cp| cp.global_root())
+            .collect();
         let x = x.into();
 
-        let expected_len = s_list.len();
+        let expected_len = canonical_penalties.len();
         let nullspace_dims = match nullspace_dims {
             Some(dims) => {
                 if dims.len() != expected_len {
@@ -994,16 +1017,25 @@ impl<'a> RemlState<'a> {
             None => vec![0; expected_len],
         };
 
-        let balanced_penalty_root = create_balanced_penalty_root(&s_list, p)?;
-        let reparam_invariant = precompute_reparam_invariant(&rs_list, p)?;
-        let sparse_penalty_blocks = build_sparse_penalty_blocks(&s_list, &rs_list)?.map(Arc::new);
+        let balanced_penalty_root =
+            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
+        let reparam_invariant =
+            precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
+
+        // Build sparse penalty blocks from global forms (needed for sparse Cholesky).
+        let s_list_global: Vec<Array2<f64>> = canonical_penalties
+            .iter()
+            .map(|cp| cp.global_penalty())
+            .collect();
+        let sparse_penalty_blocks =
+            build_sparse_penalty_blocks(&s_list_global, &rs_list)?.map(Arc::new);
 
         Ok(Self {
             y,
             x,
             weights,
             offset: offset.to_owned(),
-            s_full_list: s_list,
+            canonical_penalties,
             rs_list,
             balanced_penalty_root,
             reparam_invariant,
@@ -1619,12 +1651,8 @@ impl<'a> RemlState<'a> {
             .clone();
 
         let lambdas = rho.mapv(f64::exp);
-        let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
-        for (k, s_k) in self.s_full_list.iter().enumerate() {
-            if k < lambdas.len() && lambdas[k] != 0.0 {
-                s_lambda.scaled_add(lambdas[k], s_k);
-            }
-        }
+        let lambdas_vec: Vec<f64> = lambdas.to_vec();
+        let mut s_lambda = weighted_blockwise_penalty_sum(&self.s_full_list, &lambdas_vec, self.p);
         // Add log-barrier Hessian diagonal for monotonicity-constrained
         // coefficients (sparse path uses original coordinates).
         if let Some(ref lin) = self.linear_constraints {
@@ -2670,17 +2698,18 @@ impl<'a> RemlState<'a> {
             hessian_op.active_rank()
         );
 
-        // Penalty roots from s_full_list via eigendecomposition.
+        // Penalty roots from s_full_list via blockwise eigendecomposition.
         let penalty_roots: Vec<Array2<f64>> = self
             .s_full_list
             .iter()
             .enumerate()
-            .map(|(idx, s_k)| {
-                penalty_matrix_root(s_k).map_err(|e| {
+            .map(|(idx, bp)| {
+                let local_root = penalty_matrix_root(&bp.local).map_err(|e| {
                     EstimationError::RemlOptimizationFailed(format!(
                         "penalty root for S_{idx} failed: {e}"
                     ))
-                })
+                })?;
+                Ok(root_local_to_global(local_root, bp.col_range.clone(), self.p))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -2768,17 +2797,18 @@ impl<'a> RemlState<'a> {
             Box::new(op)
         };
 
-        // Penalty roots from s_full_list via eigendecomposition.
+        // Penalty roots from s_full_list via blockwise eigendecomposition.
         let penalty_roots: Vec<Array2<f64>> = self
             .s_full_list
             .iter()
             .enumerate()
-            .map(|(idx, s_k)| {
-                penalty_matrix_root(s_k).map_err(|e| {
+            .map(|(idx, bp)| {
+                let local_root = penalty_matrix_root(&bp.local).map_err(|e| {
                     EstimationError::RemlOptimizationFailed(format!(
                         "penalty root for S_{idx} failed: {e}"
                     ))
-                })
+                })?;
+                Ok(root_local_to_global(local_root, bp.col_range.clone(), self.p))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -3159,12 +3189,13 @@ impl<'a> RemlState<'a> {
             .s_full_list
             .iter()
             .enumerate()
-            .map(|(idx, s_k)| {
-                penalty_matrix_root(s_k).map_err(|e| {
+            .map(|(idx, bp)| {
+                let local_root = penalty_matrix_root(&bp.local).map_err(|e| {
                     EstimationError::RemlOptimizationFailed(format!(
                         "penalty root for S_{idx} failed: {e}"
                     ))
-                })
+                })?;
+                Ok(root_local_to_global(local_root, bp.col_range.clone(), self.p))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
