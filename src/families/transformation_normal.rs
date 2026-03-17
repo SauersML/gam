@@ -25,10 +25,9 @@ use crate::construction::kronecker_product;
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyWarmStart, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    build_block_spatial_psi_derivatives, custom_family_outer_capability,
-    evaluate_custom_family_joint_hyper, fit_custom_family,
+    CustomFamilyWarmStart, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
+    custom_family_outer_capability, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::families::gamlss::initializewiggle_knots_from_seed;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
@@ -205,8 +204,13 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_deriv.ncols(), p_total);
 
         // ----- 3. Tensor penalties (dense + Kronecker-separable) -----
-        let tensor_penalties =
-            build_tensor_penalties_kronecker(&resp_penalties, covariate_penalties, p_resp, p_cov, config)?;
+        let tensor_penalties = build_tensor_penalties_kronecker(
+            &resp_penalties,
+            covariate_penalties,
+            p_resp,
+            p_cov,
+            config,
+        )?;
 
         // ----- 4. Monotonicity constraints -----
         let monotonicity_constraints = build_monotonicity_constraints(
@@ -220,13 +224,8 @@ impl TransformationNormalFamily {
         )?;
 
         // ----- 5. Warm start -----
-        let initial_beta = compute_warm_start(
-            response,
-            covariate_design,
-            p_resp,
-            p_cov,
-            warm_start,
-        )?;
+        let initial_beta =
+            compute_warm_start(response, covariate_design, p_resp, p_cov, warm_start)?;
 
         // ----- 6. Initial log-lambdas (one per penalty, start at 0.0) -----
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
@@ -299,8 +298,13 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_deriv.ncols(), p_total);
 
         // Tensor penalties (dense + Kronecker-separable).
-        let tensor_penalties =
-            build_tensor_penalties_kronecker(&response_penalties, covariate_penalties, p_resp, p_cov, config)?;
+        let tensor_penalties = build_tensor_penalties_kronecker(
+            &response_penalties,
+            covariate_penalties,
+            p_resp,
+            p_cov,
+            config,
+        )?;
 
         // Monotonicity constraints.
         // Extract response values from column 1 of the value basis (which stores y)
@@ -353,7 +357,12 @@ impl TransformationNormalFamily {
             name: self.block_name.clone(),
             design: DesignMatrix::Dense(self.x_val.clone()),
             offset: Array1::zeros(self.x_val.nrows()),
-            penalties: self.tensor_penalties.clone(),
+            penalties: self
+                .tensor_penalties
+                .iter()
+                .cloned()
+                .map(PenaltyMatrix::Dense)
+                .collect(),
             nullspace_dims: vec![],
             initial_log_lambdas: self.initial_log_lambdas.clone(),
             initial_beta: Some(self.initial_beta.clone()),
@@ -444,10 +453,7 @@ impl TransformationNormalFamily {
 // ---------------------------------------------------------------------------
 
 impl CustomFamily for TransformationNormalFamily {
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 1 {
             return Err(format!(
                 "TransformationNormalFamily expects 1 block, got {}",
@@ -500,10 +506,7 @@ impl CustomFamily for TransformationNormalFamily {
         })
     }
 
-    fn log_likelihood_only(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<f64, String> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 1 {
             return Err("expected 1 block".to_string());
         }
@@ -652,7 +655,9 @@ impl CustomFamily for TransformationNormalFamily {
             let xvt_xvp = self.x_val_kron.weighted_cross(&Array1::ones(n), x_val_psi);
             let sym_val = &xvt_xvp + &xvt_xvp.t();
 
-            let xdt_xdp = self.x_deriv_kron.weighted_cross(&inv_h_prime_sq, &*x_deriv_psi);
+            let xdt_xdp = self
+                .x_deriv_kron
+                .weighted_cross(&inv_h_prime_sq, &*x_deriv_psi);
             let sym_deriv = &xdt_xdp + &xdt_xdp.t();
 
             let mut w_cubic = Array1::zeros(n);
@@ -683,7 +688,16 @@ impl CustomFamily for TransformationNormalFamily {
 fn build_response_basis(
     response: &Array1<f64>,
     config: &TransformationNormalConfig,
-) -> Result<(Array2<f64>, Array2<f64>, Vec<Array2<f64>>, Array1<f64>, Array2<f64>), String> {
+) -> Result<
+    (
+        Array2<f64>,
+        Array2<f64>,
+        Vec<Array2<f64>>,
+        Array1<f64>,
+        Array2<f64>,
+    ),
+    String,
+> {
     let n = response.len();
     if n < 4 {
         return Err(format!("need at least 4 observations, got {n}"));
@@ -726,7 +740,7 @@ fn build_response_basis(
     let raw_deriv = raw_deriv_basis.as_ref().clone();
 
     // --- Apply deviation transform: dev = raw · Z ---
-    let dev_val = raw_val.dot(&transform);   // n × dev_dim
+    let dev_val = raw_val.dot(&transform); // n × dev_dim
     let dev_deriv = raw_deriv.dot(&transform); // n × dev_dim
 
     // --- Assemble full response basis: [1, y, dev] ---
@@ -743,12 +757,8 @@ fn build_response_basis(
     resp_deriv.column_mut(1).fill(1.0);
 
     // Columns 2..: deviations
-    resp_val
-        .slice_mut(s![.., 2..])
-        .assign(&dev_val);
-    resp_deriv
-        .slice_mut(s![.., 2..])
-        .assign(&dev_deriv);
+    resp_val.slice_mut(s![.., 2..]).assign(&dev_val);
+    resp_deriv.slice_mut(s![.., 2..]).assign(&dev_deriv);
 
     // --- Response-direction penalties ---
     // Penalty acts on the deviation part only; affine columns [1, y] are in the nullspace.
@@ -763,9 +773,7 @@ fn build_response_basis(
         let dev_pen = fast_ab(&fast_atb(&transform, &raw_pen), &transform); // dev_dim × dev_dim
         // Embed in full response basis: zeros for [1, y], dev_pen for deviation part.
         let mut full_pen = Array2::<f64>::zeros((p_resp, p_resp));
-        full_pen
-            .slice_mut(s![2.., 2..])
-            .assign(&dev_pen);
+        full_pen.slice_mut(s![2.., 2..]).assign(&dev_pen);
         penalties.push(full_pen);
         Ok(())
     };
@@ -887,8 +895,8 @@ enum KroneckerDesign {
     /// Factored form: (left_factor, right_factor) where the tensor product
     /// row i is `left[i,:] ⊗ right[i,:]`.
     Factored {
-        left: Array2<f64>,   // n × p_a
-        right: Array2<f64>,  // n × p_b
+        left: Array2<f64>,  // n × p_a
+        right: Array2<f64>, // n × p_b
     },
 }
 
@@ -1192,7 +1200,9 @@ fn subsample_covariate_rows(design: &Array2<f64>, max_rows: usize) -> Array2<f64
         return design.to_owned();
     }
     let step = n as f64 / max_rows as f64;
-    let indices: Vec<usize> = (0..max_rows).map(|i| ((i as f64 * step) as usize).min(n - 1)).collect();
+    let indices: Vec<usize> = (0..max_rows)
+        .map(|i| ((i as f64 * step) as usize).min(n - 1))
+        .collect();
     let mut out = Array2::zeros((indices.len(), design.ncols()));
     for (r, &idx) in indices.iter().enumerate() {
         out.row_mut(r).assign(&design.row(idx));
@@ -1352,7 +1362,10 @@ fn compute_warm_start(
         }
         None => {
             let mean = response.mean().unwrap_or(0.0);
-            let var = response.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>()
+            let var = response
+                .iter()
+                .map(|&v| (v - mean) * (v - mean))
+                .sum::<f64>()
                 / (n.max(2) - 1) as f64;
             let sd = var.sqrt().max(1e-12);
             let intercept = Array1::from_elem(n, -mean / sd);
@@ -1386,7 +1399,10 @@ fn compute_warm_start(
         Err(_) => {
             // Fallback: use global mean/SD.
             let mean = response.mean().unwrap_or(0.0);
-            let var = response.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>()
+            let var = response
+                .iter()
+                .map(|&v| (v - mean) * (v - mean))
+                .sum::<f64>()
                 / (n.max(2) - 1) as f64;
             let sd = var.sqrt().max(1e-12);
             // Only set the first covariate column (assumes intercept is first column).
@@ -1434,7 +1450,7 @@ fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
 /// - `s_psi`: the tensor penalty derivative (for the S_cov penalties that move with ψ)
 pub fn build_tensor_psi_derivatives(
     family: &TransformationNormalFamily,
-    covariate_psi_designs: &[Array2<f64>],    // per-axis ∂cov_design/∂ψ_a
+    covariate_psi_designs: &[Array2<f64>], // per-axis ∂cov_design/∂ψ_a
     covariate_psi_penalties: &[Vec<(usize, Array2<f64>)>], // per-axis [(cov_penalty_idx, ∂S_cov/∂ψ_a)]
     covariate_psi_second_designs: Option<&[Vec<Array2<f64>>]>, // per-axis-pair ∂²cov_design/∂ψ_a∂ψ_b
     covariate_psi_second_penalties: Option<&[Vec<Vec<(usize, Array2<f64>)>>]>,
@@ -1597,26 +1613,20 @@ pub fn fit_transformation_normal(
     let rho0 = Array1::<f64>::zeros(n_penalties);
     let rho_lower = Array1::<f64>::from_elem(n_penalties, -12.0);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
-    let kappa0 =
-        SpatialLogKappaCoords::from_length_scales_aniso(covariate_spec, &spatial_terms, kappa_options);
+    let kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(
+        covariate_spec,
+        &spatial_terms,
+        kappa_options,
+    );
     let kappa_dims = kappa0.dims_per_term().to_vec();
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&kappa_dims, kappa_options);
     let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&kappa_dims, kappa_options);
-    let joint_setup = ExactJointHyperSetup::new(
-        rho0,
-        rho_lower,
-        rho_upper,
-        kappa0,
-        kappa_lower,
-        kappa_upper,
-    );
+    let joint_setup =
+        ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
 
     // Check analytic derivative capability.
-    let analytic_psi_available = build_block_spatial_psi_derivatives(
-        covariate_data,
-        &boot_spec,
-        &boot_design,
-    )?.is_some();
+    let analytic_psi_available =
+        build_block_spatial_psi_derivatives(covariate_data, &boot_spec, &boot_design)?.is_some();
 
     // Build an initial family + blocks for capability probing.
     let boot_global_penalties = boot_design.global_penalties();
@@ -1666,21 +1676,22 @@ pub fn fit_transformation_normal(
     let ws = warm_start.cloned();
 
     // Helper: build family from prebuilt response basis + covariate design.
-    let make_family = |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
-        let gp = cov_design.global_penalties();
-        TransformationNormalFamily::from_prebuilt_response_basis(
-            rv.clone(),
-            rd.clone(),
-            rp.clone(),
-            rk.clone(),
-            rdeg,
-            rt.clone(),
-            &cov_design.design,
-            &gp,
-            &cfg,
-            ws.as_ref(),
-        )
-    };
+    let make_family =
+        |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
+            let gp = cov_design.global_penalties();
+            TransformationNormalFamily::from_prebuilt_response_basis(
+                rv.clone(),
+                rd.clone(),
+                rp.clone(),
+                rk.clone(),
+                rdeg,
+                rt.clone(),
+                &cov_design.design,
+                &gp,
+                &cfg,
+                ws.as_ref(),
+            )
+        };
 
     // Helper: build blocks from family + beta hint.
     let make_blocks = |family: &TransformationNormalFamily| -> Vec<ParameterBlockSpec> {
@@ -1722,38 +1733,46 @@ pub fn fit_transformation_normal(
             let blocks = make_blocks(&family);
 
             // Build covariate-side psi derivatives, then lift to tensor product space.
-            let cov_psi_derivs = build_block_spatial_psi_derivatives(
-                covariate_data,
-                &specs[0],
-                &designs[0],
-            )?
-            .ok_or_else(|| "missing covariate spatial psi derivatives for transformation model".to_string())?;
+            let cov_psi_derivs =
+                build_block_spatial_psi_derivatives(covariate_data, &specs[0], &designs[0])?
+                    .ok_or_else(|| {
+                        "missing covariate spatial psi derivatives for transformation model"
+                            .to_string()
+                    })?;
 
             // Extract covariate-space arrays for build_tensor_psi_derivatives.
-            let cov_psi_designs: Vec<Array2<f64>> = cov_psi_derivs.iter()
-                .map(|d| d.x_psi.clone())
-                .collect();
-            let cov_psi_penalties: Vec<Vec<(usize, Array2<f64>)>> = cov_psi_derivs.iter()
+            let cov_psi_designs: Vec<Array2<f64>> =
+                cov_psi_derivs.iter().map(|d| d.x_psi.clone()).collect();
+            let cov_psi_penalties: Vec<Vec<(usize, Array2<f64>)>> = cov_psi_derivs
+                .iter()
                 .map(|d| d.s_psi_components.clone().unwrap_or_default())
                 .collect();
 
             // Second-order design derivatives.
             let has_second_designs = cov_psi_derivs.iter().all(|d| d.x_psi_psi.is_some());
             let cov_psi_second_designs: Option<Vec<Vec<Array2<f64>>>> = if has_second_designs {
-                Some(cov_psi_derivs.iter()
-                    .map(|d| d.x_psi_psi.clone().unwrap_or_default())
-                    .collect())
+                Some(
+                    cov_psi_derivs
+                        .iter()
+                        .map(|d| d.x_psi_psi.clone().unwrap_or_default())
+                        .collect(),
+                )
             } else {
                 None
             };
 
             // Second-order penalty derivatives.
-            let has_second_penalties = cov_psi_derivs.iter().all(|d| d.s_psi_psi_components.is_some());
+            let has_second_penalties = cov_psi_derivs
+                .iter()
+                .all(|d| d.s_psi_psi_components.is_some());
             let cov_psi_second_penalties: Option<Vec<Vec<Vec<(usize, Array2<f64>)>>>> =
                 if has_second_penalties {
-                    Some(cov_psi_derivs.iter()
-                        .map(|d| d.s_psi_psi_components.clone().unwrap_or_default())
-                        .collect())
+                    Some(
+                        cov_psi_derivs
+                            .iter()
+                            .map(|d| d.s_psi_psi_components.clone().unwrap_or_default())
+                            .collect(),
+                    )
                 } else {
                     None
                 };
@@ -1803,4 +1822,3 @@ pub fn fit_transformation_normal(
         covariate_design: solved.designs.into_iter().next().unwrap(),
     })
 }
-

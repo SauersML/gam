@@ -4355,7 +4355,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         }
         retained_penalties.push(bp.to_global(p_total));
         retained_nullspace_dims.push(
-            baseline.design.nullspace_dims.get(idx).copied().unwrap_or(0),
+            baseline
+                .design
+                .nullspace_dims
+                .get(idx)
+                .copied()
+                .unwrap_or(0),
         );
         retained_log_lambdas.push(baseline.fit.lambdas[idx].max(1e-12).ln());
         retained_global_indices.push(idx);
@@ -8121,9 +8126,12 @@ fn try_exact_joint_spatial_length_scale_optimization(
 /// This is the analytic anisotropic path, giving Newton/BFGS quadratic convergence on the
 /// anisotropy parameters while jointly optimizing the smoothing parameters.
 ///
-/// The ψ_a are parameterized as log-scale coordinates with a sum-to-zero
-/// identifiability constraint (Σψ_a = 0) enforced at the `SpatialLogKappaCoords`
-/// level (the ψ values are shifted to sum to zero after each step).
+/// The ψ_a are parameterized as unconstrained log-scale coordinates. The
+/// decomposition into isotropic scale (ψ̄ = mean(ψ_a)) and anisotropy
+/// (η_a = ψ_a − ψ̄, with Ση_a = 0) happens only on writeback via
+/// `SpatialLogKappaCoords::apply_tospec`. The all-ones direction in ψ-space
+/// is NOT a gauge direction — it controls the identifiable isotropic scale
+/// κ = exp(ψ̄). No sum-to-zero constraint is enforced during optimization.
 fn try_exact_joint_spatial_aniso_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -8293,22 +8301,11 @@ fn try_exact_joint_spatial_aniso_optimization(
         eval_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx
             .eval_full(theta)
         {
-            Ok((cost, mut grad, mut hess)) => {
+            Ok((cost, grad, hess)) => {
                 ctx.track_best(theta, cost);
-                // Project gradient and Hessian onto the constraint tangent space
-                // before passing to the outer optimizer (response.md §4b).
-                //
-                // The ψ-block gradient is projected: g_ψ ← P g_ψ = g_ψ − mean(g_ψ)·1
-                // This ensures the optimizer never sees the gauge direction (the
-                // flat direction 1 in ψ-space that corresponds to uniform scaling).
-                //
-                // The ψ-block Hessian is projected: H_ψψ ← P H_ψψ P
-                // This removes the zero eigenvalue along the gauge direction,
-                // making the Hessian well-conditioned on the constraint manifold.
-                // No ψ projection: the all-ones direction in ψ-space is identifiable
-                // (it controls the isotropic scale κ = exp(ψ̄)). Projecting it out
-                // would prevent the optimizer from adjusting the global scale.
-                // The trust-region/regularization handles any near-singularity.
+                // No ψ projection: the all-ones direction in raw ψ-space is the
+                // real isotropic scale coordinate. Removing it would change the
+                // model, not just fix a gauge.
                 Ok(OuterEval {
                     cost,
                     gradient: grad,
@@ -8340,73 +8337,6 @@ fn try_exact_joint_spatial_aniso_optimization(
     // optimization. The decomposition into (ψ̄, η) happens in apply_tospec.
     let mut theta_star = result.rho;
     Ok(theta_star)
-}
-
-/// Enforce sum-to-zero constraint on ψ coordinates for identifiability, with
-/// gauge-correct compensation of the corresponding ρ_κ (isotropic log-scale)
-/// parameters.
-///
-/// # Gauge invariance (see response.md §4)
-///
-/// For anisotropic Duchon/Matérn bases, the kernel depends on ψ only through
-/// the *anisotropy ratios* η_a = ψ_a − ψ̄ (where ψ̄ = mean(ψ)) and the
-/// isotropic scale κ = exp(ψ̄). There is therefore a gauge direction in the
-/// *joint* (ρ_κ, ψ) parameter space:
-///
-///   (δρ_κ, δψ) = (−c, c·1)
-///
-/// Shifting all ψ_a by +c while shifting ρ_κ by −c leaves the model unchanged
-/// (the effective scale κ/λ combination is preserved).
-///
-/// **Bug fixed here**: the previous implementation projected ψ alone
-/// (ψ_a ← ψ_a − ψ̄) without the compensating shift ρ_κ ← ρ_κ + ψ̄. This
-/// changed the model by discarding the isotropic scale component. The correct
-/// gauge-fixing projection must operate on the joint (ρ_κ, ψ) space.
-///
-/// # Parameters
-///
-/// - `theta`: mutable θ = [ρ_0, ..., ρ_{M-1}, ψ_0, ..., ψ_{K-1}] vector
-/// - `rho_dim`: number of ρ (log-lambda) parameters at the start of θ
-/// - `dims_per_term`: per-spatial-term dimensionality (1 for iso, D for aniso)
-/// - `rho_kappa_indices`: for each spatial term, the index into the ρ block
-///   (0..rho_dim) of the corresponding isotropic scale penalty parameter.
-///   If `None`, only the ψ centering is performed (legacy behavior, NOT
-///   gauge-correct — callers should provide this whenever possible).
-fn enforce_psi_sum_to_zero(
-    theta: &mut Array1<f64>,
-    rho_dim: usize,
-    dims_per_term: &[usize],
-    rho_kappa_indices: Option<&[usize]>,
-) {
-    let mut offset = rho_dim;
-    for (term_slot, &d) in dims_per_term.iter().enumerate() {
-        if d > 1 {
-            let mean = theta.slice(s![offset..offset + d]).mean().unwrap_or(0.0);
-            if mean.abs() > 1e-15 {
-                // Shift ψ_a ← ψ_a − mean(ψ)  (center to sum-to-zero)
-                for a in 0..d {
-                    theta[offset + a] -= mean;
-                }
-                // Gauge-correct compensation: ρ_κ ← ρ_κ + mean(ψ)
-                // This absorbs the isotropic component that was removed from ψ,
-                // preserving the model's effective scale. Without this shift,
-                // the projection changes the model (response.md §4a).
-                if let Some(rho_indices) = rho_kappa_indices {
-                    if let Some(&rho_idx) = rho_indices.get(term_slot) {
-                        assert!(
-                            rho_idx < rho_dim,
-                            "rho_kappa_indices[{}]={} exceeds rho_dim={}",
-                            term_slot,
-                            rho_idx,
-                            rho_dim,
-                        );
-                        theta[rho_idx] += mean;
-                    }
-                }
-            }
-        }
-        offset += d;
-    }
 }
 
 /// Joint [ρ, κ] optimization for isotropic spatial terms using analytic
@@ -9314,23 +9244,24 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 .slice_mut(s![coeff_range.clone(), coeff_range.clone()])
                 .assign(penalty_local);
 
-            let full_bp =
-                self.design
-                    .penalties
-                    .get_mut(full_penalty_idx)
-                    .ok_or_else(|| {
-                        format!(
-                            "incremental realizer full penalty {} out of range for term {}",
-                            full_penalty_idx, term_idx
-                        )
-                    })?;
+            let full_bp = self
+                .design
+                .penalties
+                .get_mut(full_penalty_idx)
+                .ok_or_else(|| {
+                    format!(
+                        "incremental realizer full penalty {} out of range for term {}",
+                        full_penalty_idx, term_idx
+                    )
+                })?;
             // Update the blockwise penalty in-place: the col_range stays the
             // same (same smooth block in the global layout), only the local
             // matrix changes.
             full_bp.local.fill(0.0);
             let local_start = coeff_range.start;
             let local_end = coeff_range.end;
-            full_bp.local
+            full_bp
+                .local
                 .slice_mut(s![local_start..local_end, local_start..local_end])
                 .assign(penalty_local);
 
@@ -9590,7 +9521,6 @@ impl<'d> ExactJointDesignCache<'d> {
     fn designs(&self) -> Vec<&TermCollectionDesign> {
         self.realizers.iter().map(|r| r.design()).collect()
     }
-
 }
 
 pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn>(
@@ -9769,89 +9699,51 @@ where
     }
 
     let result = {
-    let mut obj = ClosureObjective {
-        state: &mut state,
-        cap: OuterCapability {
-            gradient: if analytic_joint_gradient_available {
-                Derivative::Analytic
-            } else {
-                Derivative::FiniteDifference
+        let mut obj = ClosureObjective {
+            state: &mut state,
+            cap: OuterCapability {
+                gradient: if analytic_joint_gradient_available {
+                    Derivative::Analytic
+                } else {
+                    Derivative::FiniteDifference
+                },
+                hessian: if analytic_outer_hessian_available {
+                    Derivative::Analytic
+                } else {
+                    Derivative::Unavailable
+                },
+                n_params: theta_dim,
+                all_penalty_like: false,
+                has_psi_coords: true,
+                fixed_point_available: false,
+                barrier_config: None,
             },
-            hessian: if analytic_outer_hessian_available {
-                Derivative::Analytic
-            } else {
-                Derivative::Unavailable
-            },
-            n_params: theta_dim,
-            all_penalty_like: false,
-            has_psi_coords: true,
-            fixed_point_available: false,
-            barrier_config: None,
-        },
-        cost_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
-            if let Some(cost) = ctx.cache.memoized_cost(theta) {
-                ctx.track_best(theta, cost);
-                return Ok(cost);
-            }
-            if ctx.cache.ensure_theta(theta).is_err() {
-                return Ok(f64::INFINITY);
-            }
-            let specs = collect_specs(&ctx.cache);
-            let designs = collect_designs(&ctx.cache);
-            match (&mut *exact_fn_cell.borrow_mut())(
-                &theta.slice(s![..rho_dim]).to_owned(),
-                &specs,
-                &designs,
-                false, // cost-only: skip outer Hessian
-            ) {
-                Ok((cost, grad, hess)) => {
-                    ctx.cache.store_eval((cost, grad, hess));
+            cost_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
+                if let Some(cost) = ctx.cache.memoized_cost(theta) {
                     ctx.track_best(theta, cost);
-                    Ok(cost)
+                    return Ok(cost);
                 }
-                Err(_) => Ok(f64::INFINITY),
-            }
-        },
-        eval_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
-            if let Some((cost, mut grad, hess)) = ctx.cache.memoized_eval(theta) {
-                ctx.track_best(theta, cost);
-                if !cost.is_finite() {
-                    return Ok(OuterEval::infeasible(theta.len()));
+                if ctx.cache.ensure_theta(theta).is_err() {
+                    return Ok(f64::INFINITY);
                 }
-                if grad.iter().any(|v| !v.is_finite()) {
-                    return Err(EstimationError::RemlOptimizationFailed(
-                        "n-block exact-joint gradient contained non-finite values".to_string(),
-                    ));
-                }
-                let hessian_result = match hess {
-                    Some(h)
-                        if h.nrows() == theta.len()
-                            && h.ncols() == theta.len()
-                            && h.iter().all(|v| v.is_finite()) =>
-                    {
-                        HessianResult::Analytic(h)
+                let specs = collect_specs(&ctx.cache);
+                let designs = collect_designs(&ctx.cache);
+                match (&mut *exact_fn_cell.borrow_mut())(
+                    &theta.slice(s![..rho_dim]).to_owned(),
+                    &specs,
+                    &designs,
+                    false, // cost-only: skip outer Hessian
+                ) {
+                    Ok((cost, grad, hess)) => {
+                        ctx.cache.store_eval((cost, grad, hess));
+                        ctx.track_best(theta, cost);
+                        Ok(cost)
                     }
-                    _ => HessianResult::Unavailable,
-                };
-                return Ok(OuterEval {
-                    cost,
-                    gradient: grad,
-                    hessian: hessian_result,
-                });
-            }
-            if ctx.cache.ensure_theta(theta).is_err() {
-                return Ok(OuterEval::infeasible(theta.len()));
-            }
-            let specs = collect_specs(&ctx.cache);
-            let designs = collect_designs(&ctx.cache);
-            match (&mut *exact_fn_cell.borrow_mut())(
-                &theta.slice(s![..rho_dim]).to_owned(),
-                &specs,
-                &designs,
-                analytic_outer_hessian_available,
-            ) {
-                Ok((cost, grad, hess)) => {
-                    ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
+                    Err(_) => Ok(f64::INFINITY),
+                }
+            },
+            eval_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
+                if let Some((cost, mut grad, hess)) = ctx.cache.memoized_eval(theta) {
                     ctx.track_best(theta, cost);
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
@@ -9871,32 +9763,71 @@ where
                         }
                         _ => HessianResult::Unavailable,
                     };
-                    Ok(OuterEval {
+                    return Ok(OuterEval {
                         cost,
                         gradient: grad,
                         hessian: hessian_result,
-                    })
+                    });
                 }
-                Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                    "n-block exact-joint derivative evaluation failed: {e}"
-                ))),
-            }
-        },
-        reset_fn: None::<fn(&mut &mut NBlockExactJointState<'_>)>,
-        efs_fn: None::<
-            fn(
-                &mut &mut NBlockExactJointState<'_>,
-                &Array1<f64>,
-            ) -> Result<EfsEval, EstimationError>,
-        >,
-    };
+                if ctx.cache.ensure_theta(theta).is_err() {
+                    return Ok(OuterEval::infeasible(theta.len()));
+                }
+                let specs = collect_specs(&ctx.cache);
+                let designs = collect_designs(&ctx.cache);
+                match (&mut *exact_fn_cell.borrow_mut())(
+                    &theta.slice(s![..rho_dim]).to_owned(),
+                    &specs,
+                    &designs,
+                    analytic_outer_hessian_available,
+                ) {
+                    Ok((cost, grad, hess)) => {
+                        ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
+                        ctx.track_best(theta, cost);
+                        if !cost.is_finite() {
+                            return Ok(OuterEval::infeasible(theta.len()));
+                        }
+                        if grad.iter().any(|v| !v.is_finite()) {
+                            return Err(EstimationError::RemlOptimizationFailed(
+                                "n-block exact-joint gradient contained non-finite values"
+                                    .to_string(),
+                            ));
+                        }
+                        let hessian_result = match hess {
+                            Some(h)
+                                if h.nrows() == theta.len()
+                                    && h.ncols() == theta.len()
+                                    && h.iter().all(|v| v.is_finite()) =>
+                            {
+                                HessianResult::Analytic(h)
+                            }
+                            _ => HessianResult::Unavailable,
+                        };
+                        Ok(OuterEval {
+                            cost,
+                            gradient: grad,
+                            hessian: hessian_result,
+                        })
+                    }
+                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                        "n-block exact-joint derivative evaluation failed: {e}"
+                    ))),
+                }
+            },
+            reset_fn: None::<fn(&mut &mut NBlockExactJointState<'_>)>,
+            efs_fn: None::<
+                fn(
+                    &mut &mut NBlockExactJointState<'_>,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
+            >,
+        };
 
-    crate::solver::outer_strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "n-block exact-joint spatial",
-    )
-    .map_err(|e| e.to_string())?
+        crate::solver::outer_strategy::run_outer(
+            &mut obj,
+            &outer_config,
+            "n-block exact-joint spatial",
+        )
+        .map_err(|e| e.to_string())?
     }; // obj dropped here, releasing mutable borrow on state
 
     let theta_star = result.rho;
@@ -13821,15 +13752,18 @@ mod tests {
         );
 
         let p_total = design.design.ncols();
-        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
+        let err0 = (&s0_global
+            - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
-        let err1 = (&s1_global - &design.penalties[cache.tension_penalty_global_idx].to_global(p_total))
+        let err1 = (&s1_global
+            - &design.penalties[cache.tension_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
-        let err2 = (&s2_global - &design.penalties[cache.stiffness_penalty_global_idx].to_global(p_total))
+        let err2 = (&s2_global
+            - &design.penalties[cache.stiffness_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
@@ -13903,15 +13837,18 @@ mod tests {
         );
 
         let p_total = design.design.ncols();
-        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
+        let err0 = (&s0_global
+            - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
-        let err1 = (&s1_global - &design.penalties[cache.tension_penalty_global_idx].to_global(p_total))
+        let err1 = (&s1_global
+            - &design.penalties[cache.tension_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
-        let err2 = (&s2_global - &design.penalties[cache.stiffness_penalty_global_idx].to_global(p_total))
+        let err2 = (&s2_global
+            - &design.penalties[cache.stiffness_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);

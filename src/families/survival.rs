@@ -1425,7 +1425,10 @@ impl SurvivalDerivProvider {
 }
 
 impl crate::estimate::reml::unified::HessianDerivativeProvider for SurvivalDerivProvider {
-    fn hessian_derivative_correction(&self, v_k: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
         // The trait provides v_k = H^{-1}(A_k beta_hat) (positive).
         // The survival method expects u_k = -H^{-1} A_k beta_hat = -v_k.
         let u_k = -v_k;
@@ -1615,8 +1618,7 @@ where
             // Then ∂_{β_j} h_d = h_d · x_j + H_d · ẋ_j
             let weight = w * s_total * halfwidth;
             for j in 0..coeff_len_d {
-                let d_inst_hazard =
-                    inst_hazard_d * design_d[j] + hazard_d * deriv_d[j];
+                let d_inst_hazard = inst_hazard_d * design_d[j] + hazard_d * deriv_d[j];
                 let d_hazard_cond = hazard_d * design_d[j] - h_dis_t0 * design_d_t0[j];
                 let g = d_inst_hazard - inst_hazard_d * d_hazard_cond;
                 diseasegradient[j] += weight * g;

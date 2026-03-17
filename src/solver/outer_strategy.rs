@@ -1567,9 +1567,7 @@ mod tests {
                 fixed_point_available: false,
                 barrier_config: None,
             },
-            cost_fn: |_: &mut i32, _: &Array1<f64>| {
-                Ok(1.0)
-            },
+            cost_fn: |_: &mut i32, _: &Array1<f64>| Ok(1.0),
             eval_fn: |_: &mut i32, _: &Array1<f64>| {
                 Ok(OuterEval {
                     cost: 1.0,

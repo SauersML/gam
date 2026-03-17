@@ -8,6 +8,17 @@ use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+const TK_FD_REL_STEP: f64 = 1e-4;
+const TK_FD_ABS_STEP: f64 = 1e-5;
+const TK_FD_BOUNDARY_GUARD: f64 = 1e-8;
+const TK_BLOCK_SIZE: usize = 128;
+
+struct TkCorrectionTerms {
+    value: f64,
+    gradient: Option<Array1<f64>>,
+    hessian: Option<Array2<f64>>,
+}
+
 impl<'a> RemlState<'a> {
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
         match pirls_result.coordinate_frame {
@@ -66,291 +77,412 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Compute the Tierney-Kadane correction to the Laplace approximation.
-    ///
-    /// The TK correction value is the third-order Bartlett refinement:
-    ///
-    /// ```text
-    /// TK = -(1/6) Σ_j (H⁻¹)_jj³ · d3_j
-    /// ```
-    ///
-    /// where H = H_pen is the penalized Hessian and d3_j = Σ_i c_i · X_ij³
-    /// is the third-derivative projection of the negative log-likelihood.
-    ///
-    /// When `gradient_info` is `Some((penalty_roots, lambdas))`, also computes
-    /// the TK gradient using a basis-invariant trace formula:
-    ///
-    /// ```text
-    /// ∂V_TK/∂ρ_k = -½ tr(H_obs⁻¹ A_k^obs)
-    /// ```
-    ///
-    /// where H_obs = X^T W X (observation Hessian without penalty) and
-    /// A_k^obs = X^T diag(c ⊙ dη_k) X with dη_k = -X v_k the mode
-    /// sensitivity direction (v_k = H_pen⁻¹(λ_k S_k β̂)).
-    ///
-    /// The main REML gradient already includes ½ tr(H_pen⁻¹ A_k^pen), so
-    /// this TK gradient adds only the observation-Hessian part that the
-    /// main gradient does not cover.
-    ///
-    /// Computing H_obs⁻¹ exactly requires a separate factorization of the
-    /// (potentially rank-deficient) observation Hessian. We use the
-    /// approximation H_obs⁻¹ ≈ H_pen⁻¹, which is valid when the penalty
-    /// is small relative to the data information (well-identified regime).
-    /// This gives:
-    ///
-    /// ```text
-    /// ∂V_TK/∂ρ_k ≈ -½ tr(H_pen⁻¹ A_k^obs)
-    ///             = ½ Σ_i c_i · (X v_k)_i · hat_ii
-    /// ```
-    ///
-    /// where hat_ii = (X H_pen⁻¹ X^T)_{ii} are the leverages.
-    ///
-    /// NOTE: This is an approximation. The exact formula requires
-    /// factorizing H_obs = X^T W X separately. For well-conditioned
-    /// problems with moderate penalization the error is O(||S||/||H_obs||).
-    fn tierney_kadane_laml_correction(
+    fn dense_penalty_logdet_derivs(
         &self,
-        pirls_result: &PirlsResult,
-        h_eff_eval: &Array2<f64>,
-        free_basis_opt: Option<&Array2<f64>>,
-        gradient_info: Option<(&[Array2<f64>], &[f64])>,
-        beta: &Array1<f64>,
-    ) -> Result<(f64, Option<Array1<f64>>), EstimationError> {
-        let mut d_vec = pirls_result.solve_c_array.clone();
-        if d_vec.is_empty() {
-            return Ok((
-                0.0,
-                gradient_info.map(|(roots, _)| Array1::zeros(roots.len())),
-            ));
-        }
-        for val in &mut d_vec {
-            if !val.is_finite() {
-                *val = 0.0;
-            }
-        }
-
-        let p_eff = h_eff_eval.ncols();
-        if p_eff == 0 {
-            return Ok((
-                0.0,
-                gradient_info.map(|(roots, _)| Array1::zeros(roots.len())),
-            ));
-        }
-
-        // Compute the third-derivative projection for the TK value.
-        let third_deriv = if let Some(z) = free_basis_opt {
-            let mut out = Array1::<f64>::zeros(z.ncols());
-            for j in 0..z.ncols() {
-                let xz_col = pirls_result
-                    .x_transformed
-                    .matrixvectormultiply(&z.column(j).to_owned());
-                out[j] = d_vec
-                    .iter()
-                    .zip(xz_col.iter())
-                    .map(|(&d, &x)| d * x * x * x)
-                    .sum();
-            }
-            out
-        } else {
-            self.third_derivative_projection_from_design(&pirls_result.x_transformed, &d_vec)?
-        };
-
-        let num_penalties = gradient_info.map_or(0, |(roots, _)| roots.len());
-        let compute_gradient = gradient_info.is_some();
-
-        // The effective design matrix: X_eff = X Z when projected, else X.
-        // Needed for computing hat leverages and mode response projections.
-        let x_eff_dense = if compute_gradient {
-            if let Some(z) = free_basis_opt {
-                Some(Arc::new(pirls_result.x_transformed.to_dense().dot(z)))
-            } else {
-                Some(pirls_result.x_transformed.to_dense_arc())
-            }
+        rho: &Array1<f64>,
+        e_for_logdet: &Array2<f64>,
+        penalty_roots: &[Array2<f64>],
+        ridge_passport: RidgePassport,
+        mode: super::unified::EvalMode,
+    ) -> Result<(usize, super::unified::PenaltyLogdetDerivs), EstimationError> {
+        let (penalty_rank, log_det_s) =
+            self.fixed_subspace_penalty_rank_and_logdet(e_for_logdet, ridge_passport)?;
+        let lambdas = rho.mapv(f64::exp);
+        let (det1, det2_full) = self.structural_penalty_logdet_derivatives(
+            penalty_roots,
+            &lambdas,
+            ridge_passport.penalty_logdet_ridge(),
+        )?;
+        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
+            Some(det2_full)
         } else {
             None
         };
+        Ok((
+            penalty_rank,
+            super::unified::PenaltyLogdetDerivs {
+                value: log_det_s,
+                first: det1,
+                second: det2,
+            },
+        ))
+    }
 
-        let n_obs = d_vec.len();
-        let mut h_inv_diag = Array1::<f64>::zeros(p_eff);
-        // hat_leverages[i] = (X_eff H_pen⁻¹ X_eff^T)_{ii}, accumulated
-        // column-by-column during the H⁻¹ diagonal computation.
-        let mut hat_leverages = if compute_gradient {
-            Array1::<f64>::zeros(n_obs)
-        } else {
-            Array1::<f64>::zeros(0)
-        };
+    fn tk_fd_step(&self, rho_i: f64) -> Result<f64, EstimationError> {
+        let base = (TK_FD_REL_STEP * (1.0 + rho_i.abs())).max(TK_FD_ABS_STEP);
+        let symmetric_room = (RHO_BOUND - TK_FD_BOUNDARY_GUARD - rho_i.abs()).max(0.0);
+        let step = base.min(0.5 * symmetric_room);
+        if !step.is_finite() || step <= 0.0 {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "TK finite-difference derivative has no symmetric room at rho={rho_i:.6e}"
+            )));
+        }
+        Ok(step)
+    }
 
-        if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
-            for j in 0..p_eff {
-                let mut e_j = Array1::<f64>::zeros(p_eff);
-                e_j[j] = 1.0;
-                let f_j = chol.solvevec(&e_j);
-                h_inv_diag[j] = f_j[j];
+    fn tk_sanitized_array(values: &Array1<f64>) -> Array1<f64> {
+        values.mapv(|v| if v.is_finite() { v } else { 0.0 })
+    }
 
-                // Accumulate hat leverage: hat[i] += X_eff[i,j] * (X_eff f_j)[i]
-                if compute_gradient {
-                    let x_dense = x_eff_dense.as_ref().unwrap();
-                    let x_fj: Array1<f64> = x_dense.dot(&f_j);
-                    for i in 0..n_obs {
-                        hat_leverages[i] += x_dense[[i, j]] * x_fj[i];
-                    }
-                }
+    fn tierney_kadane_exact_value_from_dense(
+        &self,
+        x_dense: &Array2<f64>,
+        h_eff_eval: &Array2<f64>,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        let n = x_dense.nrows();
+        let p = x_dense.ncols();
+        if n == 0 || p == 0 {
+            return Ok(0.0);
+        }
+
+        let xt = x_dense.t().to_owned();
+        let z = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+            let mut solved = Array2::<f64>::zeros((p, n));
+            for col in 0..n {
+                let rhs = xt.column(col).to_owned();
+                let sol = chol.solvevec(&rhs);
+                solved.column_mut(col).assign(&sol);
             }
-
-            // Compute the trace-based TK gradient using the Cholesky factor.
-            if compute_gradient {
-                let (roots, lambdas) = gradient_info.unwrap();
-                let x_dense = x_eff_dense.as_ref().unwrap();
-                let mut tk_grad = Array1::<f64>::zeros(num_penalties);
-
-                for k in 0..num_penalties {
-                    // Mode sensitivity: v_k = H_pen⁻¹(λ_k S_k β̂)
-                    let r_beta = roots[k].dot(beta);
-                    let s_k_beta = fast_atv(&roots[k], &r_beta);
-                    let a_k_beta = &s_k_beta * lambdas[k];
-                    let v_k = chol.solvevec(&a_k_beta);
-
-                    // X v_k (n-vector): the predicted change in η per unit ρ_k
-                    let x_v_k: Array1<f64> = x_dense.dot(&v_k);
-
-                    // TK gradient[k] = ½ Σ_i c_i · (X v_k)_i · hat_ii
-                    // (derived from -½ tr(H_obs⁻¹ A_k^obs) with H_obs⁻¹ ≈ H_pen⁻¹)
-                    let mut acc = 0.0;
-                    for i in 0..n_obs {
-                        acc += d_vec[i] * x_v_k[i] * hat_leverages[i];
-                    }
-                    tk_grad[k] = 0.5 * acc;
-                }
-
-                // Zero out non-finite entries for robustness.
-                for v in tk_grad.iter_mut() {
-                    if !v.is_finite() {
-                        *v = 0.0;
-                    }
-                }
-
-                let correction = -h_inv_diag
-                    .iter()
-                    .zip(third_deriv.iter())
-                    .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
-                    .sum::<f64>()
-                    / 6.0;
-                let correction = if correction.is_finite() {
-                    correction
-                } else {
-                    0.0
-                };
-                return Ok((correction, Some(tk_grad)));
-            }
+            solved
         } else {
             let (evals, evecs) = h_eff_eval
                 .eigh(Side::Lower)
                 .map_err(EstimationError::EigendecompositionFailed)?;
             let floor = 1e-12;
-
-            for j in 0..p_eff {
-                let mut acc = 0.0;
-                for m in 0..evals.len() {
-                    let ev = evals[m];
-                    if ev > floor {
-                        let u = evecs[[j, m]];
-                        acc += (u * u) / ev;
-                    }
+            let mut solved = Array2::<f64>::zeros((p, n));
+            for m in 0..evals.len() {
+                let ev = evals[m];
+                if ev <= floor {
+                    continue;
                 }
-                h_inv_diag[j] = acc;
-
-                // Accumulate hat leverage from eigendecomposition path.
-                if compute_gradient {
-                    // Reconstruct f_j = H⁻¹ e_j for hat leverage accumulation.
-                    let mut f_j = Array1::<f64>::zeros(p_eff);
-                    for m in 0..evals.len() {
-                        let ev = evals[m];
-                        if ev > floor {
-                            let u_jm = evecs[[j, m]];
-                            let scale = u_jm / ev;
-                            for ii in 0..p_eff {
-                                f_j[ii] += scale * evecs[[ii, m]];
-                            }
-                        }
-                    }
-                    let x_dense = x_eff_dense.as_ref().unwrap();
-                    let x_fj: Array1<f64> = x_dense.dot(&f_j);
-                    for i in 0..n_obs {
-                        hat_leverages[i] += x_dense[[i, j]] * x_fj[i];
+                let u = evecs.column(m).to_owned();
+                let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
+                for row in 0..p {
+                    let u_row = u[row];
+                    for col in 0..n {
+                        solved[[row, col]] += u_row * coeffs[col];
                     }
                 }
             }
+            solved
+        };
 
-            // Compute the trace-based TK gradient using the eigendecomposition.
-            if compute_gradient {
-                let (roots, lambdas) = gradient_info.unwrap();
-                let x_dense = x_eff_dense.as_ref().unwrap();
-                let mut tk_grad = Array1::<f64>::zeros(num_penalties);
+        let mut h_diag = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let val = x_dense.row(i).dot(&z.column(i));
+            h_diag[i] = if val.is_finite() { val } else { 0.0 };
+        }
 
-                // Reconstruct H_pen⁻¹ for solving v_k.
-                let mut h_inv = Array2::<f64>::zeros((p_eff, p_eff));
-                for m in 0..evals.len() {
-                    let ev = evals[m];
-                    if ev > floor {
-                        let col = evecs.column(m);
-                        for i in 0..p_eff {
-                            for j in 0..p_eff {
-                                h_inv[[i, j]] += col[i] * col[j] / ev;
-                            }
+        let q_term = -0.125
+            * d_array
+                .iter()
+                .zip(h_diag.iter())
+                .map(|(&d_i, &h_i)| d_i * h_i * h_i)
+                .sum::<f64>();
+
+        let m = c_array * &h_diag;
+        let x_m = xt.dot(&m);
+        let y = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+            chol.solvevec(&x_m)
+        } else {
+            let (evals, evecs) = h_eff_eval
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let floor = 1e-12;
+            let mut solved = Array1::<f64>::zeros(p);
+            for m_idx in 0..evals.len() {
+                let ev = evals[m_idx];
+                if ev <= floor {
+                    continue;
+                }
+                let u = evecs.column(m_idx).to_owned();
+                let coeff = u.dot(&x_m) / ev;
+                solved.scaled_add(coeff, &u);
+            }
+            solved
+        };
+        let t2_term = 0.125 * x_m.dot(&y);
+
+        let mut t1_sum = 0.0_f64;
+        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
+            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
+            let z_block = z.slice(s![.., j0..j1]).to_owned();
+            let c_j = c_array.slice(s![j0..j1]);
+            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
+                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
+                let x_block = x_dense.slice(s![i0..i1, ..]);
+                let c_i = c_array.slice(s![i0..i1]);
+                let gram = x_block.dot(&z_block);
+                let mut block_sum = 0.0_f64;
+                for bi in 0..(i1 - i0) {
+                    let ci = c_i[bi];
+                    if ci == 0.0 {
+                        continue;
+                    }
+                    for bj in 0..(j1 - j0) {
+                        let cj = c_j[bj];
+                        if cj == 0.0 {
+                            continue;
                         }
+                        let kij = gram[[bi, bj]];
+                        block_sum += ci * cj * kij * kij * kij;
                     }
                 }
-
-                for k in 0..num_penalties {
-                    let r_beta = roots[k].dot(beta);
-                    let s_k_beta = fast_atv(&roots[k], &r_beta);
-                    let a_k_beta = &s_k_beta * lambdas[k];
-                    let v_k = h_inv.dot(&a_k_beta);
-
-                    let x_v_k: Array1<f64> = x_dense.dot(&v_k);
-
-                    let mut acc = 0.0;
-                    for i in 0..n_obs {
-                        acc += d_vec[i] * x_v_k[i] * hat_leverages[i];
-                    }
-                    tk_grad[k] = 0.5 * acc;
-                }
-
-                for v in tk_grad.iter_mut() {
-                    if !v.is_finite() {
-                        *v = 0.0;
-                    }
-                }
-
-                let correction = -h_inv_diag
-                    .iter()
-                    .zip(third_deriv.iter())
-                    .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
-                    .sum::<f64>()
-                    / 6.0;
-                let correction = if correction.is_finite() {
-                    correction
-                } else {
-                    0.0
-                };
-                return Ok((correction, Some(tk_grad)));
+                t1_sum += if i0 == j0 { block_sum } else { 2.0 * block_sum };
             }
         }
 
-        // Value-only path (no gradient requested).
-        let correction = -h_inv_diag
-            .iter()
-            .zip(third_deriv.iter())
-            .map(|(&hjj, &d3)| hjj * hjj * hjj * d3)
-            .sum::<f64>()
-            / 6.0;
+        let value = q_term + t1_sum / 12.0 + t2_term;
+        Ok(if value.is_finite() { value } else { 0.0 })
+    }
 
-        let correction = if correction.is_finite() {
-            correction
+    fn tierney_kadane_exact_value_from_sparse(
+        &self,
+        x_dense: &Array2<f64>,
+        factor: &crate::linalg::sparse_exact::SparseCholeskyFactor,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        let n = x_dense.nrows();
+        let p = x_dense.ncols();
+        if n == 0 || p == 0 {
+            return Ok(0.0);
+        }
+
+        let xt = x_dense.t().to_owned();
+        let z = crate::linalg::sparse_exact::solve_sparse_spdmulti(factor, &xt)?;
+
+        let mut h_diag = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let val = x_dense.row(i).dot(&z.column(i));
+            h_diag[i] = if val.is_finite() { val } else { 0.0 };
+        }
+
+        let q_term = -0.125
+            * d_array
+                .iter()
+                .zip(h_diag.iter())
+                .map(|(&d_i, &h_i)| d_i * h_i * h_i)
+                .sum::<f64>();
+
+        let m = c_array * &h_diag;
+        let x_m = xt.dot(&m);
+        let y = crate::linalg::sparse_exact::solve_sparse_spd(factor, &x_m)?;
+        let t2_term = 0.125 * x_m.dot(&y);
+
+        let mut t1_sum = 0.0_f64;
+        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
+            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
+            let z_block = z.slice(s![.., j0..j1]).to_owned();
+            let c_j = c_array.slice(s![j0..j1]);
+            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
+                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
+                let x_block = x_dense.slice(s![i0..i1, ..]);
+                let c_i = c_array.slice(s![i0..i1]);
+                let gram = x_block.dot(&z_block);
+                let mut block_sum = 0.0_f64;
+                for bi in 0..(i1 - i0) {
+                    let ci = c_i[bi];
+                    if ci == 0.0 {
+                        continue;
+                    }
+                    for bj in 0..(j1 - j0) {
+                        let cj = c_j[bj];
+                        if cj == 0.0 {
+                            continue;
+                        }
+                        let kij = gram[[bi, bj]];
+                        block_sum += ci * cj * kij * kij * kij;
+                    }
+                }
+                t1_sum += if i0 == j0 { block_sum } else { 2.0 * block_sum };
+            }
+        }
+
+        let value = q_term + t1_sum / 12.0 + t2_term;
+        Ok(if value.is_finite() { value } else { 0.0 })
+    }
+
+    fn tierney_kadane_exact_value_from_bundle(
+        &self,
+        bundle: &EvalShared,
+    ) -> Result<f64, EstimationError> {
+        let pirls_result = bundle.pirls_result.as_ref();
+        let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+        let c_array = Self::tk_sanitized_array(&c_array);
+        let d_array = Self::tk_sanitized_array(&d_array);
+        if c_array.is_empty() || d_array.is_empty() {
+            return Ok(0.0);
+        }
+
+        if let Some(sparse) = bundle.sparse_exact.as_ref() {
+            let x_dense = self
+                .x()
+                .try_to_dense_arc("exact TK correction requires dense design access")
+                .map_err(EstimationError::InvalidInput)?;
+            return self.tierney_kadane_exact_value_from_sparse(
+                x_dense.as_ref(),
+                sparse.factor.as_ref(),
+                &c_array,
+                &d_array,
+            );
+        }
+
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
+            Self::projectwith_basis(bundle.h_eff.as_ref(), z)
         } else {
-            0.0
+            bundle.h_eff.as_ref().clone()
         };
-        Ok((correction, None))
+        let x_eff_dense = if let Some(z) = free_basis_opt.as_ref() {
+            pirls_result.x_transformed.to_dense().dot(z)
+        } else {
+            pirls_result.x_transformed.to_dense()
+        };
+
+        self.tierney_kadane_exact_value_from_dense(&x_eff_dense, &h_eff_eval, &c_array, &d_array)
+    }
+
+    fn tierney_kadane_terms(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+    ) -> Result<TkCorrectionTerms, EstimationError> {
+        if self.config.link_function() == LinkFunction::Identity {
+            return Ok(TkCorrectionTerms {
+                value: 0.0,
+                gradient: None,
+                hessian: None,
+            });
+        }
+
+        let value = self.tierney_kadane_exact_value_from_bundle(bundle)?;
+        if mode == super::unified::EvalMode::ValueOnly {
+            return Ok(TkCorrectionTerms {
+                value,
+                gradient: None,
+                hessian: None,
+            });
+        }
+
+        let k = rho.len();
+        let mut steps = Vec::with_capacity(k);
+        let mut plus = vec![0.0_f64; k];
+        let mut minus = vec![0.0_f64; k];
+        let mut gradient = Array1::<f64>::zeros(k);
+        let mut hessian = if mode == super::unified::EvalMode::ValueGradientHessian {
+            Some(Array2::<f64>::zeros((k, k)))
+        } else {
+            None
+        };
+
+        for i in 0..k {
+            let h = self.tk_fd_step(rho[i])?;
+            steps.push(h);
+
+            let mut rho_p = rho.clone();
+            rho_p[i] += h;
+            plus[i] = self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_p)?)?;
+
+            let mut rho_m = rho.clone();
+            rho_m[i] -= h;
+            minus[i] = self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_m)?)?;
+
+            gradient[i] = (plus[i] - minus[i]) / (2.0 * h);
+            if let Some(ref mut tk_hess) = hessian {
+                tk_hess[[i, i]] = (plus[i] - 2.0 * value + minus[i]) / (h * h);
+            }
+        }
+
+        if let Some(ref mut tk_hess) = hessian {
+            for i in 0..k {
+                for j in 0..i {
+                    let hi = steps[i];
+                    let hj = steps[j];
+
+                    let mut rho_pp = rho.clone();
+                    rho_pp[i] += hi;
+                    rho_pp[j] += hj;
+                    let f_pp =
+                        self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_pp)?)?;
+
+                    let mut rho_pm = rho.clone();
+                    rho_pm[i] += hi;
+                    rho_pm[j] -= hj;
+                    let f_pm =
+                        self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_pm)?)?;
+
+                    let mut rho_mp = rho.clone();
+                    rho_mp[i] -= hi;
+                    rho_mp[j] += hj;
+                    let f_mp =
+                        self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_mp)?)?;
+
+                    let mut rho_mm = rho.clone();
+                    rho_mm[i] -= hi;
+                    rho_mm[j] -= hj;
+                    let f_mm =
+                        self.tierney_kadane_exact_value_from_bundle(&self.obtain_eval_bundle(&rho_mm)?)?;
+
+                    let val = (f_pp - f_pm - f_mp + f_mm) / (4.0 * hi * hj);
+                    tk_hess[[i, j]] = val;
+                    tk_hess[[j, i]] = val;
+                }
+            }
+        }
+
+        for g in gradient.iter_mut() {
+            if !g.is_finite() {
+                *g = 0.0;
+            }
+        }
+        if let Some(ref mut tk_hess) = hessian {
+            for val in tk_hess.iter_mut() {
+                if !val.is_finite() {
+                    *val = 0.0;
+                }
+            }
+        }
+
+        Ok(TkCorrectionTerms {
+            value,
+            gradient: Some(gradient),
+            hessian,
+        })
+    }
+
+    fn apply_tk_to_result(
+        &self,
+        mut result: super::unified::RemlLamlResult,
+        rho: &Array1<f64>,
+        tk_terms: TkCorrectionTerms,
+    ) -> super::unified::RemlLamlResult {
+        result.cost += tk_terms.value;
+        if let (Some(ref mut grad), Some(tk_grad)) = (&mut result.gradient, tk_terms.gradient) {
+            let k = rho.len().min(grad.len()).min(tk_grad.len());
+            {
+                let mut sl = grad.slice_mut(s![..k]);
+                sl += &tk_grad.slice(s![..k]);
+            }
+        }
+        if let (Some(ref mut hess), Some(tk_hess)) = (&mut result.hessian, tk_terms.hessian) {
+            let k = rho.len().min(hess.nrows()).min(hess.ncols()).min(tk_hess.nrows());
+            let mut sl = hess.slice_mut(s![..k, ..k]);
+            sl += &tk_hess.slice(s![..k, ..k]);
+        }
+        result
+    }
+
+    fn apply_tk_cost_to_efs(
+        &self,
+        mut eval: crate::solver::outer_strategy::EfsEval,
+        tk_value: f64,
+    ) -> crate::solver::outer_strategy::EfsEval {
+        eval.cost += tk_value;
+        eval
     }
 
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -875,8 +1007,7 @@ impl<'a> RemlState<'a> {
 
         // Exact pseudo-logdet on the positive eigenspace: L = Σ_{σ_i > ε} log σ_i.
         // The structural nullspace is identified directly from the eigenspectrum.
-        let threshold =
-            super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
         let log_det = super::unified::exact_pseudo_logdet(evals.as_slice().unwrap(), threshold);
 
         Ok((structural_rank, log_det))
@@ -913,8 +1044,7 @@ impl<'a> RemlState<'a> {
             .map_err(EstimationError::EigendecompositionFailed)?;
 
         // Exact pseudoinverse trace: tr(S⁺ S_direction) on the positive eigenspace.
-        let threshold =
-            super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
 
         let mut trace = 0.0;
         for idx in 0..p_dim {
@@ -1376,9 +1506,7 @@ impl<'a> RemlState<'a> {
             };
             let mut pirls_config = self.config.as_pirls_config();
             // Apply screening cap when active (seed screening uses cheap partial PIRLS).
-            let screen_cap = self
-                .screening_max_inner_iterations
-                .load(Ordering::Relaxed);
+            let screen_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
             if screen_cap > 0 {
                 pirls_config.max_iterations = pirls_config.max_iterations.min(screen_cap);
             }
@@ -1418,18 +1546,22 @@ impl<'a> RemlState<'a> {
                 warm_start_ref,
             );
             let pirls_elapsed = pirls_start.elapsed();
-            let screen_cap = self
-                .screening_max_inner_iterations
-                .load(Ordering::Relaxed);
+            let screen_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
             if let Ok((ref res, _)) = result {
                 log::info!(
                     "[PIRLS-timing] iters={} status={:?} max_eta={:.1} firth_logdet={} elapsed={:.3}s screening={}",
                     res.iterations,
                     res.status,
                     res.max_abs_eta,
-                    res.firth_log_det().map(|v| format!("{v:.3e}")).unwrap_or_else(|| "none".to_string()),
+                    res.firth_log_det()
+                        .map(|v| format!("{v:.3e}"))
+                        .unwrap_or_else(|| "none".to_string()),
                     pirls_elapsed.as_secs_f64(),
-                    if screen_cap > 0 { format!("cap={screen_cap}") } else { "off".to_string() },
+                    if screen_cap > 0 {
+                        format!("cap={screen_cap}")
+                    } else {
+                        "off".to_string()
+                    },
                 );
             }
             result
@@ -1866,30 +1998,30 @@ impl<'a> RemlState<'a> {
     /// Extracting these into a struct eliminates ~100 lines of duplication
     /// across the three dense-path methods.
 
-    /// Build the derivative provider, dispersion handling, TK correction,
+    /// Build the derivative provider, dispersion handling, zeroed TK placeholders,
     /// Firth log-det, log-likelihood, Firth operator, and barrier config
     /// that are common to all dense evaluation paths.
     ///
     /// # Arguments
     /// - `pirls_result`: the inner-loop solution
     /// - `bundle`: the evaluation bundle (carries h_eff, firth operator, etc.)
-    /// - `mode`: evaluation mode; controls whether TK gradient is computed
-    /// - `rho`: log-smoothing parameters (needed for TK gradient lambdas)
     /// - `free_basis_opt`: optional constraint-projection basis
-    /// - `penalty_roots`: penalty matrix square-roots (possibly projected)
-    /// - `beta`: coefficient vector in the operator's basis
     /// - `include_firth_derivs`: whether to wrap the derivative provider with
     ///   Firth-aware derivatives (false for the EFS path which does not need
     ///   Firth corrections in trace-based updates)
+    ///
+    /// The actual Tierney-Kadane correction is added outside the unified
+    /// evaluator so value, gradient, and Hessian can all come from the same
+    /// invariant scalar correction.
     fn build_dense_derivative_context(
         &self,
         pirls_result: &PirlsResult,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        rho: &Array1<f64>,
+        _mode: super::unified::EvalMode,
+        _rho: &Array1<f64>,
         free_basis_opt: &Option<Array2<f64>>,
-        penalty_roots: &[Array2<f64>],
-        beta: &Array1<f64>,
+        _penalty_roots: &[Array2<f64>],
+        _beta: &Array1<f64>,
         include_firth_derivs: bool,
     ) -> Result<
         (
@@ -1956,32 +2088,7 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        // TK correction and gradient (non-Gaussian only).
-        let (tk_correction, tk_gradient) = if !is_gaussian_identity {
-            let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
-                Self::projectwith_basis(bundle.h_eff.as_ref(), z)
-            } else {
-                bundle.h_eff.as_ref().clone()
-            };
-            let grad_info = if mode != super::unified::EvalMode::ValueOnly {
-                let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
-                Some((penalty_roots, lambdas))
-            } else {
-                None
-            };
-            let grad_ref = grad_info
-                .as_ref()
-                .map(|(roots, lams)| (*roots as &[Array2<f64>], lams.as_slice()));
-            self.tierney_kadane_laml_correction(
-                pirls_result,
-                &h_eff_eval,
-                free_basis_opt.as_ref(),
-                grad_ref,
-                beta,
-            )?
-        } else {
-            (0.0, None)
-        };
+        let (tk_correction, tk_gradient) = (0.0, None);
 
         // Firth log-det.
         let firth_logdet = if self.config.firth_bias_reduction
@@ -2201,22 +2308,26 @@ impl<'a> RemlState<'a> {
             pirls_result.reparam_result.rs_transformed.clone()
         };
 
-        // Penalty logdet second derivatives (for outer Hessian).
-        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
-            let lambdas = rho.mapv(f64::exp);
-            let (_, det2) = self.structural_penalty_logdet_derivatives(
-                &penalty_roots,
-                &lambdas,
-                ridge_passport.penalty_logdet_ridge(),
-            )?;
-            Some(det2)
-        } else {
-            None
-        };
+        // Penalty logdet derivatives — exact first and (optionally) second.
+        // Both `first` and `second` must come from the same eigendecomposition
+        // that produced `log_det_s` (the exact pseudo-logdet value). Using the
+        // surrogate det1 from `reparam_result` here would create a value/gradient
+        // mismatch: the optimizer would see an exact scalar objective but a
+        // surrogate gradient, which is not the gradient of any single function.
+        let lambdas = rho.mapv(f64::exp);
+        let (det1, det2) = self.structural_penalty_logdet_derivatives(
+            &penalty_roots,
+            &lambdas,
+            ridge_passport.penalty_logdet_ridge(),
+        )?;
         let penalty_logdet = PenaltyLogdetDerivs {
             value: log_det_s,
-            first: pirls_result.reparam_result.det1.clone(),
-            second: det2,
+            first: det1,
+            second: if mode == super::unified::EvalMode::ValueGradientHessian {
+                Some(det2)
+            } else {
+                None
+            },
         };
 
         // Beta in the operator's basis.
@@ -2775,21 +2886,22 @@ impl<'a> RemlState<'a> {
         } else {
             pirls_result.reparam_result.rs_transformed.clone()
         };
-        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
-            let lambdas = rho.mapv(f64::exp);
-            let (_, det2) = self.structural_penalty_logdet_derivatives(
-                &penalty_roots,
-                &lambdas,
-                ridge_passport.penalty_logdet_ridge(),
-            )?;
-            Some(det2)
-        } else {
-            None
-        };
+        // Exact penalty logdet derivatives from the same eigendecomposition.
+        // See evaluate_unified for rationale (value/gradient consistency).
+        let lambdas = rho.mapv(f64::exp);
+        let (det1, det2) = self.structural_penalty_logdet_derivatives(
+            &penalty_roots,
+            &lambdas,
+            ridge_passport.penalty_logdet_ridge(),
+        )?;
         let penalty_logdet = PenaltyLogdetDerivs {
             value: log_det_s,
-            first: pirls_result.reparam_result.det1.clone(),
-            second: det2,
+            first: det1,
+            second: if mode == super::unified::EvalMode::ValueGradientHessian {
+                Some(det2)
+            } else {
+                None
+            },
         };
 
         // Beta.
@@ -3293,9 +3405,16 @@ impl<'a> RemlState<'a> {
         };
 
         // EFS only needs ValueOnly — no second derivatives of penalty logdet.
+        // Still use exact first derivatives for value/gradient consistency.
+        let lambdas_efs = rho.mapv(f64::exp);
+        let (det1_efs, _) = self.structural_penalty_logdet_derivatives(
+            &penalty_roots,
+            &lambdas_efs,
+            ridge_passport.penalty_logdet_ridge(),
+        )?;
         let penalty_logdet = PenaltyLogdetDerivs {
             value: log_det_s,
-            first: pirls_result.reparam_result.det1.clone(),
+            first: det1_efs,
             second: None,
         };
 

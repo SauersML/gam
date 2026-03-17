@@ -73,8 +73,7 @@ impl<'a> RemlState<'a> {
 
         // Identify structurally positive eigenvalues. For S(ρ) = Σ λ_k S_k with
         // S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k) is independent of ρ.
-        let threshold =
-            super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
         let pos_rank = evals.iter().filter(|&&e| e > threshold).count();
         if pos_rank == 0 {
             return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));

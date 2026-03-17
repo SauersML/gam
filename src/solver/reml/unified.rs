@@ -1049,10 +1049,7 @@ impl HyperCoordDrift {
         if p == 0 {
             return Array2::zeros((0, 0));
         }
-        let mut out = self
-            .dense
-            .clone()
-            .unwrap_or_else(|| Array2::zeros((p, p)));
+        let mut out = self.dense.clone().unwrap_or_else(|| Array2::zeros((p, p)));
         if let Some(bl) = &self.block_local {
             out.slice_mut(ndarray::s![bl.start..bl.end, bl.start..bl.end])
                 .scaled_add(1.0, &bl.local);
@@ -1128,11 +1125,15 @@ impl HyperOperator for ImplicitHyperOperator {
         // Term 1: (∂X/∂ψ_d)^T (W · (X · v))
         let x_v = self.x_dense.dot(v); // (n,)
         let w_x_v = &*self.w_diag * &x_v; // (n,)
-        let term1 = self.implicit_deriv.transpose_mul(self.axis, &w_x_v.view())
+        let term1 = self
+            .implicit_deriv
+            .transpose_mul(self.axis, &w_x_v.view())
             .expect("radial scalar evaluation failed during implicit hyper transpose_mul"); // (p,)
 
         // Term 2: X^T (W · ((∂X/∂ψ_d) · v))
-        let dx_v = self.implicit_deriv.forward_mul(self.axis, &v.view())
+        let dx_v = self
+            .implicit_deriv
+            .forward_mul(self.axis, &v.view())
             .expect("radial scalar evaluation failed during implicit hyper forward_mul"); // (n,)
         let w_dx_v = &*self.w_diag * &dx_v; // (n,)
         let term2 = self.x_dense.t().dot(&w_dx_v); // (p,)
@@ -1199,9 +1200,13 @@ impl ImplicitHyperOperator {
         u: &Array1<f64>,
     ) -> f64 {
         // Design part: dx_z^T (w ⊙ y_vec) + dx_u^T (w ⊙ x_vec)
-        let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view())
+        let dx_z = self
+            .implicit_deriv
+            .forward_mul(self.axis, &z.view())
             .expect("radial scalar evaluation failed during implicit hyper forward_mul");
-        let dx_u = self.implicit_deriv.forward_mul(self.axis, &u.view())
+        let dx_u = self
+            .implicit_deriv
+            .forward_mul(self.axis, &u.view())
             .expect("radial scalar evaluation failed during implicit hyper forward_mul");
 
         let mut design = 0.0f64;
@@ -1236,7 +1241,9 @@ impl ImplicitHyperOperator {
             .expect("radial scalar evaluation failed during implicit hyper transpose_mul");
 
         // Term 2: X^T (W · ((∂X/∂ψ_d) · z))
-        let dx_z = self.implicit_deriv.forward_mul(self.axis, &z.view())
+        let dx_z = self
+            .implicit_deriv
+            .forward_mul(self.axis, &z.view())
             .expect("radial scalar evaluation failed during implicit hyper forward_mul");
         let w_dx_z = &*self.w_diag * &dx_z;
         let term2 = self.x_dense.t().dot(&w_dx_z);
@@ -1500,7 +1507,9 @@ impl PenaltyCoordinate {
                 let p = out.nrows();
                 (out, 0, p)
             }
-            Self::BlockRoot { root, start, end, .. } => {
+            Self::BlockRoot {
+                root, start, end, ..
+            } => {
                 let mut block = root.t().dot(root);
                 block *= scale;
                 (block, *start, *end)
@@ -1523,7 +1532,9 @@ impl PenaltyCoordinate {
                 out *= scale;
                 out
             }
-            Self::BlockRoot { root, start, end, .. } => {
+            Self::BlockRoot {
+                root, start, end, ..
+            } => {
                 let mut out = Array1::zeros(v.len());
                 let v_block = v.slice(ndarray::s![*start..*end]);
                 let root_v = root.dot(&v_block);
@@ -1545,12 +1556,22 @@ impl PenaltyCoordinate {
                 // tr(M · (scale · R'R)) = scale · tr(M R' R) = scale · Σ (R M R')_{ii}
                 // = scale · ‖R M^{1/2}‖_F^2 ... but simpler: scale · tr((RM) R')
                 let rm = root.dot(m);
-                scale * rm.iter().zip(root.iter()).map(|(&a, &b)| a * b).sum::<f64>()
+                scale
+                    * rm.iter()
+                        .zip(root.iter())
+                        .map(|(&a, &b)| a * b)
+                        .sum::<f64>()
             }
-            Self::BlockRoot { root, start, end, .. } => {
+            Self::BlockRoot {
+                root, start, end, ..
+            } => {
                 let m_block = m.slice(ndarray::s![*start..*end, *start..*end]);
                 let rm = root.dot(&m_block);
-                scale * rm.iter().zip(root.iter()).map(|(&a, &b)| a * b).sum::<f64>()
+                scale
+                    * rm.iter()
+                        .zip(root.iter())
+                        .map(|(&a, &b)| a * b)
+                        .sum::<f64>()
             }
         }
     }
@@ -1594,25 +1615,6 @@ impl HyperOperator for PenaltyHyperOperator<'_> {
     fn is_implicit(&self) -> bool {
         false
     }
-}
-
-/// Scale factor for δ-regularized matrix inverses (not used for logdet).
-///
-/// Used only by `smooth_logdet_delta` → `delta_regularized_inverse` for
-/// numerical stability when inverting near-singular matrices.
-pub(crate) const SMOOTH_LOGDET_DELTA_SCALE: f64 = 1e-10;
-
-/// Choose δ for δ-regularized matrix inverses based on the spectral scale.
-///
-/// δ = SMOOTH_LOGDET_DELTA_SCALE × max(|eigenvalues|, 1.0).
-/// Used only by `delta_regularized_inverse`, not for penalty logdet.
-pub(crate) fn smooth_logdet_delta(eigenvalues: &[f64]) -> f64 {
-    let max_ev = eigenvalues
-        .iter()
-        .copied()
-        .fold(0.0_f64, |a, b| a.max(b.abs()))
-        .max(1.0);
-    SMOOTH_LOGDET_DELTA_SCALE * max_ev
 }
 
 /// Compute the exact dimension of the intersection ∩_k N(S_k) for PSD penalties.
@@ -1754,6 +1756,129 @@ pub(crate) fn exact_pseudo_logdet(eigenvalues: &[f64], threshold: f64) -> f64 {
         .filter(|&&s| s > threshold)
         .map(|&s| s.ln())
         .sum()
+}
+
+/// Spectral decomposition of a PSD penalty matrix into positive and null subspaces.
+#[derive(Clone, Debug)]
+pub(crate) struct PenaltyLogdetEigenspace {
+    pub pseudoinverse: Array2<f64>,
+    pub positive_basis: Array2<f64>,
+    pub null_basis: Array2<f64>,
+    pub positive_eigenvalues: Array1<f64>,
+}
+
+impl PenaltyLogdetEigenspace {
+    pub(crate) fn logdet(&self) -> f64 {
+        self.positive_eigenvalues.iter().copied().map(f64::ln).sum()
+    }
+}
+
+/// Build the exact pseudologdet eigenspace decomposition of a PSD penalty matrix.
+///
+/// When `structural_nullity` is provided, it determines the null/positive split
+/// exactly (bottom `m0` eigenvectors are treated as the nullspace even if ridge
+/// regularization makes those eigenvalues numerically positive). Otherwise the
+/// split is inferred from the eigenspectrum via [`positive_eigenvalue_threshold`].
+pub(crate) fn build_penalty_logdet_eigenspace(
+    matrix: &Array2<f64>,
+    structural_nullity: Option<usize>,
+    context: &str,
+) -> Result<PenaltyLogdetEigenspace, String> {
+    let p = matrix.nrows();
+    if p != matrix.ncols() {
+        return Err(format!(
+            "{context}: expected square penalty matrix, got {}x{}",
+            matrix.nrows(),
+            matrix.ncols()
+        ));
+    }
+    if p == 0 {
+        return Ok(PenaltyLogdetEigenspace {
+            pseudoinverse: Array2::zeros((0, 0)),
+            positive_basis: Array2::zeros((0, 0)),
+            null_basis: Array2::zeros((0, 0)),
+            positive_eigenvalues: Array1::zeros(0),
+        });
+    }
+
+    let (eigs, vecs) = matrix
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("{context}: penalty eigendecomposition failed: {e}"))?;
+
+    let (nullity, rank) = if let Some(m0) = structural_nullity {
+        let m0 = m0.min(p);
+        (m0, p - m0)
+    } else {
+        let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
+        let rank = eigs.iter().filter(|&&e| e > threshold).count();
+        (p - rank, rank)
+    };
+
+    let mut pseudoinverse = Array2::<f64>::zeros((p, p));
+    let mut positive_basis = Array2::<f64>::zeros((p, rank));
+    let mut null_basis = Array2::<f64>::zeros((p, nullity));
+    let mut positive_eigenvalues = Array1::<f64>::zeros(rank);
+
+    for col in 0..nullity {
+        for row in 0..p {
+            null_basis[[row, col]] = vecs[[row, col]];
+        }
+    }
+    for out_col in 0..rank {
+        let eig_idx = nullity + out_col;
+        let eig = eigs[eig_idx].max(1e-300);
+        positive_eigenvalues[out_col] = eig;
+        for row in 0..p {
+            positive_basis[[row, out_col]] = vecs[[row, eig_idx]];
+        }
+    }
+
+    for col in 0..rank {
+        let inv_eig = 1.0 / positive_eigenvalues[col];
+        for i in 0..p {
+            let ui = positive_basis[[i, col]];
+            for j in 0..p {
+                pseudoinverse[[i, j]] += inv_eig * ui * positive_basis[[j, col]];
+            }
+        }
+    }
+
+    Ok(PenaltyLogdetEigenspace {
+        pseudoinverse,
+        positive_basis,
+        null_basis,
+        positive_eigenvalues,
+    })
+}
+
+/// Frobenius inner product for same-shaped matrices: Σ_ij A_ij B_ij.
+pub(crate) fn frobenius_inner_same_shape(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    debug_assert_eq!(a.dim(), b.dim());
+    kahan_sum(a.iter().zip(b.iter()).map(|(&x, &y)| x * y))
+}
+
+/// Scaled leakage matrix diag(Σ₊⁻¹) U₊ᵀ S_i U₀ used in moving-nullspace corrections.
+pub(crate) fn scaled_penalty_logdet_nullspace_leakage(
+    eigenspace: &PenaltyLogdetEigenspace,
+    derivative: &Array2<f64>,
+) -> Array2<f64> {
+    let rank = eigenspace.positive_basis.ncols();
+    let nullity = eigenspace.null_basis.ncols();
+    if rank == 0 || nullity == 0 {
+        return Array2::zeros((0, 0));
+    }
+
+    let mut scaled = eigenspace
+        .positive_basis
+        .t()
+        .dot(&derivative.dot(&eigenspace.null_basis));
+    for row in 0..rank {
+        let inv_sigma = 1.0 / eigenspace.positive_eigenvalues[row];
+        for col in 0..nullity {
+            scaled[[row, col]] *= inv_sigma;
+        }
+    }
+    scaled
 }
 
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
@@ -3424,7 +3549,7 @@ fn compute_outer_hessian(
             hop,
             &solution.beta,
             &v_ks,
-            &a_k_matrices, // h_k_matrices ≈ a_k_matrices (first-order approximation)
+            &h_k_matrices,
             &a_k_betas,
             &a_k_matrices,
         );
@@ -5239,8 +5364,7 @@ pub fn compute_block_penalty_logdet_derivs(
             // For single-penalty blocks this is just nullspace_dims[0].
             // For multi-penalty blocks, eigendecomposes each S_k and
             // intersects their nullspace bases via SVD.
-            let intersection_nullity =
-                exact_intersection_nullity(penalties, block_nullspace_dims);
+            let intersection_nullity = exact_intersection_nullity(penalties, block_nullspace_dims);
             p.saturating_sub(intersection_nullity)
         } else {
             let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
@@ -5249,7 +5373,12 @@ pub fn compute_block_penalty_logdet_derivs(
 
         // Exact pseudo-logdet: L = Σ over the `rank` largest eigenvalues of log σ_i.
         // Eigenvalues from eigh are sorted ascending, so the `rank` largest are the last `rank`.
-        let block_logdet: f64 = eigs.iter().rev().take(rank).map(|&e| e.max(1e-300).ln()).sum();
+        let block_logdet: f64 = eigs
+            .iter()
+            .rev()
+            .take(rank)
+            .map(|&e| e.max(1e-300).ln())
+            .sum();
         log_det_total += block_logdet;
 
         // S⁺ factor on the positive eigenspace: W such that W Wᵀ = S⁺.
@@ -5308,7 +5437,7 @@ pub fn compute_block_penalty_logdet_derivs(
         let rank = if !block_nullspace_dims.is_empty()
             && block_nullspace_dims.len() == penalties.len()
         {
-            let intersection_nullity = block_nullspace_dims.iter().copied().min().unwrap_or(0);
+            let intersection_nullity = exact_intersection_nullity(penalties, block_nullspace_dims);
             p.saturating_sub(intersection_nullity)
         } else {
             let threshold = positive_eigenvalue_threshold(eigs.as_slice().unwrap());
@@ -5801,8 +5930,11 @@ impl StochasticTraceEstimator {
             // Precompute (∂X/∂ψ_d) u for each implicit axis (reused across all e).
             let implicit_dx_u: Vec<Array1<f64>> = implicit_ops
                 .iter()
-                .map(|op| op.implicit_deriv.forward_mul(op.axis, &u.view())
-                    .expect("radial scalar evaluation failed during implicit derivative forward_mul"))
+                .map(|op| {
+                    op.implicit_deriv.forward_mul(op.axis, &u.view()).expect(
+                        "radial scalar evaluation failed during implicit derivative forward_mul",
+                    )
+                })
                 .collect();
 
             // Precompute u^T S_psi for each implicit axis (for penalty dot products).
@@ -6663,12 +6795,12 @@ mod tests {
         let tol = 1e-10;
         let h = 1e-5;
 
-        // Sanity-check: first derivative via FD should be finite and nonzero
-        // (the pseudo-logdet changes with psi because the nullspace rotates).
+        // The pseudo-logdet depends only on the positive eigenvalues, so a pure
+        // nullspace rotation leaves the first derivative exactly zero.
         let fd_first = pseudo_logdet_fd_first(psi, h, s1, s2, tol);
         assert!(
-            fd_first.is_finite() && fd_first.abs() > 1e-12,
-            "First derivative should be finite and nonzero for rotating nullspace, got {fd_first}"
+            fd_first.is_finite() && fd_first.abs() < 1e-8,
+            "First derivative should vanish for rotating nullspace, got {fd_first}"
         );
 
         let fd_second = pseudo_logdet_fd_second(psi, h, s1, s2, tol);

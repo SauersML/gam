@@ -536,6 +536,10 @@ impl DesignOperator for MultiChannelOperator {
         Ok(out)
     }
 
+    fn uses_matrix_free_pcg(&self) -> bool {
+        true
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         let total = self.nrows();
         let n = self.n_per_channel;
@@ -609,8 +613,7 @@ impl DesignOperator for RowwiseKroneckerOperator {
         let p_time = self.p_time;
         let n = self.n;
         // Reshape β as (p_cov, p_time).
-        let beta_mat =
-            ArrayView2::from_shape((p_cov, p_time), vector.as_slice().unwrap()).unwrap();
+        let beta_mat = ArrayView2::from_shape((p_cov, p_time), vector.as_slice().unwrap()).unwrap();
         // Compute T = time_basis · β_matᵀ: (n, p_cov).
         // T[i, j] = time[i,:] · β[j,:].
         let t_mat = self.time_basis.dot(&beta_mat.t());
@@ -729,6 +732,10 @@ impl DesignOperator for RowwiseKroneckerOperator {
             }
         }
         Ok(xtwx)
+    }
+
+    fn uses_matrix_free_pcg(&self) -> bool {
+        true
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -1030,9 +1037,7 @@ pub fn xt_diag_x_symmetric(
                 })?;
             Ok(SymmetricMatrix::Sparse(sparse))
         }
-        DesignMatrix::Operator(op) => {
-            Ok(SymmetricMatrix::Dense(op.diag_xtw_x(diag)?))
-        }
+        DesignMatrix::Operator(op) => Ok(SymmetricMatrix::Dense(op.diag_xtw_x(diag)?)),
     }
 }
 
