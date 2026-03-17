@@ -988,12 +988,6 @@ impl<'a> RemlState<'a> {
     where
         X: Into<DesignMatrix>,
     {
-        // Retain p-wide roots only for the remaining dense-only reparameterization
-        // and analytic-correction consumers.
-        let rs_list: Vec<Array2<f64>> = canonical_penalties
-            .iter()
-            .map(|cp| cp.global_root())
-            .collect();
         let x = x.into();
 
         let expected_len = canonical_penalties.len();
@@ -1026,7 +1020,6 @@ impl<'a> RemlState<'a> {
             weights,
             offset: offset.to_owned(),
             canonical_penalties,
-            rs_list,
             balanced_penalty_root,
             reparam_invariant,
             sparse_penalty_blocks,
@@ -1404,6 +1397,10 @@ impl<'a> RemlState<'a> {
 
     pub(crate) fn balanced_penalty_root(&self) -> &Array2<f64> {
         &self.balanced_penalty_root
+    }
+
+    pub(crate) fn canonical_penalties(&self) -> &[crate::construction::CanonicalPenalty] {
+        &self.canonical_penalties
     }
 
     /// Compute the exact pseudo-logdet for the sparse penalty path.
@@ -1802,14 +1799,13 @@ impl<'a> RemlState<'a> {
                 covariate_se: None,
             };
             let penalty = pirls::PenaltyConfig {
-                rs_original: &self.rs_list,
+                canonical_penalties: &self.canonical_penalties,
                 balanced_penalty_root: Some(&self.balanced_penalty_root),
                 reparam_invariant: Some(&self.reparam_invariant),
                 p: self.p,
                 coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
                 linear_constraints_original: self.linear_constraints.as_ref(),
                 penalty_shrinkage_floor: self.penalty_shrinkage_floor,
-                canonical_penalties: Some(&self.canonical_penalties),
             };
             let pirls_start = std::time::Instant::now();
             let result = pirls::fit_model_for_fixed_rho(

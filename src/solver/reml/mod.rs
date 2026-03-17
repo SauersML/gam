@@ -1946,9 +1946,9 @@ pub(crate) struct RemlState<'a> {
     weights: ArrayView1<'a, f64>,
     offset: Array1<f64>,
     /// Canonicalized block-local penalties with pre-computed roots.
+    /// This is the single canonical penalty representation — no full-width
+    /// `rank × p` roots are stored separately.
     canonical_penalties: Arc<Vec<crate::construction::CanonicalPenalty>>,
-    /// Legacy global penalty roots (rank_k x p), derived from canonical_penalties.
-    pub(crate) rs_list: Vec<Array2<f64>>,
     balanced_penalty_root: Array2<f64>,
     reparam_invariant: ReparamInvariant,
     sparse_penalty_blocks: Option<Arc<Vec<SparsePenaltyBlock>>>,

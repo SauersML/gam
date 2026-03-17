@@ -43,7 +43,7 @@ fn fit_unpenalized(
 ) -> pirls::PirlsResult {
     let rho = Array1::<f64>::zeros(0);
     let offset = Array1::<f64>::zeros(x.nrows());
-    let rs_original: Vec<Array2<f64>> = Vec::new();
+    let canonical: Vec<gam::construction::CanonicalPenalty> = Vec::new();
     let cfg = PirlsConfig {
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,
@@ -60,14 +60,13 @@ fn fit_unpenalized(
             covariate_se: None,
         },
         PenaltyConfig {
-            rs_original: &rs_original,
+            canonical_penalties: &canonical,
             balanced_penalty_root: None,
             reparam_invariant: None,
             p: x.ncols(),
             coefficient_lower_bounds: None,
             linear_constraints_original: None,
             penalty_shrinkage_floor: None,
-            canonical_penalties: None,
         },
         &cfg,
         None,

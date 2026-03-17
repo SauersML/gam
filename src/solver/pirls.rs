@@ -4315,26 +4315,34 @@ fn detect_logit_instability(
     order_separated || severe_saturation || weights_collapsed || dev_extremely_small
 }
 
-fn stack_lambdaweighted_penalty_root(
-    rs_original: &[Array2<f64>],
+/// Stack λ-weighted penalty roots from canonical penalties into a single
+/// `total_rank × p` matrix for PIRLS. Each block-local root is embedded
+/// into the full column space on-the-fly.
+fn stack_lambdaweighted_penalty_root_canonical(
+    penalties: &[crate::construction::CanonicalPenalty],
     lambdas: &[f64],
     p: usize,
 ) -> Array2<f64> {
-    let totalrows = rs_original.iter().map(Array2::nrows).sum();
+    let totalrows: usize = penalties.iter().map(|cp| cp.rank()).sum();
     if totalrows == 0 {
         return Array2::zeros((0, p));
     }
     let mut e = Array2::<f64>::zeros((totalrows, p));
     let mut row_start = 0usize;
-    for (k, rs_k) in rs_original.iter().enumerate() {
-        let rows = rs_k.nrows();
+    for (k, cp) in penalties.iter().enumerate() {
+        let rows = cp.rank();
         if rows == 0 {
             continue;
         }
         let scale = lambdas.get(k).copied().unwrap_or(0.0).max(0.0).sqrt();
         if scale != 0.0 {
-            e.slice_mut(s![row_start..row_start + rows, ..])
-                .assign(&rs_k.mapv(|v| v * scale));
+            // Embed block-local root (rank × block_dim) into full width (rank × p).
+            let r = &cp.col_range;
+            for row in 0..rows {
+                for col in 0..cp.block_dim() {
+                    e[[row_start + row, r.start + col]] = scale * cp.root[[row, col]];
+                }
+            }
         }
         row_start += rows;
     }
@@ -4343,15 +4351,16 @@ fn stack_lambdaweighted_penalty_root(
 
 fn build_sparse_native_reparam_result(
     base: ReparamResult,
-    rs_original: &[Array2<f64>],
+    penalties: &[crate::construction::CanonicalPenalty],
     lambdas: &[f64],
     p: usize,
 ) -> ReparamResult {
+    // Assemble weighted penalty sum block-locally.
     let mut s_original = Array2::<f64>::zeros((p, p));
-    for (k, rs_k) in rs_original.iter().enumerate() {
+    for (k, cp) in penalties.iter().enumerate() {
         let lambda_k = lambdas.get(k).copied().unwrap_or(0.0);
         if lambda_k != 0.0 {
-            s_original.scaled_add(lambda_k, &rs_k.t().dot(rs_k));
+            cp.accumulate_weighted(&mut s_original, lambda_k);
         }
     }
     let u_original = if base.u_truncated.nrows() == p {
@@ -4359,15 +4368,17 @@ fn build_sparse_native_reparam_result(
     } else {
         Array2::<f64>::eye(p)
     };
+    // Derive full-width roots for ReparamResult (required by downstream consumers).
+    let global_roots: Vec<Array2<f64>> = penalties.iter().map(|cp| cp.global_root()).collect();
     ReparamResult {
         penalty_shrinkage_ridge: base.penalty_shrinkage_ridge,
         s_transformed: s_original,
         log_det: base.log_det,
         det1: base.det1,
         qs: Array2::<f64>::eye(p),
-        rs_transformed: rs_original.to_vec(),
-        rs_transposed: rs_original.iter().map(|rs| rs.t().to_owned()).collect(),
-        e_transformed: stack_lambdaweighted_penalty_root(rs_original, lambdas, p),
+        rs_transposed: global_roots.iter().map(|rs| rs.t().to_owned()).collect(),
+        rs_transformed: global_roots,
+        e_transformed: stack_lambdaweighted_penalty_root_canonical(penalties, lambdas, p),
         u_truncated: u_original,
     }
 }
@@ -4381,7 +4392,11 @@ pub struct PirlsProblem<'a, X> {
 }
 
 pub struct PenaltyConfig<'a> {
-    pub rs_original: &'a [Array2<f64>],
+    /// Block-local canonical penalties with precomputed roots and spectral data.
+    /// This is the single canonical penalty representation — no full-width
+    /// `rank × p` roots are stored. When the reparameterization engine needs
+    /// full-width roots, they are derived on-the-fly from these block-local roots.
+    pub canonical_penalties: &'a [crate::construction::CanonicalPenalty],
     pub balanced_penalty_root: Option<&'a Array2<f64>>,
     pub reparam_invariant: Option<&'a crate::construction::ReparamInvariant>,
     pub p: usize,
@@ -4392,10 +4407,6 @@ pub struct PenaltyConfig<'a> {
     /// is added to prevent barely-penalized directions from causing pathological
     /// non-Gaussianity in the posterior. Typical value: `1e-6`. `None` disables.
     pub penalty_shrinkage_floor: Option<f64>,
-    /// Block-local canonical penalties. When present, PIRLS can use these for
-    /// block-local operations. The `rs_original` field is still needed for the
-    /// reparameterization engine which operates on full-width roots.
-    pub canonical_penalties: Option<&'a [crate::construction::CanonicalPenalty]>,
 }
 
 /// P-IRLS solver that follows mgcv's architecture exactly
@@ -4436,24 +4447,24 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let link_function = config.link_function();
 
     use crate::construction::{
-        EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
+        EngineDims, create_balanced_penalty_root_from_canonical,
+        stable_reparameterization_engine_canonical,
     };
 
     let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = penalty.balanced_penalty_root {
         Cow::Borrowed(precomputed)
     } else {
-        let mut s_list_full = Vec::with_capacity(penalty.rs_original.len());
-        for rs in penalty.rs_original {
-            s_list_full.push(rs.t().dot(rs));
-        }
-        Cow::Owned(create_balanced_penalty_root(&s_list_full, penalty.p)?)
+        Cow::Owned(create_balanced_penalty_root_from_canonical(
+            penalty.canonical_penalties,
+            penalty.p,
+        )?)
     };
     let eb: &Array2<f64> = eb_cow.as_ref();
 
-    let reparam_result = stable_reparameterization_engine(
-        penalty.rs_original,
+    let reparam_result = stable_reparameterization_engine_canonical(
+        penalty.canonical_penalties,
         lambdas_slice,
-        EngineDims::new(penalty.p, penalty.rs_original.len()),
+        EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
         penalty.reparam_invariant,
         penalty.penalty_shrinkage_floor,
     )?;
@@ -4494,7 +4505,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let (coordinate_frame, reparam_result_active) = if use_sparse_native {
         let sparse_reparam = build_sparse_native_reparam_result(
             reparam_result.clone(),
-            penalty.rs_original,
+            penalty.canonical_penalties,
             lambdas_slice,
             penalty.p,
         );
@@ -7387,6 +7398,17 @@ mod tests {
         let rho = Array1::<f64>::zeros(1);
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let rs = vec![array![[1.0]]];
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
+            let local = r.t().dot(r);
+            crate::construction::CanonicalPenalty {
+                root: r.clone(),
+                col_range: 0..r.ncols(),
+                total_dim: r.ncols(),
+                nullity: 0,
+                local,
+                positive_eigenvalues: Vec::new(),
+            }
+        }).collect();
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
@@ -7405,14 +7427,13 @@ mod tests {
                 covariate_se: Some(covariate_se.view()),
             },
             PenaltyConfig {
-                rs_original: &rs,
+                canonical_penalties: &canonical,
                 balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
                 linear_constraints_original: None,
                 penalty_shrinkage_floor: None,
-                canonical_penalties: None,
             },
             &config,
             Some(&Coefficients::new(array![0.0])),
@@ -7533,6 +7554,17 @@ mod tests {
         let offset = Array1::zeros(4);
         let rho = array![0.0];
         let rs = vec![array![[1.0]]];
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
+            let local = r.t().dot(r);
+            crate::construction::CanonicalPenalty {
+                root: r.clone(),
+                col_range: 0..r.ncols(),
+                total_dim: r.ncols(),
+                nullity: 0,
+                local,
+                positive_eigenvalues: Vec::new(),
+            }
+        }).collect();
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::PoissonLog),
             link_kind: InverseLink::Standard(LinkFunction::Log),
@@ -7551,14 +7583,13 @@ mod tests {
                 covariate_se: None,
             },
             PenaltyConfig {
-                rs_original: &rs,
+                canonical_penalties: &canonical,
                 balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
                 linear_constraints_original: None,
                 penalty_shrinkage_floor: None,
-                canonical_penalties: None,
             },
             &config,
             None,
@@ -7898,6 +7929,17 @@ mod root_cause_tests {
         let rho = array![0.0]; // log(lambda) = 0, so lambda = 1
         // Penalty on the second coefficient only (leave intercept unpenalized).
         let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
+            let local = r.t().dot(r);
+            crate::construction::CanonicalPenalty {
+                root: r.clone(),
+                col_range: 0..r.ncols(),
+                total_dim: r.ncols(),
+                nullity: 0,
+                local,
+                positive_eigenvalues: Vec::new(),
+            }
+        }).collect();
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
             link_kind: InverseLink::Standard(LinkFunction::Identity),
@@ -7917,14 +7959,13 @@ mod root_cause_tests {
                     covariate_se: None,
                 },
                 PenaltyConfig {
-                    rs_original: &rs,
+                    canonical_penalties: &canonical,
                     balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 2,
                     coefficient_lower_bounds: None,
                     linear_constraints_original: None,
                     penalty_shrinkage_floor: None,
-                    canonical_penalties: None,
                 },
                 &config,
                 None,
@@ -7960,6 +8001,17 @@ mod root_cause_tests {
         let offset = Array1::zeros(n);
         let rho = array![0.0];
         let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
+            let local = r.t().dot(r);
+            crate::construction::CanonicalPenalty {
+                root: r.clone(),
+                col_range: 0..r.ncols(),
+                total_dim: r.ncols(),
+                nullity: 0,
+                local,
+                positive_eigenvalues: Vec::new(),
+            }
+        }).collect();
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
@@ -7979,14 +8031,13 @@ mod root_cause_tests {
                     covariate_se: None,
                 },
                 PenaltyConfig {
-                    rs_original: &rs,
+                    canonical_penalties: &canonical,
                     balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 2,
                     coefficient_lower_bounds: None,
                     linear_constraints_original: None,
                     penalty_shrinkage_floor: None,
-                    canonical_penalties: None,
                 },
                 &config,
                 None,
@@ -8042,6 +8093,17 @@ mod root_cause_tests {
                 array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
                 array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
             ];
+            let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
+                let local = r.t().dot(r);
+                crate::construction::CanonicalPenalty {
+                    root: r.clone(),
+                    col_range: 0..r.ncols(),
+                    total_dim: r.ncols(),
+                    nullity: 0,
+                    local,
+                    positive_eigenvalues: Vec::new(),
+                }
+            }).collect();
             let config = PirlsConfig {
                 likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
                 link_kind: InverseLink::Standard(LinkFunction::Logit),
@@ -8061,14 +8123,13 @@ mod root_cause_tests {
                         covariate_se: None,
                     },
                     PenaltyConfig {
-                        rs_original: &rs,
+                        canonical_penalties: &canonical,
                         balanced_penalty_root: None,
                         reparam_invariant: None,
                         p: 3,
                         coefficient_lower_bounds: None,
                         linear_constraints_original: None,
                         penalty_shrinkage_floor: None,
-                        canonical_penalties: None,
                     },
                     &config,
                     None,

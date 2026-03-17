@@ -10993,13 +10993,13 @@ mod tests {
         // Raw TPS width for k=4,d=2 is 4; we drop intercept + matching x0 linear component.
         assert_eq!(design.smooth.total_smooth_cols(), 2);
 
+        let dense = design.design.as_dense_cow();
         let lin_col = design.linear_ranges[0].1.start;
-        let linvalues = design.design.column(lin_col).to_owned();
+        let linvalues = dense.column(lin_col).to_owned();
         let smooth_start = 1 + spec.linear_terms.len();
         let smooth_end = smooth_start + design.smooth.total_smooth_cols();
         for col in smooth_start..smooth_end {
-            let same_as_linear = design
-                .design
+            let same_as_linear = dense
                 .column(col)
                 .iter()
                 .zip(linvalues.iter())

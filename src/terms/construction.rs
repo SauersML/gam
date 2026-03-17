@@ -2223,13 +2223,13 @@ pub fn precompute_reparam_invariant_from_canonical(
 /// extreme skewness under logit link with high-dimensional spatial smooths).
 /// A typical value is `1e-6`. Set to `None` or `Some(0.0)` to disable.
 pub fn stable_reparameterizationwith_invariant(
-    rs_list: &[Array2<f64>],
+    penalties: &[CanonicalPenalty],
     lambdas: &[f64],
     p: usize,
     invariant: &ReparamInvariant,
     penalty_shrinkage_floor: Option<f64>,
 ) -> Result<ReparamResult, EstimationError> {
-    let m = rs_list.len();
+    let m = penalties.len();
 
     if lambdas.len() != m {
         return Err(EstimationError::ParameterConstraintViolation(format!(
@@ -2266,13 +2266,16 @@ pub fn stable_reparameterizationwith_invariant(
     if !invariant.has_nonzero {
         let qs = invariant.split.compose_qs();
         let u_truncated = qs.t().dot(&invariant.split.q_null);
+        // Derive full-width roots from block-local canonical penalties.
+        let global_roots: Vec<Array2<f64>> =
+            penalties.iter().map(|cp| cp.global_root()).collect();
         return Ok(ReparamResult {
             s_transformed: Array2::zeros((p, p)),
             log_det: 0.0,
             det1: Array1::zeros(m),
             qs,
-            rs_transformed: rs_list.to_vec(),
-            rs_transposed: rs_list.iter().map(transpose_owned).collect(),
+            rs_transposed: global_roots.iter().map(|r| r.t().to_owned()).collect(),
+            rs_transformed: global_roots,
             e_transformed: Array2::zeros((0, p)),
             // Stored in transformed frame for downstream trace/correction math.
             u_truncated, // All modes truncated when zero penalty
@@ -2591,8 +2594,9 @@ impl EngineDims {
 /// the fly (the post-REML refit path). Merging both cases into a single entry
 /// point ensures `penalty_shrinkage_floor` is always applied regardless of
 /// whether a cached invariant is available.
-pub fn stable_reparameterization_engine(
-    rs_list: &[Array2<f64>],
+/// Stable reparameterization from block-local canonical penalties.
+pub fn stable_reparameterization_engine_canonical(
+    penalties: &[CanonicalPenalty],
     lambdas: &[f64],
     dims: EngineDims,
     cached_invariant: Option<&ReparamInvariant>,
@@ -2602,12 +2606,12 @@ pub fn stable_reparameterization_engine(
     let invariant = match cached_invariant {
         Some(inv) => inv,
         None => {
-            owned = precompute_reparam_invariant(rs_list, dims.p)?;
+            owned = precompute_reparam_invariant_from_canonical(penalties, dims.p)?;
             &owned
         }
     };
     stable_reparameterizationwith_invariant(
-        rs_list,
+        penalties,
         lambdas,
         dims.p,
         invariant,
@@ -3015,11 +3019,30 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
 #[cfg(test)]
 mod tests {
     use super::{
-        SubspaceLeakageMetrics, assess_subspace_leakage, precompute_reparam_invariant,
+        CanonicalPenalty, SubspaceLeakageMetrics, assess_subspace_leakage,
+        precompute_reparam_invariant_from_canonical,
         stable_reparameterizationwith_invariant,
     };
     use faer::Mat;
     use ndarray::{Array2, array};
+
+    /// Build CanonicalPenalty values from full-width roots for tests.
+    fn canonical_from_roots(rs_list: &[Array2<f64>], p: usize) -> Vec<CanonicalPenalty> {
+        rs_list
+            .iter()
+            .map(|r| {
+                let local = r.t().dot(r);
+                CanonicalPenalty {
+                    root: r.clone(),
+                    col_range: 0..p,
+                    total_dim: p,
+                    nullity: 0,
+                    local,
+                    positive_eigenvalues: Vec::new(),
+                }
+            })
+            .collect()
+    }
 
     fn metrics_for(
         qs: &Mat<f64>,
@@ -3074,9 +3097,10 @@ mod tests {
     fn u_truncated_is_transformed_frame_in_nonzero_case() {
         let p = 3usize;
         let rs_list = vec![array![[1.0, 0.0, 0.0]]];
+        let canonical = canonical_from_roots(&rs_list, p);
         let lambdas = vec![2.0];
-        let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv, None)
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p).expect("precompute invariant");
+        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
         let expected = rep.qs.t().dot(&inv.split.q_null);
@@ -3091,10 +3115,10 @@ mod tests {
     #[test]
     fn u_truncated_is_identitywhen_no_penalties() {
         let p = 4usize;
-        let rs_list: Vec<Array2<f64>> = Vec::new();
+        let canonical: Vec<CanonicalPenalty> = Vec::new();
         let lambdas: Vec<f64> = Vec::new();
-        let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv, None)
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p).expect("precompute invariant");
+        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
             .expect("stable reparam");
         assert_eq!(rep.u_truncated, Array2::<f64>::eye(p));
     }
@@ -3105,9 +3129,10 @@ mod tests {
         let inv_sqrt2 = 2.0_f64.sqrt().recip();
         // Penalize a rotated direction in original space so Qs is non-trivial.
         let rs_list = vec![array![[inv_sqrt2, inv_sqrt2, 0.0]]];
+        let canonical = canonical_from_roots(&rs_list, p);
         let lambdas = vec![4.0];
-        let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv, None)
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p).expect("precompute invariant");
+        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
         assert_eq!(rep.e_transformed.nrows(), 1);
@@ -3153,10 +3178,11 @@ mod tests {
             [1.0 * q_t[1][0], 1.0 * q_t[1][1]]
         ];
         let rs_list = vec![rs];
+        let canonical = canonical_from_roots(&rs_list, p);
         let lambdas = vec![5.0];
 
-        let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
-        let rep = stable_reparameterizationwith_invariant(&rs_list, &lambdas, p, &inv, None)
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p).expect("precompute invariant");
+        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
         assert_eq!(rep.e_transformed.nrows(), p);

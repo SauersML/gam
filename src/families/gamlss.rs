@@ -10151,6 +10151,10 @@ impl BinomialLocationScaleFamily {
         for i in 0..n {
             let q = core.q0[i];
             let r = 1.0 / core.sigma[i].max(1e-12);
+            // κ = (dσ/dη_ls)/σ: 1 in the active exp region, 0 on the
+            // safe_exp plateau.  The cross block carries an overall κ and
+            // the scale-scale block carries κ².
+            let kappa = core.dsigma_deta[i] / core.sigma[i].max(1e-12);
             let (m1, m2, _) = binomial_neglog_q_derivatives_closed_form_dispatch(
                 self.y[i],
                 self.weights[i],
@@ -10159,8 +10163,8 @@ impl BinomialLocationScaleFamily {
                 &self.link_kind,
             );
             coeff_tt[i] = m2 * r * r;
-            coeff_tl[i] = r * (m1 + q * m2);
-            coeff_ll[i] = q * (m1 + q * m2);
+            coeff_tl[i] = kappa * r * (m1 + q * m2);
+            coeff_ll[i] = kappa * kappa * q * (m1 + q * m2);
         }
 
         let h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
