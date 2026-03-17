@@ -757,22 +757,45 @@ impl CanonicalPenalty {
         self.col_range.start != 0 || self.col_range.end != self.total_dim
     }
 
-    /// Reconstruct the local penalty matrix: root^T * root.
+    /// Return the cached local penalty matrix.
     /// Shape: `block_dim x block_dim`.
     pub fn local_penalty(&self) -> Array2<f64> {
-        self.root.t().dot(&self.root)
+        self.local.clone()
     }
 
     /// Accumulate lambda * S_k into a pre-allocated `p x p` target matrix.
+    /// Only touches the block [col_range × col_range].
     pub fn accumulate_weighted(&self, target: &mut Array2<f64>, lambda: f64) {
         if lambda == 0.0 || self.rank() == 0 {
             return;
         }
-        let local = self.local_penalty();
         let r = &self.col_range;
         target
             .slice_mut(s![r.start..r.end, r.start..r.end])
-            .scaled_add(lambda, &local);
+            .scaled_add(lambda, &self.local);
+    }
+
+    /// Compute `scale * tr(M · S_k)` where M is a `p × p` dense matrix.
+    /// Only reads `M[start..end, start..end]` — O(block_dim²) not O(p²).
+    pub fn trace_product(&self, m: &Array2<f64>, scale: f64) -> f64 {
+        if self.rank() == 0 || scale == 0.0 {
+            return 0.0;
+        }
+        let r = &self.col_range;
+        let m_block = m.slice(s![r.start..r.end, r.start..r.end]);
+        let rm = self.root.dot(&m_block);
+        scale * rm.iter().zip(self.root.iter()).map(|(&a, &b)| a * b).sum::<f64>()
+    }
+
+    /// Compute `scale * v^T S_k v` (quadratic form).
+    /// Only reads `v[start..end]` — O(rank × block_dim) not O(rank × p).
+    pub fn quadratic(&self, v: &Array1<f64>, scale: f64) -> f64 {
+        if self.rank() == 0 || scale == 0.0 {
+            return 0.0;
+        }
+        let v_block = v.slice(s![self.col_range.start..self.col_range.end]);
+        let rv = self.root.dot(&v_block);
+        scale * rv.dot(&rv)
     }
 
     /// Global root: `rank x p` matrix (embeds block root into full column space).

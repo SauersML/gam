@@ -1810,12 +1810,14 @@ fn build_tensor_bspline_basis(
 
     for dim in 0..marginal_penalties.len() {
         let mut s_dim = Array2::<f64>::eye(1);
+        let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
         for (j, &qj) in marginalnum_basis.iter().enumerate() {
             let factor = if j == dim {
                 marginal_penalties[j].clone()
             } else {
                 Array2::<f64>::eye(qj)
             };
+            factors.push(factor.clone());
             s_dim = kronecker_product(&s_dim, &factor);
         }
 
@@ -1824,6 +1826,7 @@ fn build_tensor_bspline_basis(
             nullspace_dim_hint: 0,
             source: PenaltySource::TensorMarginal { dim },
             normalization_scale: 1.0,
+            kronecker_factors: Some(factors),
         });
     }
 
@@ -3021,6 +3024,8 @@ fn apply_spatial_orthogonality_to_parametric(
             metadata: local_metadata[idx].clone(),
             lower_bounds_local: smooth.terms[idx].lower_bounds_local.clone(),
             linear_constraints_local: local_linear_constraints[idx].clone(),
+            // Spatial orthogonality transform breaks Kronecker structure.
+            kronecker_factored: None,
         });
         if let Some(lin_local) = &local_linear_constraints[idx] {
             for r in 0..lin_local.a.nrows() {
