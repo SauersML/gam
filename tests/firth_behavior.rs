@@ -185,17 +185,17 @@ fn firthfd_step_size_sensitivity() {
 #[test]
 fn firth_beta_monotonicity_comparison() {
     let (x, y, w, s_list) = make_problem(31);
-    let rs = compute_penalty_square_roots(&s_list).expect("roots");
+    let penalties = canonicalize_test_penalties(&s_list);
     let deltas = [
         -0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010,
     ];
     let betas_firth: Vec<f64> = deltas
         .iter()
-        .map(|&d| fit_beta_norm(&x, &y, &w, &rs, 12.0 + d, true))
+        .map(|&d| fit_beta_norm(&x, &y, &w, &penalties, 12.0 + d, true))
         .collect();
     let betas_no_firth: Vec<f64> = deltas
         .iter()
-        .map(|&d| fit_beta_norm(&x, &y, &w, &rs, 12.0 + d, false))
+        .map(|&d| fit_beta_norm(&x, &y, &w, &penalties, 12.0 + d, false))
         .collect();
     let count_sign_changes = |values: &[f64]| -> usize {
         values
@@ -213,16 +213,16 @@ fn firth_beta_monotonicity_comparison() {
 #[test]
 fn firthcost_oscillationvs_no_firth() {
     let (x, y, w, s_list) = make_problem(31);
-    let rs = compute_penalty_square_roots(&s_list).expect("roots");
+    let penalties = canonicalize_test_penalties(&s_list);
     let s = &s_list[0];
     let steps: Vec<f64> = (-20..=20).map(|i| i as f64 * 0.001).collect();
     let cost_firth: Vec<f64> = steps
         .iter()
-        .map(|&d| proxycostwith_pirls(&x, &y, &w, &rs, s, 12.0 + d, true))
+        .map(|&d| proxycostwith_pirls(&x, &y, &w, &penalties, s, 12.0 + d, true))
         .collect();
     let cost_no_firth: Vec<f64> = steps
         .iter()
-        .map(|&d| proxycostwith_pirls(&x, &y, &w, &rs, s, 12.0 + d, false))
+        .map(|&d| proxycostwith_pirls(&x, &y, &w, &penalties, s, 12.0 + d, false))
         .collect();
     let count_direction_changes = |costs: &[f64]| -> usize {
         let mut changes = 0;
