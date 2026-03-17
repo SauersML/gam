@@ -5297,6 +5297,7 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
         linear_constraints: design.linear_constraints.clone(),
         adaptive_regularization: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
+        kronecker_penalty_system: design.kronecker_penalty_system(),
     }
 }
 
@@ -7603,6 +7604,7 @@ fn external_opts_for_design(
         linear_constraints: design.linear_constraints.clone(),
         firth_bias_reduction: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
+        kronecker_penalty_system: None,
     }
 }
 
