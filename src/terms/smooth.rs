@@ -28,7 +28,9 @@ use crate::estimate::{
 };
 use crate::faer_ndarray::fast_atv;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
-use crate::matrix::{DesignMatrix, SymmetricMatrix};
+use crate::matrix::{
+    BlockDesignOperator, DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix,
+};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::LinearInequalityConstraints;
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
@@ -510,9 +512,12 @@ pub fn weighted_blockwise_penalty_sum(
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TermCollectionDesign {
-    pub design: Array2<f64>,
+    /// The full design matrix.  When random effects are present this is an
+    /// operator-based `BlockDesignOperator` wrapping a dense core and O(n)
+    /// random-effect operators; otherwise a plain `Dense` matrix.
+    pub design: DesignMatrix,
     pub penalties: Vec<BlockwisePenalty>,
     pub nullspace_dims: Vec<usize>,
     pub penaltyinfo: Vec<PenaltyBlockInfo>,
@@ -2464,37 +2469,28 @@ pub fn build_term_collection_design(
 
     let p_intercept = 1usize;
     let p_lin = spec.linear_terms.len();
-    let p_rand: usize = random_blocks.iter().map(|b| b.design.ncols()).sum();
+    let p_rand: usize = random_blocks.iter().map(|b| b.num_groups).sum();
     let p_smooth = smooth.design.ncols();
     let p_total = p_intercept + p_lin + p_rand + p_smooth;
-    let mut design = Array2::<f64>::zeros((n, p_total));
-    design.column_mut(0).fill(1.0);
+
+    // Build the dense core: intercept + linear + smooth columns.
+    let p_dense = p_intercept + p_lin + p_smooth;
+    let mut dense_core = Array2::<f64>::zeros((n, p_dense));
+    dense_core.column_mut(0).fill(1.0);
 
     let mut linear_ranges = Vec::<(String, Range<usize>)>::with_capacity(p_lin);
     for (j, linear) in spec.linear_terms.iter().enumerate() {
         let col = p_intercept + j;
-        design
+        dense_core
             .column_mut(col)
             .assign(&data.column(linear.feature_col));
+        // Column ranges are in the global (full) coordinate system:
+        // [intercept | linear | random_effects | smooth]
         linear_ranges.push((linear.name.clone(), col..(col + 1)));
     }
-    let mut random_effect_ranges =
-        Vec::<(String, Range<usize>)>::with_capacity(random_blocks.len());
-    let mut random_effect_levels = Vec::<(String, Vec<u64>)>::with_capacity(random_blocks.len());
-    let mut col_cursor = p_intercept + p_lin;
-    for block in &random_blocks {
-        let q = block.design.ncols();
-        let end = col_cursor + q;
-        design
-            .slice_mut(s![.., col_cursor..end])
-            .assign(&block.design);
-        random_effect_ranges.push((block.name.clone(), col_cursor..end));
-        random_effect_levels.push((block.name.clone(), block.kept_levels.clone()));
-        col_cursor = end;
-    }
     if p_smooth > 0 {
-        design
-            .slice_mut(s![.., (p_intercept + p_lin + p_rand)..])
+        dense_core
+            .slice_mut(s![.., (p_intercept + p_lin)..])
             .assign(&smooth.design);
     }
 
