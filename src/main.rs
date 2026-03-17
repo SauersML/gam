@@ -1850,17 +1850,19 @@ fn build_predict_input_for_model(
                 model.noise_non_intercept_start,
             )?;
             let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
+                let pred_d_dense = design.design.as_dense_cow();
+                let pred_dn_dense = design_noise_raw.design.as_dense_cow();
                 apply_scale_deviation_transform(
-                    &design.design,
-                    &design_noise_raw.design,
+                    &pred_d_dense,
+                    &pred_dn_dense,
                     transform,
                 )?
             } else {
-                design_noise_raw.design.clone()
+                design_noise_raw.design.to_dense()
             };
 
             Ok(PredictInput {
-                design: DesignMatrix::Dense(Arc::new(design.design)),
+                design: design.design.clone(),
                 offset,
                 design_noise: Some(DesignMatrix::Dense(Arc::new(prepared_noise_design))),
                 offset_noise: Some(Array1::zeros(n)),
@@ -3234,8 +3236,9 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         progress.set_stage("diagnose", "computing alo from saved geometry");
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
         let eta = design.design.dot(&fit_saved.beta);
+        let alo_design_dense = design.design.as_dense_cow();
         let input =
-            gam::alo::AloInput::from_geometry(geom, &design.design, &eta, &offset, link, 1.0);
+            gam::alo::AloInput::from_geometry(geom, &alo_design_dense, &eta, &offset, link, 1.0);
         progress.advance_workflow(4);
         gam::alo::compute_alo_from_input(&input)
             .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?

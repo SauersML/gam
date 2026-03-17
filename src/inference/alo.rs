@@ -134,10 +134,13 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let e = &base.reparam_result.e_transformed;
     let ridge = base.ridge_passport.laplacehessianridge().max(0.0);
 
+    // ALO needs dense Hessian for chunked column solves via StableSolver.
+    let h_dense_for_alo = base.stabilizedhessian_transformed.to_dense();
+
     // Build model-agnostic AloInput from PIRLS geometry, then delegate.
     let input = AloInput {
         design: x_dense,
-        penalized_hessian: &base.stabilizedhessian_transformed,
+        penalized_hessian: &h_dense_for_alo,
         working_weights: &base.finalweights,
         working_response: &base.solveworking_response,
         eta: &base.final_eta,
