@@ -6575,10 +6575,12 @@ fn run_generate_binomial_location_scale(
         model.noise_non_intercept_start,
     )?;
     let eta_t = design.design.dot(&beta_t);
+    let dense_gen_binom_mean = design.design.to_dense();
+    let dense_gen_binom_noise = design_noise.design.to_dense();
     let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
-        apply_scale_deviation_transform(&design.design, &design_noise.design, transform)?
+        apply_scale_deviation_transform(&dense_gen_binom_mean, &dense_gen_binom_noise, transform)?
     } else {
-        design_noise.design.clone()
+        dense_gen_binom_noise
     };
     let eta_noise = preparednoise_design.dot(&beta_noise);
     let sigma = eta_noise.mapv(f64::exp);
@@ -6666,7 +6668,7 @@ fn run_generate_standard(
     }
     let offset = Array1::zeros(design.design.nrows());
     let pred_input = PredictInput {
-        design: DesignMatrix::Dense(Arc::new(design.design.clone())),
+        design: design.design.clone(),
         offset,
         design_noise: None,
         offset_noise: None,
@@ -6844,7 +6846,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
 
                 let offset = Array1::<f64>::zeros(ds.values.nrows());
                 let pred =
-                    predict_gam(design.design.view(), fit.beta.view(), offset.view(), family)
+                    predict_gam(design.design.clone(), fit.beta.view(), offset.view(), family)
                         .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
                 let y = ds.values.column(y_col).to_owned();
                 n_obs = Some(y.len());
