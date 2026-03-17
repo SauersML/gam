@@ -1032,6 +1032,21 @@ pub struct SpatialLengthScaleOptimizationOptions {
     pub min_length_scale: f64,
     /// Maximum allowed length_scale during κ search.
     pub max_length_scale: f64,
+    /// Automatic pilot-fit threshold for biobank-scale acceleration.
+    ///
+    /// When n exceeds twice this value, κ/anisotropy optimization runs on a
+    /// spatially stratified random subsample of this size, then the full
+    /// dataset is fit once with frozen geometry. This avoids repeated O(n·k)
+    /// dense basis rebuilds at each κ proposal.
+    ///
+    /// The subsample preserves spatial coverage via cell-based stratification
+    /// on the coordinates of the first eligible spatial term. The full-data
+    /// fit uses the pilot-optimized length scales and anisotropy exactly,
+    /// so the only approximation is in the κ search — the final coefficients
+    /// and smoothing parameters are estimated on all observations.
+    ///
+    /// Set to 0 to disable pilot-fit and always optimize on full data.
+    pub pilot_subsample_threshold: usize,
 }
 
 impl Default for SpatialLengthScaleOptimizationOptions {
@@ -1040,10 +1055,10 @@ impl Default for SpatialLengthScaleOptimizationOptions {
             enabled: true,
             max_outer_iter: 3,
             rel_tol: 1e-4,
-            // Seed auxiliary candidates around current scale by approximately x0.5 and x2.0.
             log_step: std::f64::consts::LN_2,
             min_length_scale: 1e-3,
             max_length_scale: 1e3,
+            pilot_subsample_threshold: 10_000,
         }
     }
 }

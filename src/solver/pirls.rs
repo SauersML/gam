@@ -4956,7 +4956,28 @@ fn solve_penalized_least_squares_implicit(
     workspace.wz *= &weights;
 
     // 2. Form X'WX: compute in original coordinates, then rotate by Qs.
-    let xtwx_orig = GamWorkingModel::compute_xtwx_blas(workspace, x_original, &weights.to_owned())?;
+    let weights_owned = weights.to_owned();
+    let xtwx_orig = match x_original {
+        DesignMatrix::Dense(x_dense) => {
+            let p = x_dense.ncols();
+            if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
+                workspace.hessian_buf = Array2::zeros((p, p).f());
+            } else {
+                workspace.hessian_buf.fill(0.0);
+            }
+            PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
+                &workspace.sqrtw,
+                &mut workspace.weighted_x_chunk,
+                x_dense,
+                &mut workspace.hessian_buf,
+                get_global_parallelism(),
+            );
+            std::mem::take(&mut workspace.hessian_buf)
+        }
+        _ => x_original
+            .diag_xtw_x(&weights_owned)
+            .map_err(EstimationError::InvalidInput)?,
+    };
     let mut penalized_hessian = s_transformed.clone();
     if let Some(qs) = qs {
         let tmp = fast_atb(qs, &xtwx_orig);
