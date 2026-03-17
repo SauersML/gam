@@ -2563,25 +2563,25 @@ pub fn build_term_collection_design(
 
     // Assemble the full DesignMatrix.
     //
-    // When random effects are present, use a BlockDesignOperator that composes
-    // the dense core (intercept + linear) with O(n) random-effect operators and
-    // the dense smooth block.  This avoids materializing the n × q one-hot
-    // matrices — the dominant memory cost for biobank-scale random intercepts.
-    //
-    // When there are no random effects, the dense core already contains all
-    // columns and is wrapped directly.
-    let design: DesignMatrix = if random_blocks.is_empty() {
-        // No RE — dense_core already has [intercept | linear | smooth].
+    // Use a BlockDesignOperator when random effects are present OR when any
+    // smooth term has Kronecker (tensor-product) structure.  The factored
+    // tensor terms become implicit DesignBlock::Operator blocks, avoiding
+    // materialization of the full n × ∏q_j design.
+    let any_kronecker = smooth.terms.iter().any(|t| t.kronecker_factored.is_some());
+
+    let design: DesignMatrix = if random_blocks.is_empty() && !any_kronecker {
+        // No RE, no Kronecker — dense_core already has [intercept | linear | smooth].
         DesignMatrix::Dense(Arc::new(dense_core))
     } else {
         // Build the block operator.
         //
         // Global column layout:
-        //   [intercept + linear] | [RE_0] | [RE_1] | … | [smooth]
+        //   [intercept + linear] | [RE_0] | … | [smooth_term_0] | [smooth_term_1] | …
         //
-        // dense_core has [intercept + linear + smooth] columns.  We split it
-        // into two dense blocks (pre-RE and post-RE) with RE operators in between.
-        let p_pre_re = p_intercept + p_lin; // intercept + linear columns
+        // When any smooth term has Kronecker structure, split smooth into per-term
+        // blocks so factored terms become DesignBlock::Operator.  Otherwise, the
+        // smooth section is a single dense block.
+        let p_pre_re = p_intercept + p_lin;
         let mut blocks = Vec::<DesignBlock>::new();
 
         // Block 0: intercept + linear (dense).
@@ -2599,10 +2599,37 @@ pub fn build_term_collection_design(
             blocks.push(DesignBlock::RandomEffect(Arc::new(re_op)));
         }
 
-        // Final block: smooth (dense), if present.
+        // Smooth blocks.
         if p_smooth > 0 {
-            let smooth_part = dense_core.slice(s![.., p_pre_re..]).to_owned();
-            blocks.push(DesignBlock::Dense(Arc::new(smooth_part)));
+            if any_kronecker {
+                // Per-term blocks: factored terms become Operator, others Dense.
+                for term in &smooth.terms {
+                    if let Some(ref kron) = term.kronecker_factored {
+                        let marginals: Vec<Arc<Array2<f64>>> = kron
+                            .marginal_designs
+                            .iter()
+                            .map(|m| Arc::new(m.clone()))
+                            .collect();
+                        let op = TensorProductDesignOperator::new(marginals).map_err(|e| {
+                            BasisError::InvalidInput(format!(
+                                "TensorProductDesignOperator for term '{}': {e}",
+                                term.name
+                            ))
+                        })?;
+                        blocks.push(DesignBlock::Operator(Arc::new(op)));
+                    } else {
+                        let r = &term.coeff_range;
+                        let cols_in_dense = (p_pre_re + r.start)..(p_pre_re + r.end);
+                        let term_block =
+                            dense_core.slice(s![.., cols_in_dense]).to_owned();
+                        blocks.push(DesignBlock::Dense(Arc::new(term_block)));
+                    }
+                }
+            } else {
+                // Single dense smooth block (original path).
+                let smooth_part = dense_core.slice(s![.., p_pre_re..]).to_owned();
+                blocks.push(DesignBlock::Dense(Arc::new(smooth_part)));
+            }
         }
 
         let block_op = BlockDesignOperator::new(blocks).map_err(|e| {

@@ -1891,6 +1891,14 @@ impl DesignOperator for ConditionedDesign {
         }
     }
 
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let mut chunk = self.inner.row_chunk(rows);
+        for &(j, mean, scale) in &self.columns {
+            chunk.column_mut(j).mapv_inplace(|v| (v - mean) / scale);
+        }
+        chunk
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         let mut dense = self.inner.to_dense();
         for &(j, mean, scale) in &self.columns {
