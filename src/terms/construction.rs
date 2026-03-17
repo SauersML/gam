@@ -732,6 +732,13 @@ pub struct CanonicalPenalty {
     pub total_dim: usize,
     /// Structural nullity of the local penalty.
     pub nullity: usize,
+    /// The symmetrized block-local penalty matrix (block_dim × block_dim).
+    /// Cached at construction time to avoid recomputing root^T * root
+    /// in hot paths (penalty assembly, trace products).
+    pub local: Array2<f64>,
+    /// Positive eigenvalues of the local penalty matrix (length = rank).
+    /// Cached at construction time for REML logdet block-factored paths.
+    pub positive_eigenvalues: Vec<f64>,
 }
 
 impl CanonicalPenalty {
@@ -880,12 +887,14 @@ pub fn canonicalize_penalty_spec(
     let block_dim = local_owned.nrows();
 
     let mut root = Array2::zeros((rank_k, block_dim));
+    let mut positive_eigenvalues = Vec::with_capacity(rank_k);
     let mut row_idx = 0;
     for (i, &eigenval) in eigenvalues.iter().enumerate() {
         if eigenval > tolerance {
             let sqrt_eigenval = eigenval.sqrt();
             let eigenvec = eigenvectors.column(i);
             root.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
+            positive_eigenvalues.push(eigenval);
             row_idx += 1;
         }
     }
@@ -895,6 +904,8 @@ pub fn canonicalize_penalty_spec(
         col_range,
         total_dim: p,
         nullity: analysis.nullity,
+        local: analysis.sym_penalty,
+        positive_eigenvalues,
     }))
 }
 

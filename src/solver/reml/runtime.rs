@@ -3,6 +3,9 @@ use crate::linalg::utils::{
     boundary_hit_indices, symmetric_spectrum_condition_number,
 };
 use crate::pirls::PirlsWorkspace;
+use crate::construction::{
+    create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
+};
 use crate::terms::smooth::{BlockwisePenalty, penalties_to_global, weighted_blockwise_penalty_sum};
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
@@ -622,20 +625,11 @@ impl<'a> RemlState<'a> {
                     .unwrap_or_else(|_| Array1::zeros(rhs.len()))
             };
 
-            // Penalty roots from s_full_list via blockwise eigendecomposition.
+            // Penalty roots from canonical penalties (already precomputed).
             let penalty_roots: Vec<Array2<f64>> = self
-                .s_full_list
+                .canonical_penalties
                 .iter()
-                .enumerate()
-                .map(|(idx, bp)| {
-                    match super::unified::penalty_matrix_root(&bp.local) {
-                        Ok(local_root) => root_local_to_global(local_root, bp.col_range.clone(), self.p),
-                        Err(_) => {
-                            log::warn!("penalty root for S_{idx} failed in sparse TK");
-                            Array2::zeros((0, self.p))
-                        }
-                    }
-                })
+                .map(|cp| cp.global_root())
                 .collect();
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
@@ -939,7 +933,9 @@ impl<'a> RemlState<'a> {
         &self,
         pr: &PirlsResult,
     ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
-        let base = pr.stabilizedhessian_transformed.clone();
+        // Convert to dense: this path is only used by the dense spectral
+        // evaluator which needs a full eigendecomposition.
+        let base = pr.stabilizedhessian_transformed.to_dense();
 
         if base.cholesky(Side::Lower).is_ok() {
             return Ok((base, pr.ridge_passport));
@@ -1651,8 +1647,12 @@ impl<'a> RemlState<'a> {
             .clone();
 
         let lambdas = rho.mapv(f64::exp);
-        let lambdas_vec: Vec<f64> = lambdas.to_vec();
-        let mut s_lambda = weighted_blockwise_penalty_sum(&self.s_full_list, &lambdas_vec, self.p);
+        let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
+        for (k, cp) in self.canonical_penalties.iter().enumerate() {
+            if k < lambdas.len() && lambdas[k] != 0.0 {
+                cp.accumulate_weighted(&mut s_lambda, lambdas[k]);
+            }
+        }
         // Add log-barrier Hessian diagonal for monotonicity-constrained
         // coefficients (sparse path uses original coordinates).
         if let Some(ref lin) = self.linear_constraints {
@@ -2035,32 +2035,35 @@ impl<'a> RemlState<'a> {
 
             const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
             let want_hot_diag = self.should_compute_hot_diagnostics(cost_call_idx);
-            if ridge_used > 0.0
-                && want_hot_diag
-                && let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
-                && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
-            {
-                if should_emit_h_min_eig_diag(min_eig) {
-                    log::debug!(
-                        "[Diag] H min_eig={:.3e} (ridge={:.3e})",
-                        min_eig,
-                        ridge_used
-                    );
-                }
-                if min_eig <= 0.0 {
-                    log::warn!(
-                        "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
-                        ridge_used
-                    );
-                }
-                if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
-                    let condition_number = symmetric_spectrum_condition_number(
-                        &pirls_result.penalized_hessian_transformed,
-                    );
-                    log::warn!(
-                        "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
-                        condition_number
-                    );
+            if ridge_used > 0.0 && want_hot_diag {
+                // Eigenvalue diagnostics require dense; only pay the cost when
+                // hot diagnostics are requested and ridge was applied.
+                let pht_dense = pirls_result.penalized_hessian_transformed.to_dense();
+                if let Ok((eigs, _)) = pht_dense.eigh(Side::Lower) {
+                    if let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
+                        if should_emit_h_min_eig_diag(min_eig) {
+                            log::debug!(
+                                "[Diag] H min_eig={:.3e} (ridge={:.3e})",
+                                min_eig,
+                                ridge_used
+                            );
+                        }
+                        if min_eig <= 0.0 {
+                            log::warn!(
+                                "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
+                                ridge_used
+                            );
+                        }
+                        if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
+                            let condition_number = symmetric_spectrum_condition_number(
+                                &pht_dense,
+                            );
+                            log::warn!(
+                                "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
+                                condition_number
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2698,20 +2701,12 @@ impl<'a> RemlState<'a> {
             hessian_op.active_rank()
         );
 
-        // Penalty roots from s_full_list via blockwise eigendecomposition.
+        // Penalty roots from canonical penalties (already precomputed).
         let penalty_roots: Vec<Array2<f64>> = self
-            .s_full_list
+            .canonical_penalties
             .iter()
-            .enumerate()
-            .map(|(idx, bp)| {
-                let local_root = penalty_matrix_root(&bp.local).map_err(|e| {
-                    EstimationError::RemlOptimizationFailed(format!(
-                        "penalty root for S_{idx} failed: {e}"
-                    ))
-                })?;
-                Ok(root_local_to_global(local_root, bp.col_range.clone(), self.p))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|cp| cp.global_root())
+            .collect();
 
         // Nullspace dimension.
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
@@ -2797,20 +2792,12 @@ impl<'a> RemlState<'a> {
             Box::new(op)
         };
 
-        // Penalty roots from s_full_list via blockwise eigendecomposition.
+        // Penalty roots from canonical penalties (already precomputed).
         let penalty_roots: Vec<Array2<f64>> = self
-            .s_full_list
+            .canonical_penalties
             .iter()
-            .enumerate()
-            .map(|(idx, bp)| {
-                let local_root = penalty_matrix_root(&bp.local).map_err(|e| {
-                    EstimationError::RemlOptimizationFailed(format!(
-                        "penalty root for S_{idx} failed: {e}"
-                    ))
-                })?;
-                Ok(root_local_to_global(local_root, bp.col_range.clone(), self.p))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|cp| cp.global_root())
+            .collect();
 
         // Nullspace dimension.
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
@@ -3186,18 +3173,10 @@ impl<'a> RemlState<'a> {
         };
 
         let penalty_roots: Vec<Array2<f64>> = self
-            .s_full_list
+            .canonical_penalties
             .iter()
-            .enumerate()
-            .map(|(idx, bp)| {
-                let local_root = penalty_matrix_root(&bp.local).map_err(|e| {
-                    EstimationError::RemlOptimizationFailed(format!(
-                        "penalty root for S_{idx} failed: {e}"
-                    ))
-                })?;
-                Ok(root_local_to_global(local_root, bp.col_range.clone(), self.p))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|cp| cp.global_root())
+            .collect();
 
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {

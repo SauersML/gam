@@ -706,11 +706,19 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        let lambdas_slice = lambdas.as_slice().unwrap();
-        let s_eval = weighted_blockwise_penalty_sum(&self.s_full_list, lambdas_slice, p_dim);
+        let mut s_eval = Array2::<f64>::zeros((p_dim, p_dim));
+        for (k, cp) in self.canonical_penalties.iter().enumerate() {
+            if k < lambdas.len() && lambdas[k] != 0.0 {
+                cp.accumulate_weighted(&mut s_eval, lambdas[k]);
+            }
+        }
         let pld = super::penalty_logdet::PenaltyPseudologdet::from_assembled(s_eval)
             .map_err(EstimationError::InvalidInput)?;
-        let s_k_unscaled: Vec<Array2<f64>> = penalties_to_global(&self.s_full_list, p_dim);
+        let s_k_unscaled: Vec<Array2<f64>> = self
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.global_penalty())
+            .collect();
 
         let x_dense = self
             .x()

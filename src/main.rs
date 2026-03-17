@@ -54,7 +54,7 @@ use gam::inference::formula_dsl::{
     option_usize_any, parse_countwith_basis_alias, parse_duchon_order, parse_duchon_power,
     parse_formula, parse_link_choice, parse_linkwiggle_formulaspec, parse_matern_nu,
     parse_matching_auxiliary_formula, parse_ps_internal_knots, parse_surv_response, resolve_col,
-    unique_count_column, validate_auxiliary_formula_controls,
+    spatial_center_strategy_for_dimension, unique_count_column, validate_auxiliary_formula_controls,
 };
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
@@ -1536,9 +1536,11 @@ fn run_fitwith_predict_noise(
                 SavedFitSummary::from_blockwise_fit(&fit)?
                     .rescaled_gaussian_location_scale(response_scale, y.len())?,
             );
+            let dense_mean_design = mean_design.design.to_dense();
+            let dense_noise_design = noise_design.design.to_dense();
             let gaussian_noise_transform = build_scale_deviation_transform(
-                &mean_design.design,
-                &noise_design.design,
+                &dense_mean_design,
+                &dense_noise_design,
                 &Array1::ones(y.len()),
                 noise_design
                     .intercept_range
@@ -1710,9 +1712,11 @@ fn run_fitwith_predict_noise(
             fit.covariance_conditional.clone(),
             SavedFitSummary::from_blockwise_fit(&fit)?,
         );
+        let dense_binom_mean = solved.fit.mean_design.design.to_dense();
+        let dense_binom_noise = solved.fit.noise_design.design.to_dense();
         let binomial_noise_transform = build_scale_deviation_transform(
-            &solved.fit.mean_design.design,
-            &solved.fit.noise_design.design,
+            &dense_binom_mean,
+            &dense_binom_noise,
             &Array1::ones(y.len()),
             solved
                 .fit
@@ -1826,7 +1830,7 @@ fn build_predict_input_for_model(
                 ));
             }
             Ok(PredictInput {
-                design: DesignMatrix::Dense(Arc::new(design.design)),
+                design: design.design.clone(),
                 offset,
                 design_noise: None,
                 offset_noise: None,
@@ -1889,9 +1893,9 @@ fn build_predict_input_for_model(
             let design_logslope = build_term_collection_design(data, &spec_logslope)
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
             Ok(PredictInput {
-                design: DesignMatrix::Dense(Arc::new(design.design)),
+                design: design.design.clone(),
                 offset,
-                design_noise: Some(DesignMatrix::Dense(Arc::new(design_logslope.design))),
+                design_noise: Some(design_logslope.design.clone()),
                 offset_noise: Some(Array1::zeros(n)),
                 auxiliary_scalar: Some(z),
             })
@@ -2293,25 +2297,26 @@ fn run_predict_survival(
         } else {
             time_build.x_exit_time.clone()
         };
+        let dense_threshold_design = threshold_design.design.to_dense();
         let mut survival_primary_design =
-            Array2::<f64>::zeros((n, x_time_exit.ncols() + threshold_design.design.ncols()));
+            Array2::<f64>::zeros((n, x_time_exit.ncols() + dense_threshold_design.ncols()));
         survival_primary_design
             .slice_mut(s![.., 0..x_time_exit.ncols()])
             .assign(&x_time_exit);
         survival_primary_design
             .slice_mut(s![.., x_time_exit.ncols()..])
-            .assign(&threshold_design.design);
+            .assign(&dense_threshold_design);
+        let dense_raw_sigma = raw_sigma_design.design.to_dense();
         let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
             apply_scale_deviation_transform(
                 &survival_primary_design,
-                &raw_sigma_design.design,
+                &dense_raw_sigma,
                 transform,
             )?
         } else {
-            raw_sigma_design.design.clone()
+            dense_raw_sigma
         };
-        let eta_t = DesignMatrix::Dense(Arc::new(threshold_design.design.clone()))
-            .matrixvectormultiply(&beta_threshold);
+        let eta_t = threshold_design.design.dot(&beta_threshold);
         let eta_ls = DesignMatrix::Dense(Arc::new(prepared_sigma_design.clone()))
             .matrixvectormultiply(&beta_log_sigma);
         let sigma = eta_ls.mapv(f64::exp);
@@ -2333,7 +2338,7 @@ fn run_predict_survival(
         let pred_input = SurvivalLocationScalePredictInput {
             x_time_exit: x_time_exit,
             eta_time_offset_exit: eta_offset_exit.clone(),
-            x_threshold: DesignMatrix::Dense(Arc::new(threshold_design.design.clone())),
+            x_threshold: threshold_design.design.clone(),
             eta_threshold_offset: Array1::zeros(n),
             x_log_sigma: DesignMatrix::Dense(Arc::new(prepared_sigma_design)),
             eta_log_sigma_offset: Array1::zeros(n),
@@ -2456,7 +2461,7 @@ fn run_predict_survival(
             }
         }
         for j in 0..p_cov {
-            x_exit[[i, p_time + p_timewiggle + j]] = cov_design.design[[i, j]];
+            x_exit[[i, p_time + p_timewiggle + j]] = cov_design.design.get(i, j);
         }
     }
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
@@ -2614,12 +2619,14 @@ fn run_predict_binomial_location_scale(
         &model.noise_scale,
         model.noise_non_intercept_start,
     )?;
+    let dense_design_t = design_t.design.to_dense();
+    let dense_design_noise = design_noise.design.to_dense();
     let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
-        apply_scale_deviation_transform(&design_t.design, &design_noise.design, transform)?
+        apply_scale_deviation_transform(&dense_design_t, &dense_design_noise, transform)?
     } else {
-        design_noise.design.clone()
+        dense_design_noise.clone()
     };
-    let eta_t = design_t.design.dot(&beta_t);
+    let eta_t = dense_design_t.dot(&beta_t);
     let eta_noise = preparednoise_design.dot(&beta_noise);
     let saved_loc_link = saved_link_kind.ok_or_else(|| {
         "binomial-location-scale model is missing link state/metadata".to_string()
@@ -2655,11 +2662,11 @@ fn run_predict_binomial_location_scale(
             let scale = dq_dq0[i];
             let inv_sigma = 1.0 / sigma[i].max(1e-12);
             for j in 0..p_t {
-                grad[[i, j]] = -scale * design_t.design[[i, j]] * inv_sigma;
+                grad[[i, j]] = -scale * dense_design_t[[i, j]] * inv_sigma;
             }
             let coeff_ls = scale * eta_t[i] * dsigma[i] / sigma[i].powi(2).max(1e-12);
             for j in 0..p_ls {
-                grad[[i, p_t + j]] = coeff_ls * design_noise.design[[i, j]];
+                grad[[i, p_t + j]] = coeff_ls * dense_design_noise[[i, j]];
             }
             if let Some(wd) = wiggle_design.as_ref() {
                 for j in 0..pw {
@@ -6168,8 +6175,7 @@ fn run_sample_standard_link_wiggle(
     }
 
     // Base penalty: Σ λ_k S_k (p_main × p_main)
-    let global_penalties_base = design.global_penalties();
-    let penalty_base = weighted_penalty_matrix(&global_penalties_base, base_lambdas)?;
+    let penalty_base = weighted_blockwise_penalty_sum(&design.penalties, base_lambdas.as_slice().unwrap(), p_main);
 
     // Wiggle penalty: rebuild constrained difference penalties for the saved
     // wiggle basis and weight them by the saved LinkWiggle lambdas.
@@ -10174,7 +10180,7 @@ mod tests {
             sigma_time_degree: 3,
             adaptive_regularization: false,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: Some(out),
         }
     }
@@ -10308,7 +10314,7 @@ mod tests {
             sigma_time_degree: 3,
             adaptive_regularization: false,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: Some(model_path.clone()),
         })
         .expect("survival predict-noise fit should succeed");
@@ -10397,7 +10403,7 @@ mod tests {
             sigma_time_degree: 3,
             adaptive_regularization: true,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: Some(model_path.clone()),
         };
         run_fit(fit_args).expect("fit should succeed");
@@ -10473,7 +10479,7 @@ mod tests {
             sigma_time_degree: 3,
             adaptive_regularization: false,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: Some(model_path.clone()),
         };
         run_fit(fit_args).expect("Firth fit should succeed");
@@ -11870,7 +11876,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -11910,7 +11916,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12389,7 +12395,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12437,7 +12443,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12479,7 +12485,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12521,7 +12527,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12569,7 +12575,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12611,7 +12617,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12653,7 +12659,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12723,7 +12729,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12764,7 +12770,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -12807,7 +12813,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: None,
             logslope_formula: None,
             z_column: None,
@@ -13168,7 +13174,7 @@ mod tests {
             sigma_time_k: None,
             sigma_time_degree: 3,
             scale_dimensions: false,
-            pilot_subsample_size: None,
+            pilot_subsample_threshold: 0,
             out: Some(out_path.clone()),
             logslope_formula: None,
             z_column: None,

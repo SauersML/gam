@@ -661,8 +661,10 @@ fn map_hessian_to_original_basis(
     pirls: &crate::pirls::PirlsResult,
 ) -> Result<Array2<f64>, EstimationError> {
     let qs = &pirls.reparam_result.qs;
-    let h_t = pirls.penalized_hessian_transformed.to_dense();
-    let tmp = qs.dot(&h_t);
+    let h_t = &pirls.penalized_hessian_transformed;
+    // H_original = Qs * H_transformed * Qs'
+    // left_dot_matrix avoids densification for sparse Hessians.
+    let tmp = h_t.left_dot_matrix(qs);
     Ok(tmp.dot(&qs.t()))
 }
 
@@ -2006,6 +2008,7 @@ where
             coefficient_lower_bounds: None,
             linear_constraints_original: fit_linear_constraints.as_ref(),
             penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+            penalties: None,
         },
         &pirls::PirlsConfig {
             link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -2223,6 +2226,7 @@ where
                                     coefficient_lower_bounds: None,
                                     linear_constraints_original: fit_linear_constraints.as_ref(),
                                     penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+                                    penalties: None,
                                 },
                                 &pirls::PirlsConfig {
                                     link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -2483,7 +2487,7 @@ fn validate_and_build_reml_state<X, T, F>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<Array2<f64>>,
+    s_list: Vec<BlockwisePenalty>,
     theta: &Array1<f64>,
     rho_dim: usize,
     mut hyper_dirs: Vec<DirectionalHyperParam>,
@@ -2649,7 +2653,7 @@ pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: Vec<Array2<f64>>,
+    s_list: Vec<BlockwisePenalty>,
     theta: &Array1<f64>,
     rho_dim: usize,
     hyper_dirs: Vec<DirectionalHyperParam>,
@@ -4061,7 +4065,7 @@ pub(crate) fn fit_gamwith_heuristic_lambdas_andwarm_start<X>(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    s_list: &[Array2<f64>],
+    s_list: &[BlockwisePenalty],
     heuristic_lambdas: Option<&[f64]>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     family: crate::types::LikelihoodFamily,
@@ -4284,7 +4288,7 @@ pub fn fit_gam<X>(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    s_list: &[Array2<f64>],
+    s_list: &[BlockwisePenalty],
     family: crate::types::LikelihoodFamily,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
@@ -4367,7 +4371,7 @@ pub fn evaluate_externalgradients<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: &[Array2<f64>],
+    s_list: &[BlockwisePenalty],
     opts: &ExternalOptimOptions,
     rho: &Array1<f64>,
 ) -> Result<(Array1<f64>, Array1<f64>), EstimationError>
@@ -4435,7 +4439,7 @@ pub fn evaluate_externalcost_andridge<X>(
     w: ArrayView1<'_, f64>,
     x: X,
     offset: ArrayView1<'_, f64>,
-    s_list: &[Array2<f64>],
+    s_list: &[BlockwisePenalty],
     opts: &ExternalOptimOptions,
     rho: &Array1<f64>,
 ) -> Result<(f64, f64), EstimationError>
