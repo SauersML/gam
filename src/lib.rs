@@ -25,9 +25,10 @@ pub use families::survival_location_scale;
 pub use families::survival_marginal_slope;
 pub use families::transformation_normal;
 pub use solver::workflow::{
-    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
-    GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
-    StandardFitRequest, StandardFitResult, SurvivalLocationScaleFitRequest,
-    SurvivalLocationScaleFitResult, SurvivalMarginalSlopeFitRequest,
-    TransformationNormalFitRequest, fit_model,
+    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitConfig, FitRequest,
+    FitResult, GaussianLocationScaleFitRequest, LinkWiggleConfig, MaterializedModel,
+    StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
+    SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult,
+    SurvivalMarginalSlopeFitRequest, TransformationNormalFitRequest, fit_from_formula, fit_model,
+    is_binary_response, materialize, resolve_family,
 };

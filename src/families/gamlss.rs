@@ -203,7 +203,7 @@ impl GamlssBetaLayout {
 pub struct ParameterBlockInput {
     pub design: DesignMatrix,
     pub offset: Array1<f64>,
-    pub penalties: Vec<Array2<f64>>,
+    pub penalties: Vec<crate::solver::estimate::PenaltySpec>,
     /// Structural nullspace dimension per penalty (same length as `penalties`).
     /// Empty means "use eigenvalue-based rank detection."
     pub nullspace_dims: Vec<usize>,
@@ -252,11 +252,23 @@ impl ParameterBlockInput {
             ));
         }
         for (k, s) in self.penalties.iter().enumerate() {
-            let (r, c) = s.dim();
-            if r != p || c != p {
-                return Err(format!(
-                    "block '{name}' penalty {k} must be {p}x{p}, got {r}x{c}"
-                ));
+            match s {
+                crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                    if col_range.end > p || local.nrows() != col_range.len() || local.ncols() != col_range.len() {
+                        return Err(format!(
+                            "block '{name}' penalty {k} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
+                            col_range.start, col_range.end, local.nrows(), local.ncols()
+                        ));
+                    }
+                }
+                crate::solver::estimate::PenaltySpec::Dense(m) => {
+                    let (r, c) = m.dim();
+                    if r != p || c != p {
+                        return Err(format!(
+                            "block '{name}' penalty {k} must be {p}x{p}, got {r}x{c}"
+                        ));
+                    }
+                }
             }
         }
         let k = self.penalties.len();
@@ -273,11 +285,22 @@ impl ParameterBlockInput {
             name: name.to_string(),
             design: self.design,
             offset: self.offset,
-            penalties: self
-                .penalties
-                .into_iter()
-                .map(|m| PenaltyMatrix::Dense(m))
-                .collect(),
+            penalties: {
+                let p = p;
+                self.penalties
+                    .into_iter()
+                    .map(|spec| match spec {
+                        crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                            PenaltyMatrix::Blockwise {
+                                local,
+                                col_range,
+                                total_dim: p,
+                            }
+                        }
+                        crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m),
+                    })
+                    .collect()
+            },
             nullspace_dims: self.nullspace_dims,
             initial_log_lambdas,
             initial_beta: self.initial_beta,
@@ -359,20 +382,20 @@ pub fn buildwiggle_block_input_from_knots(
     if p == 0 {
         return Err("wiggle basis has no free monotone columns".to_string());
     }
-    let mut penalties = Vec::new();
+    let mut penalties: Vec<crate::solver::estimate::PenaltySpec> = Vec::new();
     let mut nullspace_dims = Vec::new();
     if p == 1 {
-        penalties.push(Array2::<f64>::eye(1));
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(Array2::<f64>::eye(1)));
         nullspace_dims.push(0);
     } else {
         let effective_order = penalty_order.max(1).min(p - 1);
-        penalties.push(
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(
             create_difference_penalty_matrix(p, effective_order, None).map_err(|e| e.to_string())?,
-        );
+        ));
         nullspace_dims.push(effective_order);
     }
     if double_penalty {
-        penalties.push(Array2::<f64>::eye(p));
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(Array2::<f64>::eye(p)));
         nullspace_dims.push(0);
     }
     Ok(ParameterBlockInput {
@@ -560,7 +583,7 @@ pub(crate) fn append_selected_wiggle_penalty_orders(
         }
         let penalty =
             create_difference_penalty_matrix(p, order, None).map_err(|e| e.to_string())?;
-        block.penalties.push(penalty);
+        block.penalties.push(crate::solver::estimate::PenaltySpec::Dense(penalty));
         block.nullspace_dims.push(order);
     }
     Ok(())
@@ -2528,7 +2551,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 eta_block: ParameterBlockInput {
                     design: pilot_design.design.clone(),
                     offset: Array1::zeros(y.len()),
-                    penalties: pilot_design.global_penalties(),
+                    penalties: pilot_design.penalties.iter().map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp)).collect(),
                     nullspace_dims: vec![],
                     initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
                     initial_beta: Some(pilot_fit.beta.clone()),
@@ -2638,7 +2661,19 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 name: "wiggle".to_string(),
                 design: wiggle_design.clone(),
                 offset: wiggle_offset.clone(),
-                penalties: wiggle_penalties.iter().map(|p| PenaltyMatrix::Dense(p.clone())).collect(),
+                penalties: {
+                    let p_wiggle = wiggle_design.ncols();
+                    wiggle_penalties.iter().map(|spec| match spec {
+                        crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                            PenaltyMatrix::Blockwise {
+                                local: local.clone(),
+                                col_range: col_range.clone(),
+                                total_dim: p_wiggle,
+                            }
+                        }
+                        crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
+                    }).collect()
+                },
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 initial_beta: wiggle_initial_beta.clone(),
@@ -2795,7 +2830,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             eta_block: ParameterBlockInput {
                 design: design.design.clone(),
                 offset: Array1::zeros(y.len()),
-                penalties: design.global_penalties(),
+                penalties: design.penalties.iter().map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp)).collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
                 initial_beta: Some(pilot_beta),

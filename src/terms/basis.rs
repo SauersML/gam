@@ -1586,7 +1586,14 @@ pub struct BasisBuildResult {
 /// Factored tensor-product basis metadata for operator-backed downstream use.
 #[derive(Debug, Clone)]
 pub struct KroneckerFactoredBasis {
+    /// Marginal design matrices: `marginal_designs[j]` is `(n, q_j)`.
     pub marginal_designs: Vec<Array2<f64>>,
+    /// Marginal penalty matrices: `marginal_penalties[k]` is `(q_k, q_k)`.
+    pub marginal_penalties: Vec<Array2<f64>>,
+    /// Marginal basis dimensions: `[q_0, ..., q_{d-1}]`.
+    pub marginal_dims: Vec<usize>,
+    /// Whether the system includes a global ridge (double) penalty.
+    pub has_double_penalty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

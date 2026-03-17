@@ -1051,21 +1051,26 @@ impl<'a> RemlState<'a> {
         // Canonical penalty pseudo-logdeterminant: eigendecomposes S once and
         // provides tau_hessian_component / rho_tau_hessian_component methods
         // for all derivative queries on log|S|₊.
-        let rs_eval: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
-            reparam_result
-                .rs_transformed
-                .iter()
-                .map(|r| r.dot(z))
-                .collect()
-        } else {
-            reparam_result.rs_transformed.clone()
-        };
-        let s_eval = rs_eval
-            .iter()
-            .enumerate()
-            .fold(Array2::<f64>::zeros((p_dim, p_dim)), |acc, (k, r)| {
-                acc + r.t().dot(r).mapv(|v| lambdas[k] * v)
-            });
+        let ct_eval: Vec<crate::construction::CanonicalPenalty> =
+            if let Some(z) = free_basis_opt.as_ref() {
+                reparam_result
+                    .canonical_transformed
+                    .iter()
+                    .map(|cp| {
+                        let projected_root = cp.root.dot(z);
+                        crate::construction::CanonicalPenalty::from_dense_root(
+                            projected_root,
+                            z.ncols(),
+                        )
+                    })
+                    .collect()
+            } else {
+                reparam_result.canonical_transformed.clone()
+            };
+        let mut s_eval = Array2::<f64>::zeros((p_dim, p_dim));
+        for (k, cp) in ct_eval.iter().enumerate() {
+            cp.accumulate_weighted(&mut s_eval, lambdas[k]);
+        }
         let pld = super::penalty_logdet::PenaltyPseudologdet::from_assembled(s_eval)
             .map_err(EstimationError::InvalidInput)?;
 

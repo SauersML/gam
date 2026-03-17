@@ -2278,7 +2278,7 @@ where
                             likelihood_family: opts.family,
                             mode: selected_pirls_res.beta_transformed.view(),
                             hessian: hessian_dense.view(),
-                            penalty_roots: selected_pirls_res.reparam_result.rs_transformed.clone(),
+                            penalty_roots: selected_pirls_res.reparam_result.canonical_transformed.clone(),
                             penalty_nullspace_dims: opts.nullspace_dims.clone(),
                             rho_mode: selected_rho.view(),
                             nuts_family: match opts.family {
@@ -2460,8 +2460,9 @@ where
             }
         };
         let mut traces = vec![0.0f64; k];
-        for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
-            let ekt_arr = rs.t().to_owned();
+        for (kk, cp) in pirls_res.reparam_result.canonical_transformed.iter().enumerate() {
+            let root_global = cp.global_root();
+            let ekt_arr = root_global.t().to_owned();
             let sol = factor.solvemulti(&ekt_arr).map_err(|_| {
                 EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
@@ -2471,8 +2472,8 @@ where
             traces[kk] = lambdas[kk] * frob;
         }
         edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
-        for (kk, rs_k) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
-            let p_k = rs_k.nrows() as f64;
+        for (kk, cp) in pirls_res.reparam_result.canonical_transformed.iter().enumerate() {
+            let p_k = cp.rank() as f64;
             let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
             edf_by_block[kk] = edf_k;
         }

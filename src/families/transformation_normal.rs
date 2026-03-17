@@ -1512,7 +1512,10 @@ pub fn fit_transformation_normal(
             freeze_spatial_length_scale_terms_from_design(covariate_spec, &cov_design)
                 .map_err(|e| format!("failed to freeze covariate spatial basis centers: {e}"))?;
 
-        let cov_global_penalties = cov_design.global_penalties();
+        let cov_global_penalties: Vec<Array2<f64>> = {
+            let p_cov = cov_design.design.ncols();
+            cov_design.penalties.iter().map(|bp| bp.to_global(p_cov)).collect()
+        };
         let cov_dense = cov_design.design.as_dense_cow();
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             resp_val,
@@ -1569,7 +1572,10 @@ pub fn fit_transformation_normal(
         build_block_spatial_psi_derivatives(covariate_data, &boot_spec, &boot_design)?.is_some();
 
     // Build an initial family + blocks for capability probing.
-    let boot_global_penalties = boot_design.global_penalties();
+    let boot_global_penalties: Vec<Array2<f64>> = {
+        let p_cov = boot_design.design.ncols();
+        boot_design.penalties.iter().map(|bp| bp.to_global(p_cov)).collect()
+    };
     let boot_dense = boot_design.design.as_dense_cow();
     let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
         resp_val.clone(),
@@ -1619,7 +1625,10 @@ pub fn fit_transformation_normal(
     // Helper: build family from prebuilt response basis + covariate design.
     let make_family =
         |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
-            let gp = cov_design.global_penalties();
+            let gp: Vec<Array2<f64>> = {
+                let p_cov = cov_design.design.ncols();
+                cov_design.penalties.iter().map(|bp| bp.to_global(p_cov)).collect()
+            };
             let cov_dense = cov_design.design.as_dense_cow();
             TransformationNormalFamily::from_prebuilt_response_basis(
                 rv.clone(),

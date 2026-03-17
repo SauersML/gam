@@ -2844,10 +2844,8 @@ struct JointBetaRhoPosterior {
     n_beta: usize,
     /// Dimension of ρ
     n_rho: usize,
-    /// Penalty root matrices R_k where S_k = R_k' R_k (in transformed basis)
-    penalty_roots: Vec<Array2<f64>>,
-    /// Precomputed penalty matrices S_k = R_k' R_k (avoids recomputation each gradient eval)
-    penalty_matrices: Vec<Array2<f64>>,
+    /// Canonical penalties in the transformed basis.
+    penalty_canonical: Vec<crate::construction::CanonicalPenalty>,
     /// Structural nullspace dimension of each penalty matrix.
     penalty_nullspace_dims: Vec<usize>,
     /// Prior std dev on ρ (weakly informative Gaussian)
@@ -2865,7 +2863,7 @@ impl JointBetaRhoPosterior {
         weights: ArrayView1<f64>,
         mode: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
-        penalty_roots: Vec<Array2<f64>>,
+        penalty_canonical: Vec<crate::construction::CanonicalPenalty>,
         penalty_nullspace_dims: Vec<usize>,
         rho_mode: ArrayView1<f64>,
         nuts_family: NutsFamily,
@@ -2873,13 +2871,13 @@ impl JointBetaRhoPosterior {
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let n_beta = x.ncols();
-        let n_rho = penalty_roots.len();
+        let n_rho = penalty_canonical.len();
 
         validate_firth_support(nuts_family, firth_enabled)?;
 
         if rho_mode.len() != n_rho {
             return Err(format!(
-                "rho_mode length {} != penalty_roots count {}",
+                "rho_mode length {} != penalty count {}",
                 rho_mode.len(),
                 n_rho
             ));
@@ -2894,15 +2892,11 @@ impl JointBetaRhoPosterior {
         let chol = solve_upper_triangular_transpose(&l_h, n_beta);
         let chol_t = chol.t().to_owned();
 
-        // Precompute S_k = R_k' R_k once; reused in every gradient evaluation.
-        let penalty_matrices: Vec<Array2<f64>> =
-            penalty_roots.iter().map(|r_k| r_k.t().dot(r_k)).collect();
-
         // Build combined penalty at the LAML mode (for SharedData)
         let lambdas_mode: Array1<f64> = rho_mode.mapv(f64::exp);
         let mut s_combined = Array2::<f64>::zeros((n_beta, n_beta));
-        for (k, s_k) in penalty_matrices.iter().enumerate() {
-            s_combined.scaled_add(lambdas_mode[k], s_k);
+        for (k, cp) in penalty_canonical.iter().enumerate() {
+            cp.accumulate_weighted(&mut s_combined, lambdas_mode[k]);
         }
 
         let data = SharedData {
@@ -2990,29 +2984,35 @@ impl JointBetaRhoPosterior {
         let mut s_beta = Array1::<f64>::zeros(n_beta);
         let mut grad_rho = Array1::<f64>::zeros(n_rho);
 
-        for (k, r_k) in self.penalty_roots.iter().enumerate() {
-            let r_beta = r_k.dot(&beta);
-            let quad_k = r_beta.dot(&r_beta); // β'S_k β
+        for (k, cp) in self.penalty_canonical.iter().enumerate() {
+            // Block-local quadratic: β'S_k β via root
+            let r = &cp.col_range;
+            let beta_block = beta.slice(s![r.start..r.end]);
+            let r_beta = cp.root.dot(&beta_block);
+            let quad_k = r_beta.dot(&r_beta);
             penalty_val += 0.5 * lambdas[k] * quad_k;
 
-            // Accumulate S(ρ)β for β-gradient
-            let s_k_beta = r_k.t().dot(&r_beta);
-            s_beta.scaled_add(lambdas[k], &s_k_beta);
+            // Accumulate S(ρ)β for β-gradient — block-local
+            for a in 0..cp.block_dim() {
+                let val: f64 = (0..cp.rank())
+                    .map(|row| cp.root[[row, a]] * r_beta[row])
+                    .sum();
+                s_beta[r.start + a] += lambdas[k] * val;
+            }
 
-            // ρ_k gradient from penalty: ∂/∂ρ_k [-0.5 λ_k β'S_k β] = -0.5 λ_k β'S_k β
-            // (since ∂λ_k/∂ρ_k = λ_k for ρ = log λ)
+            // ρ_k gradient from penalty
             grad_rho[k] = -0.5 * lambdas[k] * quad_k;
         }
 
         // ---- Structural penalty log-determinant: +0.5 log|S(ρ)|₊ and ρ-derivatives ----
-        // Delegates to the shared utility from the unified REML module, which
-        // uses eigendecomposition with adaptive tolerance and computes both
-        // log|S|₊ and ∂/∂ρ_k log|S|₊ = tr(S₊⁻¹ A_k) from the same decomposition.
-        //
-        // All penalty matrices live in a single block (no multi-block structure).
+        let penalty_matrices: Vec<Array2<f64>> = self
+            .penalty_canonical
+            .iter()
+            .map(|cp| cp.global_penalty())
+            .collect();
         let penalty_logdet = compute_block_penalty_logdet_derivs(
             &[rho.clone()],
-            &[self.penalty_matrices.as_slice()],
+            &[penalty_matrices.as_slice()],
             &[self.penalty_nullspace_dims.as_slice()],
             0.0,
         );

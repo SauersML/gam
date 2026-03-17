@@ -1422,11 +1422,7 @@ fn build_logslope_blockspec(
         name: "logslope_surface".to_string(),
         design: design.design.clone(),
         offset: Array1::from_elem(design.design.nrows(), baseline),
-        penalties: design
-            .global_penalties()
-            .into_iter()
-            .map(PenaltyMatrix::Dense)
-            .collect(),
+        penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,

@@ -570,15 +570,10 @@ pub struct ReparamResult {
     pub det1: Array1<f64>,
     /// Orthogonal transformation matrix Qs
     pub qs: Array2<f64>,
-    /// Transformed penalty square roots rS (each is rank_k x p).
-    /// These are the original block-local roots multiplied by QS.
-    pub rs_transformed: Vec<Array2<f64>>,
-    /// Cached transposes of rS (each is p x rank_k) to avoid repeated transposes in hot paths
-    pub rs_transposed: Vec<Array2<f64>>,
     /// Canonical penalties in the TRANSFORMED coordinate frame.
-    /// Built once from `rs_transformed` so downstream consumers (TK correction,
-    /// ext-coord paths) can use block-local `PenaltyCoordinate` construction
-    /// without re-cloning the global roots.
+    /// The single source of truth for penalty roots in the transformed frame.
+    /// Downstream consumers use these for block-local `PenaltyCoordinate`
+    /// construction, TK correction, and ext-coord paths.
     pub canonical_transformed: Vec<CanonicalPenalty>,
     /// Lambda-dependent penalty square root in TRANSFORMED coordinates (rank x p matrix).
     /// This is used for applying the actual penalty in the least squares solve.
@@ -733,12 +728,15 @@ fn ridge_root(
     rs
 }
 
+/// Per-factor decomposition result for Kronecker penalties.
+struct KroneckerFactorDecomp {
+    root: Array2<f64>,              // rank_j × q_j
+    positive_eigenvalues: Vec<f64>, // length = rank_j
+    rank: usize,
+    dim: usize,
+}
+
 /// Kronecker-factored root: eigendecompose each factor separately.
-///
-/// For factors `[F_0, F_1, ..., F_k]` where the product is `F_0 ⊗ F_1 ⊗ ... ⊗ F_k`,
-/// the eigendecomposition of the Kronecker product is the Kronecker product of
-/// the factor eigendecompositions. The root is `R_0 ⊗ R_1 ⊗ ... ⊗ R_k` where
-/// each `R_j` is the square root of factor `F_j`.
 ///
 /// Cost: O(Σ q_j³) instead of O((Π q_j)³).
 fn kronecker_root(
@@ -749,24 +747,35 @@ fn kronecker_root(
     if factors.is_empty() {
         return Ok(Array2::zeros((0, p_total)));
     }
+    let decomps = match decompose_kronecker_factors(factors, "kronecker_root")? {
+        None => return Ok(Array2::zeros((0, p_total))),
+        Some(d) => d,
+    };
+    let kron_root = assemble_kronecker_root_local(&decomps);
+    let rank_total = kron_root.nrows();
+    debug_assert_eq!(kron_root.ncols(), col_range.len());
+    let mut rs = Array2::zeros((rank_total, p_total));
+    rs.slice_mut(s![.., col_range.start..col_range.end])
+        .assign(&kron_root);
+    Ok(rs)
+}
 
-    // Eigendecompose each factor and build its square root.
-    struct FactorRoot {
-        root: Array2<f64>,  // rank_j × q_j
-        rank: usize,
-        dim: usize,
-    }
 
-    let mut factor_roots = Vec::with_capacity(factors.len());
+/// Eigendecompose each Kronecker factor separately at O(Σ q_j³).
+/// Returns per-factor decompositions, or `None` if any factor is zero.
+fn decompose_kronecker_factors(
+    factors: &[Array2<f64>],
+    context: &str,
+) -> Result<Option<Vec<KroneckerFactorDecomp>>, EstimationError> {
+    let mut decomps = Vec::with_capacity(factors.len());
     for (j, factor) in factors.iter().enumerate() {
         let q_j = factor.nrows();
         if q_j != factor.ncols() {
             return Err(EstimationError::InvalidInput(format!(
-                "Kronecker factor {j} must be square, got {}x{}", factor.nrows(), factor.ncols()
+                "{context}: Kronecker factor {j} must be square, got {}x{}",
+                factor.nrows(), factor.ncols()
             )));
         }
-
-        // Check if this factor is an identity matrix (common: I ⊗ S_j ⊗ I).
         let is_identity = {
             let mut is_id = true;
             'outer: for r in 0..q_j {
@@ -780,30 +789,25 @@ fn kronecker_root(
             }
             is_id
         };
-
         if is_identity {
-            // Identity factor: root is identity, rank = dim.
-            factor_roots.push(FactorRoot {
+            decomps.push(KroneckerFactorDecomp {
                 root: Array2::eye(q_j),
+                positive_eigenvalues: vec![1.0; q_j],
                 rank: q_j,
                 dim: q_j,
             });
             continue;
         }
-
-        // General PSD factor: eigendecompose at O(q_j^3).
         let analysis = analyze_penalty_block(factor).map_err(|err| {
             EstimationError::InvalidInput(format!(
-                "Kronecker factor {j} eigendecomposition failed: {err}"
+                "{context}: Kronecker factor {j} eigendecomp failed: {err}"
             ))
         })?;
-
         if analysis.rank == 0 {
-            // Zero factor → entire Kronecker product is zero.
-            return Ok(Array2::zeros((0, p_total)));
+            return Ok(None);
         }
-
         let mut root_j = Array2::zeros((analysis.rank, q_j));
+        let mut pos_eigs = Vec::with_capacity(analysis.rank);
         let mut row_idx = 0;
         for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
             if eigenval > analysis.tol {
@@ -812,21 +816,24 @@ fn kronecker_root(
                 for (c, &v) in evec.iter().enumerate() {
                     root_j[[row_idx, c]] = sqrt_ev * v;
                 }
+                pos_eigs.push(eigenval);
                 row_idx += 1;
             }
         }
-
-        factor_roots.push(FactorRoot {
+        decomps.push(KroneckerFactorDecomp {
             root: root_j,
+            positive_eigenvalues: pos_eigs,
             rank: analysis.rank,
             dim: q_j,
         });
     }
+    Ok(Some(decomps))
+}
 
-    // Build the Kronecker product of factor roots iteratively.
-    // Start with the first factor's root, then Kronecker-multiply with each subsequent.
-    let mut kron_root = factor_roots[0].root.clone();
-    for fr in &factor_roots[1..] {
+/// Build the block-local Kronecker root from pre-computed factor decompositions.
+fn assemble_kronecker_root_local(decomps: &[KroneckerFactorDecomp]) -> Array2<f64> {
+    let mut kron_root = decomps[0].root.clone();
+    for fr in &decomps[1..] {
         let (r1, c1) = kron_root.dim();
         let (r2, c2) = (fr.rank, fr.dim);
         let mut new_root = Array2::zeros((r1 * r2, c1 * c2));
@@ -842,18 +849,27 @@ fn kronecker_root(
         }
         kron_root = new_root;
     }
-
-    // Embed into global coordinates.
-    let rank_total = kron_root.nrows();
-    let block_dim = kron_root.ncols();
-    debug_assert_eq!(block_dim, col_range.len());
-    let mut rs = Array2::zeros((rank_total, p_total));
-    rs.slice_mut(s![.., col_range.start..col_range.end])
-        .assign(&kron_root);
-
-    Ok(rs)
+    kron_root
 }
 
+/// Compute eigenvalues of the Kronecker product from per-factor eigenvalues.
+fn kronecker_eigenvalues(decomps: &[KroneckerFactorDecomp], block_dim: usize) -> (Vec<f64>, usize) {
+    let mut kron_eigs = decomps[0].positive_eigenvalues.clone();
+    for fd in &decomps[1..] {
+        let mut new_eigs = Vec::with_capacity(kron_eigs.len() * fd.positive_eigenvalues.len());
+        for &a in &kron_eigs {
+            for &b in &fd.positive_eigenvalues {
+                new_eigs.push(a * b);
+            }
+        }
+        kron_eigs = new_eigs;
+    }
+    let max_ev = kron_eigs.iter().copied().fold(0.0_f64, f64::max);
+    let tol = max_ev * 1e-10 * (block_dim as f64);
+    let positive: Vec<f64> = kron_eigs.into_iter().filter(|&ev| ev > tol).collect();
+    let nullity = block_dim - positive.len();
+    (positive, nullity)
+}
 
 /// Create a balanced penalty root from blockwise penalties at block scale.
 ///
@@ -981,7 +997,7 @@ pub fn precompute_reparam_invariant_blockwise(
     if m == 0 {
         return Ok(ReparamInvariant {
             split: SubspaceSplit::identity(p_total),
-            rs_transformed_base: Vec::new(),
+            qs_base: Array2::eye(p_total),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
         });
@@ -1150,7 +1166,7 @@ pub fn precompute_reparam_invariant_blockwise(
     if !has_nonzero {
         return Ok(ReparamInvariant {
             split: SubspaceSplit::identity(p_total),
-            rs_transformed_base: rs_list.to_vec(),
+            qs_base: Array2::eye(p_total),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
         });
@@ -1196,25 +1212,14 @@ pub fn precompute_reparam_invariant_blockwise(
 
     let split = SubspaceSplit { q_pen, q_null };
 
-    // Assemble global transformed roots: for each penalty, embed the local
-    // transformed root into global coordinates. The root is rank_k × p_total,
-    // with nonzero entries only in the block columns, pre-multiplied by local Q_s.
-    let mut rs_transformed_base = vec![Array2::zeros((0, 0)); m];
-    for bi in &block_invariants {
-        for &(gi, ref rs_local_transformed) in &bi.penalty_transforms {
-            let rank_k = rs_local_transformed.nrows();
-            let cols = p_total;
-            let mut rs_global = Array2::zeros((rank_k, cols));
-            rs_global
-                .slice_mut(s![.., bi.col_range.start..bi.col_range.end])
-                .assign(rs_local_transformed);
-            rs_transformed_base[gi] = rs_global;
-        }
-    }
+    // Store the global Q_s = [Q_pen | Q_null] from the split.
+    // Block-local roots are transformed on-the-fly as R_block @ Q[start..end, :]
+    // inside the reparam engine.
+    let qs_global = split.compose_qs();
 
     Ok(ReparamInvariant {
         split,
-        rs_transformed_base,
+        qs_base: qs_global,
         has_nonzero,
         max_balanced_eigenvalue: global_max_bal,
     })
@@ -1435,35 +1440,28 @@ pub fn canonicalize_penalty_spec(
         }));
     }
 
-    // ── Kronecker fast path: per-factor eigendecomposition ──
+    // ── Kronecker fast path: single per-factor eigendecomposition ──
     if let Some(PenaltyStructureHint::Kronecker(factors)) = hint {
-        let kron_global = kronecker_root(&col_range, factors, p)?;
-        let rank_k = kron_global.nrows();
-        if rank_k == 0 {
+        let decomps = match decompose_kronecker_factors(
+            factors,
+            &format!("{context} penalty {idx}"),
+        )? {
+            None => return Ok(None),
+            Some(d) => d,
+        };
+        let (positive_eigenvalues, nullity) = kronecker_eigenvalues(&decomps, block_dim);
+        if positive_eigenvalues.is_empty() {
             return Ok(None);
         }
-        let root = kron_global
-            .slice(s![.., col_range.start..col_range.end])
-            .to_owned();
-        // Still need eigenvalues for REML logdet — eigendecompose the local block.
+        let root = assemble_kronecker_root_local(&decomps);
         let local_owned = local_matrix.to_owned();
-        let analysis = analyze_penalty_block(&local_owned).map_err(|err| {
-            EstimationError::InvalidInput(format!(
-                "{context}: Kronecker penalty eigenvalue extraction at index {idx}: {err}"
-            ))
-        })?;
-        let positive_eigenvalues: Vec<f64> = analysis
-            .eigenvalues
-            .iter()
-            .copied()
-            .filter(|&ev| ev > analysis.tol)
-            .collect();
+        let local_sym = (&local_owned + &local_owned.t()) * 0.5;
         return Ok(Some(CanonicalPenalty {
             root,
             col_range,
             total_dim: p,
-            nullity: analysis.nullity,
-            local: analysis.sym_penalty,
+            nullity,
+            local: local_sym,
             positive_eigenvalues,
         }));
     }
@@ -1759,7 +1757,10 @@ impl SubspaceSplit {
 #[derive(Clone)]
 pub struct ReparamInvariant {
     split: SubspaceSplit,
-    rs_transformed_base: Vec<Array2<f64>>,
+    /// The balanced eigenvector matrix Q (p x p). Block-local roots are
+    /// transformed on-the-fly as `R_block @ Q[start..end, :]` instead of
+    /// storing pre-multiplied full-width roots.
+    qs_base: Array2<f64>,
     has_nonzero: bool,
     /// Largest eigenvalue of the balanced (unit-Frobenius) penalty matrix.
     /// Used as the scale reference for the shrinkage floor.
@@ -1781,12 +1782,13 @@ pub fn precompute_reparam_invariant(
 ) -> Result<ReparamInvariant, EstimationError> {
     use std::cmp::Ordering;
 
+    let p_total = p;
     let m = rs_list.len();
 
     if m == 0 {
         return Ok(ReparamInvariant {
             split: SubspaceSplit::identity(p),
-            rs_transformed_base: Vec::new(),
+            qs_base: Array2::eye(p_total),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
         });
@@ -1813,7 +1815,7 @@ pub fn precompute_reparam_invariant(
     if !has_nonzero {
         return Ok(ReparamInvariant {
             split: SubspaceSplit::identity(p),
-            rs_transformed_base: rs_list.to_vec(),
+            qs_base: Array2::eye(p),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
         });
@@ -1855,23 +1857,9 @@ pub fn precompute_reparam_invariant(
         .count();
     let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p)?;
 
-    let mut rs_transformed_base: Vec<Mat<f64>> = Vec::with_capacity(m);
-    for rs in &rs_faer {
-        let mut product = Mat::<f64>::zeros(rs.nrows(), qs.ncols());
-        matmul(
-            product.as_mut(),
-            Accum::Replace,
-            rs.as_ref(),
-            qs.as_ref(),
-            1.0,
-            Par::Seq,
-        );
-        rs_transformed_base.push(product);
-    }
-
     Ok(ReparamInvariant {
         split,
-        rs_transformed_base: rs_transformed_base.iter().map(mat_to_array).collect(),
+        qs_base: mat_to_array(&qs),
         has_nonzero,
         max_balanced_eigenvalue: max_bal,
     })
@@ -1882,7 +1870,7 @@ pub fn precompute_reparam_invariant(
 /// directly instead of requiring rank x p global roots.
 pub fn precompute_reparam_invariant_from_canonical(
     penalties: &[CanonicalPenalty],
-    p: usize,
+    p_total: usize,
 ) -> Result<ReparamInvariant, EstimationError> {
     use std::cmp::Ordering;
 
@@ -1891,7 +1879,7 @@ pub fn precompute_reparam_invariant_from_canonical(
     if m == 0 {
         return Ok(ReparamInvariant {
             split: SubspaceSplit::identity(p),
-            rs_transformed_base: Vec::new(),
+            qs_base: Array2::eye(p_total),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
         });
@@ -1917,10 +1905,9 @@ pub fn precompute_reparam_invariant_from_canonical(
     }
 
     if !has_nonzero {
-        let global_roots: Vec<Array2<f64>> = penalties.iter().map(|cp| cp.global_root()).collect();
         return Ok(ReparamInvariant {
-            split: SubspaceSplit::identity(p),
-            rs_transformed_base: global_roots,
+            split: SubspaceSplit::identity(p_total),
+            qs_base: Array2::eye(p_total),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
         });
@@ -1989,23 +1976,9 @@ pub fn precompute_reparam_invariant_from_canonical(
             .count();
         let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p)?;
 
-        let mut rs_transformed_base: Vec<Mat<f64>> = Vec::with_capacity(m);
-        for rs in &rs_faer {
-            let mut product = Mat::<f64>::zeros(rs.nrows(), qs.ncols());
-            matmul(
-                product.as_mut(),
-                Accum::Replace,
-                rs.as_ref(),
-                qs.as_ref(),
-                1.0,
-                Par::Seq,
-            );
-            rs_transformed_base.push(product);
-        }
-
         return Ok(ReparamInvariant {
             split,
-            rs_transformed_base: rs_transformed_base.iter().map(mat_to_array).collect(),
+            qs_base: mat_to_array(&qs),
             has_nonzero,
             max_balanced_eigenvalue: max_bal,
         });
@@ -2164,55 +2137,14 @@ pub fn precompute_reparam_invariant_from_canonical(
 
     let split = SubspaceSplit { q_pen, q_null };
 
-    // Assemble global transformed roots in the Q_s-rotated coordinate system.
-    //
-    // The consumer (`stable_reparameterization_with_invariant`) reads columns
-    // `0..total_pen_rank` as the penalized subspace and `total_pen_rank..p` as
-    // the null subspace. So for each block b we must scatter:
-    //   - the first pen_rank_b local columns → global columns pen_col_offset_b .. + pen_rank_b
-    //   - the remaining null_rank_b local columns → global columns (total_pen_rank + null_col_offset_b) ..
-    let mut rs_transformed_base = vec![Array2::zeros((0, p)); m];
-
-    for br in &block_results {
-        let pen_r = br.q_pen_local.ncols();
-        let null_r = br.q_null_local.ncols();
-
-        for &pi in &br.penalty_indices {
-            let cp = &penalties[pi];
-            let local_root = &cp.root; // rank_k × block_dim
-
-            let rank_k = local_root.nrows();
-            let mut rs_global = Array2::zeros((rank_k, p));
-
-            // Penalized part: R_local * Q_pen_local → rank_k × pen_r
-            // Scatter to global columns pen_col_offset .. + pen_r
-            if pen_r > 0 {
-                let pen_part = local_root.dot(&br.q_pen_local);
-                rs_global
-                    .slice_mut(s![.., br.pen_col_offset..(br.pen_col_offset + pen_r)])
-                    .assign(&pen_part);
-            }
-
-            // Null part: R_local * Q_null_local → rank_k × null_r
-            // Scatter to global columns (total_pen_rank + null_col_offset) .. + null_r
-            if null_r > 0 {
-                let null_part = local_root.dot(&br.q_null_local);
-                let null_global_start = total_pen_rank + br.null_col_offset;
-                rs_global
-                    .slice_mut(s![.., null_global_start..(null_global_start + null_r)])
-                    .assign(&null_part);
-            }
-
-            rs_transformed_base[pi] = rs_global;
-        }
-    }
-
-    // Rank-0 penalties were excluded from block_groups and remain as (0, p)
-    // in rs_transformed_base — this is the correct shape for a rank-0 root.
+    // Store the global Q_s = [Q_pen | Q_null] from the split.
+    // Block-local roots are transformed on-the-fly as R_block @ Q[start..end, :]
+    // inside the reparam engine, avoiding O(k * rank * p) storage.
+    let qs_global = split.compose_qs();
 
     Ok(ReparamInvariant {
         split,
-        rs_transformed_base,
+        qs_base: qs_global,
         has_nonzero,
         max_balanced_eigenvalue: global_max_bal,
     })
@@ -2245,13 +2177,8 @@ pub fn stable_reparameterizationwith_invariant(
         )));
     }
 
-    if invariant.rs_transformed_base.len() != m {
-        return Err(EstimationError::LayoutError(format!(
-            "Reparameterization invariant mismatch: expected {} penalties, got {}",
-            m,
-            invariant.rs_transformed_base.len()
-        )));
-    }
+    // No separate length check needed — penalties are matched against lambdas above,
+    // and the invariant's qs_base is p x p (dimension-checked by the split).
 
     if m == 0 {
         return Ok(ReparamResult {
@@ -2259,8 +2186,6 @@ pub fn stable_reparameterizationwith_invariant(
             log_det: 0.0,
             det1: Array1::zeros(0),
             qs: Array2::eye(p),
-            rs_transformed: vec![],
-            rs_transposed: vec![],
             canonical_transformed: vec![],
             e_transformed: Array2::zeros((0, p)),
             // All modes truncated when no penalties; already in transformed frame.
@@ -2284,22 +2209,35 @@ pub fn stable_reparameterizationwith_invariant(
             log_det: 0.0,
             det1: Array1::zeros(m),
             qs,
-            rs_transposed: global_roots.iter().map(|r| r.t().to_owned()).collect(),
-            rs_transformed: global_roots,
             canonical_transformed,
             e_transformed: Array2::zeros((0, p)),
-            // Stored in transformed frame for downstream trace/correction math.
-            u_truncated, // All modes truncated when zero penalty
+            u_truncated,
             penalty_shrinkage_ridge: 0.0,
         });
     }
 
     let q_pen = array_to_faer(&invariant.split.q_pen);
     let q_null = array_to_faer(&invariant.split.q_null);
-    let rs_transformed: Vec<Mat<f64>> = invariant
-        .rs_transformed_base
+    let qs_base = array_to_faer(&invariant.qs_base);
+    // Compute transformed roots on-the-fly: R_k_block @ Q[start..end, :].
+    // This avoids storing k full-width (rank × p) matrices in the invariant.
+    let rs_transformed: Vec<Mat<f64>> = penalties
         .iter()
-        .map(array_to_faer)
+        .map(|cp| {
+            let r = &cp.col_range;
+            let root_faer = array_to_faer(&cp.root);
+            let q_block = qs_base.submatrix(r.start, 0, cp.block_dim(), p);
+            let mut product = Mat::<f64>::zeros(cp.rank(), p);
+            matmul(
+                product.as_mut(),
+                Accum::Replace,
+                root_faer.as_ref(),
+                q_block,
+                1.0,
+                Par::Seq,
+            );
+            product
+        })
         .collect();
 
     let penalized_rank = invariant.split.rank();
@@ -2580,11 +2518,6 @@ pub fn stable_reparameterizationwith_invariant(
         log_det,
         det1: Array1::from(det1vec),
         qs: mat_to_array(&qs),
-        rs_transposed: rs_transformed_arr
-            .iter()
-            .map(|r| r.t().to_owned())
-            .collect(),
-        rs_transformed: rs_transformed_arr,
         canonical_transformed,
         e_transformed: mat_to_array(&e_transformed_mat),
         u_truncated: mat_to_array(&u_truncated_mat),
@@ -2735,7 +2668,7 @@ impl KroneckerReparamResult {
             .iter()
             .map(|r| r.dot(&qs))
             .collect();
-        let rs_transposed: Vec<Array2<f64>> = rs_transformed.iter().map(|r| r.t().to_owned()).collect();
+        // rs_transposed removed — canonical_transformed is the single source of truth.
 
         // Build e_transformed: combined penalty square root in transformed coords.
         // For Kronecker structure, the penalty is diagonal in the eigenbasis.
@@ -2801,8 +2734,6 @@ impl KroneckerReparamResult {
             log_det: self.log_det,
             det1: self.det1.clone(),
             qs,
-            rs_transformed,
-            rs_transposed,
             canonical_transformed,
             e_transformed,
             u_truncated,

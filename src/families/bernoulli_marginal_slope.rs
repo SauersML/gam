@@ -277,26 +277,26 @@ fn build_deviation_block_from_seed(
     let design = runtime.design(seed)?;
     let raw_dim = runtime.transform.nrows();
     let dim = runtime.transform.ncols();
-    let mut penalties = Vec::new();
+    let mut penalties: Vec<crate::solver::estimate::PenaltySpec> = Vec::new();
     let base_penalty = create_difference_penalty_matrix(raw_dim, cfg.penalty_order, None)
         .map_err(|e| e.to_string())?;
-    penalties.push(fast_ab(
+    penalties.push(crate::solver::estimate::PenaltySpec::Dense(fast_ab(
         &fast_atb(&runtime.transform, &base_penalty),
         &runtime.transform,
-    ));
+    )));
     for &order in &cfg.penalty_orders {
         if order == cfg.penalty_order || order == 0 || order >= raw_dim {
             continue;
         }
         let raw =
             create_difference_penalty_matrix(raw_dim, order, None).map_err(|e| e.to_string())?;
-        penalties.push(fast_ab(
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(fast_ab(
             &fast_atb(&runtime.transform, &raw),
             &runtime.transform,
-        ));
+        )));
     }
     if cfg.double_penalty {
-        penalties.push(Array2::<f64>::eye(dim));
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(Array2::<f64>::eye(dim)));
     }
     let derivative_grid = deviation_grid_from_knots(&knots, cfg.degree, cfg.derivative_grid_size)?;
     let derivative_design = runtime.first_derivative_design(&derivative_grid)?;
@@ -2920,11 +2920,7 @@ fn build_blockspec(
         name: name.to_string(),
         design: design.design.clone(),
         offset: Array1::from_elem(design.design.nrows(), baseline),
-        penalties: design
-            .global_penalties()
-            .into_iter()
-            .map(PenaltyMatrix::Dense)
-            .collect(),
+        penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: vec![],
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
