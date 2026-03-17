@@ -857,7 +857,8 @@ fn gaussian_location_scalewarm_start(
         beta.clone()
     } else {
         {
-            let dense_penalties: Vec<Array2<f64>> = mu_block.penalties.iter().map(|p| p.to_dense()).collect();
+            let p_mu = mu_block.design.ncols();
+            let dense_penalties: Vec<Array2<f64>> = mu_block.penalties.iter().map(|ps| ps.to_global(p_mu)).collect();
             solve_penalizedweighted_projection(
                 &mu_block.design,
                 &mu_block.offset,
@@ -891,7 +892,8 @@ fn gaussian_location_scalewarm_start(
         let eta_sigma = sigma_hat.ln();
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
         {
-            let dense_penalties: Vec<Array2<f64>> = log_sigma_block.penalties.iter().map(|p| p.to_dense()).collect();
+            let p_ls = log_sigma_block.design.ncols();
+            let dense_penalties: Vec<Array2<f64>> = log_sigma_block.penalties.iter().map(|ps| ps.to_global(p_ls)).collect();
             solve_penalizedweighted_projection(
                 &log_sigma_block.design,
                 &log_sigma_block.offset,
@@ -1872,13 +1874,19 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                 name: "wiggle".to_string(),
                 design: self.wiggle_block.design.clone(),
                 offset: self.wiggle_block.offset.clone(),
-                penalties: self
-                    .wiggle_block
-                    .penalties
-                    .iter()
-                    .cloned()
-                    .map(|m| PenaltyMatrix::Dense(m))
-                    .collect(),
+                penalties: {
+                    let p_wiggle = self.wiggle_block.design.ncols();
+                    self.wiggle_block.penalties.iter().map(|spec| match spec {
+                        crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                            PenaltyMatrix::Blockwise {
+                                local: local.clone(),
+                                col_range: col_range.clone(),
+                                total_dim: p_wiggle,
+                            }
+                        }
+                        crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
+                    }).collect()
+                },
                 nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
@@ -2214,13 +2222,19 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                 name: "wiggle".to_string(),
                 design: self.wiggle_block.design.clone(),
                 offset: self.wiggle_block.offset.clone(),
-                penalties: self
-                    .wiggle_block
-                    .penalties
-                    .iter()
-                    .cloned()
-                    .map(|m| PenaltyMatrix::Dense(m))
-                    .collect(),
+                penalties: {
+                    let p_wiggle = self.wiggle_block.design.ncols();
+                    self.wiggle_block.penalties.iter().map(|spec| match spec {
+                        crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
+                            PenaltyMatrix::Blockwise {
+                                local: local.clone(),
+                                col_range: col_range.clone(),
+                                total_dim: p_wiggle,
+                            }
+                        }
+                        crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
+                    }).collect()
+                },
                 nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),

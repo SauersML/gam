@@ -8868,7 +8868,14 @@ mod tests {
             name: "wiggle".to_string(),
             design: wiggle_block.design.clone(),
             offset: wiggle_block.offset.clone(),
-            penalties: wiggle_block.penalties.iter().map(|p| PenaltyMatrix::Dense(p.clone())).collect(),
+            penalties: wiggle_block.penalties.iter().map(|ps| match ps {
+                crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => PenaltyMatrix::Blockwise {
+                    local: local.clone(),
+                    col_range: col_range.clone(),
+                    total_dim: wiggle_block.design.ncols(),
+                },
+                crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
+            }).collect(),
             nullspace_dims: wiggle_block.nullspace_dims.clone(),
             initial_log_lambdas: array![0.1],
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),

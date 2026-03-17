@@ -128,7 +128,7 @@ impl PenaltySpec {
                 // Caller should supply p externally when the total dim is larger;
                 // this is the best we can do without it.
                 let mut out = Array2::zeros((p, p));
-                out.slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
+                out.slice_mut(s![col_range.clone(), col_range.clone()])
                     .assign(local);
                 out
             }
@@ -146,7 +146,7 @@ impl PenaltySpec {
             }
             PenaltySpec::Block { local, col_range, .. } => {
                 let mut out = Array2::zeros((p_total, p_total));
-                out.slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
+                out.slice_mut(s![col_range.clone(), col_range.clone()])
                     .assign(local);
                 out
             }
