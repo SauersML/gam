@@ -2114,16 +2114,8 @@ pub fn precompute_reparam_invariant_from_canonical(
         }
     }
 
-    // Handle penalties with rank 0 that didn't enter any block group.
-    for (i, cp) in penalties.iter().enumerate() {
-        if rs_transformed_base[i].dim() == (0, p) {
-            continue; // already sized correctly for rank-0
-        }
-        if rs_transformed_base[i].nrows() == 0 && rs_transformed_base[i].ncols() == 0 {
-            // Rank-0 penalty that wasn't in any block group.
-            rs_transformed_base[i] = Array2::zeros((cp.rank(), p));
-        }
-    }
+    // Rank-0 penalties were excluded from block_groups and remain as (0, p)
+    // in rs_transformed_base — this is the correct shape for a rank-0 root.
 
     Ok(ReparamInvariant {
         split,

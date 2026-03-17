@@ -1036,7 +1036,20 @@ impl<'a> RemlState<'a> {
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
             screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
+            kronecker_penalty_system: None,
         })
+    }
+
+    /// Inject Kronecker penalty system metadata for tensor-product smooth terms.
+    ///
+    /// When set, the REML evaluator will use `KroneckerMarginal` penalty
+    /// coordinates and `PenaltyPseudologdet::from_kronecker_system` for
+    /// O(∏q_j) logdet instead of O(p³) eigendecomposition.
+    pub(crate) fn set_kronecker_penalty_system(
+        &mut self,
+        system: crate::smooth::KroneckerPenaltySystem,
+    ) {
+        self.kronecker_penalty_system = Some(system);
     }
 
     /// Sets the shrinkage floor for penalized block eigenvalues.
@@ -2633,7 +2646,6 @@ impl<'a> RemlState<'a> {
             mode,
             hessian_op,
             beta,
-            penalty_roots,
             penalty_logdet,
             deriv_provider,
             tk_correction,
@@ -2832,13 +2844,40 @@ impl<'a> RemlState<'a> {
         let n_observations = self.y.len();
         let p_dim = beta.len();
 
-        // Build PenaltyCoordinates from canonical penalties (block-local).
-        // This exploits O(block_p²) operations instead of O(p²).
-        let penalty_coords: Vec<super::unified::PenaltyCoordinate> = self
-            .canonical_penalties
-            .iter()
-            .map(|cp| cp.to_penalty_coordinate())
-            .collect();
+        // Build PenaltyCoordinates.  When Kronecker structure is available,
+        // use KroneckerMarginal variants for O(∏q_j) operations; otherwise
+        // fall back to block-local canonical penalties.
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
+            if let Some(ref kron) = self.kronecker_penalty_system {
+                let d = kron.ndim();
+                let total_dim = kron.p_total();
+                let eigenvalues: Vec<ndarray::Array1<f64>> = kron
+                    .marginal_eigensystems
+                    .iter()
+                    .map(|(evals, _)| evals.clone())
+                    .collect();
+                let mut coords = Vec::with_capacity(kron.num_penalties());
+                for k in 0..d {
+                    coords.push(super::unified::PenaltyCoordinate::KroneckerMarginal {
+                        eigenvalues: eigenvalues.clone(),
+                        dim_index: k,
+                        marginal_dims: kron.marginal_dims.clone(),
+                        total_dim,
+                    });
+                }
+                if kron.has_double_penalty {
+                    // Double penalty (global ridge): eigenvalue = 1 in all modes.
+                    // Use a DenseRoot with identity root as fallback.
+                    let identity_root = ndarray::Array2::<f64>::eye(total_dim);
+                    coords.push(super::unified::PenaltyCoordinate::from_dense_root(identity_root));
+                }
+                coords
+            } else {
+                self.canonical_penalties
+                    .iter()
+                    .map(|cp| cp.to_penalty_coordinate())
+                    .collect()
+            };
 
         let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,
@@ -3155,12 +3194,6 @@ impl<'a> RemlState<'a> {
             Box::new(op)
         };
 
-        let penalty_roots: Vec<Array2<f64>> = self
-            .canonical_penalties
-            .iter()
-            .map(|cp| cp.global_root())
-            .collect();
-
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             let lambdas = rho.mapv(f64::exp);
@@ -3184,18 +3217,11 @@ impl<'a> RemlState<'a> {
         let (tk_correction, tk_gradient) = (0.0, None);
 
         let n_observations = self.y.len();
-        let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
-            if self.canonical_penalties.len() == penalty_roots.len() {
-                self.canonical_penalties
-                    .iter()
-                    .map(|cp| cp.to_penalty_coordinate())
-                    .collect()
-            } else {
-                penalty_roots
-                    .into_iter()
-                    .map(super::unified::PenaltyCoordinate::from_dense_root)
-                    .collect()
-            };
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> = self
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.to_penalty_coordinate())
+            .collect();
         let mut builder = InnerSolutionBuilder::new(
             log_likelihood,
             pirls_result.stable_penalty_term,
