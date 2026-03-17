@@ -766,6 +766,20 @@ pub trait LinearOperator {
                 self.ncols()
             ));
         }
+        let baseridge = if ridge_policy.include_laplacehessian {
+            ridge_floor.max(1e-15)
+        } else {
+            0.0
+        };
+        // Try matrix-free PCG first to avoid assembling the dense p×p normal matrix.
+        if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P {
+            if let Ok(solution) =
+                self.solve_system_matrix_free_pcg_try(weights, rhs, penalty, baseridge)
+            {
+                return Ok(solution);
+            }
+        }
+        // Fallback: assemble dense system and solve via Cholesky with ridge retries.
         let mut system = self.diag_xtw_x(weights)?;
         if let Some(pen) = penalty {
             if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
@@ -778,18 +792,6 @@ pub trait LinearOperator {
                 ));
             }
             system += pen;
-        }
-        let baseridge = if ridge_policy.include_laplacehessian {
-            ridge_floor.max(1e-15)
-        } else {
-            0.0
-        };
-        if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P {
-            if let Ok(solution) =
-                self.solve_system_matrix_free_pcg_try(weights, rhs, penalty, baseridge)
-            {
-                return Ok(solution);
-            }
         }
         crate::linalg::utils::StableSolver::new("linear operator system")
             .solvevectorwithridge_retries(&system, rhs, baseridge)

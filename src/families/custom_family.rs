@@ -3943,7 +3943,10 @@ fn blockwise_logdet_terms<F: CustomFamily>(
             let m0 = if !spec.nullspace_dims.is_empty()
                 && spec.nullspace_dims.len() == spec.penalties.len()
             {
-                spec.nullspace_dims.iter().copied().min().unwrap_or(0)
+                crate::estimate::reml::unified::exact_intersection_nullity(
+                    &spec.penalties,
+                    &spec.nullspace_dims,
+                )
             } else {
                 let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(
                     evals.as_slice().unwrap(),
@@ -5669,33 +5672,52 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
                     .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total))
             };
 
-            // 2. Assemble S_ψ from penalty derivatives, embed into joint space.
+            // 2. Assemble S_ψ from penalty derivatives (block-local, not embedded).
             let s_psi_local = assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
-            let s_psi = embed_block_local_matrix(&s_psi_local, start, end, total);
 
-            // 3. Build HyperCoord.
-            let s_psi_beta = s_psi.dot(beta_flat);
-            let a = psi_terms.objective_psi + 0.5 * beta_flat.dot(&s_psi_beta);
+            // 3. Build HyperCoord using block-local S_ψ (avoids full p×p materialization).
+            let beta_block = beta_flat.slice(ndarray::s![start..end]);
+            let s_psi_beta_local = s_psi_local.dot(&beta_block);
+            let a = psi_terms.objective_psi + 0.5 * beta_block.dot(&s_psi_beta_local);
+            // Embed s_psi_beta into full p-vector for the score.
+            let mut s_psi_beta = Array1::zeros(total);
+            s_psi_beta
+                .slice_mut(ndarray::s![start..end])
+                .assign(&s_psi_beta_local);
             let g = &psi_terms.score_psi + &s_psi_beta;
-            let dense_b = if psi_terms.hessian_psi.nrows() == 0 {
-                s_psi.clone()
-            } else {
-                &psi_terms.hessian_psi + &s_psi
-            };
             let ld_s = if let Some(blocks) = s_pinv_blocks {
                 trace_product(&blocks[block_idx], &s_psi_local)
             } else {
                 0.0
             };
 
+            // Build drift: use block-local representation when possible to avoid
+            // materializing full p×p dense matrices.
+            let drift = if psi_terms.hessian_psi.nrows() == 0 {
+                // No dense Hessian contribution — penalty is block-local, operator
+                // (if present) handles the likelihood part. O(p_block²) fast path.
+                HyperCoordDrift::from_block_local_and_operator(
+                    s_psi_local,
+                    start,
+                    end,
+                    psi_terms.hessian_psi_operator,
+                )
+            } else {
+                // Dense Hessian term exists (e.g., from non-implicit family).
+                // Must add block-local penalty into the dense matrix.
+                let mut dense_b = psi_terms.hessian_psi;
+                dense_b
+                    .slice_mut(ndarray::s![start..end, start..end])
+                    .scaled_add(1.0, &s_psi_local);
+                HyperCoordDrift::from_parts(Some(dense_b), psi_terms.hessian_psi_operator)
+            };
+
             coords.push(HyperCoord {
                 a,
                 g,
-                drift: HyperCoordDrift::from_parts(Some(dense_b), psi_terms.hessian_psi_operator),
+                drift,
                 ld_s,
                 b_depends_on_beta: !hessian_beta_independent,
-                // ψ coordinates move the design/likelihood, so the Hessian drift need not
-                // be PSD. They are NOT penalty-like.
                 is_penalty_like: false,
             });
 
@@ -7147,6 +7169,8 @@ pub fn fit_custom_family<F: CustomFamily>(
             )
                 -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
         >,
+        screening_enter_fn: None,
+        screening_exit_fn: None,
     };
 
     let outer_result =
