@@ -937,6 +937,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         linear_constraints: None,
         adaptive_regularization: adaptive_opts,
         penalty_shrinkage_floor: Some(1e-6),
+        kronecker_penalty_system: None,
     };
     let standard_wiggle = if learn_linkwiggle
         && args.predict_noise.is_none()
@@ -3278,6 +3279,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 linear_constraints: design.linear_constraints.clone(),
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: Some(1e-6),
+                kronecker_penalty_system: None,
             },
         )
         .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
@@ -5062,6 +5064,7 @@ fn run_sample_standard(
             linear_constraints: design.linear_constraints.clone(),
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
+            kronecker_penalty_system: None,
         },
     )
     .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
