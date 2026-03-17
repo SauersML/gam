@@ -4368,20 +4368,16 @@ fn build_sparse_native_reparam_result(
     } else {
         Array2::<f64>::eye(p)
     };
-    // Derive full-width roots for ReparamResult (required by downstream consumers).
-    let global_roots: Vec<Array2<f64>> = penalties.iter().map(|cp| cp.global_root()).collect();
-    let canonical_transformed: Vec<crate::construction::CanonicalPenalty> = global_roots
-        .iter()
-        .map(|r| crate::construction::CanonicalPenalty::from_dense_root(r.clone(), p))
-        .collect();
+    // In the sparse-native path, qs = I, so the penalties are already in the
+    // right coordinate frame. We keep them as-is in canonical_transformed.
+    let canonical_transformed: Vec<crate::construction::CanonicalPenalty> =
+        penalties.iter().cloned().collect();
     ReparamResult {
         penalty_shrinkage_ridge: base.penalty_shrinkage_ridge,
         s_transformed: s_original,
         log_det: base.log_det,
         det1: base.det1,
         qs: Array2::<f64>::eye(p),
-        rs_transposed: global_roots.iter().map(|rs| rs.t().to_owned()).collect(),
-        rs_transformed: global_roots,
         canonical_transformed,
         e_transformed: stack_lambdaweighted_penalty_root_canonical(penalties, lambdas, p),
         u_truncated: u_original,
@@ -4412,6 +4408,10 @@ pub struct PenaltyConfig<'a> {
     /// is added to prevent barely-penalized directions from causing pathological
     /// non-Gaussianity in the posterior. Typical value: `1e-6`. `None` disables.
     pub penalty_shrinkage_floor: Option<f64>,
+    /// When set, the penalties have Kronecker (tensor-product) structure.
+    /// The reparameterization engine will use factored Qs = U_1 ⊗ ... ⊗ U_d
+    /// instead of eigendecomposing the full p×p balanced penalty.
+    pub kronecker_factored: Option<&'a crate::basis::KroneckerFactoredBasis>,
 }
 
 /// P-IRLS solver that follows mgcv's architecture exactly
