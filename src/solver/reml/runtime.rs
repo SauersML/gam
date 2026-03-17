@@ -2572,27 +2572,19 @@ impl<'a> RemlState<'a> {
         let (penalty_rank, log_det_s) =
             self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
 
-        // Penalty roots (possibly projected).
-        let penalty_roots: Vec<Array2<f64>> = if let Some(z) = free_basis_opt.as_ref() {
-            pirls_result
-                .reparam_result
-                .rs_transformed
-                .iter()
-                .map(|r| r.dot(z))
-                .collect()
-        } else {
-            pirls_result.reparam_result.rs_transformed.clone()
-        };
-
         // Penalty logdet derivatives — exact first and (optionally) second.
         // Both `first` and `second` must come from the same eigendecomposition
         // that produced `log_det_s` (the exact pseudo-logdet value). Using the
         // surrogate det1 from `reparam_result` here would create a value/gradient
         // mismatch: the optimizer would see an exact scalar objective but a
         // surrogate gradient, which is not the gradient of any single function.
+        //
+        // Use the block-local path via canonical penalties — avoids materializing
+        // global p×p penalty matrices. The penalty logdet is invariant under the
+        // QS reparameterization, so block-local eigendecomposition on the original
+        // penalties gives the same result as the global path on transformed roots.
         let lambdas = rho.mapv(f64::exp);
-        let (det1, det2) = self.structural_penalty_logdet_derivatives(
-            &penalty_roots,
+        let (det1, det2) = self.structural_penalty_logdet_derivatives_block_local(
             &lambdas,
             ridge_passport.penalty_logdet_ridge(),
         )?;
@@ -2695,13 +2687,6 @@ impl<'a> RemlState<'a> {
             hessian_op.active_rank()
         );
 
-        // Penalty roots from canonical penalties (already precomputed).
-        let penalty_roots: Vec<Array2<f64>> = self
-            .canonical_penalties
-            .iter()
-            .map(|cp| cp.global_root())
-            .collect();
-
         // Nullspace dimension.
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
 
@@ -2730,12 +2715,15 @@ impl<'a> RemlState<'a> {
         let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
             self.build_sparse_derivative_context(pirls_result, bundle)?;
 
+        // Sparse path: canonical_penalties are always available and match,
+        // so evaluate_unified_tail will use block-local PenaltyCoordinates.
+        // Pass empty vec — the fallback dense-root path is never taken.
         let result = self.evaluate_unified_tail(
             rho,
             mode,
             hessian_op,
             beta,
-            penalty_roots,
+            Vec::new(),
             penalty_logdet,
             deriv_provider,
             0.0,
@@ -2784,13 +2772,6 @@ impl<'a> RemlState<'a> {
             Box::new(op)
         };
 
-        // Penalty roots from canonical penalties (already precomputed).
-        let penalty_roots: Vec<Array2<f64>> = self
-            .canonical_penalties
-            .iter()
-            .map(|cp| cp.global_root())
-            .collect();
-
         // Nullspace dimension.
         let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
 
@@ -2809,7 +2790,7 @@ impl<'a> RemlState<'a> {
             rho,
             hessian_op,
             beta,
-            penalty_roots,
+            Vec::new(),
             penalty_logdet,
             deriv_provider,
             0.0,
@@ -2834,7 +2815,6 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         hessian_op: Box<dyn super::unified::HessianOperator>,
         beta: Array1<f64>,
-        penalty_roots: Vec<Array2<f64>>,
         penalty_logdet: super::unified::PenaltyLogdetDerivs,
         deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
         tk_correction: f64,
@@ -2852,20 +2832,13 @@ impl<'a> RemlState<'a> {
         let n_observations = self.y.len();
         let p_dim = beta.len();
 
-        // Build PenaltyCoordinates: prefer block-local from canonical_penalties
-        // to exploit O(block_p²) operations instead of O(p²).
-        let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
-            if self.canonical_penalties.len() == penalty_roots.len() {
-                self.canonical_penalties
-                    .iter()
-                    .map(|cp| cp.to_penalty_coordinate())
-                    .collect()
-            } else {
-                penalty_roots
-                    .into_iter()
-                    .map(super::unified::PenaltyCoordinate::from_dense_root)
-                    .collect()
-            };
+        // Build PenaltyCoordinates from canonical penalties (block-local).
+        // This exploits O(block_p²) operations instead of O(p²).
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> = self
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.to_penalty_coordinate())
+            .collect();
 
         let inner_solution = InnerSolutionBuilder::new(
             log_likelihood,
