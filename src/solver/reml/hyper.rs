@@ -706,14 +706,14 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        let mut s_eval = Array2::<f64>::zeros((p_dim, p_dim));
-        for (k, cp) in self.canonical_penalties.iter().enumerate() {
-            if k < lambdas.len() && lambdas[k] != 0.0 {
-                cp.accumulate_weighted(&mut s_eval, lambdas[k]);
-            }
-        }
-        let pld = super::penalty_logdet::PenaltyPseudologdet::from_assembled(s_eval)
-            .map_err(EstimationError::InvalidInput)?;
+        // Use block-factored penalty logdet when penalties are disjoint.
+        let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
+            &self.canonical_penalties,
+            &lambdas.as_slice().unwrap_or(&[]),
+            0.0,
+            p_dim,
+        )
+        .map_err(EstimationError::InvalidInput)?;
         let s_k_unscaled: Vec<Array2<f64>> = self
             .canonical_penalties
             .iter()
