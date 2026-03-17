@@ -1682,16 +1682,15 @@ pub struct RowwiseKroneckerOperator {
 /// Generic rowwise Kronecker operator for dense marginal designs.
 ///
 /// Decode a flat index into per-dimension indices for a row-major tensor
-/// with the given dimension sizes.
+/// with the given dimension sizes.  Writes into the provided `out` slice
+/// to avoid allocation.
 ///
-///   decode_multi_index(flat, &[3, 4]) → [flat / 4, flat % 4]
-fn decode_multi_index(mut flat: usize, dims: &[usize]) -> Vec<usize> {
-    let mut indices = vec![0usize; dims.len()];
+///   decode_multi_index(flat, &[3, 4], &mut out) → out = [flat / 4, flat % 4]
+fn decode_multi_index(mut flat: usize, dims: &[usize], out: &mut [usize]) {
     for d in (0..dims.len()).rev() {
-        indices[d] = flat % dims[d];
+        out[d] = flat % dims[d];
         flat /= dims[d];
     }
-    indices
 }
 
 /// Each row is the Kronecker product of the corresponding marginal rows:
@@ -1946,13 +1945,16 @@ impl DesignOperator for TensorProductDesignOperator {
         // Iterate over all (a_tail, b_tail) index pairs in the tail dimensions.
         // For symmetry, only iterate a_flat <= b_flat and mirror.
         let mut gamma = Array1::<f64>::zeros(n);
+        let mut block = Array2::<f64>::zeros((q0, q0));
+        let tail_d = tail_dims.len();
+        let mut a_indices = vec![0usize; tail_d];
+        let mut b_indices = vec![0usize; tail_d];
 
         for a_flat in 0..tail_total {
-            // Decode a_flat into per-dimension indices.
-            let a_indices = decode_multi_index(a_flat, &tail_dims);
+            decode_multi_index(a_flat, &tail_dims, &mut a_indices);
 
             for b_flat in a_flat..tail_total {
-                let b_indices = decode_multi_index(b_flat, &tail_dims);
+                decode_multi_index(b_flat, &tail_dims, &mut b_indices);
 
                 // Form γ[i] = w[i] · ∏_{d=1..k-1} B_{d+1}[i, a_d] · B_{d+1}[i, b_d]
                 for i in 0..n {
@@ -1961,11 +1963,9 @@ impl DesignOperator for TensorProductDesignOperator {
                         gamma[i] = 0.0;
                         continue;
                     }
-                    for (dim_idx, (&ai, &bi)) in
-                        a_indices.iter().zip(b_indices.iter()).enumerate()
-                    {
+                    for dim_idx in 0..tail_d {
                         let m = &self.marginals[dim_idx + 1];
-                        prod *= m[[i, ai]] * m[[i, bi]];
+                        prod *= m[[i, a_indices[dim_idx]]] * m[[i, b_indices[dim_idx]]];
                         if prod == 0.0 {
                             break;
                         }
@@ -1974,7 +1974,7 @@ impl DesignOperator for TensorProductDesignOperator {
                 }
 
                 // Compute B₁' · diag(γ) · B₁ → (q₀ × q₀) block.
-                let mut block = Array2::<f64>::zeros((q0, q0));
+                block.fill(0.0);
                 for i in 0..n {
                     let g = gamma[i];
                     if g == 0.0 {
@@ -2003,7 +2003,6 @@ impl DesignOperator for TensorProductDesignOperator {
                         let gb = b1 * tail_total + b_flat;
                         xtwx[[ga, gb]] += block[[a1, b1]];
                         if a_flat != b_flat {
-                            // Mirror the tail symmetry.
                             let ga_mirror = a1 * tail_total + b_flat;
                             let gb_mirror = b1 * tail_total + a_flat;
                             xtwx[[ga_mirror, gb_mirror]] += block[[a1, b1]];
