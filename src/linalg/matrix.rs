@@ -435,6 +435,10 @@ pub struct ReparamOperator {
     qs: Arc<Array2<f64>>,
     n: usize,
     p: usize,
+    /// Cached dense materialization of X·Qs.  Populated on first `to_dense()`
+    /// call so that repeated outer-loop access (REML hyper derivatives, ALO,
+    /// HMC) pays the O(n·p²) cost only once per PIRLS result.
+    dense_cache: OnceLock<Array2<f64>>,
 }
 
 impl ReparamOperator {
@@ -453,6 +457,7 @@ impl ReparamOperator {
             qs,
             n,
             p,
+            dense_cache: OnceLock::new(),
         }
     }
 
@@ -536,13 +541,24 @@ impl DesignOperator for ReparamOperator {
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        // Fallback materialization for consumers that truly need dense access.
-        let x_dense = self.x_original.to_dense();
-        fast_ab(&x_dense, &self.qs)
+        // Cached materialization: pay the O(n·p²) cost at most once.
+        self.dense_cache
+            .get_or_init(|| match &self.x_original {
+                DesignMatrix::Dense(x) => fast_ab(x.as_ref(), &self.qs),
+                _ => {
+                    let x_dense = self.x_original.to_dense();
+                    fast_ab(&x_dense, &self.qs)
+                }
+            })
+            .clone()
     }
 
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        // Materialize only the requested rows: X[rows, :] · Qs
+        // If the full dense product is already cached, just slice it.
+        if let Some(cached) = self.dense_cache.get() {
+            return cached.slice(s![rows, ..]).to_owned();
+        }
+        // Otherwise materialize only the requested rows: X[rows, :] · Qs
         match &self.x_original {
             DesignMatrix::Dense(x) => {
                 let chunk = x.slice(s![rows, ..]);

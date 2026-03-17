@@ -20,6 +20,7 @@ pub use families::bernoulli_marginal_slope;
 pub use families::custom_family;
 pub use families::gamlss;
 pub use families::survival;
+pub use families::survival_construction;
 pub use families::survival_location_scale;
 pub use families::survival_marginal_slope;
 pub use families::transformation_normal;

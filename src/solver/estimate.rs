@@ -105,6 +105,13 @@ impl PenaltySpec {
             col_range: bp.col_range,
         }
     }
+
+    pub fn from_blockwise_ref(bp: &crate::terms::smooth::BlockwisePenalty) -> Self {
+        PenaltySpec::Block {
+            local: bp.local.clone(),
+            col_range: bp.col_range.clone(),
+        }
+    }
 }
 
 const KAHAN_SWITCH_ELEMS: usize = 10_000;
@@ -2100,14 +2107,13 @@ where
             covariate_se: None,
         },
         pirls::PenaltyConfig {
-            rs_original: &reml_state.rs_list,
+            canonical_penalties: reml_state.canonical_penalties(),
             balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
             linear_constraints_original: fit_linear_constraints.as_ref(),
             penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
-            canonical_penalties: None,
         },
         &pirls::PirlsConfig {
             link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -2318,14 +2324,13 @@ where
                                     covariate_se: None,
                                 },
                                 pirls::PenaltyConfig {
-                                    rs_original: &reml_state.rs_list,
+                                    canonical_penalties: reml_state.canonical_penalties(),
                                     balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
                                     reparam_invariant: None,
                                     p,
                                     coefficient_lower_bounds: None,
                                     linear_constraints_original: fit_linear_constraints.as_ref(),
                                     penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
-                                    canonical_penalties: None,
                                 },
                                 &pirls::PirlsConfig {
                                     link_kind: if let Some(state) = final_mixture_state.clone() {
@@ -4237,7 +4242,7 @@ pub(crate) fn fit_gamwith_heuristic_lambdas_andwarm_start<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise).collect();
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
     let x = x.into();
     if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
         && opts.mixture_link.is_none()
@@ -4546,7 +4551,7 @@ pub fn evaluate_externalgradients<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise).collect();
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
         return Err(EstimationError::InvalidInput(message));
@@ -4616,7 +4621,7 @@ pub fn evaluate_externalcost_andridge<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise).collect();
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
         return Err(EstimationError::InvalidInput(message));

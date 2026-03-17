@@ -46,6 +46,18 @@ fn fit_beta_norm(
         firth_bias_reduction: firth,
     };
     let offset = Array1::<f64>::zeros(y.len());
+    let p = x.ncols();
+    let canonical: Vec<gam::construction::CanonicalPenalty> = rs.iter().map(|r| {
+        let local = r.t().dot(r);
+        gam::construction::CanonicalPenalty {
+            root: r.clone(),
+            col_range: 0..p,
+            total_dim: p,
+            nullity: 0,
+            local,
+            positive_eigenvalues: Vec::new(),
+        }
+    }).collect();
     let (fit, _) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
         PirlsProblem {
@@ -56,14 +68,13 @@ fn fit_beta_norm(
             covariate_se: None,
         },
         PenaltyConfig {
-            rs_original: rs,
+            canonical_penalties: &canonical,
             balanced_penalty_root: None,
             reparam_invariant: None,
-            p: x.ncols(),
+            p,
             coefficient_lower_bounds: None,
             linear_constraints_original: None,
             penalty_shrinkage_floor: None,
-            canonical_penalties: None,
         },
         &cfg,
         None,
@@ -90,6 +101,18 @@ fn proxycostwith_pirls(
         firth_bias_reduction: firth,
     };
     let offset = Array1::<f64>::zeros(y.len());
+    let p = x.ncols();
+    let canonical: Vec<gam::construction::CanonicalPenalty> = rs.iter().map(|r| {
+        let local = r.t().dot(r);
+        gam::construction::CanonicalPenalty {
+            root: r.clone(),
+            col_range: 0..p,
+            total_dim: p,
+            nullity: 0,
+            local,
+            positive_eigenvalues: Vec::new(),
+        }
+    }).collect();
     let (fit, _) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
         PirlsProblem {
@@ -100,14 +123,13 @@ fn proxycostwith_pirls(
             covariate_se: None,
         },
         PenaltyConfig {
-            rs_original: rs,
+            canonical_penalties: &canonical,
             balanced_penalty_root: None,
             reparam_invariant: None,
-            p: x.ncols(),
+            p,
             coefficient_lower_bounds: None,
             linear_constraints_original: None,
             penalty_shrinkage_floor: None,
-            canonical_penalties: None,
         },
         &cfg,
         None,
