@@ -188,7 +188,7 @@ pub struct DroppedPenaltyBlockInfo {
 
 #[derive(Debug, Clone)]
 pub struct SmoothDesign {
-    pub term_designs: Vec<Array2<f64>>,
+    pub term_designs: Vec<DesignMatrix>,
     /// Per-term block-local penalties.  Each `col_range` is relative to the
     /// smooth block (i.e. indexing into the concatenation of `term_designs`).
     pub penalties: Vec<BlockwisePenalty>,
@@ -206,16 +206,16 @@ pub struct SmoothDesign {
 
 impl SmoothDesign {
     pub fn total_smooth_cols(&self) -> usize {
-        self.term_designs.iter().map(|d| d.ncols()).sum()
+        self.term_designs.iter().map(DesignMatrix::ncols).sum()
     }
     pub fn nrows(&self) -> usize {
-        self.term_designs.first().map_or(0, |d| d.nrows())
+        self.term_designs.first().map_or(0, DesignMatrix::nrows)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct RawSmoothDesign {
-    pub term_designs: Vec<Array2<f64>>,
+    pub term_designs: Vec<DesignMatrix>,
     /// Per-term block-local penalties.  Each `col_range` is relative to the
     /// smooth block (i.e. indexing into the concatenation of `term_designs`).
     pub penalties: Vec<BlockwisePenalty>,
@@ -229,10 +229,10 @@ pub struct RawSmoothDesign {
 
 impl RawSmoothDesign {
     pub fn total_smooth_cols(&self) -> usize {
-        self.term_designs.iter().map(|d| d.ncols()).sum()
+        self.term_designs.iter().map(DesignMatrix::ncols).sum()
     }
     pub fn nrows(&self) -> usize {
-        self.term_designs.first().map_or(0, |d| d.nrows())
+        self.term_designs.first().map_or(0, DesignMatrix::nrows)
     }
 }
 
@@ -1551,7 +1551,9 @@ fn build_shape_constraint_design_1d(
                     })
                     .unwrap_or(BSplineIdentifiability::None),
             };
-            build_bspline_basis_1d(x_grid.view(), &evalspec)?.design
+            build_bspline_basis_1d(x_grid.view(), &evalspec)?
+                .design
+                .to_dense()
         }
         (
             SmoothBasisSpec::ThinPlate { .. },
@@ -1573,7 +1575,9 @@ fn build_shape_constraint_design_1d(
                     })
                     .unwrap_or(SpatialIdentifiability::None),
             };
-            build_thin_plate_basis(grid_2d.view(), &evalspec)?.design
+            build_thin_plate_basis(grid_2d.view(), &evalspec)?
+                .design
+                .to_dense()
         }
         (
             SmoothBasisSpec::Matern { .. },
@@ -1602,7 +1606,9 @@ fn build_shape_constraint_design_1d(
                 identifiability: ident,
                 aniso_log_scales: aniso_log_scales.clone(),
             };
-            build_matern_basis(grid_2d.view(), &evalspec)?.design
+            build_matern_basis(grid_2d.view(), &evalspec)?
+                .design
+                .to_dense()
         }
         (
             SmoothBasisSpec::Duchon { spec, .. },
@@ -1629,7 +1635,9 @@ fn build_shape_constraint_design_1d(
                     .unwrap_or_else(|| spec.identifiability.clone()),
                 aniso_log_scales: aniso_log_scales.clone(),
             };
-            build_duchon_basis(grid_2d.view(), &evalspec)?.design
+            build_duchon_basis(grid_2d.view(), &evalspec)?
+                .design
+                .to_dense()
         }
         _ => {
             return Err(BasisError::InvalidInput(format!(
@@ -1844,7 +1852,7 @@ fn build_tensor_bspline_basis(
         marginal_knots.push(knots);
         marginal_degrees.push(marginalspec.degree);
         marginalnum_basis.push(built.design.ncols());
-        marginal_designs.push(built.design);
+        marginal_designs.push(built.design.to_dense());
         marginal_penalties.push(
             built
                 .penalties
@@ -1863,9 +1871,10 @@ fn build_tensor_bspline_basis(
         })?;
     }
 
-    let mut design = tensor_product_design_from_marginals(&marginal_designs)?;
-
-    let total_cols = design.ncols();
+    let total_cols: usize = marginalnum_basis.iter().product();
+    let mut dense_design = (!matches!(spec.identifiability, TensorBSplineIdentifiability::None))
+        .then(|| tensor_product_design_from_marginals(&marginal_designs))
+        .transpose()?;
     let mut candidates = Vec::<PenaltyCandidate>::with_capacity(
         marginal_penalties.len() + if spec.double_penalty { 1 } else { 0 },
     );
@@ -1909,7 +1918,12 @@ fn build_tensor_bspline_basis(
                     "TensorBSpline requires at least 2 basis coefficients to enforce sum-to-zero identifiability".to_string(),
                 ));
             }
-            let (_, z) = apply_sum_to_zero_constraint(design.view(), None)?;
+            let dense_design_ref = dense_design.as_ref().ok_or_else(|| {
+                BasisError::InvalidInput(
+                    "tensor sum-to-zero identifiability requires a realized basis".to_string(),
+                )
+            })?;
+            let (_, z) = apply_sum_to_zero_constraint(dense_design_ref.view(), None)?;
             Some(z)
         }
         TensorBSplineIdentifiability::FrozenTransform { transform } => {
@@ -1925,7 +1939,12 @@ fn build_tensor_bspline_basis(
     };
 
     if let Some(z) = z_opt.as_ref() {
-        design = design.dot(z);
+        let dense = dense_design.as_mut().ok_or_else(|| {
+            BasisError::InvalidInput(
+                "tensor identifiability transform requires a realized basis".to_string(),
+            )
+        })?;
+        *dense = dense.dot(z);
         candidates = candidates
             .into_iter()
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
@@ -1953,6 +1972,18 @@ fn build_tensor_bspline_basis(
     }
 
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let design = if let Some(dense_design) = dense_design {
+        DesignMatrix::Dense(Arc::new(dense_design))
+    } else {
+        let marginals: Vec<Arc<Array2<f64>>> = marginal_designs
+            .iter()
+            .map(|m| Arc::new(m.clone()))
+            .collect();
+        let op = TensorProductDesignOperator::new(marginals).map_err(|e| {
+            BasisError::InvalidInput(format!("TensorProductDesignOperator build failed: {e}"))
+        })?;
+        DesignMatrix::Operator(Arc::new(op))
+    };
 
     Ok(BasisBuildResult {
         design,
@@ -2126,7 +2157,7 @@ pub fn build_smooth_design_withworkspace(
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<RawSmoothDesign, BasisError> {
     let n = data.nrows();
-    let mut local_designs = Vec::<Array2<f64>>::with_capacity(terms.len());
+    let mut local_designs = Vec::<DesignMatrix>::with_capacity(terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(terms.len());
     let mut local_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
@@ -2334,7 +2365,7 @@ pub fn build_smooth_design_withworkspace(
             && use_box_reparam
         {
             let t = cumulative_sum_transform_matrix(p_local, order, sign);
-            design_t = design_t.dot(&t);
+            design_t = DesignMatrix::Dense(Arc::new(design_t.to_dense().dot(&t)));
             penalties_t = penalties_t
                 .into_iter()
                 .map(|s_local| {
@@ -2628,27 +2659,16 @@ pub fn build_term_collection_design(
     }
 
     // Blocks: per-smooth-term.  Each smooth term gets its own block so that
-    // cross-block grams are tiny.  Factored tensor terms become Operator
-    // blocks; all others are small dense blocks.
+    // cross-block grams are tiny. Tensor terms can stay operator-backed all
+    // the way from basis construction; dense smooth terms stay dense.
     if p_smooth > 0 {
-        for (term_idx, term) in smooth.terms.iter().enumerate() {
-            if let Some(ref kron) = term.kronecker_factored {
-                let marginals: Vec<Arc<Array2<f64>>> = kron
-                    .marginal_designs
-                    .iter()
-                    .map(|m| Arc::new(m.clone()))
-                    .collect();
-                let op = TensorProductDesignOperator::new(marginals).map_err(|e| {
-                    BasisError::InvalidInput(format!(
-                        "TensorProductDesignOperator for term '{}': {e}",
-                        term.name
-                    ))
-                })?;
-                blocks.push(DesignBlock::Operator(Arc::new(op)));
-            } else {
-                blocks.push(DesignBlock::Dense(Arc::new(
-                    smooth.term_designs[term_idx].clone(),
-                )));
+        for term_design in &smooth.term_designs {
+            match term_design {
+                DesignMatrix::Dense(dense) => blocks.push(DesignBlock::Dense(dense.clone())),
+                DesignMatrix::Operator(op) => blocks.push(DesignBlock::Operator(op.clone())),
+                DesignMatrix::Sparse(_) => {
+                    blocks.push(DesignBlock::Dense(Arc::new(term_design.to_dense())))
+                }
             }
         }
     }
@@ -2901,7 +2921,7 @@ fn apply_spatial_orthogonality_to_parametric(
     }
 
     let n = smooth.nrows();
-    let mut local_designs = Vec::<Array2<f64>>::with_capacity(smooth.terms.len());
+    let mut local_designs = Vec::<DesignMatrix>::with_capacity(smooth.terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(smooth.terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());
     let mut local_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(smooth.terms.len());
@@ -2912,7 +2932,7 @@ fn apply_spatial_orthogonality_to_parametric(
 
     for (idx, term) in smooth.terms.iter().enumerate() {
         let termspec = &smoothspecs[idx];
-        let design_local = smooth.term_designs[idx].clone();
+        let design_local = smooth.term_designs[idx].to_dense();
         let use_frozen_transform = matches!(
             spatial_identifiability_policy(termspec),
             Some(SpatialIdentifiability::FrozenTransform { .. })
@@ -3010,7 +3030,7 @@ fn apply_spatial_orthogonality_to_parametric(
             };
 
         local_dims.push(design_constrained.ncols());
-        local_designs.push(design_constrained);
+        local_designs.push(DesignMatrix::Dense(Arc::new(design_constrained)));
         local_penalties.push(penalties_constrained);
         local_nullspaces.push(nullspace_constrained);
         local_penaltyinfo.push(penaltyinfo_constrained);
@@ -9040,9 +9060,9 @@ fn finish_single_smooth_term_realization(
                     transform.nrows()
                 )));
             }
-            design.dot(transform)
+            design.to_dense().dot(transform)
         }
-        _ => design,
+        _ => design.to_dense(),
     };
 
     Ok(SingleSmoothTermRealization {
@@ -9478,8 +9498,6 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
             .coeff_range
             .clone();
-        let full_range = (self.full_smooth_start + coeff_range.start)
-            ..(self.full_smooth_start + coeff_range.end);
         if design_local.ncols() != coeff_range.len() {
             return Err(format!(
                 "incremental realizer width mismatch for term {}: rebuilt_cols={}, cached_cols={}",
@@ -9530,11 +9548,39 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             ));
         }
 
-        self.design.smooth.term_designs[term_idx] = design_local.clone();
-        self.design
-            .design
-            .slice_mut(s![.., full_range.clone()])
-            .assign(&design_local);
+        self.design.smooth.term_designs[term_idx] = DesignMatrix::Dense(Arc::new(design_local));
+
+        let mut blocks = Vec::<DesignBlock>::new();
+        blocks.push(DesignBlock::Intercept(self.data.nrows()));
+        if !self.spec.linear_terms.is_empty() {
+            let mut linear_block =
+                Array2::<f64>::zeros((self.data.nrows(), self.spec.linear_terms.len()));
+            for (j, linear) in self.spec.linear_terms.iter().enumerate() {
+                linear_block
+                    .column_mut(j)
+                    .assign(&self.data.column(linear.feature_col));
+            }
+            blocks.push(DesignBlock::Dense(Arc::new(linear_block)));
+        }
+        for term in &self.spec.random_effect_terms {
+            let block = build_random_effect_block(self.data, term).map_err(|e| {
+                format!("failed to rebuild random-effect block '{}': {e}", term.name)
+            })?;
+            let re_op = RandomEffectOperator::new(block.group_ids, block.num_groups);
+            blocks.push(DesignBlock::RandomEffect(Arc::new(re_op)));
+        }
+        for term_design in &self.design.smooth.term_designs {
+            match term_design {
+                DesignMatrix::Dense(dense) => blocks.push(DesignBlock::Dense(dense.clone())),
+                DesignMatrix::Operator(op) => blocks.push(DesignBlock::Operator(op.clone())),
+                DesignMatrix::Sparse(_) => {
+                    blocks.push(DesignBlock::Dense(Arc::new(term_design.to_dense())))
+                }
+            }
+        }
+        let block_op = BlockDesignOperator::new(blocks)
+            .map_err(|e| format!("failed to rebuild block design operator: {e}"))?;
+        self.design.design = DesignMatrix::Operator(Arc::new(block_op));
 
         for (offset, penalty_local) in penalties_local.iter().enumerate() {
             let smooth_penalty_idx = smooth_penalty_range.start + offset;
@@ -11158,8 +11204,13 @@ mod tests {
             .iter()
             .zip(frozen_design.smooth.term_designs.iter())
             .flat_map(|(a, b)| {
-                assert_eq!(a.dim(), b.dim());
-                a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs())
+                let a_dense = a.to_dense();
+                let b_dense = b.to_dense();
+                assert_eq!(a_dense.dim(), b_dense.dim());
+                a_dense
+                    .iter()
+                    .zip(b_dense.iter())
+                    .map(|(&x, &y)| (x - y).abs())
             })
             .fold(0.0_f64, f64::max);
         assert!(
@@ -11586,10 +11637,12 @@ mod tests {
         };
         let mx = build_bspline_basis_1d(data.column(0), &spec_x)
             .unwrap()
-            .design;
+            .design
+            .to_dense();
         let my = build_bspline_basis_1d(data.column(1), &spec_y)
             .unwrap()
-            .design;
+            .design
+            .to_dense();
         let expected = tensor_product_design_from_marginals(&[mx.clone(), my.clone()]).unwrap();
 
         let term = SmoothTermSpec {
@@ -11609,7 +11662,8 @@ mod tests {
             .term_designs
             .into_iter()
             .next()
-            .unwrap();
+            .unwrap()
+            .to_dense();
         assert_eq!(got.dim(), expected.dim());
         for i in 0..got.nrows() {
             for j in 0..got.ncols() {
@@ -11670,9 +11724,14 @@ mod tests {
         };
         let full = build_term_collection_design(data.view(), &spec).unwrap();
         let ones = Array1::<f64>::ones(n);
+        let sd_dense_terms = sd
+            .term_designs
+            .iter()
+            .map(|d| d.to_dense())
+            .collect::<Vec<_>>();
         let sd_assembled = ndarray::concatenate(
             ndarray::Axis(1),
-            &sd.term_designs.iter().map(|d| d.view()).collect::<Vec<_>>(),
+            &sd_dense_terms.iter().map(|d| d.view()).collect::<Vec<_>>(),
         )
         .unwrap();
         let residualvs_tensor = residual_norm_to_column_space(&sd_assembled, &ones);

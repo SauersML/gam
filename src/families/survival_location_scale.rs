@@ -1,3 +1,7 @@
+use crate::basis::{
+    BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
+    evaluate_bspline_fourth_derivative_scalar, evaluate_bsplinethird_derivative_scalar,
+};
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
@@ -348,6 +352,8 @@ pub struct TimeDependentCovariateBlockInput {
     pub time_basis_entry: Array2<f64>,
     /// B-spline time basis at exit times (n x p_time).
     pub time_basis_exit: Array2<f64>,
+    /// Derivative of the time basis with respect to clock time at exit.
+    pub time_basis_derivative_exit: Array2<f64>,
     /// Combined Kronecker penalties for the tensor product.
     pub penalties: Vec<PenaltyMatrix>,
     pub initial_log_lambdas: Option<Array1<f64>>,
@@ -366,6 +372,8 @@ pub enum CovariateBlockKind {
 #[derive(Clone)]
 pub struct LinkWiggleBlockInput {
     pub design: DesignMatrix,
+    pub knots: Array1<f64>,
+    pub degree: usize,
     pub penalties: Vec<Array2<f64>>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
@@ -401,6 +409,7 @@ pub enum SurvivalCovariateTermBlockTemplate {
     TimeVarying {
         time_basis_entry: Array2<f64>,
         time_basis_exit: Array2<f64>,
+        time_basis_derivative_exit: Array2<f64>,
         time_penalties: Vec<Array2<f64>>,
     },
 }
@@ -729,6 +738,8 @@ pub struct SurvivalLocationScalePredictInput {
     pub x_log_sigma: DesignMatrix,
     pub eta_log_sigma_offset: Array1<f64>,
     pub x_link_wiggle: Option<DesignMatrix>,
+    pub link_wiggle_knots: Option<Array1<f64>>,
+    pub link_wiggle_degree: Option<usize>,
     pub inverse_link: InverseLink,
 }
 
@@ -765,11 +776,17 @@ struct SurvivalLocationScaleFamily {
     /// Entry design for threshold block when time-varying.
     /// When `None`, the block is time-invariant: q0 = q1 (current behavior).
     x_threshold_entry: Option<DesignMatrix>,
+    /// Exit-time derivative design for threshold when time-varying.
+    x_threshold_deriv: Option<DesignMatrix>,
     /// Exit design for log-sigma block (always present; used as main design).
     x_log_sigma: DesignMatrix,
     /// Entry design for log-sigma block when time-varying.
     x_log_sigma_entry: Option<DesignMatrix>,
+    /// Exit-time derivative design for log-sigma when time-varying.
+    x_log_sigma_deriv: Option<DesignMatrix>,
     x_link_wiggle: Option<DesignMatrix>,
+    wiggle_knots: Option<Array1<f64>>,
+    wiggle_degree: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -777,11 +794,14 @@ struct SurvivalPredictorState {
     h0: f64,
     h1: f64,
     d_raw: f64,
+    g: f64,
     /// q evaluated at entry time. When the threshold/sigma blocks are
     /// time-invariant, q0 == q1.
     q0: f64,
     /// q evaluated at exit time.
     q1: f64,
+    /// Exit-time derivative dq/dt.
+    qdot1: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -809,6 +829,11 @@ struct SurvivalRowDerivatives {
     d3_q1: f64,
     /// Exit-only fourth derivative: d⁴ ell / dq1⁴.
     d4_q1: f64,
+    /// Exit-only derivatives with respect to qdot1 = dq/dt at the event time.
+    d1_qdot1: f64,
+    d2_qdot1: f64,
+    d3_qdot1: f64,
+    d4_qdot1: f64,
     grad_time_eta_h0: f64,
     grad_time_eta_h1: f64,
     grad_time_eta_d: f64,
@@ -841,6 +866,11 @@ struct SurvivalJointQuantities {
     d2_q1: Array1<f64>,
     d3_q1: Array1<f64>,
     d4_q1: Array1<f64>,
+    /// Exit-only derivatives of ell w.r.t. qdot1 = dq/dt.
+    d1_qdot1: Array1<f64>,
+    d2_qdot1: Array1<f64>,
+    d3_qdot1: Array1<f64>,
+    d4_qdot1: Array1<f64>,
     h_time_h0: Array1<f64>,
     h_time_h1: Array1<f64>,
     h_time_d: Array1<f64>,
@@ -871,6 +901,17 @@ struct SurvivalJointQuantities {
     d3q_ls_entry: Option<Array1<f64>>,
     d4q_tls_ls_ls_entry: Option<Array1<f64>>,
     d4q_ls_entry: Option<Array1<f64>>,
+    dqdot_t: Array1<f64>,
+    dqdot_ls: Array1<f64>,
+    dqdot_td: Array1<f64>,
+    dqdot_lsd: Array1<f64>,
+    d2qdot_tt: Array1<f64>,
+    d2qdot_tls: Array1<f64>,
+    d2qdot_ttd: Array1<f64>,
+    d2qdot_tlsd: Array1<f64>,
+    d2qdot_ls: Array1<f64>,
+    d2qdot_lstd: Array1<f64>,
+    d2qdot_lslsd: Array1<f64>,
 }
 
 struct SurvivalJointPsiDirection {
@@ -980,7 +1021,57 @@ impl SurvivalLocationScaleFamily {
         offsets
     }
 
-    /// Returns `(h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw)`.
+    fn has_dynamic_wiggle(&self) -> bool {
+        self.x_link_wiggle.is_some() && self.wiggle_knots.is_some() && self.wiggle_degree.is_some()
+    }
+
+    fn wiggle_geometry(
+        &self,
+        q0: ndarray::ArrayView1<'_, f64>,
+        beta_w: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Option<SurvivalWiggleGeometry>, String> {
+        let (Some(knots), Some(degree)) = (self.wiggle_knots.as_ref(), self.wiggle_degree) else {
+            return Ok(None);
+        };
+        let basis = survival_wiggle_basis_with_options(q0, knots, degree, BasisOptions::value())?;
+        let basis_d1 =
+            survival_wiggle_basis_with_options(q0, knots, degree, BasisOptions::first_derivative())?;
+        let basis_d2 =
+            survival_wiggle_basis_with_options(q0, knots, degree, BasisOptions::second_derivative())?;
+        let basis_d3 = survival_wiggle_third_basis(q0, knots, degree)?;
+        if basis.ncols() != beta_w.len()
+            || basis_d1.ncols() != beta_w.len()
+            || basis_d2.ncols() != beta_w.len()
+            || basis_d3.ncols() != beta_w.len()
+        {
+            return Err(format!(
+                "survival linkwiggle basis/beta mismatch: B={} B'={} B''={} B'''={} betaw={}",
+                basis.ncols(),
+                basis_d1.ncols(),
+                basis_d2.ncols(),
+                basis_d3.ncols(),
+                beta_w.len()
+            ));
+        }
+        let dq_dq0 = basis_d1.dot(&beta_w) + 1.0;
+        let d2q_dq02 = basis_d2.dot(&beta_w);
+        let d3q_dq03 = basis_d3.dot(&beta_w);
+        let d4q_dq04 = survival_wiggle_fourth_q(q0, knots, degree, beta_w)?;
+        Ok(Some(SurvivalWiggleGeometry {
+            basis,
+            basis_d1,
+            basis_d2,
+            basis_d3,
+            dq_dq0,
+            d2q_dq02,
+            d3q_dq03,
+            d4q_dq04,
+        }))
+    }
+
+    /// Returns
+    /// `(h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry,
+    ///   eta_t_deriv_exit, eta_ls_deriv_exit, etaw)`.
     ///
     /// For time-invariant blocks, `eta_t_entry == eta_t_exit` and likewise for ls.
     /// For time-varying blocks, the block eta is 2n long: `[exit; entry]`.
@@ -998,6 +1089,8 @@ impl SurvivalLocationScaleFamily {
             ndarray::ArrayView1<'a, f64>,
             ndarray::ArrayView1<'a, f64>,
             ndarray::ArrayView1<'a, f64>,
+            Option<ndarray::ArrayView1<'a, f64>>,
+            Option<ndarray::ArrayView1<'a, f64>>,
             Option<&'a Array1<f64>>,
         ),
         String,
@@ -1022,15 +1115,19 @@ impl SurvivalLocationScaleFamily {
         }
         // For time-varying blocks the stacked design is [exit_design; entry_design],
         // giving eta of length 2n. For time-invariant blocks eta is length n.
-        let (eta_t_exit, eta_t_entry) = if self.x_threshold_entry.is_some() {
-            if eta_t_raw.len() != 2 * n {
+        let (eta_t_exit, eta_t_entry, eta_t_deriv_exit) = if self.x_threshold_entry.is_some() {
+            if eta_t_raw.len() != 3 * n {
                 return Err(format!(
                     "time-varying threshold eta length mismatch: got {}, expected {}",
                     eta_t_raw.len(),
-                    2 * n
+                    3 * n
                 ));
             }
-            (eta_t_raw.slice(s![0..n]), eta_t_raw.slice(s![n..2 * n]))
+            (
+                eta_t_raw.slice(s![0..n]),
+                eta_t_raw.slice(s![n..2 * n]),
+                Some(eta_t_raw.slice(s![2 * n..3 * n])),
+            )
         } else {
             if eta_t_raw.len() != n {
                 return Err(format!(
@@ -1038,17 +1135,25 @@ impl SurvivalLocationScaleFamily {
                     eta_t_raw.len()
                 ));
             }
-            (eta_t_raw.slice(s![0..n]), eta_t_raw.slice(s![0..n]))
+            (
+                eta_t_raw.slice(s![0..n]),
+                eta_t_raw.slice(s![0..n]),
+                None,
+            )
         };
-        let (eta_ls_exit, eta_ls_entry) = if self.x_log_sigma_entry.is_some() {
-            if eta_ls_raw.len() != 2 * n {
+        let (eta_ls_exit, eta_ls_entry, eta_ls_deriv_exit) = if self.x_log_sigma_entry.is_some() {
+            if eta_ls_raw.len() != 3 * n {
                 return Err(format!(
                     "time-varying log-sigma eta length mismatch: got {}, expected {}",
                     eta_ls_raw.len(),
-                    2 * n
+                    3 * n
                 ));
             }
-            (eta_ls_raw.slice(s![0..n]), eta_ls_raw.slice(s![n..2 * n]))
+            (
+                eta_ls_raw.slice(s![0..n]),
+                eta_ls_raw.slice(s![n..2 * n]),
+                Some(eta_ls_raw.slice(s![2 * n..3 * n])),
+            )
         } else {
             if eta_ls_raw.len() != n {
                 return Err(format!(
@@ -1056,7 +1161,11 @@ impl SurvivalLocationScaleFamily {
                     eta_ls_raw.len()
                 ));
             }
-            (eta_ls_raw.slice(s![0..n]), eta_ls_raw.slice(s![0..n]))
+            (
+                eta_ls_raw.slice(s![0..n]),
+                eta_ls_raw.slice(s![0..n]),
+                None,
+            )
         };
         if let Some(w) = etaw
             && w.len() != n
@@ -1071,6 +1180,8 @@ impl SurvivalLocationScaleFamily {
             eta_ls_exit,
             eta_t_entry,
             eta_ls_entry,
+            eta_t_deriv_exit,
+            eta_ls_deriv_exit,
             etaw,
         ))
     }
@@ -1080,21 +1191,19 @@ impl SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
-        let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
-            self.validate_joint_states(block_states)?;
-        // For joint Hessian / D_u H we use the EXIT evaluations of sigma and its
-        // derivatives (the exit design is the solver's primary design).
-        //
-        // We now compute sigma derivatives through 4th order because the outer
-        // REML Hessian's Q[v_k, v_l] term requires 4th-order chain-rule
-        // derivatives of q w.r.t. the block predictors (u_ϑsss and u_ssss).
-        // See response.md Section 6.
-        let (sigma, ds, d2s, d3s, d4s) = exp_sigma_derivs_up_to_fourth(eta_ls_exit.view());
-        let entry_sigma_derivs = if self.x_log_sigma_entry.is_some() {
-            Some(exp_sigma_derivs_up_to_fourth(eta_ls_entry.view()))
-        } else {
-            None
-        };
+        let (
+            h0,
+            h1,
+            d_raw,
+            _eta_t_exit,
+            _eta_ls_exit,
+            _eta_t_entry,
+            _eta_ls_entry,
+            _eta_t_deriv_exit,
+            _eta_ls_deriv_exit,
+            _etaw,
+        ) = self.validate_joint_states(block_states)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
         let mut d3_q = Array1::<f64>::zeros(n);
@@ -1106,6 +1215,10 @@ impl SurvivalLocationScaleFamily {
         let mut d2_q1 = Array1::<f64>::zeros(n);
         let mut d3_q1 = Array1::<f64>::zeros(n);
         let mut d4_q1 = Array1::<f64>::zeros(n);
+        let mut d1_qdot1 = Array1::<f64>::zeros(n);
+        let mut d2_qdot1 = Array1::<f64>::zeros(n);
+        let mut d3_qdot1 = Array1::<f64>::zeros(n);
+        let mut d4_qdot1 = Array1::<f64>::zeros(n);
         let mut h_time_h0 = Array1::<f64>::zeros(n);
         let mut h_time_h1 = Array1::<f64>::zeros(n);
         let mut h_time_d = Array1::<f64>::zeros(n);
@@ -1116,18 +1229,13 @@ impl SurvivalLocationScaleFamily {
         let mut d2_h_h1 = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let sigma_entry_i = entry_sigma_derivs
-                .as_ref()
-                .map_or(sigma[i], |entry| entry.0[i]);
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
                 d_raw[i],
-                eta_t_entry[i],
-                eta_t_exit[i],
-                sigma_entry_i,
-                sigma[i],
-                etaw.map(|w| w[i]),
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
             );
             let Some(row) = self.row_derivatives(i, state)? else {
                 continue;
@@ -1143,6 +1251,10 @@ impl SurvivalLocationScaleFamily {
             d2_q1[i] = row.d2_q1;
             d3_q1[i] = row.d3_q1;
             d4_q1[i] = row.d4_q1;
+            d1_qdot1[i] = row.d1_qdot1;
+            d2_qdot1[i] = row.d2_qdot1;
+            d3_qdot1[i] = row.d3_qdot1;
+            d4_qdot1[i] = row.d4_qdot1;
             h_time_h0[i] = row.h_time_h0;
             h_time_h1[i] = row.h_time_h1;
             h_time_d[i] = row.h_time_d;
@@ -1152,58 +1264,6 @@ impl SurvivalLocationScaleFamily {
             d2_h_h0[i] = row.d2_h_h0;
             d2_h_h1[i] = row.d2_h_h1;
         }
-
-        // q(eta_t, eta_ls, etaw) = -eta_t / max(sigma(eta_ls), 1e-12) + etaw.
-        //
-        // For the joint Hessian and D_u H, the partial derivatives of q
-        // w.r.t. the block parameters are evaluated at the EXIT linear predictor
-        // (the solver's primary design). The entry contribution is handled
-        // separately by the h0 branch of the time-side derivatives.
-        //
-        // The exact derivatives used in the joint Hessian and D_u H are:
-        //
-        //   q_t      = -1 / max(sigma, 1e-12)
-        //   q_ls     = eta_t * sigma' / max(sigma, 1e-12)^2
-        //   q_t,ls   = sigma' / max(sigma, 1e-12)^2
-        //   q_ls,ls  = eta_t * (sigma''/s^2 - 2 sigma'^2/s^3)
-        //   q_t,ls,ls= sigma''/s^2 - 2 sigma'^2/s^3
-        //   q_ls,ls,ls
-        //            = eta_t * (sigma'''/s^2 - 6 sigma' sigma''/s^3
-        //                        + 6 sigma'^3/s^4),
-        //
-        // where s = max(sigma, 1e-12). On the active floor branch the coded q
-        // is locally constant in eta_ls, so all eta_ls-derivatives vanish.
-        //
-        // These are the scalar q_{i,b}, q_{i,bc}, q_{i,bcd}, q_{i,bcde} objects
-        // from the derivation, specialized to the threshold / scale / wiggle blocks.
-        // The 4th-order terms (q_{i,bcde}) are new — needed for the outer REML
-        // Hessian drift. See response.md Section 6.
-        let exit_qd = compute_q_chain_derivs(&eta_t_exit, &sigma, &ds, &d2s, &d3s, &d4s);
-
-        // Entry-side chain rule derivatives for time-varying blocks.
-        let dq_t_entry = if self.x_threshold_entry.is_some() {
-            let se = entry_sigma_derivs
-                .as_ref()
-                .map(|(s, _, _, _, _)| s)
-                .unwrap();
-            Some(se.mapv(|s| -1.0 / s.max(1e-12)))
-        } else {
-            None
-        };
-        let entry_qd = if let Some((sigma_entry, ds_entry, d2s_entry, d3s_entry, d4s_entry)) =
-            entry_sigma_derivs.as_ref()
-        {
-            Some(compute_q_chain_derivs(
-                &eta_t_entry,
-                sigma_entry,
-                ds_entry,
-                d2s_entry,
-                d3s_entry,
-                d4s_entry,
-            ))
-        } else {
-            None
-        };
 
         Ok(SurvivalJointQuantities {
             d1_q,
@@ -1217,6 +1277,10 @@ impl SurvivalLocationScaleFamily {
             d2_q1,
             d3_q1,
             d4_q1,
+            d1_qdot1,
+            d2_qdot1,
+            d3_qdot1,
+            d4_qdot1,
             h_time_h0,
             h_time_h1,
             h_time_d,
@@ -1225,22 +1289,33 @@ impl SurvivalLocationScaleFamily {
             d_h_d,
             d2_h_h0,
             d2_h_h1,
-            dq_t: exit_qd.dq_t,
-            dq_ls: exit_qd.dq_ls,
-            d2q_tls: exit_qd.d2q_tls,
-            d2q_ls: exit_qd.d2q_ls,
-            d3q_tls_ls: exit_qd.d3q_tls_ls,
-            d3q_ls: exit_qd.d3q_ls,
-            d4q_tls_ls_ls: exit_qd.d4q_tls_ls_ls,
-            d4q_ls: exit_qd.d4q_ls,
-            dq_t_entry,
-            dq_ls_entry: entry_qd.as_ref().map(|q| q.dq_ls.clone()),
-            d2q_tls_entry: entry_qd.as_ref().map(|q| q.d2q_tls.clone()),
-            d2q_ls_entry: entry_qd.as_ref().map(|q| q.d2q_ls.clone()),
-            d3q_tls_ls_entry: entry_qd.as_ref().map(|q| q.d3q_tls_ls.clone()),
-            d3q_ls_entry: entry_qd.as_ref().map(|q| q.d3q_ls.clone()),
-            d4q_tls_ls_ls_entry: entry_qd.as_ref().map(|q| q.d4q_tls_ls_ls.clone()),
-            d4q_ls_entry: entry_qd.as_ref().map(|q| q.d4q_ls.clone()),
+            dq_t: dynamic.dq_t_exit.clone(),
+            dq_ls: dynamic.dq_ls_exit.clone(),
+            d2q_tls: dynamic.d2q_tls_exit.clone(),
+            d2q_ls: dynamic.d2q_ls_exit.clone(),
+            d3q_tls_ls: dynamic.d3q_tls_ls_exit.clone(),
+            d3q_ls: dynamic.d3q_ls_exit.clone(),
+            d4q_tls_ls_ls: dynamic.d4q_tls_ls_ls_exit.clone(),
+            d4q_ls: dynamic.d4q_ls_exit.clone(),
+            dq_t_entry: Some(dynamic.dq_t_entry.clone()),
+            dq_ls_entry: Some(dynamic.dq_ls_entry.clone()),
+            d2q_tls_entry: Some(dynamic.d2q_tls_entry.clone()),
+            d2q_ls_entry: Some(dynamic.d2q_ls_entry.clone()),
+            d3q_tls_ls_entry: Some(dynamic.d3q_tls_ls_entry.clone()),
+            d3q_ls_entry: Some(dynamic.d3q_ls_entry.clone()),
+            d4q_tls_ls_ls_entry: Some(dynamic.d4q_tls_ls_ls_entry.clone()),
+            d4q_ls_entry: Some(dynamic.d4q_ls_entry.clone()),
+            dqdot_t: dynamic.dqdot_t.clone(),
+            dqdot_ls: dynamic.dqdot_ls.clone(),
+            dqdot_td: dynamic.dqdot_td.clone(),
+            dqdot_lsd: dynamic.dqdot_lsd.clone(),
+            d2qdot_tt: dynamic.d2qdot_tt.clone(),
+            d2qdot_tls: dynamic.d2qdot_tls.clone(),
+            d2qdot_ttd: dynamic.d2qdot_ttd.clone(),
+            d2qdot_tlsd: dynamic.d2qdot_tlsd.clone(),
+            d2qdot_ls: dynamic.d2qdot_ls.clone(),
+            d2qdot_lstd: dynamic.d2qdot_lstd.clone(),
+            d2qdot_lslsd: dynamic.d2qdot_lslsd.clone(),
         })
     }
 
@@ -1725,19 +1800,18 @@ impl SurvivalLocationScaleFamily {
         h0: f64,
         h1: f64,
         d_raw: f64,
-        eta_t_entry: f64,
-        eta_t_exit: f64,
-        sigma_entry: f64,
-        sigma_exit: f64,
-        etaw: Option<f64>,
+        q0: f64,
+        q1: f64,
+        qdot1: f64,
     ) -> SurvivalPredictorState {
-        let w = etaw.unwrap_or(0.0);
         SurvivalPredictorState {
             h0,
             h1,
             d_raw,
-            q0: -eta_t_entry / sigma_entry.max(1e-12) + w,
-            q1: -eta_t_exit / sigma_exit.max(1e-12) + w,
+            g: d_raw - qdot1,
+            q0,
+            q1,
+            qdot1,
         }
     }
 
@@ -1816,8 +1890,8 @@ impl SurvivalLocationScaleFamily {
 
         let guard = self.derivative_guard;
         let soft = self.derivative_softness.max(0.0);
-        let (g, log_g_safe, d_log_g, d2_log_g, d3_log_g) = if state.d_raw.is_finite() {
-            let g_val = state.d_raw;
+        let (g, log_g_safe, d_log_g, d2_log_g, d3_log_g) = if state.g.is_finite() {
+            let g_val = state.g;
             let (log_g, d1, d2, d3) = Self::clamped_logwith_derivatives(g_val + soft, 1e-12);
             (g_val, log_g, d1, d2, d3)
         } else {
@@ -1896,6 +1970,10 @@ impl SurvivalLocationScaleFamily {
             d2_q1,
             d3_q1,
             d4_q1,
+            d1_qdot1: -w * d * d_log_g,
+            d2_qdot1: w * d * d2_log_g,
+            d3_qdot1: -w * d * d3_log_g,
+            d4_qdot1: 0.0,
             grad_time_eta_h0: -w * r0,
             grad_time_eta_h1: -w * (d * dlogphi1 + (1.0 - d) * (-r1)),
             grad_time_eta_d: w * d * d_log_g,
@@ -2319,6 +2397,12 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
                     tv.time_basis_exit.nrows()
                 ));
             }
+            if tv.time_basis_derivative_exit.nrows() != n {
+                return Err(format!(
+                    "{name} time-varying derivative basis row mismatch: got {}, expected {n}",
+                    tv.time_basis_derivative_exit.nrows()
+                ));
+            }
             if tv.offset.len() != n {
                 return Err(format!(
                     "{name} time-varying offset length mismatch: got {}, expected {n}",
@@ -2331,6 +2415,13 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
                 return Err(format!(
                     "{name} time-varying time basis column mismatch: entry={}, exit={}",
                     tv.time_basis_entry.ncols(),
+                    p_time
+                ));
+            }
+            if tv.time_basis_derivative_exit.ncols() != p_time {
+                return Err(format!(
+                    "{name} time-varying derivative basis column mismatch: derivative={}, exit={}",
+                    tv.time_basis_derivative_exit.ncols(),
                     p_time
                 ));
             }
@@ -2397,6 +2488,8 @@ struct PreparedCovBlock {
     design_exit: DesignMatrix,
     /// Entry design, only for time-varying blocks.
     design_entry: Option<DesignMatrix>,
+    /// Exit-time derivative design, only for time-varying blocks.
+    design_derivative_exit: Option<DesignMatrix>,
     /// Offset (same for both entry/exit since it comes from other terms).
     offset: Array1<f64>,
     penalties: Vec<PenaltyMatrix>,
@@ -2410,6 +2503,7 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
         CovariateBlockKind::Static(b) => Ok(PreparedCovBlock {
             design_exit: b.design.clone(),
             design_entry: None,
+            design_derivative_exit: None,
             offset: b.offset.clone(),
             penalties: b
                 .penalties
@@ -2424,9 +2518,12 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
         CovariateBlockKind::TimeVarying(tv) => {
             let design_exit = rowwise_kronecker(&tv.design_covariates, &tv.time_basis_exit);
             let design_entry = rowwise_kronecker(&tv.design_covariates, &tv.time_basis_entry);
+            let design_derivative_exit =
+                rowwise_kronecker(&tv.design_covariates, &tv.time_basis_derivative_exit);
             Ok(PreparedCovBlock {
                 design_exit,
                 design_entry: Some(design_entry),
+                design_derivative_exit: Some(design_derivative_exit),
                 offset: tv.offset.clone(),
                 penalties: tv.penalties.clone(),
                 nullspace_dims: vec![],
@@ -2457,6 +2554,7 @@ fn build_survival_covariate_block_from_design(
         SurvivalCovariateTermBlockTemplate::TimeVarying {
             time_basis_entry,
             time_basis_exit,
+            time_basis_derivative_exit,
             time_penalties,
         } => {
             let p_cov = cov_design.design.ncols();
@@ -2484,6 +2582,7 @@ fn build_survival_covariate_block_from_design(
                     design_covariates,
                     time_basis_entry: time_basis_entry.clone(),
                     time_basis_exit: time_basis_exit.clone(),
+                    time_basis_derivative_exit: time_basis_derivative_exit.clone(),
                     penalties,
                     initial_log_lambdas,
                     initial_beta,
@@ -2847,24 +2946,6 @@ fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> Blockwise
 }
 
 fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Result<(), String> {
-    if spec.linkwiggle_block.is_some() {
-        return Err(
-            "fit_survival_location_scale: survival linkwiggle is disabled until the family is rebuilt around the exact dynamic q = m(q0) model"
-                .to_string(),
-        );
-    }
-    if matches!(spec.threshold_block, CovariateBlockKind::TimeVarying(_)) {
-        return Err(
-            "fit_survival_location_scale: time-varying threshold is disabled because the current survival location-scale exact-Newton path does not model the required event Jacobian term"
-                .to_string(),
-        );
-    }
-    if matches!(spec.log_sigma_block, CovariateBlockKind::TimeVarying(_)) {
-        return Err(
-            "fit_survival_location_scale: time-varying sigma is disabled because the current survival location-scale exact-Newton path does not model the required event Jacobian term"
-                .to_string(),
-        );
-    }
     let n = spec.event_target.len();
     if n == 0 {
         return Err("fit_survival_location_scale: empty dataset".to_string());
@@ -2989,12 +3070,20 @@ fn prepare_survival_location_scale_model(
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
     let (threshold_solver_design, threshold_solver_offset) =
         if let Some(x_entry) = threshold_prep.design_entry.as_ref() {
+            let x_deriv = threshold_prep.design_derivative_exit.as_ref().ok_or_else(|| {
+                "time-varying threshold block is missing its exit derivative design".to_string()
+            })?;
             (
                 DesignMatrix::Operator(Arc::new(MultiChannelOperator::new(vec![
                     threshold_prep.design_exit.clone(),
                     x_entry.clone(),
+                    x_deriv.clone(),
                 ])?)),
-                stack_offsets(&[&threshold_prep.offset, &threshold_prep.offset]),
+                stack_offsets(&[
+                    &threshold_prep.offset,
+                    &threshold_prep.offset,
+                    &Array1::zeros(n),
+                ]),
             )
         } else {
             (
@@ -3054,12 +3143,20 @@ fn prepare_survival_location_scale_model(
     };
     let (log_sigma_solver_design, log_sigma_solver_offset) =
         if let Some(ref ls_entry) = log_sigma_entry_design {
+            let ls_deriv = log_sigma_prep.design_derivative_exit.as_ref().ok_or_else(|| {
+                "time-varying log-sigma block is missing its exit derivative design".to_string()
+            })?;
             (
                 DesignMatrix::Operator(Arc::new(MultiChannelOperator::new(vec![
                     DesignMatrix::Dense(Arc::new(log_sigma_design.clone())),
                     DesignMatrix::Dense(Arc::new(ls_entry.clone())),
+                    ls_deriv.clone(),
                 ])?)),
-                stack_offsets(&[&log_sigma_prep.offset, &log_sigma_prep.offset]),
+                stack_offsets(&[
+                    &log_sigma_prep.offset,
+                    &log_sigma_prep.offset,
+                    &Array1::zeros(n),
+                ]),
             )
         } else {
             (
@@ -3113,9 +3210,13 @@ fn prepare_survival_location_scale_model(
         offset_time_deriv_constraints: time_prepared.constraint_derivative_offset.clone(),
         x_threshold: threshold_prep.design_exit.clone(),
         x_threshold_entry: threshold_prep.design_entry.clone(),
+        x_threshold_deriv: threshold_prep.design_derivative_exit.clone(),
         x_log_sigma: DesignMatrix::Dense(Arc::new(log_sigma_design)),
         x_log_sigma_entry: log_sigma_entry_design.map(|x| DesignMatrix::Dense(Arc::new(x))),
+        x_log_sigma_deriv: log_sigma_prep.design_derivative_exit.clone(),
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
+        wiggle_knots: spec.linkwiggle_block.as_ref().map(|w| w.knots.clone()),
+        wiggle_degree: spec.linkwiggle_block.as_ref().map(|w| w.degree),
     };
 
     let mut blockspecs = vec![timespec, thresholdspec, log_sigmaspec];
@@ -3224,6 +3325,13 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), String
         ));
     }
     let p = b.design.ncols();
+    if b.knots.len() < b.degree + 2 {
+        return Err(format!(
+            "linkwiggle_block knot vector is too short for degree {}: got {} knots",
+            b.degree,
+            b.knots.len()
+        ));
+    }
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
@@ -3593,11 +3701,529 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
     }
 }
 
+fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Array1<f64> {
+    let xc = x.dot(cov);
+    Array1::from_iter((0..x.nrows()).map(|i| x.row(i).dot(&xc.row(i)).max(0.0).sqrt()))
+}
+
+#[derive(Clone)]
+struct SurvivalWiggleGeometry {
+    basis: Array2<f64>,
+    basis_d1: Array2<f64>,
+    basis_d2: Array2<f64>,
+    basis_d3: Array2<f64>,
+    dq_dq0: Array1<f64>,
+    d2q_dq02: Array1<f64>,
+    d3q_dq03: Array1<f64>,
+    d4q_dq04: Array1<f64>,
+}
+
+#[derive(Clone, Copy)]
+struct SurvivalBaseQScalars {
+    q: f64,
+    q_t: f64,
+    q_ls: f64,
+    q_tl: f64,
+    q_ll: f64,
+    q_tl_ls: f64,
+    q_ll_ls: f64,
+    q_tl_ls_ls: f64,
+    q_llll: f64,
+}
+
+#[derive(Clone, Copy)]
+struct SurvivalDynamicQScalars {
+    q: f64,
+    q_t: f64,
+    q_ls: f64,
+    q_tl: f64,
+    q_ll: f64,
+    q_tl_ls: f64,
+    q_ll_ls: f64,
+    q_tl_ls_ls: f64,
+    q_llll: f64,
+    qdot: f64,
+    qdot_t: f64,
+    qdot_ls: f64,
+    qdot_td: f64,
+    qdot_lsd: f64,
+    qdot_tt: f64,
+    qdot_tls: f64,
+    qdot_ttd: f64,
+    qdot_tlsd: f64,
+    qdot_ll: f64,
+    qdot_lstd: f64,
+    qdot_llsd: f64,
+}
+
+#[derive(Clone)]
+struct SurvivalDynamicGeometry {
+    sigma_exit: Array1<f64>,
+    ds_exit: Array1<f64>,
+    d2s_exit: Array1<f64>,
+    d3s_exit: Array1<f64>,
+    d4s_exit: Array1<f64>,
+    sigma_entry: Array1<f64>,
+    ds_entry: Array1<f64>,
+    d2s_entry: Array1<f64>,
+    d3s_entry: Array1<f64>,
+    d4s_entry: Array1<f64>,
+    q0_exit: Array1<f64>,
+    q0_entry: Array1<f64>,
+    q_exit: Array1<f64>,
+    q_entry: Array1<f64>,
+    qdot_exit: Array1<f64>,
+    dq_t_exit: Array1<f64>,
+    dq_t_entry: Array1<f64>,
+    dq_ls_exit: Array1<f64>,
+    dq_ls_entry: Array1<f64>,
+    d2q_tls_exit: Array1<f64>,
+    d2q_tls_entry: Array1<f64>,
+    d2q_ls_exit: Array1<f64>,
+    d2q_ls_entry: Array1<f64>,
+    d3q_tls_ls_exit: Array1<f64>,
+    d3q_tls_ls_entry: Array1<f64>,
+    d3q_ls_exit: Array1<f64>,
+    d3q_ls_entry: Array1<f64>,
+    d4q_tls_ls_ls_exit: Array1<f64>,
+    d4q_tls_ls_ls_entry: Array1<f64>,
+    d4q_ls_exit: Array1<f64>,
+    d4q_ls_entry: Array1<f64>,
+    dqdot_t: Array1<f64>,
+    dqdot_ls: Array1<f64>,
+    dqdot_td: Array1<f64>,
+    dqdot_lsd: Array1<f64>,
+    d2qdot_tt: Array1<f64>,
+    d2qdot_tls: Array1<f64>,
+    d2qdot_ttd: Array1<f64>,
+    d2qdot_tlsd: Array1<f64>,
+    d2qdot_ls: Array1<f64>,
+    d2qdot_lstd: Array1<f64>,
+    d2qdot_lslsd: Array1<f64>,
+    wiggle_basis_exit: Option<Array2<f64>>,
+    wiggle_basis_entry: Option<Array2<f64>>,
+    wiggle_basis_d1_exit: Option<Array2<f64>>,
+    wiggle_basis_d1_entry: Option<Array2<f64>>,
+    wiggle_basis_d2_exit: Option<Array2<f64>>,
+    wiggle_qdot_basis_exit: Option<Array2<f64>>,
+}
+
+fn survival_wiggle_basis_with_options(
+    q0: ndarray::ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    options: BasisOptions,
+) -> Result<Array2<f64>, String> {
+    let (basis, _) = create_basis::<Dense>(
+        q0,
+        KnotSource::Provided(knots.view()),
+        degree,
+        options,
+    )
+    .map_err(|e| e.to_string())?;
+    let full = basis.as_ref();
+    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
+        .map_err(|e| e.to_string())?;
+    if full.ncols() != z.nrows() {
+        return Err(format!(
+            "survival linkwiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
+            full.ncols(),
+            z.nrows()
+        ));
+    }
+    Ok(full.dot(&z))
+}
+
+fn survival_wiggle_third_basis(
+    q0: ndarray::ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+) -> Result<Array2<f64>, String> {
+    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
+        .map_err(|e| e.to_string())?;
+    let mut out = Array2::<f64>::zeros((q0.len(), z.ncols()));
+    let knots_slice = knots
+        .as_slice()
+        .ok_or_else(|| "survival linkwiggle knots are not contiguous".to_string())?;
+    for (i, &q0_i) in q0.iter().enumerate() {
+        let mut full = vec![0.0; z.nrows()];
+        for (j, slot) in full.iter_mut().enumerate() {
+            *slot = evaluate_bsplinethird_derivative_scalar(q0_i, knots_slice, degree, j);
+        }
+        out.row_mut(i)
+            .assign(&Array1::from_vec(full).dot(&z).view());
+    }
+    Ok(out)
+}
+
+fn survival_wiggle_fourth_q(
+    q0: ndarray::ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    beta_w: ndarray::ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
+        .map_err(|e| e.to_string())?;
+    let knots_slice = knots
+        .as_slice()
+        .ok_or_else(|| "survival linkwiggle knots are not contiguous".to_string())?;
+    let mut out = Array1::<f64>::zeros(q0.len());
+    for (i, &q0_i) in q0.iter().enumerate() {
+        let mut full = vec![0.0; z.nrows()];
+        for (j, slot) in full.iter_mut().enumerate() {
+            *slot = evaluate_bspline_fourth_derivative_scalar(q0_i, knots_slice, degree, j);
+        }
+        let constrained = Array1::from_vec(full).dot(&z);
+        out[i] = constrained.dot(&beta_w);
+    }
+    Ok(out)
+}
+
+fn survival_base_q_scalars(
+    eta_t: f64,
+    sigma: f64,
+    dsigma: f64,
+    d2sigma: f64,
+    d3sigma: f64,
+    d4sigma: f64,
+) -> SurvivalBaseQScalars {
+    let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
+        q_chain_derivs_fourth_scalar(eta_t, sigma, dsigma, d2sigma, d3sigma, d4sigma);
+    SurvivalBaseQScalars {
+        q: -eta_t / sigma.max(1e-12),
+        q_t,
+        q_ls,
+        q_tl,
+        q_ll,
+        q_tl_ls,
+        q_ll_ls,
+        q_tl_ls_ls,
+        q_llll,
+    }
+}
+
+fn compose_survival_dynamic_q(
+    base: SurvivalBaseQScalars,
+    eta_t_deriv: f64,
+    eta_ls_deriv: f64,
+    wiggle_value: f64,
+    dq_dq0: f64,
+    d2q_dq02: f64,
+    d3q_dq03: f64,
+    d4q_dq04: f64,
+) -> SurvivalDynamicQScalars {
+    let a = base.q_t;
+    let b = base.q_ls;
+    let c = base.q_tl;
+    let d = base.q_ll;
+    let e = base.q_tl_ls;
+    let f = base.q_ll_ls;
+    let g = base.q_tl_ls_ls;
+    let h = base.q_llll;
+    let m1 = dq_dq0;
+    let m2 = d2q_dq02;
+    let m3 = d3q_dq03;
+    let m4 = d4q_dq04;
+    let r = a * eta_t_deriv + b * eta_ls_deriv;
+    let r_t = c * eta_ls_deriv;
+    let r_ls = c * eta_t_deriv + d * eta_ls_deriv;
+    let r_ll = e * eta_t_deriv + f * eta_ls_deriv;
+    let q_t = m1 * a;
+    let q_ls = m1 * b;
+    let q_tl = m2 * a * b + m1 * c;
+    let q_ll = m2 * b * b + m1 * d;
+    let q_tl_ls = m3 * a * b * b + m2 * (a * d + 2.0 * b * c) + m1 * e;
+    let q_ll_ls = m3 * b * b * b + 3.0 * m2 * b * d + m1 * f;
+    let q_tl_ls_ls =
+        m4 * a * b * b * b
+            + m3 * (3.0 * b * b * c + 3.0 * a * b * d)
+            + m2 * (a * f + 3.0 * c * d + 3.0 * b * e)
+            + m1 * g;
+    let q_llll = m4 * b * b * b * b + 6.0 * m3 * b * b * d + m2 * (3.0 * d * d + 4.0 * b * f) + m1 * h;
+
+    SurvivalDynamicQScalars {
+        q: base.q + wiggle_value,
+        q_t,
+        q_ls,
+        q_tl,
+        q_ll,
+        q_tl_ls,
+        q_ll_ls,
+        q_tl_ls_ls,
+        q_llll,
+        qdot: m1 * r,
+        qdot_t: m2 * a * r + m1 * r_t,
+        qdot_ls: m2 * b * r + m1 * r_ls,
+        qdot_td: q_t,
+        qdot_lsd: q_ls,
+        qdot_tt: m3 * a * a * r + 2.0 * m2 * a * r_t,
+        qdot_tls: m3 * a * b * r + m2 * (c * r + a * r_ls + b * r_t) + m1 * e * eta_ls_deriv,
+        qdot_ttd: m2 * a * a,
+        qdot_tlsd: m2 * a * b + m1 * c,
+        qdot_ll: m3 * b * b * r + m2 * (d * r + 3.0 * b * r_ls) + m1 * r_ll,
+        qdot_lstd: m2 * a * b + m1 * c,
+        qdot_llsd: m2 * b * b + m1 * d,
+    }
+}
+
+impl SurvivalLocationScaleFamily {
+    fn build_dynamic_geometry(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<SurvivalDynamicGeometry, String> {
+        let n = self.n;
+        let (
+            _h0,
+            _h1,
+            _d_raw,
+            eta_t_exit,
+            eta_ls_exit,
+            eta_t_entry,
+            eta_ls_entry,
+            eta_t_deriv_exit,
+            eta_ls_deriv_exit,
+            _etaw_surrogate,
+        ) = self.validate_joint_states(block_states)?;
+        let (sigma_exit, ds_exit, d2s_exit, d3s_exit, d4s_exit) =
+            exp_sigma_derivs_up_to_fourth(eta_ls_exit.view());
+        let (sigma_entry, ds_entry, d2s_entry, d3s_entry, d4s_entry) =
+            exp_sigma_derivs_up_to_fourth(eta_ls_entry.view());
+        let eta_t_deriv_exit = eta_t_deriv_exit
+            .map(|v| v.to_owned())
+            .unwrap_or_else(|| Array1::zeros(n));
+        let eta_ls_deriv_exit = eta_ls_deriv_exit
+            .map(|v| v.to_owned())
+            .unwrap_or_else(|| Array1::zeros(n));
+        let q0_exit = Array1::from_iter(
+            eta_t_exit
+                .iter()
+                .zip(sigma_exit.iter())
+                .map(|(&t, &s)| -t / s.max(1e-12)),
+        );
+        let q0_entry = Array1::from_iter(
+            eta_t_entry
+                .iter()
+                .zip(sigma_entry.iter())
+                .map(|(&t, &s)| -t / s.max(1e-12)),
+        );
+        let beta_w = if self.x_link_wiggle.is_some() {
+            Some(block_states[Self::BLOCK_LINK_WIGGLE].beta.view())
+        } else {
+            None
+        };
+        let wiggle_exit = if let Some(beta_w) = beta_w {
+            self.wiggle_geometry(q0_exit.view(), beta_w)?
+        } else {
+            None
+        };
+        let wiggle_entry = if let Some(beta_w) = beta_w {
+            self.wiggle_geometry(q0_entry.view(), beta_w)?
+        } else {
+            None
+        };
+        if self.x_link_wiggle.is_some() && (wiggle_exit.is_none() || wiggle_entry.is_none()) {
+            return Err(
+                "survival location-scale linkwiggle requires dynamic knot/degree metadata"
+                    .to_string(),
+            );
+        }
+
+        let mut q_exit = Array1::<f64>::zeros(n);
+        let mut q_entry = Array1::<f64>::zeros(n);
+        let mut qdot_exit = Array1::<f64>::zeros(n);
+        let mut dq_t_exit = Array1::<f64>::zeros(n);
+        let mut dq_t_entry = Array1::<f64>::zeros(n);
+        let mut dq_ls_exit = Array1::<f64>::zeros(n);
+        let mut dq_ls_entry = Array1::<f64>::zeros(n);
+        let mut d2q_tls_exit = Array1::<f64>::zeros(n);
+        let mut d2q_tls_entry = Array1::<f64>::zeros(n);
+        let mut d2q_ls_exit = Array1::<f64>::zeros(n);
+        let mut d2q_ls_entry = Array1::<f64>::zeros(n);
+        let mut d3q_tls_ls_exit = Array1::<f64>::zeros(n);
+        let mut d3q_tls_ls_entry = Array1::<f64>::zeros(n);
+        let mut d3q_ls_exit = Array1::<f64>::zeros(n);
+        let mut d3q_ls_entry = Array1::<f64>::zeros(n);
+        let mut d4q_tls_ls_ls_exit = Array1::<f64>::zeros(n);
+        let mut d4q_tls_ls_ls_entry = Array1::<f64>::zeros(n);
+        let mut d4q_ls_exit = Array1::<f64>::zeros(n);
+        let mut d4q_ls_entry = Array1::<f64>::zeros(n);
+        let mut dqdot_t = Array1::<f64>::zeros(n);
+        let mut dqdot_ls = Array1::<f64>::zeros(n);
+        let mut dqdot_td = Array1::<f64>::zeros(n);
+        let mut dqdot_lsd = Array1::<f64>::zeros(n);
+        let mut d2qdot_tt = Array1::<f64>::zeros(n);
+        let mut d2qdot_tls = Array1::<f64>::zeros(n);
+        let mut d2qdot_ttd = Array1::<f64>::zeros(n);
+        let mut d2qdot_tlsd = Array1::<f64>::zeros(n);
+        let mut d2qdot_ls = Array1::<f64>::zeros(n);
+        let mut d2qdot_lstd = Array1::<f64>::zeros(n);
+        let mut d2qdot_lslsd = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let base_exit = survival_base_q_scalars(
+                eta_t_exit[i],
+                sigma_exit[i],
+                ds_exit[i],
+                d2s_exit[i],
+                d3s_exit[i],
+                d4s_exit[i],
+            );
+            let base_entry = survival_base_q_scalars(
+                eta_t_entry[i],
+                sigma_entry[i],
+                ds_entry[i],
+                d2s_entry[i],
+                d3s_entry[i],
+                d4s_entry[i],
+            );
+            let exit_dyn = if let Some(wig) = wiggle_exit.as_ref() {
+                compose_survival_dynamic_q(
+                    base_exit,
+                    eta_t_deriv_exit[i],
+                    eta_ls_deriv_exit[i],
+                    wig.basis.row(i).dot(&block_states[Self::BLOCK_LINK_WIGGLE].beta),
+                    wig.dq_dq0[i],
+                    wig.d2q_dq02[i],
+                    wig.d3q_dq03[i],
+                    wig.d4q_dq04[i],
+                )
+            } else {
+                compose_survival_dynamic_q(
+                    base_exit,
+                    eta_t_deriv_exit[i],
+                    eta_ls_deriv_exit[i],
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+            };
+            let entry_dyn = if let Some(wig) = wiggle_entry.as_ref() {
+                compose_survival_dynamic_q(
+                    base_entry,
+                    0.0,
+                    0.0,
+                    wig.basis.row(i).dot(&block_states[Self::BLOCK_LINK_WIGGLE].beta),
+                    wig.dq_dq0[i],
+                    wig.d2q_dq02[i],
+                    wig.d3q_dq03[i],
+                    wig.d4q_dq04[i],
+                )
+            } else {
+                compose_survival_dynamic_q(base_entry, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+            };
+            q_exit[i] = exit_dyn.q;
+            q_entry[i] = entry_dyn.q;
+            qdot_exit[i] = exit_dyn.qdot;
+            dq_t_exit[i] = exit_dyn.q_t;
+            dq_t_entry[i] = entry_dyn.q_t;
+            dq_ls_exit[i] = exit_dyn.q_ls;
+            dq_ls_entry[i] = entry_dyn.q_ls;
+            d2q_tls_exit[i] = exit_dyn.q_tl;
+            d2q_tls_entry[i] = entry_dyn.q_tl;
+            d2q_ls_exit[i] = exit_dyn.q_ll;
+            d2q_ls_entry[i] = entry_dyn.q_ll;
+            d3q_tls_ls_exit[i] = exit_dyn.q_tl_ls;
+            d3q_tls_ls_entry[i] = entry_dyn.q_tl_ls;
+            d3q_ls_exit[i] = exit_dyn.q_ll_ls;
+            d3q_ls_entry[i] = entry_dyn.q_ll_ls;
+            d4q_tls_ls_ls_exit[i] = exit_dyn.q_tl_ls_ls;
+            d4q_tls_ls_ls_entry[i] = entry_dyn.q_tl_ls_ls;
+            d4q_ls_exit[i] = exit_dyn.q_llll;
+            d4q_ls_entry[i] = entry_dyn.q_llll;
+            dqdot_t[i] = exit_dyn.qdot_t;
+            dqdot_ls[i] = exit_dyn.qdot_ls;
+            dqdot_td[i] = exit_dyn.qdot_td;
+            dqdot_lsd[i] = exit_dyn.qdot_lsd;
+            d2qdot_tt[i] = exit_dyn.qdot_tt;
+            d2qdot_tls[i] = exit_dyn.qdot_tls;
+            d2qdot_ttd[i] = exit_dyn.qdot_ttd;
+            d2qdot_tlsd[i] = exit_dyn.qdot_tlsd;
+            d2qdot_ls[i] = exit_dyn.qdot_ll;
+            d2qdot_lstd[i] = exit_dyn.qdot_lstd;
+            d2qdot_lslsd[i] = exit_dyn.qdot_llsd;
+        }
+
+        let wiggle_qdot_basis_exit = wiggle_exit.as_ref().map(|wig| {
+            let mut out = wig.basis_d1.clone();
+            let r = Array1::from_iter((0..n).map(|i| {
+                let base_exit = survival_base_q_scalars(
+                    eta_t_exit[i],
+                    sigma_exit[i],
+                    ds_exit[i],
+                    d2s_exit[i],
+                    d3s_exit[i],
+                    d4s_exit[i],
+                );
+                base_exit.q_t * eta_t_deriv_exit[i] + base_exit.q_ls * eta_ls_deriv_exit[i]
+            }));
+            for i in 0..n {
+                out.row_mut(i).mapv_inplace(|v| v * r[i]);
+            }
+            out
+        });
+
+        Ok(SurvivalDynamicGeometry {
+            sigma_exit,
+            ds_exit,
+            d2s_exit,
+            d3s_exit,
+            d4s_exit,
+            sigma_entry,
+            ds_entry,
+            d2s_entry,
+            d3s_entry,
+            d4s_entry,
+            q0_exit,
+            q0_entry,
+            q_exit,
+            q_entry,
+            qdot_exit,
+            dq_t_exit,
+            dq_t_entry,
+            dq_ls_exit,
+            dq_ls_entry,
+            d2q_tls_exit,
+            d2q_tls_entry,
+            d2q_ls_exit,
+            d2q_ls_entry,
+            d3q_tls_ls_exit,
+            d3q_tls_ls_entry,
+            d3q_ls_exit,
+            d3q_ls_entry,
+            d4q_tls_ls_ls_exit,
+            d4q_tls_ls_ls_entry,
+            d4q_ls_exit,
+            d4q_ls_entry,
+            dqdot_t,
+            dqdot_ls,
+            dqdot_td,
+            dqdot_lsd,
+            d2qdot_tt,
+            d2qdot_tls,
+            d2qdot_ttd,
+            d2qdot_tlsd,
+            d2qdot_ls,
+            d2qdot_lstd,
+            d2qdot_lslsd,
+            wiggle_basis_exit: wiggle_exit.as_ref().map(|w| w.basis.clone()),
+            wiggle_basis_entry: wiggle_entry.as_ref().map(|w| w.basis.clone()),
+            wiggle_basis_d1_exit: wiggle_exit.as_ref().map(|w| w.basis_d1.clone()),
+            wiggle_basis_d1_entry: wiggle_entry.as_ref().map(|w| w.basis_d1.clone()),
+            wiggle_basis_d2_exit: wiggle_exit.as_ref().map(|w| w.basis_d2.clone()),
+            wiggle_qdot_basis_exit,
+        })
+    }
+}
+
 struct PredictionLinearPredictors {
     h: Array1<f64>,
     eta_t: Array1<f64>,
     eta_ls: Array1<f64>,
     etaw: Option<Array1<f64>>,
+    wiggle_design: Option<Array2<f64>>,
+    dq_dq0: Option<Array1<f64>>,
 }
 
 fn prediction_linear_predictors(
@@ -3625,37 +4251,53 @@ fn prediction_linear_predictors(
     {
         return Err("predict_survival_location_scale: row mismatch across inputs".to_string());
     }
-    if let (Some(xw), Some(betaw)) = (&input.x_link_wiggle, &beta_link_wiggle) {
-        if xw.nrows() != n {
-            return Err(format!(
-                "predict_survival_location_scale: link-wiggle row mismatch: got {}, expected {n}",
-                xw.nrows()
-            ));
-        }
-        if xw.ncols() != betaw.len() {
+    let h = input.x_time_exit.dot(&beta_time) + &input.eta_time_offset_exit;
+    let eta_t =
+        input.x_threshold.matrixvectormultiply(&beta_threshold) + &input.eta_threshold_offset;
+    let eta_ls =
+        input.x_log_sigma.matrixvectormultiply(&beta_log_sigma) + &input.eta_log_sigma_offset;
+    let sigma = eta_ls.mapv(crate::families::sigma_link::safe_exp);
+    let q0 = Array1::from_iter(
+        eta_t.iter()
+            .zip(sigma.iter())
+            .map(|(&t, &s)| -t / s.max(1e-12)),
+    );
+    let (wiggle_design, dq_dq0, etaw) = if let Some(betaw) = beta_link_wiggle.as_ref() {
+        let knots = input.link_wiggle_knots.as_ref().ok_or_else(|| {
+            "predict_survival_location_scale: link-wiggle coefficients are missing knot metadata"
+                .to_string()
+        })?;
+        let degree = input.link_wiggle_degree.ok_or_else(|| {
+            "predict_survival_location_scale: link-wiggle coefficients are missing degree metadata"
+                .to_string()
+        })?;
+        let design = survival_wiggle_basis_with_options(q0.view(), knots, degree, BasisOptions::value())?;
+        if design.ncols() != betaw.len() {
             return Err(format!(
                 "predict_survival_location_scale: link-wiggle design/beta mismatch: {} vs {}",
-                xw.ncols(),
+                design.ncols(),
                 betaw.len()
             ));
         }
-    } else if input.x_link_wiggle.is_some() || beta_link_wiggle.is_some() {
-        return Err(
-            "predict_survival_location_scale: link-wiggle metadata is partial; both design and beta must be provided"
-                .to_string(),
-        );
-    }
+        let basis_d1 = survival_wiggle_basis_with_options(
+            q0.view(),
+            knots,
+            degree,
+            BasisOptions::first_derivative(),
+        )?;
+        let dq = Some(basis_d1.dot(betaw) + 1.0);
+        let etaw = design.dot(betaw);
+        (Some(design), dq, Some(etaw))
+    } else {
+        (None, None, None)
+    };
     Ok(PredictionLinearPredictors {
-        h: input.x_time_exit.dot(&beta_time) + &input.eta_time_offset_exit,
-        eta_t: input.x_threshold.matrixvectormultiply(&beta_threshold)
-            + &input.eta_threshold_offset,
-        eta_ls: input.x_log_sigma.matrixvectormultiply(&beta_log_sigma)
-            + &input.eta_log_sigma_offset,
-        etaw: if let (Some(xw), Some(betaw)) = (&input.x_link_wiggle, &beta_link_wiggle) {
-            Some(xw.matrixvectormultiply(betaw))
-        } else {
-            None
-        },
+        h,
+        eta_t,
+        eta_ls,
+        etaw,
+        wiggle_design,
+        dq_dq0,
     })
 }
 
@@ -4809,14 +5451,19 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let n = self.n;
-        let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
-            self.validate_joint_states(block_states)?;
-        let (sigma_exit, ds_exit, d2s_exit, _) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
-        let sigma_entry = if self.x_log_sigma_entry.is_some() {
-            Some(eta_ls_entry.mapv(crate::families::sigma_link::safe_exp))
-        } else {
-            None
-        };
+        let (
+            h0,
+            h1,
+            d_raw,
+            _eta_t_exit,
+            _eta_ls_exit,
+            _eta_t_entry,
+            _eta_ls_entry,
+            _eta_t_deriv_exit,
+            _eta_ls_deriv_exit,
+            _etaw,
+        ) = self.validate_joint_states(block_states)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
         let mut ll = 0.0;
 
         let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
@@ -4832,18 +5479,17 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let mut d2_q0 = Array1::<f64>::zeros(n);
         let mut d1_q1 = Array1::<f64>::zeros(n);
         let mut d2_q1 = Array1::<f64>::zeros(n);
+        let mut d1_qdot = Array1::<f64>::zeros(n);
+        let mut d2_qdot = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let sigma_entry_i = sigma_entry.as_ref().map_or(sigma_exit[i], |se| se[i]);
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
                 d_raw[i],
-                eta_t_entry[i],
-                eta_t_exit[i],
-                sigma_entry_i,
-                sigma_exit[i],
-                etaw.map(|w| w[i]),
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
             );
             let Some(row) = self.row_derivatives(i, state)? else {
                 continue;
@@ -4855,6 +5501,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             d2_q0[i] = row.d2_q0;
             d1_q1[i] = row.d1_q1;
             d2_q1[i] = row.d2_q1;
+            d1_qdot[i] = row.d1_qdot1;
+            d2_qdot[i] = row.d2_qdot1;
             grad_time_eta_h0[i] = row.grad_time_eta_h0;
             grad_time_eta_h1[i] = row.grad_time_eta_h1;
             grad_time_eta_d[i] = row.grad_time_eta_d;
@@ -4870,67 +5518,92 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let hess_time = fast_xt_diag_x(&self.x_time_entry, &h_time_h0)
             + fast_xt_diag_x(&self.x_time_exit, &h_time_h1)
             + fast_xt_diag_x(&self.x_time_deriv, &h_time_d);
+        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit = &*x_threshold_exit_cow;
+        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit = &*x_log_sigma_exit_cow;
 
-        // Block 1: threshold (dq_t = -1/σ, d²q_t = 0).
-        let (grad_t, hess_t) = if let Some(x_t_entry) = self.x_threshold_entry.as_ref() {
-            let dq_t_exit = sigma_exit.mapv(|s| -1.0 / s.max(1e-12));
-            let dq_t_entry = sigma_entry
-                .as_ref()
-                .map(|se| se.mapv(|s| -1.0 / s.max(1e-12)))
-                .unwrap_or_else(|| dq_t_exit.clone());
-            let (ge, he) = chain_rule_weights(&d1_q1, &d2_q1, &dq_t_exit, None);
-            let (gn, hn) = chain_rule_weights(&d1_q0, &d2_q0, &dq_t_entry, None);
-            let grad = self.x_threshold.transpose_vector_multiply(&ge)
-                + x_t_entry.transpose_vector_multiply(&gn);
-            let hess = xt_diag_x_symmetric(&self.x_threshold, &he)?
-                .add(&xt_diag_x_symmetric(x_t_entry, &hn)?)?;
-            (grad, hess)
+        let (grad_t, hess_t) = if let (Some(x_t_entry), Some(x_t_deriv)) =
+            (self.x_threshold_entry.as_ref(), self.x_threshold_deriv.as_ref())
+        {
+            let x_t_entry_cow = x_t_entry.as_dense_cow();
+            let x_t_entry_dense = &*x_t_entry_cow;
+            let x_t_deriv_cow = x_t_deriv.as_dense_cow();
+            let x_t_deriv_dense = &*x_t_deriv_cow;
+            let grad_exit = &d1_q1 * &dynamic.dq_t_exit + &d1_qdot * &dynamic.dqdot_t;
+            let grad_entry = &d1_q0 * &dynamic.dq_t_entry;
+            let grad_deriv = &d1_qdot * &dynamic.dqdot_td;
+            let h_exit = -(&d2_q1 * &dynamic.dq_t_exit.mapv(|v| v * v)
+                + &d2_qdot * &dynamic.dqdot_t.mapv(|v| v * v)
+                + &d1_qdot * &dynamic.d2qdot_tt);
+            let h_entry = -(&d2_q0 * &dynamic.dq_t_entry.mapv(|v| v * v));
+            let h_deriv = -(&d2_qdot * &dynamic.dqdot_td.mapv(|v| v * v));
+            let h_exit_deriv =
+                -(&d2_qdot * &(&dynamic.dqdot_t * &dynamic.dqdot_td) + &d1_qdot * &dynamic.d2qdot_ttd);
+            let grad = self.x_threshold.transpose_vector_multiply(&grad_exit)
+                + x_t_entry.transpose_vector_multiply(&grad_entry)
+                + x_t_deriv.transpose_vector_multiply(&grad_deriv);
+            let mut hess = weighted_crossprod_dense(x_threshold_exit, &h_exit, x_threshold_exit)?
+                + weighted_crossprod_dense(x_t_entry_dense, &h_entry, x_t_entry_dense)?
+                + weighted_crossprod_dense(x_t_deriv_dense, &h_deriv, x_t_deriv_dense)?;
+            let cross = weighted_crossprod_dense(x_threshold_exit, &h_exit_deriv, x_t_deriv_dense)?;
+            hess += &cross;
+            hess += &cross.t().to_owned();
+            (grad, SymmetricMatrix::Dense(hess))
         } else {
-            let dq_t = sigma_exit.mapv(|s| -1.0 / s.max(1e-12));
-            let (g, h) = chain_rule_weights(&d1_q, &d2_q, &dq_t, None);
-            let grad = self.x_threshold.transpose_vector_multiply(&g);
+            let grad =
+                self.x_threshold.transpose_vector_multiply(&(&d1_q1 * &dynamic.dq_t_exit
+                    + &d1_q0 * &dynamic.dq_t_entry
+                    + &d1_qdot * &dynamic.dqdot_t));
+            let h = -(&d2_q1 * &dynamic.dq_t_exit.mapv(|v| v * v)
+                + &d2_q0 * &dynamic.dq_t_entry.mapv(|v| v * v)
+                + &d2_qdot * &dynamic.dqdot_t.mapv(|v| v * v)
+                + &d1_qdot * &dynamic.d2qdot_tt);
             let hess = xt_diag_x_symmetric(&self.x_threshold, &h)?;
             (grad, hess)
         };
 
-        // Block 2: log-sigma (needs dq_ls and d²q_ls via chain rule).
-        let (grad_ls, hess_ls) = if let Some(x_ls_entry) = self.x_log_sigma_entry.as_ref() {
-            let sigma_e = sigma_entry.as_ref().unwrap();
-            // For exp link: σ' = σ = exp(η_ls)
-            let exit_qd = compute_q_chain_derivs_third(
-                &eta_t_exit,
-                &sigma_exit,
-                &ds_exit,
-                &d2s_exit,
-                &d2s_exit,
-            );
-            let ds_entry = eta_ls_entry.mapv(crate::families::sigma_link::safe_exp);
-            let entry_qd = compute_q_chain_derivs_third(
-                &eta_t_entry,
-                sigma_e,
-                &ds_entry,
-                &ds_entry,
-                &ds_entry,
-            );
-            let (ge, he) =
-                chain_rule_weights(&d1_q1, &d2_q1, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls));
-            let (gn, hn) =
-                chain_rule_weights(&d1_q0, &d2_q0, &entry_qd.dq_ls, Some(&entry_qd.d2q_ls));
-            let grad = self.x_log_sigma.transpose_vector_multiply(&ge)
-                + x_ls_entry.transpose_vector_multiply(&gn);
-            let hess = xt_diag_x_symmetric(&self.x_log_sigma, &he)?
-                .add(&xt_diag_x_symmetric(x_ls_entry, &hn)?)?;
-            (grad, hess)
+        let (grad_ls, hess_ls) = if let (Some(x_ls_entry), Some(x_ls_deriv)) =
+            (self.x_log_sigma_entry.as_ref(), self.x_log_sigma_deriv.as_ref())
+        {
+            let x_ls_entry_cow = x_ls_entry.as_dense_cow();
+            let x_ls_entry_dense = &*x_ls_entry_cow;
+            let x_ls_deriv_cow = x_ls_deriv.as_dense_cow();
+            let x_ls_deriv_dense = &*x_ls_deriv_cow;
+            let grad_exit = &d1_q1 * &dynamic.dq_ls_exit + &d1_qdot * &dynamic.dqdot_ls;
+            let grad_entry = &d1_q0 * &dynamic.dq_ls_entry;
+            let grad_deriv = &d1_qdot * &dynamic.dqdot_lsd;
+            let h_exit = -(&d2_q1 * &dynamic.dq_ls_exit.mapv(|v| v * v)
+                + &d1_q1 * &dynamic.d2q_ls_exit
+                + &d2_qdot * &dynamic.dqdot_ls.mapv(|v| v * v)
+                + &d1_qdot * &dynamic.d2qdot_ls);
+            let h_entry = -(&d2_q0 * &dynamic.dq_ls_entry.mapv(|v| v * v)
+                + &d1_q0 * &dynamic.d2q_ls_entry);
+            let h_deriv = -(&d2_qdot * &dynamic.dqdot_lsd.mapv(|v| v * v));
+            let h_exit_deriv = -(&d2_qdot * &(&dynamic.dqdot_ls * &dynamic.dqdot_lsd)
+                + &d1_qdot * &dynamic.d2qdot_lslsd);
+            let grad = self.x_log_sigma.transpose_vector_multiply(&grad_exit)
+                + x_ls_entry.transpose_vector_multiply(&grad_entry)
+                + x_ls_deriv.transpose_vector_multiply(&grad_deriv);
+            let mut hess = weighted_crossprod_dense(x_log_sigma_exit, &h_exit, x_log_sigma_exit)?
+                + weighted_crossprod_dense(x_ls_entry_dense, &h_entry, x_ls_entry_dense)?
+                + weighted_crossprod_dense(x_ls_deriv_dense, &h_deriv, x_ls_deriv_dense)?;
+            let cross =
+                weighted_crossprod_dense(x_log_sigma_exit, &h_exit_deriv, x_ls_deriv_dense)?;
+            hess += &cross;
+            hess += &cross.t().to_owned();
+            (grad, SymmetricMatrix::Dense(hess))
         } else {
-            let exit_qd = compute_q_chain_derivs_third(
-                &eta_t_exit,
-                &sigma_exit,
-                &ds_exit,
-                &d2s_exit,
-                &d2s_exit,
-            );
-            let (g, h) = chain_rule_weights(&d1_q, &d2_q, &exit_qd.dq_ls, Some(&exit_qd.d2q_ls));
-            let grad = self.x_log_sigma.transpose_vector_multiply(&g);
+            let grad =
+                self.x_log_sigma.transpose_vector_multiply(&(&d1_q1 * &dynamic.dq_ls_exit
+                    + &d1_q0 * &dynamic.dq_ls_entry
+                    + &d1_qdot * &dynamic.dqdot_ls));
+            let h = -(&d2_q1 * &dynamic.dq_ls_exit.mapv(|v| v * v)
+                + &d1_q1 * &dynamic.d2q_ls_exit
+                + &d2_q0 * &dynamic.dq_ls_entry.mapv(|v| v * v)
+                + &d1_q0 * &dynamic.d2q_ls_entry
+                + &d2_qdot * &dynamic.dqdot_ls.mapv(|v| v * v)
+                + &d1_qdot * &dynamic.d2qdot_ls);
             let hess = xt_diag_x_symmetric(&self.x_log_sigma, &h)?;
             (grad, hess)
         };
@@ -4949,12 +5622,19 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 hessian: hess_ls,
             },
         ];
-        if let Some(xw) = self.x_link_wiggle.as_ref() {
-            let gradw = xw.transpose_vector_multiply(&d1_q);
-            let hessw = xt_diag_x_symmetric(xw, &(-&d2_q))?;
+        if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
+            dynamic.wiggle_basis_exit.as_ref(),
+            dynamic.wiggle_basis_entry.as_ref(),
+            dynamic.wiggle_qdot_basis_exit.as_ref(),
+        ) {
+            let gradw =
+                xw_exit.t().dot(&d1_q1) + xw_entry.t().dot(&d1_q0) + xw_qdot.t().dot(&d1_qdot);
+            let hessw = weighted_crossprod_dense(xw_exit, &(-&d2_q1), xw_exit)?
+                + weighted_crossprod_dense(xw_entry, &(-&d2_q0), xw_entry)?
+                + weighted_crossprod_dense(xw_qdot, &(-&d2_qdot), xw_qdot)?;
             blockworking_sets.push(BlockWorkingSet::ExactNewton {
                 gradient: gradw,
-                hessian: hessw,
+                hessian: SymmetricMatrix::Dense(hessw),
             });
         }
 
@@ -4968,24 +5648,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // Fast path for backtracking line search: compute only the scalar
         // log-likelihood, skipping all gradient/Hessian/derivative assembly.
         let n = self.n;
-        let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
-            self.validate_joint_states(block_states)?;
-
-        // Value-only sigma: just exp(eta_ls), no derivative arrays needed.
-        let sigma_exit: Vec<f64> = eta_ls_exit
-            .iter()
-            .map(|&e| crate::families::sigma_link::safe_exp(e))
-            .collect();
-        let sigma_entry: Option<Vec<f64>> = if self.x_log_sigma_entry.is_some() {
-            Some(
-                eta_ls_entry
-                    .iter()
-                    .map(|&e| crate::families::sigma_link::safe_exp(e))
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let (h0, h1, d_raw, ..) = self.validate_joint_states(block_states)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
 
         let soft = self.derivative_softness.max(0.0);
         let guard = self.derivative_guard;
@@ -4998,16 +5662,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             }
             let d = self.y[i].clamp(0.0, 1.0);
 
-            let sigma_entry_i = sigma_entry.as_ref().map_or(sigma_exit[i], |se| se[i]);
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
                 d_raw[i],
-                eta_t_entry[i],
-                eta_t_exit[i],
-                sigma_entry_i,
-                sigma_exit[i],
-                etaw.map(|w| w[i]),
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
             );
 
             // Survival probabilities at entry and exit (value only).
@@ -5027,13 +5688,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             };
 
             // Log time-derivative contribution.
-            let log_g_safe = if state.d_raw.is_finite() {
-                (state.d_raw + soft).max(1e-12).ln()
+            let log_g_safe = if state.g.is_finite() {
+                (state.g + soft).max(1e-12).ln()
             } else {
                 soft.max(1e-12).ln()
             };
-            let g = if state.d_raw.is_finite() {
-                state.d_raw
+            let g = if state.g.is_finite() {
+                state.g
             } else {
                 0.0
             };
@@ -5057,8 +5718,18 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let n = self.n;
-        let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
-            self.validate_joint_states(block_states)?;
+        let (
+            h0,
+            h1,
+            d_raw,
+            eta_t_exit,
+            eta_ls_exit,
+            eta_t_entry,
+            eta_ls_entry,
+            _eta_t_deriv_exit,
+            _eta_ls_deriv_exit,
+            etaw,
+        ) = self.validate_joint_states(block_states)?;
         let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
         let sigma_entry_vec = if self.x_log_sigma_entry.is_some() {
             Some(eta_ls_entry.mapv(crate::families::sigma_link::safe_exp))
@@ -5084,11 +5755,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 h0[i],
                 h1[i],
                 d_raw[i],
-                eta_t_entry[i],
-                eta_t_exit[i],
-                sigma_entry_i,
-                sigma[i],
-                etaw.map(|w| w[i]),
+                -eta_t_entry[i] / sigma_entry_i.max(1e-12) + etaw.map_or(0.0, |w| w[i]),
+                -eta_t_exit[i] / sigma[i].max(1e-12) + etaw.map_or(0.0, |w| w[i]),
+                0.0,
             );
             let Some(row) = self.row_derivatives(i, state)? else {
                 continue;
@@ -7102,7 +7771,11 @@ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
 fn linkwiggle_block_input_from_selected_basis(
     selected_wiggle_basis: SelectedWiggleBasis,
 ) -> LinkWiggleBlockInput {
-    let crate::families::gamlss::SelectedWiggleBasis { block, .. } = selected_wiggle_basis;
+    let crate::families::gamlss::SelectedWiggleBasis {
+        block,
+        knots,
+        degree,
+    } = selected_wiggle_basis;
     let crate::families::gamlss::ParameterBlockInput {
         design,
         penalties,
@@ -7113,6 +7786,8 @@ fn linkwiggle_block_input_from_selected_basis(
     } = block;
     LinkWiggleBlockInput {
         design,
+        knots,
+        degree,
         penalties,
         nullspace_dims,
         initial_log_lambdas,
@@ -7270,6 +7945,8 @@ pub(crate) fn fit_survival_location_scale_terms(
             .as_ref()
             .map(|wiggle| LinkWiggleBlockInput {
                 design: wiggle.design.clone(),
+                knots: wiggle.knots.clone(),
+                degree: wiggle.degree,
                 penalties: wiggle.penalties.clone(),
                 nullspace_dims: wiggle.nullspace_dims.clone(),
                 initial_log_lambdas: layout.wiggle_from(rho),
@@ -7492,44 +8169,6 @@ pub fn predict_survival_location_scale_posterior_mean(
     fit: &UnifiedFitResult,
     covariance: &Array2<f64>,
 ) -> Result<SurvivalLocationScalePredictResult, String> {
-    // Uncertainty-aware survival posterior mean with conditional Gaussian
-    // reduction.
-    //
-    // The deterministic survival predictor already computes the latent pieces
-    //
-    //   h  = time block linear predictor
-    //   t  = threshold block linear predictor
-    //   ls = log-sigma block linear predictor
-    //   w  = optional link-wiggle predictor.
-    //
-    // Under the Gaussian coefficient approximation, the rowwise latent vector
-    //
-    //   (h, t, ls, w)
-    //
-    // is jointly Gaussian, with w identically zero when no wiggle block is
-    // present. The posterior-mean target is
-    //
-    //   E[g(eta)],
-    //   eta = -h - t / sigma(ls) + w.
-    //
-    // A direct evaluation is a 3D expectation without wiggle and a 4D
-    // expectation with wiggle. We do not need to integrate over all latent
-    // dimensions directly. Conditioning on ls is enough:
-    //
-    //   (h, t, w) | ls  is Gaussian,
-    //   eta | ls        is affine in (h, t, w),
-    //
-    // so eta | ls is itself Gaussian with exact conditional mean and variance.
-    // That reduces the full posterior mean to
-    //
-    //   E[g(eta)] = E_ls[ E[g(eta) | ls] ],
-    //
-    // i.e. a 1D outer Gaussian expectation over ls, where the inner object is
-    // the existing Gaussian-uncertain scalar inverse-link expectation.
-    //
-    // If the conditioning algebra becomes numerically unsafe, this routine
-    // falls back to direct adaptive Gaussian expectation rather than forcing
-    // the reduction.
     let pred = predict_survival_location_scale(input, fit)?;
     let n = input.x_time_exit.nrows();
     let predictors = prediction_linear_predictors(input, fit)?;
@@ -7554,184 +8193,40 @@ pub fn predict_survival_location_scale_posterior_mean(
                 .to_string(),
         );
     }
-    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let row_cov = rowwise_survival_latent_covariances(input, p_time, p_t, p_ls, pw, &backend)?;
-
-    let mu_h = predictors.h;
-    let mu_t = predictors.eta_t;
-    let mu_ls = predictors.eta_ls;
-    let muw = predictors.etaw;
-    let link = input.inverse_link.link_function();
-    let mixture_state = input.inverse_link.mixture_state();
-    let sas_state = input.inverse_link.sas_state();
+    let (sigma, ds, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());
+    let wiggle_design = predictors.wiggle_design.as_ref();
+    let dq_dq0 = predictors.dq_dq0.as_ref();
+    let mut grad = Array2::<f64>::zeros((n, p_total));
+    let x_t_dense = input.x_threshold.to_dense();
+    let x_ls_dense = input.x_log_sigma.to_dense();
+    for i in 0..n {
+        for j in 0..p_time {
+            grad[[i, j]] = -input.x_time_exit[[i, j]];
+        }
+        let scale = dq_dq0.as_ref().map_or(1.0, |v| v[i]);
+        let inv_sigma = 1.0 / sigma[i].max(1e-12);
+        for j in 0..p_t {
+            grad[[i, p_time + j]] = -scale * inv_sigma * x_t_dense[[i, j]];
+        }
+        let coeff_ls = scale * predictors.eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
+        for j in 0..p_ls {
+            grad[[i, p_time + p_t + j]] = coeff_ls * x_ls_dense[[i, j]];
+        }
+        if let Some(xw) = wiggle_design {
+            for j in 0..pw {
+                grad[[i, p_time + p_t + p_ls + j]] = xw[[i, j]];
+            }
+        }
+    }
+    let eta_se = linear_predictor_se(grad.view(), covariance);
     let quadctx = crate::quadrature::QuadratureContext::new();
-    const VAR_L_DEGENERATE_TOL: f64 = 1e-12;
-    const CROSS_L_DEGENERATE_TOL: f64 = 1e-10;
-    let gaussian_survival_mean = |mu_loc: f64, var_loc: f64| {
-        let var_loc = var_loc.max(0.0);
-        if matches!(input.inverse_link, InverseLink::Mixture(_)) {
-            return crate::quadrature::normal_expectation_1d_adaptive(
-                &quadctx,
-                mu_loc,
-                var_loc.sqrt(),
-                |z| inverse_link_survival_probvalue(&input.inverse_link, z),
-            )
-            .clamp(0.0, 1.0);
-        }
-        crate::quadrature::integrated_inverse_link_jetwith_state(
-            &quadctx,
-            link,
-            mu_loc,
-            var_loc.sqrt(),
-            mixture_state,
-            sas_state,
-        )
-        .map(|jet| (1.0 - jet.mean).clamp(0.0, 1.0))
-        .unwrap_or_else(|_| {
-            if link == LinkFunction::Probit {
-                let denom = (1.0 + var_loc).sqrt().max(1e-12);
-                (1.0 - normal_cdf(mu_loc / denom)).clamp(0.0, 1.0)
-            } else {
-                crate::quadrature::normal_expectation_1d_adaptive(
-                    &quadctx,
-                    mu_loc,
-                    var_loc.sqrt(),
-                    |z| inverse_link_survival_probvalue(&input.inverse_link, z),
-                )
-                .clamp(0.0, 1.0)
-            }
-        })
-    };
-
-    let fallbackrow = |i: usize| {
-        if let Some(muw) = muw.as_ref() {
-            crate::quadrature::normal_expectation_nd_adaptive::<4, _>(
-                &quadctx,
-                [mu_h[i], mu_t[i], mu_ls[i], muw[i]],
-                [
-                    [
-                        row_cov.var_h[i],
-                        row_cov.cov_ht[i],
-                        row_cov.cov_hl[i],
-                        row_cov.cov_hw.as_ref().expect("wiggle cov_hw rows")[i],
-                    ],
-                    [
-                        row_cov.cov_ht[i],
-                        row_cov.var_t[i],
-                        row_cov.cov_tl[i],
-                        row_cov.cov_tw.as_ref().expect("wiggle cov_tw rows")[i],
-                    ],
-                    [
-                        row_cov.cov_hl[i],
-                        row_cov.cov_tl[i],
-                        row_cov.var_ls[i],
-                        row_cov.cov_lw.as_ref().expect("wiggle cov_lw rows")[i],
-                    ],
-                    [
-                        row_cov.cov_hw.as_ref().expect("wiggle cov_hw rows")[i],
-                        row_cov.cov_tw.as_ref().expect("wiggle cov_tw rows")[i],
-                        row_cov.cov_lw.as_ref().expect("wiggle cov_lw rows")[i],
-                        row_cov.var_w.as_ref().expect("wiggle var rows")[i],
-                    ],
-                ],
-                11,
-                |x| {
-                    let sigma = exp_sigma_derivs_up_to_third_scalar(x[2]).0.max(1e-12);
-                    inverse_link_survival_probvalue(
-                        &input.inverse_link,
-                        -x[0] - x[1] / sigma + x[3],
-                    )
-                },
-            )
-            .clamp(0.0, 1.0)
-        } else {
-            crate::quadrature::normal_expectation_3d_adaptive(
-                &quadctx,
-                [mu_h[i], mu_t[i], mu_ls[i]],
-                [
-                    [row_cov.var_h[i], row_cov.cov_ht[i], row_cov.cov_hl[i]],
-                    [row_cov.cov_ht[i], row_cov.var_t[i], row_cov.cov_tl[i]],
-                    [row_cov.cov_hl[i], row_cov.cov_tl[i], row_cov.var_ls[i]],
-                ],
-                |h, t, ls| {
-                    let sigma = exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
-                    inverse_link_survival_probvalue(&input.inverse_link, -h - t / sigma)
-                },
-            )
-            .clamp(0.0, 1.0)
-        }
-    };
-
     let survival_prob = Array1::from_iter((0..n).map(|i| {
-        let var_h = row_cov.var_h[i];
-        let var_t = row_cov.var_t[i];
-        let var_ls = row_cov.var_ls[i];
-        let cov_ht_i = row_cov.cov_ht[i];
-        let cov_hl_i = row_cov.cov_hl[i];
-        let cov_tl_i = row_cov.cov_tl[i];
-        let muw_i = muw.as_ref().map_or(0.0, |vals| vals[i]);
-        let varw_i = row_cov.var_w.as_ref().map_or(0.0, |vals| vals[i]);
-        let cov_hw_i = row_cov.cov_hw.as_ref().map_or(0.0, |vals| vals[i]);
-        let cov_tw_i = row_cov.cov_tw.as_ref().map_or(0.0, |vals| vals[i]);
-        let cov_lw_i = row_cov.cov_lw.as_ref().map_or(0.0, |vals| vals[i]);
-        let mu_l_i = mu_ls[i];
-
-        if !(var_h.is_finite()
-            && var_t.is_finite()
-            && var_ls.is_finite()
-            && varw_i.is_finite()
-            && cov_ht_i.is_finite()
-            && cov_hl_i.is_finite()
-            && cov_tl_i.is_finite()
-            && cov_hw_i.is_finite()
-            && cov_tw_i.is_finite()
-            && cov_lw_i.is_finite())
-        {
-            return fallbackrow(i);
-        }
-
-        // Exact degenerate limit: if Var(L)=0, PSD implies the cross-covariances
-        // with L vanish, so the outer expectation collapses to the point mass
-        // L = mu_l.
-        if var_ls <= VAR_L_DEGENERATE_TOL {
-            if cov_hl_i.abs() > CROSS_L_DEGENERATE_TOL
-                || cov_tl_i.abs() > CROSS_L_DEGENERATE_TOL
-                || cov_lw_i.abs() > CROSS_L_DEGENERATE_TOL
-            {
-                return fallbackrow(i);
-            }
-            let sigma = exp_sigma_derivs_up_to_third_scalar(mu_l_i).0.max(1e-12);
-            let q_l = 1.0 / sigma;
-            let mu_base = -mu_h[i] - q_l * mu_t[i] + muw_i;
-            let var_base = var_h + q_l * q_l * var_t + varw_i + 2.0 * q_l * cov_ht_i
-                - 2.0 * cov_hw_i
-                - 2.0 * q_l * cov_tw_i;
-            let mu_loc = mu_base;
-            let var_loc = var_base.max(0.0);
-            return gaussian_survival_mean(mu_loc, var_loc);
-        }
-
-        crate::quadrature::normal_expectation_1d_adaptive(&quadctx, mu_l_i, var_ls.sqrt(), |ls| {
-            let sigma = exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
-            let q_l = 1.0 / sigma;
-            let delta_l = ls - mu_l_i;
-            let mu_base = -mu_h[i] - q_l * mu_t[i] + muw_i;
-            let cov_eta_l = cov_hl_i + q_l * cov_tl_i - cov_lw_i;
-            let mu_loc = mu_base - (cov_eta_l / var_ls) * delta_l;
-            let var_base = var_h + q_l * q_l * var_t + varw_i + 2.0 * q_l * cov_ht_i
-                - 2.0 * cov_hw_i
-                - 2.0 * q_l * cov_tw_i;
-            let var_loc = (var_base - cov_eta_l * cov_eta_l / var_ls).max(0.0);
-            if !mu_loc.is_finite() || !var_loc.is_finite() {
-                return fallbackrow(i);
-            }
-            // This is the payoff of the conditional Gaussian reduction above:
-            // for fixed ls, eta = -h - t / sigma(ls) + w is Gaussian, so we
-            // hand its conditional mean and standard deviation straight to
-            // the shared integrated-expectation dispatcher instead of
-            // integrating over h, t, and w explicitly.
-            gaussian_survival_mean(mu_loc, var_loc)
-        })
+        crate::quadrature::normal_expectation_1d_adaptive(
+            &quadctx,
+            pred.eta[i],
+            eta_se[i],
+            |eta| inverse_link_survival_probvalue(&input.inverse_link, eta),
+        )
         .clamp(0.0, 1.0)
     }));
 
@@ -7765,61 +8260,50 @@ pub fn predict_survival_location_scalewith_uncertainty(
             p_total
         ));
     }
-    if pw > 0 && (beta_link_wiggle.is_none() || input.x_link_wiggle.is_none()) {
+    if pw > 0
+        && (beta_link_wiggle.is_none()
+            || input.link_wiggle_knots.is_none()
+            || input.link_wiggle_degree.is_none())
+    {
         return Err(
-            "predict_survival_location_scalewith_uncertainty: wiggle covariance provided but wiggle design/beta is partial"
+            "predict_survival_location_scalewith_uncertainty: dynamic link-wiggle metadata is incomplete"
                 .to_string(),
         );
     }
 
     let predictors = prediction_linear_predictors(input, fit)?;
-
     if input.x_threshold.nrows() != n || input.x_log_sigma.nrows() != n {
         return Err(
             "predict_survival_location_scalewith_uncertainty: row mismatch across design views"
                 .to_string(),
         );
     }
-    if input
-        .x_link_wiggle
-        .as_ref()
-        .is_some_and(|xw| xw.nrows() != n)
-    {
-        return Err(
-            "predict_survival_location_scalewith_uncertainty: x_link_wiggle row mismatch"
-                .to_string(),
-        );
-    }
-
     let (sigma, ds, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());
-    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let row_cov = rowwise_survival_latent_covariances(input, p_time, p_t, p_ls, pw, &backend)?;
-
-    let mut etavar = Array1::<f64>::zeros(n);
+    let wiggle_design = predictors.wiggle_design.as_ref();
+    let dq_dq0 = predictors.dq_dq0.as_ref();
+    let x_t_dense = input.x_threshold.to_dense();
+    let x_ls_dense = input.x_log_sigma.to_dense();
+    let mut grad = Array2::<f64>::zeros((n, p_total));
     for i in 0..n {
+        for j in 0..p_time {
+            grad[[i, j]] = -input.x_time_exit[[i, j]];
+        }
+        let scale = dq_dq0.as_ref().map_or(1.0, |v| v[i]);
         let inv_sigma = 1.0 / sigma[i].max(1e-12);
-        let coeff_ls = predictors.eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
-        let mut acc = row_cov.var_h[i]
-            + inv_sigma * inv_sigma * row_cov.var_t[i]
-            + coeff_ls * coeff_ls * row_cov.var_ls[i]
-            + 2.0 * inv_sigma * row_cov.cov_ht[i]
-            - 2.0 * coeff_ls * row_cov.cov_hl[i]
-            - 2.0 * inv_sigma * coeff_ls * row_cov.cov_tl[i];
-        if let Some(varw) = row_cov.var_w.as_ref() {
-            acc += varw[i];
+        for j in 0..p_t {
+            grad[[i, p_time + j]] = -scale * inv_sigma * x_t_dense[[i, j]];
         }
-        if let Some(cov_hw) = row_cov.cov_hw.as_ref() {
-            acc -= 2.0 * cov_hw[i];
+        let coeff_ls = scale * predictors.eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
+        for j in 0..p_ls {
+            grad[[i, p_time + p_t + j]] = coeff_ls * x_ls_dense[[i, j]];
         }
-        if let Some(cov_tw) = row_cov.cov_tw.as_ref() {
-            acc -= 2.0 * inv_sigma * cov_tw[i];
+        if let Some(xw) = wiggle_design {
+            for j in 0..pw {
+                grad[[i, p_time + p_t + p_ls + j]] = xw[[i, j]];
+            }
         }
-        if let Some(cov_lw) = row_cov.cov_lw.as_ref() {
-            acc += 2.0 * coeff_ls * cov_lw[i];
-        }
-        etavar[i] = acc.max(0.0);
     }
-    let eta_se = etavar.mapv(f64::sqrt);
+    let eta_se = linear_predictor_se(grad.view(), covariance);
 
     let survival_prob = if posterior_mean {
         predict_survival_location_scale_posterior_mean(input, fit, covariance)?.survival_prob
@@ -7920,9 +8404,13 @@ mod tests {
             offset_time_deriv: array![0.5, 0.7, 0.6],
             x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0], [0.4], [-0.6]])),
             x_threshold_entry: None,
+            x_threshold_deriv: None,
             x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0], [-0.3], [0.5]])),
             x_log_sigma_entry: None,
+            x_log_sigma_deriv: None,
             x_link_wiggle: None,
+            wiggle_knots: None,
+            wiggle_degree: None,
         }
     }
 
@@ -9148,8 +9636,18 @@ mod tests {
             let family = survival_exact_newton_test_familywith_inverse_link(inverse_link);
             let states =
                 survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
-            let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, etaw) =
-                family.validate_joint_states(&states).expect("joint states");
+            let (
+                h0,
+                h1,
+                d_raw,
+                eta_t_exit,
+                eta_ls_exit,
+                eta_t_entry,
+                eta_ls_entry,
+                _eta_t_deriv_exit,
+                _eta_ls_deriv_exit,
+                etaw,
+            ) = family.validate_joint_states(&states).expect("joint states");
             // For time-invariant blocks, eta_ls_entry == eta_ls_exit.
             let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
             let (sigma_entry, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_entry.view());
@@ -9159,11 +9657,9 @@ mod tests {
                     h0[i],
                     h1[i],
                     d_raw[i],
-                    eta_t_entry[i],
-                    eta_t_exit[i],
-                    sigma_entry[i],
-                    sigma[i],
-                    etaw.map(|w| w[i]),
+                    -eta_t_entry[i] / sigma_entry[i].max(1e-12) + etaw.map_or(0.0, |w| w[i]),
+                    -eta_t_exit[i] / sigma[i].max(1e-12) + etaw.map_or(0.0, |w| w[i]),
+                    0.0,
                 );
                 let row = family
                     .row_derivatives(i, state)
@@ -9204,6 +9700,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
@@ -9292,6 +9790,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.4],
             x_link_wiggle: None,
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let pred = predict_survival_location_scale(&input, &fit).expect("predict");
@@ -9328,6 +9828,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(x_log_sigma_dense.clone())),
             eta_log_sigma_offset: array![0.4, 0.1],
             x_link_wiggle: Some(DesignMatrix::Dense(Arc::new(xwiggle_dense.clone()))),
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let sparse_input = SurvivalLocationScalePredictInput {
@@ -9412,6 +9914,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, -0.15]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let fit = test_survival_fit(
@@ -9486,6 +9990,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(x_log_sigma_dense.clone())),
             eta_log_sigma_offset: array![0.0, -0.03],
             x_link_wiggle: None,
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let sparse_input = SurvivalLocationScalePredictInput {
@@ -9530,6 +10036,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: Some(DesignMatrix::Dense(Arc::new(array![[1.0, 0.1]]))),
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let fit = test_survival_fit(
@@ -9626,6 +10134,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             inverse_link: InverseLink::Standard(LinkFunction::BetaLogistic),
         };
 
@@ -9646,6 +10156,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             inverse_link: InverseLink::Standard(LinkFunction::Probit),
         };
 

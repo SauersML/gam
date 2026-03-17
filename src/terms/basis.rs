@@ -2,6 +2,7 @@ use crate::faer_ndarray::{
     FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
     rrqr_nullspace_basis,
 };
+use crate::matrix::DesignMatrix;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
@@ -1569,9 +1570,9 @@ pub enum BasisMetadata {
 }
 
 /// Standardized basis build result for engine-level composition.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BasisBuildResult {
-    pub design: Array2<f64>,
+    pub design: DesignMatrix,
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
     pub penaltyinfo: Vec<PenaltyInfo>,
@@ -2711,8 +2712,7 @@ fn build_aniso_design_psi_derivatives_shared(
     full_ident_transform: Option<Array2<f64>>,
     n_poly: usize,
     radial_kind: RadialScalarKind,
-) -> Result<AnisoBasisPsiDerivatives, BasisError>
-{
+) -> Result<AnisoBasisPsiDerivatives, BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
     let dim = data.ncols();
@@ -3327,7 +3327,7 @@ pub fn build_bspline_basis_1d(
     let (penalties, nullspace_dims, penaltyinfo) =
         filter_active_penalty_candidates(transformed_candidates)?;
     Ok(BasisBuildResult {
-        design,
+        design: DesignMatrix::Dense(Arc::new(design)),
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -3712,7 +3712,7 @@ pub fn build_thin_plate_basiswithworkspace(
     }
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design,
+        design: DesignMatrix::Dense(Arc::new(design)),
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -7080,7 +7080,7 @@ pub fn build_matern_basiswithworkspace(
     };
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design,
+        design: DesignMatrix::Dense(Arc::new(design)),
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -10110,7 +10110,7 @@ pub fn build_duchon_basiswithworkspace(
     let candidates = operator_penalty_candidates_from_collocation(&ops.d0, &ops.d1, &ops.d2);
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design,
+        design: DesignMatrix::Dense(Arc::new(design)),
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -12876,11 +12876,12 @@ mod tests {
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
         };
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
+        let result_design = result.design.to_dense();
 
         let mut c = Array2::<f64>::ones((data.nrows(), data.ncols() + 1));
         c.slice_mut(s![.., 1..]).assign(&data);
-        let cross = result.design.t().dot(&c);
-        let rel = orthogonality_relative_residual(result.design.view(), c.view());
+        let cross = result_design.t().dot(&c);
+        let rel = orthogonality_relative_residual(result_design.view(), c.view());
 
         assert!(
             rel < 1e-10,
@@ -13101,6 +13102,7 @@ mod tests {
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        let built_design = built.design.to_dense();
         let knots = match &built.metadata {
             BasisMetadata::BSpline1D { knots, .. } => knots,
             _ => panic!("expected BSpline1D metadata"),
@@ -13109,7 +13111,7 @@ mod tests {
             .unwrap()
             .expect("quantile knots should trigger Greville scaling");
         let expected = create_difference_penalty_matrix(
-            built.design.ncols(),
+            built_design.ncols(),
             spec.penalty_order,
             Some(g.view()),
         )
@@ -13195,8 +13197,9 @@ mod tests {
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
-        for j in 0..built.design.ncols() {
-            let col_sum = built.design.column(j).sum();
+        let built_design = built.design.to_dense();
+        for j in 0..built_design.ncols() {
+            let col_sum = built_design.column(j).sum();
             assert!(
                 col_sum.abs() < 1e-8,
                 "default weighted-sum-to-zero failed for column {j}: {col_sum}"
@@ -13249,7 +13252,8 @@ mod tests {
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
-        let cross = built.design.t().dot(&constraints);
+        let built_design = built.design.to_dense();
+        let cross = built_design.t().dot(&constraints);
         for i in 0..cross.nrows() {
             for j in 0..cross.ncols() {
                 assert!(
@@ -14778,11 +14782,12 @@ mod tests {
             aniso_log_scales: None,
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
+        let out_design = out.design.to_dense();
 
         let mut c = Array2::<f64>::ones((data.nrows(), data.ncols() + 1));
         c.slice_mut(s![.., 1..]).assign(&data);
-        let cross = out.design.t().dot(&c);
-        let rel = orthogonality_relative_residual(out.design.view(), c.view());
+        let cross = out_design.t().dot(&c);
+        let rel = orthogonality_relative_residual(out_design.view(), c.view());
 
         assert!(
             rel < 1e-10,

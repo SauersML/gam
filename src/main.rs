@@ -2320,12 +2320,8 @@ fn run_predict_survival(
             .beta_link_wiggle
             .as_ref()
             .map(|v| Array1::from_vec(v.clone()));
-        if beta_link_wiggle.is_some() {
-            return Err(
-                "saved survival location-scale models with linkwiggle are unsupported because the historical fit path optimized the wrong surrogate model"
-                    .to_string(),
-            );
-        }
+        let link_wiggle_knots = model.linkwiggle_knots.as_ref().map(|k| Array1::from_vec(k.clone()));
+        let link_wiggle_degree = model.linkwiggle_degree;
         let pred_input = SurvivalLocationScalePredictInput {
             x_time_exit: x_time_exit,
             eta_time_offset_exit: eta_offset_exit.clone(),
@@ -2334,6 +2330,8 @@ fn run_predict_survival(
             x_log_sigma: DesignMatrix::Dense(Arc::new(prepared_sigma_design)),
             eta_log_sigma_offset: Array1::zeros(n),
             x_link_wiggle: None,
+            link_wiggle_knots,
+            link_wiggle_degree,
             inverse_link: survival_inverse_link.clone(),
         };
         let fit_stub = gam::survival_location_scale::survival_fit_from_parts(
@@ -2341,11 +2339,11 @@ fn run_predict_survival(
                 beta_time: beta_time.clone(),
                 beta_threshold: beta_threshold.clone(),
                 beta_log_sigma: beta_log_sigma.clone(),
-                beta_link_wiggle: None,
+                beta_link_wiggle: beta_link_wiggle.clone(),
                 lambdas_time: Array1::zeros(0),
                 lambdas_threshold: Array1::zeros(0),
                 lambdas_log_sigma: Array1::zeros(0),
-                lambdas_linkwiggle: None,
+                lambdas_linkwiggle: beta_link_wiggle.as_ref().map(|_| Array1::zeros(0)),
                 log_likelihood: 0.0,
                 reml_score: 0.0,
                 stable_penalty_term: 0.0,
@@ -4783,17 +4781,37 @@ fn build_time_varying_survival_covariate_template(
         &BSplineBasisSpec {
             degree: time_degree,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::Provided(knots),
+            knotspec: BSplineKnotSpec::Provided(knots.clone()),
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
         },
     )
     .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;
     let time_design_entry = time_build_entry.design;
+    let p_time = time_design_exit.ncols();
+    let mut time_design_derivative_exit = Array2::<f64>::zeros((age_exit.len(), p_time));
+    let mut deriv_buf = vec![0.0_f64; p_time];
+    for i in 0..age_exit.len() {
+        deriv_buf.fill(0.0);
+        evaluate_bspline_derivative_scalar(
+            log_exit[i],
+            knots
+                .as_slice()
+                .ok_or_else(|| format!("{block_name} time-margin knots are not contiguous"))?,
+            time_degree,
+            &mut deriv_buf,
+        )
+        .map_err(|e| format!("failed to evaluate {block_name} time-margin derivative basis: {e}"))?;
+        let chain = 1.0 / age_exit[i].max(1e-12);
+        for j in 0..p_time {
+            time_design_derivative_exit[[i, j]] = deriv_buf[j] * chain;
+        }
+    }
 
     Ok(SurvivalCovariateTermBlockTemplate::TimeVarying {
         time_basis_entry: time_design_entry,
         time_basis_exit: time_design_exit,
+        time_basis_derivative_exit: time_design_derivative_exit,
         time_penalties: time_build.penalties,
     })
 }
