@@ -121,7 +121,7 @@ impl PenaltyMatrix {
     pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         match self {
             Self::Dense(m) => Some(m),
-            Self::KroneckerFactored { .. } => None,
+            Self::KroneckerFactored { .. } | Self::Blockwise { .. } => None,
         }
     }
 
@@ -142,6 +142,18 @@ impl PenaltyMatrix {
                 let bv = right.dot(&v_mat);
                 let bva = bv.dot(&left.t());
                 Array1::from_iter(bva.iter().copied())
+            }
+            Self::Blockwise {
+                local,
+                col_range,
+                total_dim,
+            } => {
+                let mut out = Array1::zeros(*total_dim);
+                let v_block = v.slice(ndarray::s![col_range.clone()]);
+                let result_block = local.dot(&v_block);
+                out.slice_mut(ndarray::s![col_range.clone()])
+                    .assign(&result_block);
+                out
             }
         }
     }
@@ -172,6 +184,13 @@ impl PenaltyMatrix {
                     }
                 }
             }
+            Self::Blockwise {
+                local, col_range, ..
+            } => {
+                target
+                    .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
+                    .scaled_add(lambda, local);
+            }
         }
     }
 
@@ -182,6 +201,13 @@ impl PenaltyMatrix {
             Self::KroneckerFactored { .. } => {
                 let sv = self.dot(beta);
                 beta.dot(&sv)
+            }
+            Self::Blockwise {
+                local, col_range, ..
+            } => {
+                let beta_block = beta.slice(ndarray::s![col_range.clone()]);
+                let sv = local.dot(&beta_block);
+                beta_block.dot(&sv)
             }
         }
     }

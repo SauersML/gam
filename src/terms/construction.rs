@@ -1,7 +1,7 @@
 use crate::basis::analyze_penalty_block;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use crate::smooth::{BlockwisePenalty, PenaltyStructureHint};
+use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
@@ -582,8 +582,8 @@ pub struct ReparamResult {
     ///
     /// Coordinate frame note:
     /// - This matrix is stored in the TRANSFORMED coefficient frame (post-`Qs`),
-    ///   i.e. it is compatible with `rs_transformed`, `beta_transformed`, and
-    ///   transformed Hessians without additional coordinate mapping.
+    ///   i.e. it is compatible with `canonical_transformed`, `beta_transformed`,
+    ///   and transformed Hessians without additional coordinate mapping.
     ///
     /// These vectors span the structural null space used by positive-part
     /// log-determinant conventions.
@@ -593,140 +593,9 @@ pub struct ReparamResult {
     pub penalty_shrinkage_ridge: f64,
 }
 
-/// Creates a lambda-independent balanced penalty root for stable rank detection
-/// This follows mgcv's approach: scale each penalty to unit Frobenius norm, sum them,
-/// and take the matrix square root. This balanced penalty is used ONLY for rank detection.
-pub fn create_balanced_penalty_root(
-    s_list: &[Array2<f64>],
-    p: usize,
-) -> Result<Array2<f64>, EstimationError> {
-    if s_list.is_empty() {
-        // No penalties case - return empty matrix with correct number of columns
-        return Ok(Array2::zeros((0, p)));
-    }
-
-    // Validate penalty matrix dimensions
-    for (idx, s) in s_list.iter().enumerate() {
-        if s.nrows() != p || s.ncols() != p {
-            return Err(EstimationError::LayoutError(format!(
-                "Penalty matrix {idx} must be {p}×{p}, got {}×{}",
-                s.nrows(),
-                s.ncols()
-            )));
-        }
-    }
-    let mut s_balanced = Array2::zeros((p, p));
-
-    // Scale each penalty to have unit Frobenius norm and sum them
-    for s_k in s_list {
-        let frob_norm = s_k.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        if frob_norm > 1e-12 {
-            // Scale to unit Frobenius norm and add to balanced sum
-            s_balanced.scaled_add(1.0 / frob_norm, s_k);
-        }
-    }
-
-    // Take the matrix square root of the balanced penalty
-    let (eigenvalues, eigenvectors) =
-        robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
-
-    // Find the maximum eigenvalue to create a relative tolerance
-    let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-
-    // Define a relative tolerance. Use an absolute fallback for zero matrices.
-    let tolerance = if max_eig > 0.0 {
-        max_eig * 1e-12
-    } else {
-        1e-12
-    };
-
-    let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-    if penalty_rank == 0 {
-        return Ok(Array2::zeros((0, p)));
-    }
-
-    // Construct the balanced penalty square root
-    let mut eb = Array2::zeros((p, penalty_rank));
-    let mut col_idx = 0;
-    for (i, &eigenval) in eigenvalues.iter().enumerate() {
-        if eigenval > tolerance {
-            let sqrt_eigenval = eigenval.sqrt();
-            let eigenvec = eigenvectors.column(i);
-            eb.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
-            col_idx += 1;
-        }
-    }
-
-    // Return as rank x p matrix (matching mgcv's convention)
-    Ok(eb.t().to_owned())
-}
-
-
 // ---------------------------------------------------------------------------
-// Block-scale spectral decomposition
+// Kronecker factor decomposition primitives
 // ---------------------------------------------------------------------------
-//
-// These functions operate at the natural block scale of each penalty
-// (p_local × p_local) instead of inflating to p_total × p_total.
-// Structure hints (Ridge, Kronecker) enable closed-form or factored
-// eigendecomposition when available.
-
-/// Compute a block-local square root and embed into global coordinates.
-/// Returns a `rank_k × p_total` matrix where nonzero entries live in `col_range`.
-fn block_local_root(
-    col_range: &Range<usize>,
-    local: &Array2<f64>,
-    p_total: usize,
-) -> Result<Array2<f64>, EstimationError> {
-    let p_local = col_range.len();
-    debug_assert_eq!(local.nrows(), p_local);
-    debug_assert_eq!(local.ncols(), p_local);
-
-    let analysis = analyze_penalty_block(local).map_err(|err| {
-        EstimationError::InvalidInput(format!("block-local penalty analysis failed: {err}"))
-    })?;
-
-    if analysis.rank == 0 {
-        return Ok(Array2::zeros((0, p_total)));
-    }
-
-    let rank_k = analysis.rank;
-    let tolerance = analysis.tol;
-    let mut rs = Array2::zeros((rank_k, p_total));
-    let mut row_idx = 0;
-    for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
-        if eigenval > tolerance {
-            let sqrt_eigenval = eigenval.sqrt();
-            let eigenvec = analysis.eigenvectors.column(i);
-            for (j, &v) in eigenvec.iter().enumerate() {
-                rs[[row_idx, col_range.start + j]] = sqrt_eigenval * v;
-            }
-            row_idx += 1;
-        }
-    }
-
-    Ok(rs)
-}
-
-/// Ridge (scaled identity) root: trivial closed-form, no eigendecomposition.
-/// Returns a `block_size × p_total` matrix.
-fn ridge_root(
-    col_range: &Range<usize>,
-    scale: f64,
-    p_total: usize,
-) -> Array2<f64> {
-    let block_size = col_range.len();
-    if scale <= 0.0 || block_size == 0 {
-        return Array2::zeros((0, p_total));
-    }
-    let sqrt_scale = scale.sqrt();
-    let mut rs = Array2::zeros((block_size, p_total));
-    for i in 0..block_size {
-        rs[[i, col_range.start + i]] = sqrt_scale;
-    }
-    rs
-}
 
 /// Per-factor decomposition result for Kronecker penalties.
 struct KroneckerFactorDecomp {
@@ -735,31 +604,6 @@ struct KroneckerFactorDecomp {
     rank: usize,
     dim: usize,
 }
-
-/// Kronecker-factored root: eigendecompose each factor separately.
-///
-/// Cost: O(Σ q_j³) instead of O((Π q_j)³).
-fn kronecker_root(
-    col_range: &Range<usize>,
-    factors: &[Array2<f64>],
-    p_total: usize,
-) -> Result<Array2<f64>, EstimationError> {
-    if factors.is_empty() {
-        return Ok(Array2::zeros((0, p_total)));
-    }
-    let decomps = match decompose_kronecker_factors(factors, "kronecker_root")? {
-        None => return Ok(Array2::zeros((0, p_total))),
-        Some(d) => d,
-    };
-    let kron_root = assemble_kronecker_root_local(&decomps);
-    let rank_total = kron_root.nrows();
-    debug_assert_eq!(kron_root.ncols(), col_range.len());
-    let mut rs = Array2::zeros((rank_total, p_total));
-    rs.slice_mut(s![.., col_range.start..col_range.end])
-        .assign(&kron_root);
-    Ok(rs)
-}
-
 
 /// Eigendecompose each Kronecker factor separately at O(Σ q_j³).
 /// Returns per-factor decompositions, or `None` if any factor is zero.
@@ -869,360 +713,6 @@ fn kronecker_eigenvalues(decomps: &[KroneckerFactorDecomp], block_dim: usize) ->
     let positive: Vec<f64> = kron_eigs.into_iter().filter(|&ev| ev > tol).collect();
     let nullity = block_dim - positive.len();
     (positive, nullity)
-}
-
-/// Create a balanced penalty root from blockwise penalties at block scale.
-///
-/// When all penalties have non-overlapping col_ranges, the balanced sum is
-/// block-diagonal and eigendecomposition is done per-block.
-/// Falls back to the global path when penalties overlap.
-pub fn create_balanced_penalty_root_blockwise(
-    penalties: &[BlockwisePenalty],
-    p_total: usize,
-) -> Result<Array2<f64>, EstimationError> {
-    if penalties.is_empty() {
-        return Ok(Array2::zeros((0, p_total)));
-    }
-
-    // Group penalties by col_range to detect block-diagonal structure.
-    // Key: (start, end), Value: list of local penalty matrices.
-    let mut block_groups: BTreeMap<(usize, usize), Vec<&Array2<f64>>> = BTreeMap::new();
-    for bp in penalties {
-        let key = (bp.col_range.start, bp.col_range.end);
-        block_groups.entry(key).or_default().push(&bp.local);
-    }
-
-    // Check for overlapping ranges. Ranges are non-overlapping if, when sorted
-    // by start, each range's start >= the previous range's end.
-    let ranges: Vec<(usize, usize)> = block_groups.keys().copied().collect();
-    let mut overlapping = false;
-    for i in 1..ranges.len() {
-        if ranges[i].0 < ranges[i - 1].1 {
-            overlapping = true;
-            break;
-        }
-    }
-
-    if overlapping {
-        // Fall back to global path: materialize p×p matrices.
-        let s_list: Vec<Array2<f64>> = penalties.iter().map(|bp| bp.to_global(p_total)).collect();
-        return create_balanced_penalty_root(&s_list, p_total);
-    }
-
-    // Non-overlapping: process each block independently.
-    let mut total_rank = 0usize;
-    struct BlockRoot {
-        col_range: Range<usize>,
-        root: Array2<f64>,  // rank_b × block_dim
-    }
-    let mut block_roots = Vec::with_capacity(block_groups.len());
-
-    for (&(start, end), locals) in &block_groups {
-        let block_dim = end - start;
-        let mut s_balanced = Array2::zeros((block_dim, block_dim));
-
-        for local in locals {
-            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            if frob_norm > 1e-12 {
-                s_balanced.scaled_add(1.0 / frob_norm, local);
-            }
-        }
-
-        let (eigenvalues, eigenvectors) =
-            robust_eigh(&s_balanced, Side::Lower, "balanced penalty block")?;
-
-        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-        let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-        let block_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-        if block_rank == 0 {
-            continue;
-        }
-
-        let mut root = Array2::zeros((block_rank, block_dim));
-        let mut row_idx = 0;
-        for (i, &eigenval) in eigenvalues.iter().enumerate() {
-            if eigenval > tolerance {
-                let sqrt_ev = eigenval.sqrt();
-                let evec = eigenvectors.column(i);
-                root.row_mut(row_idx).assign(&(&evec * sqrt_ev));
-                row_idx += 1;
-            }
-        }
-
-        total_rank += block_rank;
-        block_roots.push(BlockRoot {
-            col_range: start..end,
-            root,
-        });
-    }
-
-    if total_rank == 0 {
-        return Ok(Array2::zeros((0, p_total)));
-    }
-
-    // Assemble global balanced root: total_rank × p_total
-    let mut eb = Array2::zeros((total_rank, p_total));
-    let mut row_offset = 0;
-    for br in &block_roots {
-        let rank_b = br.root.nrows();
-        eb.slice_mut(s![row_offset..(row_offset + rank_b), br.col_range.start..br.col_range.end])
-            .assign(&br.root);
-        row_offset += rank_b;
-    }
-
-    Ok(eb)
-}
-
-/// Precompute reparameterization invariant from blockwise penalties at block scale.
-///
-/// When all penalties have non-overlapping col_ranges, the balanced sum is
-/// block-diagonal and the Q_pen/Q_null subspace split is computed per-block.
-/// Falls back to the global path when penalties overlap.
-pub fn precompute_reparam_invariant_blockwise(
-    penalties: &[BlockwisePenalty],
-    rs_list: &[Array2<f64>],
-    p_total: usize,
-) -> Result<ReparamInvariant, EstimationError> {
-    use std::cmp::Ordering;
-
-    let m = penalties.len();
-    if m != rs_list.len() {
-        return Err(EstimationError::LayoutError(format!(
-            "penalties/rs_list length mismatch: {} vs {}",
-            m, rs_list.len()
-        )));
-    }
-
-    if m == 0 {
-        return Ok(ReparamInvariant {
-            split: SubspaceSplit::identity(p_total),
-            qs_base: Array2::eye(p_total),
-            has_nonzero: false,
-            max_balanced_eigenvalue: 0.0,
-        });
-    }
-
-    // Group penalties by col_range.
-    struct PenaltyRef {
-        global_index: usize,
-        local: Array2<f64>,
-    }
-    let mut block_groups: BTreeMap<(usize, usize), Vec<PenaltyRef>> = BTreeMap::new();
-    for (i, bp) in penalties.iter().enumerate() {
-        let key = (bp.col_range.start, bp.col_range.end);
-        block_groups.entry(key).or_default().push(PenaltyRef {
-            global_index: i,
-            local: bp.local.clone(),
-        });
-    }
-
-    // Check for overlapping ranges.
-    let ranges: Vec<(usize, usize)> = block_groups.keys().copied().collect();
-    let mut overlapping = false;
-    for i in 1..ranges.len() {
-        if ranges[i].0 < ranges[i - 1].1 {
-            overlapping = true;
-            break;
-        }
-    }
-
-    if overlapping {
-        // Fall back to global path.
-        return precompute_reparam_invariant(rs_list, p_total);
-    }
-
-    // Non-overlapping: process each block independently.
-    // The global Q_s matrix is block-diagonal: for each block, we compute a local
-    // Q_pen / Q_null split and embed it into the global matrix.
-
-    // Columns NOT covered by any penalty range get identity treatment (unpenalized).
-    let mut covered = vec![false; p_total];
-    for bp in penalties {
-        for j in bp.col_range.clone() {
-            covered[j] = true;
-        }
-    }
-
-    // Process each block.
-    struct BlockInvariant {
-        col_range: Range<usize>,
-        q_pen_local: Array2<f64>,   // block_dim × pen_rank
-        q_null_local: Array2<f64>,  // block_dim × null_count
-        max_bal_eigenvalue: f64,
-        // For each penalty in this block: its global index and local transformed root
-        penalty_transforms: Vec<(usize, Array2<f64>)>,
-    }
-
-    let mut block_invariants = Vec::with_capacity(block_groups.len());
-    let mut has_nonzero = false;
-    let mut global_max_bal = 0.0_f64;
-
-    for (&(start, end), refs) in &block_groups {
-        let block_dim = end - start;
-
-        // Build local balanced sum.
-        let mut s_balanced_local = Array2::zeros((block_dim, block_dim));
-        let mut block_has_nonzero = false;
-        for pref in refs {
-            let frob_norm = pref.local.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            if frob_norm > 1e-12 {
-                s_balanced_local.scaled_add(1.0 / frob_norm, &pref.local);
-                block_has_nonzero = true;
-            }
-        }
-
-        if !block_has_nonzero {
-            // All penalties in this block are zero → identity split (all null).
-            let mut transforms = Vec::new();
-            for pref in refs {
-                let rs_k = &rs_list[pref.global_index];
-                // Extract the block columns and transform by identity.
-                let rs_local = rs_k.slice(s![.., start..end]).to_owned();
-                transforms.push((pref.global_index, rs_local));
-            }
-            block_invariants.push(BlockInvariant {
-                col_range: start..end,
-                q_pen_local: Array2::zeros((block_dim, 0)),
-                q_null_local: Array2::eye(block_dim),
-                max_bal_eigenvalue: 0.0,
-                penalty_transforms: transforms,
-            });
-            continue;
-        }
-
-        has_nonzero = true;
-
-        // Eigendecompose the local balanced penalty.
-        let (bal_eigenvalues, bal_eigenvectors) =
-            robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
-
-        // Sort eigenvalues descending.
-        let mut order: Vec<usize> = (0..block_dim).collect();
-        order.sort_by(|&i, &j| {
-            bal_eigenvalues[j]
-                .partial_cmp(&bal_eigenvalues[i])
-                .unwrap_or(Ordering::Equal)
-                .then(i.cmp(&j))
-        });
-
-        let max_bal = order
-            .iter()
-            .map(|&idx| bal_eigenvalues[idx].abs())
-            .fold(0.0_f64, f64::max);
-        let rank_tol = if max_bal > 0.0 { max_bal * 1e-12 } else { 1e-12 };
-        let penalized_rank = order
-            .iter()
-            .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
-            .count();
-        let null_count = block_dim - penalized_rank;
-
-        // Build local Q_pen and Q_null.
-        let mut q_pen_local = Array2::zeros((block_dim, penalized_rank));
-        let mut q_null_local = Array2::zeros((block_dim, null_count));
-        for (col_idx, &idx) in order.iter().enumerate() {
-            if col_idx < penalized_rank {
-                for row in 0..block_dim {
-                    q_pen_local[[row, col_idx]] = bal_eigenvectors[[row, idx]];
-                }
-            } else {
-                let null_col = col_idx - penalized_rank;
-                for row in 0..block_dim {
-                    q_null_local[[row, null_col]] = bal_eigenvectors[[row, idx]];
-                }
-            }
-        }
-
-        // Build local Q_s = [Q_pen | Q_null] and transform each penalty root.
-        let mut qs_local = Array2::zeros((block_dim, block_dim));
-        for i in 0..block_dim {
-            for j in 0..penalized_rank {
-                qs_local[[i, j]] = q_pen_local[[i, j]];
-            }
-            for j in 0..null_count {
-                qs_local[[i, penalized_rank + j]] = q_null_local[[i, j]];
-            }
-        }
-
-        let mut transforms = Vec::new();
-        for pref in refs {
-            let rs_k = &rs_list[pref.global_index];
-            // Extract block columns from the global root, multiply by local Q_s.
-            let rs_local = rs_k.slice(s![.., start..end]);
-            let rs_transformed_local = rs_local.dot(&qs_local);
-            transforms.push((pref.global_index, rs_transformed_local));
-        }
-
-        global_max_bal = global_max_bal.max(max_bal);
-        block_invariants.push(BlockInvariant {
-            col_range: start..end,
-            q_pen_local,
-            q_null_local,
-            max_bal_eigenvalue: max_bal,
-            penalty_transforms: transforms,
-        });
-    }
-
-    if !has_nonzero {
-        return Ok(ReparamInvariant {
-            split: SubspaceSplit::identity(p_total),
-            qs_base: Array2::eye(p_total),
-            has_nonzero: false,
-            max_balanced_eigenvalue: 0.0,
-        });
-    }
-
-    // Assemble global Q_pen and Q_null from block-local splits.
-    // Uncovered columns (not in any penalty range) are fully unpenalized → go to Q_null.
-    let uncovered_cols: Vec<usize> = (0..p_total).filter(|j| !covered[*j]).collect();
-    let total_pen_rank: usize = block_invariants.iter().map(|bi| bi.q_pen_local.ncols()).sum();
-    let total_null: usize =
-        block_invariants.iter().map(|bi| bi.q_null_local.ncols()).sum() + uncovered_cols.len();
-
-    let mut q_pen = Array2::zeros((p_total, total_pen_rank));
-    let mut q_null = Array2::zeros((p_total, total_null));
-    let mut pen_col = 0;
-    let mut null_col = 0;
-
-    for bi in &block_invariants {
-        let start = bi.col_range.start;
-        let pen_r = bi.q_pen_local.ncols();
-        let null_r = bi.q_null_local.ncols();
-        if pen_r > 0 {
-            q_pen
-                .slice_mut(s![start..(start + bi.q_pen_local.nrows()), pen_col..(pen_col + pen_r)])
-                .assign(&bi.q_pen_local);
-            pen_col += pen_r;
-        }
-        if null_r > 0 {
-            q_null
-                .slice_mut(s![
-                    start..(start + bi.q_null_local.nrows()),
-                    null_col..(null_col + null_r)
-                ])
-                .assign(&bi.q_null_local);
-            null_col += null_r;
-        }
-    }
-    // Uncovered columns → identity columns in Q_null.
-    for &j in &uncovered_cols {
-        q_null[[j, null_col]] = 1.0;
-        null_col += 1;
-    }
-
-    let split = SubspaceSplit { q_pen, q_null };
-
-    // Store the global Q_s = [Q_pen | Q_null] from the split.
-    // Block-local roots are transformed on-the-fly as R_block @ Q[start..end, :]
-    // inside the reparam engine.
-    let qs_global = split.compose_qs();
-
-    Ok(ReparamInvariant {
-        split,
-        qs_base: qs_global,
-        has_nonzero,
-        max_balanced_eigenvalue: global_max_bal,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,99 +1282,12 @@ impl ReparamInvariant {
     }
 }
 
-/// Precompute the lambda-invariant reparameterization structure from penalty roots.
-pub fn precompute_reparam_invariant(
-    rs_list: &[Array2<f64>],
-    p: usize,
-) -> Result<ReparamInvariant, EstimationError> {
-    use std::cmp::Ordering;
-
-    let p_total = p;
-    let m = rs_list.len();
-
-    if m == 0 {
-        return Ok(ReparamInvariant {
-            split: SubspaceSplit::identity(p),
-            qs_base: Array2::eye(p_total),
-            has_nonzero: false,
-            max_balanced_eigenvalue: 0.0,
-        });
-    }
-
-    let rs_faer: Vec<Mat<f64>> = rs_list.iter().map(array_to_faer).collect();
-    let s_original_list: Vec<Mat<f64>> = rs_faer.iter().map(penalty_from_root_faer).collect();
-
-    let mut s_balanced = Mat::<f64>::zeros(p, p);
-    let mut has_nonzero = false;
-    for s_k in &s_original_list {
-        let frob_norm = frobenius_norm_faer(s_k);
-        if frob_norm > 1e-12 {
-            let scale = 1.0 / frob_norm;
-            for i in 0..p {
-                for j in 0..p {
-                    s_balanced[(i, j)] += scale * s_k[(i, j)];
-                }
-            }
-            has_nonzero = true;
-        }
-    }
-
-    if !has_nonzero {
-        return Ok(ReparamInvariant {
-            split: SubspaceSplit::identity(p),
-            qs_base: Array2::eye(p),
-            has_nonzero: false,
-            max_balanced_eigenvalue: 0.0,
-        });
-    }
-
-    let (bal_eigenvalues, bal_eigenvectors) =
-        robust_eigh_faer(&s_balanced, Side::Lower, "balanced penalty matrix")?;
-
-    let mut order: Vec<usize> = (0..p).collect();
-    order.sort_by(|&i, &j| {
-        bal_eigenvalues[j]
-            .partial_cmp(&bal_eigenvalues[i])
-            .unwrap_or(Ordering::Equal)
-            .then(i.cmp(&j))
-    });
-
-    let mut qs = Mat::<f64>::zeros(p, p);
-    for (col_idx, &idx) in order.iter().enumerate() {
-        for row in 0..p {
-            qs[(row, col_idx)] = bal_eigenvectors[(row, idx)];
-        }
-    }
-
-    let mut bal_eigenvalues_ordered = Vec::with_capacity(p);
-    for &idx in &order {
-        bal_eigenvalues_ordered.push(bal_eigenvalues[idx]);
-    }
-    let max_bal = bal_eigenvalues_ordered
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let rank_tol = if max_bal > 0.0 {
-        max_bal * 1e-12
-    } else {
-        1e-12
-    };
-    let penalized_rank = bal_eigenvalues_ordered
-        .iter()
-        .take_while(|&&val| val > rank_tol)
-        .count();
-    let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p)?;
-
-    Ok(ReparamInvariant {
-        split,
-        qs_base: mat_to_array(&qs),
-        has_nonzero,
-        max_balanced_eigenvalue: max_bal,
-    })
-}
-
 /// Precompute the lambda-invariant reparameterization structure from canonical penalties.
-/// Same algorithm as `precompute_reparam_invariant`, but uses block-local roots
-/// directly instead of requiring rank x p global roots.
+///
+/// Uses block-local roots directly instead of requiring rank x p global roots.
+/// Each `CanonicalPenalty` carries its own block-local root and column range,
+/// so the balanced sum can be assembled without ever materializing full-size
+/// penalty matrices.
 pub fn precompute_reparam_invariant_from_canonical(
     penalties: &[CanonicalPenalty],
     p_total: usize,
@@ -2754,6 +2157,89 @@ impl KroneckerReparamResult {
     }
 }
 
+/// Compute `log|S|₊` and its first/second derivatives w.r.t. `ρ_k = log(λ_k)`
+/// from factored marginal eigenvalues.
+///
+/// Shared implementation for `KroneckerPenaltySystem::logdet_and_derivatives`
+/// and `kronecker_reparameterization_engine`.  Iterates over the ∏q_j
+/// multi-index grid in O(d · ∏q_j) time with no O(p²) storage.
+pub fn kronecker_logdet_and_derivatives(
+    marginal_eigenvalues: &[Array1<f64>],
+    marginal_dims: &[usize],
+    lambdas: &[f64],
+    has_double_penalty: bool,
+    ridge: f64,
+) -> (f64, Array1<f64>, Array2<f64>) {
+    let d = marginal_dims.len();
+    let n_pen = d + if has_double_penalty { 1 } else { 0 };
+
+    let mut logdet = 0.0;
+    let mut grad = Array1::<f64>::zeros(n_pen);
+    let mut hess = Array2::<f64>::zeros((n_pen, n_pen));
+    let tol = 1e-12;
+
+    let mut multi_idx = vec![0usize; d];
+    loop {
+        let mut sigma = ridge;
+        for k in 0..d {
+            sigma += lambdas[k] * marginal_eigenvalues[k][multi_idx[k]];
+        }
+        if has_double_penalty {
+            sigma += lambdas[d];
+        }
+
+        if sigma > tol {
+            logdet += sigma.ln();
+            let inv_sigma = 1.0 / sigma;
+            let inv_sigma2 = inv_sigma * inv_sigma;
+
+            for k in 0..d {
+                let ck = lambdas[k] * marginal_eigenvalues[k][multi_idx[k]];
+                grad[k] += ck * inv_sigma;
+            }
+            if has_double_penalty {
+                grad[d] += lambdas[d] * inv_sigma;
+            }
+
+            for k in 0..n_pen {
+                let ck = if k < d {
+                    lambdas[k] * marginal_eigenvalues[k][multi_idx[k]]
+                } else {
+                    lambdas[d]
+                };
+                hess[[k, k]] += ck * inv_sigma - ck * ck * inv_sigma2;
+                for l in (k + 1)..n_pen {
+                    let cl = if l < d {
+                        lambdas[l] * marginal_eigenvalues[l][multi_idx[l]]
+                    } else {
+                        lambdas[d]
+                    };
+                    let off = -ck * cl * inv_sigma2;
+                    hess[[k, l]] += off;
+                    hess[[l, k]] += off;
+                }
+            }
+        }
+
+        let mut carry = true;
+        for dim in (0..d).rev() {
+            if carry {
+                multi_idx[dim] += 1;
+                if multi_idx[dim] < marginal_dims[dim] {
+                    carry = false;
+                } else {
+                    multi_idx[dim] = 0;
+                }
+            }
+        }
+        if carry {
+            break;
+        }
+    }
+
+    (logdet, grad, hess)
+}
+
 /// Kronecker-factored reparameterization for tensor-product penalties.
 ///
 /// Instead of eigendecomposing the full p×p balanced penalty (O(p³)), this
@@ -2836,71 +2322,13 @@ pub fn kronecker_reparameterization_engine(
         0.0
     };
 
-    // Compute logdet and derivatives from marginal eigenvalue grid.
-    let n_pen = d + if has_double_penalty { 1 } else { 0 };
-    let mut log_det = 0.0;
-    let mut det1 = Array1::<f64>::zeros(n_pen);
-    let mut det2 = Array2::<f64>::zeros((n_pen, n_pen));
-    let tol = 1e-12;
-
-    let mut multi_idx = vec![0usize; d];
-    loop {
-        let mut sigma = penalty_shrinkage_ridge;
-        for k in 0..d {
-            sigma += lambdas[k] * marginal_eigenvalues[k][multi_idx[k]];
-        }
-        if has_double_penalty {
-            sigma += lambdas[d];
-        }
-
-        if sigma > tol {
-            log_det += sigma.ln();
-            let inv_sigma = 1.0 / sigma;
-            let inv_sigma2 = inv_sigma * inv_sigma;
-
-            for k in 0..d {
-                let ck = lambdas[k] * marginal_eigenvalues[k][multi_idx[k]];
-                det1[k] += ck * inv_sigma;
-            }
-            if has_double_penalty {
-                det1[d] += lambdas[d] * inv_sigma;
-            }
-
-            for k in 0..n_pen {
-                let ck = if k < d {
-                    lambdas[k] * marginal_eigenvalues[k][multi_idx[k]]
-                } else {
-                    lambdas[d]
-                };
-                det2[[k, k]] += ck * inv_sigma - ck * ck * inv_sigma2;
-                for l in (k + 1)..n_pen {
-                    let cl = if l < d {
-                        lambdas[l] * marginal_eigenvalues[l][multi_idx[l]]
-                    } else {
-                        lambdas[d]
-                    };
-                    let off_diag = -ck * cl * inv_sigma2;
-                    det2[[k, l]] += off_diag;
-                    det2[[l, k]] += off_diag;
-                }
-            }
-        }
-
-        let mut carry = true;
-        for dim in (0..d).rev() {
-            if carry {
-                multi_idx[dim] += 1;
-                if multi_idx[dim] < marginal_dims[dim] {
-                    carry = false;
-                } else {
-                    multi_idx[dim] = 0;
-                }
-            }
-        }
-        if carry {
-            break;
-        }
-    }
+    let (log_det, det1, det2) = kronecker_logdet_and_derivatives(
+        &marginal_eigenvalues,
+        marginal_dims,
+        lambdas,
+        has_double_penalty,
+        penalty_shrinkage_ridge,
+    );
 
     Ok(KroneckerReparamResult {
         reparameterized_marginals,
@@ -3251,9 +2679,10 @@ mod tests {
             Array2::<f64>::eye(q1), // dummy designs
             Array2::<f64>::eye(q2),
         ];
+        let marginal_penalties = vec![s1, s2];
         let kron_result = super::kronecker_reparameterization_engine(
             &marginal_designs,
-            &[s1, s2],
+            &marginal_penalties,
             &[q1, q2],
             &lambdas,
             false,
@@ -3270,16 +2699,19 @@ mod tests {
             diff,
         );
 
-        // Also check derivatives via finite differences.
+        // Check derivatives via central FD in rho-space (rho = log lambda).
+        let rhos: Vec<f64> = lambdas.iter().map(|&l| l.ln()).collect();
         let eps = 1e-5;
         for k in 0..2 {
-            let mut lam_plus = lambdas.to_vec();
-            lam_plus[k] *= (1.0 + eps);
-            let mut lam_minus = lambdas.to_vec();
-            lam_minus[k] *= (1.0 - eps);
+            let mut rho_plus = rhos.clone();
+            rho_plus[k] += eps;
+            let mut rho_minus = rhos.clone();
+            rho_minus[k] -= eps;
+            let lam_plus: Vec<f64> = rho_plus.iter().map(|&r| r.exp()).collect();
+            let lam_minus: Vec<f64> = rho_minus.iter().map(|&r| r.exp()).collect();
             let result_plus = super::kronecker_reparameterization_engine(
                 &marginal_designs,
-                &[s1.clone(), s2.clone()],
+                &marginal_penalties,
                 &[q1, q2],
                 &lam_plus,
                 false,
@@ -3288,30 +2720,25 @@ mod tests {
             .unwrap();
             let result_minus = super::kronecker_reparameterization_engine(
                 &marginal_designs,
-                &[s1.clone(), s2.clone()],
+                &marginal_penalties,
                 &[q1, q2],
                 &lam_minus,
                 false,
                 None,
             )
             .unwrap();
-            // d(logdet)/d(rho_k) ≈ (logdet(λ*(1+ε)) - logdet(λ*(1-ε))) / (2ε)
-            // But rho = log(lambda), so d(logdet)/d(rho_k) = λ_k * d(logdet)/d(λ_k)
-            // FD in rho: shift rho by eps => lambda * exp(eps) ≈ lambda * (1 + eps)
-            let fd_deriv =
-                (result_plus.log_det - result_minus.log_det) / (2.0 * eps * lambdas[k]);
-            // The engine reports d/d(rho_k) = lambda_k * d/d(lambda_k)
+            let fd_deriv = (result_plus.log_det - result_minus.log_det) / (2.0 * eps);
             let analytic_deriv = kron_result.det1[k];
             let rel_err = if analytic_deriv.abs() > 1e-10 {
-                (fd_deriv * lambdas[k] - analytic_deriv).abs() / analytic_deriv.abs()
+                (fd_deriv - analytic_deriv).abs() / analytic_deriv.abs()
             } else {
-                (fd_deriv * lambdas[k] - analytic_deriv).abs()
+                (fd_deriv - analytic_deriv).abs()
             };
             assert!(
                 rel_err < 1e-4,
                 "det1[{k}] mismatch: analytic={:.8}, fd={:.8}, rel_err={:.3e}",
                 analytic_deriv,
-                fd_deriv * lambdas[k],
+                fd_deriv,
                 rel_err,
             );
         }

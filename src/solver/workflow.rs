@@ -659,21 +659,19 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
 
 use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
-    SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeWiggleBuild,
-    append_survival_timewiggle_columns, build_survival_baseline_offsets,
-    build_survival_time_basis, build_survival_time_monotonicity_collocation,
+    SurvivalLikelihoodMode, SurvivalTimeWiggleBuild, append_survival_timewiggle_columns,
+    build_survival_baseline_offsets, build_survival_time_basis,
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
     normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    survival_basis_supports_structural_monotonicity,
 };
 use crate::families::survival_location_scale::{
-    ResidualDistribution, SurvivalCovariateTermBlockTemplate, SurvivalLocationScaleTermSpec,
-    TimeBlockInput, residual_distribution_inverse_link,
+    SurvivalCovariateTermBlockTemplate, SurvivalLocationScaleTermSpec, TimeBlockInput,
+    residual_distribution_inverse_link,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
-    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, effectivelinkwiggle_formulaspec,
+    LinkChoice, ParsedFormula, effectivelinkwiggle_formulaspec,
     parse_formula, parse_link_choice, parse_surv_response,
 };
 use crate::term_builder::{build_termspec, enable_scale_dimensions};
@@ -773,6 +771,8 @@ pub fn materialize<'a>(
 
     if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
         materialize_survival(&parsed, data, &col_map, config, &entry_col, &exit_col, &event_col)
+    } else if config.noise_formula.is_some() {
+        Err("location-scale (noise_formula) materialization through the unified API is not yet supported; use FitRequest::GaussianLocationScale or FitRequest::BinomialLocationScale directly".to_string())
     } else {
         materialize_standard(&parsed, data, &col_map, config)
     }
@@ -888,7 +888,21 @@ fn materialize_standard<'a>(
     let n = data.values.nrows();
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let options = FitOptions::default();
+    let options = FitOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: true,
+        max_iter: 200,
+        tol: 1e-7,
+        nullspace_dims: vec![],
+        linear_constraints: None,
+        adaptive_regularization: None,
+        penalty_shrinkage_floor: Some(1e-6),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
 
     let wiggle = effective_linkwiggle.as_ref().and_then(|cfg| {
@@ -959,7 +973,16 @@ fn materialize_survival<'a>(
     }
 
     // Parse survival config
+    // NOTE: currently only LocationScale is supported through the unified API.
+    // Transformation, Weibull, and MarginalSlope require additional wiring.
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    if !matches!(survival_mode, SurvivalLikelihoodMode::LocationScale) {
+        return Err(format!(
+            "survival likelihood '{}' is not yet supported through the unified API; \
+             only 'location-scale' is currently available. Use FitRequest directly for other modes.",
+            config.survival_likelihood
+        ));
+    }
     let baseline_cfg = parse_survival_baseline_config(
         &config.baseline_target,
         config.baseline_scale,
@@ -1014,16 +1037,6 @@ fn materialize_survival<'a>(
         }
         timewiggle_build = Some(tw);
     }
-
-    // Monotonicity collocation
-    let timewiggle_ref = timewiggle_build.as_ref().map(|tw| (&tw.knots, tw.degree));
-    let (mono_rows, mono_offsets) = build_survival_time_monotonicity_collocation(
-        &age_entry,
-        &age_exit,
-        &time_build,
-        &baseline_cfg,
-        timewiggle_ref,
-    )?;
 
     // Build covariate spec
     let mut termspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;

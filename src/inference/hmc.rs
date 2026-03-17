@@ -3005,17 +3005,31 @@ impl JointBetaRhoPosterior {
         }
 
         // ---- Structural penalty log-determinant: +0.5 log|S(ρ)|₊ and ρ-derivatives ----
-        let penalty_matrices: Vec<Array2<f64>> = self
-            .penalty_canonical
-            .iter()
-            .map(|cp| cp.global_penalty())
-            .collect();
-        let penalty_logdet = compute_block_penalty_logdet_derivs(
-            &[rho.clone()],
-            &[penalty_matrices.as_slice()],
-            &[self.penalty_nullspace_dims.as_slice()],
-            0.0,
-        );
+        // Assemble S = Σ λ_k S_k block-locally, then eigendecompose once.
+        let mut s_total = Array2::<f64>::zeros((n_beta, n_beta));
+        for (k, cp) in self.penalty_canonical.iter().enumerate() {
+            cp.accumulate_weighted(&mut s_total, lambdas[k]);
+        }
+        use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+        let pld_result = PenaltyPseudologdet::from_assembled(s_total);
+        let (log_det_s, logdet_grad) = match pld_result {
+            Ok(pld) => {
+                // S_k matrices for derivatives — use global form since PenaltyPseudologdet
+                // operates in the full eigenspace.
+                let s_k_mats: Vec<Array2<f64>> = self
+                    .penalty_canonical
+                    .iter()
+                    .map(|cp| {
+                        let mut s = Array2::zeros((n_beta, n_beta));
+                        cp.accumulate_weighted(&mut s, 1.0);
+                        s
+                    })
+                    .collect();
+                let (first, _second) = pld.rho_derivatives(&s_k_mats, &lambdas);
+                (pld.value(), first)
+            }
+            Err(_) => (0.0, Array1::zeros(n_rho)),
+        };
         let (log_det_s, logdet_grad) = match penalty_logdet {
             Ok(pld) => (pld.value, pld.first),
             Err(_) => (0.0, Array1::zeros(n_rho)),
