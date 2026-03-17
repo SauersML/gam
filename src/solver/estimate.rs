@@ -1518,6 +1518,9 @@ where
         fit_linear_constraints.clone(),
     )?;
     reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
+    if let Some(kron) = opts.kronecker_penalty_system.clone() {
+        reml_state.set_kronecker_penalty_system(kron);
+    }
     reml_state.setwarm_start_original_beta(warm_start_beta);
 
     let smoothing_options = crate::solver::smoothing::SmoothingBfgsOptions {
