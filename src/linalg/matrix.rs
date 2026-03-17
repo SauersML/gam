@@ -1,5 +1,6 @@
 use crate::faer_ndarray::{
-    FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av, fast_xt_diag_x,
+    FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
+    fast_av_into, fast_xt_diag_x,
 };
 use crate::types::RidgePolicy;
 use faer::Accum;
@@ -1777,18 +1778,18 @@ impl TensorProductDesignOperator {
 
         let mut out = Array1::<f64>::zeros(n);
         let mut beta_slice = Array1::<f64>::zeros(q0);
+        let mut contrib = Array1::<f64>::zeros(n);
 
         for t_flat in 0..tail_total {
             decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
 
             // Extract β[:, t₂, …, tₖ] from the flat coefficient vector.
-            // Column layout: β[j₁ * tail_total + t_flat].
             for j1 in 0..q0 {
                 beta_slice[j1] = vector[j1 * tail_total + t_flat];
             }
 
-            // BLAS matvec: B₁ · β_slice → (n,)
-            let mut contrib = fast_av(b0.as_ref(), &beta_slice);
+            // BLAS matvec into pre-allocated buffer: B₁ · β_slice → contrib
+            fast_av_into(b0.as_ref(), &beta_slice, &mut contrib);
 
             // Elementwise scale by remaining marginal columns.
             for (dim_idx, &ti) in tail_indices.iter().enumerate() {
@@ -1828,6 +1829,7 @@ impl TensorProductDesignOperator {
 
         let mut out = Array1::<f64>::zeros(self.total_cols);
         let mut scaled_v = Array1::<f64>::zeros(n);
+        let mut col_result = Array1::<f64>::zeros(q0);
 
         for t_flat in 0..tail_total {
             decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
@@ -1841,8 +1843,8 @@ impl TensorProductDesignOperator {
                 }
             }
 
-            // BLAS transpose matvec: B₁' · scaled_v → (q₁,)
-            let col_result = fast_atv(b0.as_ref(), &scaled_v);
+            // BLAS transpose matvec into pre-allocated buffer: B₁' · scaled_v → col_result
+            fast_atv_into(b0.as_ref(), &scaled_v, &mut col_result);
 
             // Scatter into output: out[j₁ * tail_total + t_flat] = col_result[j₁]
             for j1 in 0..q0 {
@@ -1939,27 +1941,9 @@ impl DesignOperator for TensorProductDesignOperator {
                     gamma[i] = prod;
                 }
 
-                // Compute B₁' · diag(γ) · B₁ → (q₀ × q₀) block.
+                // Compute B₁' · diag(γ) · B₁ → (q₀ × q₀) block via BLAS.
                 block.fill(0.0);
-                for i in 0..n {
-                    let g = gamma[i];
-                    if g == 0.0 {
-                        continue;
-                    }
-                    for a1 in 0..q0 {
-                        let scaled = g * b0[[i, a1]];
-                        if scaled == 0.0 {
-                            continue;
-                        }
-                        for b1 in a1..q0 {
-                            let val = scaled * b0[[i, b1]];
-                            block[[a1, b1]] += val;
-                            if a1 != b1 {
-                                block[[b1, a1]] += val;
-                            }
-                        }
-                    }
-                }
+                streaming_blas_xt_diag_x(b0.as_ref(), &gamma, &mut block);
 
                 // Scatter block into the full xtwx.
                 // Global column for (j₁, tail_flat) = j₁ * tail_total + tail_flat.
