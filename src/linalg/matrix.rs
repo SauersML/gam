@@ -1765,21 +1765,45 @@ impl TensorProductDesignOperator {
         if d == 0 {
             return Array1::zeros(self.n);
         }
+        if d == 1 {
+            // Single marginal: just B·β, no contraction chain needed.
+            let b = &self.marginals[0];
+            let mut out = Array1::<f64>::zeros(self.n);
+            let q = b.ncols();
+            for i in 0..self.n {
+                let mut acc = 0.0_f64;
+                for t in 0..q {
+                    acc += b[[i, t]] * vector[t];
+                }
+                out[i] = acc;
+            }
+            return out;
+        }
 
         // Two alternating buffers for the contraction chain.
-        // Data starts in buf_a; each contraction reads from one and writes to the other.
-        let mut buf_a = vec![0.0_f64; self.total_cols];
-        let mut buf_b = vec![0.0_f64; self.total_cols];
+        // The first contraction reads directly from `vector` (β is immutable),
+        // avoiding an O(∏qⱼ) copy per observation.
+        let max_intermediate = self.total_cols / self.marginals[d - 1].ncols();
+        let mut buf_a = vec![0.0_f64; max_intermediate];
+        let mut buf_b = vec![0.0_f64; max_intermediate];
 
         let mut out = Array1::<f64>::zeros(self.n);
         for row in 0..self.n {
-            // Start: copy β into buf_a.
-            buf_a[..self.total_cols].copy_from_slice(&vector[..self.total_cols]);
-            let mut current_len = self.total_cols;
-            let mut src_is_a = true; // tracks which buffer holds current data
+            // First contraction: read from vector, write to buf_a.
+            let q_last = self.marginals[d - 1].ncols();
+            let first_contracted = self.total_cols / q_last;
+            for c in 0..first_contracted {
+                let mut acc = 0.0_f64;
+                for t in 0..q_last {
+                    acc += vector[c * q_last + t] * self.marginals[d - 1][[row, t]];
+                }
+                buf_a[c] = acc;
+            }
+            let mut current_len = first_contracted;
+            let mut src_is_a = true;
 
-            // Contract from the last marginal backwards.
-            for dim in (0..d).rev() {
+            // Remaining contractions: alternate between buf_a and buf_b.
+            for dim in (0..d - 1).rev() {
                 let q = self.marginals[dim].ncols();
                 let contracted_len = current_len / q;
                 if src_is_a {
@@ -1803,7 +1827,6 @@ impl TensorProductDesignOperator {
                 current_len = contracted_len;
             }
 
-            // After d contractions, result is a scalar in the last-written buffer.
             out[row] = if src_is_a { buf_a[0] } else { buf_b[0] };
         }
         out
@@ -1830,10 +1853,11 @@ impl TensorProductDesignOperator {
             }
 
             // Build the Kronecker row incrementally via sequential outer products.
-            // Start with the first marginal's row, then expand with each subsequent marginal.
+            // Fold `scale` into the first marginal copy so the final accumulation
+            // is a plain addition (no per-element multiply).
             let q0 = self.marginals[0].ncols();
             for t in 0..q0 {
-                buf_a[t] = self.marginals[0][[row, t]];
+                buf_a[t] = scale * self.marginals[0][[row, t]];
             }
             let mut current_len = q0;
 
@@ -1854,10 +1878,10 @@ impl TensorProductDesignOperator {
                 current_len = new_len;
             }
 
-            // Accumulate scaled row into output.
+            // Accumulate pre-scaled row into output.
             let final_buf = if d % 2 == 1 { &buf_a } else { &buf_b };
             for j in 0..self.total_cols {
-                out[j] += scale * final_buf[j];
+                out[j] += final_buf[j];
             }
         }
         Array1::from_vec(out)
