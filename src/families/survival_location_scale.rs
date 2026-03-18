@@ -88,12 +88,16 @@ fn softplus(x: f64) -> f64 {
 //     when |eta_t * inv_sigma| would exceed the clamp ceiling and saturates
 //     to ±MAX instead of overflowing.
 //
-//   Layer 3 – `safe_product` / `safe_sum2`: defense-in-depth guards that
-//     clamp inf products to MAX/MIN and map inf + (-inf) → 0.  With layers
-//     1–2 working, these should rarely trigger; they exist to prevent NaN
-//     propagation if a future code path bypasses layers 1–2.
+//   Layer 3 – factorized time-derivative algebra and compensated subtraction:
+//     the base dq/dt chain is evaluated as exp(-eta_ls) * (eta_t*eta_ls' - eta_t')
+//     so the shared exp(-eta_ls) factor is applied only once, and
+//     d_eta/dt = d_raw + qdot is formed with a compensated sum that
+//     carries an explicit roundoff bound into the monotonicity gate.
 //
-//   Layer 4 – `exact_row_kernel`: splits the old `!g.is_finite()` hard error
+//   Layer 4 – `safe_product` / `safe_sum2` plus `exact_row_kernel`: the generic
+//     arithmetic guards still clamp inf products to MAX/MIN and map
+//     inf + (-inf) → 0 as defense in depth, and the row kernel splits the old
+//     `!g.is_finite()` hard error
 //     into NaN (hard error for genuinely bad data) and ±inf (clamped to MAX
 //     so the monotonicity guard can apply).
 //
@@ -139,9 +143,9 @@ fn safe_product(lhs: f64, rhs: f64) -> f64 {
 
 /// Layer 3 defense: when a + b produces NaN from inf + (-inf), return 0.
 ///
-/// In the survival chain, g = d_raw - qdot1 where both terms scale as
+/// In the survival chain, g = d_raw + qdot1 where both terms scale as
 /// inv_sigma × (something).  When inv_sigma is very large, both terms
-/// overflow independently even though their difference is finite.  Mapping
+/// overflow independently even though their sum is finite.  Mapping
 /// the cancellation to 0 is conservative: it says "the correction is
 /// negligible", and the monotonicity guard in exact_row_kernel will floor
 /// g upward if needed.
@@ -184,6 +188,70 @@ fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
         if eta_t > 0.0 { -f64::MAX } else { f64::MAX }
     } else {
         -eta_t * exp_sigma_inverse_from_eta_scalar(eta_ls)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StableDifference {
+    value: f64,
+    roundoff_slack: f64,
+    operand_scale: f64,
+}
+
+#[inline]
+fn two_diff(lhs: f64, rhs: f64) -> (f64, f64) {
+    let high = lhs - rhs;
+    let z = high - lhs;
+    let low = (lhs - (high - z)) - (rhs + z);
+    (high, low)
+}
+
+#[inline]
+fn compensated_difference(lhs: f64, rhs: f64) -> StableDifference {
+    let operand_scale = lhs.abs().max(rhs.abs());
+    if lhs.is_nan() || rhs.is_nan() {
+        return StableDifference {
+            value: f64::NAN,
+            roundoff_slack: 0.0,
+            operand_scale,
+        };
+    }
+    if !lhs.is_finite() || !rhs.is_finite() {
+        // Compensated subtraction is undefined for infinite operands.
+        // Use a conservative slack: if the difference rounded to 0 (from
+        // inf − inf via safe_sum2), the true value could be anywhere, so
+        // make the slack large enough that the monotonicity guard will
+        // clamp rather than hard-error.
+        let diff = safe_sum2(lhs, -rhs);
+        let slack = if diff == 0.0 && operand_scale > 0.0 {
+            // inf − inf ≈ 0: the true difference is unknown; use a large
+            // slack so the guard floor can absorb it.
+            operand_scale
+        } else {
+            // One finite, one infinite, or both same-sign infinite:
+            // the result is ±inf or a well-defined finite value.
+            0.0
+        };
+        return StableDifference {
+            value: diff,
+            roundoff_slack: slack,
+            operand_scale,
+        };
+    }
+    let (high, low) = two_diff(lhs, rhs);
+    if !high.is_finite() {
+        return StableDifference {
+            value: high,
+            roundoff_slack: 0.0,
+            operand_scale,
+        };
+    }
+    let value = high + low;
+    let roundoff_slack = low.abs() + 8.0 * f64::EPSILON * operand_scale.max(value.abs());
+    StableDifference {
+        value,
+        roundoff_slack,
+        operand_scale,
     }
 }
 
@@ -416,11 +484,11 @@ pub struct TimeBlockInput {
     pub design_entry: Array2<f64>,
     pub design_exit: Array2<f64>,
     pub design_derivative_exit: Array2<f64>,
-    pub constraint_design_derivative: Option<Array2<f64>>,
+    pub constraint_design_derivative: Array2<f64>,
     pub offset_entry: Array1<f64>,
     pub offset_exit: Array1<f64>,
     pub derivative_offset_exit: Array1<f64>,
-    pub constraint_derivative_offset: Option<Array1<f64>>,
+    pub constraint_derivative_offset: Array1<f64>,
     pub penalties: Vec<Array2<f64>>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
@@ -924,8 +992,8 @@ struct SurvivalLocationScaleFamily {
     x_time_exit: Arc<Array2<f64>>,
     x_time_deriv: Arc<Array2<f64>>,
     offset_time_deriv: Array1<f64>,
-    x_time_deriv_constraints: Option<Array2<f64>>,
-    offset_time_deriv_constraints: Option<Array1<f64>>,
+    x_time_deriv_constraints: Array2<f64>,
+    offset_time_deriv_constraints: Array1<f64>,
     /// Exit design for threshold block (always present; used as main design).
     x_threshold: DesignMatrix,
     /// Entry design for threshold block when time-varying.
@@ -954,11 +1022,12 @@ struct SurvivalPredictorState {
     q0: f64,
     /// q evaluated at exit time.
     q1: f64,
-    /// max(|d_raw|, |qdot|): the magnitude of the two terms whose difference
-    /// produced `g`.  Used to set an adaptive roundoff slack in the
-    /// monotonicity guard — when both operands are large, their difference
-    /// loses proportionally more significant digits.
-    cancellation_scale: f64,
+    /// Explicit roundoff envelope from the compensated `d_raw + qdot`
+    /// subtraction used to form `g`.
+    g_roundoff_slack: f64,
+    /// max(|d_raw|, |qdot|): kept only for diagnostics so monotonicity errors
+    /// can report the scale of the operands that produced `g`.
+    g_operand_scale: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -2001,24 +2070,15 @@ impl SurvivalLocationScaleFamily {
         q1: f64,
         qdot1: f64,
     ) -> SurvivalPredictorState {
-        let g = if d_raw.is_nan() || qdot1.is_nan() {
-            // Propagate genuine NaN inputs so exact_row_kernel can error.
-            f64::NAN
-        } else {
-            // Guard against catastrophic cancellation: when both d_raw and
-            // qdot1 are very large with the same sign, their difference can
-            // become NaN (inf - inf) or lose all significant digits.
-            // safe_sum2 maps inf + (-inf) → 0.0; the monotonicity guard in
-            // exact_row_kernel will then clamp upward if needed.
-            safe_sum2(d_raw, -qdot1)
-        };
+        let g_diff = compensated_difference(d_raw, -qdot1);
         SurvivalPredictorState {
             h0,
             h1,
-            g,
+            g: g_diff.value,
             q0,
             q1,
-            cancellation_scale: d_raw.abs().max(qdot1.abs()),
+            g_roundoff_slack: g_diff.roundoff_slack,
+            g_operand_scale: g_diff.operand_scale,
         }
     }
 
@@ -2043,8 +2103,8 @@ impl SurvivalLocationScaleFamily {
             return Ok(None);
         }
         let d = self.validated_event_target(row)?;
-        let u0 = -state.h0 + state.q0;
-        let u1 = -state.h1 + state.q1;
+        let u0 = state.h0 + state.q0;
+        let u1 = state.h1 + state.q1;
 
         let (log_s0, r0, dr0, ddr0, dddr0) =
             Self::exact_survival_neglog_derivatives_fourth(&self.inverse_link, u0).map_err(
@@ -2078,18 +2138,11 @@ impl SurvivalLocationScaleFamily {
         }
         // Adaptive roundoff slack for the monotonicity guard.
         //
-        // g = d_raw − qdot suffers catastrophic cancellation when both
-        // operands are large (extreme sigma regime).  The number of reliable
-        // digits in g is roughly log10(cancellation_scale) fewer than 16.
-        // We use two complementary estimates and take the wider one:
-        //
-        //  (a) cancellation_scale × 64ε — proportional to the operands that
-        //      produced g; accounts for the ~6 chained multiplications in
-        //      compose_survival_dynamic_q whose rounding errors accumulate.
-        //
-        //  (b) legacy (1e-12) × (1 + max|state vars|) — the original formula,
-        //      retained as a lower bound for moderate-scale inputs.
-        let cancellation_slack = 64.0 * f64::EPSILON * state.cancellation_scale;
+        // `g` is now formed with a compensated subtraction, so the low-part
+        // residual from that subtraction is the primary estimate of how much
+        // rounding error the d_eta/dt reconstruction may have accumulated.
+        // The older state-scale heuristic remains as a floor for moderate
+        // inputs.
         let legacy_slack = 1e-12
             * (1.0
                 + state
@@ -2098,7 +2151,7 @@ impl SurvivalLocationScaleFamily {
                     .max(state.h1.abs())
                     .max(state.q0.abs())
                     .max(state.q1.abs()));
-        let roundoff_slack = cancellation_slack.max(legacy_slack);
+        let roundoff_slack = state.g_roundoff_slack.max(legacy_slack);
         if g < guard && g >= guard - roundoff_slack {
             g = guard;
         }
@@ -2106,8 +2159,8 @@ impl SurvivalLocationScaleFamily {
             return Err(format!(
                 "survival location-scale monotonicity violated at row {row}: \
                  d_eta/dt={g:.3e} < lower_bound={guard:.3e} \
-                 (cancellation_scale={:.3e}, roundoff_slack={roundoff_slack:.3e})",
-                state.cancellation_scale
+                 (operand_scale={:.3e}, roundoff_slack={roundoff_slack:.3e})",
+                state.g_operand_scale
             ));
         }
         let (log_g, d_log_g, d2_log_g, d3_log_g, ..) = Self::logwith_derivatives_positive(g);
@@ -2173,8 +2226,8 @@ impl SurvivalLocationScaleFamily {
         // With
         //
         //   ell = w [ d(log f(u1) + log g) + (1-d) log S(u1) - log S(u0) ],
-        //   u0 = q0 - h0,
-        //   u1 = q1 - h1,
+        //   u0 = q0 + h0,
+        //   u1 = q1 + h1,
         //
         // the entry-only derivatives (w.r.t. q0):
         //
@@ -2195,12 +2248,12 @@ impl SurvivalLocationScaleFamily {
         // Cross-Hessian d²ell/(dq0 dq1) = 0 because u0 depends only on q0
         // and u1 depends only on q1.
         //
-        // The time-side partials follow from u0 = q0 - h0 and u1 = q1 - h1:
+        // The time-side partials follow from u0 = q0 + h0 and u1 = q1 + h1:
         //
-        //   ell_h0   = -ell_q0 = -w r(u0)
-        //   ell_h1   = -ell_q1
-        //   ell_h0q0 = -w r'(u0)
-        //   ell_h1q1 = -w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
+        //   ell_h0   = ell_q0 = w r(u0)
+        //   ell_h1   = ell_q1
+        //   ell_h0q0 = w r'(u0)
+        //   ell_h1q1 = w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
         //
         // The 4th-order derivatives d4_q0 and d4_q1 are the m4 quantities
         // needed by the Arbogast chain rule for the outer REML Hessian.
@@ -2230,14 +2283,14 @@ impl SurvivalLocationScaleFamily {
             d2_q1,
             d3_q1,
             d4_q1,
-            d1_qdot1: -kernel.w * kernel.d * kernel.d_log_g,
+            d1_qdot1: kernel.w * kernel.d * kernel.d_log_g,
             d2_qdot1: kernel.w * kernel.d * kernel.d2_log_g,
-            grad_time_eta_h0: -kernel.w * kernel.r0,
-            grad_time_eta_h1: -kernel.w
+            grad_time_eta_h0: kernel.w * kernel.r0,
+            grad_time_eta_h1: kernel.w
                 * (kernel.d * kernel.dlogphi1 + (1.0 - kernel.d) * (-kernel.r1)),
             grad_time_eta_d: kernel.w * kernel.d * kernel.d_log_g,
-            h_time_h0: -kernel.w * kernel.dr0,
-            h_time_h1: -kernel.w * (kernel.d * kernel.d2logphi1 + (1.0 - kernel.d) * (-kernel.dr1)),
+            h_time_h0: kernel.w * kernel.dr0,
+            h_time_h1: kernel.w * (kernel.d * kernel.d2logphi1 + (1.0 - kernel.d) * (-kernel.dr1)),
             h_time_d: -kernel.w * kernel.d * kernel.d2_log_g,
             d_h_h0: kernel.w * kernel.ddr0,
             d_h_h1: kernel.w * kernel.d * kernel.d3logphi1
@@ -2245,8 +2298,8 @@ impl SurvivalLocationScaleFamily {
             d_h_d: -kernel.w * kernel.d * kernel.d3_log_g,
             // 4th derivatives of ℓ w.r.t. the time predictors h0, h1.
             // These are the exact bilinear coefficients for D²H[u,v] in the
-            // time-time block. Since u = q - h and d⁴ℓ/dh⁴ = d⁴ℓ/du⁴
-            // (same sign because (-1)⁴ = 1), we have:
+            // time-time block. Since u = q + h, d⁴ℓ/dh⁴ = d⁴ℓ/du⁴
+            // (same sign because (+1)⁴ = 1), we have:
             d2_h_h0: kernel.w * kernel.dddr0,
             d2_h_h1: kernel.w * (kernel.d * kernel.d4logphi1 + (1.0 - kernel.d) * (-kernel.dddr1)),
         }))
@@ -3474,26 +3527,22 @@ fn validate_time_block(n: usize, b: &TimeBlockInput) -> Result<(), String> {
     if b.design_entry.ncols() != p || b.design_derivative_exit.ncols() != p {
         return Err("time_block design column mismatch across entry/exit/derivative".to_string());
     }
-    if let Some(rows) = b.constraint_design_derivative.as_ref() {
-        if rows.ncols() != p {
-            return Err(format!(
-                "time_block monotonicity constraint width mismatch: got {}, expected {p}",
-                rows.ncols()
-            ));
-        }
-        let offsets = b.constraint_derivative_offset.as_ref().ok_or_else(|| {
-            "time_block monotonicity constraints are missing derivative offsets".to_string()
-        })?;
-        if offsets.len() != rows.nrows() {
-            return Err(format!(
-                "time_block monotonicity constraint row mismatch: rows={} offsets={}",
-                rows.nrows(),
-                offsets.len()
-            ));
-        }
-    } else if b.constraint_derivative_offset.is_some() {
+    if b.constraint_design_derivative.ncols() != p {
+        return Err(format!(
+            "time_block monotonicity constraint width mismatch: got {}, expected {p}",
+            b.constraint_design_derivative.ncols()
+        ));
+    }
+    if b.constraint_derivative_offset.len() != b.constraint_design_derivative.nrows() {
+        return Err(format!(
+            "time_block monotonicity constraint row mismatch: rows={} offsets={}",
+            b.constraint_design_derivative.nrows(),
+            b.constraint_derivative_offset.len()
+        ));
+    }
+    if b.constraint_design_derivative.nrows() == 0 {
         return Err(
-            "time_block monotonicity derivative offsets were provided without constraint rows"
+            "time_block requires explicit monotonicity constraint rows; empty constraints do not define a valid survival transform"
                 .to_string(),
         );
     }
@@ -3547,8 +3596,8 @@ struct TimeBlockPrepared {
     design_entry: Array2<f64>,
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
-    constraint_design_derivative: Option<Array2<f64>>,
-    constraint_derivative_offset: Option<Array1<f64>>,
+    constraint_design_derivative: Array2<f64>,
+    constraint_derivative_offset: Array1<f64>,
     penalties: Vec<Array2<f64>>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
@@ -3559,26 +3608,22 @@ fn prepare_identified_time_block(
     anchorrow: usize,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
-    if let Some(rows) = input.constraint_design_derivative.as_ref() {
-        if rows.ncols() != p {
-            return Err(format!(
-                "time_block monotonicity constraint width mismatch: got {}, expected {p}",
-                rows.ncols()
-            ));
-        }
-        let offsets = input.constraint_derivative_offset.as_ref().ok_or_else(|| {
-            "time_block monotonicity constraints are missing derivative offsets".to_string()
-        })?;
-        if offsets.len() != rows.nrows() {
-            return Err(format!(
-                "time_block monotonicity constraint row mismatch: rows={} offsets={}",
-                rows.nrows(),
-                offsets.len()
-            ));
-        }
-    } else if input.constraint_derivative_offset.is_some() {
+    if input.constraint_design_derivative.ncols() != p {
+        return Err(format!(
+            "time_block monotonicity constraint width mismatch: got {}, expected {p}",
+            input.constraint_design_derivative.ncols()
+        ));
+    }
+    if input.constraint_derivative_offset.len() != input.constraint_design_derivative.nrows() {
+        return Err(format!(
+            "time_block monotonicity constraint row mismatch: rows={} offsets={}",
+            input.constraint_design_derivative.nrows(),
+            input.constraint_derivative_offset.len()
+        ));
+    }
+    if input.constraint_design_derivative.nrows() == 0 {
         return Err(
-            "time_block monotonicity derivative offsets were provided without constraint rows"
+            "time_block requires explicit monotonicity constraint rows; empty constraints do not define a valid survival transform"
                 .to_string(),
         );
     }
@@ -3623,10 +3668,7 @@ fn prepare_identified_time_block(
     let design_entry = input.design_entry.dot(&z);
     let design_exit = input.design_exit.dot(&z);
     let design_derivative_exit = input.design_derivative_exit.dot(&z);
-    let constraint_design_derivative = input
-        .constraint_design_derivative
-        .as_ref()
-        .map(|rows| rows.dot(&z));
+    let constraint_design_derivative = input.constraint_design_derivative.dot(&z);
     let penalties = input
         .penalties
         .iter()
@@ -3816,6 +3858,8 @@ struct SurvivalWiggleGeometry {
 
 #[derive(Clone, Copy)]
 struct SurvivalBaseQScalars {
+    eta_t: f64,
+    inv_sigma: f64,
     q: f64,
     q_t: f64,
     q_ls: f64,
@@ -3933,7 +3977,10 @@ fn survival_wiggle_fourth_q(
 fn survival_base_q_scalars(eta_t: f64, eta_ls: f64) -> SurvivalBaseQScalars {
     let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
         q_chain_derivs_fourth_scalar(eta_t, eta_ls);
+    let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
     SurvivalBaseQScalars {
+        eta_t,
+        inv_sigma,
         q: survival_q0_from_eta(eta_t, eta_ls),
         q_t,
         q_ls,
@@ -3944,6 +3991,16 @@ fn survival_base_q_scalars(eta_t: f64, eta_ls: f64) -> SurvivalBaseQScalars {
         q_tl_ls_ls,
         q_llll,
     }
+}
+
+#[inline]
+fn survival_q0dot_from_base(
+    base: SurvivalBaseQScalars,
+    eta_t_deriv: f64,
+    eta_ls_deriv: f64,
+) -> f64 {
+    let local_derivative = base.eta_t.mul_add(eta_ls_deriv, -eta_t_deriv);
+    safe_product(base.inv_sigma, local_derivative)
 }
 
 fn compose_survival_dynamic_q(
@@ -3968,7 +4025,7 @@ fn compose_survival_dynamic_q(
     let m2 = d2q_dq02;
     let m3 = d3q_dq03;
     let m4 = d4q_dq04;
-    let r = safe_sum2(safe_product(a, eta_t_deriv), safe_product(b, eta_ls_deriv));
+    let r = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
     let r_t = safe_product(c, eta_ls_deriv);
     let r_ls = safe_sum2(safe_product(c, eta_t_deriv), safe_product(d, eta_ls_deriv));
     let r_ll = safe_sum2(safe_product(e, eta_t_deriv), safe_product(f, eta_ls_deriv));
@@ -4231,7 +4288,7 @@ impl SurvivalLocationScaleFamily {
             let mut out = wig.basis_d1.clone();
             let r = Array1::from_iter((0..n).map(|i| {
                 let base_exit = survival_base_q_scalars(eta_t_exit[i], eta_ls_exit[i]);
-                base_exit.q_t * eta_t_deriv_exit[i] + base_exit.q_ls * eta_ls_deriv_exit[i]
+                survival_q0dot_from_base(base_exit, eta_t_deriv_exit[i], eta_ls_deriv_exit[i])
             }));
             for i in 0..n {
                 out.row_mut(i).mapv_inplace(|v| v * r[i]);
@@ -5199,7 +5256,7 @@ impl SurvivalLocationScaleFamily {
                 delta_q_tls: d3q_tls_ls_en * &dls_en,
                 delta_q_ls_ls: d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en,
                 d_d1_q: &q.d2_q0 * &dq_en + &q.h_time_h0 * &delta_h0,
-                d_d2_q: &q.d3_q0 * &dq_en - &q.d_h_h0 * &delta_h0,
+                d_d2_q: &q.d3_q0 * &dq_en + &q.d_h_h0 * &delta_h0,
                 delta_q: dq_en,
             }
         } else {
@@ -5210,7 +5267,7 @@ impl SurvivalLocationScaleFamily {
                 delta_q_tls: delta_q_tls_exit.clone(),
                 delta_q_ls_ls: delta_q_ls_ls_exit.clone(),
                 d_d1_q: &q.d2_q0 * &delta_q_exit + &q.h_time_h0 * &delta_h0,
-                d_d2_q: &q.d3_q0 * &delta_q_exit - &q.d_h_h0 * &delta_h0,
+                d_d2_q: &q.d3_q0 * &delta_q_exit + &q.d_h_h0 * &delta_h0,
             }
         };
 
@@ -5290,7 +5347,7 @@ impl SurvivalLocationScaleFamily {
 
         let h_tt_entry_u = -(&entry_deltas.d_d2_q * &dq_t_entry.mapv(|v| v * v)
             + &(2.0 * &q.d2_q0 * dq_t_entry * &entry_deltas.delta_q_t));
-        let h_tt_exit_u = -(&(&q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1)
+        let h_tt_exit_u = -(&(&q.d3_q1 * &delta_q_exit + &q.d_h_h1 * &delta_h1)
             * &q.dq_t.mapv(|v| v * v)
             + &(2.0 * &q.d2_q1 * &q.dq_t * &delta_q_t_exit));
         let threshold_threshold = weighted_crossprod_psi_maps(
@@ -5316,7 +5373,7 @@ impl SurvivalLocationScaleFamily {
             + &(2.0 * &q.d2_q0 * dq_ls_entry * &entry_deltas.delta_q_ls)
             + &(&entry_deltas.d_d1_q * d2q_ls_entry)
             + &(&q.d1_q0 * &entry_deltas.delta_q_ls_ls));
-        let h_ll_exit_u = -(&(&q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1)
+        let h_ll_exit_u = -(&(&q.d3_q1 * &delta_q_exit + &q.d_h_h1 * &delta_h1)
             * &q.dq_ls.mapv(|v| v * v)
             + &(2.0 * &q.d2_q1 * &q.dq_ls * &delta_q_ls_exit)
             + &((&q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1) * &q.d2q_ls)
@@ -5346,7 +5403,7 @@ impl SurvivalLocationScaleFamily {
                     + dq_t_entry * &entry_deltas.delta_q_ls))
             + &(&entry_deltas.d_d1_q * q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls))
             + &(&q.d1_q0 * &entry_deltas.delta_q_tls));
-        let h_tl_exit_u = -(&(&q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1)
+        let h_tl_exit_u = -(&(&q.d3_q1 * &delta_q_exit + &q.d_h_h1 * &delta_h1)
             * &(&q.dq_t * &q.dq_ls)
             + &(&q.d2_q1 * &(&delta_q_t_exit * &q.dq_ls + &q.dq_t * &delta_q_ls_exit))
             + &((&q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1) * &q.d2q_tls)
@@ -5400,9 +5457,9 @@ impl SurvivalLocationScaleFamily {
         if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
             let d_d2_q_combined =
                 if self.x_threshold_entry.is_some() || self.x_log_sigma_entry.is_some() {
-                    &(&q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1) + &entry_deltas.d_d2_q
+                    &(&q.d3_q1 * &delta_q_exit + &q.d_h_h1 * &delta_h1) + &entry_deltas.d_d2_q
                 } else {
-                    &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1
+                    &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1
                 };
             let threshold_wiggle = weighted_crossprod_psi_maps(
                 x_t_exit_map,
@@ -5579,8 +5636,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let grad_time = self.x_time_entry.t().dot(&grad_time_eta_h0)
             + self.x_time_exit.t().dot(&grad_time_eta_h1)
             + self.x_time_deriv.t().dot(&grad_time_eta_d);
-        let hess_time = fast_xt_diag_x(&self.x_time_entry, &h_time_h0)
-            + fast_xt_diag_x(&self.x_time_exit, &h_time_h1)
+        let hess_time = fast_xt_diag_x(&self.x_time_entry, &(-&h_time_h0))
+            + fast_xt_diag_x(&self.x_time_exit, &(-&h_time_h1))
             + fast_xt_diag_x(&self.x_time_deriv, &h_time_d);
         let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
@@ -5835,8 +5892,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             Ok(())
         };
 
-        let h_time = fast_xt_diag_x(&self.x_time_entry, &q.h_time_h0)
-            + fast_xt_diag_x(&self.x_time_exit, &q.h_time_h1)
+        let h_time = fast_xt_diag_x(&self.x_time_entry, &(-&q.h_time_h0))
+            + fast_xt_diag_x(&self.x_time_exit, &(-&q.h_time_h1))
             + fast_xt_diag_x(&self.x_time_deriv, &q.h_time_d);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &h_time);
 
@@ -6132,7 +6189,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // For time-varying blocks, h0 couples through entry q0 and h1 through
         // exit q1, so the time block sees combined delta_q through both paths.
         let d_d1_q_exit = &q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1;
-        let d_d2_q_exit = &q.d3_q1 * &delta_q_exit - &q.d_h_h1 * &delta_h1;
+        let d_d2_q_exit = &q.d3_q1 * &delta_q_exit + &q.d_h_h1 * &delta_h1;
 
         let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
@@ -6189,7 +6246,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 delta_q_tls: d3q_tls_ls_en * &dls_en,
                 delta_q_ls_ls: d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en,
                 d_d1_q: &q.d2_q0 * &dq_en + &q.h_time_h0 * &delta_h0,
-                d_d2_q: &q.d3_q0 * &dq_en - &q.d_h_h0 * &delta_h0,
+                d_d2_q: &q.d3_q0 * &dq_en + &q.d_h_h0 * &delta_h0,
                 delta_q: dq_en,
             }
         } else {
@@ -6203,15 +6260,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 delta_q_tls: delta_q_tls_exit.clone(),
                 delta_q_ls_ls: delta_q_ls_ls_exit.clone(),
                 d_d1_q: &q.d2_q0 * &delta_q_exit + &q.h_time_h0 * &delta_h0,
-                d_d2_q: &q.d3_q0 * &delta_q_exit - &q.d_h_h0 * &delta_h0,
+                d_d2_q: &q.d3_q0 * &delta_q_exit + &q.d_h_h0 * &delta_h0,
             }
         };
 
         // Time block D_u H.
         // The combined delta_q for the time block's cross term:
         // d_h_h0 couples through delta_q via entry path, d_h_h1 through exit.
-        let dh_h0 = &q.d_h_h0 * &(&delta_h0 - &entry_deltas.delta_q);
-        let dh_h1 = &q.d_h_h1 * &(&delta_h1 - &delta_q_exit);
+        let dh_h0 = &q.d_h_h0 * &(&delta_h0 + &entry_deltas.delta_q);
+        let dh_h1 = &q.d_h_h1 * &(&delta_h1 + &delta_q_exit);
         let dh_d = &q.d_h_d * &delta_d;
         let d_h_time = fast_xt_diag_x(&self.x_time_entry, &dh_h0)
             + fast_xt_diag_x(&self.x_time_exit, &dh_h1)
@@ -6229,7 +6286,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 + weighted_crossprod_dense(x_t_en, &d_h_entry, x_t_en)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
         } else {
-            let d_d2_q_ti = &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1;
+            let d_d2_q_ti = &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1;
             let d_h_t = -(&d_d2_q_ti * &q.dq_t.mapv(|v| v * v)
                 + &(&q.d2_q * &(2.0 * &delta_q_t_exit * &q.dq_t)));
             let d_h_tt = weighted_crossprod_dense(&x_threshold_exit, &d_h_t, &x_threshold_exit)?;
@@ -6264,7 +6321,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let d_d1_q =
                     &q.d2_q * &delta_q_exit + &q.h_time_h0 * &delta_h0 + &q.h_time_h1 * &delta_h1;
                 let d_d2_q =
-                    &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1;
+                    &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1;
                 let d_h_tlweights = -(&d_d2_q * &(&q.dq_t * &q.dq_ls)
                     + &(&q.d2_q * &(&delta_q_t_exit * &q.dq_ls + &q.dq_t * &delta_q_ls_exit))
                     + &(&d_d1_q * &q.d2q_tls)
@@ -6293,7 +6350,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         } else {
             let d_d1_q =
                 &q.d2_q * &delta_q_exit + &q.h_time_h0 * &delta_h0 + &q.h_time_h1 * &delta_h1;
-            let d_d2_q = &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1;
+            let d_d2_q = &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1;
             let d_h_l = -(&d_d2_q * &q.dq_ls.mapv(|v| v * v)
                 + &(&q.d2_q * &(2.0 * &delta_q_ls_exit * &q.dq_ls))
                 + &(&d_d1_q * &q.d2q_ls)
@@ -6366,7 +6423,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let d_d2_q_combined = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
                 &d_d2_q_exit + &entry_deltas.d_d2_q
             } else {
-                &q.d3_q * &delta_q_exit - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1
+                &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1
             };
             // Threshold-wiggle D_u H cross block.
             if let (Some(x_t_en), Some(dq_t_en)) =
@@ -7096,9 +7153,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         // Perturbed curvature quantities for directions u and v on the exit side.
         let d_d1_q_exit_u = &q.d2_q1 * &delta_q_exit_u + &q.h_time_h1 * &delta_h1_u;
-        let d_d2_q_exit_u = &q.d3_q1 * &delta_q_exit_u - &q.d_h_h1 * &delta_h1_u;
+        let d_d2_q_exit_u = &q.d3_q1 * &delta_q_exit_u + &q.d_h_h1 * &delta_h1_u;
         let d_d1_q_exit_v = &q.d2_q1 * &delta_q_exit_v + &q.h_time_h1 * &delta_h1_v;
-        let d_d2_q_exit_v = &q.d3_q1 * &delta_q_exit_v - &q.d_h_h1 * &delta_h1_v;
+        let d_d2_q_exit_v = &q.d3_q1 * &delta_q_exit_v + &q.d_h_h1 * &delta_h1_v;
 
         let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
@@ -7179,7 +7236,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let dq_tls = d3q_tls_ls_en * &dls_en;
                 let dq_ls_ls = d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en;
                 let d_d1_q = &q.d2_q0 * &dq_en + &q.h_time_h0 * delta_h0;
-                let d_d2_q = &q.d3_q0 * &dq_en - &q.d_h_h0 * delta_h0;
+                let d_d2_q = &q.d3_q0 * &dq_en + &q.d_h_h0 * delta_h0;
                 (
                     dt_en, dls_en, dq_en, dq_t, dq_ls, dq_tls, dq_ls_ls, d_d1_q, d_d2_q,
                 )
@@ -7219,7 +7276,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 delta_q_tls_u: delta_q_tls_exit_u.clone(),
                 delta_q_ls_ls_u: delta_q_ls_ls_exit_u.clone(),
                 d_d1_q_u: &q.d2_q0 * &delta_q_exit_u + &q.h_time_h0 * &delta_h0_u,
-                d_d2_q_u: &q.d3_q0 * &delta_q_exit_u - &q.d_h_h0 * &delta_h0_u,
+                d_d2_q_u: &q.d3_q0 * &delta_q_exit_u + &q.d_h_h0 * &delta_h0_u,
                 delta_t_v: delta_t_exit_v.clone(),
                 delta_ls_v: delta_ls_exit_v.clone(),
                 delta_q_v: delta_q_exit_v.clone(),
@@ -7228,7 +7285,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 delta_q_tls_v: delta_q_tls_exit_v.clone(),
                 delta_q_ls_ls_v: delta_q_ls_ls_exit_v.clone(),
                 d_d1_q_v: &q.d2_q0 * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v,
-                d_d2_q_v: &q.d3_q0 * &delta_q_exit_v - &q.d_h_h0 * &delta_h0_v,
+                d_d2_q_v: &q.d3_q0 * &delta_q_exit_v + &q.d_h_h0 * &delta_h0_v,
             }
         };
 
@@ -7264,10 +7321,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // Q[v_k, v_l]. See response.md Section 6.
         //
         // --- Time block D²H[u,v] ---
-        let xi_h0_u = &delta_h0_u - &entry_deltas.delta_q_u;
-        let xi_h1_u = &delta_h1_u - &delta_q_exit_u;
-        let xi_h0_v = &delta_h0_v - &entry_deltas.delta_q_v;
-        let xi_h1_v = &delta_h1_v - &delta_q_exit_v;
+        let xi_h0_u = &delta_h0_u + &entry_deltas.delta_q_u;
+        let xi_h1_u = &delta_h1_u + &delta_q_exit_u;
+        let xi_h0_v = &delta_h0_v + &entry_deltas.delta_q_v;
+        let xi_h1_v = &delta_h1_v + &delta_q_exit_v;
         let d2q_tls_entry = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
         let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
         let d3q_tls_ls_entry = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
@@ -7309,9 +7366,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d_d1_q_combined_v =
             &q.d2_q * &delta_q_exit_v + &q.h_time_h0 * &delta_h0_v + &q.h_time_h1 * &delta_h1_v;
         let d_d2_q_combined_u =
-            &q.d3_q * &delta_q_exit_u - &q.d_h_h0 * &delta_h0_u - &q.d_h_h1 * &delta_h1_u;
+            &q.d3_q * &delta_q_exit_u + &q.d_h_h0 * &delta_h0_u + &q.d_h_h1 * &delta_h1_u;
         let d_d2_q_combined_v =
-            &q.d3_q * &delta_q_exit_v - &q.d_h_h0 * &delta_h0_v - &q.d_h_h1 * &delta_h1_v;
+            &q.d3_q * &delta_q_exit_v + &q.d_h_h0 * &delta_h0_v + &q.d_h_h1 * &delta_h1_v;
 
         let d2_d1_q_entry_exact = &q.d3_q0 * &(&xi_h0_u * &xi_h0_v) + &q.d2_q0 * &delta_q_uv_entry;
         let d2_d1_q_exit_exact = &q.d3_q1 * &(&xi_h1_u * &xi_h1_v) + &q.d2_q1 * &delta_q_uv_exit;
@@ -7469,10 +7526,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         // --- Time-threshold cross D²H[u,v] ---
         {
-            let dh_h0_u = &q.d_h_h0 * &(&delta_h0_u - &entry_deltas.delta_q_u);
-            let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u - &delta_q_exit_u);
-            let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v - &entry_deltas.delta_q_v);
-            let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v - &delta_q_exit_v);
+            let dh_h0_u = &q.d_h_h0 * &(&delta_h0_u + &entry_deltas.delta_q_u);
+            let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u + &delta_q_exit_u);
+            let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v + &entry_deltas.delta_q_v);
+            let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v + &delta_q_exit_v);
             if let (Some(x_t_en), Some(_)) = (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref()) {
                 let d2_w_exit = &dh_h1_u * &delta_q_t_exit_v
                     + &dh_h1_v * &delta_q_t_exit_u
@@ -7522,10 +7579,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
         // --- Time-log-sigma cross D²H[u,v] ---
         {
-            let dh_h0_u = &q.d_h_h0 * &(&delta_h0_u - &entry_deltas.delta_q_u);
-            let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u - &delta_q_exit_u);
-            let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v - &entry_deltas.delta_q_v);
-            let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v - &delta_q_exit_v);
+            let dh_h0_u = &q.d_h_h0 * &(&delta_h0_u + &entry_deltas.delta_q_u);
+            let dh_h1_u = &q.d_h_h1 * &(&delta_h1_u + &delta_q_exit_u);
+            let dh_h0_v = &q.d_h_h0 * &(&delta_h0_v + &entry_deltas.delta_q_v);
+            let dh_h1_v = &q.d_h_h1 * &(&delta_h1_v + &delta_q_exit_v);
             if let (Some(x_ls_en), Some(_)) = (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref()) {
                 let d2_w_exit = &dh_h1_u * &delta_q_ls_exit_v
                     + &dh_h1_v * &delta_q_ls_exit_u
@@ -7645,14 +7702,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if block_idx != Self::BLOCK_TIME {
             return Ok(None);
         }
-        let constraint_rows = self
-            .x_time_deriv_constraints
-            .as_ref()
-            .unwrap_or(&self.x_time_deriv);
-        let constraint_offsets = self
-            .offset_time_deriv_constraints
-            .as_ref()
-            .unwrap_or(&self.offset_time_deriv);
+        let constraint_rows = &self.x_time_deriv_constraints;
+        let constraint_offsets = &self.offset_time_deriv_constraints;
         let n = constraint_rows.nrows();
         let p = constraint_rows.ncols();
         if constraint_offsets.len() != n {
@@ -8032,7 +8083,7 @@ pub fn predict_survival_location_scale(
             .zip(inv_sigma.iter())
             .enumerate()
             .map(|(i, ((&hh, &tt), &r))| {
-                let mut q = -hh - tt * r;
+                let mut q = hh - tt * r;
                 if let Some(w) = predictors.etaw.as_ref() {
                     q += w[i];
                 }
@@ -8083,7 +8134,7 @@ pub fn predict_survival_location_scale_posterior_mean(
     let x_ls_dense = input.x_log_sigma.to_dense();
     for i in 0..n {
         for j in 0..p_time {
-            grad[[i, j]] = -input.x_time_exit[[i, j]];
+            grad[[i, j]] = input.x_time_exit[[i, j]];
         }
         let scale = dq_dq0.as_ref().map_or(1.0, |v| v[i]);
         for j in 0..p_t {
@@ -8171,7 +8222,7 @@ pub fn predict_survival_location_scalewith_uncertainty(
     let mut grad = Array2::<f64>::zeros((n, p_total));
     for i in 0..n {
         for j in 0..p_time {
-            grad[[i, j]] = -input.x_time_exit[[i, j]];
+            grad[[i, j]] = input.x_time_exit[[i, j]];
         }
         let scale = dq_dq0.as_ref().map_or(1.0, |v| v[i]);
         for j in 0..p_t {
@@ -9622,15 +9673,15 @@ mod tests {
                 let ell_h1q = row.h_time_h1;
                 let ell_qq = row.d2_q;
                 assert!(
-                    (ell_q + ell_h0 + ell_h1).abs() <= 1e-10,
-                    "survival {label} row {i} violated ell_q = -ell_h0 - ell_h1: q={} h0={} h1={}",
+                    (ell_q - ell_h0 - ell_h1).abs() <= 1e-10,
+                    "survival {label} row {i} violated ell_q = ell_h0 + ell_h1: q={} h0={} h1={}",
                     ell_q,
                     ell_h0,
                     ell_h1
                 );
                 assert!(
-                    (ell_qq + ell_h0q + ell_h1q).abs() <= 1e-10,
-                    "survival {label} row {i} violated ell_qq = -ell_h0q - ell_h1q: qq={} h0q={} h1q={}",
+                    (ell_qq - ell_h0q - ell_h1q).abs() <= 1e-10,
+                    "survival {label} row {i} violated ell_qq = ell_h0q + ell_h1q: qq={} h0q={} h1q={}",
                     ell_qq,
                     ell_h0q,
                     ell_h1q
@@ -10607,6 +10658,46 @@ mod tests {
         assert!((q_ll + eta_t * inv_sigma).abs() <= 1e-15);
         assert!((q_tl_ls + inv_sigma).abs() <= 1e-15);
         assert!((q_ll_ls - eta_t * inv_sigma).abs() <= 1e-15);
+    }
+
+    #[test]
+    fn survival_q0dot_from_base_preserves_far_tail_cancellation() {
+        let eta_t = 1e-10;
+        let eta_ls = -700.0;
+        let eta_t_deriv = 1.0 - 1e-12;
+        let eta_ls_deriv = 1e10;
+        let base = survival_base_q_scalars(eta_t, eta_ls);
+
+        let factorized = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
+        let expected = safe_product(
+            exp_sigma_inverse_from_eta_scalar(eta_ls),
+            eta_t.mul_add(eta_ls_deriv, -eta_t_deriv),
+        );
+        let expanded = safe_sum2(
+            safe_product(base.q_t, eta_t_deriv),
+            safe_product(base.q_ls, eta_ls_deriv),
+        );
+
+        assert!(factorized.is_finite());
+        assert!(expected.is_finite());
+        assert!(
+            (factorized - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+            "factorized qdot mismatch: got {factorized}, expected {expected}"
+        );
+        assert!(expanded.abs() >= 1e200);
+        assert!(factorized.abs() <= 1e206);
+    }
+
+    #[test]
+    fn compensated_difference_carries_explicit_roundoff_bound() {
+        let lhs = 1.0e217 + 1.0e201;
+        let rhs = 1.0e217;
+        let diff = compensated_difference(lhs, rhs);
+
+        assert!(diff.value.is_finite());
+        assert!(diff.roundoff_slack.is_finite());
+        assert!(diff.roundoff_slack >= 0.0);
+        assert!(diff.operand_scale >= rhs.abs());
     }
 
     #[test]

@@ -3308,7 +3308,7 @@ pub fn laplace_directional_cubic_diagnostic(
         let n_pos = positive_mask.iter().filter(|&&m| m).count();
         if n_pos >= 2 {
             let max_abs_from_probes = cubic_power_iteration_refinement(
-                design, c_weights, &evals, &evecs, &positive_mask, n_pos, tol,
+                design, c_weights, &evals, &evecs, &positive_mask, n_pos,
             );
             if max_abs_from_probes > max_abs {
                 max_abs = max_abs_from_probes;
@@ -3424,7 +3424,6 @@ fn cubic_power_iteration_refinement(
     evecs: &Array2<f64>,
     positive_mask: &[bool],
     n_pos: usize,
-    tol: f64,
 ) -> f64 {
     let p = evals.len();
     let max_probes = 8;

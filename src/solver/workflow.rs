@@ -36,7 +36,7 @@ use crate::smooth::{
 };
 use crate::solver::optimize::{CostOnlyOptimizationRequest, optimize_cost_only};
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec};
-use ndarray::{Array1, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -729,11 +729,11 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
 use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeWiggleBuild,
-    append_survival_timewiggle_columns, build_survival_baseline_offsets,
-    build_survival_time_basis, build_survival_time_monotonicity_collocation,
-    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
-    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    append_survival_timewiggle_columns, build_survival_baseline_offsets, build_survival_time_basis,
+    build_survival_time_monotonicity_collocation, build_survival_timewiggle_from_baseline,
+    build_time_varying_survival_covariate_template, normalize_survival_time_pair,
+    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
+    parse_survival_time_basis_config, survival_basis_supports_structural_monotonicity,
 };
 use crate::families::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, TimeBlockInput, residual_distribution_inverse_link,
@@ -1128,16 +1128,21 @@ fn materialize_survival<'a>(
         timewiggle_build = Some(tw);
     }
 
-    // Monotonicity collocation — feeds into TimeBlockInput constraint fields
-    let timewiggle_ref = timewiggle_build.as_ref().map(|tw| (&tw.knots, tw.degree));
-    let (mono_rows, mono_offsets) = build_survival_time_monotonicity_collocation(
-        &age_entry,
-        &age_exit,
-        &time_build,
-        &baseline_cfg,
-        timewiggle_ref,
-    )?;
-    let has_mono = mono_rows.nrows() > 0;
+    let (mono_rows, mono_offsets, has_mono) =
+        if survival_basis_supports_structural_monotonicity(&time_build.basisname) {
+            (Array2::zeros((0, 0)), Array1::zeros(0), false)
+        } else {
+            let timewiggle_ref = timewiggle_build.as_ref().map(|tw| (&tw.knots, tw.degree));
+            let (mono_rows, mono_offsets) = build_survival_time_monotonicity_collocation(
+                &age_entry,
+                &age_exit,
+                &time_build,
+                &baseline_cfg,
+                timewiggle_ref,
+            )?;
+            let has_mono = mono_rows.nrows() > 0;
+            (mono_rows, mono_offsets, has_mono)
+        };
 
     // Build covariate spec
     let mut termspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;

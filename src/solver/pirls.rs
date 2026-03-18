@@ -6661,28 +6661,6 @@ pub fn fisher_weight_gaussian_inverse(eta: f64, phi: f64, pw: f64) -> (f64, f64,
     (inv_phi / eta4, -4.0 * inv_phi / eta5, 20.0 * inv_phi / eta6)
 }
 
-/// Binomial(n, p) with canonical logit link.
-///
-/// Returns `(w, c, d)` pre-multiplied by the prior weight `pw`.
-/// Since logit is the canonical link for the binomial family,
-/// observed = Fisher (no residual correction).
-///
-/// ```text
-/// w = ω n p(1−p)
-/// c = ω n p(1−p)(1−2p)
-/// d = ω n p(1−p)(1−6p+6p²)
-/// ```
-#[inline]
-pub fn observed_weight_binomial_logit(n_trials: f64, p: f64, pw: f64) -> (f64, f64, f64) {
-    let q = 1.0 - p;
-    let pq = p * q;
-    let npq = pw * n_trials * pq;
-    let w = npq;
-    let c = npq * (1.0 - 2.0 * p);
-    let d = npq * (1.0 - 6.0 * p * q);
-    (w, c, d)
-}
-
 #[inline]
 fn observed_weight_binomial_logit_from_jet(
     n_trials: f64,
