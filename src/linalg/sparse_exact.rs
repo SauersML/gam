@@ -1035,24 +1035,49 @@ impl TakahashiInverse {
     /// tr(H⁻¹ S) where S is given as sparse CSC (symmetric, upper or full).
     /// Only accesses entries in the filled pattern of Z.
     pub fn trace_product_sparse(&self, s: &SparseColMat<usize, f64>) -> f64 {
-        let mut trace = 0.0;
         let (symbolic, values) = s.parts();
         let s_col_ptr = symbolic.col_ptr();
         let s_row_idx = symbolic.row_idx();
-        for col in 0..s.ncols() {
-            let col_start = s_col_ptr[col];
-            let col_end = s_col_ptr[col + 1];
-            for idx in col_start..col_end {
-                let row = s_row_idx[idx];
-                let val = values[idx];
-                if row > col {
-                    continue;
-                }
-                let z_ij = self.get(row, col);
-                if row == col {
+
+        // Detect storage format: if any entry has row > col, the matrix uses
+        // full symmetric storage and off-diagonals must NOT be doubled.
+        // If only upper-triangle entries are present, off-diagonals must be
+        // doubled to account for the implicit lower triangle.
+        let has_lower = (0..s.ncols()).any(|col| {
+            let start = s_col_ptr[col];
+            let end = s_col_ptr[col + 1];
+            (start..end).any(|idx| s_row_idx[idx] > col)
+        });
+
+        let mut trace = 0.0;
+        if has_lower {
+            // Full storage: every (i,j) and (j,i) pair is explicitly stored,
+            // so tr(Z S) = sum over all stored entries of Z[i,j] * S[i,j].
+            for col in 0..s.ncols() {
+                let col_start = s_col_ptr[col];
+                let col_end = s_col_ptr[col + 1];
+                for idx in col_start..col_end {
+                    let row = s_row_idx[idx];
+                    let val = values[idx];
+                    let z_ij = self.get(row, col);
                     trace += z_ij * val;
-                } else {
-                    trace += 2.0 * z_ij * val; // symmetric: count off-diagonal twice
+                }
+            }
+        } else {
+            // Upper-triangle-only storage: double the off-diagonal contributions
+            // to account for the implicit lower triangle.
+            for col in 0..s.ncols() {
+                let col_start = s_col_ptr[col];
+                let col_end = s_col_ptr[col + 1];
+                for idx in col_start..col_end {
+                    let row = s_row_idx[idx];
+                    let val = values[idx];
+                    let z_ij = self.get(row, col);
+                    if row == col {
+                        trace += z_ij * val;
+                    } else {
+                        trace += 2.0 * z_ij * val;
+                    }
                 }
             }
         }

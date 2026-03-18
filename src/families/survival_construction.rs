@@ -105,7 +105,12 @@ pub struct SurvivalTimeWiggleBuild {
     pub degree: usize,
 }
 
-const SURVIVAL_MONOTONICITY_COLLOCATION_POINTS: usize = 8;
+/// Number of collocation points per knot interval for derivative positivity
+/// constraints.  Higher values reduce the risk of monotonicity violations
+/// between grid points at the cost of more inequality constraints in PIRLS.
+/// For a degree-3 B-spline, 16 points per interval is sufficient to catch
+/// any sign change in a cubic polynomial piece.
+const SURVIVAL_MONOTONICITY_COLLOCATION_POINTS: usize = 16;
 const SURVIVAL_MONOTONICITY_UNIFORM_SEGMENTS: usize = 32;
 
 // ---------------------------------------------------------------------------
@@ -645,20 +650,6 @@ pub fn build_survival_time_basis(
                 knots
             };
 
-            let (entry_arc, _) = create_basis::<Dense>(
-                log_entry.view(),
-                KnotSource::Provided(knotvec.view()),
-                degree,
-                BasisOptions::i_spline(),
-            )
-            .map_err(|e| format!("failed to build ispline entry basis: {e}"))?;
-            let (exit_arc, _) = create_basis::<Dense>(
-                log_exit.view(),
-                KnotSource::Provided(knotvec.view()),
-                degree,
-                BasisOptions::i_spline(),
-            )
-            .map_err(|e| format!("failed to build ispline exit basis: {e}"))?;
             let (db_exit_arc, _) = create_basis::<Dense>(
                 log_exit.view(),
                 KnotSource::Provided(knotvec.view()),
@@ -667,56 +658,75 @@ pub fn build_survival_time_basis(
             )
             .map_err(|e| format!("failed to build ispline derivative basis: {e}"))?;
 
-            let x_entry_time_full = entry_arc.as_ref();
-            let x_exit_time_full = exit_arc.as_ref();
-            let db_exit = db_exit_arc.as_ref();
-            let p_time_full = x_exit_time_full.ncols();
-            if p_time_full == 0 {
-                return Err("internal error: empty ispline time basis".to_string());
-            }
-            if db_exit.ncols() != p_time_full + 1 {
-                return Err(
-                    "internal error: ispline derivative basis width must exceed basis width by one"
-                        .to_string(),
-                );
-            }
+            // Build full-width I-spline bases inside a block scope so the
+            // large Arc allocations are freed when the block ends.
+            let (x_entry_time, x_exit_time, keep_cols, p_time, p_time_full) = {
+                let (entry_arc, _) = create_basis::<Dense>(
+                    log_entry.view(),
+                    KnotSource::Provided(knotvec.view()),
+                    degree,
+                    BasisOptions::i_spline(),
+                )
+                .map_err(|e| format!("failed to build ispline entry basis: {e}"))?;
+                let (exit_arc, _) = create_basis::<Dense>(
+                    log_exit.view(),
+                    KnotSource::Provided(knotvec.view()),
+                    degree,
+                    BasisOptions::i_spline(),
+                )
+                .map_err(|e| format!("failed to build ispline exit basis: {e}"))?;
 
-            let keep_cols = if keep_cols.is_empty() {
-                let constant_tol = 1e-12_f64;
-                let mut inferred_keep_cols: Vec<usize> = Vec::new();
-                for j in 0..p_time_full {
-                    let mut minv = f64::INFINITY;
-                    let mut maxv = f64::NEG_INFINITY;
-                    for i in 0..n {
-                        let ve = x_exit_time_full[[i, j]];
-                        let vs = x_entry_time_full[[i, j]];
-                        minv = minv.min(ve.min(vs));
-                        maxv = maxv.max(ve.max(vs));
-                    }
-                    if (maxv - minv) > constant_tol {
-                        inferred_keep_cols.push(j);
-                    }
+                let x_entry_full = entry_arc.as_ref();
+                let x_exit_full = exit_arc.as_ref();
+                let p_time_full = x_exit_full.ncols();
+                if p_time_full == 0 {
+                    return Err("internal error: empty ispline time basis".to_string());
                 }
-                inferred_keep_cols
-            } else {
-                keep_cols
-            };
-            if keep_cols.is_empty() {
-                return Err(
-                    "internal error: ispline basis has no shape-varying time columns".to_string(),
-                );
-            }
-            if keep_cols.iter().any(|&j| j >= p_time_full) {
-                return Err("saved survival ispline keep_cols exceed basis width".to_string());
-            }
+                let db_exit = db_exit_arc.as_ref();
+                if db_exit.ncols() != p_time_full + 1 {
+                    return Err(
+                        "internal error: ispline derivative basis width must exceed basis width by one"
+                            .to_string(),
+                    );
+                }
 
-            let p_time = keep_cols.len();
-            // Use ndarray::select for column projection — single copy, no element-wise loop.
-            let x_entry_time = x_entry_time_full.select(ndarray::Axis(1), keep_cols);
-            let x_exit_time = x_exit_time_full.select(ndarray::Axis(1), keep_cols);
-            // Drop full-width bases immediately to free memory before derivative computation.
-            drop(entry_arc);
-            drop(exit_arc);
+                let keep_cols = if keep_cols.is_empty() {
+                    let constant_tol = 1e-12_f64;
+                    let mut inferred_keep_cols: Vec<usize> = Vec::new();
+                    for j in 0..p_time_full {
+                        let mut minv = f64::INFINITY;
+                        let mut maxv = f64::NEG_INFINITY;
+                        for i in 0..n {
+                            let ve = x_exit_full[[i, j]];
+                            let vs = x_entry_full[[i, j]];
+                            minv = minv.min(ve.min(vs));
+                            maxv = maxv.max(ve.max(vs));
+                        }
+                        if (maxv - minv) > constant_tol {
+                            inferred_keep_cols.push(j);
+                        }
+                    }
+                    inferred_keep_cols
+                } else {
+                    keep_cols
+                };
+                if keep_cols.is_empty() {
+                    return Err(
+                        "internal error: ispline basis has no shape-varying time columns".to_string(),
+                    );
+                }
+                if keep_cols.iter().any(|&j| j >= p_time_full) {
+                    return Err("saved survival ispline keep_cols exceed basis width".to_string());
+                }
+
+                let p_time = keep_cols.len();
+                let x_entry_time = x_entry_full.select(ndarray::Axis(1), &keep_cols);
+                let x_exit_time = x_exit_full.select(ndarray::Axis(1), &keep_cols);
+                // entry_arc and exit_arc go out of scope here, freeing the
+                // full-width bases before derivative computation below.
+                (x_entry_time, x_exit_time, keep_cols, p_time, p_time_full)
+            };
+            let db_exit = db_exit_arc.as_ref();
 
             let mut x_derivative_time = Array2::<f64>::zeros((n, p_time));
             for i in 0..n {
@@ -960,31 +970,59 @@ pub fn build_survival_timewiggle_from_baseline(
         seed[i] = eta_entry[i];
         seed[n + i] = eta_exit[i];
     }
+    // Use the user's minimum qualified penalty order (≥ 2) as the primary
+    // geometric-constraint penalty.  This ensures the penalty geometry matches
+    // the user's intent rather than always defaulting to order 2.
+    let primary_order = cfg
+        .penalty_orders
+        .iter()
+        .copied()
+        .filter(|&o| o >= 2)
+        .min()
+        .unwrap_or(2);
     let wiggle_cfg = WiggleBlockConfig {
         degree: cfg.degree,
         num_internal_knots: cfg.num_internal_knots,
-        penalty_order: 2,
+        penalty_order: primary_order,
         double_penalty: cfg.double_penalty,
     };
     let (mut combined_block, knots) = buildwiggle_block_input_from_seed(seed.view(), &wiggle_cfg)?;
+    // Add difference penalties for all requested orders except the primary
+    // (which is already represented by the geometric-constraint penalty).
+    let extra_orders: Vec<usize> = cfg
+        .penalty_orders
+        .iter()
+        .copied()
+        .filter(|&o| o != primary_order)
+        .collect();
     crate::families::gamlss::append_selected_wiggle_penalty_orders(
         &mut combined_block,
-        &cfg.penalty_orders,
+        &extra_orders,
     )?;
-    let design_entry =
-        match buildwiggle_block_input_from_knots(eta_entry.view(), &knots, cfg.degree, 2, false)?
-            .design
-        {
-            DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-            _ => return Err("baseline-timewiggle entry design must be dense".to_string()),
-        };
-    let design_exit =
-        match buildwiggle_block_input_from_knots(eta_exit.view(), &knots, cfg.degree, 2, false)?
-            .design
-        {
-            DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-            _ => return Err("baseline-timewiggle exit design must be dense".to_string()),
-        };
+    let design_entry = match buildwiggle_block_input_from_knots(
+        eta_entry.view(),
+        &knots,
+        cfg.degree,
+        primary_order,
+        false,
+    )?
+    .design
+    {
+        DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
+        _ => return Err("baseline-timewiggle entry design must be dense".to_string()),
+    };
+    let design_exit = match buildwiggle_block_input_from_knots(
+        eta_exit.view(),
+        &knots,
+        cfg.degree,
+        primary_order,
+        false,
+    )?
+    .design
+    {
+        DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
+        _ => return Err("baseline-timewiggle exit design must be dense".to_string()),
+    };
     let design_derivative_exit =
         build_survival_timewiggle_derivative_design(eta_exit, derivative_exit, &knots, cfg.degree)?;
     Ok(SurvivalTimeWiggleBuild {

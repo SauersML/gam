@@ -67,9 +67,19 @@ fn softplus(x: f64) -> f64 {
     }
 }
 
+/// Clamp threshold for `exp(-eta_ls)` to prevent overflow.  The largest finite
+/// f64 is ~1.8e308, so `exp(709)` is the hard ceiling.  We use 500 to leave
+/// headroom for subsequent multiplications (inv_sigma * eta_t, etc.) which
+/// would otherwise overflow to inf and produce NaN via inf*0 or inf-inf.
+const EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
+
 #[inline]
 fn exp_neg_stable(x: f64) -> f64 {
-    (-x).exp()
+    // Clamp the *negated* argument so that exp never exceeds exp(500).
+    // When eta_ls << -500 the raw exp(-eta_ls) would overflow; clamping
+    // saturates inv_sigma at a very large but finite value.
+    let arg = (-x).clamp(-EXP_NEG_STABLE_MAX_ARG, EXP_NEG_STABLE_MAX_ARG);
+    arg.exp()
 }
 
 #[inline]
@@ -82,7 +92,16 @@ fn safe_product(lhs: f64, rhs: f64) -> f64 {
     if lhs == 0.0 || rhs == 0.0 {
         0.0
     } else {
-        lhs * rhs
+        let v = lhs * rhs;
+        // Clamp overflow to large finite values so that downstream sums
+        // (d_raw - qdot) produce finite differences instead of NaN (inf-inf).
+        if v == f64::INFINITY {
+            f64::MAX
+        } else if v == f64::NEG_INFINITY {
+            f64::MIN
+        } else {
+            v
+        }
     }
 }
 
@@ -91,12 +110,17 @@ fn safe_sum2(a: f64, b: f64) -> f64 {
     let sum = a + b;
     if sum.is_nan() {
         if a == 0.0 {
-            b
+            return b;
         } else if b == 0.0 {
-            a
-        } else {
-            sum
+            return a;
         }
+        // inf + (-inf) or (-inf) + inf → treat as catastrophic cancellation → 0.
+        if (a == f64::INFINITY && b == f64::NEG_INFINITY)
+            || (a == f64::NEG_INFINITY && b == f64::INFINITY)
+        {
+            return 0.0;
+        }
+        sum
     } else {
         sum
     }
@@ -109,7 +133,18 @@ fn safe_sum3(a: f64, b: f64, c: f64) -> f64 {
 
 #[inline]
 fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
-    -safe_product(eta_t, exp_sigma_inverse_from_eta_scalar(eta_ls))
+    if eta_t == 0.0 {
+        return 0.0;
+    }
+    // Use log-space to avoid overflow: q0 = -eta_t * exp(-eta_ls).
+    // |q0| = exp(ln|eta_t| + (-eta_ls)), sign = -sign(eta_t).
+    let log_abs = eta_t.abs().ln() + (-eta_ls).clamp(-EXP_NEG_STABLE_MAX_ARG, EXP_NEG_STABLE_MAX_ARG);
+    if log_abs > EXP_NEG_STABLE_MAX_ARG {
+        // Saturate to large finite value.
+        if eta_t > 0.0 { -f64::MAX } else { f64::MAX }
+    } else {
+        -eta_t * exp_sigma_inverse_from_eta_scalar(eta_ls)
+    }
 }
 
 #[inline]
@@ -845,9 +880,9 @@ struct SurvivalLocationScaleFamily {
     w: Array1<f64>,
     inverse_link: InverseLink,
     derivative_guard: f64,
-    x_time_entry: Array2<f64>,
-    x_time_exit: Array2<f64>,
-    x_time_deriv: Array2<f64>,
+    x_time_entry: Arc<Array2<f64>>,
+    x_time_exit: Arc<Array2<f64>>,
+    x_time_deriv: Arc<Array2<f64>>,
     offset_time_deriv: Array1<f64>,
     x_time_deriv_constraints: Option<Array2<f64>>,
     offset_time_deriv_constraints: Option<Array1<f64>>,
@@ -1921,10 +1956,21 @@ impl SurvivalLocationScaleFamily {
         q1: f64,
         qdot1: f64,
     ) -> SurvivalPredictorState {
+        let g = if d_raw.is_nan() || qdot1.is_nan() {
+            // Propagate genuine NaN inputs so exact_row_kernel can error.
+            f64::NAN
+        } else {
+            // Guard against catastrophic cancellation: when both d_raw and
+            // qdot1 are very large with the same sign, their difference can
+            // become NaN (inf - inf) or lose all significant digits.
+            // safe_sum2 maps inf + (-inf) → 0.0; the monotonicity guard in
+            // exact_row_kernel will then clamp upward if needed.
+            safe_sum2(d_raw, -qdot1)
+        };
         SurvivalPredictorState {
             h0,
             h1,
-            g: d_raw - qdot1,
+            g,
             q0,
             q1,
         }
@@ -1971,10 +2017,19 @@ impl SurvivalLocationScaleFamily {
 
         let guard = self.time_derivative_lower_bound();
         let mut g = state.g;
-        if !g.is_finite() {
+        // Genuine NaN (from corrupted d_raw or qdot inputs) is still a hard
+        // error.  Overflow-induced cancellation is handled upstream in
+        // row_predictor_state via safe_sum2, so NaN here means bad data.
+        if g.is_nan() {
             return Err(format!(
                 "survival location-scale time derivative is non-finite at row {row}: d_eta/dt={g}"
             ));
+        }
+        // Clamp ±inf to finite extremes so downstream log(g) is well-defined.
+        if g == f64::INFINITY {
+            g = f64::MAX;
+        } else if g == f64::NEG_INFINITY {
+            g = f64::MIN;
         }
         let roundoff_slack = 1e-12
             * (1.0
@@ -3149,9 +3204,9 @@ fn prepare_survival_location_scale_model(
         w: spec.weights.clone(),
         inverse_link: spec.inverse_link.clone(),
         derivative_guard: spec.derivative_guard,
-        x_time_entry: time_prepared.design_entry.clone(),
-        x_time_exit: time_prepared.design_exit.clone(),
-        x_time_deriv: time_prepared.design_derivative_exit.clone(),
+        x_time_entry: Arc::new(time_prepared.design_entry.clone()),
+        x_time_exit: Arc::new(time_prepared.design_exit.clone()),
+        x_time_deriv: Arc::new(time_prepared.design_derivative_exit.clone()),
         offset_time_deriv: spec.time_block.derivative_offset_exit.clone(),
         x_time_deriv_constraints: time_prepared.constraint_design_derivative.clone(),
         offset_time_deriv_constraints: time_prepared.constraint_derivative_offset.clone(),

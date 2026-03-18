@@ -728,12 +728,12 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
 
 use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
-    SurvivalLikelihoodMode, SurvivalTimeWiggleBuild, append_survival_timewiggle_columns,
-    build_survival_baseline_offsets, build_survival_time_basis,
-    build_survival_time_monotonicity_collocation, build_survival_timewiggle_from_baseline,
-    build_time_varying_survival_covariate_template, normalize_survival_time_pair,
-    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
-    parse_survival_time_basis_config,
+    SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeWiggleBuild,
+    append_survival_timewiggle_columns, build_survival_baseline_offsets,
+    build_survival_time_basis, build_survival_time_monotonicity_collocation,
+    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config,
 };
 use crate::families::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, TimeBlockInput, residual_distribution_inverse_link,
@@ -1094,6 +1094,13 @@ fn materialize_survival<'a>(
 
     // Time wiggles
     let effective_timewiggle = parsed.timewiggle.clone();
+    if effective_timewiggle.is_some() && baseline_cfg.target == SurvivalBaselineTarget::Linear {
+        return Err(
+            "timewiggle requires a non-linear scalar survival baseline target; \
+             use baseline_target weibull, gompertz, or gompertz-makeham"
+                .to_string(),
+        );
+    }
     let mut time_design_entry = time_build.x_entry_time.clone();
     let mut time_design_exit = time_build.x_exit_time.clone();
     let mut time_design_derivative = time_build.x_derivative_time.clone();

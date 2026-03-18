@@ -369,11 +369,23 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         // Fallback: materializes the full dense matrix.  Every concrete operator
         // should override this with an O(chunk) implementation.
-        log::debug!(
-            "DenseDesignOperator::row_chunk default fallback (full materialization) for {}x{} operator",
-            self.nrows(),
-            self.ncols()
-        );
+        let dense_elems = self.nrows().saturating_mul(self.ncols());
+        const DENSE_FALLBACK_WARN: usize = 10_000_000; // ~76 MiB at f64
+        if dense_elems > DENSE_FALLBACK_WARN {
+            log::warn!(
+                "DenseDesignOperator::row_chunk default fallback materializing {}x{} ({:.1} MiB) — \
+                 operator should implement a chunked override",
+                self.nrows(),
+                self.ncols(),
+                (dense_elems * 8) as f64 / (1024.0 * 1024.0),
+            );
+        } else {
+            log::debug!(
+                "DenseDesignOperator::row_chunk default fallback (full materialization) for {}x{} operator",
+                self.nrows(),
+                self.ncols()
+            );
+        }
         self.to_dense().slice(s![rows, ..]).to_owned()
     }
 
@@ -2351,6 +2363,181 @@ impl DenseDesignOperator for TensorProductDesignOperator {
 
     fn to_dense(&self) -> Array2<f64> {
         self.row_chunk(0..self.n)
+    }
+}
+
+/// Chunked kernel design operator for spatial smooths (TPS, Matérn, Duchon).
+///
+/// Instead of storing a dense n × k matrix, evaluates K(data[i], center[j])
+/// on-the-fly in row chunks. Memory usage is O(chunk_size × k) instead of O(n × k).
+///
+/// The optional `poly_basis` appends polynomial columns after the kernel columns
+/// (e.g., linear polynomial for TPS identifiability).
+///
+/// The optional `constraint_transform` applies a column-space projection Z
+/// such that the effective design is [K * Z | poly] instead of [K | poly].
+pub struct ChunkedKernelDesignOperator {
+    /// Observation data points (n × d).
+    data: Arc<Array2<f64>>,
+    /// Radial basis centers (k × d).
+    centers: Arc<Array2<f64>>,
+    /// Kernel evaluator: (data_row, center_row) → f64
+    kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync>,
+    /// Optional constraint projection (k × k_eff) applied to kernel columns.
+    constraint_transform: Option<Arc<Array2<f64>>>,
+    /// Optional polynomial basis columns (n × m) appended after kernel columns.
+    poly_basis: Option<Arc<Array2<f64>>>,
+    n: usize,
+    total_cols: usize,
+}
+
+impl ChunkedKernelDesignOperator {
+    pub fn new(
+        data: Arc<Array2<f64>>,
+        centers: Arc<Array2<f64>>,
+        kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync>,
+        constraint_transform: Option<Arc<Array2<f64>>>,
+        poly_basis: Option<Arc<Array2<f64>>>,
+    ) -> Result<Self, String> {
+        let n = data.nrows();
+        let k = centers.ncols();
+        if data.ncols() != centers.ncols() {
+            return Err(format!(
+                "ChunkedKernelDesignOperator: data dim {} != centers dim {}",
+                data.ncols(),
+                centers.ncols(),
+            ));
+        }
+        let k_eff = constraint_transform.as_ref().map_or(k, |z| z.ncols());
+        let poly_cols = poly_basis.as_ref().map_or(0, |p| p.ncols());
+        let _ = k;
+        Ok(Self {
+            data,
+            centers,
+            kernel_fn,
+            constraint_transform,
+            poly_basis,
+            n,
+            total_cols: k_eff + poly_cols,
+        })
+    }
+
+    /// Evaluate kernel block for a range of rows: K[rows, :] or K[rows, :] * Z.
+    fn kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let chunk_n = rows.end - rows.start;
+        let k_raw = self.centers.nrows();
+        let mut kernel_block = Array2::<f64>::zeros((chunk_n, k_raw));
+        for (local, global) in rows.clone().enumerate() {
+            let data_row = self.data.row(global);
+            for j in 0..k_raw {
+                let center_row = self.centers.row(j);
+                kernel_block[[local, j]] =
+                    (self.kernel_fn)(data_row.as_slice().unwrap(), center_row.as_slice().unwrap());
+            }
+        }
+        if let Some(z) = self.constraint_transform.as_ref() {
+            fast_ab(&kernel_block, z)
+        } else {
+            kernel_block
+        }
+    }
+}
+
+impl LinearOperator for ChunkedKernelDesignOperator {
+    fn nrows(&self) -> usize {
+        self.n
+    }
+    fn ncols(&self) -> usize {
+        self.total_cols
+    }
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let k_eff = self.constraint_transform.as_ref().map_or(
+            self.centers.nrows(),
+            |z| z.ncols(),
+        );
+        let v_kernel = vector.slice(s![..k_eff]);
+        let mut result = Array1::<f64>::zeros(self.n);
+        // Process in chunks to limit memory.
+        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+            let chunk = self.kernel_chunk(start..end);
+            let partial = chunk.dot(&v_kernel);
+            result.slice_mut(s![start..end]).assign(&partial);
+        }
+        if let Some(poly) = self.poly_basis.as_ref() {
+            let v_poly = vector.slice(s![k_eff..]);
+            let poly_part = poly.dot(&v_poly);
+            result += &poly_part;
+        }
+        result
+    }
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let k_eff = self.constraint_transform.as_ref().map_or(
+            self.centers.nrows(),
+            |z| z.ncols(),
+        );
+        let mut result = Array1::<f64>::zeros(self.total_cols);
+        // Kernel part: chunked accumulation of K^T v.
+        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+            let chunk = self.kernel_chunk(start..end);
+            let v_slice = vector.slice(s![start..end]);
+            let partial = chunk.t().dot(&v_slice);
+            result.slice_mut(s![..k_eff]).scaled_add(1.0, &partial);
+        }
+        // Poly part.
+        if let Some(poly) = self.poly_basis.as_ref() {
+            let poly_part = poly.t().dot(vector);
+            result.slice_mut(s![k_eff..]).assign(&poly_part);
+        }
+        result
+    }
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        let p = self.total_cols;
+        let mut xtwx = Array2::<f64>::zeros((p, p));
+        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+            let mut chunk = self.row_chunk_combined(start..end);
+            // Apply sqrt(w) to each row.
+            for local in 0..(end - start) {
+                let w = weights[start + local].max(0.0).sqrt();
+                chunk.row_mut(local).mapv_inplace(|v| v * w);
+            }
+            // Accumulate chunk^T chunk.
+            let ata = fast_ab(&chunk.t().to_owned(), &chunk);
+            xtwx += &ata;
+        }
+        Ok(xtwx)
+    }
+}
+
+impl ChunkedKernelDesignOperator {
+    /// Combined row chunk: [kernel_chunk | poly_chunk].
+    fn row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
+        let chunk_n = rows.end - rows.start;
+        let k_eff = self.constraint_transform.as_ref().map_or(
+            self.centers.nrows(),
+            |z| z.ncols(),
+        );
+        let kernel = self.kernel_chunk(rows.clone());
+        let poly_cols = self.poly_basis.as_ref().map_or(0, |p| p.ncols());
+        let mut combined = Array2::<f64>::zeros((chunk_n, k_eff + poly_cols));
+        combined.slice_mut(s![.., ..k_eff]).assign(&kernel);
+        if let Some(poly) = self.poly_basis.as_ref() {
+            combined
+                .slice_mut(s![.., k_eff..])
+                .assign(&poly.slice(s![rows, ..]));
+        }
+        combined
+    }
+}
+
+impl DenseDesignOperator for ChunkedKernelDesignOperator {
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        self.row_chunk_combined(rows)
+    }
+    fn to_dense(&self) -> Array2<f64> {
+        self.row_chunk_combined(0..self.n)
     }
 }
 

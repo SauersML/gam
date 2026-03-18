@@ -283,12 +283,20 @@ fn build_deviation_block_from_seed(
     let raw_dim = runtime.transform.nrows();
     let dim = runtime.transform.ncols();
     let mut penalties: Vec<crate::solver::estimate::PenaltySpec> = Vec::new();
+    // The deviation transform T projects out 2 anchor constraints (value + derivative
+    // at the seed median).  For a difference penalty of order k on the raw basis,
+    // ker(D^k) has dimension k (polynomials of degree ≤ k-1).  After the projection
+    // T'S T, the anchor constraints absorb 2 of those null directions, giving
+    // transformed nullspace dimension = max(0, k - 2).
+    let anchor_rank = raw_dim - dim; // number of constraints removed by T (typically 2)
+    let mut nullspace_dims: Vec<usize> = Vec::new();
     let base_penalty = create_difference_penalty_matrix(raw_dim, cfg.penalty_order, None)
         .map_err(|e| e.to_string())?;
     penalties.push(crate::solver::estimate::PenaltySpec::Dense(fast_ab(
         &fast_atb(&runtime.transform, &base_penalty),
         &runtime.transform,
     )));
+    nullspace_dims.push(cfg.penalty_order.saturating_sub(anchor_rank));
     for &order in &cfg.penalty_orders {
         if order == cfg.penalty_order || order == 0 || order >= raw_dim {
             continue;
@@ -299,11 +307,13 @@ fn build_deviation_block_from_seed(
             &fast_atb(&runtime.transform, &raw),
             &runtime.transform,
         )));
+        nullspace_dims.push(order.saturating_sub(anchor_rank));
     }
     if cfg.double_penalty {
         penalties.push(crate::solver::estimate::PenaltySpec::Dense(
             Array2::<f64>::eye(dim),
         ));
+        nullspace_dims.push(0); // identity has full rank, no nullspace
     }
     let mut derivative_grid =
         deviation_grid_from_knots(&knots, cfg.degree, cfg.derivative_grid_size)?;
@@ -333,7 +343,7 @@ fn build_deviation_block_from_seed(
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
             offset: Array1::zeros(seed.len()),
             penalties,
-            nullspace_dims: vec![],
+            nullspace_dims,
             initial_log_lambdas: None,
             initial_beta: Some(Array1::zeros(dim)),
         },
@@ -3229,10 +3239,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
         build_block_spatial_psi_derivatives(data, &marginalspec_boot, &marginal_design);
     let logslope_psi_result =
         build_block_spatial_psi_derivatives(data, &logslopespec_boot, &logslope_design);
+    // Track which blocks actually have spatial psi-dependence.  A block that is
+    // entirely non-spatial returns Ok(None), which is fine — its psi contribution
+    // is identically zero.  We only require that at least one block has spatial
+    // derivatives when the model has kappa dimensions to optimize.
+    let marginal_has_spatial = marginal_psi_result
+        .as_ref()
+        .map(|r| r.is_some())
+        .unwrap_or(false);
+    let logslope_has_spatial = logslope_psi_result
+        .as_ref()
+        .map(|r| r.is_some())
+        .unwrap_or(false);
     let analytic_joint_derivatives_available = marginal_psi_result.is_ok()
         && logslope_psi_result.is_ok()
-        && (marginal_psi_result.as_ref().unwrap().is_some()
-            || logslope_psi_result.as_ref().unwrap().is_some());
+        && (marginal_has_spatial || logslope_has_spatial);
     if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
         return Err(
             "exact bernoulli marginal-slope spatial optimization requires analytic joint psi derivatives"
@@ -3300,12 +3321,29 @@ pub fn fit_bernoulli_marginal_slope_terms(
         |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             let blocks = build_blocks(rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1]);
-            let mut derivative_blocks = vec![
+            // For blocks with spatial terms, require derivatives (error if missing).
+            // For non-spatial blocks, use an empty vec (zero psi contribution).
+            let marginal_psi_derivs = if marginal_has_spatial {
                 build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
-                    .unwrap_or_default(),
+                    .ok_or_else(|| {
+                        "bernoulli marginal-slope: marginal block has spatial terms \
+                         but spatial psi derivatives are unavailable"
+                            .to_string()
+                    })?
+            } else {
+                Vec::new()
+            };
+            let logslope_psi_derivs = if logslope_has_spatial {
                 build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
-                    .unwrap_or_default(),
-            ];
+                    .ok_or_else(|| {
+                        "bernoulli marginal-slope: logslope block has spatial terms \
+                         but spatial psi derivatives are unavailable"
+                            .to_string()
+                    })?
+            } else {
+                Vec::new()
+            };
+            let mut derivative_blocks = vec![marginal_psi_derivs, logslope_psi_derivs];
             if family.score_warp.is_some() {
                 derivative_blocks.push(Vec::new());
             }

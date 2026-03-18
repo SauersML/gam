@@ -1528,6 +1528,15 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             ));
         }
     }
+    let n_entry = spec.time_block.design_entry.nrows();
+    let n_exit = spec.time_block.design_exit.nrows();
+    let n_deriv = spec.time_block.design_derivative_exit.nrows();
+    if n_entry != n || n_exit != n || n_deriv != n {
+        return Err(format!(
+            "survival-marginal-slope time block design row mismatch: \
+             data={n}, design_entry={n_entry}, design_exit={n_exit}, design_derivative_exit={n_deriv}"
+        ));
+    }
     let p_entry = spec.time_block.design_entry.ncols();
     let p_exit = spec.time_block.design_exit.ncols();
     let p_deriv = spec.time_block.design_derivative_exit.ncols();

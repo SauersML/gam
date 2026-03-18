@@ -4812,15 +4812,22 @@ fn run_sample_survival(
             seed[i] = eta_offset_entry[i];
             seed[n + i] = eta_offset_exit[i];
         }
+        let primary_order = wiggle_cfg
+            .penalty_orders
+            .iter()
+            .copied()
+            .filter(|&o| o >= 2)
+            .min()
+            .unwrap_or(2);
         let mut block = buildwiggle_block_input_from_knots(
             seed.view(),
             &wiggle_knots,
             wiggle_degree,
-            2,
+            primary_order,
             wiggle_cfg.double_penalty,
         )?;
         for &order in &wiggle_cfg.penalty_orders {
-            if order <= 1 || order >= exit_w.ncols() {
+            if order == primary_order || order <= 1 || order >= exit_w.ncols() {
                 continue;
             }
             let penalty = create_difference_penalty_matrix(exit_w.ncols(), order, None)
