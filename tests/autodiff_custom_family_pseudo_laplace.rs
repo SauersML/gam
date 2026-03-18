@@ -9,7 +9,6 @@ use gam::families::custom_family::{
 use gam::matrix::SymmetricMatrix;
 use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
-use std::sync::Arc;
 
 mod common;
 
