@@ -11,7 +11,6 @@ pub(super) enum GeometryBackendKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HessianEvalStrategyKind {
     SpectralExact,
-    AnalyticFallback,
     DiagnosticNumeric,
 }
 
@@ -33,10 +32,13 @@ impl<'a> RemlState<'a> {
                 reason: "objective_consistent_numericgradient",
             };
         }
-        if bundle.active_subspace_unstable {
+        // When the sparse-exact backend produced the PIRLS result, prefer
+        // the sparse Hessian path for consistency (avoids dense→sparse
+        // round-trip that loses sparsity structure).
+        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             return HessianStrategyDecision {
-                strategy: HessianEvalStrategyKind::AnalyticFallback,
-                reason: "active_subspace_unstable",
+                strategy: HessianEvalStrategyKind::SpectralExact,
+                reason: "sparse_exact_backend_consistency",
             };
         }
         HessianStrategyDecision {

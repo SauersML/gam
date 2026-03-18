@@ -37,10 +37,14 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub event_target: Array1<f64>,
     pub weights: Array1<f64>,
     pub z: Array1<f64>,
+    /// Strict lower bound on q'(t) used by both the likelihood domain and
+    /// the monotonicity constraints.
     pub derivative_guard: f64,
     pub time_block: TimeBlockInput,
     pub logslopespec: TermCollectionSpec,
 }
+
+pub const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
 
 pub struct SurvivalMarginalSlopeFitResult {
     pub fit: UnifiedFitResult,
@@ -76,7 +80,7 @@ struct SurvivalMarginalSlopeFamily {
     derivative_offset_exit: Array1<f64>,
     constraint_derivative_offset: Option<Array1<f64>>,
     /// Log-slope block: standard single design.
-    logslope_design: Array2<f64>,
+    logslope_design: DesignMatrix,
 }
 
 // ── Block layout ──────────────────────────────────────────────────────
@@ -86,6 +90,10 @@ struct BlockSlices {
     time: std::ops::Range<usize>,
     logslope: std::ops::Range<usize>,
     total: usize,
+}
+
+fn design_row_owned(design: &DesignMatrix, row: usize) -> Array1<f64> {
+    design.row_chunk(row..row + 1).row(0).to_owned()
 }
 
 fn block_slices(block_states: &[ParameterBlockState]) -> BlockSlices {
@@ -126,6 +134,11 @@ struct EvalCache {
 // ── Row-level NLL computation ─────────────────────────────────────────
 
 impl SurvivalMarginalSlopeFamily {
+    fn time_derivative_lower_bound(&self) -> f64 {
+        assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
+        self.derivative_guard
+    }
+
     /// Per-row NLL and its directional derivatives through 4 primary scalars.
     ///
     /// NLL_i = w_i * [ (1-d)·neglogΦ(-η₁) − neglogΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
@@ -217,17 +230,20 @@ impl SurvivalMarginalSlopeFamily {
         };
 
         // Time derivative: -d * log(ad1)
-        // If ad1_val is tiny/negative (before monotonicity converges), derivatives
-        // through log() are meaningless — return a constant penalty instead.
+        // The model domain is enforced on qd1 itself, which is the same quantity
+        // constrained by the time monotonicity inequalities. Since c = sqrt(1+beta^2)
+        // is strictly positive, qd1 >= guard implies ad1 > 0 as required by log(ad1).
         let time_deriv_term = if di > 0.0 {
+            let qd1_lower = self.time_derivative_lower_bound();
+            let qd1_val = qd1_jet.coeff(0);
             let ad1_val = ad1_jet.coeff(0);
-            if ad1_val > 0.0 {
+            if qd1_val >= qd1_lower {
                 ad1_jet
                     .compose_unary(unary_derivatives_log(ad1_val))
                     .scale(-wi * di)
             } else {
                 return Err(format!(
-                    "survival marginal-slope monotonicity violated at row {row}: transformed time derivative={ad1_val:.3e} must be positive"
+                    "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
                 ));
             }
         } else {
@@ -358,7 +374,7 @@ impl SurvivalMarginalSlopeFamily {
             &x_entry * primary_vec[0] + &x_exit * primary_vec[1] + &x_deriv * primary_vec[2];
         out.slice_mut(s![slices.time.clone()]).assign(&time_contrib);
         // Slope block: primary scalar g
-        let g_row = self.logslope_design.row(row).to_owned();
+        let g_row = design_row_owned(&self.logslope_design, row);
         out.slice_mut(s![slices.logslope.clone()])
             .assign(&(&g_row * primary_vec[3]));
         out
@@ -375,7 +391,7 @@ impl SurvivalMarginalSlopeFamily {
         let x_entry = self.design_entry.row(row).to_owned();
         let x_exit = self.design_exit.row(row).to_owned();
         let x_deriv = self.design_derivative_exit.row(row).to_owned();
-        let g_row = self.logslope_design.row(row).to_owned();
+        let g_row = design_row_owned(&self.logslope_design, row);
 
         // Time-time block (indices 0,1,2 × 0,1,2 in primary space)
         // We have 3 design vectors for the time block. The time-time Hessian is:
@@ -439,9 +455,7 @@ impl SurvivalMarginalSlopeFamily {
         out[0] = self.design_entry.row(row).dot(&d_time);
         out[1] = self.design_exit.row(row).dot(&d_time);
         out[2] = self.design_derivative_exit.row(row).dot(&d_time);
-        out[3] = self
-            .logslope_design
-            .row(row)
+        out[3] = design_row_owned(&self.logslope_design, row)
             .dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned());
         out
     }
@@ -550,7 +564,8 @@ impl SurvivalMarginalSlopeFamily {
                 }
             }
 
-            for (local_idx, &value) in self.logslope_design.row(row).iter().enumerate() {
+            let logslope_row = design_row_owned(&self.logslope_design, row);
+            for (local_idx, &value) in logslope_row.iter().enumerate() {
                 diagonal[slices.logslope.start + local_idx] += value * value * row_hessian[[3, 3]];
             }
         }
@@ -1359,6 +1374,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
         if block_idx == 0 {
+            let derivative_guard = self.time_derivative_lower_bound();
             let constraint_rows = self
                 .constraint_design_derivative
                 .as_ref()
@@ -1372,7 +1388,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             if let Some(structural) = structural_nonnegative_time_constraints(
                 constraint_rows,
                 constraint_offsets,
-                self.derivative_guard,
+                derivative_guard,
             ) {
                 return Ok(Some(structural));
             }
@@ -1381,7 +1397,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 b: Array1::from_iter(
                     constraint_offsets
                         .iter()
-                        .map(|&o| self.derivative_guard - o),
+                        .map(|&o| derivative_guard - o),
                 ),
             }))
         } else {
@@ -1496,6 +1512,12 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     }
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
         return Err("survival-marginal-slope requires finite z values".to_string());
+    }
+    if !spec.derivative_guard.is_finite() || spec.derivative_guard <= 0.0 {
+        return Err(format!(
+            "survival-marginal-slope requires derivative_guard > 0, got {}",
+            spec.derivative_guard
+        ));
     }
     for i in 0..n {
         if spec.age_exit[i] < spec.age_entry[i] {
@@ -1647,7 +1669,7 @@ pub fn fit_survival_marginal_slope_terms(
             offset_exit: offset_exit.clone(),
             derivative_offset_exit: derivative_offset_exit.clone(),
             constraint_derivative_offset: constraint_derivative_offset.clone(),
-            logslope_design: logslope_design.design.to_dense(),
+            logslope_design: logslope_design.design.clone(),
         }
     };
 

@@ -90,17 +90,6 @@ impl<'a> RemlState<'a> {
         Ok((det1, det2))
     }
 
-    pub(super) fn compute_lamlhessian_analytic_fallback(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        // The old partial analytic fallback omitted the full ½ ∂² log|H| block,
-        // so it was not the Hessian of the objective being optimized. When the
-        // exact spectral assembly is unavailable, fall back to differentiating
-        // the actual scalar objective numerically instead.
-        self.compute_lamlhessian_diagnostic_numeric(rho)
-    }
-
     fn diagnostic_hessian_fd_step(&self, rho_i: f64) -> Result<f64, EstimationError> {
         let base = (DIAGNOSTIC_HESSIAN_FD_REL_STEP * (1.0 + rho_i.abs()))
             .max(DIAGNOSTIC_HESSIAN_FD_ABS_STEP);
@@ -205,15 +194,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
         let decision = self.selecthessian_strategy_policy(rho, &bundle);
-        if decision.reason == "active_subspace_unstable" {
-            let rel_gap = bundle.active_subspace_rel_gap.unwrap_or(f64::NAN);
-            log::warn!(
-                "LAML Hessian strategy selected {:?} (reason={}, rel_gap={:.3e}).",
-                decision.strategy,
-                decision.reason,
-                rel_gap
-            );
-        } else if decision.strategy != HessianEvalStrategyKind::SpectralExact {
+        if decision.strategy != HessianEvalStrategyKind::SpectralExact {
             log::warn!(
                 "LAML Hessian strategy selected {:?} (reason={}).",
                 decision.strategy,
@@ -223,9 +204,6 @@ impl<'a> RemlState<'a> {
         match decision.strategy {
             HessianEvalStrategyKind::SpectralExact => {
                 self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
-            }
-            HessianEvalStrategyKind::AnalyticFallback => {
-                self.compute_lamlhessian_analytic_fallback(rho)
             }
             HessianEvalStrategyKind::DiagnosticNumeric => {
                 self.compute_lamlhessian_diagnostic_numeric(rho)
@@ -284,16 +262,6 @@ impl<'a> RemlState<'a> {
         if final_fit.beta_transformed.len() > AUTO_CUBATURE_MAX_BETA_DIM {
             return first_order_correction;
         }
-        if let Ok(bundle) = self.obtain_eval_bundle(final_rho)
-            && bundle.active_subspace_unstable
-        {
-            // Cubature correction relies on a locally stable outer Hessian.
-            // Near active-subspace crossings of H_+, the hard-truncated
-            // spectral objective is not described by one smooth quadratic
-            // model, so we keep only the first-order correction.
-            return first_order_correction;
-        }
-
         let near_boundary = final_rho
             .iter()
             .any(|&v| (RHO_BOUND - v.abs()) <= AUTO_CUBATURE_BOUNDARY_MARGIN);

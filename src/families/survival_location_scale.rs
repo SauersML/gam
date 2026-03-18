@@ -20,12 +20,13 @@ use crate::families::gamlss::{
     select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative,
 };
 use crate::families::scale_design::{
-    apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
+    build_scale_deviation_operator, build_scale_deviation_transform_design,
+    infer_non_intercept_start_design,
 };
-use crate::families::sigma_link::{exp_sigma_derivs_up_to_fourth, exp_sigma_derivs_up_to_third};
 use crate::matrix::{
-    DesignMatrix, DesignOperator, EmbeddedColumnBlock, EmbeddedSquareBlock, MultiChannelOperator,
-    RowwiseKroneckerOperator, SymmetricMatrix, xt_diag_x_symmetric,
+    BlockDesignOperator, DesignBlock, DesignMatrix, DesignOperator, EmbeddedColumnBlock,
+    EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
+    xt_diag_x_symmetric,
 };
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdfthird_derivative_for_inverse_link,
@@ -48,9 +49,6 @@ use ndarray::{Array1, Array2, Axis, s};
 use statrs::function::erf::erfc;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-#[cfg(test)]
-use crate::families::sigma_link::exp_sigma_derivs_up_to_third_scalar;
 
 #[inline]
 fn softplus(x: f64) -> f64 {
@@ -116,23 +114,6 @@ fn probit_log_survival_and_ratio_derivatives(eta: f64) -> (f64, f64, f64, f64, f
         + (7.0 * eta * eta - 4.0) * ratio.powi(2)
         + (-eta * eta * eta + 3.0 * eta) * ratio;
     (log_survival, ratio, dr, ddr, dddr)
-}
-
-#[inline]
-fn exact_log_value_and_derivatives(x: f64) -> Result<(f64, f64, f64, f64, f64), String> {
-    if !x.is_finite() || x <= 0.0 {
-        return Err(format!(
-            "log-domain argument must be finite and positive, got {x}"
-        ));
-    }
-    let inv = x.recip();
-    Ok((
-        x.ln(),
-        inv,
-        -inv * inv,
-        2.0 * inv.powi(3),
-        -6.0 * inv.powi(4),
-    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,7 +391,7 @@ pub(crate) fn structural_nonnegative_time_constraints(
     if rows.ncols() == 0 {
         return None;
     }
-    if rows.iter().all(|&v| v >= -TOL) && offsets.iter().all(|&o| o >= guard - TOL) {
+    if rows.iter().all(|&v| v >= -TOL) && offsets.iter().all(|&o| o >= guard) {
         let p = rows.ncols();
         let mut a = Array2::<f64>::zeros((p, p));
         for j in 0..p {
@@ -491,7 +472,6 @@ struct SurvivalLocationScaleSpec {
     pub weights: Array1<f64>,
     pub inverse_link: InverseLink,
     pub derivative_guard: f64,
-    pub derivative_softness: f64,
     /// Optional anchor time for identifiability of h(t).
     ///
     /// If `None`, the model anchors at the earliest observed entry time.
@@ -523,8 +503,9 @@ pub struct SurvivalLocationScaleTermSpec {
     pub event_target: Array1<f64>,
     pub weights: Array1<f64>,
     pub inverse_link: InverseLink,
+    /// Strict lower bound on d_eta/dt used by both the event Jacobian term
+    /// and the time monotonicity constraints.
     pub derivative_guard: f64,
-    pub derivative_softness: f64,
     pub time_anchor: Option<f64>,
     pub max_iter: usize,
     pub tol: f64,
@@ -535,6 +516,8 @@ pub struct SurvivalLocationScaleTermSpec {
     pub log_sigma_template: SurvivalCovariateTermBlockTemplate,
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
 }
+
+pub const DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD: f64 = 1e-6;
 
 pub struct SurvivalLocationScaleTermFitResult {
     pub fit: UnifiedFitResult,
@@ -871,7 +854,6 @@ struct SurvivalLocationScaleFamily {
     w: Array1<f64>,
     inverse_link: InverseLink,
     derivative_guard: f64,
-    derivative_softness: f64,
     x_time_entry: Array2<f64>,
     x_time_exit: Array2<f64>,
     x_time_deriv: Array2<f64>,
@@ -959,6 +941,42 @@ struct SurvivalRowDerivatives {
     d2_h_h1: f64,
 }
 
+#[derive(Clone, Copy)]
+struct SurvivalExactRowKernel {
+    w: f64,
+    d: f64,
+    log_s0: f64,
+    r0: f64,
+    dr0: f64,
+    ddr0: f64,
+    dddr0: f64,
+    log_s1: f64,
+    r1: f64,
+    dr1: f64,
+    ddr1: f64,
+    dddr1: f64,
+    logphi1: f64,
+    dlogphi1: f64,
+    d2logphi1: f64,
+    d3logphi1: f64,
+    d4logphi1: f64,
+    log_g: f64,
+    d_log_g: f64,
+    d2_log_g: f64,
+    d3_log_g: f64,
+    d4_log_g: f64,
+}
+
+impl SurvivalExactRowKernel {
+    #[inline]
+    fn log_likelihood(self) -> f64 {
+        self.w
+            * (self.d * (self.logphi1 + self.log_g)
+                + (1.0 - self.d) * self.log_s1
+                - self.log_s0)
+    }
+}
+
 struct SurvivalJointQuantities {
     d1_q: Array1<f64>,
     d2_q: Array1<f64>,
@@ -988,7 +1006,7 @@ struct SurvivalJointQuantities {
     d2_h_h0: Array1<f64>,
     /// d⁴ℓ/d(h1)⁴ for the exact bilinear D²H[u,v] time-time coefficient.
     d2_h_h1: Array1<f64>,
-    /// Exit-side dq/d(eta_t) = -1/sigma_exit.
+    /// Exit-side dq/d(eta_t) = -exp(-eta_ls_exit).
     dq_t: Array1<f64>,
     /// Exit-side dq/d(eta_ls).
     dq_ls: Array1<f64>,
@@ -998,9 +1016,9 @@ struct SurvivalJointQuantities {
     d3q_ls: Array1<f64>,
     d4q_tls_ls_ls: Array1<f64>,
     d4q_ls: Array1<f64>,
-    /// Entry-side dq0/d(eta_t_entry) = -1/sigma_entry (only for time-varying).
+    /// Entry-side dq0/d(eta_t_entry) = -exp(-eta_ls_entry) (only for time-varying).
     dq_t_entry: Option<Array1<f64>>,
-    /// Entry-side chain-rule derivatives for sigma at entry (only for time-varying sigma).
+    /// Entry-side q-chain derivatives at entry (only for time-varying sigma).
     dq_ls_entry: Option<Array1<f64>>,
     d2q_tls_entry: Option<Array1<f64>>,
     d2q_ls_entry: Option<Array1<f64>>,
@@ -1097,6 +1115,12 @@ impl SurvivalLocationScaleFamily {
     const BLOCK_THRESHOLD: usize = 1;
     const BLOCK_LOG_SIGMA: usize = 2;
     const BLOCK_LINK_WIGGLE: usize = 3;
+
+    #[inline]
+    fn time_derivative_lower_bound(&self) -> f64 {
+        assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
+        self.derivative_guard
+    }
 
     #[inline]
     fn expected_blocks(&self) -> usize {
@@ -1779,103 +1803,130 @@ impl SurvivalLocationScaleFamily {
             + 2.0 * fp * f * f / s3
     }
 
-    /// Clamp-aware log-pdf and its first/second/third derivatives.
-    ///
-    /// Let `L(u) = log f(u)` on the unclamped branch. The exact derivatives are:
-    ///
-    /// `L'   = f'/f`
-    ///
-    /// `L''  = d/du(f'/f)
-    ///       = (f'' f - (f')²) / f²
-    ///       = f''/f - (f'/f)²`
-    ///
-    /// For the third derivative, differentiate `L'' = f''/f - (f'/f)^2`:
-    ///
-    /// `d/du[f''/f]   = f'''/f - f'f''/f²`
-    ///
-    /// `d/du[(f'/f)²] = 2(f'/f)(f''/f - (f'/f)²)
-    ///                = 2f'f''/f² - 2(f')³/f³`
-    ///
-    /// so
-    ///
-    /// `L''' = f'''/f - 3 f'f''/f² + 2(f')³/f³`.
-    ///
-    /// This is the branchwise-exact `d³(log f)/du³` term used in the survival exact-Newton
-    /// Hessian directional derivative. If it is dropped, the event contribution
-    /// to `d³ℓ/dq³` is wrong, which then corrupts the block Hessian drift
-    /// `D H[u]`.
-    ///
-    /// The objective actually uses `log(max(f, MIN_PROB))`, not `log f`, so once
-    /// `f <= MIN_PROB` the active branch is constant and all derivatives must be
-    /// zero. That is why the clamped branch returns `(log MIN_PROB, 0, 0, 0)`.
-    fn clamped_log_pdfwith_derivatives(
-        f: f64,
-        fp: f64,
-        fpp: f64,
-        fppp: f64,
-    ) -> (f64, f64, f64, f64) {
-        if f <= MIN_PROB {
-            (MIN_PROB.ln(), 0.0, 0.0, 0.0)
-        } else {
-            let d1 = fp / f;
-            let d2 = fpp / f - d1 * d1;
-            let d3 = fppp / f - 3.0 * fp * fpp / (f * f) + 2.0 * fp * fp * fp / (f * f * f);
-            (f.ln(), d1, d2, d3)
+    /// Exact log-pdf and its first four derivatives.
+    fn exact_log_pdf_derivatives(
+        inverse_link: &InverseLink,
+        eta: f64,
+    ) -> Result<(f64, f64, f64, f64, f64), String> {
+        match inverse_link {
+            InverseLink::Standard(LinkFunction::Probit) => Ok((
+                -0.5 * eta * eta - 0.5 * (2.0 * std::f64::consts::PI).ln(),
+                -eta,
+                -1.0,
+                0.0,
+                0.0,
+            )),
+            InverseLink::Standard(LinkFunction::Logit) => {
+                let mu = crate::solver::mixture_link::component_inverse_link_jet(
+                    crate::types::LinkComponent::Logit,
+                    eta,
+                )
+                .mu;
+                let w = mu * (1.0 - mu);
+                Ok((
+                    -softplus(eta) - softplus(-eta),
+                    1.0 - 2.0 * mu,
+                    -2.0 * w,
+                    -2.0 * w * (1.0 - 2.0 * mu),
+                    -2.0 * w * (1.0 - 6.0 * w),
+                ))
+            }
+            InverseLink::Standard(LinkFunction::CLogLog) => {
+                let t = eta.exp();
+                Ok((eta - t, 1.0 - t, -t, -t, -t))
+            }
+            InverseLink::Standard(LinkFunction::Identity) => Ok((0.0, 0.0, 0.0, 0.0, 0.0)),
+            _ => {
+                let jet = inverse_link_jet_for_inverse_link(inverse_link, eta)
+                    .map_err(|e| format!("inverse link evaluation failed at eta={eta}: {e}"))?;
+                let f = jet.d1;
+                if !(f.is_finite() && f > 0.0) {
+                    return Err(format!(
+                        "inverse-link pdf must be finite and positive, got {f} at eta={eta}"
+                    ));
+                }
+                let fp = jet.d2;
+                let fpp = jet.d3;
+                let fppp = inverse_link_pdfthird_derivative_for_inverse_link(inverse_link, eta)
+                    .map_err(|e| {
+                        format!(
+                            "inverse link third-derivative evaluation failed at eta={eta}: {e}"
+                        )
+                    })?;
+                let fpppp = inverse_link_pdffourth_derivative(inverse_link, eta);
+                let d1 = fp / f;
+                let d2 = fpp / f - d1 * d1;
+                let d3 = fppp / f - 3.0 * fp * fpp / (f * f) + 2.0 * fp.powi(3) / f.powi(3);
+                let d4 = fpppp / f
+                    - 4.0 * fp * fppp / f.powi(2)
+                    - 3.0 * fpp * fpp / f.powi(2)
+                    + 12.0 * fp.powi(2) * fpp / f.powi(3)
+                    - 6.0 * fp.powi(4) / f.powi(4);
+                Ok((f.ln(), d1, d2, d3, d4))
+            }
         }
     }
 
-    /// Fourth derivative of log f(u), given f through f''''.
-    ///
-    /// ```text
-    /// L'''' = f''''/f - 4f'f'''/f² - 3(f'')²/f² + 12(f')²f''/f³ - 6(f')⁴/f⁴
-    /// ```
-    ///
-    /// Derivation: differentiate L''' = f'''/f - 3f'f''/f² + 2(f')³/f³.
-    ///
-    /// This is needed for d⁴ℓ/dq1⁴ (the exit-side 4th derivative of the
-    /// event contribution), which enters the outer REML Hessian Q[v_k, v_l].
-    fn log_pdf_fourth_derivative(f: f64, fp: f64, fpp: f64, fppp: f64, fpppp: f64) -> f64 {
-        if f <= MIN_PROB {
-            return 0.0;
-        }
-        let f2 = f * f;
-        let f3 = f2 * f;
-        let f4 = f3 * f;
-        let fp2 = fp * fp;
-        fpppp / f - 4.0 * fp * fppp / f2 - 3.0 * fpp * fpp / f2 + 12.0 * fp2 * fpp / f3
-            - 6.0 * fp2 * fp2 / f4
-    }
-
-    /// Clamp-aware survival value and branchwise-exact derivatives of
-    /// `-log(clamp(S, MIN_PROB, 1))`
-    /// through **4th order**.
-    ///
-    /// Returns `(S_clamped, r, dr, ddr, dddr)` where dddr = d⁴/du⁴[-log S].
-    ///
-    /// The 4th derivative of -log S is r''' (the 3rd derivative of the
-    /// survival ratio r = f/S). This is needed by the outer REML Hessian's
-    /// Q[v_k, v_l] term for the entry-side contribution.
-    fn clamped_survival_neglog_derivatives_fourth(
-        raw_s: f64,
-        f: f64,
-        fp: f64,
-        fpp: f64,
-        fppp: f64,
-    ) -> (f64, f64, f64, f64, f64) {
-        let s = raw_s.clamp(MIN_PROB, 1.0);
-        if raw_s <= MIN_PROB || raw_s >= 1.0 {
-            (s, 0.0, 0.0, 0.0, 0.0)
-        } else {
-            let (r, dr) = Self::survival_ratio_first_derivative(f, fp, s);
-            let ddr = Self::survival_ratiosecond_derivative(r, dr, f, fp, fpp, s);
-            let dddr = Self::survival_ratio_third_derivative(r, dr, ddr, f, fp, fpp, fppp, s);
-            (s, r, dr, ddr, dddr)
+    /// Exact log-survival value and the derivatives of `-log S` through 4th order.
+    fn exact_survival_neglog_derivatives_fourth(
+        inverse_link: &InverseLink,
+        eta: f64,
+    ) -> Result<(f64, f64, f64, f64, f64), String> {
+        match inverse_link {
+            InverseLink::Standard(LinkFunction::Probit) => {
+                let (log_s, r, dr, ddr, dddr) = probit_log_survival_and_ratio_derivatives(eta);
+                Ok((log_s, r, dr, ddr, dddr))
+            }
+            InverseLink::Standard(LinkFunction::Logit) => {
+                let mu = crate::solver::mixture_link::component_inverse_link_jet(
+                    crate::types::LinkComponent::Logit,
+                    eta,
+                )
+                .mu;
+                let w = mu * (1.0 - mu);
+                Ok((-softplus(eta), mu, w, w * (1.0 - 2.0 * mu), w * (1.0 - 6.0 * w)))
+            }
+            InverseLink::Standard(LinkFunction::CLogLog) => {
+                let t = eta.exp();
+                Ok((-t, t, t, t, t))
+            }
+            InverseLink::Standard(LinkFunction::Identity) => {
+                let s = 1.0 - eta;
+                if !(s.is_finite() && s > 0.0) {
+                    return Err(format!("identity-link survival invalid at eta={eta}: S={s}"));
+                }
+                let inv = s.recip();
+                Ok((s.ln(), inv, inv * inv, 2.0 * inv.powi(3), 6.0 * inv.powi(4)))
+            }
+            _ => {
+                let jet = inverse_link_jet_for_inverse_link(inverse_link, eta)
+                    .map_err(|e| format!("inverse link evaluation failed at eta={eta}: {e}"))?;
+                let s = inverse_link_survival_probvalue(inverse_link, eta);
+                if !(s.is_finite() && s > 0.0 && s <= 1.0) {
+                    return Err(format!(
+                        "inverse-link survival probability must lie in (0,1], got {s} at eta={eta}"
+                    ));
+                }
+                let fppp = inverse_link_pdfthird_derivative_for_inverse_link(inverse_link, eta)
+                    .map_err(|e| {
+                        format!(
+                            "inverse link third-derivative evaluation failed at eta={eta}: {e}"
+                        )
+                    })?;
+                let (r, dr) = Self::survival_ratio_first_derivative(jet.d1, jet.d2, s);
+                let ddr =
+                    Self::survival_ratiosecond_derivative(r, dr, jet.d1, jet.d2, jet.d3, s);
+                let dddr = Self::survival_ratio_third_derivative(
+                    r, dr, ddr, jet.d1, jet.d2, jet.d3, fppp, s,
+                );
+                Ok((s.ln(), r, dr, ddr, dddr))
+            }
         }
     }
 
     /// Exact `log(x)` value and first four derivatives on the positive domain.
     fn logwith_derivatives_positive(x: f64) -> (f64, f64, f64, f64, f64) {
-        debug_assert!(x.is_finite() && x > 0.0);
+        assert!(x.is_finite() && x > 0.0);
         let inv = 1.0 / x;
         (
             x.ln(),
@@ -1911,22 +1962,95 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
+    #[inline]
+    fn validated_event_target(&self, row: usize) -> Result<f64, String> {
+        let d = self.y[row];
+        if !(d.is_finite() && (0.0..=1.0).contains(&d)) {
+            return Err(format!(
+                "survival location-scale event target must lie in [0,1] at row {row}, got {d}"
+            ));
+        }
+        Ok(d)
+    }
+
+    fn exact_row_kernel(
+        &self,
+        row: usize,
+        state: SurvivalPredictorState,
+    ) -> Result<Option<SurvivalExactRowKernel>, String> {
+        let w = self.w[row];
+        if w <= 0.0 {
+            return Ok(None);
+        }
+        let d = self.validated_event_target(row)?;
+        let u0 = -state.h0 + state.q0;
+        let u1 = -state.h1 + state.q1;
+
+        let (log_s0, r0, dr0, ddr0, dddr0) =
+            Self::exact_survival_neglog_derivatives_fourth(&self.inverse_link, u0).map_err(
+                |e| format!("inverse-link survival evaluation failed at row {row} entry: {e}"),
+            )?;
+
+        let (log_s1, r1, dr1, ddr1, dddr1) =
+            Self::exact_survival_neglog_derivatives_fourth(&self.inverse_link, u1).map_err(
+                |e| format!("inverse-link survival evaluation failed at row {row} exit: {e}"),
+            )?;
+
+        let (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1) =
+            Self::exact_log_pdf_derivatives(&self.inverse_link, u1).map_err(|e| {
+                format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
+            })?;
+
+        let guard = self.time_derivative_lower_bound();
+        let g = state.g;
+        if !g.is_finite() {
+            return Err(format!(
+                "survival location-scale time derivative is non-finite at row {row}: d_eta/dt={g}"
+            ));
+        }
+        if g < guard {
+            return Err(format!(
+                "survival location-scale monotonicity violated at row {row}: d_eta/dt={g:.3e} < lower_bound={:.3e}",
+                guard
+            ));
+        }
+        let (log_g, d_log_g, d2_log_g, d3_log_g, d4_log_g) =
+            Self::logwith_derivatives_positive(g);
+
+        Ok(Some(SurvivalExactRowKernel {
+            w,
+            d,
+            log_s0,
+            r0,
+            dr0,
+            ddr0,
+            dddr0,
+            log_s1,
+            r1,
+            dr1,
+            ddr1,
+            dddr1,
+            logphi1,
+            dlogphi1,
+            d2logphi1,
+            d3logphi1,
+            d4logphi1,
+            log_g,
+            d_log_g,
+            d2_log_g,
+            d3_log_g,
+            d4_log_g,
+        }))
+    }
+
     fn row_derivatives(
         &self,
         row: usize,
         state: SurvivalPredictorState,
     ) -> Result<Option<SurvivalRowDerivatives>, String> {
-        let w = self.w[row];
-        if w <= 0.0 {
+        let Some(kernel) = self.exact_row_kernel(row, state)? else {
             return Ok(None);
-        }
-        let d = self.y[row].clamp(0.0, 1.0);
-        let u0 = -state.h0 + state.q0;
-        let u1 = -state.h1 + state.q1;
-        let j0 = inverse_link_jet_for_inverse_link(&self.inverse_link, u0)
-            .map_err(|e| format!("inverse link evaluation failed at row {row} entry: {e}"))?;
-        let j1 = inverse_link_jet_for_inverse_link(&self.inverse_link, u1)
-            .map_err(|e| format!("inverse link evaluation failed at row {row} exit: {e}"))?;
+        };
         // The row likelihood is written in terms of the survival values
         //
         //   S(u0),  S(u1),
@@ -1949,56 +2073,8 @@ impl SurvivalLocationScaleFamily {
         //
         //   ell = w [ d(log f(u1) + log g) + (1-d) log S(u1) - log S(u0) ].
         //
-        // So we evaluate `S` directly through the inverse-link-specific stable
-        // survival helper and only use the inverse-link jet for the density-side
-        // derivatives `(f, f', f'')`.
-        let raw_s0 = inverse_link_survival_probvalue(&self.inverse_link, u0);
-        let raw_s1 = inverse_link_survival_probvalue(&self.inverse_link, u1);
-
-        // For the 4th-order derivatives (needed by the outer REML Hessian),
-        // we need the survival ratio through r''' and log-pdf through L''''.
-        // The entry side needs f'''(u0) for r'''(u0); the exit side needs
-        // f''''(u1) for L''''(u1).
-        //
-        // f''' comes from inverse_link_pdfthird_derivative; f'''' from our
-        // local inverse_link_pdffourth_derivative helper.
-        let fppp0 = inverse_link_pdfthird_derivative_for_inverse_link(&self.inverse_link, u0)
-            .map_err(|e| {
-                format!("inverse link third-derivative evaluation failed at row {row} entry: {e}")
-            })?;
-        let (s0, r0, dr0, ddr0, dddr0) =
-            Self::clamped_survival_neglog_derivatives_fourth(raw_s0, j0.d1, j0.d2, j0.d3, fppp0);
-
-        let fppp1 = inverse_link_pdfthird_derivative_for_inverse_link(&self.inverse_link, u1)
-            .map_err(|e| {
-                format!("inverse link third-derivative evaluation failed at row {row} exit: {e}")
-            })?;
-        let (s1, r1, dr1, ddr1, dddr1) =
-            Self::clamped_survival_neglog_derivatives_fourth(raw_s1, j1.d1, j1.d2, j1.d3, fppp1);
-
-        let (logphi1, dlogphi1, d2logphi1, d3logphi1) =
-            Self::clamped_log_pdfwith_derivatives(j1.d1, j1.d2, j1.d3, fppp1);
-
-        // 4th derivative of log f(u1) for the exit-side event contribution.
-        // f'''' is the 4th PDF derivative; L'''' uses f through f''''.
-        let fpppp1 = inverse_link_pdffourth_derivative(&self.inverse_link, u1);
-        let d4logphi1 = Self::log_pdf_fourth_derivative(j1.d1, j1.d2, j1.d3, fppp1, fpppp1);
-
-        let guard = self.derivative_guard.max(0.0);
-        let g = state.g;
-        if !g.is_finite() {
-            return Err(format!(
-                "survival location-scale time derivative is non-finite at row {row}: d_eta/dt={g}"
-            ));
-        }
-        if g <= guard.max(f64::MIN_POSITIVE) {
-            return Err(format!(
-                "survival location-scale monotonicity violated at row {row}: d_eta/dt={g:.3e} <= lower_bound={:.3e}",
-                guard.max(f64::MIN_POSITIVE)
-            ));
-        }
-        let (log_g_safe, d_log_g, d2_log_g, d3_log_g, d4_log_g) =
-            Self::logwith_derivatives_positive(g);
+        // So we evaluate both log-density and log-survival through the same
+        // inverse-link-specific exact formulas used by the derivative algebra.
 
         // With
         //
@@ -2036,19 +2112,22 @@ impl SurvivalLocationScaleFamily {
         // needed by the Arbogast chain rule for the outer REML Hessian.
         // They enter F_αβγδ = m4·u_α·u_β·u_γ·u_δ + ... in the (s,s,s,s)
         // and (ϑ,s,s,s) blocks. See response.md Section 6.
-        let d1_q0 = w * r0;
-        let d2_q0 = w * dr0;
-        let d3_q0 = w * ddr0;
-        let d4_q0 = w * dddr0;
-        let d1_q1 = w * (d * dlogphi1 + (1.0 - d) * (-r1));
-        let d2_q1 = w * (d * d2logphi1 + (1.0 - d) * (-dr1));
-        let d3_q1 = w * (d * d3logphi1 + (1.0 - d) * (-ddr1));
-        let d4_q1 = w * (d * d4logphi1 + (1.0 - d) * (-dddr1));
+        let d1_q0 = kernel.w * kernel.r0;
+        let d2_q0 = kernel.w * kernel.dr0;
+        let d3_q0 = kernel.w * kernel.ddr0;
+        let d4_q0 = kernel.w * kernel.dddr0;
+        let d1_q1 = kernel.w * (kernel.d * kernel.dlogphi1 + (1.0 - kernel.d) * (-kernel.r1));
+        let d2_q1 =
+            kernel.w * (kernel.d * kernel.d2logphi1 + (1.0 - kernel.d) * (-kernel.dr1));
+        let d3_q1 =
+            kernel.w * (kernel.d * kernel.d3logphi1 + (1.0 - kernel.d) * (-kernel.ddr1));
+        let d4_q1 =
+            kernel.w * (kernel.d * kernel.d4logphi1 + (1.0 - kernel.d) * (-kernel.dddr1));
         let d1_q = d1_q0 + d1_q1;
         let d2_q = d2_q0 + d2_q1;
         let d3_q = d3_q0 + d3_q1;
         Ok(Some(SurvivalRowDerivatives {
-            ll: w * (d * (logphi1 + log_g_safe) + (1.0 - d) * s1.ln() - s0.ln()),
+            ll: kernel.log_likelihood(),
             d1_q,
             d2_q,
             d3_q,
@@ -2060,61 +2139,53 @@ impl SurvivalLocationScaleFamily {
             d2_q1,
             d3_q1,
             d4_q1,
-            d1_qdot1: -w * d * d_log_g,
-            d2_qdot1: w * d * d2_log_g,
-            d3_qdot1: -w * d * d3_log_g,
-            d4_qdot1: w * d * d4_log_g,
-            grad_time_eta_h0: -w * r0,
-            grad_time_eta_h1: -w * (d * dlogphi1 + (1.0 - d) * (-r1)),
-            grad_time_eta_d: w * d * d_log_g,
-            h_time_h0: -w * dr0,
-            h_time_h1: -w * (d * d2logphi1 + (1.0 - d) * (-dr1)),
-            h_time_d: -w * d * d2_log_g,
-            d_h_h0: w * ddr0,
-            d_h_h1: w * d * d3logphi1 - w * (1.0 - d) * ddr1,
-            d_h_d: -w * d * d3_log_g,
+            d1_qdot1: -kernel.w * kernel.d * kernel.d_log_g,
+            d2_qdot1: kernel.w * kernel.d * kernel.d2_log_g,
+            d3_qdot1: -kernel.w * kernel.d * kernel.d3_log_g,
+            d4_qdot1: kernel.w * kernel.d * kernel.d4_log_g,
+            grad_time_eta_h0: -kernel.w * kernel.r0,
+            grad_time_eta_h1: -kernel.w
+                * (kernel.d * kernel.dlogphi1 + (1.0 - kernel.d) * (-kernel.r1)),
+            grad_time_eta_d: kernel.w * kernel.d * kernel.d_log_g,
+            h_time_h0: -kernel.w * kernel.dr0,
+            h_time_h1: -kernel.w
+                * (kernel.d * kernel.d2logphi1 + (1.0 - kernel.d) * (-kernel.dr1)),
+            h_time_d: -kernel.w * kernel.d * kernel.d2_log_g,
+            d_h_h0: kernel.w * kernel.ddr0,
+            d_h_h1: kernel.w * kernel.d * kernel.d3logphi1
+                - kernel.w * (1.0 - kernel.d) * kernel.ddr1,
+            d_h_d: -kernel.w * kernel.d * kernel.d3_log_g,
             // 4th derivatives of ℓ w.r.t. the time predictors h0, h1.
             // These are the exact bilinear coefficients for D²H[u,v] in the
             // time-time block. Since u = q - h and d⁴ℓ/dh⁴ = d⁴ℓ/du⁴
             // (same sign because (-1)⁴ = 1), we have:
-            d2_h_h0: w * dddr0,
-            d2_h_h1: w * (d * d4logphi1 + (1.0 - d) * (-dddr1)),
+            d2_h_h0: kernel.w * kernel.dddr0,
+            d2_h_h1: kernel.w
+                * (kernel.d * kernel.d4logphi1 + (1.0 - kernel.d) * (-kernel.dddr1)),
         }))
     }
 }
 
 /// Scalar chain-rule derivatives of
-/// q(eta_t, eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12).
+/// q(eta_t, eta_ls) = -eta_t * exp(-eta_ls).
 ///
 /// Returns (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) — the full set of
 /// partials up to third order needed by both the survival and GAMLSS engines.
 #[inline]
-pub(crate) fn q_chain_derivs_scalar(
-    eta_t: f64,
-    sigma: f64,
-    dsigma: f64,
-    d2sigma: f64,
-    d3sigma: f64,
-) -> (f64, f64, f64, f64, f64, f64) {
-    let s = sigma.max(1e-12);
-    let q_t = -1.0 / s;
-    if sigma <= 1e-12 {
-        return (q_t, 0.0, 0.0, 0.0, 0.0, 0.0);
-    }
-
-    let s2 = s * s;
-    let s3 = s2 * s;
-    let s4 = s3 * s;
-    let q_tl = dsigma / s2;
-    let q_ls = eta_t * q_tl;
-    let q_tl_ls = d2sigma / s2 - 2.0 * dsigma * dsigma / s3;
-    let q_ll = eta_t * q_tl_ls;
-    let q_ll_ls = eta_t * (d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * dsigma.powi(3) / s4);
-    (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls)
+pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, f64, f64, f64) {
+    let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
+    (
+        -inv_sigma,
+        eta_t * inv_sigma,
+        inv_sigma,
+        -eta_t * inv_sigma,
+        -inv_sigma,
+        eta_t * inv_sigma,
+    )
 }
 
 /// Extended scalar chain-rule derivatives of
-/// q(eta_t, eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12)
+/// q(eta_t, eta_ls) = -eta_t * exp(-eta_ls)
 /// through **4th order**.
 ///
 /// Returns the same 6 values as `q_chain_derivs_scalar` plus two 4th-order terms:
@@ -2156,137 +2227,35 @@ pub(crate) fn q_chain_derivs_scalar(
 #[inline]
 pub(crate) fn q_chain_derivs_fourth_scalar(
     eta_t: f64,
-    sigma: f64,
-    dsigma: f64,
-    d2sigma: f64,
-    d3sigma: f64,
-    d4sigma: f64,
+    eta_ls: f64,
 ) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
-    let s = sigma.max(1e-12);
-    let q_t = -1.0 / s;
-    if sigma <= 1e-12 {
-        return (q_t, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    }
-
-    let s2 = s * s;
-    let s3 = s2 * s;
-    let s4 = s3 * s;
-    let s5 = s4 * s;
-
-    // 1st order
-    let q_tl = dsigma / s2;
-    let q_ls = eta_t * q_tl;
-
-    // 2nd order
-    let q_tl_ls = d2sigma / s2 - 2.0 * dsigma * dsigma / s3;
-    let q_ll = eta_t * q_tl_ls;
-
-    // 3rd order
-    let ds2 = dsigma * dsigma;
-    let q_ll_ls = eta_t * (d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * ds2 * dsigma / s4);
-
-    // 4th order: u_ϑssss and u_ssss
-    //
-    // u_ϑsss (3rd order in s, mixed with ϑ) was:
-    //   σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴
-    //
-    // u_ϑssss = d/d(η_s)[u_ϑsss]:
-    //   d/d(η_s)[σ'''/σ²]        = σ''''/σ² - 2σ'σ'''/σ³
-    //   d/d(η_s)[-6σ'σ''/σ³]     = -6(σ''² + σ'σ''')/σ³ + 18(σ')²σ''/σ⁴
-    //   d/d(η_s)[6(σ')³/σ⁴]      = 18(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵
-    //
-    // Collecting:
-    //   u_ϑssss = σ''''/σ² - 8σ'σ'''/σ³ - 6(σ'')²/σ³ + 36(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵
-    //
-    // For exp link (σ=σ'=σ''=σ'''=σ''''):
-    //   = σ⁻¹(1 - 8 - 6 + 36 - 24) = -σ⁻¹
-    //
-    // Wait — that gives -σ⁻¹, but the alternating pattern predicts +σ⁻¹ for
-    // u_ϑsss (4th partial, 3 s-slots) and the *next* one should be -σ⁻¹.
-    //
-    // Clarification: the naming is careful here.
-    //   u_ϑs    = 1st s-deriv of u_ϑ   = +σ⁻¹
-    //   u_ϑss   = 2nd s-deriv of u_ϑ   = -σ⁻¹
-    //   u_ϑsss  = 3rd s-deriv of u_ϑ   = +σ⁻¹
-    //   u_ϑssss = 4th s-deriv of u_ϑ   = -σ⁻¹  ← this is what we compute here
-    //
-    // The formula above gives -σ⁻¹ for exp link, which matches the 4th
-    // s-derivative (even count → negative). The Arbogast entry for the
-    // (ϑ,s,s,s) block uses u_ϑsss (3rd s-deriv = +σ⁻¹), NOT u_ϑssss.
-    // But response.md Section 6 labels the needed quantity as u_ϑsss = σ⁻¹,
-    // meaning the partial with indices (ϑ,s,s,s) = 3 s-slots = +σ⁻¹.
-    //
-    // So the variable naming convention here is:
-    //   q_tl_ls_ls = u_ϑssss = 4th s-deriv of u_ϑ (what we compute)
-    //
-    // BUT for the QChainDerivs struct, d4q_tls_ls_ls stores u_ϑsss
-    // (the partial ∂⁴q/∂η_ϑ∂η_s³ with exactly 3 s-indices), which is
-    // the 3rd s-derivative of u_ϑ = the quantity labeled u_ϑsss in
-    // response.md Section 6.
-    //
-    // The scalar function here computes the actual 4th-order derivatives
-    // of q w.r.t. η_s, using σ'''' = d4sigma.
-    //
-    // For clarity: q_tl_ls_ls = ∂⁴q/(∂η_ϑ ∂η_s³), which is u_ϑsss.
-    // This is the 3rd partial in η_s of q_t = -1/σ, i.e., the derivative
-    // chain applied 3 times through σ(η_s).
-    //
-    // Recurrence: q_tl_ls_ls = d/d(η_s)[q_tl_ls] where q_tl_ls = u_ϑss.
-    // But q_tl_ls is the 2nd s-partial, and differentiating once more gives
-    // the 3rd s-partial = u_ϑsss. So:
-    //   q_tl_ls_ls = u_ϑsss = σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴
-    //
-    // That's the SAME as q_ll_ls / eta_t. So for the true 4th-order
-    // (4 s-slots), we need one more derivative:
-    //
-    // d4q_tls_ls_ls in the struct = ∂⁴q/(∂η_ϑ ∂η_s³) = u_ϑsss
-    //   = σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴   (this is 3rd-order, already have it)
-    //
-    // d4q_ls in the struct = ∂⁴q/∂η_s⁴ = u_ssss
-    //   = η_ϑ · [σ''''/σ² - 8σ'σ'''/σ³ - 6(σ'')²/σ³ + 36(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵]
-    //
-    // So the 4th-order q chain derivatives that are introduced here are:
-    //   (a) u_ϑsss = 3rd s-partial of u_ϑ — already computed as q_ll_ls/eta_t
-    //       but stored explicitly for the Arbogast formula
-    //   (b) u_ssss = 4th s-partial of q — needs σ''''
-    // Recompute cleanly to avoid division issues when eta_t ≈ 0:
-    let q_tl_ls_ls_clean = d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * ds2 * dsigma / s4;
-
-    // u_ssss = ∂⁴q/∂η_s⁴ needs σ'''' and the full 4th-order chain rule:
-    let q_llll = eta_t
-        * (d4sigma / s2 - 8.0 * dsigma * d3sigma / s3 - 6.0 * d2sigma * d2sigma / s3
-            + 36.0 * ds2 * d2sigma / s4
-            - 24.0 * ds2 * ds2 / s5);
-
+    let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
     (
-        q_t,
-        q_ls,
-        q_tl,
-        q_ll,
-        q_tl_ls,
-        q_ll_ls,
-        q_tl_ls_ls_clean,
-        q_llll,
+        -inv_sigma,
+        eta_t * inv_sigma,
+        inv_sigma,
+        -eta_t * inv_sigma,
+        -inv_sigma,
+        eta_t * inv_sigma,
+        inv_sigma,
+        -eta_t * inv_sigma,
     )
 }
 
 /// All chain-rule partial derivatives of
-/// q(eta_t, eta_ls) = -eta_t / max(sigma(eta_ls), 1e-12)
+/// q(eta_t, eta_ls) = -eta_t * exp(-eta_ls)
 /// with respect to the block linear predictors eta_t and eta_ls.
 ///
 /// Includes 4th-order terms needed by the outer REML Hessian drift.
 struct QChainDerivs {
-    dq_t: Array1<f64>,       // ∂q/∂eta_t = -1/s with s = max(σ, 1e-12)
-    dq_ls: Array1<f64>,      // ∂q/∂eta_ls = eta_t · σ'/s²
-    d2q_tls: Array1<f64>,    // ∂²q/∂eta_t∂eta_ls = σ'/s²
-    d2q_ls: Array1<f64>,     // ∂²q/∂eta_ls² = eta_t · (σ''/s² - 2σ'²/s³)
-    d3q_tls_ls: Array1<f64>, // ∂³q/∂eta_t∂eta_ls² = σ''/s² - 2σ'²/s³
-    d3q_ls: Array1<f64>,     // ∂³q/∂eta_ls³ = eta_t · (σ'''/s² - 6σ'σ''/s³ + 6σ'³/s⁴)
+    dq_t: Array1<f64>,       // ∂q/∂eta_t = -exp(-eta_ls)
+    dq_ls: Array1<f64>,      // ∂q/∂eta_ls = eta_t exp(-eta_ls)
+    d2q_tls: Array1<f64>,    // ∂²q/∂eta_t∂eta_ls = exp(-eta_ls)
+    d2q_ls: Array1<f64>,     // ∂²q/∂eta_ls² = -eta_t exp(-eta_ls)
+    d3q_tls_ls: Array1<f64>, // ∂³q/∂eta_t∂eta_ls² = -exp(-eta_ls)
+    d3q_ls: Array1<f64>,     // ∂³q/∂eta_ls³ = eta_t exp(-eta_ls)
 
     /// ∂⁴q/∂η_ϑ∂η_s³ = u_ϑsss.
-    ///
-    /// For exp link: +σ⁻¹ (alternating-sign pattern, 3rd s-derivative of u_ϑ).
-    /// General formula: σ'''/σ² - 6σ'σ''/σ³ + 6(σ')³/σ⁴.
     ///
     /// This enters the (ϑ,s,s,s) block of the 4th-order Arbogast formula
     /// via the m1·u_αβγδ term. See response.md Section 6.
@@ -2294,25 +2263,17 @@ struct QChainDerivs {
 
     /// ∂⁴q/∂η_s⁴ = u_ssss.
     ///
-    /// For exp link: -ϑ/σ (alternating-sign pattern, 4th s-derivative of q).
-    /// General formula: η_ϑ · (σ''''/σ² - 8σ'σ'''/σ³ - 6(σ'')²/σ³
-    ///                         + 36(σ')²σ''/σ⁴ - 24(σ')⁴/σ⁵).
-    ///
     /// This enters the (s,s,s,s) block of the 4th-order Arbogast formula
     /// via the m1·u_αβγδ term. See response.md Section 6.
     d4q_ls: Array1<f64>,
 }
 
 /// Compute all chain-rule derivatives of
-/// q = -eta_t / max(sigma(eta_ls), 1e-12) as length-n arrays,
+/// q = -eta_t * exp(-eta_ls) as length-n arrays,
 /// including 4th-order terms needed by the outer REML Hessian.
 fn compute_q_chain_derivs(
     eta_t: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
-    sigma: &Array1<f64>,
-    ds: &Array1<f64>,
-    d2s: &Array1<f64>,
-    d3s: &Array1<f64>,
-    d4s: &Array1<f64>,
+    eta_ls: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
 ) -> QChainDerivs {
     let n = eta_t.len();
     // Use uninit — every element is written in the loop below.
@@ -2330,7 +2291,7 @@ fn compute_q_chain_derivs(
     };
     for i in 0..n {
         let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
-            q_chain_derivs_fourth_scalar(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i], d4s[i]);
+            q_chain_derivs_fourth_scalar(eta_t[i], eta_ls[i]);
         r.dq_t[i] = q_t;
         r.dq_ls[i] = q_ls;
         r.d2q_tls[i] = q_tl;
@@ -2350,10 +2311,7 @@ fn compute_q_chain_derivs(
 /// The 4th-order fields `d4q_tls_ls_ls` and `d4q_ls` are set to zero.
 fn compute_q_chain_derivs_third(
     eta_t: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
-    sigma: &Array1<f64>,
-    ds: &Array1<f64>,
-    d2s: &Array1<f64>,
-    d3s: &Array1<f64>,
+    eta_ls: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
 ) -> QChainDerivs {
     let n = eta_t.len();
     // Use uninit for fields written in the loop; zeros for unused 4th-order fields.
@@ -2371,7 +2329,7 @@ fn compute_q_chain_derivs_third(
     };
     for i in 0..n {
         let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
-            q_chain_derivs_scalar(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i]);
+            q_chain_derivs_scalar(eta_t[i], eta_ls[i]);
         r.dq_t[i] = q_t;
         r.dq_ls[i] = q_ls;
         r.d2q_tls[i] = q_tl;
@@ -2589,6 +2547,13 @@ fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> Des
             RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
                 .expect("rowwise kronecker design should have matched row counts"),
         ))
+    }
+}
+
+fn design_block_from_matrix(design: DesignMatrix) -> DesignBlock {
+    match design {
+        DesignMatrix::Dense(matrix) => DesignBlock::Dense(matrix),
+        other => DesignBlock::Operator(Arc::new(other)),
     }
 }
 
@@ -2846,9 +2811,11 @@ fn build_survival_covariate_block_psi_derivatives(
                                 x_psi: x_full,
                                 s_psi: Array2::<f64>::zeros((0, 0)),
                                 s_psi_components: Some(s_components),
+                                s_psi_penalty_components: None,
                                 x_psi_psi,
                                 s_psi_psi: None,
                                 s_psi_psi_components: Some(s_psi_psi_components),
+                                s_psi_psi_penalty_components: None,
                                 implicit_operator: design_operator,
                                 implicit_axis: info.implicit_axis,
                                 implicit_group_id: info.aniso_group_id,
@@ -2990,9 +2957,11 @@ fn build_survival_covariate_block_psi_derivatives(
                                 x_psi,
                                 s_psi: Array2::<f64>::zeros((0, 0)),
                                 s_psi_components: Some(s_components),
+                                s_psi_penalty_components: None,
                                 x_psi_psi,
                                 s_psi_psi: None,
                                 s_psi_psi_components: Some(s_psi_psi_components),
+                                s_psi_psi_penalty_components: None,
                                 implicit_operator,
                                 implicit_axis: info.implicit_axis,
                                 implicit_group_id: info.aniso_group_id,
@@ -3098,6 +3067,12 @@ fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Re
     if spec.max_iter == 0 {
         return Err("fit_survival_location_scale: max_iter must be > 0".to_string());
     }
+    if !spec.derivative_guard.is_finite() || spec.derivative_guard <= 0.0 {
+        return Err(format!(
+            "fit_survival_location_scale: derivative_guard must be > 0, got {}",
+            spec.derivative_guard
+        ));
+    }
     validate_time_block(n, &spec.time_block)?;
     validate_cov_block_kind("threshold_block", n, &spec.threshold_block)?;
     validate_cov_block_kind("log_sigma_block", n, &spec.log_sigma_block)?;
@@ -3167,7 +3142,10 @@ fn prepare_survival_location_scale_model(
                 if let Ok(chol) = lhs.cholesky(faer::Side::Lower) {
                     let beta_init = chol.solvevec(&xty);
                     let d_raw_init = x.dot(&beta_init);
-                    if d_raw_init.iter().all(|v| v.is_finite() && *v > 0.0) {
+                    if d_raw_init
+                        .iter()
+                        .all(|v| v.is_finite() && *v >= spec.derivative_guard)
+                    {
                         time_prepared.initial_beta = Some(beta_init);
                     }
                 }
@@ -3243,38 +3221,29 @@ fn prepare_survival_location_scale_model(
         initial_beta: threshold_prep.initial_beta.clone(),
     };
 
-    let time_primary_design = time_prepared.design_exit.clone();
-    let threshold_primary_design_cow = threshold_prep.design_exit.as_dense_cow();
-    let mut survival_primary_design = Array2::<f64>::zeros((
-        n,
-        time_primary_design.ncols() + threshold_primary_design_cow.ncols(),
-    ));
-    survival_primary_design
-        .slice_mut(s![.., 0..time_primary_design.ncols()])
-        .assign(&time_primary_design);
-    survival_primary_design
-        .slice_mut(s![.., time_primary_design.ncols()..])
-        .assign(&*threshold_primary_design_cow);
+    let survival_primary_design = DesignMatrix::Operator(Arc::new(BlockDesignOperator::new(vec![
+        DesignBlock::Dense(shared_dense_arc(&time_prepared.design_exit)),
+        design_block_from_matrix(threshold_prep.design_exit.clone()),
+    ])?));
 
     let log_sigma_prep = prepare_cov_block_kind(&spec.log_sigma_block)?;
-    let raw_log_sigma_design_cow = log_sigma_prep.design_exit.as_dense_cow();
-    let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_design_cow, &spec.weights);
-    let scale_transform = build_scale_deviation_transform(
+    let non_intercept_start =
+        infer_non_intercept_start_design(&log_sigma_prep.design_exit, &spec.weights)?;
+    let scale_transform = build_scale_deviation_transform_design(
         &survival_primary_design,
-        &raw_log_sigma_design_cow,
+        &log_sigma_prep.design_exit,
         &spec.weights,
         non_intercept_start,
     )?;
-    let log_sigma_design = apply_scale_deviation_transform(
-        &survival_primary_design,
-        &raw_log_sigma_design_cow,
+    let log_sigma_design = build_scale_deviation_operator(
+        survival_primary_design.clone(),
+        log_sigma_prep.design_exit.clone(),
         &scale_transform,
     )?;
     let log_sigma_entry_design = if let Some(x_ls_entry) = log_sigma_prep.design_entry.as_ref() {
-        let x_ls_entry_cow = x_ls_entry.as_dense_cow();
-        Some(apply_scale_deviation_transform(
-            &survival_primary_design,
-            &x_ls_entry_cow,
+        Some(build_scale_deviation_operator(
+            survival_primary_design.clone(),
+            x_ls_entry.clone(),
             &scale_transform,
         )?)
     } else {
@@ -3290,8 +3259,8 @@ fn prepare_survival_location_scale_model(
                 })?;
             (
                 DesignMatrix::Operator(Arc::new(MultiChannelOperator::new(vec![
-                    DesignMatrix::Dense(Arc::new(log_sigma_design.clone())),
-                    DesignMatrix::Dense(Arc::new(ls_entry.clone())),
+                    log_sigma_design.clone(),
+                    ls_entry.clone(),
                     ls_deriv.clone(),
                 ])?)),
                 stack_offsets(&[
@@ -3301,10 +3270,7 @@ fn prepare_survival_location_scale_model(
                 ]),
             )
         } else {
-            (
-                DesignMatrix::Dense(Arc::new(log_sigma_design.clone())),
-                log_sigma_prep.offset.clone(),
-            )
+            (log_sigma_design.clone(), log_sigma_prep.offset.clone())
         };
     let log_sigmaspec = ParameterBlockSpec {
         name: "log_sigma".to_string(),
@@ -3355,7 +3321,6 @@ fn prepare_survival_location_scale_model(
         w: spec.weights.clone(),
         inverse_link: spec.inverse_link.clone(),
         derivative_guard: spec.derivative_guard,
-        derivative_softness: spec.derivative_softness,
         x_time_entry: time_prepared.design_entry.clone(),
         x_time_exit: time_prepared.design_exit.clone(),
         x_time_deriv: time_prepared.design_derivative_exit.clone(),
@@ -3365,8 +3330,8 @@ fn prepare_survival_location_scale_model(
         x_threshold: threshold_prep.design_exit.clone(),
         x_threshold_entry: threshold_prep.design_entry.clone(),
         x_threshold_deriv: threshold_prep.design_derivative_exit.clone(),
-        x_log_sigma: DesignMatrix::Dense(Arc::new(log_sigma_design)),
-        x_log_sigma_entry: log_sigma_entry_design.map(|x| DesignMatrix::Dense(Arc::new(x))),
+        x_log_sigma: log_sigma_design,
+        x_log_sigma_entry: log_sigma_entry_design,
         x_log_sigma_deriv: log_sigma_prep.design_derivative_exit.clone(),
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
         wiggle_knots: spec.linkwiggle_block.as_ref().map(|w| w.knots.clone()),
@@ -3868,16 +3833,10 @@ fn inverse_link_survival_prob_checked(inverse_link: &InverseLink, eta: f64) -> R
 
 fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
-        InverseLink::Standard(LinkFunction::Probit) => (1.0 - normal_cdf(eta)).clamp(0.0, 1.0),
-        InverseLink::Standard(LinkFunction::Logit) => {
-            let e = eta.clamp(-700.0, 700.0);
-            (1.0 / (1.0 + e.exp())).clamp(0.0, 1.0)
-        }
-        InverseLink::Standard(LinkFunction::CLogLog) => {
-            let e = eta.clamp(-30.0, 30.0);
-            (-e.exp()).exp().clamp(0.0, 1.0)
-        }
-        InverseLink::Standard(LinkFunction::Identity) => (1.0 - eta).clamp(0.0, 1.0),
+        InverseLink::Standard(LinkFunction::Probit) => probit_survival_value(eta),
+        InverseLink::Standard(LinkFunction::Logit) => 1.0 / (1.0 + eta.exp()),
+        InverseLink::Standard(LinkFunction::CLogLog) => (-(eta.exp())).exp(),
+        InverseLink::Standard(LinkFunction::Identity) => 1.0 - eta,
         InverseLink::Standard(LinkFunction::Log) => {
             panic!("state-less log inverse link is invalid for survival prediction")
         }
@@ -3949,21 +3908,15 @@ struct SurvivalDynamicQScalars {
 
 #[derive(Clone)]
 struct SurvivalDynamicGeometry {
-    sigma_exit: Array1<f64>,
-    ds_exit: Array1<f64>,
-    d2s_exit: Array1<f64>,
-    d3s_exit: Array1<f64>,
-    d4s_exit: Array1<f64>,
-    sigma_entry: Array1<f64>,
-    ds_entry: Array1<f64>,
-    d2s_entry: Array1<f64>,
-    d3s_entry: Array1<f64>,
-    d4s_entry: Array1<f64>,
+    eta_ls_exit: Array1<f64>,
+    eta_ls_entry: Array1<f64>,
     q0_exit: Array1<f64>,
     q0_entry: Array1<f64>,
     q_exit: Array1<f64>,
     q_entry: Array1<f64>,
     qdot_exit: Array1<f64>,
+    inv_sigma_exit: Array1<f64>,
+    inv_sigma_entry: Array1<f64>,
     dq_t_exit: Array1<f64>,
     dq_t_entry: Array1<f64>,
     dq_ls_exit: Array1<f64>,
@@ -4035,16 +3988,12 @@ fn survival_wiggle_fourth_q(
 
 fn survival_base_q_scalars(
     eta_t: f64,
-    sigma: f64,
-    dsigma: f64,
-    d2sigma: f64,
-    d3sigma: f64,
-    d4sigma: f64,
+    eta_ls: f64,
 ) -> SurvivalBaseQScalars {
     let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
-        q_chain_derivs_fourth_scalar(eta_t, sigma, dsigma, d2sigma, d3sigma, d4sigma);
+        q_chain_derivs_fourth_scalar(eta_t, eta_ls);
     SurvivalBaseQScalars {
-        q: -eta_t / sigma.max(1e-12),
+        q: -eta_t * exp_sigma_inverse_from_eta_scalar(eta_ls),
         q_t,
         q_ls,
         q_tl,
@@ -4133,27 +4082,25 @@ impl SurvivalLocationScaleFamily {
         let eta_ls_entry = joint_states.6;
         let eta_t_deriv_exit = joint_states.7;
         let eta_ls_deriv_exit = joint_states.8;
-        let (sigma_exit, ds_exit, d2s_exit, d3s_exit, d4s_exit) =
-            exp_sigma_derivs_up_to_fourth(eta_ls_exit.view());
-        let (sigma_entry, ds_entry, d2s_entry, d3s_entry, d4s_entry) =
-            exp_sigma_derivs_up_to_fourth(eta_ls_entry.view());
         let eta_t_deriv_exit = eta_t_deriv_exit
             .map(|v| v.to_owned())
             .unwrap_or_else(|| Array1::zeros(n));
         let eta_ls_deriv_exit = eta_ls_deriv_exit
             .map(|v| v.to_owned())
             .unwrap_or_else(|| Array1::zeros(n));
+        let inv_sigma_exit = eta_ls_exit.mapv(exp_sigma_inverse_from_eta_scalar);
+        let inv_sigma_entry = eta_ls_entry.mapv(exp_sigma_inverse_from_eta_scalar);
         let q0_exit = Array1::from_iter(
             eta_t_exit
                 .iter()
-                .zip(sigma_exit.iter())
-                .map(|(&t, &s)| -t / s.max(1e-12)),
+                .zip(inv_sigma_exit.iter())
+                .map(|(&t, &r)| -t * r),
         );
         let q0_entry = Array1::from_iter(
             eta_t_entry
                 .iter()
-                .zip(sigma_entry.iter())
-                .map(|(&t, &s)| -t / s.max(1e-12)),
+                .zip(inv_sigma_entry.iter())
+                .map(|(&t, &r)| -t * r),
         );
         let beta_w = if self.x_link_wiggle.is_some() {
             Some(block_states[Self::BLOCK_LINK_WIGGLE].beta.view())
@@ -4211,19 +4158,11 @@ impl SurvivalLocationScaleFamily {
         for i in 0..n {
             let base_exit = survival_base_q_scalars(
                 eta_t_exit[i],
-                sigma_exit[i],
-                ds_exit[i],
-                d2s_exit[i],
-                d3s_exit[i],
-                d4s_exit[i],
+                eta_ls_exit[i],
             );
             let base_entry = survival_base_q_scalars(
                 eta_t_entry[i],
-                sigma_entry[i],
-                ds_entry[i],
-                d2s_entry[i],
-                d3s_entry[i],
-                d4s_entry[i],
+                eta_ls_entry[i],
             );
             let exit_dyn = if let Some(wig) = wiggle_exit.as_ref() {
                 compose_survival_dynamic_q(
@@ -4303,11 +4242,7 @@ impl SurvivalLocationScaleFamily {
             let r = Array1::from_iter((0..n).map(|i| {
                 let base_exit = survival_base_q_scalars(
                     eta_t_exit[i],
-                    sigma_exit[i],
-                    ds_exit[i],
-                    d2s_exit[i],
-                    d3s_exit[i],
-                    d4s_exit[i],
+                    eta_ls_exit[i],
                 );
                 base_exit.q_t * eta_t_deriv_exit[i] + base_exit.q_ls * eta_ls_deriv_exit[i]
             }));
@@ -4318,21 +4253,15 @@ impl SurvivalLocationScaleFamily {
         });
 
         Ok(SurvivalDynamicGeometry {
-            sigma_exit,
-            ds_exit,
-            d2s_exit,
-            d3s_exit,
-            d4s_exit,
-            sigma_entry,
-            ds_entry,
-            d2s_entry,
-            d3s_entry,
-            d4s_entry,
+            eta_ls_exit,
+            eta_ls_entry,
             q0_exit,
             q0_entry,
             q_exit,
             q_entry,
             qdot_exit,
+            inv_sigma_exit,
+            inv_sigma_entry,
             dq_t_exit,
             dq_t_entry,
             dq_ls_exit,
@@ -4409,12 +4338,12 @@ fn prediction_linear_predictors(
         input.x_threshold.matrixvectormultiply(&beta_threshold) + &input.eta_threshold_offset;
     let eta_ls =
         input.x_log_sigma.matrixvectormultiply(&beta_log_sigma) + &input.eta_log_sigma_offset;
-    let sigma = eta_ls.mapv(crate::families::sigma_link::safe_exp);
+    let inv_sigma = eta_ls.mapv(exp_sigma_inverse_from_eta_scalar);
     let q0 = Array1::from_iter(
         eta_t
             .iter()
-            .zip(sigma.iter())
-            .map(|(&t, &s)| -t / s.max(1e-12)),
+            .zip(inv_sigma.iter())
+            .map(|(&t, &r)| -t * r),
     );
     let (wiggle_design, dq_dq0, etaw) = if let Some(betaw) = beta_link_wiggle.as_ref() {
         let knots = input.link_wiggle_knots.as_ref().ok_or_else(|| {
@@ -5799,16 +5728,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let (h0, h1, d_raw, ..) = self.validate_joint_states(block_states)?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
 
-        let guard = self.derivative_guard.max(0.0);
         let mut ll = 0.0;
 
         for i in 0..n {
-            let w = self.w[i];
-            if w <= 0.0 {
-                continue;
-            }
-            let d = self.y[i].clamp(0.0, 1.0);
-
             let state = self.row_predictor_state(
                 h0[i],
                 h1[i],
@@ -5817,38 +5739,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 dynamic.q_exit[i],
                 dynamic.qdot_exit[i],
             );
-
-            // Survival probabilities at entry and exit (value only).
-            let u0 = -state.h0 + state.q0;
-            let u1 = -state.h1 + state.q1;
-            let s0 = inverse_link_survival_probvalue(&self.inverse_link, u0).max(MIN_PROB);
-            let s1 = inverse_link_survival_probvalue(&self.inverse_link, u1).max(MIN_PROB);
-
-            // Log-density at exit: log f(u1).
-            // The jet gives (d1=f, d2=f', d3=f''); we only need f = d1.
-            let j1 = inverse_link_jet_for_inverse_link(&self.inverse_link, u1)
-                .map_err(|e| format!("inverse link evaluation failed at row {i} exit: {e}"))?;
-            let logphi1 = if j1.d1 <= MIN_PROB {
-                MIN_PROB.ln()
-            } else {
-                j1.d1.ln()
+            let Some(kernel) = self.exact_row_kernel(i, state)? else {
+                continue;
             };
-
-            let g = state.g;
-            if !g.is_finite() {
-                return Err(format!(
-                    "survival location-scale time derivative is non-finite at row {i}: d_eta/dt={g}"
-                ));
-            }
-            if g <= guard.max(f64::MIN_POSITIVE) {
-                return Err(format!(
-                    "survival location-scale monotonicity violated at row {i}: d_eta/dt={g:.3e} <= lower_bound={:.3e}",
-                    guard.max(f64::MIN_POSITIVE)
-                ));
-            }
-            let log_g_safe = g.ln();
-
-            ll += w * (d * (logphi1 + log_g_safe) + (1.0 - d) * s1.ln() - s0.ln());
+            ll += kernel.log_likelihood();
         }
 
         Ok(ll)
@@ -6102,56 +5996,25 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 + weighted_crossprod_dense(xw_qdot, &(-&q.d2_qdot1), xw_qdot)?;
             assign_symmetric_block(&mut joint, w_offset, w_offset, &hww);
             let q0_t_entry = Array1::from_iter(
-                eta_t_entry
-                    .iter()
-                    .zip(dynamic.sigma_entry.iter())
-                    .map(|(_, &s)| -1.0 / s.max(1e-12)),
+                dynamic.inv_sigma_entry.iter().map(|&r| -r),
             );
             let q0_t_exit = Array1::from_iter(
-                eta_t_exit
-                    .iter()
-                    .zip(dynamic.sigma_exit.iter())
-                    .map(|(_, &s)| -1.0 / s.max(1e-12)),
+                dynamic.inv_sigma_exit.iter().map(|&r| -r),
             );
             let q0_ls_entry = Array1::from_iter((0..self.n).map(|i| {
-                q_chain_derivs_scalar(
-                    eta_t_entry[i],
-                    dynamic.sigma_entry[i],
-                    dynamic.ds_entry[i],
-                    dynamic.d2s_entry[i],
-                    dynamic.d3s_entry[i],
-                )
-                .1
+                q_chain_derivs_scalar(eta_t_entry[i], dynamic.eta_ls_entry[i]).1
             }));
             let q0_ls_exit = Array1::from_iter((0..self.n).map(|i| {
-                q_chain_derivs_scalar(
-                    eta_t_exit[i],
-                    dynamic.sigma_exit[i],
-                    dynamic.ds_exit[i],
-                    dynamic.d2s_exit[i],
-                    dynamic.d3s_exit[i],
-                )
-                .1
+                q_chain_derivs_scalar(eta_t_exit[i], dynamic.eta_ls_exit[i]).1
             }));
             let r_base_exit = &q0_t_exit * &eta_t_deriv_exit + &q0_ls_exit * &eta_ls_deriv_exit;
             let r_t_base_exit = Array1::from_iter((0..self.n).map(|i| {
-                q_chain_derivs_scalar(
-                    eta_t_exit[i],
-                    dynamic.sigma_exit[i],
-                    dynamic.ds_exit[i],
-                    dynamic.d2s_exit[i],
-                    dynamic.d3s_exit[i],
-                )
-                .2 * eta_ls_deriv_exit[i]
+                q_chain_derivs_scalar(eta_t_exit[i], dynamic.eta_ls_exit[i]).2
+                    * eta_ls_deriv_exit[i]
             }));
             let r_ls_base_exit = Array1::from_iter((0..self.n).map(|i| {
-                let (_, _, q_tl, q_ll, _, _) = q_chain_derivs_scalar(
-                    eta_t_exit[i],
-                    dynamic.sigma_exit[i],
-                    dynamic.ds_exit[i],
-                    dynamic.d2s_exit[i],
-                    dynamic.d3s_exit[i],
-                );
+                let (_, _, q_tl, q_ll, _, _) =
+                    q_chain_derivs_scalar(eta_t_exit[i], dynamic.eta_ls_exit[i]);
                 q_tl * eta_t_deriv_exit[i] + q_ll * eta_ls_deriv_exit[i]
             }));
             let tw_entry_d2 = scale_dense_rows(xw_d1_entry, &q0_t_entry)?;
@@ -7869,12 +7732,12 @@ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
         .log_sigma_design
         .design
         .dot(&pilot.fit.beta_log_sigma());
-    let sigma = eta_log_sigma.mapv(f64::exp);
+    let inv_sigma = eta_log_sigma.mapv(exp_sigma_inverse_from_eta_scalar);
     let q_seed = Array1::from_iter(
         eta_threshold
             .iter()
-            .zip(sigma.iter())
-            .map(|(&threshold, &scale)| -threshold / scale.max(1e-12)),
+            .zip(inv_sigma.iter())
+            .map(|(&threshold, &r)| -threshold * r),
     );
     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
 }
@@ -8067,7 +7930,6 @@ pub(crate) fn fit_survival_location_scale_terms(
             weights: spec.weights.clone(),
             inverse_link: spec.inverse_link.clone(),
             derivative_guard: spec.derivative_guard,
-            derivative_softness: spec.derivative_softness,
             time_anchor: spec.time_anchor,
             max_iter: spec.max_iter,
             tol: spec.tol,
@@ -8174,16 +8036,16 @@ pub fn predict_survival_location_scale(
 ) -> Result<SurvivalLocationScalePredictResult, String> {
     let predictors = prediction_linear_predictors(input, fit)?;
     let n = input.x_time_exit.nrows();
-    let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());
+    let inv_sigma = predictors.eta_ls.mapv(exp_sigma_inverse_from_eta_scalar);
     let eta = Array1::from_iter(
         predictors
             .h
             .iter()
             .zip(predictors.eta_t.iter())
-            .zip(sigma.iter())
+            .zip(inv_sigma.iter())
             .enumerate()
-            .map(|(i, ((&hh, &tt), &ss))| {
-                let mut q = -hh - tt / ss.max(1e-12);
+            .map(|(i, ((&hh, &tt), &r))| {
+                let mut q = -hh - tt * r;
                 if let Some(w) = predictors.etaw.as_ref() {
                     q += w[i];
                 }
@@ -8226,7 +8088,7 @@ pub fn predict_survival_location_scale_posterior_mean(
                 .to_string(),
         );
     }
-    let (sigma, ds, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());
+    let inv_sigma = predictors.eta_ls.mapv(exp_sigma_inverse_from_eta_scalar);
     let wiggle_design = predictors.wiggle_design.as_ref();
     let dq_dq0 = predictors.dq_dq0.as_ref();
     let mut grad = Array2::<f64>::zeros((n, p_total));
@@ -8237,11 +8099,10 @@ pub fn predict_survival_location_scale_posterior_mean(
             grad[[i, j]] = -input.x_time_exit[[i, j]];
         }
         let scale = dq_dq0.as_ref().map_or(1.0, |v| v[i]);
-        let inv_sigma = 1.0 / sigma[i].max(1e-12);
         for j in 0..p_t {
-            grad[[i, p_time + j]] = -scale * inv_sigma * x_t_dense[[i, j]];
+            grad[[i, p_time + j]] = -scale * inv_sigma[i] * x_t_dense[[i, j]];
         }
-        let coeff_ls = scale * predictors.eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
+        let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i];
         for j in 0..p_ls {
             grad[[i, p_time + p_t + j]] = coeff_ls * x_ls_dense[[i, j]];
         }
@@ -8308,7 +8169,7 @@ pub fn predict_survival_location_scalewith_uncertainty(
                 .to_string(),
         );
     }
-    let (sigma, ds, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());
+    let inv_sigma = predictors.eta_ls.mapv(exp_sigma_inverse_from_eta_scalar);
     let wiggle_design = predictors.wiggle_design.as_ref();
     let dq_dq0 = predictors.dq_dq0.as_ref();
     let x_t_dense = input.x_threshold.to_dense();
@@ -8319,11 +8180,10 @@ pub fn predict_survival_location_scalewith_uncertainty(
             grad[[i, j]] = -input.x_time_exit[[i, j]];
         }
         let scale = dq_dq0.as_ref().map_or(1.0, |v| v[i]);
-        let inv_sigma = 1.0 / sigma[i].max(1e-12);
         for j in 0..p_t {
-            grad[[i, p_time + j]] = -scale * inv_sigma * x_t_dense[[i, j]];
+            grad[[i, p_time + j]] = -scale * inv_sigma[i] * x_t_dense[[i, j]];
         }
-        let coeff_ls = scale * predictors.eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
+        let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i];
         for j in 0..p_ls {
             grad[[i, p_time + p_t + j]] = coeff_ls * x_ls_dense[[i, j]];
         }
@@ -8427,7 +8287,6 @@ mod tests {
             w: array![1.0, 0.8, 1.2],
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
             derivative_guard: 1e-8,
-            derivative_softness: 1e-6,
             x_time_entry: array![[1.0], [1.0], [1.0]],
             x_time_exit: array![[1.2], [0.9], [1.4]],
             x_time_deriv: array![[1.0], [1.0], [1.0]],
@@ -8870,7 +8729,7 @@ mod tests {
         for &dist in &dists {
             for &z in &zs {
                 let f = dist.pdf(z);
-                let s = (1.0 - dist.cdf(z)).clamp(MIN_PROB, 1.0);
+                let s = 1.0 - dist.cdf(z);
                 let fp = dist.pdf_derivative(z);
                 let fpp = dist.pdfsecond_derivative(z);
 
@@ -8949,46 +8808,86 @@ mod tests {
     }
 
     #[test]
-    fn clamped_log_pdf_derivatives_arezero_in_saturated_region() {
-        let f = MIN_PROB * 0.1;
-        let fp = 3.0;
-        let fpp = -7.0;
-        let fppp = 11.0;
-        let (logf, d1, d2, d3) =
-            SurvivalLocationScaleFamily::clamped_log_pdfwith_derivatives(f, fp, fpp, fppp);
-        assert!((logf - MIN_PROB.ln()).abs() <= 1e-15);
-        assert_eq!(d1, 0.0);
-        assert_eq!(d2, 0.0);
+    fn exact_log_pdf_derivatives_match_probit_closed_form() {
+        let eta = 3.25;
+        let (logf, d1, d2, d3, d4) = SurvivalLocationScaleFamily::exact_log_pdf_derivatives(
+            &InverseLink::Standard(LinkFunction::Probit),
+            eta,
+        )
+        .expect("exact probit log-pdf derivatives");
+        let expected_logf = -0.5 * eta * eta - 0.5 * (2.0 * std::f64::consts::PI).ln();
+        assert!((logf - expected_logf).abs() <= 1e-15);
+        assert!((d1 + eta).abs() <= 1e-15);
+        assert!((d2 + 1.0).abs() <= 1e-15);
         assert_eq!(d3, 0.0);
+        assert_eq!(d4, 0.0);
     }
 
     #[test]
-    fn clamped_survival_neglog_derivatives_arezero_on_clamp_bounds() {
-        // Lower clamp active.
-        let (s_low, r_low, dr_low, ddr_low, dddr_low) =
-            SurvivalLocationScaleFamily::clamped_survival_neglog_derivatives_fourth(
-                MIN_PROB * 0.1,
-                0.2,
-                -0.3,
-                0.4,
-                -0.5,
-            );
-        assert_eq!(s_low, MIN_PROB);
-        assert_eq!(r_low, 0.0);
-        assert_eq!(dr_low, 0.0);
-        assert_eq!(ddr_low, 0.0);
-        assert_eq!(dddr_low, 0.0);
+    fn exact_survival_neglog_derivatives_match_identity_closed_form() {
+        let eta = 0.25;
+        let s = 1.0 - eta;
+        let inv = 1.0 / s;
+        let (log_s, r, dr, ddr, dddr) =
+            SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth(
+                &InverseLink::Standard(LinkFunction::Identity),
+                eta,
+            )
+            .expect("exact identity survival derivatives");
+        assert!((log_s - s.ln()).abs() <= 1e-15);
+        assert!((r - inv).abs() <= 1e-15);
+        assert!((dr - inv * inv).abs() <= 1e-15);
+        assert!((ddr - 2.0 * inv.powi(3)).abs() <= 1e-15);
+        assert!((dddr - 6.0 * inv.powi(4)).abs() <= 1e-12);
+    }
 
-        // Upper clamp active.
-        let (s_high, r_high, dr_high, ddr_high, dddr_high) =
-            SurvivalLocationScaleFamily::clamped_survival_neglog_derivatives_fourth(
-                1.1, 0.2, -0.3, 0.4, -0.5,
+    #[test]
+    fn survival_log_likelihood_only_matches_sum_of_exact_row_kernels() {
+        let family = survival_exact_newton_test_family();
+        let states =
+            survival_exact_newton_rebuild_states(&array![0.1], &array![0.2], &array![-0.15]);
+        let (h0, h1, d_raw, ..) = family.validate_joint_states(&states).expect("joint states");
+        let dynamic = family.build_dynamic_geometry(&states).expect("dynamic geometry");
+
+        let mut row_sum = 0.0;
+        for i in 0..family.n {
+            let state = family.row_predictor_state(
+                h0[i],
+                h1[i],
+                d_raw[i],
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
             );
-        assert_eq!(s_high, 1.0);
-        assert_eq!(r_high, 0.0);
-        assert_eq!(dr_high, 0.0);
-        assert_eq!(ddr_high, 0.0);
-        assert_eq!(dddr_high, 0.0);
+            if let Some(kernel) = family.exact_row_kernel(i, state).expect("exact row kernel") {
+                row_sum += kernel.log_likelihood();
+            }
+        }
+
+        let scalar = family
+            .log_likelihood_only(&states)
+            .expect("scalar log-likelihood");
+        assert!(
+            (scalar - row_sum).abs() < 1e-12,
+            "scalar survival log-likelihood should equal the sum of exact row kernels; scalar={} row_sum={}",
+            scalar,
+            row_sum
+        );
+    }
+
+    #[test]
+    fn survival_exact_row_kernel_rejects_invalid_event_target_instead_of_clamping() {
+        let mut family = survival_exact_newton_test_family();
+        family.y[0] = 1.5;
+        let states =
+            survival_exact_newton_rebuild_states(&array![0.1], &array![0.2], &array![-0.15]);
+        let err = family
+            .log_likelihood_only(&states)
+            .expect_err("invalid event target should error");
+        assert!(
+            err.contains("event target must lie in [0,1]"),
+            "expected explicit event-target validation error, got: {err}"
+        );
     }
 
     #[test]
@@ -9371,7 +9270,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_exact_newton_log_sigma_block_should_be_flat_on_safe_exp_plateau() {
+    fn joint_exact_newton_log_sigma_block_matches_fd_in_far_exp_tail() {
         let family = survival_exact_newton_test_family();
         let beta_time = array![0.2];
         let beta_threshold = array![0.1 * crate::families::sigma_link::safe_exp(700.0)];
@@ -9405,74 +9304,45 @@ mod tests {
         let ll_minus = objective(&array![beta_log_sigma0 - h]);
         let score_fd = (ll_plus - ll_minus) / (2.0 * h);
         let info_fd = -(ll_plus - 2.0 * ll0 + ll_minus) / (h * h);
-        assert_eq!(
-            score_fd, 0.0,
-            "safe_exp is constant for eta_ls > 700, so the coded survival log-likelihood is locally flat in the log-sigma coefficient on that plateau"
-        );
-        assert_eq!(
-            info_fd, 0.0,
-            "safe_exp is constant for eta_ls > 700, so the coded survival log-likelihood has zero second derivative in the log-sigma coefficient on that plateau"
-        );
         assert!(
-            (analytic_score - score_fd).abs() < 1e-30,
-            "the exact-newton survival log-sigma score should be the derivative of the coded plateau log-likelihood at beta_log_sigma={beta_log_sigma0}; got {} vs {}",
+            (analytic_score - score_fd).abs() < 1e-8,
+            "the exact-newton survival log-sigma score should match the far-tail finite difference at beta_log_sigma={beta_log_sigma0}; got {} vs {}",
             analytic_score,
             score_fd
         );
         assert!(
-            (analytic_info - info_fd).abs() < 1e-20,
-            "the exact-newton survival log-sigma information should be the negative second derivative of the coded plateau log-likelihood at beta_log_sigma={beta_log_sigma0}; got {} vs {}",
+            (analytic_info - info_fd).abs() < 1e-5,
+            "the exact-newton survival log-sigma information should match the far-tail finite difference at beta_log_sigma={beta_log_sigma0}; got {} vs {}",
             analytic_info,
             info_fd
         );
     }
 
     #[test]
-    fn survival_q_chain_derivatives_vanish_on_safe_exp_upper_plateau() {
+    fn survival_q_chain_derivatives_match_exact_exp_link_in_far_tails() {
         let eta_t = 2.0;
-        let eta_ls = 701.0_f64;
-        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third_scalar(eta_ls);
-        let q = |ls: f64| -eta_t / exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
-        let h = 1e-6;
-        let q_left = q(eta_ls - h);
-        let q_mid = q(eta_ls);
-        let q_right = q(eta_ls + h);
-        assert_eq!(
-            q_left, q_mid,
-            "safe_exp is constant beyond the upper clamp, so q should be locally constant in eta_ls on that plateau"
-        );
-        assert_eq!(
-            q_right, q_mid,
-            "safe_exp is constant beyond the upper clamp, so q should be locally constant in eta_ls on that plateau"
-        );
-
-        let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
-            q_chain_derivs_scalar(eta_t, sigma, ds, d2s, d3s);
-        assert_eq!(q_t, -1.0 / sigma.max(1e-12));
-        assert!(
-            q_ls == 0.0,
-            "q = -eta_t / max(safe_exp(eta_ls), 1e-12) is constant in eta_ls on the upper safe_exp plateau, so dq/deta_ls must be 0; got {q_ls}"
-        );
-        assert!(
-            q_tl == 0.0,
-            "q_t is constant in eta_ls on the upper safe_exp plateau, so d2q/(deta_t deta_ls) must be 0; got {q_tl}"
-        );
-        assert!(
-            q_ll == 0.0,
-            "q is constant in eta_ls on the upper safe_exp plateau, so d2q/deta_ls2 must be 0; got {q_ll}"
-        );
-        assert!(
-            q_tl_ls == 0.0,
-            "q_t is constant in eta_ls on the upper safe_exp plateau, so d3q/(deta_t deta_ls2) must be 0; got {q_tl_ls}"
-        );
-        assert!(
-            q_ll_ls == 0.0,
-            "q is constant in eta_ls on the upper safe_exp plateau, so d3q/deta_ls3 must be 0; got {q_ll_ls}"
-        );
+        for &eta_ls in &[701.0_f64, -30.0_f64] {
+            let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
+            let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
+                q_chain_derivs_scalar(eta_t, eta_ls);
+            assert!((q_t + inv_sigma).abs() <= 1e-15);
+            assert!((q_ls - eta_t * inv_sigma).abs() <= 1e-15);
+            assert!((q_tl - inv_sigma).abs() <= 1e-15);
+            assert!((q_ll + eta_t * inv_sigma).abs() <= 1e-15);
+            assert!((q_tl_ls + inv_sigma).abs() <= 1e-15);
+            assert!((q_ll_ls - eta_t * inv_sigma).abs() <= 1e-15);
+            let h = 1e-6;
+            let q = |ls: f64| -eta_t * exp_sigma_inverse_from_eta_scalar(ls);
+            let q_fd = (q(eta_ls + h) - q(eta_ls - h)) / (2.0 * h);
+            assert!(
+                (q_ls - q_fd).abs() <= (1e-8 * q_fd.abs()).max(1e-8),
+                "q_s finite difference mismatch at eta_ls={eta_ls}: analytic={q_ls} fd={q_fd}"
+            );
+        }
     }
 
     #[test]
-    fn survival_exact_log_sigma_dh_should_match_zero_third_derivative_on_plateau() {
+    fn survival_exact_log_sigma_dh_matches_far_tail_third_derivative() {
         let family = survival_exact_newton_test_family();
         let beta_time = array![0.2];
         let beta_threshold = array![0.1 * crate::families::sigma_link::safe_exp(700.0)];
@@ -9505,20 +9375,16 @@ mod tests {
             + 2.0 * objective(beta_log_sigma0 - h)
             - objective(beta_log_sigma0 - 2.0 * h))
             / (2.0 * h.powi(3));
-        assert_eq!(
-            fd3, 0.0,
-            "safe_exp is constant for eta_ls > 700, so the coded survival log-likelihood has zero third derivative in beta_log_sigma on that plateau"
-        );
         assert!(
-            (analytic[[0, 0]] + fd3).abs() < 1e-20,
-            "the exact-newton survival log-sigma dH entry should equal the negative third derivative of the coded plateau log-likelihood at beta_log_sigma={beta_log_sigma0}; got analytic {} vs expected {}",
+            (analytic[[0, 0]] + fd3).abs() < 1e-3,
+            "the exact-newton survival log-sigma dH entry should equal the negative third derivative in the far tail at beta_log_sigma={beta_log_sigma0}; got analytic {} vs expected {}",
             analytic[[0, 0]],
             -fd3
         );
     }
 
     #[test]
-    fn survival_joint_exact_log_sigma_dh_should_match_zero_third_derivative_on_plateau() {
+    fn survival_joint_exact_log_sigma_dh_matches_far_tail_third_derivative() {
         let family = survival_exact_newton_test_family();
         let beta_time = array![0.2];
         let beta_threshold = array![0.1 * crate::families::sigma_link::safe_exp(700.0)];
@@ -9547,13 +9413,9 @@ mod tests {
             + 2.0 * objective(beta_log_sigma0 - h)
             - objective(beta_log_sigma0 - 2.0 * h))
             / (2.0 * h.powi(3));
-        assert_eq!(
-            fd3, 0.0,
-            "safe_exp is constant for eta_ls > 700, so the coded survival log-likelihood has zero third derivative in beta_log_sigma on that plateau"
-        );
         assert!(
-            (analytic[[2, 2]] + fd3).abs() < 1e-20,
-            "the exact joint survival dH log-sigma/log-sigma entry should equal the negative third derivative of the coded plateau log-likelihood at beta_log_sigma={beta_log_sigma0}; got analytic {} vs expected {}",
+            (analytic[[2, 2]] + fd3).abs() < 1e-3,
+            "the exact joint survival dH log-sigma/log-sigma entry should equal the negative third derivative in the far tail at beta_log_sigma={beta_log_sigma0}; got analytic {} vs expected {}",
             analytic[[2, 2]],
             -fd3
         );
@@ -9670,16 +9532,16 @@ mod tests {
             let (h0, h1, d_raw, eta_t_exit, eta_ls_exit, eta_t_entry, eta_ls_entry, .., etaw) =
                 family.validate_joint_states(&states).expect("joint states");
             // For time-invariant blocks, eta_ls_entry == eta_ls_exit.
-            let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_exit.view());
-            let (sigma_entry, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_entry.view());
+            let inv_sigma = eta_ls_exit.mapv(exp_sigma_inverse_from_eta_scalar);
+            let inv_sigma_entry = eta_ls_entry.mapv(exp_sigma_inverse_from_eta_scalar);
 
             for i in 0..family.n {
                 let state = family.row_predictor_state(
                     h0[i],
                     h1[i],
                     d_raw[i],
-                    -eta_t_entry[i] / sigma_entry[i].max(1e-12) + etaw.map_or(0.0, |w| w[i]),
-                    -eta_t_exit[i] / sigma[i].max(1e-12) + etaw.map_or(0.0, |w| w[i]),
+                    -eta_t_entry[i] * inv_sigma_entry[i] + etaw.map_or(0.0, |w| w[i]),
+                    -eta_t_exit[i] * inv_sigma[i] + etaw.map_or(0.0, |w| w[i]),
                     0.0,
                 );
                 let row = family
@@ -9819,9 +9681,9 @@ mod tests {
 
         let eta_t = array![1.0, -0.2].dot(&fit.beta_threshold()) + input.eta_threshold_offset[0];
         let eta_ls = array![1.0, 0.3].dot(&fit.beta_log_sigma()) + input.eta_log_sigma_offset[0];
-        let sigma = exp_sigma_derivs_up_to_third_scalar(eta_ls).0;
+        let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
         let h = array![1.0, 0.5].dot(&fit.beta_time()) + input.eta_time_offset_exit[0];
-        let expected_eta = -h - eta_t / sigma.max(1e-12);
+        let expected_eta = -h - eta_t * inv_sigma;
         let expected_survival =
             inverse_link_survival_prob_checked(&input.inverse_link, expected_eta)
                 .expect("expected survival");
@@ -9992,8 +9854,10 @@ mod tests {
                 [cov_hl_i, cov_tl_i, var_ls],
             ],
             |h, t, ls| {
-                let sigma = exp_sigma_derivs_up_to_third_scalar(ls).0;
-                (1.0 - normal_cdf(-h - t / sigma.max(1e-12))).clamp(0.0, 1.0)
+                inverse_link_survival_probvalue(
+                    &input.inverse_link,
+                    -h - t * exp_sigma_inverse_from_eta_scalar(ls),
+                )
             },
         );
         assert!((reduced.survival_prob[0] - ghq).abs() <= 2e-4);
@@ -10137,8 +10001,10 @@ mod tests {
             ],
             11,
             |x| {
-                let sigma = exp_sigma_derivs_up_to_third_scalar(x[2]).0.max(1e-12);
-                (1.0 - normal_cdf(-x[0] - x[1] / sigma + x[3])).clamp(0.0, 1.0)
+                inverse_link_survival_probvalue(
+                    &input.inverse_link,
+                    -x[0] - x[1] * exp_sigma_inverse_from_eta_scalar(x[2]) + x[3],
+                )
             },
         );
         assert!((reduced.survival_prob[0] - ghq).abs() <= 2e-4);
@@ -10293,8 +10159,7 @@ mod tests {
             event_target,
             weights,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-            derivative_guard: 0.0,
-            derivative_softness: 1e-6,
+            derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
             time_anchor: None,
             max_iter: 400,
             tol: 1e-6,
@@ -10383,8 +10248,7 @@ mod tests {
             y: array![1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
             w: Array1::ones(n),
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-            derivative_guard: 0.0,
-            derivative_softness: 1e-6,
+            derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
             x_time_entry: x_entry,
             x_time_exit: x_exit.clone(),
             x_time_deriv: x_deriv.clone(),
@@ -10396,11 +10260,16 @@ mod tests {
             x_link_wiggle: None,
         };
 
-        // Build initial states with beta=0 → d_raw = 0 for all rows.
+        // Build initial states with beta=0 and a feasible positive derivative offset.
         let states = vec![
             ParameterBlockState {
                 beta: Array1::zeros(2),
-                eta: Array1::zeros(3 * n), // [h0; h1; d_raw] all zero
+                eta: {
+                    let mut eta = Array1::<f64>::zeros(3 * n);
+                    eta.slice_mut(ndarray::s![2 * n..3 * n])
+                        .fill(DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD);
+                    eta
+                },
             },
             ParameterBlockState {
                 beta: Array1::zeros(1),
@@ -10412,10 +10281,10 @@ mod tests {
             },
         ];
 
-        // Step 1: Verify initial evaluate succeeds with d_raw=0.
+        // Step 1: Verify initial evaluate succeeds on the feasible domain.
         let eval = family
             .evaluate(&states)
-            .expect("initial evaluate with d_raw=0 should succeed");
+            .expect("initial evaluate with positive d_eta/dt should succeed");
         eprintln!("initial log-likelihood: {:.6e}", eval.log_likelihood);
 
         // Step 2: Extract time block gradient and Hessian.
@@ -10505,15 +10374,14 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_survival_location_scale_soft_clamps_non_finite_d_eta_dt() {
+    fn evaluate_survival_location_scale_rejects_non_finite_d_eta_dt() {
         let n = 2;
         let family = SurvivalLocationScaleFamily {
             n,
             y: array![1.0, 0.0],
             w: Array1::ones(n),
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-            derivative_guard: 0.0,
-            derivative_softness: 1e-6,
+            derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
             x_time_entry: Array2::zeros((n, 1)),
             x_time_exit: Array2::ones((n, 1)),
             x_time_deriv: Array2::ones((n, 1)),
@@ -10545,55 +10413,33 @@ mod tests {
 
         let eval = family
             .evaluate(&states)
-            .expect("non-finite d_eta/dt should be soft-clamped, not fatal");
-        assert!(eval.log_likelihood.is_finite());
+            .expect_err("non-finite d_eta/dt must be rejected");
+        assert!(eval.contains("non-finite"));
     }
 
     #[test]
-    fn q_chain_derivatives_vanish_when_sigma_floor_is_active() {
+    fn q_chain_derivatives_match_exact_exp_link_in_lower_tail() {
         let eta_t = 2.0;
         let eta_ls = -30.0;
-        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third_scalar(eta_ls);
-        assert!(sigma < 1e-12, "test requires the sigma floor branch");
-
-        let q = |ls: f64| -eta_t / exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
+        let q = |ls: f64| -eta_t * exp_sigma_inverse_from_eta_scalar(ls);
         let h = 1e-6;
         let q_left = q(eta_ls - h);
         let q_mid = q(eta_ls);
         let q_right = q(eta_ls + h);
-        assert_eq!(
-            q_left, q_mid,
-            "the floor branch should make q locally constant in eta_ls"
-        );
-        assert_eq!(
-            q_right, q_mid,
-            "the floor branch should make q locally constant in eta_ls"
+        assert!(
+            q_left != q_mid && q_right != q_mid,
+            "exact exp-link q should remain eta_ls-sensitive in the lower tail"
         );
 
         let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
-            q_chain_derivs_scalar(eta_t, sigma, ds, d2s, d3s);
-
-        assert_eq!(q_t, -1.0 / 1e-12);
-        assert!(
-            q_ls == 0.0,
-            "q = -eta_t / max(sigma, 1e-12) is constant in eta_ls on the active floor branch, so dq/deta_ls must be 0; got {q_ls}"
-        );
-        assert!(
-            q_tl == 0.0,
-            "q_t = -1 / max(sigma, 1e-12) is constant in eta_ls on the active floor branch, so d2q/(deta_t deta_ls) must be 0; got {q_tl}"
-        );
-        assert!(
-            q_ll == 0.0,
-            "q is locally constant in eta_ls on the active floor branch, so d2q/deta_ls2 must be 0; got {q_ll}"
-        );
-        assert!(
-            q_tl_ls == 0.0,
-            "q_t is locally constant in eta_ls on the active floor branch, so d3q/(deta_t deta_ls2) must be 0; got {q_tl_ls}"
-        );
-        assert!(
-            q_ll_ls == 0.0,
-            "q is locally constant in eta_ls on the active floor branch, so d3q/deta_ls3 must be 0; got {q_ll_ls}"
-        );
+            q_chain_derivs_scalar(eta_t, eta_ls);
+        let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
+        assert!((q_t + inv_sigma).abs() <= 1e-15);
+        assert!((q_ls - eta_t * inv_sigma).abs() <= 1e-15);
+        assert!((q_tl - inv_sigma).abs() <= 1e-15);
+        assert!((q_ll + eta_t * inv_sigma).abs() <= 1e-15);
+        assert!((q_tl_ls + inv_sigma).abs() <= 1e-15);
+        assert!((q_ll_ls - eta_t * inv_sigma).abs() <= 1e-15);
     }
 
     #[test]
@@ -10649,7 +10495,7 @@ mod tests {
     }
 
     #[test]
-    fn probit_survival_helper_loses_upper_tail_probability() {
+    fn probit_survival_helper_matches_upper_tail_probability() {
         let eta = 10.0_f64;
         let stable_survival = 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2);
         assert!(stable_survival > 0.0);
@@ -10664,7 +10510,7 @@ mod tests {
     }
 
     #[test]
-    fn cloglog_survival_helper_changes_the_negative_tail_function() {
+    fn cloglog_survival_helper_matches_negative_tail_function() {
         let eta = -100.0_f64;
         let stable_survival = (-(eta.exp())).exp();
         let helper =
