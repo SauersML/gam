@@ -2590,34 +2590,6 @@ impl SymmetricMatrix {
         }
     }
 
-    /// Consuming conversion: moves the inner `Array2` when `Dense`, converts
-    /// when `Sparse`.  Avoids the clone that `to_dense()` performs on a Dense
-    /// variant that is about to be dropped.
-    pub fn into_dense(self) -> Array2<f64> {
-        match self {
-            Self::Dense(mat) => mat,
-            Self::Sparse(mat) => {
-                let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
-                let (symbolic, values) = mat.parts();
-                let col_ptr = symbolic.col_ptr();
-                let row_idx = symbolic.row_idx();
-                for col in 0..mat.ncols() {
-                    let start = col_ptr[col];
-                    let end = col_ptr[col + 1];
-                    for idx in start..end {
-                        let row = row_idx[idx];
-                        let value = values[idx];
-                        out[[row, col]] += value;
-                        if row != col {
-                            out[[col, row]] += value;
-                        }
-                    }
-                }
-                out
-            }
-        }
-    }
-
     pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(mat) => {

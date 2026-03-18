@@ -25,7 +25,7 @@
 
 use super::polya_gamma::PolyaGamma;
 use crate::estimate::reml::FirthDenseOperator;
-use crate::estimate::reml::unified::compute_block_penalty_logdet_derivs;
+use crate::construction::CanonicalPenalty;
 use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
 use crate::types::LikelihoodFamily;
 use crate::visualizer::VisualizerSession;
@@ -2921,8 +2921,7 @@ impl JointBetaRhoPosterior {
             nuts_family,
             n_beta,
             n_rho,
-            penalty_roots,
-            penalty_matrices,
+            penalty_canonical,
             penalty_nullspace_dims,
             rho_prior_sd,
             rho_mode: rho_mode.to_owned(),
@@ -2987,8 +2986,8 @@ impl JointBetaRhoPosterior {
         for (k, cp) in self.penalty_canonical.iter().enumerate() {
             // Block-local quadratic: β'S_k β via root
             let r = &cp.col_range;
-            let beta_block = beta.slice(s![r.start..r.end]);
-            let r_beta = cp.root.dot(&beta_block);
+            let beta_block = beta.slice(ndarray::s![r.start..r.end]);
+            let r_beta: Array1<f64> = cp.root.dot(&beta_block);
             let quad_k = r_beta.dot(&r_beta);
             penalty_val += 0.5 * lambdas[k] * quad_k;
 
@@ -3005,35 +3004,18 @@ impl JointBetaRhoPosterior {
         }
 
         // ---- Structural penalty log-determinant: +0.5 log|S(ρ)|₊ and ρ-derivatives ----
-        // Assemble S = Σ λ_k S_k block-locally, then eigendecompose once.
-        let mut s_total = Array2::<f64>::zeros((n_beta, n_beta));
+        // Block-local: log|λ_k S_k|₊ = rank_k * log(λ_k) + Σ_i log(e_i^k)
+        // where e_i^k are the positive eigenvalues of the unscaled penalty.
+        let mut log_det_s = 0.0;
+        let mut logdet_grad = Array1::<f64>::zeros(n_rho);
         for (k, cp) in self.penalty_canonical.iter().enumerate() {
-            cp.accumulate_weighted(&mut s_total, lambdas[k]);
+            let rank_k = cp.positive_eigenvalues.len();
+            // Σ_i log(λ_k * e_i) = rank_k * ρ_k + Σ_i log(e_i)
+            let log_eig_sum: f64 = cp.positive_eigenvalues.iter().map(|&e| e.ln()).sum();
+            log_det_s += rank_k as f64 * rho[k] + log_eig_sum;
+            // ∂/∂ρ_k log|S|₊ = rank_k  (since ∂ρ_k of rank_k * ρ_k = rank_k)
+            logdet_grad[k] = rank_k as f64;
         }
-        use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-        let pld_result = PenaltyPseudologdet::from_assembled(s_total);
-        let (log_det_s, logdet_grad) = match pld_result {
-            Ok(pld) => {
-                // S_k matrices for derivatives — use global form since PenaltyPseudologdet
-                // operates in the full eigenspace.
-                let s_k_mats: Vec<Array2<f64>> = self
-                    .penalty_canonical
-                    .iter()
-                    .map(|cp| {
-                        let mut s = Array2::zeros((n_beta, n_beta));
-                        cp.accumulate_weighted(&mut s, 1.0);
-                        s
-                    })
-                    .collect();
-                let (first, _second) = pld.rho_derivatives(&s_k_mats, &lambdas);
-                (pld.value(), first)
-            }
-            Err(_) => (0.0, Array1::zeros(n_rho)),
-        };
-        let (log_det_s, logdet_grad) = match penalty_logdet {
-            Ok(pld) => (pld.value, pld.first),
-            Err(_) => (0.0, Array1::zeros(n_rho)),
-        };
 
         // Add logdet ρ-gradient: +0.5 ∂/∂ρ_k log|S|₊
         for k in 0..n_rho {
@@ -3086,7 +3068,7 @@ pub struct JointBetaRhoInputs<'a> {
     pub likelihood_family: LikelihoodFamily,
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
-    pub penalty_roots: Vec<Array2<f64>>,
+    pub penalty_roots: Vec<CanonicalPenalty>,
     pub penalty_nullspace_dims: Vec<usize>,
     pub rho_mode: ArrayView1<'a, f64>,
     pub nuts_family: NutsFamily,

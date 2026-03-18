@@ -71,10 +71,6 @@ impl<'a> PredictionCovarianceBackend<'a> {
     }
 }
 
-pub(crate) fn dense_row_chunk(matrix: &Array2<f64>, rows: Range<usize>) -> Array2<f64> {
-    matrix.slice(s![rows, ..]).to_owned()
-}
-
 pub(crate) fn design_row_chunk(
     design: &DesignMatrix,
     rows: Range<usize>,
