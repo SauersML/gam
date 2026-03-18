@@ -623,8 +623,14 @@ impl MultiDirJet {
     }
 
     pub fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
+        debug_assert!(
+            first.len() <= n_dirs,
+            "MultiDirJet::linear: first.len()={} exceeds n_dirs={}",
+            first.len(),
+            n_dirs,
+        );
         let mut out = Self::constant(n_dirs, base);
-        for (idx, &value) in first.iter().enumerate() {
+        for (idx, &value) in first.iter().take(n_dirs).enumerate() {
             out.coeffs[1usize << idx] = value;
         }
         out
