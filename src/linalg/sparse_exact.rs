@@ -1,6 +1,5 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
-use crate::matrix::DesignMatrix;
 use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
@@ -527,68 +526,6 @@ pub fn trace_hinv_sk(
         )?;
     }
     Ok(total)
-}
-
-pub fn leverages_from_factor(
-    factor: &SparseExactFactor,
-    x: &DesignMatrix,
-) -> Result<Array1<f64>, EstimationError> {
-    const LEVERAGE_BATCH: usize = 32;
-    match x {
-        DesignMatrix::Dense(matrix) => {
-            let dense = matrix.to_dense_arc();
-            let mut out = Array1::<f64>::zeros(dense.nrows());
-            let p = dense.ncols();
-            let n = dense.nrows();
-            let mut start = 0usize;
-            while start < n {
-                let end = (start + LEVERAGE_BATCH).min(n);
-                let cols = end - start;
-                let mut rhs = Array2::<f64>::zeros((p, cols));
-                for local_col in 0..cols {
-                    let row = start + local_col;
-                    rhs.column_mut(local_col).assign(&dense.row(row).t());
-                }
-                let solved = solve_sparse_spdmulti(factor, &rhs)?;
-                for local_col in 0..cols {
-                    let row = start + local_col;
-                    out[row] = dense.row(row).dot(&solved.column(local_col));
-                }
-                start = end;
-            }
-            Ok(out)
-        }
-        DesignMatrix::Sparse(matrix) => {
-            let csr = matrix.to_csr_arc().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "failed to build CSR cache for sparse design".to_string(),
-                )
-            })?;
-            let mut workspace = SparseTraceWorkspace::default();
-            let symbolic = csr.symbolic();
-            let row_ptr = symbolic.row_ptr();
-            let col_idx = symbolic.col_idx();
-            let values = csr.val();
-            let mut out = Array1::<f64>::zeros(csr.nrows());
-            let n = csr.nrows();
-            for row in 0..n {
-                let r0 = row_ptr[row];
-                let r1 = row_ptr[row + 1];
-                let idx = &col_idx[r0..r1];
-                let val = &values[r0..r1];
-                let hrow = workspace.selected_support_inverse(factor, idx)?;
-                let mut quad = 0.0_f64;
-                for i in 0..idx.len() {
-                    let vi = val[i];
-                    for j in 0..idx.len() {
-                        quad += vi * hrow[[i, j]] * val[j];
-                    }
-                }
-                out[row] = quad;
-            }
-            Ok(out)
-        }
-    }
 }
 
 pub fn logdet_from_factor(factor: &SparseExactFactor) -> Result<f64, EstimationError> {
