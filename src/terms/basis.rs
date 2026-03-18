@@ -3613,6 +3613,8 @@ fn build_nullspace_shrinkage_penalty(
     let shrink = fast_ab(&z, &z.t().to_owned());
     Ok(Some(CanonicalPenaltyBlock {
         sym_penalty: shrink,
+        eigenvalues: evals,
+        eigenvectors: evecs,
         rank: zero_idx.len(),
         nullity: 0,
         tol,

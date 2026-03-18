@@ -2464,6 +2464,7 @@ where
     if opts.compute_inference {
         // EDF by block using stabilized H and penalty roots in transformed basis.
         let h = &pirls_res.stabilizedhessian_transformed;
+        let p_dim = h.nrows();
         // Sparse-aware factorization with ridge retry — no densification.
         // Uses SymmetricMatrix::factorize() -> sparse Cholesky for sparse,
         // dense Cholesky for dense.
@@ -2504,7 +2505,6 @@ where
             // Build the p × rank RHS with nonzeros only in [start..end] rows.
             let r = &cp.col_range;
             let rank = cp.rank();
-            let p_dim = factor.dim();
             let mut rhs = Array2::<f64>::zeros((p_dim, rank));
             for col in 0..rank {
                 for row in 0..cp.block_dim() {
