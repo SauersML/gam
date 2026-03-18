@@ -67,8 +67,9 @@ use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSp
 use gam::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
     append_zero_tail_columns, build_survival_baseline_offsets, build_survival_time_basis,
-    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
-    evaluate_survival_baseline, normalize_survival_time_pair, parse_survival_baseline_config,
+    build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
+    build_time_varying_survival_covariate_template, evaluate_survival_baseline,
+    normalize_survival_time_pair, parse_survival_baseline_config,
     parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, survival_baseline_targetname,
     survival_likelihood_modename,
@@ -2612,21 +2613,21 @@ fn run_predict_survival(
     }
 
     let p_time = time_build.x_exit_time.ncols();
-    let p_timewiggle = saved_timewiggle
+    let p_timewiggle = saved_timewiggle_runtime
         .as_ref()
-        .map(|(_, exit, _)| exit.ncols())
-        .unwrap_or(0);
+        .map_or(0, |w| w.beta.len());
     let p = p_time + p_timewiggle + p_cov;
     let mut x_exit = Array2::<f64>::zeros((n, p));
+    x_exit
+        .slice_mut(s![.., ..p_time])
+        .assign(&time_build.x_exit_time);
+    // Timewiggle columns are evaluated dynamically from the runtime
+    // (the old frozen-column approach was removed). For the generic
+    // survival path we do NOT support dynamic timewiggle — it is only
+    // available through the exact location-scale path. Pad with zeros
+    // so coefficient indexing stays consistent.
+    // (The location-scale predict path above handles timewiggle properly.)
     for i in 0..n {
-        for j in 0..p_time {
-            x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
-        }
-        if let Some((_, exit_w, _)) = saved_timewiggle.as_ref() {
-            for j in 0..p_timewiggle {
-                x_exit[[i, p_time + j]] = exit_w[[i, j]];
-            }
-        }
         for j in 0..p_cov {
             x_exit[[i, p_time + p_timewiggle + j]] = cov_design.design.get(i, j);
         }
@@ -4898,10 +4899,6 @@ fn run_sample_survival(
         &derivative_offset_exit,
         model,
     )?;
-    let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
-    let saved_timewiggle_knots = saved_timewiggle_runtime
-        .as_ref()
-        .map(|wiggle| Array1::from_vec(wiggle.knots.clone()));
     let p_time = time_build.x_exit_time.ncols();
     let p_timewiggle = saved_timewiggle
         .as_ref()
@@ -8720,7 +8717,7 @@ mod tests {
         required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain,
-        survival_basis_supports_structural_monotonicity, validate_cli_firth_configuration,
+        validate_cli_firth_configuration,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use super::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
@@ -10683,10 +10680,10 @@ mod tests {
 
     #[test]
     fn structural_survival_basis_detection_is_ispline_only() {
-        assert!(survival_basis_supports_structural_monotonicity("ispline"));
-        assert!(survival_basis_supports_structural_monotonicity("ISPLINE"));
-        assert!(!survival_basis_supports_structural_monotonicity("linear"));
-        assert!(!survival_basis_supports_structural_monotonicity("bspline"));
+        assert!(gam::survival_construction::survival_basis_supports_structural_monotonicity("ispline"));
+        assert!(gam::survival_construction::survival_basis_supports_structural_monotonicity("ISPLINE"));
+        assert!(!gam::survival_construction::survival_basis_supports_structural_monotonicity("linear"));
+        assert!(!gam::survival_construction::survival_basis_supports_structural_monotonicity("bspline"));
     }
 
     #[test]
