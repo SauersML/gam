@@ -15,7 +15,6 @@ use gam::pirls::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 mod common;
 
