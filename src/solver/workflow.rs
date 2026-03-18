@@ -395,7 +395,6 @@ fn fit_survival_location_scale_model(
         let mut wiggle_degree = None;
 
         let fit = if let Some(wiggle) = wiggle {
-            ensure_joint_wiggle_supported(&spec.inverse_link, "survival link wiggle")?;
             let mut pilot_spec = spec.clone();
             pilot_spec.linkwiggle_block = None;
             let pilot = fit_survival_location_scale_terms(data, pilot_spec, kappa_options)?;
@@ -427,6 +426,7 @@ fn fit_survival_location_scale_model(
     fn optimize_survival_inverse_link(
         data: ArrayView2<'_, f64>,
         spec: &SurvivalLocationScaleTermSpec,
+        wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
     ) -> Result<InverseLink, String> {
         let optimize_link_parameters = |init: Array1<f64>,
@@ -476,6 +476,7 @@ fn fit_survival_location_scale_model(
         match spec.inverse_link.clone() {
             InverseLink::Sas(state0) => {
                 let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
+                let wiggle_cfg = wiggle.clone();
                 Ok(optimize_link_parameters(
                     init,
                     "SAS",
@@ -487,13 +488,16 @@ fn fit_survival_location_scale_model(
                         .map_err(EstimationError::InvalidInput)?;
                         let mut spec_at_theta = spec.clone();
                         spec_at_theta.inverse_link = InverseLink::Sas(state);
-                        Ok(
-                            fit_survival_with_link(data, spec_at_theta, None, kappa_options)
-                                .map_err(EstimationError::InvalidInput)?
-                                .0
-                                .fit
-                                .reml_score,
+                        Ok(fit_survival_with_link(
+                            data,
+                            spec_at_theta,
+                            wiggle_cfg.clone(),
+                            kappa_options,
                         )
+                        .map_err(EstimationError::InvalidInput)?
+                        .0
+                        .fit
+                        .reml_score)
                     }),
                     Box::new(|rho| {
                         state_from_sasspec(SasLinkSpec {
@@ -508,6 +512,7 @@ fn fit_survival_location_scale_model(
             }
             InverseLink::BetaLogistic(state0) => {
                 let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
+                let wiggle_cfg = wiggle.clone();
                 Ok(optimize_link_parameters(
                     init,
                     "BetaLogistic",
@@ -519,13 +524,16 @@ fn fit_survival_location_scale_model(
                         .map_err(EstimationError::InvalidInput)?;
                         let mut spec_at_theta = spec.clone();
                         spec_at_theta.inverse_link = InverseLink::BetaLogistic(state);
-                        Ok(
-                            fit_survival_with_link(data, spec_at_theta, None, kappa_options)
-                                .map_err(EstimationError::InvalidInput)?
-                                .0
-                                .fit
-                                .reml_score,
+                        Ok(fit_survival_with_link(
+                            data,
+                            spec_at_theta,
+                            wiggle_cfg.clone(),
+                            kappa_options,
                         )
+                        .map_err(EstimationError::InvalidInput)?
+                        .0
+                        .fit
+                        .reml_score)
                     }),
                     Box::new(|rho| {
                         state_from_beta_logisticspec(SasLinkSpec {
@@ -541,6 +549,7 @@ fn fit_survival_location_scale_model(
             InverseLink::Mixture(state0) if !state0.rho.is_empty() => {
                 let components = state0.components.clone();
                 let components_recover = components.clone();
+                let wiggle_cfg = wiggle.clone();
                 Ok(optimize_link_parameters(
                     state0.rho.clone(),
                     "mixture",
@@ -552,13 +561,16 @@ fn fit_survival_location_scale_model(
                         .map_err(EstimationError::InvalidInput)?;
                         let mut spec_at_theta = spec.clone();
                         spec_at_theta.inverse_link = InverseLink::Mixture(state);
-                        Ok(
-                            fit_survival_with_link(data, spec_at_theta, None, kappa_options)
-                                .map_err(EstimationError::InvalidInput)?
-                                .0
-                                .fit
-                                .reml_score,
+                        Ok(fit_survival_with_link(
+                            data,
+                            spec_at_theta,
+                            wiggle_cfg.clone(),
+                            kappa_options,
                         )
+                        .map_err(EstimationError::InvalidInput)?
+                        .0
+                        .fit
+                        .reml_score)
                     }),
                     Box::new(move |rho| {
                         state_fromspec(&MixtureLinkSpec {
@@ -576,7 +588,12 @@ fn fit_survival_location_scale_model(
     }
 
     let inverse_link = if request.optimize_inverse_link {
-        optimize_survival_inverse_link(request.data, &request.spec, &request.kappa_options)?
+        optimize_survival_inverse_link(
+            request.data,
+            &request.spec,
+            request.wiggle.clone(),
+            &request.kappa_options,
+        )?
     } else {
         request.spec.inverse_link.clone()
     };
@@ -667,13 +684,12 @@ use crate::families::survival_construction::{
     parse_survival_time_basis_config,
 };
 use crate::families::survival_location_scale::{
-    SurvivalCovariateTermBlockTemplate, TimeBlockInput,
-    residual_distribution_inverse_link,
+    SurvivalCovariateTermBlockTemplate, TimeBlockInput, residual_distribution_inverse_link,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
-    LinkChoice, ParsedFormula, effectivelinkwiggle_formulaspec,
-    parse_formula, parse_link_choice, parse_surv_response,
+    LinkChoice, ParsedFormula, effectivelinkwiggle_formulaspec, parse_formula, parse_link_choice,
+    parse_surv_response,
 };
 use crate::term_builder::{build_termspec, enable_scale_dimensions};
 
@@ -779,7 +795,9 @@ pub fn materialize<'a>(
     let col_map = build_col_map(data);
 
     if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
-        materialize_survival(&parsed, data, &col_map, config, &entry_col, &exit_col, &event_col)
+        materialize_survival(
+            &parsed, data, &col_map, config, &entry_col, &exit_col, &event_col,
+        )
     } else if config.noise_formula.is_some() {
         materialize_location_scale(&parsed, data, &col_map, config)
     } else {
@@ -884,10 +902,8 @@ fn materialize_standard<'a>(
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
     let family = resolve_family(config.family.as_deref(), link_choice.as_ref(), y.view())?;
 
-    let effective_linkwiggle = effectivelinkwiggle_formulaspec(
-        parsed.linkwiggle.as_ref(),
-        link_choice.as_ref(),
-    );
+    let effective_linkwiggle =
+        effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
     let mut spec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
     if config.scale_dimensions {
@@ -902,7 +918,7 @@ fn materialize_standard<'a>(
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        compute_inference: true,
+        compute_inference: false,
         max_iter: 200,
         tol: 1e-7,
         nullspace_dims: vec![],
@@ -918,9 +934,10 @@ fn materialize_standard<'a>(
         if !is_binomial_family(family) {
             return None;
         }
-        let link_kind = link_choice.as_ref().map(|c| {
-            InverseLink::Standard(c.link)
-        }).unwrap_or(InverseLink::Standard(LinkFunction::Logit));
+        let link_kind = link_choice
+            .as_ref()
+            .map(|c| InverseLink::Standard(c.link))
+            .unwrap_or(InverseLink::Standard(LinkFunction::Logit));
         Some(StandardBinomialWiggleConfig {
             link_kind,
             wiggle: LinkWiggleConfig {
@@ -961,11 +978,14 @@ fn materialize_survival<'a>(
     let mut inference_notes = Vec::new();
 
     // Extract columns
-    let entry_idx = *col_map.get(entry_col)
+    let entry_idx = *col_map
+        .get(entry_col)
         .ok_or_else(|| format!("entry column '{entry_col}' not found"))?;
-    let exit_idx = *col_map.get(exit_col)
+    let exit_idx = *col_map
+        .get(exit_col)
         .ok_or_else(|| format!("exit column '{exit_col}' not found"))?;
-    let event_idx = *col_map.get(event_col)
+    let event_idx = *col_map
+        .get(event_col)
         .ok_or_else(|| format!("event column '{event_col}' not found"))?;
     let n = data.values.nrows();
     let mut age_entry = Array1::<f64>::zeros(n);
@@ -983,7 +1003,10 @@ fn materialize_survival<'a>(
 
     // Parse survival config
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
-    if matches!(survival_mode, SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull) {
+    if matches!(
+        survival_mode,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+    ) {
         return Err(format!(
             "survival likelihood '{}' is not yet supported through the unified API; \
              use 'location-scale' or 'marginal-slope'. For transformation/weibull, use FitRequest directly.",
@@ -1068,22 +1091,28 @@ fn materialize_survival<'a>(
 
     // Link wiggle config
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
-    let effective_linkwiggle = effectivelinkwiggle_formulaspec(
-        parsed.linkwiggle.as_ref(),
-        link_choice.as_ref(),
-    );
+    let effective_linkwiggle =
+        effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
     // Time-varying covariate templates
     let threshold_template = if let Some(k) = config.threshold_time_k {
         build_time_varying_survival_covariate_template(
-            &age_entry, &age_exit, k, config.threshold_time_degree, "threshold",
+            &age_entry,
+            &age_exit,
+            k,
+            config.threshold_time_degree,
+            "threshold",
         )?
     } else {
         SurvivalCovariateTermBlockTemplate::Static
     };
     let log_sigma_template = if let Some(k) = config.sigma_time_k {
         build_time_varying_survival_covariate_template(
-            &age_entry, &age_exit, k, config.sigma_time_degree, "sigma",
+            &age_entry,
+            &age_exit,
+            k,
+            config.sigma_time_degree,
+            "sigma",
         )?
     } else {
         SurvivalCovariateTermBlockTemplate::Static
@@ -1103,14 +1132,19 @@ fn materialize_survival<'a>(
 
     // Initial time lambdas
     let time_initial_log_lambdas = if !time_penalties.is_empty() {
-        Some(Array1::from_elem(time_penalties.len(), config.time_smooth_lambda.ln()))
+        Some(Array1::from_elem(
+            time_penalties.len(),
+            config.time_smooth_lambda.ln(),
+        ))
     } else {
         None
     };
 
     // Assemble the time block (shared between LocationScale and MarginalSlope)
     let time_p = time_build.x_exit_time.ncols()
-        + timewiggle_build.as_ref().map_or(0, |tw| tw.design_exit.ncols());
+        + timewiggle_build
+            .as_ref()
+            .map_or(0, |tw| tw.design_exit.ncols());
     let time_block = TimeBlockInput {
         design_entry: time_design_entry,
         design_exit: time_design_exit,
@@ -1137,7 +1171,7 @@ fn materialize_survival<'a>(
                 weights: Array1::ones(n),
                 inverse_link: survival_inverse_link,
                 derivative_guard: 1e-6,
-                derivative_softness: 1e-4,
+                derivative_softness: 0.0,
                 time_anchor: None,
                 max_iter: 200,
                 tol: 1e-7,
@@ -1169,7 +1203,8 @@ fn materialize_survival<'a>(
             let z_col_name = config.z_column.as_deref().ok_or_else(|| {
                 "marginal-slope survival requires z_column in FitConfig".to_string()
             })?;
-            let z_idx = *col_map.get(z_col_name)
+            let z_idx = *col_map
+                .get(z_col_name)
                 .ok_or_else(|| format!("z column '{z_col_name}' not found"))?;
             let z = data.values.column(z_idx).to_owned();
             let logslopespec = if let Some(ls_formula) = config.logslope_formula.as_deref() {
@@ -1216,20 +1251,21 @@ fn materialize_location_scale<'a>(
     let y = data.values.column(y_col).to_owned();
     let mut inference_notes = Vec::new();
 
-    let noise_formula = config.noise_formula.as_deref()
+    let noise_formula = config
+        .noise_formula
+        .as_deref()
         .ok_or_else(|| "noise_formula is required for location-scale models".to_string())?;
     let noise_parsed = parse_formula(&format!("{} ~ {noise_formula}", parsed.response))?;
 
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
     let family = resolve_family(config.family.as_deref(), link_choice.as_ref(), y.view())?;
 
-    let effective_linkwiggle = effectivelinkwiggle_formulaspec(
-        parsed.linkwiggle.as_ref(),
-        link_choice.as_ref(),
-    );
+    let effective_linkwiggle =
+        effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
     let mut meanspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
-    let mut log_sigmaspec = build_termspec(&noise_parsed.terms, data, col_map, &mut inference_notes)?;
+    let mut log_sigmaspec =
+        build_termspec(&noise_parsed.terms, data, col_map, &mut inference_notes)?;
     if config.scale_dimensions {
         enable_scale_dimensions(&mut meanspec);
         enable_scale_dimensions(&mut log_sigmaspec);
@@ -1247,7 +1283,8 @@ fn materialize_location_scale<'a>(
     });
 
     if is_binomial_family(family) {
-        let link_kind = link_choice.as_ref()
+        let link_kind = link_choice
+            .as_ref()
             .map(|c| InverseLink::Standard(c.link))
             .unwrap_or(InverseLink::Standard(LinkFunction::Logit));
         Ok(MaterializedModel {

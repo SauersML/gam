@@ -21,8 +21,8 @@ use crate::custom_family::{
     PenaltyMatrix, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{
-    EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState,
-    PenaltySpec, UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
+    EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState, PenaltySpec,
+    UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
@@ -609,9 +609,11 @@ impl KroneckerPenaltySystem {
                 faer::Side::Lower,
                 &format!("KroneckerPenaltySystem marginal {k}"),
             )
-            .map_err(|e| BasisError::InvalidInput(format!(
-                "KroneckerPenaltySystem: eigendecomp of marginal {k}: {e}"
-            )))?;
+            .map_err(|e| {
+                BasisError::InvalidInput(format!(
+                    "KroneckerPenaltySystem: eigendecomp of marginal {k}: {e}"
+                ))
+            })?;
             let evals = Array1::from_vec(evals_vec);
             let evecs = crate::construction::mat_to_array(&evecs_mat);
             eigensystems.push((evals, evecs));
@@ -893,8 +895,9 @@ impl SpatialLogKappaCoords {
 
             match aniso {
                 Some(ref eta) if eta.len() == d && d > 1 => {
+                    let eta = center_aniso_log_scales(eta);
                     // Existing per-axis anisotropy: ψ_a = ψ̄ + η_a
-                    for &eta_a in eta {
+                    for &eta_a in &eta {
                         vals.push(psi_bar + eta_a);
                     }
                     dims.push(d);
@@ -1064,6 +1067,23 @@ impl SpatialLogKappaCoords {
     }
 }
 
+fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
+    if eta.len() <= 1 {
+        return eta.to_vec();
+    }
+    let mean = eta.iter().sum::<f64>() / eta.len() as f64;
+    eta.iter()
+        .map(|&v| {
+            let centered = v - mean;
+            if centered.abs() <= 1e-15 {
+                0.0
+            } else {
+                centered
+            }
+        })
+        .collect()
+}
+
 /// Get the `aniso_log_scales` from a spatial term, if present.
 pub fn get_spatial_aniso_log_scales(
     spec: &TermCollectionSpec,
@@ -1136,6 +1156,7 @@ fn set_spatial_aniso_log_scales(
     term_idx: usize,
     eta: Vec<f64>,
 ) -> Result<(), EstimationError> {
+    let eta = center_aniso_log_scales(&eta);
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
         return Err(EstimationError::InvalidInput(format!(
             "spatial aniso_log_scales term index {term_idx} out of range"
@@ -1428,8 +1449,8 @@ impl LinearFitConditioning {
         penalties
             .iter()
             .map(|bp| {
-                let overlaps = (bp.col_range.start..bp.col_range.end)
-                    .any(|j| conditioning_cols.contains(&j));
+                let overlaps =
+                    (bp.col_range.start..bp.col_range.end).any(|j| conditioning_cols.contains(&j));
                 if overlaps {
                     // Rare: penalty block overlaps conditioning columns.
                     // Fall back to dense transform.
@@ -5221,7 +5242,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &local,
             )));
         } else {
-            local_penalty_blocks.push(PenaltySpec::Dense(bp.to_global(p_total).mapv(|v| v * full_lambdas[global_idx])));
+            local_penalty_blocks.push(PenaltySpec::Dense(
+                bp.to_global(p_total).mapv(|v| v * full_lambdas[global_idx]),
+            ));
         }
     }
     let (edf_by_block, edf_total) = if let Some(cov) = beta_covariance.as_ref() {
@@ -7236,15 +7259,19 @@ fn exact_bounded_edf(
     for (k, ps) in penalties.iter().enumerate() {
         let lambda_k = lambdas[k];
         match ps {
-            PenaltySpec::Block { local, col_range, .. } => {
+            PenaltySpec::Block {
+                local, col_range, ..
+            } => {
                 s_lambda
                     .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
                     .scaled_add(lambda_k, local);
                 // Compute penalty rank from the block-local matrix directly.
                 let penalty_rank =
-                    local.nrows().saturating_sub(estimate_penalty_nullity(local).map_err(|e| {
-                        EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
-                    })?);
+                    local
+                        .nrows()
+                        .saturating_sub(estimate_penalty_nullity(local).map_err(|e| {
+                            EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
+                        })?);
                 // Trace only involves the block slice of latent_cov.
                 let cov_block = latent_cov.slice(ndarray::s![col_range.clone(), col_range.clone()]);
                 let trace_k = lambda_k
@@ -7256,10 +7283,9 @@ fn exact_bounded_edf(
             }
             PenaltySpec::Dense(m) => {
                 s_lambda.scaled_add(lambda_k, m);
-                let penalty_rank =
-                    p.saturating_sub(estimate_penalty_nullity(m).map_err(|e| {
-                        EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
-                    })?);
+                let penalty_rank = p.saturating_sub(estimate_penalty_nullity(m).map_err(|e| {
+                    EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
+                })?);
                 let trace_k = lambda_k
                     * trace_of_dense_product(latent_cov, m)
                         .map_err(EstimationError::InvalidInput)?;
@@ -7298,10 +7324,8 @@ fn fit_bounded_term_collection_with_design(
     let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
     let dense_design = design.design.as_dense_cow();
     let fit_design = conditioning.apply_to_design(&dense_design);
-    let fit_penalties = conditioning.transform_blockwise_penalties_to_internal(
-        &design.penalties,
-        design.design.ncols(),
-    );
+    let fit_penalties = conditioning
+        .transform_blockwise_penalties_to_internal(&design.penalties, design.design.ncols());
     if design.linear_constraints.is_some() {
         return Err(EstimationError::InvalidInput(
             "bounded() terms are not yet compatible with explicit linear constraints".to_string(),
@@ -7391,7 +7415,9 @@ fn fit_bounded_term_collection_with_design(
         penalties: fit_penalties
             .iter()
             .map(|ps| match ps {
-                PenaltySpec::Block { local, col_range, .. } => PenaltyMatrix::Blockwise {
+                PenaltySpec::Block {
+                    local, col_range, ..
+                } => PenaltyMatrix::Blockwise {
                     local: local.clone(),
                     col_range: col_range.clone(),
                     total_dim: design.design.ncols(),
@@ -7438,7 +7464,9 @@ fn fit_bounded_term_collection_with_design(
     let mut s_lambda_internal = Array2::<f64>::zeros((p_fit, p_fit));
     for (k, penalty) in fit_penalties.iter().enumerate() {
         match penalty {
-            PenaltySpec::Block { local, col_range, .. } => {
+            PenaltySpec::Block {
+                local, col_range, ..
+            } => {
                 s_lambda_internal
                     .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
                     .scaled_add(fit.lambdas[k], local);
@@ -10531,23 +10559,10 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             options,
             &pilot_kappa,
         )?;
-        log::info!("[spatial-kappa] pilot complete; fitting full n={n} with frozen geometry");
-        let frozen_spec = pilot_result.resolvedspec;
-        let full_result = fit_term_collection_forspec(
-            data,
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &frozen_spec,
-            family,
-            options,
-        )?;
-        return Ok(FittedTermCollectionWithSpec {
-            fit: full_result.fit,
-            design: full_result.design,
-            resolvedspec: frozen_spec,
-            adaptive_diagnostics: full_result.adaptive_diagnostics,
-        });
+        log::info!(
+            "[spatial-kappa] pilot complete; using pilot geometry as the full-data initializer"
+        );
+        resolvedspec = pilot_result.resolvedspec;
     }
 
     let best = fit_term_collection_forspec(

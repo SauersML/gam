@@ -295,6 +295,7 @@ impl<'a> RemlState<'a> {
                 Some(Self::build_firth_dense_operator(
                     x_dense,
                     &pirls_result.final_eta,
+                    self.weights,
                 )?)
             }
         } else {
@@ -559,6 +560,7 @@ impl<'a> RemlState<'a> {
                 Some(Self::build_firth_dense_operator(
                     x_dense_arc.as_ref(),
                     &pirls_result.final_eta,
+                    self.weights,
                 )?)
             }
         } else {
@@ -1075,10 +1077,13 @@ impl<'a> RemlState<'a> {
             .map_err(EstimationError::InvalidInput)?;
 
         // Unscaled penalty component matrices S_k = R_k^T R_k for ρ-τ pairs.
-        let s_k_unscaled: Vec<Array2<f64>> = ct_eval.iter().map(|cp| {
-            let r = cp.full_width_root();
-            r.t().dot(&r)
-        }).collect();
+        let s_k_unscaled: Vec<Array2<f64>> = ct_eval
+            .iter()
+            .map(|cp| {
+                let r = cp.full_width_root();
+                r.t().dot(&r)
+            })
+            .collect();
 
         // Pre-compute transformed design matrices X_{τ_j} for each τ direction.
         let x_dense_arc = pirls_result

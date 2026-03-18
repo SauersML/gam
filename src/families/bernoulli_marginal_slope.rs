@@ -296,7 +296,9 @@ fn build_deviation_block_from_seed(
         )));
     }
     if cfg.double_penalty {
-        penalties.push(crate::solver::estimate::PenaltySpec::Dense(Array2::<f64>::eye(dim)));
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(
+            Array2::<f64>::eye(dim),
+        ));
     }
     let derivative_grid = deviation_grid_from_knots(&knots, cfg.degree, cfg.derivative_grid_size)?;
     let derivative_design = runtime.first_derivative_design(&derivative_grid)?;
@@ -369,7 +371,7 @@ fn pooled_probit_baseline(
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
-            compute_inference: true,
+            compute_inference: false,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: Vec::new(),

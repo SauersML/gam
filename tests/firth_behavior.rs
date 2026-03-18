@@ -6,9 +6,7 @@ use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-fn canonicalize_test_penalties(
-    s_list: &[Array2<f64>],
-) -> Vec<CanonicalPenalty> {
+fn canonicalize_test_penalties(s_list: &[Array2<f64>]) -> Vec<CanonicalPenalty> {
     let p = s_list[0].nrows();
     s_list
         .iter()

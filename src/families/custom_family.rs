@@ -16,8 +16,7 @@ use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
     InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
-    compute_block_penalty_logdet_derivs,
-    exact_intersection_nullity, penalty_matrix_root,
+    compute_block_penalty_logdet_derivs, exact_intersection_nullity, penalty_matrix_root,
     reml_laml_evaluate,
 };
 use crate::solver::estimate::{
@@ -190,6 +189,42 @@ impl PenaltyMatrix {
                 target
                     .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
                     .scaled_add(lambda, local);
+            }
+        }
+    }
+
+    /// Add λ * diag(self) to a mutable diagonal accumulator.
+    pub fn add_scaled_diag_to(&self, lambda: f64, target: &mut Array1<f64>) {
+        match self {
+            Self::Dense(m) => {
+                let p = m.nrows().min(target.len());
+                for j in 0..p {
+                    target[j] += lambda * m[[j, j]];
+                }
+            }
+            Self::KroneckerFactored { left, right } => {
+                let p_left = left.nrows();
+                let p_right = right.nrows();
+                debug_assert_eq!(target.len(), p_left * p_right);
+                for i_left in 0..p_left {
+                    let left_diag = left[[i_left, i_left]];
+                    if left_diag == 0.0 {
+                        continue;
+                    }
+                    let scaled_left = lambda * left_diag;
+                    for i_right in 0..p_right {
+                        target[i_left * p_right + i_right] +=
+                            scaled_left * right[[i_right, i_right]];
+                    }
+                }
+            }
+            Self::Blockwise {
+                local, col_range, ..
+            } => {
+                let width = local.nrows().min(col_range.len());
+                for local_idx in 0..width {
+                    target[col_range.start + local_idx] += lambda * local[[local_idx, local_idx]];
+                }
             }
         }
     }
@@ -1983,127 +2018,122 @@ pub(crate) fn build_block_spatial_psi_derivatives(
         })
         .collect();
     let collected: Result<Vec<CustomFamilyBlockPsiDerivative>, String> = info_list
-            .into_iter()
-            .enumerate()
-            .map(|(psi_idx, info)| {
-                let implicit_operator = info
-                    .implicit_operator
-                    .as_ref()
-                    .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op)));
-                let dense_operator = if implicit_operator.is_none() && !info.x_psi_local.is_empty()
-                {
-                    Some(build_embedded_dense_psi_operator(
-                        &info.x_psi_local,
-                        &info.x_psi_psi_local,
-                        info.aniso_cross_designs.as_ref(),
-                        info.global_range.clone(),
-                        info.total_p,
-                        info.implicit_axis,
-                    )?)
-                } else {
-                    None
-                };
-                let design_operator = implicit_operator.or(dense_operator);
-                let dense_row_count = design_operator
-                    .as_ref()
-                    .map_or_else(|| info.x_psi_local.nrows(), |op| op.n_data());
-                let materialize_dense_design = !info.x_psi_local.is_empty()
-                    && should_materialize_custom_family_psi_dense(
-                        dense_row_count,
-                        info.total_p,
-                        psi_dim,
-                        design_operator.is_some(),
-                    );
-                let x_full = if materialize_dense_design {
-                    EmbeddedColumnBlock::new(
-                        &info.x_psi_local,
-                        info.global_range.clone(),
-                        info.total_p,
-                    )
+        .into_iter()
+        .enumerate()
+        .map(|(psi_idx, info)| {
+            let implicit_operator = info
+                .implicit_operator
+                .as_ref()
+                .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op)));
+            let dense_operator = if implicit_operator.is_none() && !info.x_psi_local.is_empty() {
+                Some(build_embedded_dense_psi_operator(
+                    &info.x_psi_local,
+                    &info.x_psi_psi_local,
+                    info.aniso_cross_designs.as_ref(),
+                    info.global_range.clone(),
+                    info.total_p,
+                    info.implicit_axis,
+                )?)
+            } else {
+                None
+            };
+            let design_operator = implicit_operator.or(dense_operator);
+            let dense_row_count = design_operator
+                .as_ref()
+                .map_or_else(|| info.x_psi_local.nrows(), |op| op.n_data());
+            let materialize_dense_design = !info.x_psi_local.is_empty()
+                && should_materialize_custom_family_psi_dense(
+                    dense_row_count,
+                    info.total_p,
+                    psi_dim,
+                    design_operator.is_some(),
+                );
+            let x_full = if materialize_dense_design {
+                EmbeddedColumnBlock::new(&info.x_psi_local, info.global_range.clone(), info.total_p)
                     .materialize()
-                } else {
-                    Array2::<f64>::zeros((0, 0))
-                };
-                let penalty_indices = info.penalty_indices.clone();
-                let embed_penalty = |local: &Array2<f64>| -> Array2<f64> {
-                    EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
-                        .materialize()
-                };
-                let s_components: Vec<(usize, Array2<f64>)> = info
-                    .penalty_indices
-                    .into_iter()
-                    .zip(
-                        info.s_psi_components_local
-                            .into_iter()
-                            .map(|local| embed_penalty(&local)),
-                    )
-                    .collect();
-                // Build x_psi_psi rows with cross-derivative designs
-                let x_psi_psi_rows = if materialize_dense_design {
-                    let mut rows =
-                        vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
-                    rows[psi_idx] = EmbeddedColumnBlock::new(
-                        &info.x_psi_psi_local,
-                        info.global_range.clone(),
-                        info.total_p,
-                    )
-                    .materialize();
-                    if let (Some(gid), Some(cross_designs)) =
-                        (info.aniso_group_id, info.aniso_cross_designs.as_ref())
-                    {
-                        for (axis_j, local) in cross_designs {
-                            if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                                rows[global_j] = EmbeddedColumnBlock::new(
-                                    local,
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                )
-                                .materialize();
-                            }
-                        }
-                    }
-                    Some(rows)
-                } else {
-                    None
-                };
-                // Build s_psi_psi_components with cross-penalty terms
-                let mut s_psi_psi_comp_rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-                s_psi_psi_comp_rows[psi_idx] = penalty_indices
-                    .iter()
-                    .copied()
-                    .zip(
-                        info.s_psi_psi_components_local
-                            .iter()
-                            .map(|local| embed_penalty(local)),
-                    )
-                    .collect();
-                if let (Some(gid), Some(cross_penalties)) =
-                    (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
+            } else {
+                Array2::<f64>::zeros((0, 0))
+            };
+            let penalty_indices = info.penalty_indices.clone();
+            let embed_penalty = |local: &Array2<f64>| -> Array2<f64> {
+                EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
+                    .materialize()
+            };
+            let s_components: Vec<(usize, Array2<f64>)> = info
+                .penalty_indices
+                .into_iter()
+                .zip(
+                    info.s_psi_components_local
+                        .into_iter()
+                        .map(|local| embed_penalty(&local)),
+                )
+                .collect();
+            // Build x_psi_psi rows with cross-derivative designs
+            let x_psi_psi_rows = if materialize_dense_design {
+                let mut rows =
+                    vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
+                rows[psi_idx] = EmbeddedColumnBlock::new(
+                    &info.x_psi_psi_local,
+                    info.global_range.clone(),
+                    info.total_p,
+                )
+                .materialize();
+                if let (Some(gid), Some(cross_designs)) =
+                    (info.aniso_group_id, info.aniso_cross_designs.as_ref())
                 {
-                    for (axis_j, local_components) in cross_penalties {
+                    for (axis_j, local) in cross_designs {
                         if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                            s_psi_psi_comp_rows[global_j] = penalty_indices
-                                .iter()
-                                .copied()
-                                .zip(local_components.iter().map(|local| embed_penalty(local)))
-                                .collect();
+                            rows[global_j] = EmbeddedColumnBlock::new(
+                                local,
+                                info.global_range.clone(),
+                                info.total_p,
+                            )
+                            .materialize();
                         }
                     }
                 }
-                Ok(CustomFamilyBlockPsiDerivative {
-                    penalty_index: Some(info.penalty_index),
-                    x_psi: x_full,
-                    s_psi: Array2::<f64>::zeros((0, 0)),
-                    s_psi_components: Some(s_components),
-                    x_psi_psi: x_psi_psi_rows,
-                    s_psi_psi: None,
-                    s_psi_psi_components: Some(s_psi_psi_comp_rows),
-                    implicit_operator: design_operator,
-                    implicit_axis: info.implicit_axis,
-                    implicit_group_id: info.aniso_group_id,
-                })
+                Some(rows)
+            } else {
+                None
+            };
+            // Build s_psi_psi_components with cross-penalty terms
+            let mut s_psi_psi_comp_rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+            s_psi_psi_comp_rows[psi_idx] = penalty_indices
+                .iter()
+                .copied()
+                .zip(
+                    info.s_psi_psi_components_local
+                        .iter()
+                        .map(|local| embed_penalty(local)),
+                )
+                .collect();
+            if let (Some(gid), Some(cross_penalties)) =
+                (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
+            {
+                for (axis_j, local_components) in cross_penalties {
+                    if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
+                        s_psi_psi_comp_rows[global_j] = penalty_indices
+                            .iter()
+                            .copied()
+                            .zip(local_components.iter().map(|local| embed_penalty(local)))
+                            .collect();
+                    }
+                }
+            }
+            Ok(CustomFamilyBlockPsiDerivative {
+                penalty_index: Some(info.penalty_index),
+                x_psi: x_full,
+                s_psi: Array2::<f64>::zeros((0, 0)),
+                s_psi_components: Some(s_components),
+                x_psi_psi: x_psi_psi_rows,
+                s_psi_psi: None,
+                s_psi_psi_components: Some(s_psi_psi_comp_rows),
+                implicit_operator: design_operator,
+                implicit_axis: info.implicit_axis,
+                implicit_group_id: info.aniso_group_id,
             })
-            .collect();
+        })
+        .collect();
     Ok(Some(collected?))
 }
 
@@ -6385,12 +6415,14 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
 
                 if let Some(ref logdet_blocks) = *s_logdet_block_cache {
                     let pld = &logdet_blocks[cache_i.block_idx];
-                    let s_psi_i = cache_i.s_local.as_ref().expect(
-                        "psi cache should include S_psi when penalty logdet is active",
-                    );
-                    let s_psi_j = cache_j.s_local.as_ref().expect(
-                        "psi cache should include S_psi when penalty logdet is active",
-                    );
+                    let s_psi_i = cache_i
+                        .s_local
+                        .as_ref()
+                        .expect("psi cache should include S_psi when penalty logdet is active");
+                    let s_psi_j = cache_j
+                        .s_local
+                        .as_ref()
+                        .expect("psi cache should include S_psi when penalty logdet is active");
                     // τ-Hessian: tr(S⁺ S_{ψi ψj}) − tr(S⁺ S_ψi S⁺ S_ψj) + 2 tr(Σ₊⁻² L_i L_j^T)
                     pld.tau_hessian_component(s_psi_i, s_psi_j, Some(&s_local))
                 } else {
@@ -6461,9 +6493,10 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
 
                 if let Some(ref logdet_blocks) = *s_logdet_block_cache {
                     let pld = &logdet_blocks[rho_cache.block_idx];
-                    let s_psi_j = psi_cache.s_local.as_ref().expect(
-                        "psi cache should include S_psi when penalty logdet is active",
-                    );
+                    let s_psi_j = psi_cache
+                        .s_local
+                        .as_ref()
+                        .expect("psi cache should include S_psi when penalty logdet is active");
                     // ∂S_k/∂ψ_j (unscaled): extract from local by dividing out λ_k.
                     let ds_k_dpsi = if lambda_k.abs() > 1e-300 {
                         Some(local.mapv(|v| v / lambda_k))
@@ -8868,14 +8901,22 @@ mod tests {
             name: "wiggle".to_string(),
             design: wiggle_block.design.clone(),
             offset: wiggle_block.offset.clone(),
-            penalties: wiggle_block.penalties.iter().map(|ps| match ps {
-                crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => PenaltyMatrix::Blockwise {
-                    local: local.clone(),
-                    col_range: col_range.clone(),
-                    total_dim: wiggle_block.design.ncols(),
-                },
-                crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
-            }).collect(),
+            penalties: wiggle_block
+                .penalties
+                .iter()
+                .map(|ps| match ps {
+                    crate::solver::estimate::PenaltySpec::Block {
+                        local, col_range, ..
+                    } => PenaltyMatrix::Blockwise {
+                        local: local.clone(),
+                        col_range: col_range.clone(),
+                        total_dim: wiggle_block.design.ncols(),
+                    },
+                    crate::solver::estimate::PenaltySpec::Dense(m) => {
+                        PenaltyMatrix::Dense(m.clone())
+                    }
+                })
+                .collect(),
             nullspace_dims: wiggle_block.nullspace_dims.clone(),
             initial_log_lambdas: array![0.1],
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),

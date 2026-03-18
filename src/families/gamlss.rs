@@ -24,10 +24,11 @@ use crate::families::sigma_link::{
     exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar, safe_exp,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
+use crate::linalg::utils::solve_spd_pcg_with_info;
 use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
-use crate::probability::normal_pdf;
 use crate::pirls::LinearInequalityConstraints;
+use crate::probability::normal_pdf;
 use crate::smooth::{
     BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -250,11 +251,19 @@ impl ParameterBlockInput {
         }
         for (k, s) in self.penalties.iter().enumerate() {
             match s {
-                crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
-                    if col_range.end > p || local.nrows() != col_range.len() || local.ncols() != col_range.len() {
+                crate::solver::estimate::PenaltySpec::Block {
+                    local, col_range, ..
+                } => {
+                    if col_range.end > p
+                        || local.nrows() != col_range.len()
+                        || local.ncols() != col_range.len()
+                    {
                         return Err(format!(
                             "block '{name}' penalty {k} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
-                            col_range.start, col_range.end, local.nrows(), local.ncols()
+                            col_range.start,
+                            col_range.end,
+                            local.nrows(),
+                            local.ncols()
                         ));
                     }
                 }
@@ -287,13 +296,13 @@ impl ParameterBlockInput {
                 self.penalties
                     .into_iter()
                     .map(|spec| match spec {
-                        crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
-                            PenaltyMatrix::Blockwise {
-                                local,
-                                col_range,
-                                total_dim: p,
-                            }
-                        }
+                        crate::solver::estimate::PenaltySpec::Block {
+                            local, col_range, ..
+                        } => PenaltyMatrix::Blockwise {
+                            local,
+                            col_range,
+                            total_dim: p,
+                        },
                         crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m),
                     })
                     .collect()
@@ -382,17 +391,22 @@ pub fn buildwiggle_block_input_from_knots(
     let mut penalties: Vec<crate::solver::estimate::PenaltySpec> = Vec::new();
     let mut nullspace_dims = Vec::new();
     if p == 1 {
-        penalties.push(crate::solver::estimate::PenaltySpec::Dense(Array2::<f64>::eye(1)));
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(
+            Array2::<f64>::eye(1),
+        ));
         nullspace_dims.push(0);
     } else {
         let effective_order = penalty_order.max(1).min(p - 1);
         penalties.push(crate::solver::estimate::PenaltySpec::Dense(
-            create_difference_penalty_matrix(p, effective_order, None).map_err(|e| e.to_string())?,
+            create_difference_penalty_matrix(p, effective_order, None)
+                .map_err(|e| e.to_string())?,
         ));
         nullspace_dims.push(effective_order);
     }
     if double_penalty {
-        penalties.push(crate::solver::estimate::PenaltySpec::Dense(Array2::<f64>::eye(p)));
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(
+            Array2::<f64>::eye(p),
+        ));
         nullspace_dims.push(0);
     }
     Ok(ParameterBlockInput {
@@ -543,7 +557,9 @@ pub(crate) fn append_selected_wiggle_penalty_orders(
         }
         let penalty =
             create_difference_penalty_matrix(p, order, None).map_err(|e| e.to_string())?;
-        block.penalties.push(crate::solver::estimate::PenaltySpec::Dense(penalty));
+        block
+            .penalties
+            .push(crate::solver::estimate::PenaltySpec::Dense(penalty));
         block.nullspace_dims.push(order);
     }
     Ok(())
@@ -747,7 +763,7 @@ fn solve_penalizedweighted_projection(
     offset: &Array1<f64>,
     target_eta: &Array1<f64>,
     weights: &Array1<f64>,
-    penalties: &[Array2<f64>],
+    penalties: &[PenaltyMatrix],
     log_lambdas: &Array1<f64>,
     ridge_floor: f64,
 ) -> Result<Array1<f64>, String> {
@@ -766,7 +782,8 @@ fn solve_penalizedweighted_projection(
 
     let y_star = target_eta - offset;
     let xtwy = design.compute_xtwy(weights, &y_star)?;
-    let mut penalty = Array2::<f64>::zeros((p, p));
+    let mut lambdas = Vec::with_capacity(penalties.len());
+    let mut preconditioner = design.diag_gram(weights)?;
     for (k, s) in penalties.iter().enumerate() {
         let lambda = log_lambdas[k].exp();
         if !lambda.is_finite() || lambda < 0.0 {
@@ -784,18 +801,34 @@ fn solve_penalizedweighted_projection(
                 p
             ));
         }
-        penalty.scaled_add(lambda, s);
+        lambdas.push(lambda);
+        s.add_scaled_diag_to(lambda, &mut preconditioner);
     }
     let ridge = ridge_floor.max(1e-12);
-    for a in 0..p {
-        penalty[[a, a]] += ridge;
+    for j in 0..p {
+        preconditioner[j] += ridge;
     }
 
-    let beta = design
-        .solve_system(weights, &xtwy, Some(&penalty))
-        .map_err(|_| {
-            "solve_penalizedweighted_projection produced non-finite coefficients".to_string()
-        })?;
+    let max_iter = p.clamp(64, 4096) * 4;
+    let (beta, _) = solve_spd_pcg_with_info(
+        |v| {
+            let mut out = design.apply_weighted_normal(weights, v, None, 0.0);
+            for (lambda, penalty) in lambdas.iter().zip(penalties.iter()) {
+                out += &penalty.dot(v).mapv(|value| value * *lambda);
+            }
+            if ridge > 0.0 {
+                out += &v.mapv(|value| ridge * value);
+            }
+            out
+        },
+        &xtwy,
+        &preconditioner,
+        1e-8,
+        max_iter,
+    )
+    .ok_or_else(|| {
+        "solve_penalizedweighted_projection matrix-free solve failed to converge".to_string()
+    })?;
     if beta.iter().any(|v| !v.is_finite()) {
         return Err(
             "solve_penalizedweighted_projection produced non-finite coefficients".to_string(),
@@ -816,19 +849,15 @@ fn gaussian_location_scalewarm_start(
     let betamu = if let Some(beta) = mean_beta_hint {
         beta.clone()
     } else {
-        {
-            let p_mu = mu_block.design.ncols();
-            let dense_penalties: Vec<Array2<f64>> = mu_block.penalties.iter().map(|ps| ps.to_dense()).collect();
-            solve_penalizedweighted_projection(
-                &mu_block.design,
-                &mu_block.offset,
-                y,
-                weights,
-                &dense_penalties,
-                &mu_block.initial_log_lambdas,
-                ridge_floor,
-            )?
-        }
+        solve_penalizedweighted_projection(
+            &mu_block.design,
+            &mu_block.offset,
+            y,
+            weights,
+            &mu_block.penalties,
+            &mu_block.initial_log_lambdas,
+            ridge_floor,
+        )?
     };
     let mut mu_hat = mu_block.design.matrixvectormultiply(&betamu);
     mu_hat += &mu_block.offset;
@@ -851,19 +880,15 @@ fn gaussian_location_scalewarm_start(
     } else {
         let eta_sigma = sigma_hat.ln();
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
-        {
-            let p_ls = log_sigma_block.design.ncols();
-            let dense_penalties: Vec<Array2<f64>> = log_sigma_block.penalties.iter().map(|ps| ps.to_dense()).collect();
-            solve_penalizedweighted_projection(
-                &log_sigma_block.design,
-                &log_sigma_block.offset,
-                &sigma_target,
-                weights,
-                &dense_penalties,
-                &log_sigma_block.initial_log_lambdas,
-                ridge_floor,
-            )?
-        }
+        solve_penalizedweighted_projection(
+            &log_sigma_block.design,
+            &log_sigma_block.offset,
+            &sigma_target,
+            weights,
+            &log_sigma_block.penalties,
+            &log_sigma_block.initial_log_lambdas,
+            ridge_floor,
+        )?
     };
     Ok((betamu, beta_log_sigma, sigma_hat))
 }
@@ -1624,8 +1649,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             name: "mu".to_string(),
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design
-                .penalties_as_penalty_matrix(),
+            penalties: mean_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
@@ -1644,8 +1668,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                     .min(noise_design.design.ncols()),
             )?)),
             offset: Array1::zeros(self.y.len()),
-            penalties: noise_design
-                .penalties_as_penalty_matrix(),
+            penalties: noise_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: noise_log_lambdas,
             initial_beta: noise_beta_hint,
@@ -1784,8 +1807,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             name: "mu".to_string(),
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design
-                .penalties_as_penalty_matrix(),
+            penalties: mean_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
@@ -1804,8 +1826,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                     .min(noise_design.design.ncols()),
             )?)),
             offset: Array1::zeros(self.y.len()),
-            penalties: noise_design
-                .penalties_as_penalty_matrix(),
+            penalties: noise_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
@@ -1836,16 +1857,24 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                 offset: self.wiggle_block.offset.clone(),
                 penalties: {
                     let p_wiggle = self.wiggle_block.design.ncols();
-                    self.wiggle_block.penalties.iter().map(|spec| match spec {
-                        crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
-                            PenaltyMatrix::Blockwise {
+                    self.wiggle_block
+                        .penalties
+                        .iter()
+                        .map(|spec| match spec {
+                            crate::solver::estimate::PenaltySpec::Block {
+                                local,
+                                col_range,
+                                ..
+                            } => PenaltyMatrix::Blockwise {
                                 local: local.clone(),
                                 col_range: col_range.clone(),
                                 total_dim: p_wiggle,
+                            },
+                            crate::solver::estimate::PenaltySpec::Dense(m) => {
+                                PenaltyMatrix::Dense(m.clone())
                             }
-                        }
-                        crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
-                    }).collect()
+                        })
+                        .collect()
                 },
                 nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
@@ -1984,8 +2013,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             name: "threshold".to_string(),
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design
-                .penalties_as_penalty_matrix(),
+            penalties: mean_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
@@ -2143,8 +2171,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             name: "threshold".to_string(),
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
-            penalties: mean_design
-                .penalties_as_penalty_matrix(),
+            penalties: mean_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
@@ -2184,16 +2211,24 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                 offset: self.wiggle_block.offset.clone(),
                 penalties: {
                     let p_wiggle = self.wiggle_block.design.ncols();
-                    self.wiggle_block.penalties.iter().map(|spec| match spec {
-                        crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
-                            PenaltyMatrix::Blockwise {
+                    self.wiggle_block
+                        .penalties
+                        .iter()
+                        .map(|spec| match spec {
+                            crate::solver::estimate::PenaltySpec::Block {
+                                local,
+                                col_range,
+                                ..
+                            } => PenaltyMatrix::Blockwise {
                                 local: local.clone(),
                                 col_range: col_range.clone(),
                                 total_dim: p_wiggle,
+                            },
+                            crate::solver::estimate::PenaltySpec::Dense(m) => {
+                                PenaltyMatrix::Dense(m.clone())
                             }
-                        }
-                        crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
-                    }).collect()
+                        })
+                        .collect()
                 },
                 nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
@@ -2525,7 +2560,11 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 eta_block: ParameterBlockInput {
                     design: pilot_design.design.clone(),
                     offset: Array1::zeros(y.len()),
-                    penalties: pilot_design.penalties.iter().map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp)).collect(),
+                    penalties: pilot_design
+                        .penalties
+                        .iter()
+                        .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                        .collect(),
                     nullspace_dims: vec![],
                     initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
                     initial_beta: Some(pilot_fit.beta.clone()),
@@ -2637,16 +2676,23 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 offset: wiggle_offset.clone(),
                 penalties: {
                     let p_wiggle = wiggle_design.ncols();
-                    wiggle_penalties.iter().map(|spec| match spec {
-                        crate::solver::estimate::PenaltySpec::Block { local, col_range, .. } => {
-                            PenaltyMatrix::Blockwise {
+                    wiggle_penalties
+                        .iter()
+                        .map(|spec| match spec {
+                            crate::solver::estimate::PenaltySpec::Block {
+                                local,
+                                col_range,
+                                ..
+                            } => PenaltyMatrix::Blockwise {
                                 local: local.clone(),
                                 col_range: col_range.clone(),
                                 total_dim: p_wiggle,
+                            },
+                            crate::solver::estimate::PenaltySpec::Dense(m) => {
+                                PenaltyMatrix::Dense(m.clone())
                             }
-                        }
-                        crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
-                    }).collect()
+                        })
+                        .collect()
                 },
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
@@ -2804,7 +2850,11 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             eta_block: ParameterBlockInput {
                 design: design.design.clone(),
                 offset: Array1::zeros(y.len()),
-                penalties: design.penalties.iter().map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp)).collect(),
+                penalties: design
+                    .penalties
+                    .iter()
+                    .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                    .collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
                 initial_beta: Some(pilot_beta),
@@ -3782,6 +3832,13 @@ fn binomial_location_scale_working_sets(
     }
 
     // Diagonal IRLS fallback path with observed-information weights.
+    if etawiggle.is_some() || dq_dq0.is_some() {
+        return Err(
+            "binomial location-scale wiggle requires exact curvature; diagonal fallback has been removed"
+                .to_string(),
+        );
+    }
+
     //
     // The observed curvature in q-space is:
     //   curvature_q = -d^2 ell / dq^2 = -w * [ell_mumu * d1^2 + ell_mu * d2]
@@ -4266,8 +4323,7 @@ fn gaussian_joint_psisecondweights(
         // Objective psi-psi: d²NLL/d(ψ_a)d(ψ_b).
         // Score_μ = -m, Score_ls = κ(1-n). Hessian blocks carry κ, κ².
         objective_psi_psirow[i].write(
-            wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * sea_seb
-                - mi * mab
+            wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * sea_seb - mi * mab
                 + ki * (1.0 - ni) * eta_ab[i],
         );
         d2scoremu[i].write(wi * mab - 2.0 * wi * cross - 4.0 * mi * sea_seb + 2.0 * mi * seab);
@@ -4935,11 +4991,7 @@ impl GaussianLocationScaleFamily {
         let cross = 2.0 * &rows.kappa * &rows.m;
         let scale = 2.0 * &rows.kappa * &rows.kappa * &rows.n;
         Ok(Some(gaussian_joint_hessian_from_coeffs(
-            xmu,
-            x_ls,
-            &rows.w,
-            &cross,
-            &scale,
+            xmu, x_ls, &rows.w, &cross, &scale,
         )?))
     }
 
@@ -10476,12 +10528,14 @@ impl BinomialLocationScaleFamily {
             coeff_tt[i] =
                 r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
             // Cross block carries overall κ; scale-scale block carries κ².
-            coeff_tl[i] = s * r
+            coeff_tl[i] = s
+                * r
                 * (q * m4 * du * dv
                     + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
                     + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
                     + m1 * b * d);
-            coeff_ll[i] = s * s
+            coeff_ll[i] = s
+                * s
                 * (q * q * m4 * du * dv
                     + m3 * (q * q * d2 + 5.0 * q * du * dv)
                     + m2 * (3.0 * q * d2 + 4.0 * du * dv)
@@ -11500,8 +11554,7 @@ impl BinomialLocationScaleFamily {
             h_ll_u[row] = (a + 3.0 * q * b + q * q * c) * du;
             dh_tt_u[row] = r
                 * r
-                * (d * du * q_a + c * q_au
-                    - 2.0 * c * (q_a * xi_ls_s + du * z_ls_psi_s)
+                * (d * du * q_a + c * q_au - 2.0 * c * (q_a * xi_ls_s + du * z_ls_psi_s)
                     + 4.0 * b * xi_ls_s * z_ls_psi_s);
             dh_tl_u[row] = r
                 * (((3.0 * c + q * d) * q_a) * du + (2.0 * b + q * c) * q_au

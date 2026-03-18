@@ -277,14 +277,18 @@ impl GlmLikelihoodSpec {
     pub fn canonical(family: GlmLikelihoodFamily) -> Self {
         let scale = match family {
             GlmLikelihoodFamily::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
-            GlmLikelihoodFamily::GammaLog => LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 },
+            GlmLikelihoodFamily::GammaLog => {
+                LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 }
+            }
             GlmLikelihoodFamily::BinomialLogit
             | GlmLikelihoodFamily::BinomialProbit
             | GlmLikelihoodFamily::BinomialCLogLog
             | GlmLikelihoodFamily::BinomialSas
             | GlmLikelihoodFamily::BinomialBetaLogistic
             | GlmLikelihoodFamily::BinomialMixture
-            | GlmLikelihoodFamily::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            | GlmLikelihoodFamily::PoissonLog => {
+                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
+            }
         };
         Self { family, scale }
     }

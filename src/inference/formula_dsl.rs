@@ -1126,7 +1126,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
 // Link choice parsing
 // ---------------------------------------------------------------------------
 
-pub fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<LinkChoice>, String> {
+pub fn parse_link_choice(
+    raw: Option<&str>,
+    flexible_flag: bool,
+) -> Result<Option<LinkChoice>, String> {
     if raw.is_none() && !flexible_flag {
         return Ok(None);
     }
