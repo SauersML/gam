@@ -7,8 +7,8 @@ use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
     BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, CenterStrategy, Dense,
-    KnotSource, MaternIdentifiability, SpatialIdentifiability,
-    compute_geometric_constraint_transform, create_basis, create_difference_penalty_matrix,
+    KnotSource, MaternIdentifiability, SpatialIdentifiability, create_basis,
+    create_difference_penalty_matrix,
 };
 use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
@@ -1112,7 +1112,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         if let Some((wiggle_knots, wiggle_degree)) = standard_wiggle_meta {
             payload.linkwiggle_knots = Some(wiggle_knots);
             payload.linkwiggle_degree = Some(wiggle_degree);
-            payload.linkwiggle_ispline = Some(true);
         }
         match &saved_fit.fitted_link {
             FittedLinkState::Mixture { covariance, .. } => {
@@ -1593,7 +1592,6 @@ fn run_fitwith_predict_noise(
             if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
                 model.linkwiggle_knots = Some(knots.mapv(|v| v * response_scale).to_vec());
                 model.linkwiggle_degree = Some(degree);
-                model.linkwiggle_ispline = Some(true);
                 model.beta_link_wiggle = Some(
                     beta_link_wiggle
                         .into_iter()
@@ -1776,7 +1774,6 @@ fn run_fitwith_predict_noise(
         if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
             model.linkwiggle_knots = Some(knots.to_vec());
             model.linkwiggle_degree = Some(degree);
-            model.linkwiggle_ispline = Some(true);
             model.beta_link_wiggle = Some(beta_link_wiggle);
         }
         write_model_json(out, &model)?;
@@ -3407,9 +3404,7 @@ fn saved_linkwiggle_basis(
         None => Ok(None),
         Some(runtime) => {
             runtime.derivative_q0(q0).map(|_| ())?;
-            runtime
-                .constrained_basis(q0, basis_options)
-                .map(Some)
+            runtime.constrained_basis(q0, basis_options).map(Some)
         }
     }
 }
@@ -3959,7 +3954,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.data_schema = Some(ds.schema.clone());
             payload.link = Some(inverse_link_to_saved_string(&fitted_inverse_link));
             payload.linkwiggle_degree = fit.wiggle_degree;
-            payload.linkwiggle_ispline = fit.wiggle_degree.map(|_| true);
             payload.beta_link_wiggle = fit.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
             payload.linkwiggle_knots = fit.wiggle_knots.as_ref().map(|k| k.to_vec());
             payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
@@ -5159,16 +5153,6 @@ fn run_sample_standard_link_wiggle(
     let wiggle_lambdas = wiggle_lambdas_owned.view();
     let degree = wiggle_runtime.degree;
     let knot_arr = Array1::from_vec(wiggle_runtime.knots.clone());
-    let use_ispline = wiggle_runtime.use_ispline;
-    // For I-spline models, the transform is the identity (I-spline basis IS the
-    // constrained basis). For legacy B-spline+Z models, compute the Z-transform.
-    let z_transform = if use_ispline {
-        Array2::eye(p_wiggle)
-    } else {
-        let (z, _) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
-            .map_err(|e| format!("link-wiggle transform failed: {e}"))?;
-        z
-    };
 
     // Build wiggle penalty matrices in the structural monotone basis.
     let mut wiggle_penalties = Vec::new();
@@ -5206,9 +5190,7 @@ fn run_sample_standard_link_wiggle(
     let spline = LinkWiggleSplineArtifacts {
         knot_range: (q0_min, q0_max),
         knot_vector: knot_arr,
-        link_transform: z_transform,
         degree,
-        use_ispline,
     };
 
     // Map family to NutsFamily

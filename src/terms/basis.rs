@@ -11907,10 +11907,7 @@ pub fn create_ispline_derivative_dense(
         .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
     if derivative_order > bs_degree {
         // Derivative order exceeds basis degree — result is identically zero.
-        let num_bspline_basis = knot_vector
-            .len()
-            .checked_sub(bs_degree + 1)
-            .unwrap_or(0);
+        let num_bspline_basis = knot_vector.len().checked_sub(bs_degree + 1).unwrap_or(0);
         let num_ispline_basis = num_bspline_basis.saturating_sub(1);
         return Ok(Array2::zeros((data.len(), num_ispline_basis)));
     }
@@ -11933,14 +11930,11 @@ pub fn create_ispline_derivative_dense(
         3 | 4 => {
             let mut db = Array2::<f64>::zeros((data.len(), num_bspline_cols));
             for (row_idx, &x) in data.iter().enumerate() {
-                let row = db
-                    .slice_mut(s![row_idx, ..])
-                    .into_slice()
-                    .ok_or_else(|| {
-                        BasisError::InvalidInput(
-                            "I-spline derivative row is not contiguous".to_string(),
-                        )
-                    })?;
+                let row = db.slice_mut(s![row_idx, ..]).into_slice().ok_or_else(|| {
+                    BasisError::InvalidInput(
+                        "I-spline derivative row is not contiguous".to_string(),
+                    )
+                })?;
                 match derivative_order {
                     3 => evaluate_bsplinethird_derivative_scalar(
                         x,
