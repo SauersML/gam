@@ -28,6 +28,7 @@ use crate::construction::CanonicalPenalty;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
+use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::inverse_link_jet_for_family;
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -1387,8 +1388,8 @@ mod tests {
         let penalties = [cp1.clone(), cp2.clone()];
 
         // REML path: PenaltyPseudologdet directly.
-        let pld = PenaltyPseudologdet::from_penalties(&penalties, &lambdas, 0.0, 3)
-            .expect("reml pld");
+        let pld =
+            PenaltyPseudologdet::from_penalties(&penalties, &lambdas, 0.0, 3).expect("reml pld");
         let reml_value = pld.value();
         let (reml_d1, reml_d2) = pld.rho_derivatives_from_penalties(&penalties, &lambdas);
 
@@ -1470,12 +1471,30 @@ mod tests {
 
         // These families must succeed with their own inverse link.
         let accepted = [
-            (LikelihoodFamily::BinomialLogit, InverseLink::Standard(LinkFunction::Logit)),
-            (LikelihoodFamily::BinomialProbit, InverseLink::Standard(LinkFunction::Probit)),
-            (LikelihoodFamily::BinomialCLogLog, InverseLink::Standard(LinkFunction::CLogLog)),
-            (LikelihoodFamily::GaussianIdentity, InverseLink::Standard(LinkFunction::Identity)),
-            (LikelihoodFamily::PoissonLog, InverseLink::Standard(LinkFunction::Log)),
-            (LikelihoodFamily::GammaLog, InverseLink::Standard(LinkFunction::Log)),
+            (
+                LikelihoodFamily::BinomialLogit,
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
+            (
+                LikelihoodFamily::BinomialProbit,
+                InverseLink::Standard(LinkFunction::Probit),
+            ),
+            (
+                LikelihoodFamily::BinomialCLogLog,
+                InverseLink::Standard(LinkFunction::CLogLog),
+            ),
+            (
+                LikelihoodFamily::GaussianIdentity,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
+            (
+                LikelihoodFamily::PoissonLog,
+                InverseLink::Standard(LinkFunction::Log),
+            ),
+            (
+                LikelihoodFamily::GammaLog,
+                InverseLink::Standard(LinkFunction::Log),
+            ),
         ];
         for (family, link) in &accepted {
             let result = joint_family_logp_and_grad(*family, link, &data, &eta);
@@ -1489,24 +1508,20 @@ mod tests {
 
         // SAS/BetaLogistic/Mixture must succeed with their real link state,
         // NOT be remapped to logit.
-        let sas_state = crate::mixture_link::state_from_sasspec(
-            crate::types::SasLinkSpec {
-                initial_epsilon: 0.0,
-                initial_log_delta: 0.0,
-            },
-        )
+        let sas_state = crate::mixture_link::state_from_sasspec(crate::types::SasLinkSpec {
+            initial_epsilon: 0.0,
+            initial_log_delta: 0.0,
+        })
         .expect("sas state");
         let adaptive = [
             (LikelihoodFamily::BinomialSas, InverseLink::Sas(sas_state)),
             (
                 LikelihoodFamily::BinomialBetaLogistic,
                 InverseLink::BetaLogistic(
-                    crate::mixture_link::state_from_sasspec(
-                        crate::types::SasLinkSpec {
-                            initial_epsilon: 0.0,
-                            initial_log_delta: 0.0,
-                        },
-                    )
+                    crate::mixture_link::state_from_sasspec(crate::types::SasLinkSpec {
+                        initial_epsilon: 0.0,
+                        initial_log_delta: 0.0,
+                    })
                     .expect("bl state"),
                 ),
             ),
@@ -1558,7 +1573,9 @@ mod tests {
         .expect("diagnostic");
 
         // max_val should be >= max of eigenvector-only values.
-        let eig_max = eigenvector_vals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let eig_max = eigenvector_vals
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         assert!(
             max_val >= eig_max - 1.0e-12,
             "power iteration result {} should be >= eigenvector max {}",
@@ -2764,11 +2781,12 @@ pub fn run_nuts_sampling_flattened_family(
 // ============================================================================
 //
 // NUTS sampling over the joint parameter space [β_eta; β_wiggle] for models
-// with a B-spline link wiggle. The wiggle introduces a nonlinear coupling:
+// with a structurally monotone I-spline link wiggle. The wiggle introduces a
+// nonlinear coupling:
 //
 //   η(β_eta, β_wiggle) = q₀(β_eta) + B(q₀(β_eta)) · β_wiggle
 //
-// where B is a constrained B-spline basis evaluated at the base linear
+// where B is the shared monotone wiggle basis evaluated at the base linear
 // predictor q₀ = X · β_eta. The gradient of log p(y|β_eta, β_wiggle) w.r.t.
 // β_eta picks up a chain-rule factor g'(q₀) = 1 + B'(q₀) · β_wiggle / range_width
 // from the dependence of B on q₀.
@@ -2782,16 +2800,10 @@ pub fn run_nuts_sampling_flattened_family(
 pub struct LinkWiggleSplineArtifacts {
     /// Knot range (min, max) from training (in standardized [0,1] space of q₀)
     pub knot_range: (f64, f64),
-    /// Full knot vector for B-splines
+    /// Full knot vector for the shared monotone I-spline basis
     pub knot_vector: Array1<f64>,
-    /// Constraint transform Z (raw basis → constrained basis).
-    /// For I-spline models this is an identity matrix (the I-spline basis IS
-    /// the constrained basis).
-    pub link_transform: Array2<f64>,
-    /// B-spline degree (for legacy) or I-spline degree (for new models)
+    /// I-spline degree
     pub degree: usize,
-    /// When true, evaluate I-spline basis directly instead of B-spline + Z-transform.
-    pub use_ispline: bool,
 }
 
 /// Whitened log-posterior target for joint (β_eta, β_wiggle) with analytical gradients.
@@ -2886,33 +2898,23 @@ impl LinkWigglePosterior {
 
     /// Evaluate the wiggle basis and compute η = q₀ + B(q₀)·θ with C^1 linear extension.
     fn evaluate_link(&self, u: &Array1<f64>, theta: &Array1<f64>) -> (Array2<f64>, Array1<f64>) {
-        use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
         let n = u.len();
-        let n_raw = self
-            .spline
-            .knot_vector
-            .len()
-            .saturating_sub(self.spline.degree + 1);
-        let n_c = self.spline.link_transform.ncols();
-        if n_raw == 0 || n_c == 0 || theta.len() != n_c {
+        if theta.is_empty() {
             return (Array2::zeros((n, 0)), u.clone());
         }
 
         let (z_raw, z_c, _) = self.standardized_z(u);
-        let basis_options = if self.spline.use_ispline {
-            BasisOptions::i_spline()
-        } else {
-            BasisOptions::value()
-        };
-        let Ok((b_raw_arc, _)) = create_basis::<Dense>(
+        let Ok(mut basis) = monotone_wiggle_basis_with_derivative_order(
             z_c.view(),
-            KnotSource::Provided(self.spline.knot_vector.view()),
+            &self.spline.knot_vector,
             self.spline.degree,
-            basis_options,
+            0,
         ) else {
-            return (Array2::zeros((n, n_c)), u.clone());
+            return (Array2::zeros((n, theta.len())), u.clone());
         };
-        let mut b_raw = b_raw_arc.as_ref().clone();
+        if basis.ncols() != theta.len() {
+            return (Array2::zeros((n, theta.len())), u.clone());
+        }
 
         // C^1 linear extension outside [0, 1]:
         // B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c)
@@ -2924,89 +2926,46 @@ impl LinkWigglePosterior {
             }
         }
         if needs_ext {
-            let b_prime_result = if self.spline.use_ispline {
-                crate::basis::create_ispline_derivative_dense(
-                    z_c.view(),
-                    &self.spline.knot_vector,
-                    self.spline.degree,
-                    1,
-                )
-                .map(|m| (m, ()))
-            } else {
-                create_basis::<Dense>(
-                    z_c.view(),
-                    KnotSource::Provided(self.spline.knot_vector.view()),
-                    self.spline.degree,
-                    BasisOptions::first_derivative(),
-                )
-                .map(|(arc, _meta)| (arc.as_ref().clone(), ()))
-                .map_err(|e| e)
-            };
-            if let Ok((b_prime, _)) = b_prime_result {
-                for i in 0..n {
-                    let dz = z_raw[i] - z_c[i];
-                    if dz.abs() <= 1e-12 {
-                        continue;
-                    }
-                    for j in 0..b_raw.ncols().min(b_prime.ncols()) {
-                        b_raw[[i, j]] += dz * b_prime[[i, j]];
-                    }
-                }
-            }
-        }
-
-        let b = if self.spline.use_ispline {
-            // I-spline basis is already the constrained basis — no transform needed
-            b_raw
-        } else if self.spline.link_transform.nrows() == n_raw {
-            b_raw.dot(&self.spline.link_transform)
-        } else {
-            Array2::zeros((n, n_c))
-        };
-        (b.clone(), u + &b.dot(theta))
-    }
-
-    /// Compute dη/dq₀ = 1 + B'(q₀)·θ / range_width (chain-rule factor for β_eta gradient).
-    fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
-        use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
-        let n = u.len();
-        let mut g = Array1::<f64>::ones(n);
-        let (_, z_c, rw) = self.standardized_z(u);
-        let n_raw = self
-            .spline
-            .knot_vector
-            .len()
-            .saturating_sub(self.spline.degree + 1);
-        let n_c = self.spline.link_transform.ncols();
-        if n_raw == 0 || n_c == 0 || theta.len() != n_c {
-            return g;
-        }
-
-        let b_prime_constrained = if self.spline.use_ispline {
-            match crate::basis::create_ispline_derivative_dense(
+            if let Ok(b_prime) = monotone_wiggle_basis_with_derivative_order(
                 z_c.view(),
                 &self.spline.knot_vector,
                 self.spline.degree,
                 1,
             ) {
-                Ok(m) => m,
-                Err(_) => return g,
+                for i in 0..n {
+                    let dz = z_raw[i] - z_c[i];
+                    if dz.abs() <= 1e-12 {
+                        continue;
+                    }
+                    for j in 0..basis.ncols().min(b_prime.ncols()) {
+                        basis[[i, j]] += dz * b_prime[[i, j]];
+                    }
+                }
             }
-        } else {
-            let Ok((b_prime_raw_arc, _)) = create_basis::<Dense>(
-                z_c.view(),
-                KnotSource::Provided(self.spline.knot_vector.view()),
-                self.spline.degree,
-                BasisOptions::first_derivative(),
-            ) else {
-                return g;
-            };
-            let b_prime_raw = b_prime_raw_arc.as_ref();
-            if self.spline.link_transform.nrows() != n_raw {
-                return g;
-            }
-            b_prime_raw.dot(&self.spline.link_transform)
+        }
+        (basis.clone(), u + &basis.dot(theta))
+    }
+
+    /// Compute dη/dq₀ = 1 + B'(q₀)·θ / range_width (chain-rule factor for β_eta gradient).
+    fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
+        let n = u.len();
+        let mut g = Array1::<f64>::ones(n);
+        let (_, z_c, rw) = self.standardized_z(u);
+        if theta.is_empty() {
+            return g;
+        }
+
+        let Ok(b_prime_constrained) = monotone_wiggle_basis_with_derivative_order(
+            z_c.view(),
+            &self.spline.knot_vector,
+            self.spline.degree,
+            1,
+        ) else {
+            return g;
         };
+        if b_prime_constrained.ncols() != theta.len() {
+            return g;
+        }
         let dwiggle_dz = b_prime_constrained.dot(theta);
         for i in 0..n {
             g[i] = 1.0 + dwiggle_dz[i] / rw;
@@ -3344,7 +3303,12 @@ pub fn laplace_directional_cubic_diagnostic(
         let n_pos = positive_mask.iter().filter(|&&m| m).count();
         if n_pos >= 2 {
             let max_abs_from_probes = cubic_power_iteration_refinement(
-                design, c_weights, &evals, &evecs, &positive_mask, n_pos,
+                design,
+                c_weights,
+                &evals,
+                &evecs,
+                &positive_mask,
+                n_pos,
             );
             if max_abs_from_probes > max_abs {
                 max_abs = max_abs_from_probes;

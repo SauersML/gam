@@ -470,12 +470,9 @@ pub fn buildwiggle_block_input_from_knots(
         nullspace_dims.push(0);
     } else {
         let effective_order = penalty_order.max(1).min(p - 1);
-        let diff_penalty =
-            create_difference_penalty_matrix(p, effective_order, None)
-                .map_err(|e| e.to_string())?;
-        penalties.push(crate::solver::estimate::PenaltySpec::Dense(
-            diff_penalty,
-        ));
+        let diff_penalty = create_difference_penalty_matrix(p, effective_order, None)
+            .map_err(|e| e.to_string())?;
+        penalties.push(crate::solver::estimate::PenaltySpec::Dense(diff_penalty));
         nullspace_dims.push(effective_order);
     }
     if double_penalty {
@@ -498,7 +495,8 @@ pub fn buildwiggle_block_input_from_seed(
     seed: ArrayView1<'_, f64>,
     cfg: &WiggleBlockConfig,
 ) -> Result<(ParameterBlockInput, Array1<f64>), String> {
-    let knots = initialize_monotone_wiggle_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
+    let knots =
+        initialize_monotone_wiggle_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
     let block = buildwiggle_block_input_from_knots(
         seed,
         &knots,
@@ -18467,9 +18465,10 @@ mod tests {
             DesignMatrix::Sparse(_) => panic!("expected dense wiggle design"),
         };
         let beta = Array1::from_elem(design.ncols(), 0.2);
-        let derivative = monotone_wiggle_basis_with_derivative_order(q_seed.view(), &knots, degree, 1)
-            .expect("wiggle derivative basis")
-            .dot(&beta);
+        let derivative =
+            monotone_wiggle_basis_with_derivative_order(q_seed.view(), &knots, degree, 1)
+                .expect("wiggle derivative basis")
+                .dot(&beta);
         assert!(
             derivative.iter().all(|&value| value >= -1e-12),
             "I-spline wiggle derivative must stay non-negative for non-negative coefficients: min={}",

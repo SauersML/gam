@@ -175,8 +175,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::estimate::EstimationError;
 use crate::mixture_link::{
-    beta_logistic_inverse_link_jet, component_inverse_link_jet, logit_inverse_link_jet5,
-    sas_inverse_link_jet,
+    beta_logistic_inverse_link_jet, component_inverse_link_jet, sas_inverse_link_jet,
 };
 use crate::types::{LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkState, SasLinkState};
 use statrs::function::erf::erfc;
@@ -911,7 +910,7 @@ fn logit_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     // with the derivative obtained by differentiating the same truncated
     // series. This keeps the low-variance branch off the erfcx path where the
     // exact series is most cancellation-prone.
-    let (mean0, d1, d2, d3) = logit_point_jet(mu);
+    let (mean0, d1, d2, d3) = component_point_jet(LinkComponent::Logit, mu);
     let s2 = sigma * sigma;
     IntegratedMeanDerivative {
         mean: (mean0 + 0.5 * s2 * d2).clamp(0.0, 1.0),
@@ -1152,7 +1151,7 @@ fn logit_posterior_meanwith_deriv_ghq(
     sigma: f64,
 ) -> IntegratedMeanDerivative {
     let (mean, dmean_dmu) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
-        let (p, d1, _, _) = logit_point_jet(x);
+        let (p, d1, _, _) = component_point_jet(LinkComponent::Logit, x);
         (p, d1)
     });
     IntegratedMeanDerivative {
@@ -2349,13 +2348,13 @@ pub fn integrated_inverse_link_jet(
             mu,
             sigma,
             |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
-            logit_point_jet,
+            |x| component_point_jet(LinkComponent::Logit, x),
         ),
         LinkFunction::CLogLog => integrate_inverse_link_jet_from_scalar_backend(
             mu,
             sigma,
             |m, s| Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, m, s)),
-            cloglog_point_jet,
+            |x| component_point_jet(LinkComponent::CLogLog, x),
         ),
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
@@ -2396,7 +2395,9 @@ fn integrated_expectation_mode_rank(mode: IntegratedExpectationMode) -> u8 {
 }
 
 #[inline]
-fn mixture_component_point_jet(component: LinkComponent, x: f64) -> (f64, f64, f64, f64) {
+fn component_point_jet(component: LinkComponent, x: f64) -> (f64, f64, f64, f64) {
+    // Keep the point-mass quadrature kernels wired to the same inverse-link
+    // implementation used by mixture links and survival residual distributions.
     let jet = component_inverse_link_jet(component, x);
     (jet.mu, jet.d1, jet.d2, jet.d3)
 }
@@ -2417,7 +2418,7 @@ fn integrated_mixture_component_jet(
             mu,
             sigma,
             |m, s| logit_posterior_meanwith_deriv_controlled(ctx, m, s),
-            logit_point_jet,
+            |x| component_point_jet(LinkComponent::Logit, x),
         )
         .unwrap_or_else(|_| integrated_logit_jet_ghq(ctx, mu, sigma)),
         LinkComponent::Probit => integrated_probit_jet(mu, sigma),
@@ -2425,12 +2426,12 @@ fn integrated_mixture_component_jet(
             mu,
             sigma,
             |m, s| Ok(cloglog_posterior_meanwith_deriv_controlled(ctx, m, s)),
-            cloglog_point_jet,
+            |x| component_point_jet(LinkComponent::CLogLog, x),
         )
         .unwrap_or_else(|_| integrated_cloglog_jet_ghq(ctx, mu, sigma)),
         LinkComponent::LogLog | LinkComponent::Cauchit => {
             let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
-                mixture_component_point_jet(component, x)
+                component_point_jet(component, x)
             });
             IntegratedInverseLinkJet {
                 mean,
@@ -2930,83 +2931,14 @@ fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
 }
 
 #[inline]
-fn logit_point_jet(x: f64) -> (f64, f64, f64, f64) {
-    let jet = logit_inverse_link_jet5(x);
-    (jet.mu, jet.d1, jet.d2, jet.d3)
-}
-
-#[inline]
-fn cloglog_point_jet(x: f64) -> (f64, f64, f64, f64) {
-    // Numerically stable cloglog inverse-link jet.
-    //
-    //   mu(x) = 1 - exp(-exp(x))
-    //   d1    = exp(x) * exp(-exp(x))          = t * exp(-t)
-    //   d2    = t*(1 - t) * exp(-t)
-    //   d3    = t*(1 - 3t + t^2) * exp(-t)
-    //
-    // where t = exp(x).
-    //
-    // The naive computation overflows when t = exp(x) is large.  We avoid
-    // this by working in log-space: log(d1) = x - exp(x), which is always
-    // ≤ -1 and tends to -∞ in both tails.  For the positive tail (x large)
-    // the exp(x) term dominates so d1 decays super-exponentially; for the
-    // negative tail d1 ≈ exp(x) which decays exponentially.
-    //
-    // This replaces the previous hard-clamp approach that zeroed derivatives
-    // outside a fixed range, introducing step discontinuities.
-    if x.is_nan() {
-        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
-    }
-    if x == f64::NEG_INFINITY {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-    if x == f64::INFINITY {
-        return (1.0, 0.0, 0.0, 0.0);
-    }
-
-    // Compute t = exp(x), but guard against overflow for the mu and
-    // derivative paths separately.
-    let t = x.exp(); // may be +inf for x > ~709
-
-    // mu = 1 - exp(-t).  Use exp_m1 for accuracy when t is small.
-    let mu = if t.is_finite() {
-        -(-t).exp_m1() // = 1 - exp(-t), accurate even for tiny t
-    } else {
-        1.0 // t overflowed ⟹ exp(-t) = 0
-    };
-
-    // d1 = t * exp(-t) = exp(x - exp(x)).
-    // Compute via log-space to avoid overflow in the intermediate t.
-    let log_d1 = x - t;
-    // When t overflows, log_d1 = x - inf = -inf, so d1 = 0 naturally.
-    // Guard against log_d1 being so negative that exp underflows — that
-    // just gives 0.0, which is the correct limiting value.
-    let d1 = if log_d1 < -745.0 { 0.0 } else { log_d1.exp() };
-
-    // Higher derivatives: d_k = d1 * P_k(t) for degree-(k-1) polynomials.
-    // When d1 is zero (or negligible), d_k = 0 as well — no clamp needed.
-    let (d2, d3) = if d1 == 0.0 {
-        (0.0, 0.0)
-    } else if t.is_finite() {
-        // Normal range: use t directly.
-        (d1 * (1.0 - t), d1 * (1.0 - 3.0 * t + t * t))
-    } else {
-        // t overflowed but d1 was somehow nonzero (shouldn't happen, but
-        // defend against it).  The polynomial terms diverge with the
-        // opposite sign of d1, driving the product to zero.
-        (0.0, 0.0)
-    };
-
-    (mu, d1, d2, d3)
-}
-
-#[inline]
 fn integrated_logit_jet_ghq(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet {
-    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, logit_point_jet);
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
+        component_point_jet(LinkComponent::Logit, x)
+    });
     IntegratedInverseLinkJet {
         mean,
         d1: d1.max(0.0),
@@ -3026,7 +2958,9 @@ fn integrated_cloglog_jet_ghq(
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet {
-    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, cloglog_point_jet);
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
+        component_point_jet(LinkComponent::CLogLog, x)
+    });
     IntegratedInverseLinkJet {
         mean,
         d1: d1.max(0.0),
@@ -4528,7 +4462,7 @@ mod tests {
         assert_eq!(probit.d2, 0.0);
         assert_eq!(probit.d3, 0.0);
 
-        let logit = logit_point_jet(-710.0);
+        let logit = component_point_jet(LinkComponent::Logit, -710.0);
         assert_eq!(logit.1, 0.0);
         assert_eq!(logit.2, 0.0);
         assert_eq!(logit.3, 0.0);
@@ -4536,7 +4470,7 @@ mod tests {
         // At x = -40 the cloglog derivatives are tiny but nonzero (d1 ≈ exp(-40)),
         // because the stable formulation allows them to decay smoothly rather
         // than hard-clamping to zero.
-        let cloglog = cloglog_point_jet(-40.0);
+        let cloglog = component_point_jet(LinkComponent::CLogLog, -40.0);
         assert!(
             cloglog.1.abs() < 1e-15,
             "d1 should be near-zero: {}",
@@ -4552,6 +4486,24 @@ mod tests {
             "d3 should be near-zero: {}",
             cloglog.3
         );
+    }
+
+    #[test]
+    fn test_zero_sigma_logit_and_cloglog_share_component_tail_jets() {
+        let ctx = QuadratureContext::new();
+        for (link, component, eta) in [
+            (LinkFunction::Logit, LinkComponent::Logit, 50.0),
+            (LinkFunction::CLogLog, LinkComponent::CLogLog, -50.0),
+        ] {
+            let integrated = integrated_inverse_link_jet(&ctx, link, eta, 0.0)
+                .expect("degenerate integrated jet");
+            let point = component_inverse_link_jet(component, eta);
+            assert_eq!(integrated.mode, IntegratedExpectationMode::ExactClosedForm);
+            assert_eq!(integrated.mean, point.mu);
+            assert_eq!(integrated.d1, point.d1);
+            assert_eq!(integrated.d2, point.d2);
+            assert_eq!(integrated.d3, point.d3);
+        }
     }
 
     #[test]
@@ -5021,7 +4973,7 @@ mod tests {
     fn cloglog_negative_tail_mean_matches_exact_near_boundary() {
         // At η = −30 the exact cloglog mean is 1 − exp(−exp(−30)).
         // Our tail helper should agree to high relative accuracy.
-        let eta = -30.0;
+        let eta: f64 = -30.0;
         let exact = {
             let ex = eta.exp();
             -(-ex).exp_m1()
@@ -5036,7 +4988,7 @@ mod tests {
     #[test]
     fn cloglog_negative_tail_derivative_matches_exact_near_boundary() {
         // At η = −30: dμ/dη = exp(η)·exp(−exp(η)).
-        let eta = -30.0;
+        let eta: f64 = -30.0;
         let ex = eta.exp();
         let exact = ex * (-ex).exp();
         let tail = cloglog_negative_tail_derivative(eta);
@@ -5069,7 +5021,11 @@ mod tests {
 
         // Derivatives: both ≈ exp(−30).
         let deriv_rel = (inside.dmean_dmu - outside.dmean_dmu).abs()
-            / inside.dmean_dmu.abs().max(outside.dmean_dmu.abs()).max(1e-300);
+            / inside
+                .dmean_dmu
+                .abs()
+                .max(outside.dmean_dmu.abs())
+                .max(1e-300);
         assert!(
             deriv_rel < 1e-3,
             "derivative discontinuity at clamp boundary: inside={:.6e} outside={:.6e} rel={deriv_rel:.3e}",
@@ -5096,7 +5052,11 @@ mod tests {
         );
 
         let deriv_rel = (inside.dmean_dmu - outside.dmean_dmu).abs()
-            / inside.dmean_dmu.abs().max(outside.dmean_dmu.abs()).max(1e-300);
+            / inside
+                .dmean_dmu
+                .abs()
+                .max(outside.dmean_dmu.abs())
+                .max(1e-300);
         assert!(
             deriv_rel < 1e-3,
             "derivative discontinuity (small σ): inside={:.6e} outside={:.6e} rel={deriv_rel:.3e}",
