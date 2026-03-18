@@ -53,10 +53,6 @@ fn detect_format(path: &Path) -> Result<DataFormat, String> {
 // Unified public API  — format auto-detected, zero extra CLI args
 // ---------------------------------------------------------------------------
 
-pub fn load_dataset(path: &Path) -> Result<EncodedDataset, String> {
-    load_dataset_projected(path, &[])
-}
-
 pub fn load_dataset_projected(
     path: &Path,
     requested_columns: &[String],

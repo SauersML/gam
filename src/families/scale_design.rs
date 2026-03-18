@@ -1,4 +1,4 @@
-use crate::faer_ndarray::{FaerArrayView, fast_av};
+use crate::faer_ndarray::{FaerArrayView, FaerSvd, fast_av};
 use crate::matrix::{
     BlockDesignOperator, DesignBlock, DesignMatrix, ReparamDesignOperator,
 };
@@ -246,18 +246,214 @@ pub fn infer_non_intercept_start_design(
     Ok(end)
 }
 
+/// Solve the projection `argmin_B ||sqrt(W)*(X*B - N)||_F` given the cross-products
+/// `xtwx = X'WX` (p_primary x p_primary) and `xtwn = X'WN` (p_primary x p_noise_active).
+///
+/// Instead of forming `(X'WX)^{-1} X'WN` via Cholesky (which squares the condition
+/// number of X), we use a truncated SVD on `X'WX` to build a numerically stable
+/// pseudoinverse.  Singular values below `max(sigma) * tol` are zeroed, so the
+/// result is well-behaved even when `X` is rank-deficient or ill-conditioned.
+fn solve_projection_system(
+    xtwx: &Array2<f64>,
+    xtwn: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let p = xtwx.nrows();
+    debug_assert_eq!(xtwx.ncols(), p);
+    debug_assert_eq!(xtwn.nrows(), p);
+    let k = xtwn.ncols();
+
+    if p == 0 || k == 0 {
+        return Ok(Array2::<f64>::zeros((p, k)));
+    }
+
+    // SVD of the symmetric PSD matrix X'WX = U * diag(sigma) * V'.
+    // For a symmetric matrix U == V, but we request both for generality.
+    let (u_opt, sigma, vt_opt) = xtwx
+        .svd(true, true)
+        .map_err(|e| format!("SVD failed in solve_projection_system: {e:?}"))?;
+    let u = u_opt.ok_or("SVD did not produce left singular vectors")?;
+    let vt = vt_opt.ok_or("SVD did not produce right singular vectors")?;
+
+    // Truncation threshold: same convention as numpy/scipy lstsq.
+    let sigma_max = sigma.iter().copied().fold(0.0_f64, f64::max);
+    let tol = sigma_max * (p as f64) * f64::EPSILON;
+
+    // Compute pseudoinverse application: B = V * diag(1/sigma_trunc) * U' * xtwn.
+    // Step 1: tmp = U' * xtwn  (p x k)
+    let ut_rhs = u.t().dot(xtwn);
+    // Step 2: scale each row i of tmp by 1/sigma[i] (or 0 if below tolerance)
+    let mut scaled = ut_rhs;
+    for i in 0..p {
+        let s = sigma[i];
+        let inv_s = if s > tol { 1.0 / s } else { 0.0 };
+        for j in 0..k {
+            scaled[[i, j]] *= inv_s;
+        }
+    }
+    // Step 3: result = V * scaled = Vt' * scaled
+    Ok(vt.t().dot(&scaled))
+}
+
 pub fn build_scale_deviation_transform_design(
     primary_design: &DesignMatrix,
     noise_design: &DesignMatrix,
     weights: &Array1<f64>,
     non_intercept_start: usize,
 ) -> Result<ScaleDeviationTransform, String> {
-    build_scale_deviation_transform(
-        &primary_design.to_dense(),
-        &noise_design.to_dense(),
-        weights,
+    if primary_design.nrows() != noise_design.nrows() || weights.len() != noise_design.nrows() {
+        return Err("scale deviation transform design row mismatch".to_string());
+    }
+    let n = primary_design.nrows();
+    let p_primary = primary_design.ncols();
+    let p_noise = noise_design.ncols();
+    let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
+    let mut weighted_column_mean = Array1::<f64>::zeros(p_noise);
+    let mut rescale = Array1::<f64>::ones(p_noise);
+    let first_active = non_intercept_start.min(p_noise);
+
+    if first_active < p_noise {
+        let active_cols = p_noise - first_active;
+
+        // Accumulate cross-products X'WX and X'WN via row chunks, avoiding
+        // full materialisation of the n x p design matrices.
+        let mut xtwx = Array2::<f64>::zeros((p_primary, p_primary));
+        let mut xtwn = Array2::<f64>::zeros((p_primary, active_cols));
+
+        let chunk_rows = (SCALE_DESIGN_TARGET_CHUNK_BYTES
+            / (p_primary.max(p_noise).max(1) * std::mem::size_of::<f64>()))
+        .max(1)
+        .min(n.max(1));
+
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let x_chunk = primary_design.row_chunk(start..end);
+            let n_chunk = noise_design.row_chunk(start..end);
+            let rows = end - start;
+
+            for i in 0..rows {
+                let w = weights[start + i];
+                if w == 0.0 {
+                    continue;
+                }
+                // Accumulate X'WX
+                for a in 0..p_primary {
+                    let wxa = w * x_chunk[[i, a]];
+                    for b in a..p_primary {
+                        let val = wxa * x_chunk[[i, b]];
+                        xtwx[[a, b]] += val;
+                        if a != b {
+                            xtwx[[b, a]] += val;
+                        }
+                    }
+                }
+                // Accumulate X'WN (active columns only)
+                for a in 0..p_primary {
+                    let wxa = w * x_chunk[[i, a]];
+                    for j in 0..active_cols {
+                        xtwn[[a, j]] += wxa * n_chunk[[i, first_active + j]];
+                    }
+                }
+            }
+        }
+
+        // Solve the projection via SVD-based pseudoinverse (numerically stable).
+        let coef = solve_projection_system(&xtwx, &xtwn)?;
+        projection_coef
+            .slice_mut(s![.., first_active..])
+            .assign(&coef);
+    }
+
+    // Compute residual statistics: center and rescale.
+    // We need column-level access to the noise design and the fitted values
+    // X * projection_coef[.., j].  We reuse row_chunk for streaming access.
+    let chunk_rows = (SCALE_DESIGN_TARGET_CHUNK_BYTES
+        / (p_primary.max(p_noise).max(1) * std::mem::size_of::<f64>()))
+    .max(1)
+    .min(n.max(1));
+
+    for j in first_active..p_noise {
+        // First pass: compute weighted mean of residual = noise_col - X * proj_col.
+        let proj_col = projection_coef.column(j);
+        let mut w_sum = 0.0;
+        let mut w_resid_sum = 0.0;
+
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let x_chunk = primary_design.row_chunk(start..end);
+            let n_chunk = noise_design.row_chunk(start..end);
+            let rows = end - start;
+            for i in 0..rows {
+                let w = weights[start + i];
+                let mut fitted = 0.0;
+                for k in 0..p_primary {
+                    fitted += x_chunk[[i, k]] * proj_col[k];
+                }
+                let resid = n_chunk[[i, j]] - fitted;
+                w_sum += w;
+                w_resid_sum += w * resid;
+            }
+        }
+
+        if !w_sum.is_finite() || w_sum <= 0.0 {
+            return Err("scale deviation requires positive finite total weight".to_string());
+        }
+        let center = w_resid_sum / w_sum;
+
+        // Second pass: weighted centered sum-of-squares for original and residual.
+        let mut orig_css = 0.0;
+        let mut resid_css = 0.0;
+        // We also need the weighted mean of the original noise column.
+        let mut w_noise_sum = 0.0;
+
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let n_chunk = noise_design.row_chunk(start..end);
+            let rows = end - start;
+            for i in 0..rows {
+                let w = weights[start + i];
+                w_noise_sum += w * n_chunk[[i, j]];
+            }
+        }
+        let noise_mean = w_noise_sum / w_sum;
+
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let x_chunk = primary_design.row_chunk(start..end);
+            let n_chunk = noise_design.row_chunk(start..end);
+            let rows = end - start;
+            for i in 0..rows {
+                let w = weights[start + i];
+                let nij = n_chunk[[i, j]];
+                let d_orig = nij - noise_mean;
+                orig_css += w * d_orig * d_orig;
+                let mut fitted = 0.0;
+                for k in 0..p_primary {
+                    fitted += x_chunk[[i, k]] * proj_col[k];
+                }
+                let d_resid = nij - fitted - center;
+                resid_css += w * d_resid * d_resid;
+            }
+        }
+
+        let scale = if resid_css.is_finite()
+            && resid_css > COLUMN_TOL
+            && orig_css.is_finite()
+            && orig_css > COLUMN_TOL
+        {
+            (orig_css / resid_css).sqrt()
+        } else {
+            1.0
+        };
+        weighted_column_mean[j] = center;
+        rescale[j] = scale;
+    }
+
+    Ok(ScaleDeviationTransform {
+        projection_coef,
+        weighted_column_mean,
+        rescale,
         non_intercept_start,
-    )
+    })
 }
 
 fn design_block_from_matrix(design: DesignMatrix) -> DesignBlock {

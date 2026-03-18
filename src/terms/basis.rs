@@ -3764,6 +3764,17 @@ pub fn build_thin_plate_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let dense_work = data.nrows().saturating_mul(centers.nrows());
+    const SPATIAL_DENSE_WARN: usize = 10_000_000;
+    if dense_work > SPATIAL_DENSE_WARN {
+        log::warn!(
+            "thin-plate basis: n={} × k={} = {:.1} MiB dense design. \
+             Future: use ChunkedKernelDesignOperator for biobank scale.",
+            data.nrows(),
+            centers.nrows(),
+            (dense_work * 8) as f64 / (1024.0 * 1024.0),
+        );
+    }
     let tps = create_thin_plate_spline_basis_scaledwithworkspace(
         data,
         centers.view(),
@@ -7160,6 +7171,17 @@ pub fn build_matern_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let dense_work = data.nrows().saturating_mul(centers.nrows());
+    const SPATIAL_DENSE_WARN: usize = 10_000_000;
+    if dense_work > SPATIAL_DENSE_WARN {
+        log::warn!(
+            "Matérn basis: n={} × k={} = {:.1} MiB dense design. \
+             Future: use ChunkedKernelDesignOperator for biobank scale.",
+            data.nrows(),
+            centers.nrows(),
+            (dense_work * 8) as f64 / (1024.0 * 1024.0),
+        );
+    }
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
@@ -9090,19 +9112,28 @@ fn duchon_radial_jets(
     out.t_r = (out.q_rr - out.t) / r_eval;
     out.t_rr = (out.lap_rr + 2.0 * out.t - (k_dim as f64 + 4.0) * out.q_rr) / (r_eval * r_eval);
 
-    if r <= 16.0 * r_floor {
-        // The off-origin derivative path uses a small-r evaluation floor to keep
-        // the partial-fraction pieces numerically stable. At an exact collision we
-        // do not want to inherit that surrogate for the operator scalars. Instead
-        // we impose the mathematically checked collision limits and use the even
-        // Taylor structure of the radial operators to keep the tiny-r path
-        // continuous with the exact center collision.
+    if r < r_floor {
+        // When r is below the derivative evaluation floor the generic formulas
+        // were evaluated at the clamped r_eval = r_floor, not at the true r.
+        // Rather than trusting those surrogate values we switch entirely to the
+        // collision-limit Taylor expansion which is exact at r = 0 and stays
+        // accurate throughout the tiny-r region (r < r_floor ≈ 1e-5 * ℓ).
+        //
+        // This eliminates the jump discontinuity that previously existed at the
+        // boundary of the collision zone: the generic derivative path is used
+        // for all r >= r_floor (where r_eval == r), and the collision Taylor
+        // path is used for all r < r_floor, so both sides meet continuously at
+        // r = r_floor.
+        //
+        // Collision limits used:
         //   phi_r(0)   = 0
         //   q(0)       = phi_rr(0)
-        //   Delta phi(0) = d * phi_rr(0).
-        //
-        // This keeps the raw radial jets aligned with the collision convention
-        // used by the higher-level Duchon operator and psi-derivative code.
+        //   Delta phi(0) = d * phi_rr(0)
+        //   t(0)      = φ''''(0) / 3
+        //   q_rr(0)   = t(0)
+        //   lap_rr(0) = (d + 2) t(0)
+        //   t_r(0)    = 0
+        //   t_rr(0)   = φ⁽⁶⁾(0) / 15
         let (phi_rr, _, _) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
         let t_collision =
@@ -9110,24 +9141,17 @@ fn duchon_radial_jets(
         let t_rr_collision =
             duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 15.0;
 
-        // Exact center-collision limits for the higher R-operator scalars:
-        //   t(0)      = φ''''(0) / 3,
-        //   q_rr(0)   = t(0),
-        //   lap_rr(0) = (d + 2) t(0),
-        //   t_r(0)    = 0,
-        //   t_rr(0)   = φ⁽⁶⁾(0) / 15.
-        let r_small = r.min(16.0 * r_floor);
-        let r2 = r_small * r_small;
-        out.phi_r = phi_rr * r_small + 0.5 * t_collision * r_small * r2;
+        let r2 = r * r;
+        out.phi_r = phi_rr * r + 0.5 * t_collision * r * r2;
         out.phi_rr = phi_rr + 1.5 * t_collision * r2;
         out.q = phi_rr + 0.5 * t_collision * r2;
         out.lap = k_dim as f64 * phi_rr + 0.5 * (k_dim as f64 + 2.0) * t_collision * r2;
-        out.q_r = t_collision * r_small;
+        out.q_r = t_collision * r;
         out.q_rr = t_collision;
-        out.lap_r = (k_dim as f64 + 2.0) * t_collision * r_small;
+        out.lap_r = (k_dim as f64 + 2.0) * t_collision * r;
         out.lap_rr = (k_dim as f64 + 2.0) * t_collision;
         out.t = t_collision + 0.5 * t_rr_collision * r2;
-        out.t_r = t_rr_collision * r_small;
+        out.t_r = t_rr_collision * r;
         out.t_rr = t_rr_collision;
     }
     if !out.phi_r.is_finite()
@@ -10199,6 +10223,17 @@ pub fn build_duchon_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let dense_work = data.nrows().saturating_mul(centers.nrows());
+    const SPATIAL_DENSE_WARN: usize = 10_000_000;
+    if dense_work > SPATIAL_DENSE_WARN {
+        log::warn!(
+            "Duchon basis: n={} × k={} = {:.1} MiB dense design. \
+             Future: use ChunkedKernelDesignOperator for biobank scale.",
+            data.nrows(),
+            centers.nrows(),
+            (dense_work * 8) as f64 / (1024.0 * 1024.0),
+        );
+    }
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());

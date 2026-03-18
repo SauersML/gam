@@ -67,6 +67,12 @@ pub trait HessianOperator: Send + Sync {
     /// Default implementation materializes `B` densely. Backends with
     /// native operator traces (notably sparse Cholesky) should override it.
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+        if op.is_implicit() {
+            log::warn!(
+                "trace_hinv_operator: materializing implicit HyperOperator — \
+                 backend should provide a matrix-free override"
+            );
+        }
         self.trace_hinv_product(&op.to_dense())
     }
 
@@ -117,6 +123,12 @@ pub trait HessianOperator: Send + Sync {
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> f64 {
+        if op.is_implicit() {
+            log::warn!(
+                "trace_hinv_matrix_operator_cross: materializing implicit HyperOperator — \
+                 backend should provide a matrix-free override"
+            );
+        }
         self.trace_hinv_product_cross(matrix, &op.to_dense())
     }
 
@@ -129,6 +141,12 @@ pub trait HessianOperator: Send + Sync {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
+        if left.is_implicit() || right.is_implicit() {
+            log::warn!(
+                "trace_hinv_operator_cross: materializing implicit HyperOperator(s) — \
+                 backend should provide a matrix-free override"
+            );
+        }
         self.trace_hinv_product_cross(&left.to_dense(), &right.to_dense())
     }
 
@@ -146,6 +164,12 @@ pub trait HessianOperator: Send + Sync {
     /// Default implementation materializes `B` densely. For Cholesky-based
     /// backends this equals `trace_hinv_operator`.
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        if op.is_implicit() {
+            log::warn!(
+                "trace_logdet_operator: materializing implicit HyperOperator — \
+                 backend should provide a matrix-free override"
+            );
+        }
         self.trace_logdet_gradient(&op.to_dense())
     }
 
@@ -959,6 +983,19 @@ pub struct HyperCoordPair {
     /// ∂²_ij L_δ(S) — smooth penalty pseudo-logdet second derivative.
     /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
     pub ld_s: f64,
+}
+
+impl HyperCoordPair {
+    /// Return a zero-valued pair (used as a no-op fallback when hyper-coordinate
+    /// construction is skipped for large models).
+    pub fn zero() -> Self {
+        Self {
+            a: 0.0,
+            g: Array1::zeros(0),
+            b_mat: Array2::zeros((0, 0)),
+            ld_s: 0.0,
+        }
+    }
 }
 
 /// Callback for computing M_i[u] = D_β B_i[u], the directional derivative

@@ -671,39 +671,8 @@ impl<'a> RemlState<'a> {
         let xt = x_eff_dense.t().to_owned();
         let p = x_eff_dense.ncols();
         let n = x_eff_dense.nrows();
-        let z_mat = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
-            let mut solved = Array2::<f64>::zeros((p, n));
-            for col in 0..n {
-                let rhs = xt.column(col).to_owned();
-                let sol = chol.solvevec(&rhs);
-                solved.column_mut(col).assign(&sol);
-            }
-            solved
-        } else {
-            let (evals, evecs) = h_eff_eval
-                .eigh(Side::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            let floor = 1e-12;
-            let mut solved = Array2::<f64>::zeros((p, n));
-            for m in 0..evals.len() {
-                let ev = evals[m];
-                if ev <= floor {
-                    continue;
-                }
-                let u = evecs.column(m).to_owned();
-                let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
-                for row in 0..p {
-                    let u_row = u[row];
-                    for col in 0..n {
-                        solved[[row, col]] += u_row * coeffs[col];
-                    }
-                }
-            }
-            solved
-        };
 
-        // Pre-factor H once so the solve closure reuses the factorization
-        // instead of refactorizing on every call.
+        // Factor H once and reuse for both Z computation and the solve closure.
         enum HFactor {
             Cholesky(crate::linalg::faer_ndarray::FaerCholeskyFactor),
             Eigh {
@@ -719,6 +688,37 @@ impl<'a> RemlState<'a> {
         } else {
             HFactor::None(p)
         };
+
+        // Build Z = H⁻¹ Xᵀ using the pre-computed factorization.
+        let z_mat = match &h_factor {
+            HFactor::Cholesky(chol) => {
+                let mut solved = xt.clone();
+                chol.solve_mat_in_place(&mut solved);
+                solved
+            }
+            HFactor::Eigh { evals, evecs } => {
+                let floor = 1e-12;
+                let mut solved = Array2::<f64>::zeros((p, n));
+                for m in 0..evals.len() {
+                    let ev = evals[m];
+                    if ev <= floor {
+                        continue;
+                    }
+                    let u = evecs.column(m).to_owned();
+                    let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
+                    for row in 0..p {
+                        let u_row = u[row];
+                        for col in 0..n {
+                            solved[[row, col]] += u_row * coeffs[col];
+                        }
+                    }
+                }
+                solved
+            }
+            HFactor::None(_) => Array2::<f64>::zeros((p, n)),
+        };
+
+        // Reuse the same factorization for the solve closure.
         let h_inv_solve = move |rhs: &Array1<f64>| -> Array1<f64> {
             match &h_factor {
                 HFactor::Cholesky(chol) => chol.solvevec(rhs),

@@ -544,6 +544,14 @@ pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
     Ok(())
 }
 
+/// Append raw difference penalties for the given orders to an existing block.
+///
+/// These are plain difference penalties `D_k^T D_k` on `p` coefficients, whose
+/// nullspace is the set of polynomial sequences of degree ≤ k−1, giving
+/// `nullspace_dim = k`.  This differs from the geometric-constraint penalty in
+/// [`buildwiggle_block_input_from_knots`], which uses `effective_order.saturating_sub(2)`
+/// because its penalty is projected through a constraint transform that absorbs
+/// the constant and linear null directions.
 pub fn append_selected_wiggle_penalty_orders(
     block: &mut ParameterBlockInput,
     penalty_orders: &[usize],
