@@ -729,14 +729,14 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
 use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeWiggleBuild,
-    append_survival_timewiggle_columns, build_survival_baseline_offsets, build_survival_time_basis,
-    build_survival_time_monotonicity_collocation, build_survival_timewiggle_from_baseline,
-    build_time_varying_survival_covariate_template, normalize_survival_time_pair,
-    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
-    parse_survival_time_basis_config, survival_basis_supports_structural_monotonicity,
+    append_zero_tail_columns, build_survival_baseline_offsets, build_survival_time_basis,
+    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config,
 };
 use crate::families::survival_location_scale::{
-    SurvivalCovariateTermBlockTemplate, TimeBlockInput, residual_distribution_inverse_link,
+    SurvivalCovariateTermBlockTemplate, TimeBlockInput, TimeWiggleBlockInput,
+    residual_distribution_inverse_link,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
@@ -1107,6 +1107,7 @@ fn materialize_survival<'a>(
     let mut time_penalties = time_build.penalties.clone();
     let mut time_nullspace_dims = time_build.nullspace_dims.clone();
     let mut timewiggle_build: Option<SurvivalTimeWiggleBuild> = None;
+    let mut timewiggle_block: Option<TimeWiggleBlockInput> = None;
 
     if let Some(tw_cfg) = effective_timewiggle.as_ref() {
         let tw = build_survival_timewiggle_from_baseline(
@@ -1115,34 +1116,28 @@ fn materialize_survival<'a>(
             &derivative_offset_exit,
             tw_cfg,
         )?;
-        append_survival_timewiggle_columns(
+        let p_base = time_design_exit.ncols();
+        append_zero_tail_columns(
             &mut time_design_entry,
             &mut time_design_exit,
             &mut time_design_derivative,
-            &tw,
+            tw.ncols,
         );
         for (idx, p) in tw.penalties.iter().enumerate() {
-            time_penalties.push(p.clone());
+            let mut embedded = Array2::<f64>::zeros((p_base + tw.ncols, p_base + tw.ncols));
+            embedded
+                .slice_mut(s![p_base..p_base + tw.ncols, p_base..p_base + tw.ncols])
+                .assign(p);
+            time_penalties.push(embedded);
             time_nullspace_dims.push(tw.nullspace_dims.get(idx).copied().unwrap_or(0));
         }
+        timewiggle_block = Some(TimeWiggleBlockInput {
+            knots: tw.knots.clone(),
+            degree: tw.degree,
+            ncols: tw.ncols,
+        });
         timewiggle_build = Some(tw);
     }
-
-    let (mono_rows, mono_offsets, has_mono) =
-        if survival_basis_supports_structural_monotonicity(&time_build.basisname) {
-            (Array2::zeros((0, 0)), Array1::zeros(0), false)
-        } else {
-            let timewiggle_ref = timewiggle_build.as_ref().map(|tw| (&tw.knots, tw.degree));
-            let (mono_rows, mono_offsets) = build_survival_time_monotonicity_collocation(
-                &age_entry,
-                &age_exit,
-                &time_build,
-                &baseline_cfg,
-                timewiggle_ref,
-            )?;
-            let has_mono = mono_rows.nrows() > 0;
-            (mono_rows, mono_offsets, has_mono)
-        };
 
     // Build covariate spec
     let mut termspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
@@ -1206,31 +1201,20 @@ fn materialize_survival<'a>(
     };
 
     // Assemble the time block (shared between LocationScale and MarginalSlope)
-    let time_p = time_build.x_exit_time.ncols()
-        + timewiggle_build
-            .as_ref()
-            .map_or(0, |tw| tw.design_exit.ncols());
+    let time_p =
+        time_build.x_exit_time.ncols() + timewiggle_build.as_ref().map_or(0, |tw| tw.ncols);
     let time_block = TimeBlockInput {
         design_entry: time_design_entry,
         design_exit: time_design_exit,
         design_derivative_exit: time_design_derivative.clone(),
-        constraint_design_derivative: if has_mono {
-            mono_rows
-        } else {
-            time_design_derivative.clone()
-        },
         offset_entry: eta_offset_entry,
         offset_exit: eta_offset_exit,
         derivative_offset_exit: derivative_offset_exit.clone(),
-        constraint_derivative_offset: if has_mono {
-            mono_offsets
-        } else {
-            derivative_offset_exit.clone()
-        },
+        structural_monotonicity: true,
         penalties: time_penalties,
         nullspace_dims: time_nullspace_dims,
         initial_log_lambdas: time_initial_log_lambdas,
-        initial_beta: Some(Array1::zeros(time_p)),
+        initial_beta: Some(Array1::from_elem(time_p, 1e-4)),
     };
 
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
@@ -1252,6 +1236,7 @@ fn materialize_survival<'a>(
                 log_sigmaspec,
                 threshold_template,
                 log_sigma_template,
+                timewiggle_block,
                 linkwiggle_block: None,
             };
 
@@ -1275,6 +1260,12 @@ fn materialize_survival<'a>(
             })
         }
         SurvivalLikelihoodMode::MarginalSlope => {
+            if timewiggle_build.is_some() {
+                return Err(
+                    "timewiggle is only implemented for survival-likelihood=location-scale in the exact dynamic path"
+                        .to_string(),
+                );
+            }
             let z_col_name = config.z_column.as_deref().ok_or_else(|| {
                 "marginal-slope survival requires z_column in FitConfig".to_string()
             })?;

@@ -9991,6 +9991,7 @@ mod tests {
     #[test]
     fn uniform_eta_lengths_do_not_panic() {
         let n = 10;
+        #[derive(Clone)]
         struct UniformEtaFamily;
         impl CustomFamily for UniformEtaFamily {
             fn evaluate(
@@ -10105,6 +10106,7 @@ mod tests {
     #[test]
     fn heterogeneous_eta_no_panic_when_all_blocks_converged() {
         let n = 10;
+        #[derive(Clone)]
         struct AllConvergedFamily {
             n: usize,
         }
@@ -10162,6 +10164,7 @@ mod tests {
     #[test]
     fn heterogeneous_eta_completes_when_only_small_block_steps() {
         let n = 10;
+        #[derive(Clone)]
         struct OnlySmallBlockStepsFamily {
             n: usize,
         }
