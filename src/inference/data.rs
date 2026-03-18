@@ -550,8 +550,8 @@ struct ColMeta {
 
 fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
     use arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        Array as ArrowArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::DataType;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -604,7 +604,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
                 let str_arr = col.as_any().downcast_ref::<StringArray>();
                 if let Some(arr) = str_arr {
                     for i in 0..n_rows {
-                        if arr.nulls().is_some_and(|n| n.is_null(i)) {
+                        if ArrowArray::is_null(arr, i) {
                             return Err(format!(
                                 "null value at row {}, column '{}'",
                                 col_vecs[j].len() + i + 1,
@@ -628,7 +628,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
                             )
                         })?;
                     for i in 0..n_rows {
-                        if arr.nulls().is_some_and(|n| n.is_null(i)) {
+                        if ArrowArray::is_null(arr, i) {
                             return Err(format!(
                                 "null value at row {}, column '{}'",
                                 col_vecs[j].len() + i + 1,

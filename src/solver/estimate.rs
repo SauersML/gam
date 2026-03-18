@@ -47,7 +47,7 @@ use crate::types::{
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, Axis, Zip, s};
+use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, fast_ab, fast_atb,

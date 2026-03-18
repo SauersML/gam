@@ -2783,7 +2783,6 @@ impl<'a> RemlState<'a> {
         use super::unified::{InnerSolutionBuilder, reml_laml_evaluate};
 
         let n_observations = self.y.len();
-        let p_dim = beta.len();
 
         // Build PenaltyCoordinates.  When Kronecker structure is available AND
         // factored reparameterization is active (kronecker_factored is set), the

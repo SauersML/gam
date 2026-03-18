@@ -2,7 +2,7 @@ use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_matmut,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array1_to_col_matmut,
     array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
 };
 use crate::linalg::sparse_exact::{

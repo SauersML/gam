@@ -7,7 +7,7 @@ use crate::custom_family::{
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_capability,
+    build_block_spatial_psi_derivatives, custom_family_outer_capability,
     evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
     second_psi_linear_map,
 };

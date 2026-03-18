@@ -1632,7 +1632,6 @@ impl PenaltyCoordinate {
             } => {
                 // Apply (I ⊗ ... ⊗ Λ_k ⊗ ... ⊗ I) β via mode-k scaling.
                 // In the eigenbasis, Λ_k is diagonal, so this is element-wise.
-                let d = marginal_dims.len();
                 let k = *dim_index;
                 let q_k = marginal_dims[k];
                 let stride_k: usize = marginal_dims[k + 1..]
@@ -1644,6 +1643,11 @@ impl PenaltyCoordinate {
                     marginal_dims[..k].iter().copied().product::<usize>().max(1);
                 let inner_size = stride_k;
                 let eigs = &eigenvalues[k];
+                debug_assert_eq!(
+                    outer_size * q_k * stride_k,
+                    *total_dim,
+                    "KroneckerMarginal dimension mismatch in apply"
+                );
 
                 let mut out = Array1::<f64>::zeros(*total_dim);
                 for outer in 0..outer_size {
@@ -1677,7 +1681,6 @@ impl PenaltyCoordinate {
                 ..
             } => {
                 // β' (I ⊗ ... ⊗ Λ_k ⊗ ... ⊗ I) β = Σ μ_{k,j} β[...]²
-                let d = marginal_dims.len();
                 let k = *dim_index;
                 let q_k = marginal_dims[k];
                 let stride_k: usize = marginal_dims[k + 1..]
@@ -1736,7 +1739,6 @@ impl PenaltyCoordinate {
                 total_dim,
             } => {
                 // Materialize diagonal penalty in eigenbasis.
-                let d = marginal_dims.len();
                 let k = *dim_index;
                 let q_k = marginal_dims[k];
                 let stride_k: usize = marginal_dims[k + 1..]
@@ -1747,6 +1749,11 @@ impl PenaltyCoordinate {
                 let outer_size: usize =
                     marginal_dims[..k].iter().copied().product::<usize>().max(1);
                 let eigs = &eigenvalues[k];
+                debug_assert_eq!(
+                    outer_size * q_k * stride_k,
+                    *total_dim,
+                    "KroneckerMarginal dimension mismatch in to_dense"
+                );
 
                 let mut out = Array2::<f64>::zeros((*total_dim, *total_dim));
                 for outer in 0..outer_size {
