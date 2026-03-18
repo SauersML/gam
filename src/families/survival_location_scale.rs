@@ -29,7 +29,9 @@ use crate::matrix::{
     xt_diag_x_symmetric,
 };
 use crate::mixture_link::{
-    inverse_link_jet_for_inverse_link, inverse_link_pdfthird_derivative_for_inverse_link,
+    component_inverse_link_jet, inverse_link_jet_for_inverse_link,
+    inverse_link_pdffourth_derivative_for_inverse_link,
+    inverse_link_pdfthird_derivative_for_inverse_link,
 };
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf};
@@ -147,18 +149,7 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => normal_cdf(z),
             ResidualDistribution::Gumbel => {
-                // F(z)=1-exp(-exp(z))
-                if z == f64::INFINITY {
-                    return 1.0;
-                }
-                if z == f64::NEG_INFINITY {
-                    return 0.0;
-                }
-                if z > 700.0 {
-                    return 1.0;
-                }
-                let ez = z.exp();
-                1.0 - (-ez).exp()
+                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).mu
             }
             ResidualDistribution::Logistic => {
                 if z == f64::INFINITY {
@@ -180,15 +171,10 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => normal_pdf(z),
             ResidualDistribution::Gumbel => {
-                if z.is_infinite() {
-                    return 0.0;
-                }
-                let log_f = z - z.exp();
-                if log_f < -745.0 { 0.0 } else { log_f.exp() }
+                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d1
             }
             ResidualDistribution::Logistic => {
-                let s = self.cdf(z);
-                s * (1.0 - s)
+                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d1
             }
         }
     }
@@ -197,21 +183,10 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => -z * normal_pdf(z),
             ResidualDistribution::Gumbel => {
-                if z.is_infinite() {
-                    return 0.0;
-                }
-                let log_f = z - z.exp();
-                if log_f < -745.0 {
-                    return 0.0;
-                }
-                let f = log_f.exp();
-                let ez = z.clamp(-700.0, 700.0).exp();
-                f * (1.0 - ez)
+                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d2
             }
             ResidualDistribution::Logistic => {
-                let s = self.cdf(z);
-                let f = s * (1.0 - s);
-                f * (1.0 - 2.0 * s)
+                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d2
             }
         }
     }
@@ -223,21 +198,10 @@ impl ResidualDistributionOps for ResidualDistribution {
                 (z * z - 1.0) * f
             }
             ResidualDistribution::Gumbel => {
-                if z.is_infinite() {
-                    return 0.0;
-                }
-                let log_f = z - z.exp();
-                if log_f < -745.0 {
-                    return 0.0;
-                }
-                let f = log_f.exp();
-                let ez = z.clamp(-700.0, 700.0).exp();
-                f * (1.0 - 3.0 * ez + ez * ez)
+                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d3
             }
             ResidualDistribution::Logistic => {
-                let s = self.cdf(z);
-                let f = s * (1.0 - s);
-                f * (1.0 - 6.0 * s + 6.0 * s * s)
+                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d3
             }
         }
     }
@@ -249,21 +213,18 @@ impl ResidualDistributionOps for ResidualDistribution {
                 -(z * z * z - 3.0 * z) * f
             }
             ResidualDistribution::Gumbel => {
-                if z.is_infinite() {
-                    return 0.0;
-                }
-                let log_f = z - z.exp();
-                if log_f < -745.0 {
-                    return 0.0;
-                }
-                let f = log_f.exp();
-                let ez = z.clamp(-700.0, 700.0).exp();
-                f * (1.0 - 7.0 * ez + 6.0 * ez * ez - ez * ez * ez)
+                inverse_link_pdfthird_derivative_for_inverse_link(
+                    &InverseLink::Standard(LinkFunction::CLogLog),
+                    z,
+                )
+                .unwrap_or(0.0)
             }
             ResidualDistribution::Logistic => {
-                let s = self.cdf(z);
-                let f = s * (1.0 - s);
-                f * (1.0 - 14.0 * s + 36.0 * s * s - 24.0 * s * s * s)
+                inverse_link_pdfthird_derivative_for_inverse_link(
+                    &InverseLink::Standard(LinkFunction::Logit),
+                    z,
+                )
+                .unwrap_or(0.0)
             }
         }
     }
@@ -293,25 +254,18 @@ impl ResidualDistributionOps for ResidualDistribution {
                 (z2 * z2 - 6.0 * z2 + 3.0) * f
             }
             ResidualDistribution::Gumbel => {
-                if z.is_infinite() {
-                    return 0.0;
-                }
-                let log_f = z - z.exp();
-                if log_f < -745.0 {
-                    return 0.0;
-                }
-                let f = log_f.exp();
-                let ez = z.clamp(-700.0, 700.0).exp();
-                let ez2 = ez * ez;
-                // Q_4(e) = 1 - 15e + 25e² - 10e³ + e⁴
-                f * (1.0 - 15.0 * ez + 25.0 * ez2 - 10.0 * ez2 * ez + ez2 * ez2)
+                inverse_link_pdffourth_derivative_for_inverse_link(
+                    &InverseLink::Standard(LinkFunction::CLogLog),
+                    z,
+                )
+                .unwrap_or(0.0)
             }
             ResidualDistribution::Logistic => {
-                let s = self.cdf(z);
-                let f = s * (1.0 - s);
-                let s2 = s * s;
-                // P_4(s) = 1 - 30s + 150s² - 240s³ + 120s⁴
-                f * (1.0 - 30.0 * s + 150.0 * s2 - 240.0 * s2 * s + 120.0 * s2 * s2)
+                inverse_link_pdffourth_derivative_for_inverse_link(
+                    &InverseLink::Standard(LinkFunction::Logit),
+                    z,
+                )
+                .unwrap_or(0.0)
             }
         }
     }

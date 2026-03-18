@@ -1152,16 +1152,17 @@ pub fn blockwise_fit_from_parts(
                 total_p, total_p, rows, cols
             ));
         }
-        if geom.working_weights.len() != n {
+        let stacked_n = n.saturating_mul(specs.len());
+        if geom.working_weights.len() != n && geom.working_weights.len() != stacked_n {
             return Err(format!(
-                "blockwise_fit.geometry.working_weights length mismatch: got {}, expected {n}",
-                geom.working_weights.len()
+                "blockwise_fit.geometry.working_weights length mismatch: got {}, expected {n} or {stacked_n}",
+                geom.working_weights.len(),
             ));
         }
-        if geom.working_response.len() != n {
+        if geom.working_response.len() != n && geom.working_response.len() != stacked_n {
             return Err(format!(
-                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n}",
-                geom.working_response.len()
+                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n} or {stacked_n}",
+                geom.working_response.len(),
             ));
         }
     }
@@ -7488,6 +7489,9 @@ fn compute_joint_geometry<F: CustomFamily>(
     if all_working_weights.is_empty() {
         return None;
     }
+    if all_working_weights.len() != 1 {
+        return None;
+    }
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     if total == 0 {
@@ -7507,22 +7511,10 @@ fn compute_joint_geometry<F: CustomFamily>(
                 .scaled_add(lambdas[k], &*s_dense);
         }
     }
-    let n = all_working_weights[0].len();
-    let n_blocks = all_working_weights.len();
-    let mut joint_w = Array1::<f64>::zeros(n * n_blocks);
-    let mut joint_z = Array1::<f64>::zeros(n * n_blocks);
-    for (b, (w, z)) in all_working_weights
-        .iter()
-        .zip(all_working_responses.iter())
-        .enumerate()
-    {
-        joint_w.slice_mut(ndarray::s![b * n..(b + 1) * n]).assign(w);
-        joint_z.slice_mut(ndarray::s![b * n..(b + 1) * n]).assign(z);
-    }
     Some(FitGeometry {
         penalized_hessian: h,
-        working_weights: joint_w,
-        working_response: joint_z,
+        working_weights: all_working_weights[0].clone(),
+        working_response: all_working_responses[0].clone(),
     })
 }
 
@@ -7718,7 +7710,6 @@ pub fn fit_custom_family<F: CustomFamily>(
         },
         reset_fn: Some(|outer: &mut CustomOuterState| {
             outer.warm_cache = None;
-            outer.last_error = None;
         }),
         efs_fn: None::<
             fn(
@@ -9062,12 +9053,14 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
         };
+        let threshold_design = thresholdspec.design.clone();
+        let log_sigma_design = log_sigmaspec.design.clone();
         let family = BinomialLocationScaleFamily {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            threshold_design: None,
-            log_sigma_design: None,
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
         };
         let specs = vec![thresholdspec, log_sigmaspec];
         let penalty_counts = vec![1usize, 1usize];
@@ -9157,12 +9150,14 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
         };
+        let threshold_design = thresholdspec.design.clone();
+        let log_sigma_design = log_sigmaspec.design.clone();
         let family = BinomialLocationScaleFamily {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            threshold_design: None,
-            log_sigma_design: None,
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
         };
         let specs = vec![thresholdspec, log_sigmaspec];
         let penalty_counts = vec![1usize, 1usize];
@@ -9425,12 +9420,14 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
         };
+        let threshold_design = thresholdspec.design.clone();
+        let log_sigma_design = log_sigmaspec.design.clone();
         let family = BinomialLocationScaleFamily {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            threshold_design: None,
-            log_sigma_design: None,
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
         };
         let specs = vec![thresholdspec, log_sigmaspec];
         let penalty_counts = vec![1usize, 1usize];

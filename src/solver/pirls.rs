@@ -1695,13 +1695,9 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             self.priorweights,
                         )?
                     } else {
-                        let x_dense = x_transformed.as_dense().ok_or_else(|| {
-                            EstimationError::InvalidInput(
-                                "failed to access dense transformed design".to_string(),
-                            )
-                        })?;
+                        let x_dense_cow = x_transformed.as_dense_cow();
                         compute_jeffreys_pirls_diagnostics(
-                            x_dense.view(),
+                            x_dense_cow.view(),
                             self.workspace.eta_buf.view(),
                             self.priorweights,
                         )?
@@ -2182,12 +2178,10 @@ fn estimate_sparse_native_decision(
     let x_sparse = if let Some(sparse) = x_original.as_sparse() {
         sparse
     } else {
-        let dense = x_original
-            .as_dense()
-            .expect("non-sparse design should expose dense storage");
+        let dense = x_original.as_dense_cow();
         return dense_reject(
             "design_not_sparse",
-            dense.iter().filter(|v| v.abs() > 1e-12).count(),
+            dense.as_ref().iter().filter(|v| v.abs() > 1e-12).count(),
         );
     };
     let nnz_x = x_sparse.val().len();

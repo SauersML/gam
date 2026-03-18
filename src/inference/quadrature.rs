@@ -3631,7 +3631,7 @@ fn cloglog_g_derivatives(t: f64) -> (f64, f64, f64, f64, f64) {
 pub fn cloglog_ghq_value(ctx: &QuadratureContext, mu: f64, sigma: f64, n_nodes: usize) -> f64 {
     if sigma.abs() < 1e-14 {
         let (g, _, _, _, _) = cloglog_g_derivatives(mu);
-        return g;
+        return g.clamp(0.0, 1.0);
     }
     let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
     let scale = SQRT_2 * sigma;
@@ -3642,7 +3642,7 @@ pub fn cloglog_ghq_value(ctx: &QuadratureContext, mu: f64, sigma: f64, n_nodes: 
             let (g, _, _, _, _) = cloglog_g_derivatives(t);
             sum += weights[i] * g;
         }
-        sum * inv_sqrt_pi
+        (sum * inv_sqrt_pi).clamp(0.0, 1.0)
     })
 }
 

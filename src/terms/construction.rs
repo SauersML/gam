@@ -2647,26 +2647,17 @@ mod tests {
         };
 
         let lambdas = [2.5, 1.3];
-        let ridge = 1e-4;
-
-        // Build dense Kronecker penalty: λ1 (I⊗S1) + λ2 (S2⊗I) + ridge I
-        // Wait — convention: I_q2 ⊗ S1 + S2 ⊗ I_q1 (matches tensor product ordering).
+        // Build dense Kronecker penalty: λ1 (S1⊗I) + λ2 (I⊗S2).
         let p = q1 * q2;
         let i1 = Array2::<f64>::eye(q1);
         let i2 = Array2::<f64>::eye(q2);
-        // Actually the standard tensor ordering for our code is:
-        // dim 0 varies slowest: penalty_dim0 = I_{q1} ⊗ ... but let me just do it simply.
-        // For 2D: penalty_0 = S1 ⊗ I_{q2}, penalty_1 = I_{q1} ⊗ S2
         let pen0 = kronecker_product(&s1, &i2);
         let pen1 = kronecker_product(&i1, &s2);
         let mut s_dense = Array2::<f64>::zeros((p, p));
         s_dense.scaled_add(lambdas[0], &pen0);
         s_dense.scaled_add(lambdas[1], &pen1);
-        for i in 0..p {
-            s_dense[[i, i]] += ridge;
-        }
 
-        // Dense eigendecomposition for reference logdet.
+        // Dense eigendecomposition for reference pseudo-logdet.
         let (evals_dense, _): (ndarray::Array1<f64>, ndarray::Array2<f64>) =
             s_dense.eigh(faer::Side::Lower).unwrap();
         let tol = 1e-12;
