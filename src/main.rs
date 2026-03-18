@@ -2356,7 +2356,7 @@ fn run_predict_survival(
             )),
             eta_log_sigma_offset: Array1::zeros(n),
             x_link_wiggle: None,
-            link_wiggle_knots,
+            link_wiggle_knots: link_wiggle_knots.clone(),
             link_wiggle_degree,
             inverse_link: survival_inverse_link.clone(),
         };
@@ -2366,7 +2366,7 @@ fn run_predict_survival(
                 beta_threshold: beta_threshold.clone(),
                 beta_log_sigma: beta_log_sigma.clone(),
                 beta_link_wiggle: beta_link_wiggle.clone(),
-                link_wiggle_knots: link_wiggle_knots.clone(),
+                link_wiggle_knots,
                 link_wiggle_degree,
                 lambdas_time: Array1::zeros(0),
                 lambdas_threshold: Array1::zeros(0),

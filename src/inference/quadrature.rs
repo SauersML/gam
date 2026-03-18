@@ -5014,4 +5014,116 @@ mod tests {
             }
         }
     }
+
+    // ── Cloglog negative-tail asymptotic tests ──────────────────────────
+
+    #[test]
+    fn cloglog_negative_tail_mean_matches_exact_near_boundary() {
+        // At η = −30 the exact cloglog mean is 1 − exp(−exp(−30)).
+        // Our tail helper should agree to high relative accuracy.
+        let eta = -30.0;
+        let exact = {
+            let ex = eta.exp();
+            -(-ex).exp_m1()
+        };
+        let tail = cloglog_negative_tail_mean(eta);
+        assert!(
+            (exact - tail).abs() < 1e-26 * exact.abs().max(1e-300),
+            "tail mean at η={eta}: exact={exact:.6e} tail={tail:.6e}"
+        );
+    }
+
+    #[test]
+    fn cloglog_negative_tail_derivative_matches_exact_near_boundary() {
+        // At η = −30: dμ/dη = exp(η)·exp(−exp(η)).
+        let eta = -30.0;
+        let ex = eta.exp();
+        let exact = ex * (-ex).exp();
+        let tail = cloglog_negative_tail_derivative(eta);
+        assert!(
+            (exact - tail).abs() < 1e-26 * exact.abs().max(1e-300),
+            "tail derivative at η={eta}: exact={exact:.6e} tail={tail:.6e}"
+        );
+    }
+
+    #[test]
+    fn cloglog_negative_tail_continuous_across_clamp_boundary_degenerate() {
+        // The degenerate-sigma (σ≈0) branch transitions from the exact
+        // formula (η ≥ −30) to the tail asymptotic (η < −30).
+        // Verify continuity: evaluations just inside and just outside the
+        // clamp window should agree to high relative accuracy.
+        let ctx = QuadratureContext::default();
+        let sigma = 0.0;
+        let inside = cloglog_posterior_meanwith_deriv_controlled(&ctx, -29.999, sigma);
+        let outside = cloglog_posterior_meanwith_deriv_controlled(&ctx, -30.001, sigma);
+
+        // Means: both ≈ exp(−30) ≈ 9.36e-14.
+        let mean_rel = (inside.mean - outside.mean).abs()
+            / inside.mean.abs().max(outside.mean.abs()).max(1e-300);
+        assert!(
+            mean_rel < 1e-3,
+            "mean discontinuity at clamp boundary: inside={:.6e} outside={:.6e} rel={mean_rel:.3e}",
+            inside.mean,
+            outside.mean
+        );
+
+        // Derivatives: both ≈ exp(−30).
+        let deriv_rel = (inside.dmean_dmu - outside.dmean_dmu).abs()
+            / inside.dmean_dmu.abs().max(outside.dmean_dmu.abs()).max(1e-300);
+        assert!(
+            deriv_rel < 1e-3,
+            "derivative discontinuity at clamp boundary: inside={:.6e} outside={:.6e} rel={deriv_rel:.3e}",
+            inside.dmean_dmu,
+            outside.dmean_dmu
+        );
+    }
+
+    #[test]
+    fn cloglog_negative_tail_continuous_across_clamp_boundary_small_sigma() {
+        // Same continuity check for the small-sigma Taylor branch.
+        let ctx = QuadratureContext::default();
+        let sigma = 0.1; // within CLOGLOG_SIGMA_TAYLOR_MAX = 0.25
+        let inside = cloglog_posterior_meanwith_deriv_controlled(&ctx, -29.999, sigma);
+        let outside = cloglog_posterior_meanwith_deriv_controlled(&ctx, -30.001, sigma);
+
+        let mean_rel = (inside.mean - outside.mean).abs()
+            / inside.mean.abs().max(outside.mean.abs()).max(1e-300);
+        assert!(
+            mean_rel < 1e-3,
+            "mean discontinuity (small σ): inside={:.6e} outside={:.6e} rel={mean_rel:.3e}",
+            inside.mean,
+            outside.mean
+        );
+
+        let deriv_rel = (inside.dmean_dmu - outside.dmean_dmu).abs()
+            / inside.dmean_dmu.abs().max(outside.dmean_dmu.abs()).max(1e-300);
+        assert!(
+            deriv_rel < 1e-3,
+            "derivative discontinuity (small σ): inside={:.6e} outside={:.6e} rel={deriv_rel:.3e}",
+            inside.dmean_dmu,
+            outside.dmean_dmu
+        );
+    }
+
+    #[test]
+    fn cloglog_negative_tail_derivative_nonzero_at_minus_40() {
+        // Before this fix, the derivative was exactly 0.0 for η < −30.
+        // Now it should be ≈ exp(−40) ≈ 4.25e-18.
+        let ctx = QuadratureContext::default();
+        let sigma = 0.0;
+        let result = cloglog_posterior_meanwith_deriv_controlled(&ctx, -40.0, sigma);
+
+        let expected = (-40.0_f64).exp();
+        assert!(
+            result.dmean_dmu > 0.0,
+            "derivative at η=−40 should be positive, got {}",
+            result.dmean_dmu
+        );
+        let rel = (result.dmean_dmu - expected).abs() / expected;
+        assert!(
+            rel < 1e-6,
+            "derivative at η=−40: got={:.6e} expected={expected:.6e} rel={rel:.3e}",
+            result.dmean_dmu
+        );
+    }
 }

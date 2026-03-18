@@ -38,7 +38,6 @@ pub struct DeviationBlockConfig {
     pub penalty_order: usize,
     pub penalty_orders: Vec<usize>,
     pub double_penalty: bool,
-    pub derivative_grid_size: usize,
     pub monotonicity_eps: f64,
 }
 
@@ -50,7 +49,6 @@ impl Default for DeviationBlockConfig {
             penalty_order: 2,
             penalty_orders: vec![1, 2],
             double_penalty: true,
-            derivative_grid_size: 64,
             monotonicity_eps: 1e-4,
         }
     }
@@ -61,13 +59,13 @@ pub struct DeviationRuntime {
     pub knots: Array1<f64>,
     pub degree: usize,
     pub transform: Array2<f64>,
+    pub monotonicity_eps: f64,
 }
 
 #[derive(Clone)]
 struct DeviationPrepared {
     block: ParameterBlockInput,
     runtime: DeviationRuntime,
-    constraints: LinearInequalityConstraints,
 }
 
 #[derive(Clone)]
@@ -106,8 +104,6 @@ struct BernoulliMarginalSlopeFamily {
     score_warp: Option<DeviationRuntime>,
     score_warp_obs_design: Option<Array2<f64>>,
     link_dev: Option<DeviationRuntime>,
-    score_warp_constraints: Option<LinearInequalityConstraints>,
-    link_dev_constraints: Option<LinearInequalityConstraints>,
 }
 
 #[derive(Clone, Default)]
@@ -162,6 +158,35 @@ impl DeviationRuntime {
         self.higher_derivative_design(values, 4)
     }
 
+    fn support_interval(&self) -> Result<(f64, f64), String> {
+        if self.knots.len() < self.degree + 2 {
+            return Err(format!(
+                "deviation support needs at least {} knots for degree {}, got {}",
+                self.degree + 2,
+                self.degree,
+                self.knots.len()
+            ));
+        }
+        Ok((
+            self.knots[self.degree],
+            self.knots[self.knots.len() - self.degree - 1],
+        ))
+    }
+
+    fn supported_unique_values_from_iter<I>(&self, values: I) -> Result<Array1<f64>, String>
+    where
+        I: IntoIterator<Item = f64>,
+    {
+        let (left, right) = self.support_interval()?;
+        let mut filtered = values
+            .into_iter()
+            .filter(|value| value.is_finite() && *value >= left && *value <= right)
+            .collect::<Vec<_>>();
+        filtered.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        filtered.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
+        Ok(Array1::from_vec(filtered))
+    }
+
     fn higher_derivative_design(
         &self,
         values: &Array1<f64>,
@@ -198,31 +223,6 @@ impl DeviationRuntime {
 
 fn design_row_owned(design: &DesignMatrix, row: usize) -> Array1<f64> {
     design.row_chunk(row..row + 1).row(0).to_owned()
-}
-
-fn deviation_grid_from_knots(
-    knots: &Array1<f64>,
-    degree: usize,
-    grid_size: usize,
-) -> Result<Array1<f64>, String> {
-    if knots.len() < degree + 2 {
-        return Err(format!(
-            "deviation derivative grid needs at least {} knots for degree {}, got {}",
-            degree + 2,
-            degree,
-            knots.len()
-        ));
-    }
-    let left = knots[degree];
-    let right = knots[knots.len() - degree - 1];
-    let n = grid_size.max(2);
-    if (right - left).abs() < 1e-12 {
-        return Ok(Array1::from_vec(vec![left; n]));
-    }
-    Ok(Array1::from_iter((0..n).map(|i| {
-        let t = i as f64 / ((n - 1) as f64);
-        left + (right - left) * t
-    })))
 }
 
 fn deviation_transform(
@@ -271,13 +271,13 @@ fn deviation_transform(
 fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
-    extra_collocation: Option<&[f64]>,
 ) -> Result<DeviationPrepared, String> {
     let knots = initializewiggle_knots_from_seed(seed.view(), cfg.degree, cfg.num_internal_knots)?;
     let runtime = DeviationRuntime {
         knots: knots.clone(),
         degree: cfg.degree,
         transform: deviation_transform(&knots, cfg.degree, seed)?,
+        monotonicity_eps: cfg.monotonicity_eps,
     };
     let design = runtime.design(seed)?;
     let raw_dim = runtime.transform.nrows();
@@ -315,29 +315,6 @@ fn build_deviation_block_from_seed(
         ));
         nullspace_dims.push(0); // identity has full rank, no nullspace
     }
-    let mut derivative_grid =
-        deviation_grid_from_knots(&knots, cfg.degree, cfg.derivative_grid_size)?;
-    // Extend collocation grid with evaluation-domain points that fall within the
-    // B-spline active support.  Outside the support the basis is zero so the
-    // deviation is identically zero and no constraint is needed.
-    if let Some(extra) = extra_collocation {
-        let left = knots[cfg.degree];
-        let right = knots[knots.len() - cfg.degree - 1];
-        let mut pts: Vec<f64> = derivative_grid.to_vec();
-        for &pt in extra {
-            if pt.is_finite() && pt >= left && pt <= right {
-                pts.push(pt);
-            }
-        }
-        pts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        pts.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
-        derivative_grid = Array1::from_vec(pts);
-    }
-    let derivative_design = runtime.first_derivative_design(&derivative_grid)?;
-    let constraints = LinearInequalityConstraints {
-        a: derivative_design,
-        b: Array1::from_elem(derivative_grid.len(), cfg.monotonicity_eps - 1.0),
-    };
     Ok(DeviationPrepared {
         block: ParameterBlockInput {
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
@@ -348,7 +325,6 @@ fn build_deviation_block_from_seed(
             initial_beta: Some(Array1::zeros(dim)),
         },
         runtime,
-        constraints,
     })
 }
 
@@ -923,6 +899,67 @@ impl BernoulliMarginalSlopeFamily {
         }
         let beta_h = &block_states[2].beta;
         Ok(Some((obs_design.clone(), obs_design.dot(beta_h))))
+    }
+
+    fn deviation_constraints_from_points(
+        runtime: &DeviationRuntime,
+        points: Array1<f64>,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        if points.is_empty() {
+            return Ok(None);
+        }
+        let derivative_design = runtime.first_derivative_design(&points)?;
+        Ok(Some(LinearInequalityConstraints {
+            a: derivative_design,
+            b: Array1::from_elem(points.len(), runtime.monotonicity_eps - 1.0),
+        }))
+    }
+
+    fn score_warp_constraint_points(&self) -> Result<Option<Array1<f64>>, String> {
+        let Some(runtime) = self.score_warp.as_ref() else {
+            return Ok(None);
+        };
+        let points = runtime.supported_unique_values_from_iter(
+            self.z
+                .iter()
+                .copied()
+                .chain(self.quadrature_nodes.iter().copied()),
+        )?;
+        if points.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(points))
+    }
+
+    fn link_dev_constraint_points(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array1<f64>>, String> {
+        let Some(runtime) = self.link_dev.as_ref() else {
+            return Ok(None);
+        };
+        let beta_w = block_states.last().map(|state| &state.beta);
+        let (h_nodes, _) = self.quadrature_h(block_states)?;
+        let score_warp_obs = self.score_warp_obs(block_states)?;
+        let mut values = Vec::with_capacity(self.z.len() * (h_nodes.len() + 1));
+        for row in 0..self.z.len() {
+            let marginal_eta = block_states[0].eta[row];
+            let slope = block_states[1].eta[row].exp();
+            let h_obs_base = if let Some((_, dev_obs)) = score_warp_obs.as_ref() {
+                self.z[row] + dev_obs[row]
+            } else {
+                self.z[row]
+            };
+            let (intercept, _) =
+                self.solve_row_intercept_base(marginal_eta, slope, &h_nodes, beta_w)?;
+            values.extend(h_nodes.iter().map(|&h| intercept + slope * h));
+            values.push(intercept + slope * h_obs_base);
+        }
+        let points = runtime.supported_unique_values_from_iter(values)?;
+        if points.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(points))
     }
 
     fn solve_row_intercept_base(
@@ -2865,7 +2902,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             self.link_dev.is_some(),
         );
         if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
-            return Ok(self.score_warp_constraints.clone());
+            return match self.score_warp_constraint_points()? {
+                Some(points) => Self::deviation_constraints_from_points(
+                    self.score_warp
+                        .as_ref()
+                        .ok_or_else(|| "score-warp runtime missing".to_string())?,
+                    points,
+                ),
+                None => Ok(None),
+            };
         }
         let link_block_idx = if slices.h.is_some() { 3 } else { 2 };
         if slices
@@ -2873,7 +2918,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .as_ref()
             .is_some_and(|_| block_idx == link_block_idx)
         {
-            return Ok(self.link_dev_constraints.clone());
+            return match self.link_dev_constraint_points(block_states)? {
+                Some(points) => Self::deviation_constraints_from_points(
+                    self.link_dev
+                        .as_ref()
+                        .ok_or_else(|| "link-deviation runtime missing".to_string())?,
+                    points,
+                ),
+                None => Ok(None),
+            };
         }
         Ok(None)
     }
@@ -3054,17 +3107,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
         freeze_spatial_length_scale_terms_from_design(&spec.logslopespec, &logslope_design)
             .map_err(|e| e.to_string())?;
 
-    // Compute quadrature nodes early so they can be used as collocation hints
-    // for the score-warp monotonicity constraints (fix #9a: the score-warp is
-    // evaluated at these nodes, so monotonicity must be enforced there too).
     let (quad_nodes, quad_weights) = normal_expectation_nodes(spec.quadrature_points);
 
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
-        .map(|cfg| {
-            build_deviation_block_from_seed(&spec.z, cfg, Some(quad_nodes.as_slice().unwrap()))
-        })
+        .map(|cfg| build_deviation_block_from_seed(&spec.z, cfg))
         .transpose()?;
     let rigid_family = BernoulliMarginalSlopeFamily {
         y: spec.y.clone(),
@@ -3077,8 +3125,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         score_warp: None,
         score_warp_obs_design: None,
         link_dev: None,
-        score_warp_constraints: None,
-        link_dev_constraints: None,
     };
     let rigid_blocks = vec![
         build_blockspec(
@@ -3105,30 +3151,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
             marginal_eta[i] * (1.0 + b * b).sqrt() + b * spec.z[i]
         }))
     };
-    // Estimate the link-deviation evaluation domain from the rigid fit.
-    // During fitting, the link is evaluated at a_i + b_i * h_m where a_i is
-    // the intercept and b_i = exp(g_i) is the slope for each row, and h_m are
-    // the quadrature nodes.  We use the rigid-fit parameters to estimate the
-    // range of these values so the collocation grid covers them.
-    let link_dev_collocation_hints: Vec<f64> = {
-        let marginal_eta = &rigid_fit.block_states[0].eta;
-        let logslope_eta = &rigid_fit.block_states[1].eta;
-        let mut hints = Vec::new();
-        for i in 0..marginal_eta.len() {
-            let b = logslope_eta[i].exp();
-            let a_i = marginal_eta[i] * (1.0 + b * b).sqrt();
-            for &h in quad_nodes.iter() {
-                hints.push(a_i + b * h);
-            }
-        }
-        hints
-    };
     let link_dev_prepared = spec
         .link_dev
         .as_ref()
-        .map(|cfg| {
-            build_deviation_block_from_seed(&q0_seed, cfg, Some(&link_dev_collocation_hints))
-        })
+        .map(|cfg| build_deviation_block_from_seed(&q0_seed, cfg))
         .transpose()?;
 
     let extra_rho0 = {
@@ -3162,8 +3188,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             DesignMatrix::Sparse(_) => None,
         });
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
-    let score_warp_constraints = score_warp_prepared.as_ref().map(|p| p.constraints.clone());
-    let link_dev_constraints = link_dev_prepared.as_ref().map(|p| p.constraints.clone());
 
     let build_blocks = |rho: &Array1<f64>,
                         marginal_design: &TermCollectionDesign,
@@ -3235,8 +3259,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             score_warp: score_warp_runtime.clone(),
             score_warp_obs_design: score_warp_obs_design.clone(),
             link_dev: link_dev_runtime.clone(),
-            score_warp_constraints: score_warp_constraints.clone(),
-            link_dev_constraints: link_dev_constraints.clone(),
         }
     };
 
@@ -3329,22 +3351,24 @@ pub fn fit_bernoulli_marginal_slope_terms(
             // For blocks with spatial terms, require derivatives (error if missing).
             // For non-spatial blocks, use an empty vec (zero psi contribution).
             let marginal_psi_derivs = if marginal_has_spatial {
-                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
-                    .ok_or_else(|| {
+                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
+                    || {
                         "bernoulli marginal-slope: marginal block has spatial terms \
                          but spatial psi derivatives are unavailable"
                             .to_string()
-                    })?
+                    },
+                )?
             } else {
                 Vec::new()
             };
             let logslope_psi_derivs = if logslope_has_spatial {
-                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
-                    .ok_or_else(|| {
+                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
+                    || {
                         "bernoulli marginal-slope: logslope block has spatial terms \
                          but spatial psi derivatives are unavailable"
                             .to_string()
-                    })?
+                    },
+                )?
             } else {
                 Vec::new()
             };
@@ -3479,10 +3503,8 @@ mod tests {
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
-                derivative_grid_size: 16,
                 ..DeviationBlockConfig::default()
             },
-            None,
         )
         .expect("build link deviation block");
         let link_dim = prepared
@@ -3507,8 +3529,6 @@ mod tests {
             score_warp: None,
             score_warp_obs_design: None,
             link_dev: Some(prepared.runtime.clone()),
-            score_warp_constraints: None,
-            link_dev_constraints: Some(prepared.constraints.clone()),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -3565,14 +3585,93 @@ mod tests {
             .block_linear_constraints(&block_states, 2, &dummy_spec)
             .expect("constraint lookup")
             .expect("link block constraints");
+        let exact_points = family
+            .link_dev_constraint_points(&block_states)
+            .expect("exact link constraint points")
+            .expect("non-empty link constraint points");
         assert_eq!(constraints.a.ncols(), link_dim);
-        assert_eq!(constraints.a.nrows(), prepared.constraints.a.nrows());
+        assert_eq!(constraints.a.nrows(), exact_points.len());
+        assert_eq!(
+            constraints.a,
+            prepared
+                .runtime
+                .first_derivative_design(&exact_points)
+                .expect("link derivative design"),
+        );
+        assert_eq!(
+            constraints.b,
+            Array1::from_elem(exact_points.len(), prepared.runtime.monotonicity_eps - 1.0),
+        );
         assert!(
             family
                 .block_linear_constraints(&block_states, 1, &dummy_spec)
                 .expect("non-link constraint lookup")
                 .is_none(),
             "only block 2 should expose link constraints when score_warp is absent"
+        );
+    }
+
+    #[test]
+    fn score_warp_constraints_use_observed_and_quadrature_points() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let family = BernoulliMarginalSlopeFamily {
+            y: Array1::zeros(seed.len()),
+            weights: Array1::ones(seed.len()),
+            z: seed.clone(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            quadrature_nodes: array![-0.25, 0.25],
+            quadrature_weights: array![0.5, 0.5],
+            score_warp: Some(prepared.runtime.clone()),
+            score_warp_obs_design: Some(prepared.block.design.to_dense().as_ref().clone()),
+            link_dev: None,
+        };
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(Array1::zeros(score_dim), seed.len()),
+        ];
+
+        let points = family
+            .score_warp_constraint_points()
+            .expect("score-warp points")
+            .expect("non-empty score-warp points");
+        assert!(
+            points.iter().any(|value| (*value - 0.25).abs() < 1e-12),
+            "quadrature nodes should be included in the exact score-warp constraint domain"
+        );
+
+        let dummy_spec = dummy_blockspec(score_dim, seed.len());
+        let constraints = family
+            .block_linear_constraints(&block_states, 2, &dummy_spec)
+            .expect("constraint lookup")
+            .expect("score-warp constraints");
+        assert_eq!(constraints.a.ncols(), score_dim);
+        assert_eq!(constraints.a.nrows(), points.len());
+        assert_eq!(
+            constraints.a,
+            prepared
+                .runtime
+                .first_derivative_design(&points)
+                .expect("score-warp derivative design"),
         );
     }
 
@@ -3702,10 +3801,8 @@ mod tests {
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
-                derivative_grid_size: 16,
                 ..DeviationBlockConfig::default()
             },
-            None,
         )
         .expect("build link deviation block");
         let link_dim = prepared
@@ -3732,8 +3829,6 @@ mod tests {
             score_warp: None,
             score_warp_obs_design: None,
             link_dev: Some(prepared.runtime.clone()),
-            score_warp_constraints: None,
-            link_dev_constraints: Some(prepared.constraints.clone()),
         };
 
         // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
