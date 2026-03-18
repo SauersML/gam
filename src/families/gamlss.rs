@@ -4281,7 +4281,7 @@ fn gaussian_joint_psisecondweights(
         let sea_seb = sea * seb;
         let ma_mb = ma * mb;
         // Objective psi-psi: d²NLL/d(ψ_a)d(ψ_b).
-        // Score_μ = -m, Score_ls = κ(1-n). Hessian blocks carry κ, κ².
+        // Score_μ = -m, Score_ls = κ(weight - n). Hessian blocks carry κ, κ².
         objective_psi_psirow[i].write(
             wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * sea_seb - mi * mab
                 + ki * (scalars.obs_weight[i] - ni) * eta_ab[i],

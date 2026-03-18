@@ -8991,8 +8991,9 @@ fn duchon_radial_jets(
     }
 
     // Compute t = R²φ = (φ'' - q) / r² = q' / r for r > 0.
-    // At the r_eval floor this is well-defined and numerically stable.
-    out.t = (out.phi_rr - out.q) / (r_eval * r_eval);
+    // Use q'/r directly: q_r is assembled from the same partial-fraction
+    // blocks as q_rr and gives the most stable derivative-consistent path.
+    out.t = out.q_r / r_eval;
     out.t_r = (out.q_rr - out.t) / r_eval;
     out.t_rr = (out.lap_rr + 2.0 * out.t - (k_dim as f64 + 4.0) * out.q_rr) / (r_eval * r_eval);
 

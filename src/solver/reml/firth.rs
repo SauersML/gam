@@ -320,14 +320,7 @@ impl FirthDenseOperator {
         let mut w3 = Array1::<f64>::zeros(n);
         let mut w4 = Array1::<f64>::zeros(n);
         let logisticweight = |z: f64| {
-            let ez = z.clamp(-700.0, 700.0);
-            let mz = if ez >= 0.0 {
-                1.0 / (1.0 + (-ez).exp())
-            } else {
-                let ex = ez.exp();
-                ex / (1.0 + ex)
-            };
-            mz * (1.0 - mz)
+            crate::solver::mixture_link::component_inverse_link_jet(LinkComponent::Logit, z).d1
         };
         let h12 = 2e-5;
         let h34 = 1e-3;
@@ -337,33 +330,33 @@ impl FirthDenseOperator {
         };
         let w3fd = |z: f64| (w2fd(z + h34) - w2fd(z - h34)) / (2.0 * h34);
         for i in 0..n {
-            // Compute mu and logistic derivatives from eta with stable algebra.
-            // Clamping eta to [-700, 700] avoids exp overflow while preserving
-            // strictly positive working weights in floating point:
-            //   mu in (0,1), w = mu(1-mu) > 0.
-            let ei = eta[i].clamp(-700.0, 700.0);
-            let mi = if ei >= 0.0 {
-                1.0 / (1.0 + (-ei).exp())
-            } else {
-                let ex = ei.exp();
-                ex / (1.0 + ex)
-            };
-            let wi = mi * (1.0 - mi);
-            let ti = 1.0 - 2.0 * mi;
-            let wi2 = wi * wi;
-            let wi3 = wi2 * wi;
+            let ei = eta[i];
+            let jet = crate::solver::mixture_link::component_inverse_link_jet(LinkComponent::Logit, ei);
+            let mi = jet.mu;
+            let wi = jet.d1;
             w[i] = wi;
-            w1[i] = wi * ti;
-            w2[i] = wi * ti * ti - 2.0 * wi2;
-            w3[i] = wi * ti * ti * ti - 8.0 * wi2 * ti;
-            let w4fd = (w3fd(ei + h34) - w3fd(ei - h34)) / (2.0 * h34);
-            // Keep a numerically stable fourth derivative in regimes where
-            // high-order finite differences of logistic weights are sensitive.
-            w4[i] = if w4fd.is_finite() {
-                w4fd
-            } else {
-                wi * ti * ti * ti * ti - 22.0 * wi2 * ti * ti + 16.0 * wi3
-            };
+            w1[i] = jet.d2;
+            w2[i] = jet.d3;
+            w3[i] = crate::solver::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                &InverseLink::Standard(LinkFunction::Logit),
+                ei,
+            )
+            .unwrap_or(0.0);
+            w4[i] = crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                &InverseLink::Standard(LinkFunction::Logit),
+                ei,
+            )
+            .unwrap_or_else(|_| {
+                let w4fd = (w3fd(ei + h34) - w3fd(ei - h34)) / (2.0 * h34);
+                if w4fd.is_finite() {
+                    w4fd
+                } else {
+                    let m2 = mi * mi;
+                    let m3 = m2 * mi;
+                    let m4 = m3 * mi;
+                    wi * (1.0 - 30.0 * mi + 150.0 * m2 - 240.0 * m3 + 120.0 * m4)
+                }
+            });
         }
         let basis_design = if let Some(scale) = observation_weight_sqrt.as_ref() {
             RemlState::row_scale(x_dense, scale)
@@ -446,21 +439,45 @@ impl FirthDenseOperator {
         let mut k_reduced = Array2::<f64>::zeros((r, r));
         let mut half_log_det = 0.0_f64;
         if r > 0 {
-            // Exact reduced-space inverse: I_r should be SPD for finite-logit eta
-            // with full-rank X_r. We intentionally avoid diagonal ridge here.
-            // If this fails, the current point is outside the smooth regime
-            // required by exact Jeffreys/Firth derivatives.
-            let chol = fisher_reduced.cholesky(Side::Lower).map_err(|_| {
-                EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
+            // The fixed-Q identifiable-space objective is the positive-part
+            // pseudodeterminant of I_r. Prefer the fast SPD path, but when I_r
+            // is only numerically semidefinite after projection, keep the exact
+            // positive eigenspace instead of failing outright.
+            if let Ok(chol) = fisher_reduced.cholesky(Side::Lower) {
+                half_log_det = chol.diag().iter().map(|d| d.ln()).sum::<f64>();
+                for col in 0..r {
+                    let mut e_col = Array1::<f64>::zeros(r);
+                    e_col[col] = 1.0;
+                    let solved = chol.solvevec(&e_col);
+                    k_reduced.column_mut(col).assign(&solved);
                 }
-            })?;
-            half_log_det = chol.diag().iter().map(|d| d.ln()).sum::<f64>();
-            for col in 0..r {
-                let mut e_col = Array1::<f64>::zeros(r);
-                e_col[col] = 1.0;
-                let solved = chol.solvevec(&e_col);
-                k_reduced.column_mut(col).assign(&solved);
+            } else {
+                let (evals_ir, evecs_ir) = fisher_reduced
+                    .eigh(Side::Lower)
+                    .map_err(EstimationError::EigendecompositionFailed)?;
+                let max_eval = evals_ir.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+                let tol = (r.max(1) as f64) * f64::EPSILON * max_eval;
+                let keep: Vec<usize> = evals_ir
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &v)| if v > tol { Some(i) } else { None })
+                    .collect();
+                if keep.is_empty() {
+                    return Err(EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    });
+                }
+                for &eig_idx in &keep {
+                    let eig = evals_ir[eig_idx];
+                    half_log_det += 0.5 * eig.ln();
+                    let inv = eig.recip();
+                    let vec = evecs_ir.column(eig_idx).to_owned();
+                    for row in 0..r {
+                        for col in 0..r {
+                            k_reduced[[row, col]] += inv * vec[row] * vec[col];
+                        }
+                    }
+                }
             }
         }
         // Reduced design enters M = Z K_r Z' and P = M⊙M.
@@ -516,14 +533,6 @@ impl FirthDenseOperator {
     }
 
     #[inline]
-    fn assert_unweighted_directional_support(&self, method: &str) {
-        assert!(
-            self.observation_weight_sqrt.is_none(),
-            "FirthDenseOperator::{method} currently supports only the unweighted exact REML path; weighted operators are limited to Jeffreys value/gradient accessors"
-        );
-    }
-
-    #[inline]
     fn reduce_explicit_design(&self, x: &Array2<f64>) -> Array2<f64> {
         let mut reduced = fast_ab(x, &self.q_basis);
         if let Some(scale) = self.observation_weight_sqrt.as_ref() {
@@ -533,7 +542,6 @@ impl FirthDenseOperator {
     }
 
     pub(crate) fn direction_from_deta(&self, deta: Array1<f64>) -> FirthDirection {
-        self.assert_unweighted_directional_support("direction_from_deta");
         // Directional building blocks for u:
         //   δη_u = X u
         //   I_u  = Xᵀ diag(w' ⊙ δη_u) X
@@ -855,7 +863,6 @@ impl FirthDenseOperator {
         beta: &Array1<f64>,
         include_hphi_tau_kernel: bool,
     ) -> FirthTauExactKernel {
-        self.assert_unweighted_directional_support("exact_tau_kernel");
         // Shared exact tau-partial bundle used by both dense and sparse paths:
         //   (gphi)_tau | beta-fixed,
         //   Phi_tau | beta-fixed,

@@ -1152,16 +1152,15 @@ pub fn blockwise_fit_from_parts(
                 total_p, total_p, rows, cols
             ));
         }
-        let stacked_n = n.saturating_mul(specs.len());
-        if geom.working_weights.len() != n && geom.working_weights.len() != stacked_n {
+        if geom.working_weights.len() != n {
             return Err(format!(
-                "blockwise_fit.geometry.working_weights length mismatch: got {}, expected {n} or {stacked_n}",
+                "blockwise_fit.geometry.working_weights length mismatch: got {}, expected {n}",
                 geom.working_weights.len(),
             ));
         }
-        if geom.working_response.len() != n && geom.working_response.len() != stacked_n {
+        if geom.working_response.len() != n {
             return Err(format!(
-                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n} or {stacked_n}",
+                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n}",
                 geom.working_response.len(),
             ));
         }
@@ -7489,6 +7488,9 @@ fn compute_joint_geometry<F: CustomFamily>(
     if all_working_weights.is_empty() {
         return None;
     }
+    // FitGeometry is row-wise. Multi-block families expose one working pair per
+    // block, so they must stay on the explicit blockwise paths instead of
+    // fabricating a stacked diagonal geometry with mismatched semantics.
     if all_working_weights.len() != 1 {
         return None;
     }
