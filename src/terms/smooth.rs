@@ -1225,15 +1225,16 @@ pub struct SpatialLengthScaleOptimizationOptions {
     /// Automatic pilot-fit threshold for biobank-scale acceleration.
     ///
     /// When n exceeds twice this value, κ/anisotropy optimization runs on a
-    /// spatially stratified random subsample of this size, then the full
-    /// dataset is fit once with frozen geometry. This avoids repeated O(n·k)
-    /// dense basis rebuilds at each κ proposal.
+    /// spatially stratified random subsample of this size to obtain an
+    /// initializer, then the exact joint full-data [rho, psi] optimization
+    /// continues from that pilot geometry. This avoids repeated O(n·k) dense
+    /// basis rebuilds during the seeding phase while still enforcing
+    /// stationarity on the full objective.
     ///
     /// The subsample preserves spatial coverage via cell-based stratification
-    /// on the coordinates of the first eligible spatial term. The full-data
-    /// fit uses the pilot-optimized length scales and anisotropy exactly,
-    /// so the only approximation is in the κ search — the final coefficients
-    /// and smoothing parameters are estimated on all observations.
+    /// on the coordinates of the first eligible spatial term. The final
+    /// coefficients, smoothing parameters, and spatial geometry are then all
+    /// re-optimized on the full dataset.
     ///
     /// Set to 0 to disable pilot-fit and always optimize on full data.
     pub pilot_subsample_threshold: usize,
@@ -4805,9 +4806,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     baseline.design.design.ncols(),
                 )),
                 s_psi_components: None,
+                s_psi_penalty_components: None,
                 x_psi_psi: None,
                 s_psi_psi: None,
                 s_psi_psi_components: None,
+                s_psi_psi_penalty_components: None,
                 implicit_operator: None,
                 implicit_axis: 0,
                 implicit_group_id: None,
@@ -9547,6 +9550,15 @@ struct FrozenTermCollectionIncrementalRealizer<'d> {
     basisworkspace: crate::basis::BasisWorkspace,
 }
 
+impl<'d> std::fmt::Debug for FrozenTermCollectionIncrementalRealizer<'d> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrozenTermCollectionIncrementalRealizer")
+            .field("data_shape", &(self.data.nrows(), self.data.ncols()))
+            .field("full_smooth_start", &self.full_smooth_start)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     fn new(
         data: ArrayView2<'d, f64>,
@@ -13524,9 +13536,11 @@ mod tests {
             x_psi: Array2::zeros((2, 2)),
             s_psi: Array2::zeros((2, 2)),
             s_psi_components: None,
+            s_psi_penalty_components: None,
             x_psi_psi: None,
             s_psi_psi: None,
             s_psi_psi_components: None,
+            s_psi_psi_penalty_components: None,
             implicit_operator: None,
             implicit_axis: 0,
             implicit_group_id: None,
@@ -13930,9 +13944,11 @@ mod tests {
                         baseline.design.design.ncols(),
                     )),
                     s_psi_components: None,
+                    s_psi_penalty_components: None,
                     x_psi_psi: None,
                     s_psi_psi: None,
                     s_psi_psi_components: None,
+                    s_psi_psi_penalty_components: None,
                     implicit_operator: None,
                     implicit_axis: 0,
                     implicit_group_id: None,
@@ -14122,9 +14138,11 @@ mod tests {
                         baseline.design.design.ncols(),
                     )),
                     s_psi_components: None,
+                    s_psi_penalty_components: None,
                     x_psi_psi: None,
                     s_psi_psi: None,
                     s_psi_psi_components: None,
+                    s_psi_psi_penalty_components: None,
                     implicit_operator: None,
                     implicit_axis: 0,
                     implicit_group_id: None,

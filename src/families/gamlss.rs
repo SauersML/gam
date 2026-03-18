@@ -3790,9 +3790,6 @@ fn binomial_location_scale_working_sets(
             let q0 = nonwiggle_q_derivs(
                 eta_t[i],
                 core.sigma[i],
-                core.dsigma_deta[i],
-                geom.d2sigma_deta2[i],
-                0.0,
             );
             // Full rowwise chain rule for the exact wiggle geometry.
             //

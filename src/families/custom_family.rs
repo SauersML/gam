@@ -27,6 +27,7 @@ use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2, ArrayView1, s};
+use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -1243,9 +1244,11 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub x_psi: Array2<f64>,
     pub s_psi: Array2<f64>,
     pub s_psi_components: Option<Vec<(usize, Array2<f64>)>>,
+    pub s_psi_penalty_components: Option<Vec<(usize, PenaltyMatrix)>>,
     pub x_psi_psi: Option<Vec<Array2<f64>>>,
     pub s_psi_psi: Option<Vec<Array2<f64>>>,
     pub s_psi_psi_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
+    pub s_psi_psi_penalty_components: Option<Vec<Vec<(usize, PenaltyMatrix)>>>,
     pub(crate) implicit_operator: Option<Arc<dyn CustomFamilyPsiDerivativeOperator>>,
     pub implicit_axis: usize,
     pub implicit_group_id: Option<usize>,
@@ -1268,9 +1271,11 @@ impl CustomFamilyBlockPsiDerivative {
             x_psi,
             s_psi,
             s_psi_components,
+            s_psi_penalty_components: None,
             x_psi_psi,
             s_psi_psi,
             s_psi_psi_components,
+            s_psi_psi_penalty_components: None,
             implicit_operator: None,
             implicit_axis: 0,
             implicit_group_id: None,
@@ -1278,7 +1283,8 @@ impl CustomFamilyBlockPsiDerivative {
     }
 }
 
-pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync {
+pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
+    fn as_any(&self) -> &dyn Any;
     fn n_data(&self) -> usize;
     fn p_out(&self) -> usize;
     fn transpose_mul(
@@ -1329,6 +1335,10 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync {
 }
 
 impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn n_data(&self) -> usize {
         crate::terms::basis::ImplicitDesignPsiDerivative::n_data(self)
     }
@@ -1553,6 +1563,10 @@ impl EmbeddedDensePsiDerivativeOperator {
 }
 
 impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn n_data(&self) -> usize {
         self.first_local.nrows()
     }
@@ -1767,6 +1781,10 @@ impl RowwiseKroneckerPsiDerivativeOperator {
 }
 
 impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn n_data(&self) -> usize {
         self.n_per_block * self.time_bases.len()
     }
@@ -2125,9 +2143,11 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                 x_psi: x_full,
                 s_psi: Array2::<f64>::zeros((0, 0)),
                 s_psi_components: Some(s_components),
+                s_psi_penalty_components: None,
                 x_psi_psi: x_psi_psi_rows,
                 s_psi_psi: None,
                 s_psi_psi_components: Some(s_psi_psi_comp_rows),
+                s_psi_psi_penalty_components: None,
                 implicit_operator: design_operator,
                 implicit_axis: info.implicit_axis,
                 implicit_group_id: info.aniso_group_id,
@@ -6063,6 +6083,13 @@ fn assemble_block_local_s_psi(
     per_block_rho: &Array1<f64>,
     p_block: usize,
 ) -> Array2<f64> {
+    if let Some(ref components) = deriv.s_psi_penalty_components {
+        let mut s = Array2::<f64>::zeros((p_block, p_block));
+        for (penalty_idx, s_part) in components {
+            s_part.add_scaled_to(per_block_rho[*penalty_idx].exp(), &mut s);
+        }
+        return s;
+    }
     if let Some(ref components) = deriv.s_psi_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         for (penalty_idx, s_part) in components {
@@ -6088,6 +6115,15 @@ fn assemble_block_local_s_psi_psi(
     per_block_rho: &Array1<f64>,
     p_block: usize,
 ) -> Array2<f64> {
+    if let Some(ref parts) = deriv_i.s_psi_psi_penalty_components {
+        let mut s = Array2::<f64>::zeros((p_block, p_block));
+        if let Some(pair_parts) = parts.get(local_j) {
+            for (penalty_idx, s_part) in pair_parts {
+                s_part.add_scaled_to(per_block_rho[*penalty_idx].exp(), &mut s);
+            }
+        }
+        return s;
+    }
     if let Some(ref parts) = deriv_i.s_psi_psi_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         if let Some(pair_parts) = parts.get(local_j) {
@@ -6460,7 +6496,15 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 let p_block = rho_cache.end - rho_cache.start;
                 let deriv = &derivative_blocks[psi_cache.block_idx][psi_cache.local_idx];
                 let lambda_k = per_block[rho_cache.block_idx][rho_cache.penalty_idx].exp();
-                let local = if let Some(ref components) = deriv.s_psi_components {
+                let local = if let Some(ref components) = deriv.s_psi_penalty_components {
+                    let mut m = Array2::<f64>::zeros((p_block, p_block));
+                    for (penalty_idx, s_part) in components {
+                        if *penalty_idx == rho_cache.penalty_idx {
+                            s_part.add_scaled_to(lambda_k, &mut m);
+                        }
+                    }
+                    m
+                } else if let Some(ref components) = deriv.s_psi_components {
                     let mut m = Array2::<f64>::zeros((p_block, p_block));
                     for (penalty_idx, s_part) in components {
                         if *penalty_idx == rho_cache.penalty_idx {
@@ -8756,9 +8800,11 @@ mod tests {
             x_psi: Array2::zeros((1, 1)),
             s_psi: Array2::zeros((1, 1)),
             s_psi_components: None,
+            s_psi_penalty_components: None,
             x_psi_psi: None,
             s_psi_psi: None,
             s_psi_psi_components: None,
+            s_psi_psi_penalty_components: None,
             implicit_operator: None,
             implicit_axis: 0,
             implicit_group_id: None,

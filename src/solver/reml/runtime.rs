@@ -1484,10 +1484,6 @@ impl<'a> RemlState<'a> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
         let (h_eff, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
 
-        const EIG_REL_THRESHOLD: f64 = 1e-10;
-        const EIG_ABS_FLOOR: f64 = 1e-14;
-
-        let dim = h_eff.nrows();
         let mut h_total = h_eff.clone();
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if self.config.firth_bias_reduction
@@ -1559,80 +1555,6 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        let (eigvals, eigvecs) = h_total
-            .eigh(Side::Lower)
-            .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
-        let max_eig = eigvals.iter().copied().fold(0.0_f64, f64::max);
-        let eig_threshold = if self.config.link_function() == LinkFunction::Identity {
-            (max_eig * EIG_REL_THRESHOLD).max(EIG_ABS_FLOOR)
-        } else {
-            EIG_ABS_FLOOR
-        };
-        let h_total_log_det: f64 = eigvals
-            .iter()
-            .filter(|&&v| v > eig_threshold)
-            .map(|&v| v.ln())
-            .sum();
-        if !h_total_log_det.is_finite() {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-
-        let valid_indices: Vec<usize> = eigvals
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &v)| if v > eig_threshold { Some(i) } else { None })
-            .collect();
-        let min_kept = valid_indices
-            .iter()
-            .map(|&i| eigvals[i])
-            .fold(f64::INFINITY, f64::min);
-        let max_dropped = eigvals
-            .iter()
-            .copied()
-            .filter(|&v| v <= eig_threshold)
-            .fold(0.0_f64, f64::max);
-        let active_subspace_rel_gap =
-            if min_kept.is_finite() && max_dropped.is_finite() && min_kept > 0.0 {
-                let gap = (min_kept - max_dropped).max(0.0);
-                Some(gap / min_kept.max(1e-16))
-            } else {
-                None
-            };
-        let active_subspace_unstable =
-            active_subspace_rel_gap.is_some_and(|rel_gap| rel_gap < 1e-6);
-        // Active-subspace stability diagnostic for hard-truncated logdet
-        // derivatives. The branch-local formulas used elsewhere assume a fixed
-        // retained eigenspace; once retained and dropped eigenvalues crowd the
-        // threshold, even first-order exactness is no longer justified at the
-        // crossing and second-order updates are especially fragile.
-        if log::log_enabled!(log::Level::Warn) {
-            if active_subspace_unstable {
-                let rel_gap = active_subspace_rel_gap.unwrap_or(f64::NAN);
-                log::warn!(
-                    "[REML] H_+ active-subspace is near a hard-threshold crossing: min_kept={:.3e}, max_dropped={:.3e}, threshold={:.3e}, rel_gap={:.3e}; exact truncated-logdet derivatives are branch-local only",
-                    min_kept,
-                    max_dropped,
-                    eig_threshold,
-                    rel_gap
-                );
-            }
-        }
-
-        let valid_count = valid_indices.len();
-        let mut w = Array2::<f64>::zeros((dim, valid_count));
-
-        for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
-            let val = eigvals[eig_idx];
-            let scale = 1.0 / val.sqrt();
-            let u_col = eigvecs.column(eig_idx);
-            let mut w_col = w.column_mut(w_col_idx);
-            Zip::from(&mut w_col)
-                .and(&u_col)
-                .for_each(|w_elem, &u_elem| *w_elem = u_elem * scale);
-        }
-
         Ok(EvalShared {
             key,
             pirls_result,
@@ -1640,8 +1562,6 @@ impl<'a> RemlState<'a> {
             geometry: RemlGeometry::DenseSpectral,
             h_eff: Arc::new(h_eff),
             h_total: Arc::new(h_total),
-            active_subspace_rel_gap,
-            active_subspace_unstable,
             sparse_exact: None,
             firth_dense_operator,
             firth_dense_operator_original: None,
@@ -1732,8 +1652,6 @@ impl<'a> RemlState<'a> {
             geometry: RemlGeometry::SparseExactSpd,
             h_eff: Arc::new(Array2::zeros((0, 0))),
             h_total: Arc::new(Array2::zeros((0, 0))),
-            active_subspace_rel_gap: None,
-            active_subspace_unstable: false,
             sparse_exact: Some(Arc::new({
                 let factor = Arc::new(sparse_system.factor);
                 // Compute Takahashi selected inverse from simplicial factorization.
@@ -1862,11 +1780,11 @@ impl<'a> RemlState<'a> {
             let screen_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
             if let Ok((ref res, ref wm)) = result {
                 log::info!(
-                    "[PIRLS-timing] iters={} status={:?} max_eta={:.1} firth_logdet={} elapsed={:.3}s screening={}",
+                    "[PIRLS-timing] iters={} status={:?} max_eta={:.1} jeffreys_logdet={} elapsed={:.3}s screening={}",
                     wm.iterations,
                     res.status,
                     res.max_abs_eta,
-                    res.firth_log_det()
+                    res.jeffreys_logdet()
                         .map(|v| format!("{v:.3e}"))
                         .unwrap_or_else(|| "none".to_string()),
                     pirls_elapsed.as_secs_f64(),
@@ -2306,14 +2224,48 @@ impl<'a> RemlState<'a> {
     // Stage: Remember that the sign of ∂β̂/∂λₖ matters; from the implicit-function theorem the linear solve reads
     //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
     //     direct quadratic pieces are exact negatives, which is what the algebra requires.
-    /// Holds the family-dependent components of the REML/LAML evaluation
-    /// that are shared across dense path variants (`evaluate_unified`,
-    /// `evaluate_unified_with_ext_from_bundle`, `evaluate_unified_for_efs`).
-    /// Extracting these into a struct eliminates ~100 lines of duplication
-    /// across the three dense-path methods.
+    /// Build the exact Jeffreys operator in the same coefficient basis used by
+    /// the outer Hessian operator and derivative provider.
+    ///
+    /// If the outer solve is projected to a free subspace `β = Z β_free`, the
+    /// Jeffreys term must also be evaluated on `X_eff = X Z`. Reusing the
+    /// cached full-basis operator in that situation would recreate the original
+    /// value/derivative mismatch this code is meant to eliminate.
+    fn build_dense_firth_operator_for_outer_basis(
+        &self,
+        pirls_result: &PirlsResult,
+        bundle: &EvalShared,
+        free_basis_opt: &Option<Array2<f64>>,
+    ) -> Result<Option<std::sync::Arc<super::FirthDenseOperator>>, EstimationError> {
+        if !(self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit))
+        {
+            return Ok(None);
+        }
+
+        if let Some(z) = free_basis_opt.as_ref() {
+            let x_projected = pirls_result.x_transformed.to_dense().dot(z);
+            return Ok(Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                &x_projected,
+                &pirls_result.final_eta,
+                self.weights,
+            )?)));
+        }
+
+        if let Some(cached) = bundle.firth_dense_operator.clone() {
+            return Ok(Some(cached));
+        }
+
+        let x_dense = pirls_result.x_transformed.to_dense();
+        Ok(Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+            &x_dense,
+            &pirls_result.final_eta,
+            self.weights,
+        )?)))
+    }
 
     /// Build the derivative provider, dispersion handling, zeroed TK placeholders,
-    /// Firth log-det, log-likelihood, Firth operator, and barrier config
+    /// exact Firth operator, log-likelihood, and barrier config
     /// that are common to all dense evaluation paths.
     ///
     /// # Arguments
@@ -2321,8 +2273,7 @@ impl<'a> RemlState<'a> {
     /// - `bundle`: the evaluation bundle (carries h_eff, firth operator, etc.)
     /// - `free_basis_opt`: optional constraint-projection basis
     /// - `include_firth_derivs`: whether to wrap the derivative provider with
-    ///   Firth-aware derivatives (false for the EFS path which does not need
-    ///   Firth corrections in trace-based updates)
+    ///   Firth-aware derivatives
     ///
     /// The actual Tierney-Kadane correction is added outside the unified
     /// evaluator so value, gradient, and Hessian can all come from the same
@@ -2339,7 +2290,6 @@ impl<'a> RemlState<'a> {
             super::unified::DispersionHandling,
             f64,                                               // tk_correction
             Option<Array1<f64>>,                               // tk_gradient
-            f64,                                               // firth_logdet
             f64,                                               // log_likelihood
             Option<std::sync::Arc<super::FirthDenseOperator>>, // firth_op
             Option<super::unified::BarrierConfig>,
@@ -2351,12 +2301,11 @@ impl<'a> RemlState<'a> {
         };
 
         let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let firth_op =
+            self.build_dense_firth_operator_for_outer_basis(pirls_result, bundle, free_basis_opt)?;
 
         // Derivative provider.
-        let firth_active_for_derivs = include_firth_derivs
-            && self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit)
-            && free_basis_opt.is_none();
+        let firth_active_for_derivs = include_firth_derivs && firth_op.is_some();
         let deriv_provider: Box<dyn super::unified::HessianDerivativeProvider> =
             if is_gaussian_identity {
                 Box::new(GaussianDerivatives)
@@ -2377,7 +2326,7 @@ impl<'a> RemlState<'a> {
                     x_transformed,
                 };
                 if firth_active_for_derivs {
-                    if let Some(firth_op) = bundle.firth_dense_operator.clone() {
+                    if let Some(firth_op) = firth_op.clone() {
                         Box::new(super::unified::FirthAwareGlmDerivatives { base, firth_op })
                     } else {
                         Box::new(base)
@@ -2400,31 +2349,12 @@ impl<'a> RemlState<'a> {
 
         let (tk_correction, tk_gradient) = (0.0, None);
 
-        // Firth log-det.
-        let firth_logdet = if self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit)
-        {
-            pirls_result.firth_log_det().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-
         let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
             self.y,
             &pirls_result.finalmu,
             self.config.likelihood(),
             self.weights,
         );
-
-        // Firth operator: passed through to the unified evaluator which computes
-        // the Firth gradient and Hessian internally. Only active when Firth is
-        // enabled AND no constraint projection (the FirthDenseOperator is built
-        // in the unprojected reparameterized basis).
-        let firth_op = if firth_logdet != 0.0 && free_basis_opt.is_none() {
-            bundle.firth_dense_operator.clone()
-        } else {
-            None
-        };
 
         // Construct barrier config for monotonicity constraints when no
         // active-set projection is in effect (barrier indices are in the
@@ -2443,15 +2373,14 @@ impl<'a> RemlState<'a> {
             dispersion,
             tk_correction,
             tk_gradient,
-            firth_logdet,
             log_likelihood,
             firth_op,
             barrier_config,
         ))
     }
 
-    /// Build the dispersion handling, derivative provider, Firth log-det,
-    /// log-likelihood, Firth operator, and barrier config that are common
+    /// Build the dispersion handling, derivative provider, log-likelihood,
+    /// exact Firth operator, and barrier config that are common
     /// to both sparse evaluation paths (`evaluate_unified_sparse` and
     /// `evaluate_unified_sparse_for_efs`).
     ///
@@ -2465,7 +2394,6 @@ impl<'a> RemlState<'a> {
         (
             super::unified::DispersionHandling,
             Box<dyn super::unified::HessianDerivativeProvider>,
-            f64,                                               // firth_logdet
             f64,                                               // log_likelihood
             Option<std::sync::Arc<super::FirthDenseOperator>>, // firth_op
             Option<super::unified::BarrierConfig>,
@@ -2479,17 +2407,11 @@ impl<'a> RemlState<'a> {
 
         let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
 
-        // Firth log-det and operator. Sparse exact still uses the same dense
-        // Fisher-information reduction as the dense backend; only the H^{-1}
-        // applications move to the sparse Cholesky operator.
-        let firth_logdet = if self.config.firth_bias_reduction
+        // Sparse exact still uses the same dense Jeffreys operator; only the
+        // H^{-1} applications move to the sparse Cholesky operator.
+        let firth_op = if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
         {
-            pirls_result.firth_log_det().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let firth_op = if firth_logdet != 0.0 {
             if let Some(cached) = bundle.firth_dense_operator_original.clone() {
                 Some(cached)
             } else {
@@ -2563,7 +2485,6 @@ impl<'a> RemlState<'a> {
         Ok((
             dispersion,
             deriv_provider,
-            firth_logdet,
             log_likelihood,
             firth_op,
             barrier_config,
@@ -2661,7 +2582,6 @@ impl<'a> RemlState<'a> {
             dispersion,
             tk_correction,
             tk_gradient,
-            firth_logdet,
             log_likelihood,
             firth_op,
             barrier_config,
@@ -2681,7 +2601,6 @@ impl<'a> RemlState<'a> {
             deriv_provider,
             tk_correction,
             tk_gradient,
-            firth_logdet,
             firth_op,
             nullspace_dim,
             dispersion,
@@ -2753,7 +2672,7 @@ impl<'a> RemlState<'a> {
 
         // Build the family-dependent context (dispersion, deriv provider,
         // Firth, barrier) via the shared sparse helper.
-        let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
+        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
             self.build_sparse_derivative_context(pirls_result, bundle)?;
 
         // Sparse path: canonical_penalties are always available and match,
@@ -2768,7 +2687,6 @@ impl<'a> RemlState<'a> {
             deriv_provider,
             0.0,
             None,
-            firth_logdet,
             firth_op,
             mp,
             dispersion,
@@ -2821,7 +2739,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Build the family-dependent context via the shared sparse helper.
-        let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
+        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
             self.build_sparse_derivative_context(pirls_result, bundle)?;
 
         let result = self.evaluate_unified_tail_efs(
@@ -2831,7 +2749,6 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             deriv_provider,
             0.0,
-            firth_logdet,
             firth_op,
             mp,
             dispersion,
@@ -2856,7 +2773,6 @@ impl<'a> RemlState<'a> {
         deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
         tk_correction: f64,
         tk_gradient: Option<Array1<f64>>,
-        firth_logdet: f64,
         firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
         nullspace_dim: f64,
         dispersion: super::unified::DispersionHandling,
@@ -2929,7 +2845,7 @@ impl<'a> RemlState<'a> {
         )
         .deriv_provider(deriv_provider)
         .tk(tk_correction, tk_gradient)
-        .firth(firth_logdet, firth_op)
+        .firth(firth_op)
         .nullspace_dim_override(nullspace_dim)
         .barrier_config(barrier_config)
         .build();
@@ -3106,7 +3022,6 @@ impl<'a> RemlState<'a> {
             dispersion,
             tk_correction,
             tk_gradient,
-            firth_logdet,
             log_likelihood,
             firth_op,
             barrier_config,
@@ -3136,7 +3051,7 @@ impl<'a> RemlState<'a> {
         )
         .deriv_provider(deriv_provider)
         .tk(tk_correction, tk_gradient)
-        .firth(firth_logdet, firth_op)
+        .firth(firth_op)
         .nullspace_dim_override(nullspace_dim)
         .barrier_config(barrier_config)
         .ext_coords(ext_coords);
@@ -3234,7 +3149,7 @@ impl<'a> RemlState<'a> {
             second: det2,
         };
 
-        let (dispersion, deriv_provider, firth_logdet, log_likelihood, firth_op, barrier_config) =
+        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
             self.build_sparse_derivative_context(pirls_result, bundle)?;
 
         let (tk_correction, tk_gradient) = (0.0, None);
@@ -3257,7 +3172,7 @@ impl<'a> RemlState<'a> {
         )
         .deriv_provider(deriv_provider)
         .tk(tk_correction, tk_gradient)
-        .firth(firth_logdet, firth_op)
+        .firth(firth_op)
         .nullspace_dim_override(mp)
         .barrier_config(barrier_config)
         .ext_coords(ext_coords);
@@ -3317,7 +3232,6 @@ impl<'a> RemlState<'a> {
         penalty_logdet: super::unified::PenaltyLogdetDerivs,
         deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
         tk_correction: f64,
-        firth_logdet: f64,
         firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
         nullspace_dim: f64,
         dispersion: super::unified::DispersionHandling,
@@ -3348,7 +3262,7 @@ impl<'a> RemlState<'a> {
         )
         .deriv_provider(deriv_provider)
         .tk(tk_correction, None)
-        .firth(firth_logdet, firth_op)
+        .firth(firth_op)
         .nullspace_dim_override(nullspace_dim)
         .barrier_config(barrier_config)
         .build();
@@ -3514,14 +3428,15 @@ impl<'a> RemlState<'a> {
         let p_eff_dim = h_for_operator.ncols();
         let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
 
-        // Build derivative context via the shared helper. EFS uses ValueOnly
-        // mode (no TK gradient) and skips Firth derivative wrapping.
+        // Build derivative context via the shared helper. Even though pure EFS
+        // is usually value-only, the hybrid EFS path requests gradients for ψ
+        // coordinates, so the Hessian-derivative provider must stay Firth-aware
+        // when the exact Jeffreys term is active.
         let (
             deriv_provider,
             dispersion,
             tk_correction,
             _,
-            firth_logdet,
             log_likelihood,
             firth_op,
             barrier_config,
@@ -3529,7 +3444,7 @@ impl<'a> RemlState<'a> {
             pirls_result,
             bundle,
             &free_basis_opt,
-            false, // EFS: no Firth derivatives in deriv_provider
+            true,
         )?;
 
         let result = self.evaluate_unified_tail_efs(
@@ -3539,7 +3454,6 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             deriv_provider,
             tk_correction,
-            firth_logdet,
             firth_op,
             nullspace_dim,
             dispersion,

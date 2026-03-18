@@ -8291,6 +8291,8 @@ mod tests {
             x_time_exit: array![[1.2], [0.9], [1.4]],
             x_time_deriv: array![[1.0], [1.0], [1.0]],
             offset_time_deriv: array![0.5, 0.7, 0.6],
+            x_time_deriv_constraints: None,
+            offset_time_deriv_constraints: None,
             x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0], [0.4], [-0.6]])),
             x_threshold_entry: None,
             x_threshold_deriv: None,
@@ -10253,11 +10255,17 @@ mod tests {
             x_time_exit: x_exit.clone(),
             x_time_deriv: x_deriv.clone(),
             offset_time_deriv: offset_deriv.clone(),
+            x_time_deriv_constraints: None,
+            offset_time_deriv_constraints: None,
             x_threshold: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
             x_threshold_entry: None,
+            x_threshold_deriv: None,
             x_log_sigma: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
             x_log_sigma_entry: None,
+            x_log_sigma_deriv: None,
             x_link_wiggle: None,
+            wiggle_knots: None,
+            wiggle_degree: None,
         };
 
         // Build initial states with beta=0 and a feasible positive derivative offset.
@@ -10386,11 +10394,17 @@ mod tests {
             x_time_exit: Array2::ones((n, 1)),
             x_time_deriv: Array2::ones((n, 1)),
             offset_time_deriv: Array1::zeros(n),
+            x_time_deriv_constraints: None,
+            offset_time_deriv_constraints: None,
             x_threshold: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
             x_threshold_entry: None,
+            x_threshold_deriv: None,
             x_log_sigma: DesignMatrix::Dense(Arc::new(Array2::ones((n, 1)))),
             x_log_sigma_entry: None,
+            x_log_sigma_deriv: None,
             x_link_wiggle: None,
+            wiggle_knots: None,
+            wiggle_degree: None,
         };
 
         let mut eta_time = Array1::<f64>::zeros(3 * n);

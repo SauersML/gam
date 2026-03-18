@@ -1,4 +1,4 @@
-use crate::construction::ReparamResult;
+use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
@@ -411,6 +411,14 @@ pub trait WorkingModel {
         self.update(beta)
     }
 
+    fn update_candidate(
+        &mut self,
+        beta: &Coefficients,
+        curvature: HessianCurvatureKind,
+    ) -> Result<WorkingState, EstimationError> {
+        self.update_with_curvature(beta, curvature)
+    }
+
     fn supports_observed_information_curvature(&self) -> bool {
         false
     }
@@ -575,7 +583,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
 #[derive(Debug, Clone)]
 pub enum FirthDiagnostics {
     Inactive,
-    Active { log_det: f64, hat_diag: Array1<f64> },
+    Active {
+        jeffreys_logdet: f64,
+        hat_diag: Array1<f64>,
+    },
 }
 
 impl Default for FirthDiagnostics {
@@ -586,10 +597,10 @@ impl Default for FirthDiagnostics {
 
 impl FirthDiagnostics {
     #[inline]
-    pub fn log_det(&self) -> Option<f64> {
+    pub fn jeffreys_logdet(&self) -> Option<f64> {
         match self {
             Self::Inactive => None,
-            Self::Active { log_det, .. } => Some(*log_det),
+            Self::Active { jeffreys_logdet, .. } => Some(*jeffreys_logdet),
         }
     }
 }
@@ -637,8 +648,8 @@ pub struct WorkingState {
 
 impl WorkingState {
     #[inline]
-    pub fn firth_log_det(&self) -> Option<f64> {
-        self.firth.log_det()
+    pub fn jeffreys_logdet(&self) -> Option<f64> {
+        self.firth.jeffreys_logdet()
     }
 }
 
@@ -1023,8 +1034,192 @@ enum WorkingCoordinateDesign {
         x_csr: Option<SparseRowMat<usize, f64>>,
     },
     TransformedImplicit {
-        qs: Array2<f64>,
+        transform: WorkingReparamTransform,
     },
+}
+
+#[derive(Clone)]
+enum WorkingReparamTransform {
+    Dense(Arc<Array2<f64>>),
+    Kronecker(Arc<KroneckerQsTransform>),
+}
+
+impl WorkingReparamTransform {
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(qs) => qs.dot(vector),
+            Self::Kronecker(transform) => transform.apply(vector),
+        }
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(qs) => fast_atv(qs, vector),
+            Self::Kronecker(transform) => transform.apply_transpose(vector),
+        }
+    }
+
+    fn materialize_dense(&self) -> Array2<f64> {
+        match self {
+            Self::Dense(qs) => qs.as_ref().clone(),
+            Self::Kronecker(transform) => transform.materialize(),
+        }
+    }
+
+    fn conjugate_matrix(&self, matrix: &Array2<f64>) -> Array2<f64> {
+        match self {
+            Self::Dense(qs) => {
+                let tmp = fast_atb(qs, matrix);
+                fast_ab(&tmp, qs)
+            }
+            Self::Kronecker(transform) => transform.conjugate_matrix(matrix),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum PirlsPenalty {
+    Dense {
+        s_transformed: Array2<f64>,
+        e_transformed: Array2<f64>,
+    },
+    Diagonal {
+        diag: Array1<f64>,
+        positive_indices: Vec<usize>,
+        positive_sqrt: Array1<f64>,
+    },
+}
+
+impl PirlsPenalty {
+    fn dim(&self) -> usize {
+        match self {
+            Self::Dense { s_transformed, .. } => s_transformed.ncols(),
+            Self::Diagonal { diag, .. } => diag.len(),
+        }
+    }
+
+    fn rank(&self) -> usize {
+        match self {
+            Self::Dense { e_transformed, .. } => e_transformed.nrows(),
+            Self::Diagonal {
+                positive_indices, ..
+            } => positive_indices.len(),
+        }
+    }
+
+    fn add_to_hessian(&self, hessian: &mut Array2<f64>) {
+        match self {
+            Self::Dense { s_transformed, .. } => {
+                *hessian += s_transformed;
+            }
+            Self::Diagonal { diag, .. } => {
+                for i in 0..diag.len() {
+                    hessian[[i, i]] += diag[i];
+                }
+            }
+        }
+    }
+
+    fn apply(&self, beta: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Dense { s_transformed, .. } => s_transformed.dot(beta),
+            Self::Diagonal { diag, .. } => diag * beta,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct KroneckerQsTransform {
+    marginal_qs: Vec<Array2<f64>>,
+    dims: Vec<usize>,
+    p: usize,
+}
+
+impl KroneckerQsTransform {
+    fn new(result: &KroneckerReparamResult) -> Self {
+        let dims = result.marginal_dims.clone();
+        let p = dims.iter().product();
+        Self {
+            marginal_qs: result.marginal_qs.clone(),
+            dims,
+            p,
+        }
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        self.apply_internal(vector, false)
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        self.apply_internal(vector, true)
+    }
+
+    fn apply_internal(&self, vector: &Array1<f64>, transpose: bool) -> Array1<f64> {
+        debug_assert_eq!(vector.len(), self.p);
+        let mut current = vector.to_vec();
+        for (axis, q) in self.marginal_qs.iter().enumerate() {
+            current = apply_kron_mode(&current, &self.dims, axis, q, transpose);
+        }
+        Array1::from_vec(current)
+    }
+
+    fn materialize(&self) -> Array2<f64> {
+        let mut qs = Array2::<f64>::zeros((self.p, self.p));
+        for j in 0..self.p {
+            let mut e = Array1::<f64>::zeros(self.p);
+            e[j] = 1.0;
+            let col = self.apply(&e);
+            qs.column_mut(j).assign(&col);
+        }
+        qs
+    }
+
+    fn conjugate_matrix(&self, matrix: &Array2<f64>) -> Array2<f64> {
+        let p = self.p;
+        let mut right = Array2::<f64>::zeros((p, p));
+        for j in 0..p {
+            let col = matrix.dot(&self.column(j));
+            right.column_mut(j).assign(&col);
+        }
+        let mut out = Array2::<f64>::zeros((p, p));
+        for j in 0..p {
+            let transformed_col = self.apply_transpose(&right.column(j).to_owned());
+            out.column_mut(j).assign(&transformed_col);
+        }
+        out
+    }
+
+    fn column(&self, j: usize) -> Array1<f64> {
+        let mut e = Array1::<f64>::zeros(self.p);
+        e[j] = 1.0;
+        self.apply(&e)
+    }
+}
+
+fn apply_kron_mode(
+    data: &[f64],
+    dims: &[usize],
+    axis: usize,
+    q: &Array2<f64>,
+    transpose: bool,
+) -> Vec<f64> {
+    let before: usize = dims[..axis].iter().product();
+    let dim = dims[axis];
+    let after: usize = dims[axis + 1..].iter().product();
+    let mut out = vec![0.0_f64; data.len()];
+    for b in 0..before {
+        for s in 0..after {
+            for i in 0..dim {
+                let mut acc = 0.0;
+                for a in 0..dim {
+                    let coeff = if transpose { q[[a, i]] } else { q[[i, a]] };
+                    acc += coeff * data[(b * dim + a) * after + s];
+                }
+                out[(b * dim + i) * after + s] = acc;
+            }
+        }
+    }
+    out
 }
 
 struct GamWorkingModel<'a> {
@@ -1033,8 +1228,7 @@ struct GamWorkingModel<'a> {
     offset: Array1<f64>,
     y: ArrayView1<'a, f64>,
     priorweights: ArrayView1<'a, f64>,
-    s_transformed: Array2<f64>,
-    e_transformed: Array2<f64>,
+    penalty: PirlsPenalty,
     workspace: PirlsWorkspace,
     likelihood: GlmLikelihoodSpec,
     link_kind: InverseLink,
@@ -1061,7 +1255,6 @@ struct GamWorkingModel<'a> {
 
 struct GamModelFinalState {
     coordinate_frame: PirlsCoordinateFrame,
-    e_transformed: Array2<f64>,
     finalmu: Array1<f64>,
     finalweights: Array1<f64>,
     scoreweights: Array1<f64>,
@@ -1082,13 +1275,12 @@ impl<'a> GamWorkingModel<'a> {
         offset: ArrayView1<f64>,
         y: ArrayView1<'a, f64>,
         priorweights: ArrayView1<'a, f64>,
-        s_transformed: Array2<f64>,
-        e_transformed: Array2<f64>,
+        penalty: PirlsPenalty,
         workspace: PirlsWorkspace,
         likelihood: GlmLikelihoodSpec,
         link_kind: InverseLink,
         firth_bias_reduction: bool,
-        qs: Option<Array2<f64>>,
+        transform: Option<WorkingReparamTransform>,
         quadctx: crate::quadrature::QuadratureContext,
     ) -> Self {
         let coordinate_design = match coordinate_frame {
@@ -1103,7 +1295,7 @@ impl<'a> GamWorkingModel<'a> {
                     }
                 } else {
                     WorkingCoordinateDesign::TransformedImplicit {
-                        qs: qs.expect(
+                        transform: transform.expect(
                             "TransformedQs PIRLS coordinate frame requires either x_transformed or qs",
                         ),
                     }
@@ -1124,8 +1316,7 @@ impl<'a> GamWorkingModel<'a> {
             offset: offset.to_owned(),
             y,
             priorweights,
-            s_transformed,
-            e_transformed,
+            penalty,
             workspace,
             likelihood,
             link_kind,
@@ -1166,7 +1357,6 @@ impl<'a> GamWorkingModel<'a> {
     fn into_final_state(self) -> GamModelFinalState {
         let GamWorkingModel {
             coordinate_design,
-            e_transformed,
             lastmu,
             lastweights,
             lastz,
@@ -1194,7 +1384,6 @@ impl<'a> GamWorkingModel<'a> {
         };
         GamModelFinalState {
             coordinate_frame,
-            e_transformed,
             finalmu: lastmu,
             finalweights: lasthessian_weights,
             scoreweights: lastweights,
@@ -1216,8 +1405,8 @@ impl<'a> GamWorkingModel<'a> {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 x_transformed.matrixvectormultiply(beta)
             }
-            WorkingCoordinateDesign::TransformedImplicit { qs } => {
-                let beta_orig = qs.dot(beta.as_ref());
+            WorkingCoordinateDesign::TransformedImplicit { transform } => {
+                let beta_orig = transform.apply(beta.as_ref());
                 self.x_original.matrixvectormultiply(&beta_orig)
             }
         }
@@ -1234,10 +1423,10 @@ impl<'a> GamWorkingModel<'a> {
                 }
                 out.assign(&x_transformed.matrixvectormultiply(beta));
             }
-            WorkingCoordinateDesign::TransformedImplicit { qs } => {
+            WorkingCoordinateDesign::TransformedImplicit { transform } => {
                 // Composed: X · (Qs · beta).  Qs·beta is p-dim (cheap),
                 // then write X·(Qs·beta) directly into out when X is dense.
-                let beta_orig = qs.dot(beta.as_ref());
+                let beta_orig = transform.apply(beta.as_ref());
                 if let Some(dense) = self.x_original.as_dense() {
                     fast_av_into(dense, &beta_orig, out);
                 } else {
@@ -1258,9 +1447,9 @@ impl<'a> GamWorkingModel<'a> {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 x_transformed.transpose_vector_multiply(vec)
             }
-            WorkingCoordinateDesign::TransformedImplicit { qs } => {
+            WorkingCoordinateDesign::TransformedImplicit { transform } => {
                 let xtv = self.x_original.transpose_vector_multiply(vec);
-                qs.t().dot(&xtv)
+                transform.apply_transpose(&xtv)
             }
         }
     }
@@ -1303,20 +1492,19 @@ impl<'a> GamWorkingModel<'a> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 let mut h = Self::compute_xtwx_blas(&mut self.workspace, x_transformed, weights)?;
-                h += &self.s_transformed;
+                self.penalty.add_to_hessian(&mut h);
                 Ok(h)
             }
-            WorkingCoordinateDesign::TransformedImplicit { qs } => {
+            WorkingCoordinateDesign::TransformedImplicit { transform } => {
                 let xtwx = Self::compute_xtwx_blas(&mut self.workspace, &self.x_original, weights)?;
-                let tmp = crate::faer_ndarray::fast_atb(qs, &xtwx);
-                let mut h = fast_ab(&tmp, qs);
-                h += &self.s_transformed;
+                let mut h = transform.conjugate_matrix(&xtwx);
+                self.penalty.add_to_hessian(&mut h);
                 Ok(h)
             }
             WorkingCoordinateDesign::OriginalSparseNative => {
                 let mut h =
                     Self::compute_xtwx_blas(&mut self.workspace, &self.x_original, weights)?;
-                h += &self.s_transformed;
+                self.penalty.add_to_hessian(&mut h);
                 Ok(h)
             }
         }
@@ -1390,12 +1578,13 @@ impl<'a> GamWorkingModel<'a> {
                 "sparse-native PIRLS requires a sparse original design".to_string(),
             )
         })?;
-        self.workspace.assemble_sparse_penalized_hessian(
-            x_sparse,
-            weights,
-            &self.s_transformed,
-            ridge,
-        )
+        let PirlsPenalty::Dense { s_transformed, .. } = &self.penalty else {
+            return Err(EstimationError::InvalidInput(
+                "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
+            ));
+        };
+        self.workspace
+            .assemble_sparse_penalized_hessian(x_sparse, weights, s_transformed, ridge)
     }
 }
 
@@ -1538,15 +1727,17 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mu = self.lastmu.clone();
         let mut firth = FirthDiagnostics::Inactive;
         if self.firth_bias_reduction {
-            // IMPORTANT: Firth bias reduction must be computed in the *same basis*
-            // as the inner objective being optimized by PIRLS.
+            // IMPORTANT: Jeffreys/Firth bias reduction must be computed in the
+            // *same coefficient basis* as the inner objective being optimized by PIRLS.
             //
             // The working response (z) and the coefficients β are in the transformed
-            // basis when a reparameterization is used. The Jeffreys term
-            //   0.5 * log|X^T W X|
-            // and its hat-diagonal adjustment must therefore be computed with the
-            // transformed design matrix, otherwise the inner objective and the
-            // outer LAML gradient are inconsistent.
+            // basis when a reparameterization is used. The Jeffreys term is the
+            // identifiable-subspace Fisher pseudodeterminant
+            //   Φ(β) = 0.5 * log|X^T W X|_+,
+            // not a penalized logdet. Its PIRLS hat-diagonal adjustment must
+            // therefore be computed from that same transformed-design Fisher
+            // matrix, otherwise the inner objective and the outer LAML
+            // derivatives disagree.
             //
             // This mismatch is subtle but severe: it leaves the analytic gradient
             // differentiating a *different* objective than the one PIRLS actually
@@ -1554,7 +1745,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             //
             // Rule: use X_transformed if available; fall back to X_original only
             // when PIRLS is operating directly in the original basis.
-            let (hat_diag, half_log_det) = match &self.coordinate_design {
+            let (hat_diag, jeffreys_logdet) = match &self.coordinate_design {
                 WorkingCoordinateDesign::TransformedExplicit {
                     x_transformed,
                     x_csr,
@@ -1565,7 +1756,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                                 "missing CSR cache for sparse transformed design".to_string(),
                             )
                         })?;
-                        compute_firth_hat_and_half_logdet_sparse(
+                        compute_jeffreys_pirls_diagnostics_sparse(
                             csr,
                             self.workspace.eta_buf.view(),
                             self.priorweights,
@@ -1576,20 +1767,20 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                                 "failed to access dense transformed design".to_string(),
                             )
                         })?;
-                        compute_firth_hat_and_half_logdet(
+                        compute_jeffreys_pirls_diagnostics(
                             x_dense.view(),
                             self.workspace.eta_buf.view(),
                             self.priorweights,
                         )?
                     }
                 }
-                WorkingCoordinateDesign::TransformedImplicit { qs } => {
-                    // Firth MUST use a consistent basis.  TransformedImplicit
+                WorkingCoordinateDesign::TransformedImplicit { transform } => {
+                    // Jeffreys/Firth MUST use a consistent basis. TransformedImplicit
                     // stores s_transformed in the Qs basis, so we need X in that
                     // same basis.  Materialize X·Qs on demand (Firth models are
                     // typically small clinical logistic regressions).
-                    let x_t_dense = fast_ab(&self.x_original.to_dense(), qs);
-                    compute_firth_hat_and_half_logdet(
+                    let x_t_dense = fast_ab(&self.x_original.to_dense(), &transform.materialize_dense());
+                    compute_jeffreys_pirls_diagnostics(
                         x_t_dense.view(),
                         self.workspace.eta_buf.view(),
                         self.priorweights,
@@ -1603,7 +1794,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                                 "missing CSR cache for sparse original design".to_string(),
                             )
                         })?;
-                        compute_firth_hat_and_half_logdet_sparse(
+                        compute_jeffreys_pirls_diagnostics_sparse(
                             csr,
                             self.workspace.eta_buf.view(),
                             self.priorweights,
@@ -1615,7 +1806,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                                 "Firth diagnostics require dense access to the original design",
                             )
                             .map_err(EstimationError::InvalidInput)?;
-                        compute_firth_hat_and_half_logdet(
+                        compute_jeffreys_pirls_diagnostics(
                             x_dense.view(),
                             self.workspace.eta_buf.view(),
                             self.priorweights,
@@ -1624,7 +1815,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 }
             };
             firth = FirthDiagnostics::Active {
-                log_det: half_log_det,
+                jeffreys_logdet,
                 hat_diag: hat_diag.clone(),
             };
             for i in 0..self.lastz.len() {
@@ -1650,7 +1841,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 *wr = residual * wi;
             });
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
-        let s_beta = self.s_transformed.dot(beta.as_ref());
+        let s_beta = self.penalty.apply(beta.as_ref());
         gradient += &s_beta;
         let (hessian_weights, hessian_c, hessian_d, hessian_curvature) =
             self.hessian_curvature_arrays(requested_curvature)?;
@@ -1722,6 +1913,21 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             ridge_used,
             hessian_curvature,
         })
+    }
+
+    fn update_candidate(
+        &mut self,
+        beta: &Coefficients,
+        curvature: HessianCurvatureKind,
+    ) -> Result<WorkingState, EstimationError> {
+        if !self.firth_bias_reduction {
+            return self.update_with_curvature(beta, curvature);
+        }
+        let firth_enabled = self.firth_bias_reduction;
+        self.firth_bias_reduction = false;
+        let result = self.update_with_curvature(beta, curvature);
+        self.firth_bias_reduction = firth_enabled;
+        result
     }
 
     fn supports_observed_information_curvature(&self) -> bool {
@@ -1880,7 +2086,7 @@ fn sparse_xtwx_par(ncols: usize) -> Par {
     }
 }
 
-fn compute_firth_hat_and_half_logdet_sparse(
+fn compute_jeffreys_pirls_diagnostics_sparse(
     x_design_csr: &SparseRowMat<usize, f64>,
     eta: ArrayView1<f64>,
     observation_weights: ArrayView1<f64>,
@@ -1901,14 +2107,19 @@ fn compute_firth_hat_and_half_logdet_sparse(
             x_dense[[i, col.unbound()]] = vals[idx];
         }
     }
-    compute_firth_hat_and_half_logdet(x_dense.view(), eta, observation_weights)
+    compute_jeffreys_pirls_diagnostics(x_dense.view(), eta, observation_weights)
 }
 
-fn compute_firth_hat_and_half_logdet(
+fn compute_jeffreys_pirls_diagnostics(
     x_design: ArrayView2<f64>,
     eta: ArrayView1<f64>,
     observation_weights: ArrayView1<f64>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
+    // PIRLS must use the same identifiable-subspace Jeffreys functional as the
+    // outer REML code:
+    //   Φ(β) = 0.5 log|Xᵀ W(η) X|_+.
+    // The operator below is the single source of truth for both the Jeffreys
+    // scalar value and the PIRLS hat-diagonal correction derived from it.
     let op = FirthDenseOperator::build_with_observation_weights(
         &x_design.to_owned(),
         &eta.to_owned(),
@@ -3286,9 +3497,10 @@ where
     let penalizedobjective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
         if options.firth_bias_reduction {
-            if let Some(firth_log_det) = state.firth_log_det() {
-                // Firth adds +0.5 log|I| to log-likelihood, so deviance is reduced by 2*log_det.
-                value -= 2.0 * firth_log_det;
+            if let Some(jeffreys_logdet) = state.jeffreys_logdet() {
+                // Jeffreys/Firth adds +0.5 log|XᵀWX|_+ to the log-likelihood,
+                // so the PIRLS deviance is reduced by 2 * Φ.
+                value -= 2.0 * jeffreys_logdet;
             }
         }
         value
@@ -3485,10 +3697,10 @@ where
                 project_coefficients_to_lower_bounds(&mut candidatevec, lb);
             }
             let candidate_beta = Coefficients::new(candidatevec);
-            match model.update_with_curvature(&candidate_beta, state.hessian_curvature) {
+            match model.update_candidate(&candidate_beta, state.hessian_curvature) {
                 Ok(candidate_state) => {
-                    let candidate_penalized = penalizedobjective(&candidate_state);
-                    let actual_reduction = current_penalized - candidate_penalized;
+                    let screening_penalized = penalizedobjective(&candidate_state);
+                    let screening_reduction = current_penalized - screening_penalized;
 
                     // 4. Gain Ratio
                     // When predicted reduction is at floating-point noise level
@@ -3496,9 +3708,9 @@ where
                     // meaningless — treat as a neutral step (rho = 1) rather
                     // than hard-rejecting on the sign of noise.
                     let noise_floor = current_penalized.abs().max(1.0) * 1e-14;
-                    let rho = if predicted_reduction > noise_floor {
-                        actual_reduction / predicted_reduction
-                    } else if actual_reduction >= -noise_floor {
+                    let screening_rho = if predicted_reduction > noise_floor {
+                        screening_reduction / predicted_reduction
+                    } else if screening_reduction >= -noise_floor {
                         // Both reductions are noise — accept the step
                         1.0
                     } else {
@@ -3528,11 +3740,36 @@ where
                     const ETA_ABS_CAP: f64 = 40.0;
                     let eta_ok = candidate_max_eta <= ETA_ABS_CAP;
 
-                    if rho > 0.0
-                        && candidate_penalized.is_finite()
+                    if screening_rho > 0.0
+                        && screening_penalized.is_finite()
                         && candidate_grad_finite
                         && eta_ok
                     {
+                        let accepted_state = if options.firth_bias_reduction {
+                            match model.update_with_curvature(&candidate_beta, state.hessian_curvature) {
+                                Ok(state) => state,
+                                Err(_) if loop_lambda < 1e12 => {
+                                    loop_lambda *= lambda_factor;
+                                    continue;
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        } else {
+                            candidate_state
+                        };
+                        let candidate_penalized = penalizedobjective(&accepted_state);
+                        let actual_reduction = current_penalized - candidate_penalized;
+                        let rho = if predicted_reduction > noise_floor {
+                            actual_reduction / predicted_reduction
+                        } else if actual_reduction >= -noise_floor {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        if !(rho > 0.0 && candidate_penalized.is_finite()) {
+                            loop_lambda *= lambda_factor;
+                            continue;
+                        }
                         if preferred_curvature == HessianCurvatureKind::Observed {
                             if state.hessian_curvature == HessianCurvatureKind::Observed
                                 && !used_fisher_fallback_this_iter
@@ -3556,15 +3793,15 @@ where
                         beta = candidate_beta;
 
                         // Update Iteration Info
-                        let candidategrad_norm = candidate_state
+                        let candidategrad_norm = accepted_state
                             .gradient
-                            .dot(&candidate_state.gradient)
+                            .dot(&accepted_state.gradient)
                             .sqrt();
                         let deviance_change = actual_reduction;
 
                         iteration_callback(&WorkingModelIterationInfo {
                             iteration: iter,
-                            deviance: candidate_state.deviance,
+                            deviance: accepted_state.deviance,
                             gradient_norm: candidategrad_norm,
                             step_size: 1.0,
                             step_halving: attempts, // repurpose as attempt count
@@ -3574,7 +3811,7 @@ where
                         last_deviance_change = deviance_change;
                         last_step_size = 1.0;
                         last_step_halving = attempts;
-                        max_abs_eta = candidate_state
+                        max_abs_eta = accepted_state
                             .eta
                             .iter()
                             .copied()
@@ -3585,7 +3822,7 @@ where
                         // For bound-constrained problems, use the projected gradient
                         // (excludes KKT multiplier components at active bounds).
                         let convergence_grad_norm = projected_gradient_norm(
-                            &candidate_state.gradient,
+                            &accepted_state.gradient,
                             beta.as_ref(),
                             options.coefficient_lower_bounds.as_ref(),
                         );
@@ -3593,7 +3830,7 @@ where
                         // Preserve the structural ridge computed by the model.
                         // LM damping is a transient solver detail and must not
                         // redefine the objective's stabilization ridge.
-                        final_state = Some(candidate_state);
+                        final_state = Some(accepted_state);
                         let deviance_scale = current_penalized
                             .abs()
                             .max(candidate_penalized.abs())
@@ -3934,8 +4171,8 @@ pub struct PirlsResult {
 
 impl PirlsResult {
     #[inline]
-    pub fn firth_log_det(&self) -> Option<f64> {
-        self.firth.log_det()
+    pub fn jeffreys_logdet(&self) -> Option<f64> {
+        self.firth.jeffreys_logdet()
     }
 
     pub(crate) fn compact_for_reml_cache(&self) -> Self {
@@ -4268,6 +4505,56 @@ fn build_sparse_native_reparam_result(
     }
 }
 
+fn build_diagonal_penalty_from_kronecker(
+    kron_result: &KroneckerReparamResult,
+    lambdas: &[f64],
+) -> PirlsPenalty {
+    let d = kron_result.marginal_dims.len();
+    let p: usize = kron_result.marginal_dims.iter().copied().product();
+    let mut diag = Array1::<f64>::zeros(p);
+    let mut positive_indices = Vec::new();
+    let mut positive_sqrt = Vec::new();
+
+    let mut multi_idx = vec![0usize; d];
+    let mut flat = 0usize;
+    loop {
+        let mut sigma = kron_result.penalty_shrinkage_ridge;
+        for k in 0..d {
+            sigma += lambdas[k] * kron_result.marginal_eigenvalues[k][multi_idx[k]];
+        }
+        if kron_result.has_double_penalty && lambdas.len() > d {
+            sigma += lambdas[d];
+        }
+        diag[flat] = sigma;
+        if sigma > 0.0 {
+            positive_indices.push(flat);
+            positive_sqrt.push(sigma.sqrt());
+        }
+        flat += 1;
+
+        let mut carry = true;
+        for dim in (0..d).rev() {
+            if carry {
+                multi_idx[dim] += 1;
+                if multi_idx[dim] < kron_result.marginal_dims[dim] {
+                    carry = false;
+                } else {
+                    multi_idx[dim] = 0;
+                }
+            }
+        }
+        if carry {
+            break;
+        }
+    }
+
+    PirlsPenalty::Diagonal {
+        diag,
+        positive_indices,
+        positive_sqrt: Array1::from_vec(positive_sqrt),
+    }
+}
+
 pub struct PirlsProblem<'a, X> {
     pub x: X,
     pub offset: ArrayView1<'a, f64>,
@@ -4350,14 +4637,21 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     };
     let eb: &Array2<f64> = eb_cow.as_ref();
 
-    // Kronecker fast path: factored reparameterization via marginal eigensystems.
-    // Qs = U_1 ⊗ ... ⊗ U_d, avoiding O(p³) eigendecomposition of the balanced penalty.
-    let reparam_result = if let Some(kron) = penalty.kronecker_factored {
-        let rs_list: Vec<Array2<f64>> = penalty
-            .canonical_penalties
-            .iter()
-            .map(|cp| cp.full_width_root())
-            .collect();
+    // Kronecker fast path: keep Q factored and the transformed penalty diagonal
+    // throughout the PIRLS solve. Dense ReparamResult materialization is deferred
+    // until the final result assembly for legacy downstream consumers.
+    let dense_reparam_result = if penalty.kronecker_factored.is_none() {
+        Some(stable_reparameterization_engine_canonical(
+            penalty.canonical_penalties,
+            lambdas_slice,
+            EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
+            penalty.reparam_invariant,
+            penalty.penalty_shrinkage_floor,
+        )?)
+    } else {
+        None
+    };
+    let kronecker_runtime = if let Some(kron) = penalty.kronecker_factored {
         let kron_result = crate::construction::kronecker_reparameterization_engine(
             &kron.marginal_designs,
             &kron.marginal_penalties,
@@ -4366,24 +4660,40 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             kron.has_double_penalty,
             penalty.penalty_shrinkage_floor,
         )?;
-        kron_result.to_standard_reparam_result(&rs_list, lambdas_slice, penalty.p)?
+        let transform = Arc::new(KroneckerQsTransform::new(&kron_result));
+        let penalty_diag = build_diagonal_penalty_from_kronecker(&kron_result, lambdas_slice);
+        Some((kron_result, transform, penalty_diag))
     } else {
-        stable_reparameterization_engine_canonical(
-            penalty.canonical_penalties,
-            lambdas_slice,
-            EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
-            penalty.reparam_invariant,
-            penalty.penalty_shrinkage_floor,
-        )?
+        None
     };
-    let transformed_bounds = build_transformed_lower_bound_constraints(
-        &reparam_result.qs,
-        penalty.coefficient_lower_bounds,
-    );
-    let transformed_linear = build_transformed_linear_constraints(
-        &reparam_result.qs,
-        penalty.linear_constraints_original,
-    );
+    let transformed_bounds = if let Some((_, transform, _)) = kronecker_runtime.as_ref() {
+        build_transformed_lower_bound_constraints_with_transform(
+            &WorkingReparamTransform::Kronecker(Arc::clone(transform)),
+            penalty.coefficient_lower_bounds,
+        )
+    } else {
+        build_transformed_lower_bound_constraints(
+            &dense_reparam_result
+                .as_ref()
+                .expect("dense reparam result should be present outside Kronecker path")
+                .qs,
+            penalty.coefficient_lower_bounds,
+        )
+    };
+    let transformed_linear = if let Some((_, transform, _)) = kronecker_runtime.as_ref() {
+        build_transformed_linear_constraints_with_transform(
+            &WorkingReparamTransform::Kronecker(Arc::clone(transform)),
+            penalty.linear_constraints_original,
+        )
+    } else {
+        build_transformed_linear_constraints(
+            &dense_reparam_result
+                .as_ref()
+                .expect("dense reparam result should be present outside Kronecker path")
+                .qs,
+            penalty.linear_constraints_original,
+        )
+    };
     let linear_constraints = merge_linear_constraints(transformed_bounds, transformed_linear);
 
     let x_original: DesignMatrix = x.into();
@@ -4396,47 +4706,117 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         auto_sparse.unwrap_or(x_original)
     };
     let ebrows = eb.nrows();
-    let erows = reparam_result.e_transformed.nrows();
+    let erows = if let Some((_, _, penalty_diag)) = kronecker_runtime.as_ref() {
+        penalty_diag.rank()
+    } else {
+        dense_reparam_result
+            .as_ref()
+            .expect("dense reparam result should be present outside Kronecker path")
+            .e_transformed
+            .nrows()
+    };
     let mut workspace = PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), ebrows, erows);
-    let solver_decision = should_use_sparse_native_pirls(
-        &mut workspace,
-        &x_original,
-        &reparam_result.s_transformed,
-        penalty.linear_constraints_original,
-    );
+    let solver_decision = if let Some((_, _, _)) = kronecker_runtime.as_ref() {
+        SparsePirlsDecision {
+            path: PirlsLinearSolvePath::DenseTransformed,
+            reason: "kronecker_runtime",
+            p: x_original.ncols(),
+            nnz_x: 0,
+            nnz_xtwx_symbolic: None,
+            nnz_s_lambda: 0,
+            nnz_h_est: None,
+            density_h_est: None,
+        }
+    } else {
+        should_use_sparse_native_pirls(
+            &mut workspace,
+            &x_original,
+            &dense_reparam_result
+                .as_ref()
+                .expect("dense reparam result should be present outside Kronecker path")
+                .s_transformed,
+            penalty.linear_constraints_original,
+        )
+    };
     solver_decision.log_once();
 
     let use_sparse_native = matches!(solver_decision.path, PirlsLinearSolvePath::SparseNative);
-
-    let qs_arc = Arc::new(reparam_result.qs.clone());
-
-    let (coordinate_frame, reparam_result_active) = if use_sparse_native {
+    let qs_arc = dense_reparam_result
+        .as_ref()
+        .map(|reparam_result| Arc::new(reparam_result.qs.clone()));
+    let transform_active = if let Some((_, transform, _)) = kronecker_runtime.as_ref() {
+        Some(WorkingReparamTransform::Kronecker(Arc::clone(transform)))
+    } else if use_sparse_native {
+        None
+    } else {
+        Some(WorkingReparamTransform::Dense(Arc::clone(
+            qs_arc.as_ref().expect("dense Qs should exist for non-Kronecker transformed path"),
+        )))
+    };
+    let penalty_active = if let Some((_, _, penalty_diag)) = kronecker_runtime.as_ref() {
+        penalty_diag.clone()
+    } else if use_sparse_native {
         let sparse_reparam = build_sparse_native_reparam_result(
-            reparam_result.clone(),
+            dense_reparam_result
+                .as_ref()
+                .expect("dense reparam result should be present outside Kronecker path")
+                .clone(),
             penalty.canonical_penalties,
             lambdas_slice,
             penalty.p,
         );
-        (PirlsCoordinateFrame::OriginalSparseNative, sparse_reparam)
+        PirlsPenalty::Dense {
+            s_transformed: sparse_reparam.s_transformed.clone(),
+            e_transformed: sparse_reparam.e_transformed.clone(),
+        }
     } else {
-        // Lazy composition: do NOT materialize X·Qs.  The GamWorkingModel
-        // will use TransformedImplicit to apply Qs on the coefficient side.
-        (PirlsCoordinateFrame::TransformedQs, reparam_result.clone())
+        let dense = dense_reparam_result
+            .as_ref()
+            .expect("dense reparam result should be present outside Kronecker path");
+        PirlsPenalty::Dense {
+            s_transformed: dense.s_transformed.clone(),
+            e_transformed: dense.e_transformed.clone(),
+        }
+    };
+    let coordinate_frame = if use_sparse_native {
+        PirlsCoordinateFrame::OriginalSparseNative
+    } else {
+        PirlsCoordinateFrame::TransformedQs
+    };
+    let materialize_final_reparam_result = || -> Result<ReparamResult, EstimationError> {
+        if let Some((kron_result, _, _)) = kronecker_runtime.as_ref() {
+            let rs_list: Vec<Array2<f64>> = penalty
+                .canonical_penalties
+                .iter()
+                .map(|cp| cp.full_width_root())
+                .collect();
+            kron_result.materialize_dense_artifact_result(&rs_list, lambdas_slice, penalty.p)
+        } else if use_sparse_native {
+            Ok(build_sparse_native_reparam_result(
+                dense_reparam_result
+                    .as_ref()
+                    .expect("dense reparam result should be present outside Kronecker path")
+                    .clone(),
+                penalty.canonical_penalties,
+                lambdas_slice,
+                penalty.p,
+            ))
+        } else {
+            Ok(dense_reparam_result
+                .as_ref()
+                .expect("dense reparam result should be present outside Kronecker path")
+                .clone())
+        }
     };
 
     if matches!(link_function, LinkFunction::Identity) {
         let (pls_result, _) = solve_penalized_least_squares_implicit(
             &x_original,
-            if use_sparse_native {
-                None
-            } else {
-                Some(&qs_arc)
-            },
+            transform_active.as_ref(),
             y,
             priorweights,
             offset,
-            &reparam_result_active.e_transformed,
-            &reparam_result_active.s_transformed,
+            &penalty_active,
             &mut workspace,
             y,
             link_function,
@@ -4449,11 +4829,10 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
         let priorweights_owned = priorweights.to_owned();
         // eta = offset + X Qs beta (composed, no materialization)
-        let qbeta = if use_sparse_native {
-            beta_transformed.as_ref().clone()
-        } else {
-            qs_arc.dot(beta_transformed.as_ref())
-        };
+        let qbeta = transform_active
+            .as_ref()
+            .map(|transform| transform.apply(beta_transformed.as_ref()))
+            .unwrap_or_else(|| beta_transformed.as_ref().clone());
         let mut eta = offset.to_owned();
         eta += &x_original.apply(&qbeta);
         let final_eta = eta.clone();
@@ -4465,14 +4844,11 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         weighted_residual *= &priorweights_owned;
         // gradient = Qs^T X^T (w * residual) (composed)
         let xt_wr = x_original.apply_transpose(&weighted_residual);
-        let gradient_data = if use_sparse_native {
-            xt_wr
-        } else {
-            fast_atv(&qs_arc, &xt_wr)
-        };
-        let s_beta = reparam_result_active
-            .s_transformed
-            .dot(beta_transformed.as_ref());
+        let gradient_data = transform_active
+            .as_ref()
+            .map(|transform| transform.apply_transpose(&xt_wr))
+            .unwrap_or(xt_wr);
+        let s_beta = penalty_active.apply(beta_transformed.as_ref());
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
@@ -4532,6 +4908,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 &final_eta,
                 priorweights_owned.view(),
             )?;
+        let reparam_result = materialize_final_reparam_result()?;
+        let qs_arc_final = Arc::new(reparam_result.qs.clone());
         let pirls_result = PirlsResult {
             beta_transformed,
             penalized_hessian_transformed: penalized_hessian,
@@ -4567,7 +4945,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             constraint_kkt: working_summary.constraint_kkt.clone(),
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
-            x_transformed: make_reparam_operator(&x_original, &qs_arc, use_sparse_native),
+            x_transformed: make_reparam_operator(&x_original, &qs_arc_final, use_sparse_native),
             coordinate_frame: coordinate_frame.clone(),
             cache_compacted: false,
         };
@@ -4583,8 +4961,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         offset,
         y,
         priorweights,
-        reparam_result_active.s_transformed.clone(),
-        reparam_result_active.e_transformed.clone(),
+        penalty_active.clone(),
         workspace,
         likelihood,
         config.link_kind.clone(),
@@ -4593,11 +4970,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 &config.link_kind,
                 InverseLink::Standard(LinkFunction::Logit)
             ),
-        if use_sparse_native {
-            None
-        } else {
-            Some((*qs_arc).clone())
-        },
+        transform_active.clone(),
         quadctx,
     );
 
@@ -4623,7 +4996,10 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     if let Some(lb) = penalty.coefficient_lower_bounds {
         project_coefficients_to_lower_bounds(&mut beta_guess_original.0, lb);
     }
-    let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
+    let initial_beta = transform_active
+        .as_ref()
+        .map(|transform| transform.apply_transpose(beta_guess_original.as_ref()))
+        .unwrap_or_else(|| beta_guess_original.as_ref().clone());
     let firth_active = config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit);
     let options = WorkingModelPirlsOptions {
         // Firth logit fits often need more inner iterations to settle.
@@ -4661,7 +5037,6 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let final_state = working_model.into_final_state();
     let GamModelFinalState {
         coordinate_frame,
-        e_transformed,
         finalmu,
         finalweights,
         scoreweights,
@@ -4681,11 +5056,10 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     // H_eff = X'W_H X + S_λ + ridge I (if ridge_used > 0).
     let penalized_hessian_transformed = working_summary.state.hessian.clone();
     let stabilizedhessian_transformed = penalized_hessian_transformed.clone();
-
-    let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
+    let mut edf = calculate_edf_with_penalty(&penalized_hessian_transformed, &penalty_active)?;
     if !edf.is_finite() || edf.is_nan() {
         let p = penalized_hessian_transformed.ncols() as f64;
-        let r = e_transformed.nrows() as f64;
+        let r = penalty_active.rank() as f64;
         edf = (p - r).max(0.0);
     }
 
@@ -4723,7 +5097,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             working_summary.status = status.clone();
         }
     }
-    let has_penalty = e_transformed.nrows() > 0;
+    let has_penalty = penalty_active.rank() > 0;
     let firth_active = options.firth_bias_reduction;
     if detect_logit_instability(
         link_function,
@@ -4740,8 +5114,10 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     // Store a lazy ReparamOperator instead of materializing X·Qs.
     // Consumers that truly need dense access can call .to_dense() on demand.
+    let reparam_result_final = materialize_final_reparam_result()?;
+    let qs_arc_final = Arc::new(reparam_result_final.qs.clone());
     let x_transformed_final =
-        make_reparam_operator(&x_original_for_result, &qs_arc, use_sparse_native);
+        make_reparam_operator(&x_original_for_result, &qs_arc_final, use_sparse_native);
 
     let pirls_result = assemble_pirls_result(
         &working_summary,
@@ -4760,7 +5136,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         &final_d2mu_deta2,
         &final_d3mu_deta3,
         status,
-        reparam_result_active,
+        reparam_result_final,
         x_transformed_final,
         coordinate_frame,
         linear_constraints,
@@ -4837,24 +5213,28 @@ fn make_reparam_operator(
 /// of the O(p³) dense Cholesky.
 fn solve_penalized_least_squares_implicit(
     x_original: &DesignMatrix,
-    qs: Option<&Arc<Array2<f64>>>,
+    transform: Option<&WorkingReparamTransform>,
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
     offset: ArrayView1<f64>,
-    e_transformed: &Array2<f64>,
-    s_transformed: &Array2<f64>,
+    penalty: &PirlsPenalty,
     workspace: &mut PirlsWorkspace,
     y: ArrayView1<f64>,
     link_function: LinkFunction,
 ) -> Result<(StablePLSResult, usize), EstimationError> {
-    let p_dim = s_transformed.ncols();
+    let p_dim = penalty.dim();
 
     // ── Sparse-native fast path ──────────────────────────────────────────
     // When design is sparse and we are in original coordinates (qs = None),
     // assemble the penalized Hessian in sparse format and solve with sparse
     // Cholesky.  This avoids O(p²) dense X'WX and O(p³) dense factorization.
-    if qs.is_none() {
+    if transform.is_none() {
         if let Some(x_sparse) = x_original.as_sparse() {
+            let PirlsPenalty::Dense { s_transformed, .. } = penalty else {
+                return Err(EstimationError::InvalidInput(
+                    "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
+                ));
+            };
             let weights_owned = weights.to_owned();
 
             // 1. Sparse penalized Hessian: H = X'diag(w)X + S_λ + ridge·I
@@ -4884,7 +5264,7 @@ fn solve_penalized_least_squares_implicit(
 
             // 4. EDF via sparse factorization
             let h_sym = SymmetricMatrix::Sparse(h_sparse);
-            let edf = calculate_edf(&h_sym, e_transformed)?;
+            let edf = calculate_edf_with_penalty(&h_sym, penalty)?;
 
             // 5. Fitted values and scale
             let fitted_vals = {
@@ -4954,21 +5334,22 @@ fn solve_penalized_least_squares_implicit(
             .diag_xtw_x(&weights_owned)
             .map_err(EstimationError::InvalidInput)?,
     };
-    let mut penalized_hessian = s_transformed.clone();
-    if let Some(qs) = qs {
-        let tmp = fast_atb(qs, &xtwx_orig);
-        penalized_hessian += &fast_ab(&tmp, qs);
+    let mut penalized_hessian = if let Some(transform) = transform {
+        transform.conjugate_matrix(&xtwx_orig)
     } else {
-        penalized_hessian += &xtwx_orig;
-    }
+        xtwx_orig
+    };
+    penalty.add_to_hessian(&mut penalized_hessian);
 
     // 3. Form X'Wz: compute in original coordinates, then rotate.
     let xtwy_orig = x_original.transpose_vector_multiply(&workspace.wz);
     if workspace.vec_buf_p.len() != p_dim {
         workspace.vec_buf_p = Array1::zeros(p_dim);
     }
-    if let Some(qs) = qs {
-        workspace.vec_buf_p.assign(&fast_atv(qs, &xtwy_orig));
+    if let Some(transform) = transform {
+        workspace
+            .vec_buf_p
+            .assign(&transform.apply_transpose(&xtwy_orig));
     } else {
         workspace.vec_buf_p.assign(&xtwy_orig);
     }
@@ -5004,11 +5385,11 @@ fn solve_penalized_least_squares_implicit(
     let betavec = workspace.rhs_full.clone();
 
     // 6. EDF
-    let edf = calculate_edfwithworkspace(&regularizedhessian, e_transformed, workspace)?;
+    let edf = calculate_edfwithworkspace_with_penalty(&regularizedhessian, penalty, workspace)?;
 
     // 7. Scale (composed: eta = offset + X Qs beta)
-    let qbeta = if let Some(qs) = qs {
-        qs.dot(&betavec)
+    let qbeta = if let Some(transform) = transform {
+        transform.apply(&betavec)
     } else {
         betavec.clone()
     };
@@ -5073,6 +5454,34 @@ fn build_transformed_lower_bound_constraints(
     Some(LinearInequalityConstraints { a, b })
 }
 
+fn build_transformed_lower_bound_constraints_with_transform(
+    transform: &WorkingReparamTransform,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
+) -> Option<LinearInequalityConstraints> {
+    let lb = coefficient_lower_bounds?;
+    let p = match transform {
+        WorkingReparamTransform::Dense(qs) => qs.nrows(),
+        WorkingReparamTransform::Kronecker(kron) => kron.p,
+    };
+    if lb.len() != p {
+        return None;
+    }
+    let activerows: Vec<usize> = (0..lb.len()).filter(|&i| lb[i].is_finite()).collect();
+    if activerows.is_empty() {
+        return None;
+    }
+    let mut a = Array2::<f64>::zeros((activerows.len(), p));
+    let mut b = Array1::<f64>::zeros(activerows.len());
+    for (r, &idx) in activerows.iter().enumerate() {
+        let mut basis = Array1::<f64>::zeros(p);
+        basis[idx] = 1.0;
+        let row = transform.apply_transpose(&basis);
+        a.row_mut(r).assign(&row);
+        b[r] = lb[idx];
+    }
+    Some(LinearInequalityConstraints { a, b })
+}
+
 fn build_transformed_linear_constraints(
     qs: &Array2<f64>,
     linear_constraints: Option<&LinearInequalityConstraints>,
@@ -5085,6 +5494,26 @@ fn build_transformed_linear_constraints(
         a: lc.a.dot(qs),
         b: lc.b.clone(),
     })
+}
+
+fn build_transformed_linear_constraints_with_transform(
+    transform: &WorkingReparamTransform,
+    linear_constraints: Option<&LinearInequalityConstraints>,
+) -> Option<LinearInequalityConstraints> {
+    let lc = linear_constraints?;
+    let p = match transform {
+        WorkingReparamTransform::Dense(qs) => qs.nrows(),
+        WorkingReparamTransform::Kronecker(kron) => kron.p,
+    };
+    if lc.a.ncols() != p {
+        return None;
+    }
+    let mut a = Array2::<f64>::zeros((lc.a.nrows(), p));
+    for row in 0..lc.a.nrows() {
+        let transformed = transform.apply_transpose(&lc.a.row(row).to_owned());
+        a.row_mut(row).assign(&transformed);
+    }
+    Some(LinearInequalityConstraints { a, b: lc.b.clone() })
 }
 
 fn merge_linear_constraints(
@@ -6724,6 +7153,20 @@ fn calculate_edf(
     })
 }
 
+fn calculate_edf_with_penalty(
+    penalized_hessian: &SymmetricMatrix,
+    penalty: &PirlsPenalty,
+) -> Result<f64, EstimationError> {
+    match penalty {
+        PirlsPenalty::Dense { e_transformed, .. } => calculate_edf(penalized_hessian, e_transformed),
+        PirlsPenalty::Diagonal {
+            diag,
+            positive_indices,
+            ..
+        } => calculate_edf_from_diagonal_penalty(penalized_hessian, diag, positive_indices),
+    }
+}
+
 fn calculate_edfwithworkspace(
     penalized_hessian: &Array2<f64>,
     e_transformed: &Array2<f64>,
@@ -6765,6 +7208,98 @@ fn calculate_edfwithworkspace(
     Err(EstimationError::ModelIsIllConditioned {
         condition_number: f64::INFINITY,
     })
+}
+
+fn calculate_edfwithworkspace_with_penalty(
+    penalized_hessian: &Array2<f64>,
+    penalty: &PirlsPenalty,
+    workspace: &mut PirlsWorkspace,
+) -> Result<f64, EstimationError> {
+    match penalty {
+        PirlsPenalty::Dense { e_transformed, .. } => {
+            calculate_edfwithworkspace(penalized_hessian, e_transformed, workspace)
+        }
+        PirlsPenalty::Diagonal {
+            diag,
+            positive_indices,
+            ..
+        } => calculate_edfwithworkspace_from_diagonal_penalty(
+            penalized_hessian,
+            diag,
+            positive_indices,
+            workspace,
+        ),
+    }
+}
+
+fn calculate_edf_from_diagonal_penalty(
+    penalized_hessian: &SymmetricMatrix,
+    diag: &Array1<f64>,
+    positive_indices: &[usize],
+) -> Result<f64, EstimationError> {
+    let p = penalized_hessian.ncols();
+    let r = positive_indices.len();
+    let mp = ((p - r) as f64).max(0.0);
+    if r == 0 {
+        return Ok(p as f64);
+    }
+    let mut rhs_arr = Array2::<f64>::zeros((p, r));
+    for (col, &idx) in positive_indices.iter().enumerate() {
+        rhs_arr[[idx, col]] = 1.0;
+    }
+    let factor =
+        penalized_hessian
+            .factorize()
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
+    let sol = factor
+        .solvemulti(&rhs_arr)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    let mut tr = 0.0;
+    for (col, &idx) in positive_indices.iter().enumerate() {
+        tr += diag[idx] * sol[[idx, col]];
+    }
+    Ok((p as f64 - tr).clamp(mp, p as f64))
+}
+
+fn calculate_edfwithworkspace_from_diagonal_penalty(
+    penalized_hessian: &Array2<f64>,
+    diag: &Array1<f64>,
+    positive_indices: &[usize],
+    workspace: &mut PirlsWorkspace,
+) -> Result<f64, EstimationError> {
+    let p = penalized_hessian.ncols();
+    let r = positive_indices.len();
+    let mp = ((p - r) as f64).max(0.0);
+    if r == 0 {
+        return Ok(p as f64);
+    }
+    if workspace.final_aug_matrix.nrows() != p || workspace.final_aug_matrix.ncols() != r {
+        workspace.final_aug_matrix = Array2::zeros((p, r));
+    } else {
+        workspace.final_aug_matrix.fill(0.0);
+    }
+    for (col, &idx) in positive_indices.iter().enumerate() {
+        workspace.final_aug_matrix[[idx, col]] = 1.0;
+    }
+
+    let factor = StableSolver::new("pirls diagonal edf workspace")
+        .factorize(penalized_hessian)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    {
+        let mut rhsview = array2_to_matmut(&mut workspace.final_aug_matrix);
+        factor.solve_in_place(rhsview.as_mut());
+    }
+    let mut tr = 0.0;
+    for (col, &idx) in positive_indices.iter().enumerate() {
+        tr += diag[idx] * workspace.final_aug_matrix[[idx, col]];
+    }
+    Ok((p as f64 - tr).clamp(mp, p as f64))
 }
 
 #[inline]

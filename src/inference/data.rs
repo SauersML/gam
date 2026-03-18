@@ -604,7 +604,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
                 let str_arr = col.as_any().downcast_ref::<StringArray>();
                 if let Some(arr) = str_arr {
                     for i in 0..n_rows {
-                        if !arr.is_valid(i) {
+                        if arr.is_null(i) {
                             return Err(format!(
                                 "null value at row {}, column '{}'",
                                 col_vecs[j].len() + i + 1,
@@ -628,7 +628,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
                             )
                         })?;
                     for i in 0..n_rows {
-                        if !arr.is_valid(i) {
+                        if arr.is_null(i) {
                             return Err(format!(
                                 "null value at row {}, column '{}'",
                                 col_vecs[j].len() + i + 1,
@@ -648,7 +648,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
                 // Check for nulls.
                 if col.null_count() > 0 {
                     for i in 0..n_rows {
-                        if !col.is_valid(i) {
+                        if col.is_null(i) {
                             return Err(format!(
                                 "null value at row {}, column '{}'",
                                 base_row + i + 1,

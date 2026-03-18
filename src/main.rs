@@ -81,11 +81,13 @@ use gam::survival_construction::{
     survival_basis_supports_structural_monotonicity, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
-    SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
-    SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
-    residual_distribution_inverse_link,
+    DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
+    SurvivalLocationScalePredictInput, SurvivalLocationScaleTermSpec, TimeBlockInput,
+    predict_survival_location_scale, residual_distribution_inverse_link,
 };
-use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
+use gam::survival_marginal_slope::{
+    DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeTermSpec,
+};
 use gam::term_builder::{
     build_termspec, enable_scale_dimensions, heuristic_knots, heuristic_knots_for_column,
     parse_duchon_order, parse_duchon_power, unique_count_column,
@@ -327,8 +329,8 @@ struct FitArgs {
     scale_dimensions: bool,
     /// Subsample threshold for automatic pilot-fit spatial length-scale optimization.
     /// When n exceeds 2x this value, κ/anisotropy optimization runs on a
-    /// spatially stratified subsample, then the full dataset is fit with
-    /// frozen geometry. Set to 0 to disable.
+    /// spatially stratified subsample to initialize the geometry, then the
+    /// full dataset re-optimizes κ/anisotropy jointly. Set to 0 to disable.
     #[arg(long, value_name = "N", default_value_t = 10_000)]
     pilot_subsample_threshold: usize,
     #[arg(long = "out")]
@@ -2629,18 +2631,14 @@ fn run_predict_binomial_location_scale(
     let saved_loc_link = saved_link_kind.ok_or_else(|| {
         "binomial-location-scale model is missing link state/metadata".to_string()
     })?;
-    let sigma = eta_noise.mapv(crate::families::sigma_link::safe_exp);
-    let dsigma = eta_noise.mapv(|eta| {
-        let jet = crate::families::sigma_link::exp_sigma_jet1_scalar(eta);
-        jet.d1
-    });
+    let inv_sigma = eta_noise.mapv(crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar);
     let q0 = Array1::from_iter(
         eta_t
             .iter()
-            .zip(sigma.iter())
-            .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
+            .zip(inv_sigma.iter())
+            .map(|(&t, &r)| -t * r),
     );
-    let eta = apply_saved_linkwiggle(&q0, model)?.mapv(|v| v.clamp(-30.0, 30.0));
+    let eta = apply_saved_linkwiggle(&q0, model)?;
     let wiggle_design = saved_linkwiggle_design(&q0, model)?;
     let dq_dq0 = saved_linkwiggle_derivative_q0(&q0, model)?;
     let p_t = beta_t.len();
@@ -2661,11 +2659,10 @@ fn run_predict_binomial_location_scale(
         let mut grad = Array2::<f64>::zeros((eta.len(), p_total));
         for i in 0..eta.len() {
             let scale = dq_dq0[i];
-            let inv_sigma = 1.0 / sigma[i].max(1e-12);
             for j in 0..p_t {
-                grad[[i, j]] = -scale * dense_design_t[[i, j]] * inv_sigma;
+                grad[[i, j]] = -scale * dense_design_t[[i, j]] * inv_sigma[i];
             }
-            let coeff_ls = scale * eta_t[i] * dsigma[i] / sigma[i].powi(2).max(1e-12);
+            let coeff_ls = scale * eta_t[i] * inv_sigma[i];
             for j in 0..p_ls {
                 grad[[i, p_t + j]] = coeff_ls * dense_design_noise[[i, j]];
             }
@@ -2702,11 +2699,10 @@ fn run_predict_binomial_location_scale(
                             [eta_t[i], eta_noise[i]],
                             [[var_t, cov_tls], [cov_tls, var_ls]],
                             |t, ls| {
-                                let sigma = ls.exp().max(1e-12);
                                 integrated_inverse_link_mean_scalar(
                                     &quadctx,
                                     saved_loc_link,
-                                    -t / sigma,
+                                    -t * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls),
                                     0.0,
                                 )
                             },
@@ -2781,8 +2777,8 @@ fn run_predict_binomial_location_scale(
                     [eta_t[i], eta_noise[i]],
                     [[var_t, cov_tls], [cov_tls, var_ls]],
                     |t, ls| {
-                        let sigma = ls.exp().max(1e-12);
-                        let q0 = (-t / sigma).clamp(-30.0, 30.0);
+                        let q0 =
+                            -t * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls);
                         let xw = saved_linkwiggle_basisrow_scalar(q0, model)?;
                         if xw.len() != pw {
                             return Err(format!(
@@ -3844,8 +3840,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 event_target: event_target.mapv(f64::from),
                 weights: weights.clone(),
                 inverse_link,
-                derivative_guard: 0.0,
-                derivative_softness: 0.0,
+                derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
                 time_anchor: args.survival_time_anchor,
                 max_iter: 400,
                 tol: 1e-6,
@@ -3886,7 +3881,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     double_penalty: cfg.double_penalty,
                 }),
                 kappa_options: kappa_options.clone(),
-                optimize_inverse_link: true,
+                optimize_inverse_link: match &survival_inverse_link {
+                    InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => true,
+                    InverseLink::Mixture(state) => !state.rho.is_empty(),
+                    InverseLink::Standard(_) => false,
+                },
             },
         )) {
             Ok(FitResult::SurvivalLocationScale(result)) => result,
@@ -4074,7 +4073,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             event_target: event_target.mapv(f64::from),
             weights: weights.clone(),
             z,
-            derivative_guard: 0.0,
+            derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
             time_block: TimeBlockInput {
                 design_entry: time_design_entry.clone(),
                 design_exit: time_design_exit.clone(),
@@ -5514,7 +5513,7 @@ fn run_generate_binomial_location_scale(
         eta_t
             .iter()
             .zip(sigma.iter())
-            .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
+            .map(|(&t, &s)| -t / s),
     );
     let eta = apply_saved_linkwiggle(&q0, model)?;
     let mean = Array1::from_iter(
@@ -6212,8 +6211,8 @@ fn compute_probit_q0_from_eta(
     }
     let mut q0 = Array1::<f64>::zeros(eta_t.len());
     for i in 0..q0.len() {
-        let sigma = eta_ls[i].exp().max(1e-12);
-        q0[i] = -eta_t[i] / sigma;
+        q0[i] = -eta_t[i]
+            * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
     }
     Ok(q0)
 }
@@ -9324,7 +9323,9 @@ mod tests {
             let z2: f64 = StandardNormal.sample(&mut rng);
             let t = beta_t + l11 * z1;
             let ls = beta_ls + l21 * z1 + l22 * z2;
-            acc += gam::probability::normal_cdf(-t / ls.exp().max(1e-12));
+            acc += gam::probability::normal_cdf(
+                -t * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls),
+            );
         }
         acc / draws.max(1) as f64
     }
@@ -9347,7 +9348,8 @@ mod tests {
             let z_ls: f64 = StandardNormal.sample(&mut rng);
             let t = beta_t + cov_diag[0].max(0.0).sqrt() * z_t;
             let ls = beta_ls + cov_diag[1].max(0.0).sqrt() * z_ls;
-            q0_draws[i] = (-t / ls.exp().max(1e-12)).clamp(-30.0, 30.0);
+            q0_draws[i] =
+                -t * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls);
             for j in 0..beta_link_wiggle.len() {
                 let zw: f64 = StandardNormal.sample(&mut rng);
                 beta_draws[[i, j]] = beta_link_wiggle[j] + cov_diag[2 + j].max(0.0).sqrt() * zw;
@@ -9435,7 +9437,7 @@ mod tests {
     #[test]
     fn survival_probability_is_bounded_and_monotone_decreasing_in_eta() {
         let eta: Array1<f64> = array![-3.0, -1.0, 0.0, 1.0, 2.0];
-        let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
+        let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
         assert!(
             surv.iter()
                 .all(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0)
@@ -9447,9 +9449,7 @@ mod tests {
     fn concordance_depends_on_score_semantics() {
         let time = [12.0, 10.0, 8.0, 6.0, 4.0, 2.0];
         let eta: Array1<f64> = array![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
-        let surv = eta
-            .mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0))
-            .to_vec();
+        let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0)).to_vec();
         let risk = eta.to_vec();
         let neg_risk = eta.mapv(|v| -v).to_vec();
 
@@ -10126,7 +10126,7 @@ mod tests {
         path.push(format!("gam_survival_pred_schema_{ts}.csv"));
 
         let eta: Array1<f64> = array![0.5, -0.25];
-        let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
+        let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
         write_survival_prediction_csv(&path, eta.view(), surv.view(), None, None, None)
             .expect("write survival prediction csv");
 
@@ -11491,7 +11491,7 @@ mod tests {
                 );
                 let beta = summary.beta.as_ref().to_owned();
                 let eta = time_build.x_exit_time.dot(&beta);
-                let surv = eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0));
+                let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
                 let state = constrained_model
                     .update_state(&beta)
                     .expect("evaluate fitted structural survival state");
@@ -12115,8 +12115,8 @@ mod tests {
         let q0 =
             compute_probit_q0_from_eta(eta_t.view(), eta_ls.view()).expect("compute probit q0");
         for i in 0..q0.len() {
-            let sigma = eta_ls[i].exp().max(1e-12);
-            let expected = -eta_t[i] / sigma;
+            let expected = -eta_t[i]
+                * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
             assert!((q0[i] - expected).abs() < 1e-12);
         }
     }

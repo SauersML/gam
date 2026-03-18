@@ -1070,6 +1070,15 @@ pub fn create_balanced_penalty_root_from_canonical(
     }
 
     if overlapping {
+        const OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P: usize = 4096;
+        if p > OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P {
+            return Err(EstimationError::LayoutError(format!(
+                "overlapping penalty root would require dense {}x{} eigendecomposition; \
+                 large-model dense fallback is disabled. Keep penalties structured or \
+                 extend the overlapping-penalty solver path",
+                p, p
+            )));
+        }
         // Fallback: accumulate into p × p and eigendecompose globally.
         let mut s_balanced = Array2::zeros((p, p));
         for cp in penalties {
@@ -2078,16 +2087,23 @@ impl KroneckerReparamResult {
         s
     }
 
-    /// Convert to a standard ReparamResult for compatibility with the existing
-    /// solver infrastructure.  This materializes the dense Qs and transformed
-    /// penalty — O(p²) — but allows the factored path to integrate without
-    /// modifying every downstream consumer.
-    pub fn to_standard_reparam_result(
+    /// Explicitly materialize the dense artifact bundle expected by legacy
+    /// downstream consumers. This is not part of the native Kronecker solve path.
+    pub fn materialize_dense_artifact_result(
         &self,
         rs_list: &[Array2<f64>],
         lambdas: &[f64],
         p: usize,
     ) -> Result<ReparamResult, EstimationError> {
+        const KRONECKER_DENSE_COMPAT_FALLBACK_MAX_P: usize = 4096;
+        if p > KRONECKER_DENSE_COMPAT_FALLBACK_MAX_P {
+            return Err(EstimationError::LayoutError(format!(
+                "Kronecker reparameterization would materialize dense {}x{} compatibility tensors; \
+                 large-model dense fallback is disabled. Wire the downstream solver to consume \
+                 the factored Kronecker result directly",
+                p, p
+            )));
+        }
         let qs = self.materialize_qs();
         let s_transformed = self.materialize_s_transformed(lambdas);
 

@@ -322,8 +322,8 @@ mod tests {
             .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
             .expect("exact firth hessian");
         let h_fallback = state
-            .compute_lamlhessian_analytic_fallback(&rho)
-            .expect("analytic fallback hessian");
+            .compute_lamlhessian_diagnostic_numeric(&rho)
+            .expect("diagnostic numeric hessian");
 
         assert!(h_exact.iter().all(|v: &f64| v.is_finite()));
         assert!(h_fallback.iter().all(|v: &f64| v.is_finite()));
@@ -347,7 +347,7 @@ mod tests {
         let rel = num / den;
         assert!(
             rel < 8.0e-1,
-            "Firth exact-vs-analytic-fallback Hessian mismatch too large: rel={rel:.3e}, exact={h_exact:?}, fallback={h_fallback:?}"
+            "Firth exact-vs-diagnostic-numeric Hessian mismatch too large: rel={rel:.3e}, exact={h_exact:?}, fallback={h_fallback:?}"
         );
     }
 
@@ -1736,66 +1736,6 @@ pub(crate) struct EvalShared {
     /// The exact H_total matrix used for LAML cost computation.
     /// For Firth: h_eff - hphi. For non-Firth: h_eff.
     h_total: Arc<Array2<f64>>,
-
-    // ══════════════════════════════════════════════════════════════════════
-    // WHY TWO INVERSES? (Hybrid Approach for Indefinite Hessians)
-    // ══════════════════════════════════════════════════════════════════════
-    //
-    // The LAML gradient has two terms requiring DIFFERENT matrix inverses:
-    //
-    // 1. TRACE TERM (∂/∂ρ log|H|): Uses PSEUDOINVERSE H₊†
-    //    - Cost defines log|H| = Σᵢ log(λᵢ) for λᵢ > ε only (truncated)
-    //    - Derivative: ∂J/∂ρ = ½ tr(H₊† ∂H/∂ρ)
-    //    - H₊† = Σᵢ (1/λᵢ) uᵢuᵢᵀ for positive λᵢ only
-    //    - Negative eigenvalues contribute 0 to cost, so their derivative contribution is 0
-    //
-    // 2. IMPLICIT TERM (dβ/dρ): Uses RIDGED FACTOR (H + δI)⁻¹
-    //    - PIRLS stabilizes indefinite H by adding ridge: solves (H + δI)β = ...
-    //    - Stationarity condition: G(β,ρ) = ∇L + δβ = 0
-    //    - By Implicit Function Theorem: dβ/dρ = (H + δI)⁻¹ (λₖ Sₖ β)
-    //    - Must use ridged inverse because β moves on the RIDGED surface
-    //
-    // EXAMPLE: H = -5 (indefinite), ridge δ = 10
-    //   Trace term: Pseudoinverse → 0 (correct: truncated eigenvalue)
-    //               Ridged inverse → 0.2 (WRONG: gradient of non-existent curve)
-    //   Implicit term: Ridged inverse → 1/5 (correct: solver sees stiffness +5)
-    //                  Pseudoinverse → 0 or ∞ (WRONG: ignores ridge physics)
-    //
-    // ══════════════════════════════════════════════════════════════════════
-    /// Positive-spectrum factor W = U_+ diag(1/sqrt(lambda_+)).
-    /// This avoids materializing H₊† = W Wᵀ in hot paths.
-    ///
-    /// We use identities:
-    ///   H₊† v = W (Wᵀ v)
-    ///   tr(H₊† S_k) = ||R_k W||_F², where S_k = R_kᵀ R_k.
-    ///
-    /// Architectural consequence: this representation is defined by a dense
-    /// eigendecomposition of the transformed Hessian. Because it is a
-    /// positive-part pseudoinverse on a dense rotated basis, it cannot be
-    /// replaced directly by sparse selected inversion / Takahashi equations.
-    /// Those methods apply to sparse SPD solves for H^{-1} in a sparsity-
-    /// preserving coordinate system, not to the truncated spectral inverse
-    /// used here.
-    ///
-    /// Derivation:
-    /// If H = U diag(mu) U' and U_+ contains only eigenvectors with
-    /// mu_i > tau, then the positive-part pseudoinverse is
-    ///   H_+^dagger = U_+ diag(1 / mu_i) U_+'.
-    /// Writing
-    ///   W := U_+ diag(1 / sqrt(mu_i))
-    /// gives
-    ///   H_+^dagger = W W'.
-    /// Relative eigengap between kept and dropped spectra around the H_+
-    /// threshold used for pseudo-logdet derivatives (if available).
-    active_subspace_rel_gap: Option<f64>,
-    /// True when the H_+ active subspace is numerically near a hard-threshold
-    /// crossing. In that regime, the truncated logdet objective no longer has
-    /// a clean fixed-projector derivative model: even first-order derivatives
-    /// cease to be exact at the crossing, and second-order identities are more
-    /// fragile still. We use this flag to suppress "exact Hessian" claims and
-    /// other branch-local second-order logic that assumes a fixed active
-    /// projector.
-    active_subspace_unstable: bool,
     sparse_exact: Option<Arc<SparseExactEvalData>>,
     firth_dense_operator: Option<Arc<FirthDenseOperator>>,
     /// Cached FirthDenseOperator built from the original (non-reparameterized)
