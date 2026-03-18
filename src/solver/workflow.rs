@@ -667,7 +667,7 @@ use crate::families::survival_construction::{
     parse_survival_time_basis_config,
 };
 use crate::families::survival_location_scale::{
-    SurvivalCovariateTermBlockTemplate, SurvivalLocationScaleTermSpec, TimeBlockInput,
+    SurvivalCovariateTermBlockTemplate, TimeBlockInput,
     residual_distribution_inverse_link,
 };
 use crate::inference::data::EncodedDataset as Dataset;

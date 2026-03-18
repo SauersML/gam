@@ -1603,6 +1603,7 @@ fn matern_operator_penalty_triplet_from_metadata(
             nullspace_dim_hint: 0,
             source,
             normalization_scale,
+            kronecker_factors: None,
         });
     }
     filter_active_penalty_candidates(candidates)
@@ -2107,6 +2108,7 @@ fn build_tensor_bspline_basis(
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale * c_new,
+                    kronecker_factors: candidate.kronecker_factors.clone(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;

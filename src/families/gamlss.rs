@@ -818,7 +818,7 @@ fn gaussian_location_scalewarm_start(
     } else {
         {
             let p_mu = mu_block.design.ncols();
-            let dense_penalties: Vec<Array2<f64>> = mu_block.penalties.iter().map(|ps| ps.to_global(p_mu)).collect();
+            let dense_penalties: Vec<Array2<f64>> = mu_block.penalties.iter().map(|ps| ps.to_dense()).collect();
             solve_penalizedweighted_projection(
                 &mu_block.design,
                 &mu_block.offset,
@@ -853,7 +853,7 @@ fn gaussian_location_scalewarm_start(
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
         {
             let p_ls = log_sigma_block.design.ncols();
-            let dense_penalties: Vec<Array2<f64>> = log_sigma_block.penalties.iter().map(|ps| ps.to_global(p_ls)).collect();
+            let dense_penalties: Vec<Array2<f64>> = log_sigma_block.penalties.iter().map(|ps| ps.to_dense()).collect();
             solve_penalizedweighted_projection(
                 &log_sigma_block.design,
                 &log_sigma_block.offset,
@@ -1049,7 +1049,7 @@ pub struct BinomialLocationScaleWiggleTermSpec {
     pub wiggle_block: ParameterBlockInput,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct BlockwiseTermFitResult {
     pub fit: UnifiedFitResult,
     pub meanspec_resolved: TermCollectionSpec,
