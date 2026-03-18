@@ -244,18 +244,6 @@ fn sanitize_symmetric_faer(matrix: &Mat<f64>) -> Mat<f64> {
     sanitized
 }
 
-fn frobenius_norm_faer(matrix: &Mat<f64>) -> f64 {
-    let (rows, cols) = matrix.as_ref().shape();
-    let mut sum_sq = 0.0_f64;
-    for i in 0..rows {
-        for j in 0..cols {
-            let val = matrix[(i, j)];
-            sum_sq += val * val;
-        }
-    }
-    sum_sq.sqrt()
-}
-
 fn penalty_from_root_faer(root: &Mat<f64>) -> Mat<f64> {
     let cols = root.ncols();
     let mut full = Mat::<f64>::zeros(cols, cols);
@@ -423,12 +411,6 @@ pub(crate) fn robust_eigh_faer(
         },
         |err| EstimationError::EigendecompositionFailed(FaerLinalgError::SelfAdjointEigen(err)),
     )
-}
-
-fn transpose_owned(matrix: &Array2<f64>) -> Array2<f64> {
-    let mut transposed = Array2::zeros((matrix.ncols(), matrix.nrows()));
-    transposed.assign(&matrix.t());
-    transposed
 }
 
 fn robust_eigh(
@@ -1430,8 +1412,6 @@ pub fn precompute_reparam_invariant_from_canonical(
         col_range: Range<usize>,
         q_pen_local: Array2<f64>,  // block_dim × pen_rank
         q_null_local: Array2<f64>, // block_dim × null_rank
-        max_bal: f64,
-        penalty_indices: Vec<usize>,
         /// Column offset of this block's penalized directions within global Q_pen.
         pen_col_offset: usize,
         /// Column offset of this block's null directions within global Q_null.
@@ -1457,15 +1437,11 @@ pub fn precompute_reparam_invariant_from_canonical(
             }
         }
 
-        let penalty_indices: Vec<usize> = refs.iter().map(|r| r.penalty_index).collect();
-
         if !block_has_nonzero {
             block_results.push(BlockResult {
                 col_range: start..end,
                 q_pen_local: Array2::zeros((block_dim, 0)),
                 q_null_local: Array2::eye(block_dim),
-                max_bal: 0.0,
-                penalty_indices,
                 pen_col_offset: 0,  // set later
                 null_col_offset: 0, // set later
             });
@@ -1519,8 +1495,6 @@ pub fn precompute_reparam_invariant_from_canonical(
             col_range: start..end,
             q_pen_local,
             q_null_local,
-            max_bal,
-            penalty_indices,
             pen_col_offset: 0,  // set later
             null_col_offset: 0, // set later
         });

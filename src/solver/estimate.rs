@@ -556,26 +556,6 @@ impl ParametricColumnConditioning {
         }
     }
 
-    /// Infer unpenalized columns by scanning penalty matrices, then compute
-    /// column statistics via per-column extraction — no full-design densification.
-    /// Legacy: kept for callers that still pass `&[Array2<f64>]`.
-    fn infer_from_penalties(x: &DesignMatrix, s_list: &[Array2<f64>]) -> Self {
-        let p = x.ncols();
-        let mut penalized = vec![false; p];
-        for s in s_list {
-            for j in 0..p.min(s.ncols()) {
-                for i in 0..s.nrows() {
-                    if s[[i, j]] != 0.0 || s[[j, i]] != 0.0 {
-                        penalized[j] = true;
-                        break;
-                    }
-                }
-            }
-        }
-        let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
-        Self::from_column_indices(x, &unpenalized)
-    }
-
     /// Infer unpenalized columns from `PenaltySpec` slices.
     fn infer_from_penalty_specs(x: &DesignMatrix, specs: &[PenaltySpec]) -> Self {
         let p = x.ncols();
@@ -590,31 +570,18 @@ impl ParametricColumnConditioning {
         Self::from_column_indices(x, &unpenalized)
     }
 
-    /// Infer unpenalized columns from blockwise penalties via `col_range` — O(k),
-    /// no matrix scanning needed.
-    fn infer_from_blockwise_penalties(x: &DesignMatrix, s_list: &[BlockwisePenalty]) -> Self {
+    /// Infer unpenalized columns by scanning dense penalty matrices.
+    fn infer_from_penalties(x: &DesignMatrix, s_list: &[Array2<f64>]) -> Self {
         let p = x.ncols();
         let mut penalized = vec![false; p];
-        for bp in s_list {
-            for j in bp.col_range.clone() {
-                penalized[j] = true;
-            }
-        }
-        let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
-        Self::from_column_indices(x, &unpenalized)
-    }
-
-    /// Infer unpenalized columns from canonical penalties via `col_range` — O(k),
-    /// no matrix scanning needed.
-    fn infer_from_canonical_penalties(
-        x: &DesignMatrix,
-        s_list: &[crate::construction::CanonicalPenalty],
-    ) -> Self {
-        let p = x.ncols();
-        let mut penalized = vec![false; p];
-        for cp in s_list {
-            for j in cp.col_range.clone() {
-                penalized[j] = true;
+        for s in s_list {
+            for j in 0..p.min(s.ncols()) {
+                for i in 0..s.nrows() {
+                    if s[[i, j]] != 0.0 || s[[j, i]] != 0.0 {
+                        penalized[j] = true;
+                        break;
+                    }
+                }
             }
         }
         let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();

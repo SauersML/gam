@@ -37,7 +37,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
 use faer::linalg::cholesky::llt::factor::LltParams;
-use faer::{Auto, MatRef, Spec};
+use faer::{Auto, Spec};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -56,18 +56,6 @@ fn array1_is_finite(values: &Array1<f64>) -> bool {
 #[inline]
 fn array2_is_finite(values: &Array2<f64>) -> bool {
     values.iter().all(|v| v.is_finite())
-}
-
-#[inline]
-fn matref_is_finite(mat: MatRef<'_, f64>) -> bool {
-    for j in 0..mat.ncols() {
-        for i in 0..mat.nrows() {
-            if !mat[(i, j)].is_finite() {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -672,8 +660,6 @@ pub struct PirlsWorkspace {
     pub delta_eta: Array1<f64>,
     // Preallocated buffer for GEMV results (length p)
     pub vec_buf_p: Array1<f64>,
-    // Cached sparse XtWX workspace (symbolic + scratch)
-    pub(crate) sparse_xtwx_cache: Option<SparseXtWxCache>,
     // Cached sparse penalized-system workspace for sparse-native solve eligibility/assembly.
     sparse_penalized_system_cache: Option<SparsePenalizedSystemCache>,
     // Factorization scratch (avoid per-iteration allocation)
@@ -711,7 +697,6 @@ impl PirlsWorkspace {
             weighted_residual: Array1::zeros(n),
             delta_eta: Array1::zeros(n),
             vec_buf_p: Array1::zeros(p),
-            sparse_xtwx_cache: None,
             sparse_penalized_system_cache: None,
             // Keep scratch minimal at init; grow only if/when a factorization path
             // needs it.
@@ -1050,7 +1035,6 @@ enum PirlsPenalty {
     Diagonal {
         diag: Array1<f64>,
         positive_indices: Vec<usize>,
-        positive_sqrt: Array1<f64>,
     },
 }
 
@@ -1358,21 +1342,6 @@ impl<'a> GamWorkingModel<'a> {
             final_d2mu_deta2: last_d2mu_deta2,
             final_d3mu_deta3: last_d3mu_deta3,
             penalty_term: last_penalty_term,
-        }
-    }
-
-    fn transformed_matvec(&self, beta: &Coefficients) -> Array1<f64> {
-        match &self.coordinate_design {
-            WorkingCoordinateDesign::OriginalSparseNative => {
-                self.x_original.matrixvectormultiply(beta)
-            }
-            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
-                x_transformed.matrixvectormultiply(beta)
-            }
-            WorkingCoordinateDesign::TransformedImplicit { transform } => {
-                let beta_orig = transform.apply(beta.as_ref());
-                self.x_original.matrixvectormultiply(&beta_orig)
-            }
         }
     }
 
@@ -2018,28 +1987,6 @@ impl SparseXtWxCache {
         Ok(())
     }
 
-    fn compute_dense(
-        &mut self,
-        x: &SparseColMat<usize, f64>,
-        weights: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        self.compute_numeric(x, weights)?;
-
-        // Convert sparse XtWX directly into ndarray without materializing an
-        // intermediate faer dense matrix.
-        let mut out = Array2::<f64>::zeros((self.ncols, self.ncols));
-        let xtwx_symbolic = self.xtwx_symbolic.as_ref();
-        let col_ptr = xtwx_symbolic.col_ptr();
-        let row_idx = xtwx_symbolic.row_idx();
-        for col in 0..self.ncols {
-            let start = col_ptr[col];
-            let end = col_ptr[col + 1];
-            for idx in start..end {
-                out[[row_idx[idx], col]] += self.xtwxvalues[idx];
-            }
-        }
-        Ok(out)
-    }
 }
 
 fn sparse_xtwx_par(ncols: usize) -> Par {
@@ -4463,7 +4410,6 @@ fn build_diagonal_penalty_from_kronecker(
     let p: usize = kron_result.marginal_dims.iter().copied().product();
     let mut diag = Array1::<f64>::zeros(p);
     let mut positive_indices = Vec::new();
-    let mut positive_sqrt = Vec::new();
 
     let mut multi_idx = vec![0usize; d];
     let mut flat = 0usize;
@@ -4478,7 +4424,6 @@ fn build_diagonal_penalty_from_kronecker(
         diag[flat] = sigma;
         if sigma > 0.0 {
             positive_indices.push(flat);
-            positive_sqrt.push(sigma.sqrt());
         }
         flat += 1;
 
@@ -4501,7 +4446,6 @@ fn build_diagonal_penalty_from_kronecker(
     PirlsPenalty::Diagonal {
         diag,
         positive_indices,
-        positive_sqrt: Array1::from_vec(positive_sqrt),
     }
 }
 
@@ -5111,14 +5055,6 @@ impl PirlsConfig {
     }
 }
 
-fn maybe_sparse_design(x: &Array2<f64>) -> DesignMatrix {
-    if let Some(sparse) = sparse_from_denseview(x.view()) {
-        sparse
-    } else {
-        DesignMatrix::from(x.clone())
-    }
-}
-
 #[inline]
 #[cfg(debug_assertions)]
 fn debug_assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
@@ -5370,17 +5306,6 @@ fn solve_penalized_least_squares_implicit(
         },
         p_dim,
     ))
-}
-
-fn design_dot_dense_rhs(x: &DesignMatrix, rhs: &Array2<f64>) -> Array2<f64> {
-    let nrows = x.nrows();
-    let ncols = rhs.ncols();
-    let mut out = Array2::<f64>::zeros((nrows, ncols));
-    for col in 0..ncols {
-        let v = x.apply(&rhs.column(col).to_owned());
-        out.column_mut(col).assign(&v);
-    }
-    out
 }
 
 fn build_transformed_lower_bound_constraints(
@@ -7272,59 +7197,12 @@ where
     (p as f64 - tr).clamp(mp, p as f64)
 }
 
-/// Calculate scale parameter correctly for different link functions.
-///
-/// Contract:
-/// - Gaussian (Identity): residual standard deviation sigma
-/// - Binomial links: fixed at 1.0 as in mgcv
-fn calculate_scale(
-    beta: &Array1<f64>,
-    x: ArrayView2<f64>,
-    y: ArrayView1<f64>, // This is the original response, not the working response z
-    weights: ArrayView1<f64>,
-    offset: ArrayView1<f64>,
-    edf: f64,
-    link_function: LinkFunction,
-) -> f64 {
-    match link_function {
-        LinkFunction::Logit
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::Sas
-        | LinkFunction::BetaLogistic
-        | LinkFunction::Log => {
-            // For binomial models (logistic regression), scale is fixed at 1.0
-            // This follows mgcv's convention in gam.fit3.R
-            1.0
-        }
-        LinkFunction::Identity => {
-            // For Gaussian models, scale is estimated from the residual sum of squares
-            // IMPORTANT: the fitted mean is eta = offset + Xβ. Using Xβ alone
-            // silently biases dispersion whenever offsets are present.
-            let mut fitted = x.dot(beta);
-            fitted += &offset;
-            let residuals = &y - &fitted;
-            let weighted_rss: f64 = weights
-                .iter()
-                .zip(residuals.iter())
-                .map(|(&w, &r)| w * r * r)
-                .sum();
-            // STRATEGIC DESIGN DECISION: Use unweighted observation count for mgcv parity
-            // Standard WLS theory suggests using sum(weights) as effective sample size,
-            // but mgcv's gam.fit3 uses 'n.true' (unweighted count) in the denominator.
-            // We maintain this behavior for strict mgcv parity.
-            let effective_n = y.len() as f64;
-            (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet,
-        calculate_deviance, calculate_scale, compress_activeworking_set,
+        calculate_deviance, compress_activeworking_set,
         compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
         default_beta_guess_external, fit_model_for_fixed_rho, logit_clampzero_enabled,
         should_log_pirls_decision_summary, should_use_sparse_native_pirls,
@@ -7339,8 +7217,44 @@ mod tests {
     };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{Array1, Array2, ArrayView1, ArrayView2, array};
     use std::sync::Arc;
+
+    /// Calculate scale parameter correctly for different link functions.
+    ///
+    /// Contract:
+    /// - Gaussian (Identity): residual standard deviation sigma
+    /// - Binomial links: fixed at 1.0 as in mgcv
+    fn calculate_scale(
+        beta: &Array1<f64>,
+        x: ArrayView2<f64>,
+        y: ArrayView1<f64>,
+        weights: ArrayView1<f64>,
+        offset: ArrayView1<f64>,
+        edf: f64,
+        link_function: LinkFunction,
+    ) -> f64 {
+        match link_function {
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas
+            | LinkFunction::BetaLogistic
+            | LinkFunction::Log => 1.0,
+            LinkFunction::Identity => {
+                let mut fitted = x.dot(beta);
+                fitted += &offset;
+                let residuals = &y - &fitted;
+                let weighted_rss: f64 = weights
+                    .iter()
+                    .zip(residuals.iter())
+                    .map(|(&w, &r)| w * r * r)
+                    .sum();
+                let effective_n = y.len() as f64;
+                (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
+            }
+        }
+    }
 
     #[test]
     fn gaussian_scale_uses_offset_in_residuals() {
