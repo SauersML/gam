@@ -846,6 +846,256 @@ mod tests {
             "analytic tau-tau block deviates from FD reference: rel={rel:.3e}, analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
         );
     }
+
+    // ── Profiled Gaussian REML coverage for design-moving τ-directions ──
+    //
+    // The existing directional-hyper tests all use BinomialLogit, which has
+    // DispersionHandling::Fixed.  These tests validate the profiled Gaussian
+    // path (DispersionHandling::ProfiledGaussian) with design-moving
+    // τ-directions, where the profiled scale φ̂ = D_p/(n−M) depends on ρ
+    // and the envelope-theorem rescaling by (n−M)/D_p must be correct.
+
+    #[test]
+    fn profiled_gaussian_design_moving_gradient_matches_fd() {
+        // Continuous response for Gaussian family.
+        let y = array![0.5, 1.2, -0.3, 0.8, 1.1, -0.6, 0.9, 0.1, -0.2, 0.7];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.2, 0.3],
+            [1.0, -0.8, -0.4],
+            [1.0, -0.3, 0.7],
+            [1.0, 0.1, -0.9],
+            [1.0, 0.5, 0.2],
+            [1.0, 0.9, -0.1],
+            [1.0, 1.3, 0.8],
+            [1.0, 1.7, -0.6],
+            [1.0, -0.5, 0.5],
+            [1.0, 0.3, -0.3],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]];
+
+        // Gaussian config → ProfiledGaussian dispersion.
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
+            1e-14,
+            false,
+        );
+
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let rho = array![0.0];
+
+        // Design-moving direction: non-zero X_τ, zero S_τ.
+        let x_tau = array![
+            [0.0, 1e-3, -2e-3],
+            [0.0, -3e-3, 1e-3],
+            [0.0, 2e-3, 0.5e-3],
+            [0.0, -1e-3, 3e-3],
+            [0.0, 0.5e-3, -1e-3],
+            [0.0, 1.5e-3, 2e-3],
+            [0.0, -2e-3, -0.5e-3],
+            [0.0, 3e-3, 1e-3],
+            [0.0, -0.5e-3, 2e-3],
+            [0.0, 1e-3, -1.5e-3],
+        ];
+        let s_tau = Array2::<f64>::zeros((3, 3));
+        let hyper =
+            DirectionalHyperParam::single_penalty(0, x_tau.clone(), s_tau.clone(), None, None)
+                .expect("design-moving hyper direction");
+
+        let v_tau_analytic = single_directional_tau_gradient(&state, &rho, hyper.clone())
+            .expect("analytic directional gradient");
+
+        // Finite-difference reference: perturb X along τ, re-fit, compare cost.
+        let h = 2e-5;
+        let x_plus = &x + &x_tau.mapv(|v| h * v);
+        let x_minus = &x - &x_tau.mapv(|v| h * v);
+
+        let state_plus = build_logit_state(&y, &w, &x_plus, &s0, &cfg);
+        let state_minus = build_logit_state(&y, &w, &x_minus, &s0, &cfg);
+        let v_plus = state_plus.compute_cost(&rho).expect("cost+");
+        let v_minus = state_minus.compute_cost(&rho).expect("cost-");
+        let v_taufd = (v_plus - v_minus) / (2.0 * h);
+
+        let v_abs = (v_tau_analytic - v_taufd).abs();
+        let v_rel = v_abs / v_taufd.abs().max(1e-10);
+        assert!(
+            v_rel < 1e-3,
+            "Gaussian REML design-moving V_tau mismatch: rel={v_rel:.3e}, \
+             analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
+        );
+    }
+
+    #[test]
+    fn profiled_gaussian_penalty_only_gradient_matches_fd() {
+        // Same setup, but penalty-only direction (S_τ ≠ 0, X_τ = 0).
+        let y = array![0.5, 1.2, -0.3, 0.8, 1.1, -0.6, 0.9, 0.1, -0.2, 0.7];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.2, 0.3],
+            [1.0, -0.8, -0.4],
+            [1.0, -0.3, 0.7],
+            [1.0, 0.1, -0.9],
+            [1.0, 0.5, 0.2],
+            [1.0, 0.9, -0.1],
+            [1.0, 1.3, 0.8],
+            [1.0, 1.7, -0.6],
+            [1.0, -0.5, 0.5],
+            [1.0, 0.3, -0.3],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]];
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
+            1e-14,
+            false,
+        );
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let rho = array![0.0];
+
+        let x_tau = Array2::<f64>::zeros(x.raw_dim());
+        let s_tau = array![[0.0, 0.0, 0.0], [0.0, 0.25, 0.04], [0.0, 0.04, 0.15]];
+        let hyper =
+            DirectionalHyperParam::single_penalty(0, x_tau.clone(), s_tau.clone(), None, None)
+                .expect("penalty-only hyper direction");
+
+        let v_tau_analytic = single_directional_tau_gradient(&state, &rho, hyper.clone())
+            .expect("analytic directional gradient");
+
+        let h = 2e-5;
+        let s_plus = &s0 + &s_tau.mapv(|v| h * v);
+        let s_minus = &s0 - &s_tau.mapv(|v| h * v);
+        let state_plus = build_logit_state(&y, &w, &x, &s_plus, &cfg);
+        let state_minus = build_logit_state(&y, &w, &x, &s_minus, &cfg);
+        let v_plus = state_plus.compute_cost(&rho).expect("cost+");
+        let v_minus = state_minus.compute_cost(&rho).expect("cost-");
+        let v_taufd = (v_plus - v_minus) / (2.0 * h);
+
+        let v_abs = (v_tau_analytic - v_taufd).abs();
+        let v_rel = v_abs / v_taufd.abs().max(1e-10);
+        assert!(
+            v_rel < 1e-3,
+            "Gaussian REML penalty-only V_tau mismatch: rel={v_rel:.3e}, \
+             analytic={v_tau_analytic:.6e}, fd={v_taufd:.6e}"
+        );
+    }
+
+    #[test]
+    fn profiled_gaussian_joint_hessian_matches_fd() {
+        // Validate the ττ Hessian block under profiled Gaussian REML with
+        // both a penalty-only and a design-moving direction.
+        let y = array![0.5, 1.2, -0.3, 0.8, 1.1, -0.6, 0.9, 0.1, -0.2, 0.7];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.2, 0.3],
+            [1.0, -0.8, -0.4],
+            [1.0, -0.3, 0.7],
+            [1.0, 0.1, -0.9],
+            [1.0, 0.5, 0.2],
+            [1.0, 0.9, -0.1],
+            [1.0, 1.3, 0.8],
+            [1.0, 1.7, -0.6],
+            [1.0, -0.5, 0.5],
+            [1.0, 0.3, -0.3],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]];
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
+            1e-14,
+            false,
+        );
+        let rho = array![0.0];
+
+        // Two τ-directions: penalty-only and design-moving.
+        let x_tau_0 = Array2::<f64>::zeros(x.raw_dim());
+        let s_tau_0 = array![[0.0, 0.0, 0.0], [0.0, 0.25, 0.04], [0.0, 0.04, 0.15]];
+        let x_tau_1 = array![
+            [0.0, 1e-3, -2e-3],
+            [0.0, -3e-3, 1e-3],
+            [0.0, 2e-3, 0.5e-3],
+            [0.0, -1e-3, 3e-3],
+            [0.0, 0.5e-3, -1e-3],
+            [0.0, 1.5e-3, 2e-3],
+            [0.0, -2e-3, -0.5e-3],
+            [0.0, 3e-3, 1e-3],
+            [0.0, -0.5e-3, 2e-3],
+            [0.0, 1e-3, -1.5e-3],
+        ];
+        let s_tau_1 = Array2::<f64>::zeros((3, 3));
+
+        let hyper_dirs = vec![
+            DirectionalHyperParam::single_penalty(
+                0,
+                x_tau_0.clone(),
+                s_tau_0.clone(),
+                None,
+                None,
+            )
+            .expect("penalty-only direction"),
+            DirectionalHyperParam::single_penalty(
+                0,
+                x_tau_1.clone(),
+                s_tau_1.clone(),
+                None,
+                None,
+            )
+            .expect("design-moving direction"),
+        ];
+
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let mut theta = Array1::<f64>::zeros(rho.len() + hyper_dirs.len());
+        theta.slice_mut(s![..rho.len()]).assign(&rho);
+        let (_, _, h_full) = state
+            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+            .expect("joint cost+gradient+hessian");
+        let h_tt_analytic = h_full
+            .slice(s![rho.len().., rho.len()..])
+            .to_owned();
+
+        // Finite-difference Hessian: perturb each direction, re-evaluate
+        // gradient of all directions at perturbed states.
+        let x_tau_mats = [&x_tau_0, &x_tau_1];
+        let s_tau_mats = [&s_tau_0, &s_tau_1];
+        let n_dirs = hyper_dirs.len();
+        let mut h_ttfd = Array2::<f64>::zeros((n_dirs, n_dirs));
+        let eps = 1e-5;
+        for j in 0..n_dirs {
+            let x_plus = &x + &x_tau_mats[j].mapv(|v| eps * v);
+            let x_minus = &x - &x_tau_mats[j].mapv(|v| eps * v);
+            let s_plus = &s0 + &s_tau_mats[j].mapv(|v| eps * v);
+            let s_minus = &s0 - &s_tau_mats[j].mapv(|v| eps * v);
+            let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
+            let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
+            for i in 0..n_dirs {
+                let g_plus =
+                    single_directional_tau_gradient(&state_plus, &rho, hyper_dirs[i].clone())
+                        .expect("g+ for FD");
+                let g_minus =
+                    single_directional_tau_gradient(&state_minus, &rho, hyper_dirs[i].clone())
+                        .expect("g- for FD");
+                h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * eps);
+            }
+        }
+        // Symmetrize FD Hessian.
+        for i in 0..n_dirs {
+            for j in 0..i {
+                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
+                h_ttfd[[i, j]] = avg;
+                h_ttfd[[j, i]] = avg;
+            }
+        }
+
+        let num = (&h_tt_analytic - &h_ttfd)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let den = h_ttfd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
+        let rel = num / den;
+        assert!(
+            rel < 3e-1,
+            "Gaussian REML tau-tau Hessian mismatch: rel={rel:.3e}, \
+             analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

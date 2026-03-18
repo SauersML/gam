@@ -544,14 +544,42 @@ pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
     Ok(())
 }
 
+/// Resolve a requested wiggle penalty-order set into:
+///
+/// - the primary order used by the geometric-constraint penalty, and
+/// - the remaining plain difference-penalty orders to append on the reduced basis.
+///
+/// The primary order is the smallest positive requested order. If no positive
+/// order is requested, `fallback_primary` is used instead. Extra orders are
+/// returned in the original order, deduplicated, and exclude the primary order.
+pub fn split_wiggle_penalty_orders(
+    fallback_primary: usize,
+    penalty_orders: &[usize],
+) -> (usize, Vec<usize>) {
+    let primary_order = penalty_orders
+        .iter()
+        .copied()
+        .filter(|&order| order >= 1)
+        .min()
+        .unwrap_or_else(|| fallback_primary.max(1));
+    let mut extras = Vec::new();
+    for &order in penalty_orders {
+        if order == 0 || order == primary_order || extras.contains(&order) {
+            continue;
+        }
+        extras.push(order);
+    }
+    (primary_order, extras)
+}
+
 /// Append raw difference penalties for the given orders to an existing block.
 ///
 /// These are plain difference penalties `D_k^T D_k` on `p` coefficients, whose
 /// nullspace is the set of polynomial sequences of degree ≤ k−1, giving
 /// `nullspace_dim = k`.  This differs from the geometric-constraint penalty in
-/// [`buildwiggle_block_input_from_knots`], which uses `effective_order.saturating_sub(2)`
-/// because its penalty is projected through a constraint transform that absorbs
-/// the constant and linear null directions.
+/// [`buildwiggle_block_input_from_knots`], which projects the raw penalty
+/// through the geometric constraint transform and therefore removes the
+/// constant and linear directions from its structural nullspace bookkeeping.
 pub fn append_selected_wiggle_penalty_orders(
     block: &mut ParameterBlockInput,
     penalty_orders: &[usize],
@@ -561,7 +589,7 @@ pub fn append_selected_wiggle_penalty_orders(
         return Ok(());
     }
     for &order in penalty_orders {
-        if order <= 1 || order >= p {
+        if order == 0 || order >= p {
             continue;
         }
         let penalty =
@@ -579,8 +607,16 @@ pub(crate) fn select_wiggle_basis_from_seed(
     cfg: &WiggleBlockConfig,
     penalty_orders: &[usize],
 ) -> Result<SelectedWiggleBasis, String> {
-    let (mut block, knots) = buildwiggle_block_input_from_seed(seed, cfg)?;
-    append_selected_wiggle_penalty_orders(&mut block, penalty_orders)?;
+    let (primary_order, extra_orders) =
+        split_wiggle_penalty_orders(cfg.penalty_order, penalty_orders);
+    let effective_cfg = WiggleBlockConfig {
+        degree: cfg.degree,
+        num_internal_knots: cfg.num_internal_knots,
+        penalty_order: primary_order,
+        double_penalty: cfg.double_penalty,
+    };
+    let (mut block, knots) = buildwiggle_block_input_from_seed(seed, &effective_cfg)?;
+    append_selected_wiggle_penalty_orders(&mut block, &extra_orders)?;
     Ok(SelectedWiggleBasis {
         knots,
         degree: cfg.degree,
@@ -18560,6 +18596,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn split_wiggle_penalty_orders_uses_requested_order_one_as_primary() {
+        let (primary, extras) = split_wiggle_penalty_orders(2, &[1, 2, 3, 3]);
+        assert_eq!(primary, 1);
+        assert_eq!(extras, vec![2, 3]);
+    }
+
+    #[test]
+    fn append_selected_wiggle_penalty_orders_keeps_order_one() {
+        let q_seed = Array1::linspace(-1.0, 1.0, 11);
+        let degree = 3usize;
+        let num_internal_knots = 5usize;
+        let cfg = WiggleBlockConfig {
+            degree,
+            num_internal_knots,
+            penalty_order: 1,
+            double_penalty: false,
+        };
+        let selected = select_wiggle_basis_from_seed(q_seed.view(), &cfg, &[1, 3])
+            .expect("selected wiggle basis");
+
+        assert_eq!(selected.block.penalties.len(), 2);
+        assert_eq!(selected.block.nullspace_dims, vec![0, 3]);
     }
 
     #[test]

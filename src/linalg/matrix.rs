@@ -2410,7 +2410,6 @@ impl ChunkedKernelDesignOperator {
         }
         let k_eff = constraint_transform.as_ref().map_or(k, |z| z.ncols());
         let poly_cols = poly_basis.as_ref().map_or(0, |p| p.ncols());
-        let _ = k;
         Ok(Self {
             data,
             centers,

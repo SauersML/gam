@@ -3871,13 +3871,24 @@ fn stable_logdet_with_ridge_policy(
             //
             //   log |A + ridge I|_+ = Σ_{lambda_j > floor} log(lambda_j)
             //
-            // on the symmetrized matrix surface used by this mode. Unlike the
-            // historical implementation, this does not silently change the
-            // objective by falling back to singular-value, bumped-Cholesky, or
-            // diagonal surrogates when eigendecomposition fails.
+            // This is a *surrogate* objective, not a valid Laplace term when
+            // the Hessian is indefinite. Unlike the historical implementation,
+            // this does not silently cascade between different approximation
+            // methods when eigendecomposition fails.
             let floor = ridge.max(1e-14);
             let (evals, _) = crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower)
                 .map_err(|e| format!("positive-part surrogate eigendecomposition failed: {e}"))?;
+            let n_negative = evals.iter().filter(|&&ev| ev < -floor).count();
+            if n_negative > 0 {
+                log::warn!(
+                    "[RidgedSurrogateReml] Hessian has {} negative eigenvalue(s) after \
+                     ridging (ridge={:.2e}). The Laplace approximation is not valid in \
+                     these directions; the surrogate objective ignores them. Consider \
+                     using StrictPseudoLaplace if exact Laplace semantics are needed.",
+                    n_negative,
+                    ridge,
+                );
+            }
             let mut logdet = 0.0;
             for &ev in &evals {
                 if ev > floor {

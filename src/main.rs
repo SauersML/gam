@@ -29,7 +29,8 @@ use gam::families::scale_design::{
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
-    buildwiggle_block_input_from_knots,
+    append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
+    split_wiggle_penalty_orders,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
@@ -4812,13 +4813,8 @@ fn run_sample_survival(
             seed[i] = eta_offset_entry[i];
             seed[n + i] = eta_offset_exit[i];
         }
-        let primary_order = wiggle_cfg
-            .penalty_orders
-            .iter()
-            .copied()
-            .filter(|&o| o >= 2)
-            .min()
-            .unwrap_or(2);
+        let (primary_order, extra_orders) =
+            split_wiggle_penalty_orders(2, &wiggle_cfg.penalty_orders);
         let mut block = buildwiggle_block_input_from_knots(
             seed.view(),
             &wiggle_knots,
@@ -4826,17 +4822,8 @@ fn run_sample_survival(
             primary_order,
             wiggle_cfg.double_penalty,
         )?;
-        for &order in &wiggle_cfg.penalty_orders {
-            if order == primary_order || order <= 1 || order >= exit_w.ncols() {
-                continue;
-            }
-            let penalty = create_difference_penalty_matrix(exit_w.ncols(), order, None)
-                .map_err(|e| format!("baseline-timewiggle difference penalty failed: {e}"))?;
-            block
-                .penalties
-                .push(gam::estimate::PenaltySpec::Dense(penalty));
-            block.nullspace_dims.push(order);
-        }
+        append_selected_wiggle_penalty_orders(&mut block, &extra_orders)
+            .map_err(|e| format!("baseline-timewiggle penalty reconstruction failed: {e}"))?;
         for (widx, s) in block.penalties.iter().enumerate() {
             let s = match s {
                 gam::estimate::PenaltySpec::Block { local, .. } => local,
