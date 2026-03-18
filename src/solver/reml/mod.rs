@@ -1247,6 +1247,386 @@ mod tests {
              analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
         );
     }
+
+    // ── Larger non-Gaussian + design-motion fixture (n=30, p=5) ────────
+    //
+    // Validates the IFT correction (hessian_derivative_correction) at a
+    // scale large enough that the correction is numerically non-trivial:
+    // with n=30 and p=5, the logistic Hessian W(η) is far from identity
+    // and the IFT term dβ̂/dψ contributes meaningfully.
+
+    /// Shared test fixture for binomial-logit REML with design-moving
+    /// ψ-coordinates, n=30, p=5.
+    struct BinomialLogitDesignMotionFixture {
+        y: Array1<f64>,
+        w: Array1<f64>,
+        x: Array2<f64>,
+        s0: Array2<f64>,
+        cfg: RemlConfig,
+        rho: Array1<f64>,
+        /// Design-moving τ-direction: non-zero X_τ, zero S_τ.
+        x_tau_design: Array2<f64>,
+        /// Penalty-only τ-direction: zero X_τ, non-zero S_τ.
+        s_tau_penalty: Array2<f64>,
+    }
+
+    impl BinomialLogitDesignMotionFixture {
+        fn new() -> Self {
+            // Binary response with roughly balanced classes.
+            let y = array![
+                1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0,
+                1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0,
+                0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0
+            ];
+            // Design matrix: intercept + 4 covariate columns with varied magnitudes.
+            let x = array![
+                [1.0, -1.50,  0.42,  0.88, -0.31],
+                [1.0, -1.12, -0.65,  0.14,  1.23],
+                [1.0, -0.80,  1.10, -0.53,  0.07],
+                [1.0, -0.55, -0.22,  1.40, -0.90],
+                [1.0, -0.30,  0.73, -1.05,  0.44],
+                [1.0, -0.05, -1.33,  0.60,  0.81],
+                [1.0,  0.18,  0.55, -0.27, -1.15],
+                [1.0,  0.42, -0.90,  1.12,  0.33],
+                [1.0,  0.70,  1.28, -0.78, -0.56],
+                [1.0,  0.95, -0.18,  0.45,  1.40],
+                [1.0,  1.20,  0.66, -1.30, -0.02],
+                [1.0,  1.45, -1.05,  0.22,  0.68],
+                [1.0, -1.35,  0.90,  0.55, -0.43],
+                [1.0, -0.98, -0.40, -0.88,  1.05],
+                [1.0, -0.62,  1.42,  0.30, -0.70],
+                [1.0, -0.28, -0.77, -1.18,  0.52],
+                [1.0,  0.05,  0.15,  0.95, -1.35],
+                [1.0,  0.33, -1.20, -0.40,  0.18],
+                [1.0,  0.60,  0.82,  1.25, -0.85],
+                [1.0,  0.88, -0.50, -0.65,  1.10],
+                [1.0,  1.15,  1.05,  0.10, -0.22],
+                [1.0, -1.22, -0.95,  0.72,  0.90],
+                [1.0, -0.75,  0.38, -1.42,  0.15],
+                [1.0, -0.42, -1.15,  0.50, -1.08],
+                [1.0, -0.10,  0.60, -0.15,  0.75],
+                [1.0,  0.25, -0.28,  1.05, -0.48],
+                [1.0,  0.52,  1.35, -0.92,  0.30],
+                [1.0,  0.80, -0.70,  0.38,  1.20],
+                [1.0,  1.08,  0.48, -0.60, -0.95],
+                [1.0,  1.35, -0.55,  0.85,  0.42]
+            ];
+            // Penalty matrix: zero on intercept, SPD on remaining 4 columns.
+            let s0 = array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.40, 0.15, 0.05, -0.10],
+                [0.0, 0.15, 1.10, -0.20, 0.08],
+                [0.0, 0.05, -0.20, 0.95, 0.12],
+                [0.0, -0.10, 0.08, 0.12, 1.25]
+            ];
+            let cfg = RemlConfig::external(
+                GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+                1e-14,
+                false,
+            );
+            // Design-moving direction: perturb covariate columns, leave
+            // intercept untouched.
+            let x_tau_design = array![
+                [0.0,  1.2e-3, -0.8e-3,  0.5e-3, -1.5e-3],
+                [0.0, -2.0e-3,  1.4e-3, -0.3e-3,  0.9e-3],
+                [0.0,  0.6e-3, -1.1e-3,  1.8e-3, -0.4e-3],
+                [0.0, -1.3e-3,  0.7e-3, -1.0e-3,  2.1e-3],
+                [0.0,  0.9e-3, -0.5e-3,  0.2e-3, -0.8e-3],
+                [0.0, -0.4e-3,  1.8e-3, -1.5e-3,  0.3e-3],
+                [0.0,  1.5e-3, -1.3e-3,  0.8e-3, -1.1e-3],
+                [0.0, -0.7e-3,  0.4e-3, -2.0e-3,  1.6e-3],
+                [0.0,  2.2e-3, -0.9e-3,  1.3e-3, -0.6e-3],
+                [0.0, -1.0e-3,  1.6e-3, -0.7e-3,  0.5e-3],
+                [0.0,  0.3e-3, -2.1e-3,  1.1e-3, -1.8e-3],
+                [0.0, -1.8e-3,  0.2e-3, -0.4e-3,  1.3e-3],
+                [0.0,  1.1e-3, -1.5e-3,  2.0e-3, -0.2e-3],
+                [0.0, -0.5e-3,  0.9e-3, -1.2e-3,  0.7e-3],
+                [0.0,  1.7e-3, -0.3e-3,  0.6e-3, -2.0e-3],
+                [0.0, -1.4e-3,  1.1e-3, -0.9e-3,  0.4e-3],
+                [0.0,  0.8e-3, -1.7e-3,  1.5e-3, -0.1e-3],
+                [0.0, -0.2e-3,  0.6e-3, -1.8e-3,  1.0e-3],
+                [0.0,  1.4e-3, -0.4e-3,  0.3e-3, -1.3e-3],
+                [0.0, -0.9e-3,  2.0e-3, -0.5e-3,  0.8e-3],
+                [0.0,  0.5e-3, -1.0e-3,  1.6e-3, -0.7e-3],
+                [0.0, -2.1e-3,  0.3e-3, -0.8e-3,  1.5e-3],
+                [0.0,  0.7e-3, -1.8e-3,  0.9e-3, -0.3e-3],
+                [0.0, -0.6e-3,  1.3e-3, -2.2e-3,  1.1e-3],
+                [0.0,  1.9e-3, -0.7e-3,  0.4e-3, -0.9e-3],
+                [0.0, -1.1e-3,  0.5e-3, -1.4e-3,  2.2e-3],
+                [0.0,  0.4e-3, -1.6e-3,  1.2e-3, -0.5e-3],
+                [0.0, -1.6e-3,  0.8e-3, -0.1e-3,  0.6e-3],
+                [0.0,  1.3e-3, -2.2e-3,  0.7e-3, -1.4e-3],
+                [0.0, -0.3e-3,  1.0e-3, -1.6e-3,  1.8e-3]
+            ];
+            // Penalty-only direction: non-zero S_τ, symmetric, zero on intercept.
+            let s_tau_penalty = array![
+                [0.0,  0.0,   0.0,   0.0,   0.0  ],
+                [0.0,  0.30,  0.05, -0.02,  0.04 ],
+                [0.0,  0.05,  0.22,  0.03, -0.01 ],
+                [0.0, -0.02,  0.03,  0.18,  0.06 ],
+                [0.0,  0.04, -0.01,  0.06,  0.26 ]
+            ];
+            Self {
+                w: Array1::<f64>::ones(y.len()),
+                y,
+                x,
+                s0,
+                cfg,
+                rho: array![0.0],
+                x_tau_design,
+                s_tau_penalty,
+            }
+        }
+
+        fn state(&self) -> RemlState<'_> {
+            build_logit_state(&self.y, &self.w, &self.x, &self.s0, &self.cfg)
+        }
+
+        fn state_perturbed(
+            &self,
+            x_tau: &Array2<f64>,
+            s_tau: &Array2<f64>,
+            eps: f64,
+        ) -> (RemlState<'_>, RemlState<'_>) {
+            let x_plus = &self.x + &x_tau.mapv(|v| eps * v);
+            let x_minus = &self.x - &x_tau.mapv(|v| eps * v);
+            let s_plus = &self.s0 + &s_tau.mapv(|v| eps * v);
+            let s_minus = &self.s0 - &s_tau.mapv(|v| eps * v);
+            (
+                build_logit_state(&self.y, &self.w, &x_plus, &s_plus, &self.cfg),
+                build_logit_state(&self.y, &self.w, &x_minus, &s_minus, &self.cfg),
+            )
+        }
+
+        /// Central FD approximation to the directional cost derivative.
+        fn fd_directional_gradient(
+            &self,
+            x_tau: &Array2<f64>,
+            s_tau: &Array2<f64>,
+        ) -> f64 {
+            let h = 2e-5;
+            let (state_plus, state_minus) = self.state_perturbed(x_tau, s_tau, h);
+            let v_plus = state_plus.compute_cost(&self.rho).expect("cost+");
+            let v_minus = state_minus.compute_cost(&self.rho).expect("cost-");
+            (v_plus - v_minus) / (2.0 * h)
+        }
+    }
+
+    // ── n=30, p=5 binomial-logit design-motion gradient tests ────────
+
+    #[test]
+    fn binomial_logit_n30_design_moving_gradient_matches_fd() {
+        // Pure design-motion: X_τ ≠ 0, S_τ = 0.
+        // The IFT correction is essential here: because the family is
+        // binomial-logit, the working weights W(η) depend on β̂, so
+        // when X moves with ψ, the implicit derivative dβ̂/dψ enters
+        // the total Hessian drift.  Without hessian_derivative_correction
+        // the analytic gradient would disagree with FD.
+        let f = BinomialLogitDesignMotionFixture::new();
+        let state = f.state();
+        let s_tau = Array2::<f64>::zeros((5, 5));
+        let hyper =
+            DirectionalHyperParam::single_penalty(
+                0,
+                f.x_tau_design.clone(),
+                s_tau.clone(),
+                None,
+                None,
+            )
+            .expect("design-moving hyper direction");
+
+        let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
+            .expect("analytic directional gradient");
+        let v_tau_fd = f.fd_directional_gradient(&f.x_tau_design, &s_tau);
+
+        let v_rel = (v_tau_analytic - v_tau_fd).abs() / v_tau_fd.abs().max(1e-10);
+        assert!(
+            v_rel < 1e-3,
+            "Binomial-logit n=30 design-moving gradient mismatch: rel={v_rel:.3e}, \
+             analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
+        );
+    }
+
+    #[test]
+    fn binomial_logit_n30_penalty_only_gradient_matches_fd() {
+        // Penalty-only direction: X_τ = 0, S_τ ≠ 0.
+        // Serves as a baseline: the IFT correction should still be
+        // present (since H depends on β̂ through W(η)), but the
+        // explicit X_τ contribution is zero.
+        let f = BinomialLogitDesignMotionFixture::new();
+        let state = f.state();
+        let x_tau = Array2::<f64>::zeros(f.x.raw_dim());
+        let hyper =
+            DirectionalHyperParam::single_penalty(
+                0,
+                x_tau.clone(),
+                f.s_tau_penalty.clone(),
+                None,
+                None,
+            )
+            .expect("penalty-only hyper direction");
+
+        let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
+            .expect("analytic directional gradient");
+        let v_tau_fd = f.fd_directional_gradient(&x_tau, &f.s_tau_penalty);
+
+        let v_rel = (v_tau_analytic - v_tau_fd).abs() / v_tau_fd.abs().max(1e-10);
+        assert!(
+            v_rel < 1e-3,
+            "Binomial-logit n=30 penalty-only gradient mismatch: rel={v_rel:.3e}, \
+             analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
+        );
+    }
+
+    #[test]
+    fn binomial_logit_n30_joint_design_penalty_gradient_matches_fd() {
+        // Joint direction: both X_τ ≠ 0 and S_τ ≠ 0 simultaneously.
+        // This is the hardest case: the analytic gradient must correctly
+        // combine the explicit penalty drift, the explicit design drift,
+        // and the IFT Hessian-drift correction.
+        let f = BinomialLogitDesignMotionFixture::new();
+        let state = f.state();
+        let hyper =
+            DirectionalHyperParam::single_penalty(
+                0,
+                f.x_tau_design.clone(),
+                f.s_tau_penalty.clone(),
+                None,
+                None,
+            )
+            .expect("joint design+penalty hyper direction");
+
+        let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
+            .expect("analytic directional gradient");
+        let v_tau_fd = f.fd_directional_gradient(&f.x_tau_design, &f.s_tau_penalty);
+
+        let v_rel = (v_tau_analytic - v_tau_fd).abs() / v_tau_fd.abs().max(1e-10);
+        assert!(
+            v_rel < 1e-3,
+            "Binomial-logit n=30 joint design+penalty gradient mismatch: rel={v_rel:.3e}, \
+             analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
+        );
+    }
+
+    #[test]
+    fn binomial_logit_n30_design_moving_hessian_matches_fd() {
+        // Hessian-level validation with two τ-directions: one
+        // penalty-only and one design-moving.  The ττ Hessian block is
+        // the most sensitive test of the IFT correction because errors
+        // in the correction accumulate quadratically in the trace term.
+        let f = BinomialLogitDesignMotionFixture::new();
+        let x_tau_0 = Array2::<f64>::zeros(f.x.raw_dim());
+        let s_tau_0 = f.s_tau_penalty.clone();
+        let x_tau_1 = f.x_tau_design.clone();
+        let s_tau_1 = Array2::<f64>::zeros((5, 5));
+
+        let hyper_dirs = vec![
+            DirectionalHyperParam::single_penalty(
+                0,
+                x_tau_0.clone(),
+                s_tau_0.clone(),
+                None,
+                None,
+            )
+            .expect("penalty-only direction"),
+            DirectionalHyperParam::single_penalty(
+                0,
+                x_tau_1.clone(),
+                s_tau_1.clone(),
+                None,
+                None,
+            )
+            .expect("design-moving direction"),
+        ];
+
+        let state = f.state();
+        let mut theta = Array1::<f64>::zeros(f.rho.len() + hyper_dirs.len());
+        theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
+        let (_, _, h_full) = state
+            .compute_joint_hypercostgradienthessian(&theta, f.rho.len(), &hyper_dirs)
+            .expect("joint cost+gradient+hessian");
+        let h_tt_analytic = h_full
+            .slice(s![f.rho.len().., f.rho.len()..])
+            .to_owned();
+
+        let x_tau_mats = [&x_tau_0, &x_tau_1];
+        let s_tau_mats = [&s_tau_0, &s_tau_1];
+        let n_dirs = hyper_dirs.len();
+        let mut h_tt_fd = Array2::<f64>::zeros((n_dirs, n_dirs));
+        let eps = 1e-5;
+        for j in 0..n_dirs {
+            let (state_plus, state_minus) =
+                f.state_perturbed(x_tau_mats[j], s_tau_mats[j], eps);
+            for i in 0..n_dirs {
+                let g_plus =
+                    single_directional_tau_gradient(&state_plus, &f.rho, hyper_dirs[i].clone())
+                        .expect("g+ for FD");
+                let g_minus =
+                    single_directional_tau_gradient(&state_minus, &f.rho, hyper_dirs[i].clone())
+                        .expect("g- for FD");
+                h_tt_fd[[i, j]] = (g_plus - g_minus) / (2.0 * eps);
+            }
+        }
+        // Symmetrize FD Hessian.
+        for i in 0..n_dirs {
+            for j in 0..i {
+                let avg = 0.5 * (h_tt_fd[[i, j]] + h_tt_fd[[j, i]]);
+                h_tt_fd[[i, j]] = avg;
+                h_tt_fd[[j, i]] = avg;
+            }
+        }
+
+        let num = (&h_tt_analytic - &h_tt_fd)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let den = h_tt_fd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
+        let rel = num / den;
+        assert!(
+            rel < 3e-1,
+            "Binomial-logit n=30 tau-tau Hessian mismatch: rel={rel:.3e}, \
+             analytic={h_tt_analytic:?}, fd={h_tt_fd:?}"
+        );
+    }
+
+    #[test]
+    fn binomial_logit_n30_nonzero_rho_design_moving_gradient_matches_fd() {
+        // Validate at a non-trivial smoothing parameter ρ = log(λ) = 1.5,
+        // so the penalty term λS is scaled up and the balance between
+        // likelihood and penalty is different from ρ=0.
+        let f = BinomialLogitDesignMotionFixture::new();
+        let rho = array![1.5];
+        let s_tau = Array2::<f64>::zeros((5, 5));
+
+        let state = f.state();
+        let hyper =
+            DirectionalHyperParam::single_penalty(
+                0,
+                f.x_tau_design.clone(),
+                s_tau.clone(),
+                None,
+                None,
+            )
+            .expect("design-moving hyper direction");
+
+        let v_tau_analytic = single_directional_tau_gradient(&state, &rho, hyper)
+            .expect("analytic directional gradient");
+
+        // FD at the shifted ρ: perturb X, re-solve inner, evaluate cost.
+        let h = 2e-5;
+        let (state_plus, state_minus) = f.state_perturbed(&f.x_tau_design, &s_tau, h);
+        let v_plus = state_plus.compute_cost(&rho).expect("cost+");
+        let v_minus = state_minus.compute_cost(&rho).expect("cost-");
+        let v_tau_fd = (v_plus - v_minus) / (2.0 * h);
+
+        let v_rel = (v_tau_analytic - v_tau_fd).abs() / v_tau_fd.abs().max(1e-10);
+        assert!(
+            v_rel < 1e-3,
+            "Binomial-logit n=30 rho=1.5 design-moving gradient mismatch: rel={v_rel:.3e}, \
+             analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
