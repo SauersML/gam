@@ -1213,12 +1213,20 @@ fn materialize_survival<'a>(
     let time_block = TimeBlockInput {
         design_entry: time_design_entry,
         design_exit: time_design_exit,
-        design_derivative_exit: time_design_derivative,
-        constraint_design_derivative: if has_mono { Some(mono_rows) } else { None },
+        design_derivative_exit: time_design_derivative.clone(),
+        constraint_design_derivative: if has_mono {
+            mono_rows
+        } else {
+            time_design_derivative.clone()
+        },
         offset_entry: eta_offset_entry,
         offset_exit: eta_offset_exit,
-        derivative_offset_exit,
-        constraint_derivative_offset: if has_mono { Some(mono_offsets) } else { None },
+        derivative_offset_exit: derivative_offset_exit.clone(),
+        constraint_derivative_offset: if has_mono {
+            mono_offsets
+        } else {
+            derivative_offset_exit.clone()
+        },
         penalties: time_penalties,
         nullspace_dims: time_nullspace_dims,
         initial_log_lambdas: time_initial_log_lambdas,
