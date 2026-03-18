@@ -2939,7 +2939,7 @@ impl LinkWigglePosterior {
                     self.spline.degree,
                     BasisOptions::first_derivative(),
                 )
-                .map(|(arc, meta)| (arc.as_ref().clone(), ()))
+                .map(|(arc, _meta)| (arc.as_ref().clone(), ()))
                 .map_err(|e| e)
             };
             if let Ok((b_prime, _)) = b_prime_result {
