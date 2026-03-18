@@ -2342,7 +2342,6 @@ pub fn build_smooth_design_withworkspace(
     terms: &[SmoothTermSpec],
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<RawSmoothDesign, BasisError> {
-    let n = data.nrows();
     let mut local_designs = Vec::<DesignMatrix>::with_capacity(terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(terms.len());
@@ -3107,7 +3106,6 @@ fn apply_spatial_orthogonality_to_parametric(
         return Ok(smooth.into());
     }
 
-    let n = smooth.nrows();
     let mut local_designs = Vec::<DesignMatrix>::with_capacity(smooth.terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(smooth.terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());

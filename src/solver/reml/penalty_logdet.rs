@@ -194,10 +194,6 @@ impl PenaltyPseudologdet {
         }
 
         // Eigendecompose each block and collect results.
-        let mut total_value = 0.0_f64;
-        let mut total_rank = 0usize;
-        let mut w_factor = Array2::<f64>::zeros((p_total, 0)); // will be rebuilt
-        let mut inv_evals_sq_vec: Vec<f64> = Vec::new();
 
         // For the unpenalized dimensions (not covered by any block), add ridge.
         // Those dimensions have eigenvalue = ridge if ridge > 0, otherwise 0 (null).
@@ -205,20 +201,6 @@ impl PenaltyPseudologdet {
         for bd in &blocks {
             for i in bd.start..bd.end {
                 covered[i] = true;
-            }
-        }
-        let uncovered_count = covered.iter().filter(|&&c| !c).count();
-
-        // Each uncovered dimension has eigenvalue = ridge.
-        if ridge > 0.0 && uncovered_count > 0 {
-            total_value += uncovered_count as f64 * ridge.ln();
-            total_rank += uncovered_count;
-            for (idx, &c) in covered.iter().enumerate() {
-                if !c {
-                    inv_evals_sq_vec.push(1.0 / (ridge * ridge));
-                    // W-factor column for this dimension: e_idx / sqrt(ridge)
-                    // We'll build the full W-factor after collecting all columns.
-                }
             }
         }
 
@@ -271,8 +253,8 @@ impl PenaltyPseudologdet {
         }
 
         // Assemble combined W-factor and other arrays.
-        total_rank = block_results.iter().map(|br| br.rank).sum();
-        total_value = block_results.iter().map(|br| br.value).sum();
+        let total_rank: usize = block_results.iter().map(|br| br.rank).sum();
+        let total_value: f64 = block_results.iter().map(|br| br.value).sum();
 
         let mut w_factor_combined = Array2::<f64>::zeros((p_total, total_rank));
         let mut inv_evals_sq_combined = Array1::<f64>::zeros(total_rank);

@@ -3757,7 +3757,6 @@ fn binomial_location_scale_working_sets(
     y: &Array1<f64>,
     weights: &Array1<f64>,
     eta_t: &Array1<f64>,
-    eta_ls: &Array1<f64>,
     etawiggle: Option<&Array1<f64>>,
     dq_dq0: Option<&Array1<f64>>,
     exact_geometry: BinomialLocationScaleExactGeometry<'_>,
@@ -11618,7 +11617,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
                 &self.y,
                 &self.weights,
                 eta_t,
-                eta_ls,
                 None,
                 None,
                 BinomialLocationScaleExactGeometry {
@@ -12396,7 +12394,7 @@ impl BinomialLocationScaleWiggleFamily {
         let m = d0.dot(betaw) + 1.0;
         let g2 = dd0.dot(betaw);
         let g3 = d3q;
-        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
+        let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
 
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
@@ -14239,7 +14237,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             &self.y,
             &self.weights,
             eta_t,
-            eta_ls,
             Some(etaw),
             Some(&dq_dq0),
             BinomialLocationScaleExactGeometry {
@@ -14457,7 +14454,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         }
         let m = d0.dot(&betaw0) + 1.0;
         let g2 = dd0.dot(&betaw0);
-        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
+        let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
         let pw = b0.ncols();
         let total = pt + pls + pw;
         let mut coeff_tt = Array1::<f64>::zeros(n);
@@ -14622,7 +14619,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let m = d0.dot(&betaw0) + 1.0;
         let g2 = dd0.dot(&betaw0);
         let g3 = d3q;
-        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
+        let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
 
         let mut coeff_tt = Array1::<f64>::zeros(n);
         let mut coeff_tl = Array1::<f64>::zeros(n);

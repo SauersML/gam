@@ -2767,6 +2767,8 @@ fn build_aniso_design_psi_derivatives_shared(
     let mut t_values = Array1::<f64>::zeros(nk);
     let mut axis_components = Array2::<f64>::zeros((nk, dim));
 
+    let psi_scale_share = radial_kind.raw_psi_isotropic_share();
+
     let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
     let nc = (n + cs - 1) / cs;
     let err_flag = std::sync::atomic::AtomicBool::new(false);
@@ -2828,7 +2830,7 @@ fn build_aniso_design_psi_derivatives_shared(
         n_poly,
         dim,
     )
-    .with_psi_scale_share(radial_kind.raw_psi_isotropic_share());
+    .with_psi_scale_share(psi_scale_share);
     let design_first = (0..dim)
         .map(|a| op.materialize_first(a))
         .collect::<Result<Vec<_>, _>>()?;

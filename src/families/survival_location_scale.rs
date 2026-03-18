@@ -4253,8 +4253,8 @@ impl SurvivalLocationScaleFamily {
         });
 
         Ok(SurvivalDynamicGeometry {
-            eta_ls_exit,
-            eta_ls_entry,
+            eta_ls_exit: eta_ls_exit.to_owned(),
+            eta_ls_entry: eta_ls_entry.to_owned(),
             q0_exit,
             q0_entry,
             q_exit,

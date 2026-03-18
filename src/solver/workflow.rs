@@ -1244,6 +1244,9 @@ fn materialize_survival<'a>(
                 linkwiggle_block: None,
             };
 
+            let optimize_inverse_link =
+                survival_inverse_link_has_free_parameters(&spec.inverse_link);
+
             Ok(MaterializedModel {
                 request: FitRequest::SurvivalLocationScale(SurvivalLocationScaleFitRequest {
                     data: data.values.view(),
@@ -1255,9 +1258,7 @@ fn materialize_survival<'a>(
                         double_penalty: cfg.double_penalty,
                     }),
                     kappa_options,
-                    optimize_inverse_link: survival_inverse_link_has_free_parameters(
-                        &spec.inverse_link,
-                    ),
+                    optimize_inverse_link,
                 }),
                 inference_notes,
             })
