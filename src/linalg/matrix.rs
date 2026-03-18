@@ -6,7 +6,7 @@ use crate::types::RidgePolicy;
 use faer::Accum;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
-use ndarray::{Array1, Array2, ArrayView2, ShapeBuilder, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ShapeBuilder, s};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -4357,6 +4357,236 @@ impl DesignMatrix {
                 out
             }
         }
+    }
+
+    /// Dot a single design row against a coefficient vector without allocating
+    /// a standalone row buffer when the underlying storage permits.
+    pub fn dot_row(&self, row: usize, beta: &Array1<f64>) -> f64 {
+        self.dot_row_view(row, beta.view())
+    }
+
+    pub fn dot_row_view(&self, row: usize, beta: ArrayView1<'_, f64>) -> f64 {
+        assert_eq!(
+            beta.len(),
+            self.ncols(),
+            "DesignMatrix::dot_row_view length mismatch: beta={}, ncols={}",
+            beta.len(),
+            self.ncols()
+        );
+        match self {
+            Self::Dense(matrix) => {
+                if let Some(dense) = matrix.as_dense_ref() {
+                    dense.row(row).dot(&beta)
+                } else {
+                    matrix.row_chunk(row..row + 1).row(0).dot(&beta)
+                }
+            }
+            Self::Sparse(matrix) => {
+                let csr = matrix.to_csr_arc().unwrap_or_else(|| {
+                    panic!("DesignMatrix::dot_row: failed to obtain CSR view")
+                });
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                let mut out = 0.0;
+                for ptr in row_ptr[row]..row_ptr[row + 1] {
+                    out += vals[ptr] * beta[col_idx[ptr]];
+                }
+                out
+            }
+        }
+    }
+
+    /// Add `alpha * X[row, :]` into `out` without allocating a row buffer.
+    pub fn axpy_row_into(
+        &self,
+        row: usize,
+        alpha: f64,
+        out: &mut ArrayViewMut1<'_, f64>,
+    ) -> Result<(), String> {
+        if out.len() != self.ncols() {
+            return Err(format!(
+                "DesignMatrix::axpy_row_into length mismatch: out={}, ncols={}",
+                out.len(),
+                self.ncols()
+            ));
+        }
+        if alpha == 0.0 {
+            return Ok(());
+        }
+        match self {
+            Self::Dense(matrix) => {
+                if let Some(dense) = matrix.as_dense_ref() {
+                    for (dst, &value) in out.iter_mut().zip(dense.row(row).iter()) {
+                        *dst += alpha * value;
+                    }
+                } else {
+                    let chunk = matrix.row_chunk(row..row + 1);
+                    for (dst, &value) in out.iter_mut().zip(chunk.row(0).iter()) {
+                        *dst += alpha * value;
+                    }
+                }
+            }
+            Self::Sparse(matrix) => {
+                let csr = matrix.to_csr_arc().unwrap_or_else(|| {
+                    panic!("DesignMatrix::axpy_row_into: failed to obtain CSR view")
+                });
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for ptr in row_ptr[row]..row_ptr[row + 1] {
+                    out[col_idx[ptr]] += alpha * vals[ptr];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Symmetric rank-1 update `target += alpha * x_row x_row^T` for one row.
+    pub fn syr_row_into(
+        &self,
+        row: usize,
+        alpha: f64,
+        target: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        if target.nrows() != self.ncols() || target.ncols() != self.ncols() {
+            return Err(format!(
+                "DesignMatrix::syr_row_into shape mismatch: target={}x{}, ncols={}",
+                target.nrows(),
+                target.ncols(),
+                self.ncols()
+            ));
+        }
+        if alpha == 0.0 {
+            return Ok(());
+        }
+        match self {
+            Self::Dense(matrix) => {
+                if let Some(dense) = matrix.as_dense_ref() {
+                    let x = dense.row(row);
+                    for i in 0..x.len() {
+                        let xi = x[i];
+                        if xi == 0.0 {
+                            continue;
+                        }
+                        for j in 0..x.len() {
+                            target[[i, j]] += alpha * xi * x[j];
+                        }
+                    }
+                } else {
+                    let chunk = matrix.row_chunk(row..row + 1);
+                    let x = chunk.row(0);
+                    for i in 0..x.len() {
+                        let xi = x[i];
+                        if xi == 0.0 {
+                            continue;
+                        }
+                        for j in 0..x.len() {
+                            target[[i, j]] += alpha * xi * x[j];
+                        }
+                    }
+                }
+            }
+            Self::Sparse(matrix) => {
+                let csr = matrix.to_csr_arc().unwrap_or_else(|| {
+                    panic!("DesignMatrix::syr_row_into: failed to obtain CSR view")
+                });
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for ptr_i in row_ptr[row]..row_ptr[row + 1] {
+                    let i = col_idx[ptr_i];
+                    let xi = vals[ptr_i];
+                    for ptr_j in row_ptr[row]..row_ptr[row + 1] {
+                        let j = col_idx[ptr_j];
+                        target[[i, j]] += alpha * xi * vals[ptr_j];
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// General row outer-product update `target += alpha * x_row y_row^T`.
+    pub fn row_outer_into(
+        &self,
+        row: usize,
+        other: &DesignMatrix,
+        alpha: f64,
+        target: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        if target.nrows() != self.ncols() || target.ncols() != other.ncols() {
+            return Err(format!(
+                "DesignMatrix::row_outer_into shape mismatch: target={}x{}, lhs_ncols={}, rhs_ncols={}",
+                target.nrows(),
+                target.ncols(),
+                self.ncols(),
+                other.ncols()
+            ));
+        }
+        if alpha == 0.0 {
+            return Ok(());
+        }
+        match (self, other) {
+            (Self::Dense(lhs), Self::Dense(rhs))
+                if lhs.as_dense_ref().is_some() && rhs.as_dense_ref().is_some() =>
+            {
+                let x = lhs.as_dense_ref().expect("dense lhs missing").row(row);
+                let y = rhs.as_dense_ref().expect("dense rhs missing").row(row);
+                for i in 0..x.len() {
+                    let xi = x[i];
+                    if xi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..y.len() {
+                        target[[i, j]] += alpha * xi * y[j];
+                    }
+                }
+            }
+            (Self::Sparse(lhs), Self::Sparse(rhs)) => {
+                let lhs_csr = lhs.to_csr_arc().unwrap_or_else(|| {
+                    panic!("DesignMatrix::row_outer_into: failed to obtain lhs CSR view")
+                });
+                let rhs_csr = rhs.to_csr_arc().unwrap_or_else(|| {
+                    panic!("DesignMatrix::row_outer_into: failed to obtain rhs CSR view")
+                });
+                let lhs_sym = lhs_csr.symbolic();
+                let rhs_sym = rhs_csr.symbolic();
+                let lhs_row_ptr = lhs_sym.row_ptr();
+                let rhs_row_ptr = rhs_sym.row_ptr();
+                let lhs_col_idx = lhs_sym.col_idx();
+                let rhs_col_idx = rhs_sym.col_idx();
+                let lhs_vals = lhs_csr.val();
+                let rhs_vals = rhs_csr.val();
+                for ptr_i in lhs_row_ptr[row]..lhs_row_ptr[row + 1] {
+                    let i = lhs_col_idx[ptr_i];
+                    let xi = lhs_vals[ptr_i];
+                    for ptr_j in rhs_row_ptr[row]..rhs_row_ptr[row + 1] {
+                        let j = rhs_col_idx[ptr_j];
+                        target[[i, j]] += alpha * xi * rhs_vals[ptr_j];
+                    }
+                }
+            }
+            _ => {
+                let x = self.row_chunk(row..row + 1);
+                let y = other.row_chunk(row..row + 1);
+                let x_row = x.row(0);
+                let y_row = y.row(0);
+                for i in 0..x_row.len() {
+                    let xi = x_row[i];
+                    if xi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..y_row.len() {
+                        target[[i, j]] += alpha * xi * y_row[j];
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Element access: returns the value at row `i`, column `j`.

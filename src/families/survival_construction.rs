@@ -16,7 +16,7 @@ use crate::basis::{
     KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
 use crate::families::gamlss::{
-    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
+    WiggleBlockConfig, append_selected_wiggle_penalty_orders,
     buildwiggle_block_input_from_seed, monotone_wiggle_basis_with_derivative_order,
     split_wiggle_penalty_orders,
 };
@@ -24,7 +24,7 @@ use crate::families::survival_location_scale::{
     ResidualDistribution, SurvivalCovariateTermBlockTemplate,
 };
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
-use crate::matrix::DesignMatrix;
+
 
 // ---------------------------------------------------------------------------
 // Types

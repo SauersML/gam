@@ -36,7 +36,7 @@ use crate::smooth::{
 };
 use crate::solver::optimize::{CostOnlyOptimizationRequest, optimize_cost_only};
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -1273,6 +1273,7 @@ fn materialize_survival<'a>(
                 .get(z_col_name)
                 .ok_or_else(|| format!("z column '{z_col_name}' not found"))?;
             let z = data.values.column(z_idx).to_owned();
+            let marginalspec = termspec.clone();
             let logslopespec = if let Some(ls_formula) = config.logslope_formula.as_deref() {
                 let ls_parsed = parse_formula(&format!("{} ~ {ls_formula}", parsed.response))?;
                 build_termspec(&ls_parsed.terms, data, col_map, &mut inference_notes)?
@@ -1285,6 +1286,7 @@ fn materialize_survival<'a>(
                 event_target: event,
                 weights: Array1::ones(n),
                 z,
+                marginalspec,
                 derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                 time_block,
                 logslopespec,

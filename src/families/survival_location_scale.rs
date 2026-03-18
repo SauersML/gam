@@ -1259,12 +1259,6 @@ impl SurvivalLocationScaleFamily {
     }
 
     #[inline]
-    fn time_base_cols(&self) -> std::ops::Range<usize> {
-        let range = self.time_wiggle_range();
-        0..range.start
-    }
-
-    #[inline]
     fn time_derivative_lower_bound(&self) -> f64 {
         assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
         self.derivative_guard
@@ -4045,14 +4039,9 @@ struct SurvivalDynamicGeometry {
     time_jac_entry: Array2<f64>,
     time_jac_exit: Array2<f64>,
     time_jac_deriv: Array2<f64>,
-    time_wiggle_basis_entry: Option<Array2<f64>>,
-    time_wiggle_basis_exit: Option<Array2<f64>>,
     time_wiggle_basis_d1_entry: Option<Array2<f64>>,
     time_wiggle_basis_d1_exit: Option<Array2<f64>>,
     time_wiggle_basis_d2_exit: Option<Array2<f64>>,
-    time_wiggle_basis_d3_exit: Option<Array2<f64>>,
-    time_wiggle_dq_entry: Option<Array1<f64>>,
-    time_wiggle_dq_exit: Option<Array1<f64>>,
     time_wiggle_d2_entry: Option<Array1<f64>>,
     time_wiggle_d2_exit: Option<Array1<f64>>,
     time_wiggle_d3_exit: Option<Array1<f64>>,
@@ -4371,14 +4360,9 @@ impl SurvivalLocationScaleFamily {
         let mut time_jac_entry = self.x_time_entry.as_ref().clone();
         let mut time_jac_exit = self.x_time_exit.as_ref().clone();
         let mut time_jac_deriv = self.x_time_deriv.as_ref().clone();
-        let mut time_wiggle_basis_entry = None;
-        let mut time_wiggle_basis_exit = None;
         let mut time_wiggle_basis_d1_entry = None;
         let mut time_wiggle_basis_d1_exit = None;
         let mut time_wiggle_basis_d2_exit = None;
-        let mut time_wiggle_basis_d3_exit = None;
-        let mut time_wiggle_dq_entry = None;
-        let mut time_wiggle_dq_exit = None;
         let mut time_wiggle_d2_entry = None;
         let mut time_wiggle_d2_exit = None;
         let mut time_wiggle_d3_exit = None;
@@ -4406,14 +4390,9 @@ impl SurvivalLocationScaleFamily {
             time_jac_deriv
                 .slice_mut(s![.., time_wiggle_range.start..time_wiggle_range.end])
                 .assign(&wiggle_qdot);
-            time_wiggle_basis_entry = Some(wig_entry.basis.clone());
-            time_wiggle_basis_exit = Some(wig_exit.basis.clone());
             time_wiggle_basis_d1_entry = Some(wig_entry.basis_d1.clone());
             time_wiggle_basis_d1_exit = Some(wig_exit.basis_d1.clone());
             time_wiggle_basis_d2_exit = Some(wig_exit.basis_d2.clone());
-            time_wiggle_basis_d3_exit = Some(wig_exit.basis_d3.clone());
-            time_wiggle_dq_entry = Some(wig_entry.dq_dq0.clone());
-            time_wiggle_dq_exit = Some(wig_exit.dq_dq0.clone());
             time_wiggle_d2_entry = Some(wig_entry.d2q_dq02.clone());
             time_wiggle_d2_exit = Some(wig_exit.d2q_dq02.clone());
             time_wiggle_d3_exit = Some(wig_exit.d3q_dq03.clone());
@@ -4546,14 +4525,9 @@ impl SurvivalLocationScaleFamily {
             time_jac_entry,
             time_jac_exit,
             time_jac_deriv,
-            time_wiggle_basis_entry,
-            time_wiggle_basis_exit,
             time_wiggle_basis_d1_entry,
             time_wiggle_basis_d1_exit,
             time_wiggle_basis_d2_exit,
-            time_wiggle_basis_d3_exit,
-            time_wiggle_dq_entry,
-            time_wiggle_dq_exit,
             time_wiggle_d2_entry,
             time_wiggle_d2_exit,
             time_wiggle_d3_exit,
@@ -6525,6 +6499,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             ));
         }
 
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+
         let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
         let threshold_dir = d_beta_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
         let log_sigma_dir = d_beta_flat.slice(s![offsets[2]..offsets[3]]).to_owned();
@@ -6890,6 +6866,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let z_ls_exit_psi = &dir.z_ls_exit_psi;
         let z_ls_entry_psi = &dir.z_ls_entry_psi;
         let q = self.collect_joint_quantities(block_states)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
@@ -7454,6 +7431,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities(block_states)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
@@ -8935,7 +8913,7 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(&time_block, 0).expect("prepare time block");
+        let prepared = prepare_identified_time_block(&time_block, 0, 0).expect("prepare time block");
         let entry_anchorrow = prepared.design_entry.row(0);
         let entry_max_abs = entry_anchorrow
             .iter()
@@ -8978,7 +8956,7 @@ mod tests {
             initial_beta: None,
         };
 
-        let prepared = prepare_identified_time_block(&time_block, 0).expect("prepare time block");
+        let prepared = prepare_identified_time_block(&time_block, 0, 0).expect("prepare time block");
         let p = time_block.design_entry.ncols();
 
         assert_eq!(
@@ -9023,7 +9001,7 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(&time_block, 0).expect("prepare time block");
+        let prepared = prepare_identified_time_block(&time_block, 0, 0).expect("prepare time block");
         // With a non-trivial exit design row, one dimension should be removed.
         assert_eq!(
             prepared.design_exit.ncols(),
