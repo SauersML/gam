@@ -3336,7 +3336,7 @@ pub fn build_bspline_basis_1d(
     let (penalties, nullspace_dims, penaltyinfo) =
         filter_active_penalty_candidates(transformed_candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(Arc::new(design)),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -3723,7 +3723,7 @@ pub fn build_thin_plate_basiswithworkspace(
     }
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(Arc::new(design)),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -7108,7 +7108,7 @@ pub fn build_matern_basiswithworkspace(
     };
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(Arc::new(design)),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -10139,7 +10139,7 @@ pub fn build_duchon_basiswithworkspace(
     let candidates = operator_penalty_candidates_from_collocation(&ops.d0, &ops.d1, &ops.d2);
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(Arc::new(design)),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -15282,8 +15282,7 @@ mod tests {
         let plus_design = plus.design.to_dense();
         let base_design = base.design.to_dense();
         let minus_design = minus.design.to_dense();
-        let fd_design =
-            (&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps);
+        let fd_design = (&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps);
         let fd_primary = (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0)
             + &minus.penalties[0])
             / (eps * eps);
@@ -15420,8 +15419,7 @@ mod tests {
         let plus_design = plus.design.to_dense();
         let base_design = base.design.to_dense();
         let minus_design = minus.design.to_dense();
-        let fd_design =
-            (&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps);
+        let fd_design = (&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps);
         let design_err = (&second_derivative.designsecond_derivative - &fd_design)
             .iter()
             .map(|v| v * v)

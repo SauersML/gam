@@ -312,7 +312,7 @@ fn build_deviation_block_from_seed(
     };
     Ok(DeviationPrepared {
         block: ParameterBlockInput {
-            design: DesignMatrix::Dense(Arc::new(design)),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
             offset: Array1::zeros(seed.len()),
             penalties,
             nullspace_dims: vec![],
@@ -3037,8 +3037,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let score_warp_obs_design = score_warp_prepared
         .as_ref()
         .and_then(|p| match &p.block.design {
-            DesignMatrix::Dense(x) => Some((**x).clone()),
-            DesignMatrix::Operator(op) => Some(op.to_dense()),
+            DesignMatrix::Dense(x) => Some(x.to_dense()),
             DesignMatrix::Sparse(_) => None,
         });
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
@@ -3268,7 +3267,9 @@ mod tests {
     fn dummy_blockspec(p: usize, n_rows: usize) -> ParameterBlockSpec {
         ParameterBlockSpec {
             name: "dummy".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::<f64>::zeros((n_rows, p)))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::zeros((n_rows, p)),
+            )),
             offset: Array1::zeros(n_rows),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -3354,8 +3355,12 @@ mod tests {
             y: Array1::zeros(seed.len()),
             weights: Array1::ones(seed.len()),
             z: seed.clone(),
-            marginal_design: DesignMatrix::Dense(Arc::new(Array2::zeros((seed.len(), 0)))),
-            logslope_design: DesignMatrix::Dense(Arc::new(Array2::zeros((seed.len(), 0)))),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
             quadrature_nodes: array![0.0],
             quadrature_weights: array![1.0],
             score_warp: None,

@@ -121,7 +121,10 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
     let weights = Array1::ones(n_train);
     let offset = Array1::zeros(n_train);
     let s_list = vec![
-        BlockwisePenalty::new(0..tps_train.basis.ncols(), tps_train.penalty_bending.clone()),
+        BlockwisePenalty::new(
+            0..tps_train.basis.ncols(),
+            tps_train.penalty_bending.clone(),
+        ),
         BlockwisePenalty::new(0..tps_train.basis.ncols(), tps_train.penalty_ridge.clone()),
     ];
 
@@ -220,7 +223,10 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
     let (tps_train, knots) =
         create_thin_plate_spline_basis_with_knot_count(x_train.view(), 36).expect("3D TPS basis");
     let s_list = vec![
-        BlockwisePenalty::new(0..tps_train.basis.ncols(), tps_train.penalty_bending.clone()),
+        BlockwisePenalty::new(
+            0..tps_train.basis.ncols(),
+            tps_train.penalty_bending.clone(),
+        ),
         BlockwisePenalty::new(0..tps_train.basis.ncols(), tps_train.penalty_ridge.clone()),
     ];
     let p = s_list[0].local.nrows();
@@ -230,8 +236,8 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
         0,
         "3D TPS test",
     )
-        .expect("canonicalize penalty")
-        .expect("penalty should have positive rank");
+    .expect("canonicalize penalty")
+    .expect("penalty should have positive rank");
     assert!(
         cp.rank() > 0,
         "3D TPS bending penalty root should have positive rank"

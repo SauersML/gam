@@ -249,7 +249,11 @@ fn test_component_b_hessian_logdet() {
 
         // tr(H⁻¹ λ_k S_k)
         let trace_h_inv_s_k: f64 = (0..p)
-            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k.local[[j, i]]).sum::<f64>())
+            .map(|i| {
+                (0..p)
+                    .map(|j| h_inv[[i, j]] * s_k.local[[j, i]])
+                    .sum::<f64>()
+            })
             .sum();
 
         // v_k = H⁻¹(λ_k S_k β̂)
@@ -313,7 +317,11 @@ fn test_component_b1_simple_trace() {
         let lambda_k = rho[k].exp();
         let s_k = &s_list[k];
         let trace: f64 = (0..p)
-            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k.local[[j, i]]).sum::<f64>())
+            .map(|i| {
+                (0..p)
+                    .map(|j| h_inv[[i, j]] * s_k.local[[j, i]])
+                    .sum::<f64>()
+            })
             .sum();
         analytic_b1[k] = 0.5 * lambda_k * trace;
     }
@@ -1019,7 +1027,11 @@ fn test_standalone_gradient_matches_own_fd() {
 
         // Term B
         let trace_h_inv_s_k: f64 = (0..p)
-            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k.local[[j, i]]).sum::<f64>())
+            .map(|i| {
+                (0..p)
+                    .map(|j| h_inv[[i, j]] * s_k.local[[j, i]])
+                    .sum::<f64>()
+            })
             .sum();
         let v_k = h_inv.dot(&(s_k.local.dot(&beta) * lambda_k));
         let x_v_k = x.dot(&v_k);

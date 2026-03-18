@@ -582,9 +582,8 @@ impl ParametricColumnConditioning {
         if !self.is_active() {
             return x.clone();
         }
-        DesignMatrix::Operator(Arc::new(crate::matrix::ConditionedDesign::new(
-            x.clone(),
-            self.columns.clone(),
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(
+            crate::matrix::ConditionedDesign::new(x.clone(), self.columns.clone()),
         )))
     }
 
@@ -4849,10 +4848,12 @@ mod fd_policy_tests {
             "sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19",
         );
         let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(
-            &DesignMatrix::Dense(Arc::new(x.clone())),
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
             &penalty_specs,
         );
-        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(
+            crate::matrix::DenseDesignMatrix::from(x.clone()),
+        ));
         let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
@@ -4980,7 +4981,9 @@ mod fd_policy_tests {
         let beta_at = |raw_eps: f64| -> Array1<f64> {
             let mut state = RemlState::newwith_offset(
                 y.view(),
-                conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone()))),
+                conditioning.apply_to_design(&DesignMatrix::Dense(
+                    crate::matrix::DenseDesignMatrix::from(x.clone()),
+                )),
                 w.view(),
                 offset.view(),
                 canonical_penalties.clone(),
@@ -5062,10 +5065,12 @@ mod fd_policy_tests {
             "sas_true_score_beta_jacobian_matchesfd_at_seed19",
         );
         let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(
-            &DesignMatrix::Dense(Arc::new(x.clone())),
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
             &penalty_specs,
         );
-        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(
+            crate::matrix::DenseDesignMatrix::from(x.clone()),
+        ));
         let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
@@ -5096,8 +5101,7 @@ mod fd_policy_tests {
         let s_transformed = pirls_result.reparam_result.s_transformed.clone();
         let ridge = pirls_result.ridge_used;
         let x_dense = match &pirls_result.x_transformed {
-            DesignMatrix::Dense(x_dense) => (**x_dense).clone(),
-            DesignMatrix::Operator(op) => op.to_dense(),
+            DesignMatrix::Dense(x_dense) => x_dense.to_dense(),
             DesignMatrix::Sparse(_) => {
                 panic!("expected dense transformed design in seed-19 SAS test")
             }
@@ -5218,10 +5222,12 @@ mod fd_policy_tests {
             "sas_pirlshessian_matches_true_score_jacobian_at_seed19",
         );
         let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(
-            &DesignMatrix::Dense(Arc::new(x.clone())),
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
             &penalty_specs,
         );
-        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(
+            crate::matrix::DenseDesignMatrix::from(x.clone()),
+        ));
         let mut reml_state = RemlState::newwith_offset(
             y.view(),
             x_fit,
@@ -5252,8 +5258,7 @@ mod fd_policy_tests {
         let s_transformed = pirls_result.reparam_result.s_transformed.clone();
         let ridge = pirls_result.ridge_used;
         let x_dense = match &pirls_result.x_transformed {
-            DesignMatrix::Dense(x_dense) => (**x_dense).clone(),
-            DesignMatrix::Operator(op) => op.to_dense(),
+            DesignMatrix::Dense(x_dense) => x_dense.to_dense(),
             DesignMatrix::Sparse(_) => {
                 panic!("expected dense transformed design in seed-19 SAS test")
             }

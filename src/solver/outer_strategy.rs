@@ -842,6 +842,45 @@ pub struct OuterConfig {
     pub screening_cap: Option<Arc<AtomicUsize>>,
 }
 
+struct ScreeningCapGuard<'a> {
+    cap: Option<&'a Arc<AtomicUsize>>,
+}
+
+impl<'a> ScreeningCapGuard<'a> {
+    fn engage(cap: Option<&'a Arc<AtomicUsize>>, screen_max: usize) -> Self {
+        if screen_max > 0 {
+            if let Some(cap) = cap {
+                cap.store(screen_max, Ordering::Relaxed);
+                return Self { cap: Some(cap) };
+            }
+        }
+        Self { cap: None }
+    }
+
+    fn is_active(&self) -> bool {
+        self.cap.is_some()
+    }
+}
+
+impl Drop for ScreeningCapGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(cap) = self.cap {
+            cap.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+fn with_screening_cap<T>(
+    cap: Option<&Arc<AtomicUsize>>,
+    screen_max: usize,
+    f: impl FnOnce(bool) -> T,
+) -> T {
+    // Keep the guard scoped to the callback so every return path resets the
+    // screening cap before the caller can reuse the objective.
+    let screening_cap_guard = ScreeningCapGuard::engage(cap, screen_max);
+    f(screening_cap_guard.is_active())
+}
+
 impl Default for OuterConfig {
     fn default() -> Self {
         Self {
@@ -999,40 +1038,31 @@ fn run_outer_with_plan(
             seeds.len(),
         );
         let screen_start = std::time::Instant::now();
-        struct ScreeningCapGuard<'a> {
-            cap: Option<&'a Arc<AtomicUsize>>,
-        }
-        impl Drop for ScreeningCapGuard<'_> {
-            fn drop(&mut self) {
-                if let Some(cap) = self.cap {
-                    cap.store(0, Ordering::Relaxed);
+        let mut scored: Vec<(usize, f64)> = with_screening_cap(
+            config.screening_cap.as_ref(),
+            screen_max,
+            |screening_cap_active| {
+                if screening_cap_active {
+                    log::debug!(
+                        "[OUTER] {context}: screening cap enabled for cost-only evaluation ({screen_max} PIRLS iterations)"
+                    );
                 }
-            }
-        }
-        let screening_cap_guard = if screen_max > 0 {
-            if let Some(cap) = config.screening_cap.as_ref() {
-                cap.store(screen_max, Ordering::Relaxed);
-                Some(ScreeningCapGuard { cap: Some(cap) })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let mut scored: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
-        for (i, rho) in seeds.iter().enumerate() {
-            obj.reset();
-            let cost = obj.eval_cost(rho).unwrap_or(f64::INFINITY);
-            scored.push((
-                i,
-                if cost.is_finite() {
-                    cost
-                } else {
-                    f64::INFINITY
-                },
-            ));
-        }
-        drop(screening_cap_guard);
+                let mut scored: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
+                for (i, rho) in seeds.iter().enumerate() {
+                    obj.reset();
+                    let cost = obj.eval_cost(rho).unwrap_or(f64::INFINITY);
+                    scored.push((
+                        i,
+                        if cost.is_finite() {
+                            cost
+                        } else {
+                            f64::INFINITY
+                        },
+                    ));
+                }
+                scored
+            },
+        );
         // Reset after screening so cached partial-iteration results don't
         // leak into the real optimizer.
         obj.reset();

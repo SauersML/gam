@@ -27,7 +27,15 @@ fn canonicalize_test_penalties(s_list: &[Array2<f64>]) -> Vec<CanonicalPenalty> 
         .collect()
 }
 
-fn make_problem(seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>, Array2<f64>, Vec<BlockwisePenalty>) {
+fn make_problem(
+    seed: u64,
+) -> (
+    Array2<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array2<f64>,
+    Vec<BlockwisePenalty>,
+) {
     let n = 100;
     let p = 10;
     let mut rng = StdRng::seed_from_u64(seed);

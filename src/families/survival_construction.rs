@@ -10,8 +10,6 @@
 //! These are the building blocks a library consumer needs to construct
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
-use std::sync::Arc;
-
 use ndarray::{Array1, Array2, s};
 
 use crate::basis::{
@@ -962,14 +960,14 @@ pub fn build_survival_timewiggle_from_baseline(
         match buildwiggle_block_input_from_knots(eta_entry.view(), &knots, cfg.degree, 2, false)?
             .design
         {
-            DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
+            DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
             _ => return Err("baseline-timewiggle entry design must be dense".to_string()),
         };
     let design_exit =
         match buildwiggle_block_input_from_knots(eta_exit.view(), &knots, cfg.degree, 2, false)?
             .design
         {
-            DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
+            DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
             _ => return Err("baseline-timewiggle exit design must be dense".to_string()),
         };
     let design_derivative_exit =

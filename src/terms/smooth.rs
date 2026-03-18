@@ -2144,7 +2144,7 @@ fn build_tensor_bspline_basis(
 
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     let design = if let Some(dense_design) = dense_design {
-        DesignMatrix::Dense(Arc::new(dense_design))
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense_design))
     } else {
         let marginals: Vec<Arc<Array2<f64>>> = marginal_designs
             .iter()
@@ -2153,7 +2153,7 @@ fn build_tensor_bspline_basis(
         let op = TensorProductDesignOperator::new(marginals).map_err(|e| {
             BasisError::InvalidInput(format!("TensorProductDesignOperator build failed: {e}"))
         })?;
-        DesignMatrix::Operator(Arc::new(op))
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
     };
 
     Ok(BasisBuildResult {
@@ -2540,7 +2540,9 @@ pub fn build_smooth_design_withworkspace(
             && use_box_reparam
         {
             let t = cumulative_sum_transform_matrix(p_local, order, sign);
-            design_t = DesignMatrix::Dense(Arc::new(design_t.to_dense().dot(&t)));
+            design_t = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                design_t.to_dense().dot(&t),
+            ));
             penalties_t = penalties_t
                 .into_iter()
                 .map(|s_local| {
@@ -2825,7 +2827,9 @@ pub fn build_term_collection_design(
 
     // Block 1: linear terms.
     if let Some(lin_block) = linear_block {
-        blocks.push(DesignBlock::Dense(Arc::new(lin_block)));
+        blocks.push(DesignBlock::Dense(crate::matrix::DenseDesignMatrix::from(
+            lin_block,
+        )));
     }
 
     // Blocks: random-effect operators — O(n) implicit one-hot.
@@ -2841,10 +2845,9 @@ pub fn build_term_collection_design(
         for term_design in &smooth.term_designs {
             match term_design {
                 DesignMatrix::Dense(dense) => blocks.push(DesignBlock::Dense(dense.clone())),
-                DesignMatrix::Operator(op) => blocks.push(DesignBlock::Operator(op.clone())),
-                DesignMatrix::Sparse(_) => {
-                    blocks.push(DesignBlock::Dense(Arc::new(term_design.to_dense())))
-                }
+                DesignMatrix::Sparse(_) => blocks.push(DesignBlock::Dense(
+                    crate::matrix::DenseDesignMatrix::from(Arc::new(term_design.clone())),
+                )),
             }
         }
     }
@@ -2852,7 +2855,7 @@ pub fn build_term_collection_design(
     let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
         BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
     })?;
-    let design = DesignMatrix::Operator(Arc::new(block_op));
+    let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(block_op)));
 
     let mut penalties = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims = Vec::<usize>::new();
@@ -3206,7 +3209,9 @@ fn apply_spatial_orthogonality_to_parametric(
             };
 
         local_dims.push(design_constrained.ncols());
-        local_designs.push(DesignMatrix::Dense(Arc::new(design_constrained)));
+        local_designs.push(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            design_constrained,
+        )));
         local_penalties.push(penalties_constrained);
         local_nullspaces.push(nullspace_constrained);
         local_penaltyinfo.push(penaltyinfo_constrained);
@@ -7120,7 +7125,9 @@ impl CustomFamily for BoundedLinearFamily {
     ) -> Result<(DesignMatrix, Array1<f64>), String> {
         if block_states.is_empty() {
             return Ok((
-                DesignMatrix::Dense(Arc::new(self.designzeroed.clone())),
+                DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    self.designzeroed.clone(),
+                )),
                 self.offset.clone(),
             ));
         }
@@ -7132,7 +7139,10 @@ impl CustomFamily for BoundedLinearFamily {
         } else {
             return Err("bounded linear family design column mismatch".to_string());
         };
-        Ok((DesignMatrix::Dense(Arc::new(x)), offset))
+        Ok((
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
+            offset,
+        ))
     }
 
     fn block_geometry_is_dynamic(&self) -> bool {
@@ -7401,7 +7411,7 @@ fn fit_bounded_term_collection_with_design(
     };
     let blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(Arc::new(designzeroed)),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(designzeroed)),
         offset: offset.to_owned(),
         penalties: fit_penalties
             .iter()
@@ -9792,7 +9802,8 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             ));
         }
 
-        self.design.smooth.term_designs[term_idx] = DesignMatrix::Dense(Arc::new(design_local));
+        self.design.smooth.term_designs[term_idx] =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_local));
 
         let mut blocks = Vec::<DesignBlock>::new();
         blocks.push(DesignBlock::Intercept(self.data.nrows()));
@@ -9804,7 +9815,9 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     .column_mut(j)
                     .assign(&self.data.column(linear.feature_col));
             }
-            blocks.push(DesignBlock::Dense(Arc::new(linear_block)));
+            blocks.push(DesignBlock::Dense(crate::matrix::DenseDesignMatrix::from(
+                linear_block,
+            )));
         }
         for term in &self.spec.random_effect_terms {
             let block = build_random_effect_block(self.data, term).map_err(|e| {
@@ -9816,15 +9829,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         for term_design in &self.design.smooth.term_designs {
             match term_design {
                 DesignMatrix::Dense(dense) => blocks.push(DesignBlock::Dense(dense.clone())),
-                DesignMatrix::Operator(op) => blocks.push(DesignBlock::Operator(op.clone())),
-                DesignMatrix::Sparse(_) => {
-                    blocks.push(DesignBlock::Dense(Arc::new(term_design.to_dense())))
-                }
+                DesignMatrix::Sparse(_) => blocks.push(DesignBlock::Dense(
+                    crate::matrix::DenseDesignMatrix::from(Arc::new(term_design.clone())),
+                )),
             }
         }
         let block_op = BlockDesignOperator::new(blocks)
             .map_err(|e| format!("failed to rebuild block design operator: {e}"))?;
-        self.design.design = DesignMatrix::Operator(Arc::new(block_op));
+        self.design.design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(block_op)));
 
         for (offset, penalty_local) in penalties_local.iter().enumerate() {
             let smooth_penalty_idx = smooth_penalty_range.start + offset;
@@ -11276,7 +11289,10 @@ mod tests {
         c.column_mut(1).assign(&data.column(0));
         let smooth_start = 1 + spec.linear_terms.len();
         let b = design_dense
-            .slice(s![.., smooth_start..(smooth_start + design.smooth.total_smooth_cols())])
+            .slice(s![
+                ..,
+                smooth_start..(smooth_start + design.smooth.total_smooth_cols())
+            ])
             .to_owned();
         let rel = orthogonality_relative_residual(b.view(), c.view());
         assert!(
@@ -12289,11 +12305,15 @@ mod tests {
         let fixed_before_dense = fixed_before.to_dense();
         let updated_full_dense = realizer.design().design.to_dense();
         let linear_diff = max_abs_diff_matrix(
-            &fixed_before_dense.slice(s![.., linear_range.clone()]).to_owned(),
+            &fixed_before_dense
+                .slice(s![.., linear_range.clone()])
+                .to_owned(),
             &updated_full_dense.slice(s![.., linear_range]).to_owned(),
         );
         let random_diff = max_abs_diff_matrix(
-            &fixed_before_dense.slice(s![.., random_range.clone()]).to_owned(),
+            &fixed_before_dense
+                .slice(s![.., random_range.clone()])
+                .to_owned(),
             &updated_full_dense.slice(s![.., random_range]).to_owned(),
         );
         let nonspatial_diff = max_abs_diff_matrix(
@@ -12311,7 +12331,9 @@ mod tests {
             &fixed_before_dense
                 .slice(s![.., full_spatial_range.clone()])
                 .to_owned(),
-            &updated_full_dense.slice(s![.., full_spatial_range]).to_owned(),
+            &updated_full_dense
+                .slice(s![.., full_spatial_range])
+                .to_owned(),
         );
         assert!(
             linear_diff <= 1e-12,
@@ -13524,7 +13546,10 @@ mod tests {
         };
         let spec = ParameterBlockSpec {
             name: "toy".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0, 0.0],
+                [0.0, 1.0]
+            ])),
             offset: array![0.0, 0.0],
             penalties: vec![],
             nullspace_dims: vec![],

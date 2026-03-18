@@ -180,15 +180,13 @@ fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64
                 let z = (-eta).exp();
                 let opz = 1.0 + z;
                 canonicalzero(
-                    z * (z * z * z - 11.0 * z * z + 11.0 * z - 1.0)
-                        / (opz * opz * opz * opz * opz),
+                    z * (z * z * z - 11.0 * z * z + 11.0 * z - 1.0) / (opz * opz * opz * opz * opz),
                 )
             } else {
                 let z = eta.exp();
                 let opz = 1.0 + z;
                 canonicalzero(
-                    z * (1.0 - 11.0 * z + 11.0 * z * z - z * z * z)
-                        / (opz * opz * opz * opz * opz),
+                    z * (1.0 - 11.0 * z + 11.0 * z * z - z * z * z) / (opz * opz * opz * opz * opz),
                 )
             }
         }

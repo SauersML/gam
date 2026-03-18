@@ -1421,14 +1421,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Clear warm-start state. Used in tests to ensure consistent starting points
-    /// when comparing different gradient computation paths.
-    #[cfg(test)]
-    pub fn clearwarm_start(&self) {
-        self.warm_start_beta.write().unwrap().take();
-        self.cache_manager.invalidate_eval_bundle();
-    }
-
     // Accessor methods for private fields
     pub(crate) fn x(&self) -> &DesignMatrix {
         &self.x
@@ -2315,7 +2307,9 @@ impl<'a> RemlState<'a> {
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
-                    crate::linalg::matrix::DesignMatrix::Dense(Arc::new(x_dense.dot(z)))
+                    crate::linalg::matrix::DesignMatrix::Dense(
+                        crate::matrix::DenseDesignMatrix::from(x_dense.dot(z)),
+                    )
                 } else {
                     pirls_result.x_transformed.clone()
                 };
@@ -3438,12 +3432,7 @@ impl<'a> RemlState<'a> {
             log_likelihood,
             firth_op,
             barrier_config,
-        ) = self.build_dense_derivative_context(
-            pirls_result,
-            bundle,
-            &free_basis_opt,
-            true,
-        )?;
+        ) = self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
 
         let result = self.evaluate_unified_tail_efs(
             rho,

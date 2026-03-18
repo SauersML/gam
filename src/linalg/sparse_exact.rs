@@ -536,9 +536,10 @@ pub fn leverages_from_factor(
     const LEVERAGE_BATCH: usize = 32;
     match x {
         DesignMatrix::Dense(matrix) => {
-            let mut out = Array1::<f64>::zeros(matrix.nrows());
-            let p = matrix.ncols();
-            let n = matrix.nrows();
+            let dense = matrix.to_dense_arc();
+            let mut out = Array1::<f64>::zeros(dense.nrows());
+            let p = dense.ncols();
+            let n = dense.nrows();
             let mut start = 0usize;
             while start < n {
                 let end = (start + LEVERAGE_BATCH).min(n);
@@ -546,12 +547,12 @@ pub fn leverages_from_factor(
                 let mut rhs = Array2::<f64>::zeros((p, cols));
                 for local_col in 0..cols {
                     let row = start + local_col;
-                    rhs.column_mut(local_col).assign(&matrix.row(row).t());
+                    rhs.column_mut(local_col).assign(&dense.row(row).t());
                 }
                 let solved = solve_sparse_spdmulti(factor, &rhs)?;
                 for local_col in 0..cols {
                     let row = start + local_col;
-                    out[row] = matrix.row(row).dot(&solved.column(local_col));
+                    out[row] = dense.row(row).dot(&solved.column(local_col));
                 }
                 start = end;
             }
@@ -586,11 +587,6 @@ pub fn leverages_from_factor(
                 out[row] = quad;
             }
             Ok(out)
-        }
-        DesignMatrix::Operator(op) => {
-            // Materialize and follow the Dense path.
-            let matrix = Arc::new(op.to_dense());
-            leverages_from_factor(factor, &DesignMatrix::Dense(matrix))
         }
     }
 }

@@ -13,7 +13,6 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::InverseLink;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use std::sync::Arc;
 
 /// Compute standard errors from a covariance matrix (sqrt of diagonal).
 pub fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
@@ -374,7 +373,7 @@ fn slice_predict_input(
     rows: std::ops::Range<usize>,
 ) -> Result<PredictInput, EstimationError> {
     Ok(PredictInput {
-        design: DesignMatrix::Dense(Arc::new(
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             design_row_chunk(&input.design, rows.clone()).map_err(EstimationError::InvalidInput)?,
         )),
         offset: input.offset.slice(ndarray::s![rows.clone()]).to_owned(),
@@ -383,7 +382,7 @@ fn slice_predict_input(
             .as_ref()
             .map(|design| {
                 design_row_chunk(design, rows.clone())
-                    .map(|d| DesignMatrix::Dense(Arc::new(d)))
+                    .map(|d| DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(d)))
                     .map_err(EstimationError::InvalidInput)
             })
             .transpose()?,

@@ -47,7 +47,16 @@ fn make_problem(
         s2[[j, j]] = 1.0;
     }
 
-    (x, y, w, offset, vec![BlockwisePenalty::new(0..p, s1), BlockwisePenalty::new(0..p, s2)])
+    (
+        x,
+        y,
+        w,
+        offset,
+        vec![
+            BlockwisePenalty::new(0..p, s1),
+            BlockwisePenalty::new(0..p, s2),
+        ],
+    )
 }
 
 #[test]

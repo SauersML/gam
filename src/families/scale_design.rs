@@ -392,7 +392,7 @@ pub fn build_scale_deviation_transform_design(
 fn design_block_from_matrix(design: DesignMatrix) -> DesignBlock {
     match design {
         DesignMatrix::Dense(matrix) => DesignBlock::Dense(matrix),
-        other => DesignBlock::Operator(Arc::new(other)),
+        other => DesignBlock::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(other))),
     }
 }
 
@@ -440,18 +440,17 @@ pub fn build_scale_deviation_operator(
         design_block_from_matrix(primary_design),
         DesignBlock::Intercept(n),
     ])?;
-    let operator = ReparamDesignOperator::new(
-        Arc::new(base),
-        scale_deviation_reparam_matrix(transform),
-    )?;
-    Ok(DesignMatrix::Operator(Arc::new(operator)))
+    let operator =
+        ReparamDesignOperator::new(Arc::new(base), scale_deviation_reparam_matrix(transform))?;
+    Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        Arc::new(operator),
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::matrix::DesignMatrix;
-    use std::sync::Arc;
 
     /// Verify the real scale-deviation pipeline for an overdetermined system.
     #[test]
@@ -484,8 +483,10 @@ mod tests {
         assert!(transformed.iter().all(|v| v.is_finite()));
         assert!(transformed.column(0).iter().all(|&v| v == 1.0));
 
-        let primary_design = DesignMatrix::Dense(Arc::new(primary.clone()));
-        let noise_design = DesignMatrix::Dense(Arc::new(noise.clone()));
+        let primary_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(primary.clone()));
+        let noise_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(noise.clone()));
         let non_intercept_start = infer_non_intercept_start_design(&noise_design, &weights)
             .expect("design-native non-intercept detection should succeed");
         assert_eq!(non_intercept_start, 1);
@@ -496,13 +497,10 @@ mod tests {
             non_intercept_start,
         )
         .expect("design-native transform should succeed");
-        let transformed_design = build_scale_deviation_operator(
-            primary_design,
-            noise_design,
-            &design_transform,
-        )
-        .expect("design-native operator should build")
-        .to_dense();
+        let transformed_design =
+            build_scale_deviation_operator(primary_design, noise_design, &design_transform)
+                .expect("design-native operator should build")
+                .to_dense();
 
         assert_eq!(design_transform.projection_coef.dim(), (p_primary, p_noise));
         assert_eq!(transformed_design.dim(), transformed.dim());

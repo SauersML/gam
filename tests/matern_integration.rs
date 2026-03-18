@@ -337,8 +337,8 @@ fn matern_3d_aniso_fits_successfully() {
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },
-        &kappa_options,
-    )
+            &kappa_options,
+        )
         .expect("anisotropic Matérn 3D fit should succeed");
 
     // Coefficients must be finite.
