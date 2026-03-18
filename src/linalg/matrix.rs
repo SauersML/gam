@@ -4221,6 +4221,7 @@ mod tests {
         DesignMatrix, SparseDesignMatrix, dense_matvec, dense_transpose_matvec,
         dense_transpose_weighted_response,
     };
+    use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
@@ -4556,7 +4557,7 @@ mod tests {
         let op_dense = op.to_dense();
         let max_diff = (&op_dense - &dense)
             .iter()
-            .map(|v| v.abs())
+            .map(|v: &f64| v.abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-14, "to_dense mismatch: max_diff={max_diff}");
 
@@ -4566,7 +4567,7 @@ mod tests {
         let op_result = op.apply(&beta);
         let max_diff = (&op_result - &ref_result)
             .iter()
-            .map(|v| v.abs())
+            .map(|v: &f64| v.abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-12, "apply mismatch: max_diff={max_diff}");
 
@@ -4576,7 +4577,7 @@ mod tests {
         let op_xt_v = op.apply_transpose(&v);
         let max_diff = (&op_xt_v - &ref_xt_v)
             .iter()
-            .map(|v| v.abs())
+            .map(|v: &f64| v.abs())
             .fold(0.0f64, f64::max);
         assert!(
             max_diff < 1e-12,
@@ -4599,7 +4600,7 @@ mod tests {
         let op_xtwx = op.diag_xtw_x(&w).unwrap();
         let max_diff = (&op_xtwx - &ref_xtwx)
             .iter()
-            .map(|v| v.abs())
+            .map(|v: &f64| v.abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-10, "diag_xtw_x mismatch: max_diff={max_diff}");
     }
@@ -4646,7 +4647,7 @@ mod tests {
         let op_dense = op.to_dense();
         let max_diff = (&op_dense - &dense)
             .iter()
-            .map(|v| v.abs())
+            .map(|v: &f64| v.abs())
             .fold(0.0f64, f64::max);
         assert!(
             max_diff < 1e-14,
@@ -4660,7 +4661,7 @@ mod tests {
         let ref_xtxb = dense.t().dot(&dense.dot(&beta));
         let max_diff = (&xtxb - &ref_xtxb)
             .iter()
-            .map(|v| v.abs())
+            .map(|v: &f64| v.abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-10, "3D X'Xβ mismatch: max_diff={max_diff}");
     }

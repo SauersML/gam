@@ -1174,7 +1174,7 @@ mod tests {
             [1.0, 0.7],
             [1.0, 1.3],
         ];
-        let beta_full = array![0.25, -0.5, 0.15];
+        let beta_full: ndarray::Array1<f64> = array![0.25, -0.5, 0.15];
         let beta_reduced = array![beta_full[0] + beta_full[2], beta_full[1] + beta_full[2]];
         let eta_full = x_full.dot(&beta_full);
         let eta_reduced = x_reduced.dot(&beta_reduced);

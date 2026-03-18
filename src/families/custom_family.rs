@@ -369,7 +369,7 @@ impl ExactOuterDerivativeOrder {
 }
 
 /// Family evaluation over all parameter blocks.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FamilyEvaluation {
     pub log_likelihood: f64,
     pub blockworking_sets: Vec<BlockWorkingSet>,

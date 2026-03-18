@@ -1076,7 +1076,7 @@ pub struct BinomialLocationScaleWiggleTermSpec {
     pub wiggle_block: ParameterBlockInput,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BlockwiseTermFitResult {
     pub fit: UnifiedFitResult,
     pub meanspec_resolved: TermCollectionSpec,
@@ -3408,7 +3408,6 @@ struct BinomialLocationScaleExactGeometry<'a> {
     threshold_design: &'a DesignMatrix,
     log_sigma_design: &'a DesignMatrix,
     wiggle_design: Option<&'a Array2<f64>>,
-    d2sigma_deta2: &'a Array1<f64>,
     d2q_dq02: Option<&'a Array1<f64>>,
 }
 
@@ -11606,7 +11605,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
             // objects from the rowwise eta-space chain rule. Entering that path
             // here is what makes the family consistent with the exact joint
             // outer-Hessian callbacks implemented below.
-            let (_, _, d2sigma_deta2, _) = exp_sigma_derivs_up_to_third(eta_ls.view());
+            let (_, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
             let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
                 "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
             })?;
@@ -11623,7 +11622,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
                     threshold_design,
                     log_sigma_design,
                     wiggle_design: None,
-                    d2sigma_deta2: &d2sigma_deta2,
                     d2q_dq02: None,
                 },
                 &core,
@@ -14224,7 +14222,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             self.wiggle_dq_dq0(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
         let d2q_dq02 =
             self.wiggle_d2q_dq02(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
-        let (_, _, d2sigma_deta2, _) = exp_sigma_derivs_up_to_third(eta_ls.view());
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleWiggleFamily exact-newton path is missing threshold design"
                 .to_string()
@@ -14243,7 +14240,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
                 threshold_design,
                 log_sigma_design,
                 wiggle_design: Some(&wiggle_design),
-                d2sigma_deta2: &d2sigma_deta2,
                 d2q_dq02: Some(&d2q_dq02),
             },
             &core,
@@ -15257,10 +15253,10 @@ mod tests {
     use super::*;
     use crate::basis::{
         CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu,
-        compute_greville_abscissae,
+        compute_geometric_constraint_transform, compute_greville_abscissae,
     };
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
-    use ndarray::{Axis, array};
+    use ndarray::{Array2, Axis, array};
     use num_dual::{
         DualNum, second_derivative, second_partial_derivative, third_partial_derivative_vec,
     };
@@ -15362,10 +15358,11 @@ mod tests {
         knots: &Array1<f64>,
         degree: usize,
     ) -> Array1<D> {
-        let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
+        let (z, _): (Array2<f64>, Array2<f64>) =
+            compute_geometric_constraint_transform(knots, degree, 2)
             .expect("wiggle constraint transform");
         let full = bspline_basis_scalar_numdual(x, knots, degree);
-        let mut constrained = Array1::from_elem(z.ncols(), D::zero());
+        let mut constrained = Array1::<D>::from_elem(z.ncols(), D::zero());
         for j in 0..z.nrows() {
             for k in 0..z.ncols() {
                 constrained[k] += full[j] * D::from(z[[j, k]]);
@@ -16771,13 +16768,15 @@ mod tests {
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.6),
         };
 
-        let err = fit_gaussian_location_scale_terms(
+        let err = match fit_gaussian_location_scale_terms(
             data.view(),
             spec,
             &BlockwiseFitOptions::default(),
             &spatial_kappa_options(),
-        )
-        .expect_err("term API should reject negative weights");
+        ) {
+            Ok(_) => panic!("term API should reject negative weights"),
+            Err(err) => err,
+        };
         assert!(err.contains("weights must be finite and non-negative"));
     }
 
@@ -16797,13 +16796,15 @@ mod tests {
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
         };
 
-        let err = fit_binomial_location_scale_terms(
+        let err = match fit_binomial_location_scale_terms(
             data.view(),
             spec,
             &BlockwiseFitOptions::default(),
             &spatial_kappa_options(),
-        )
-        .expect_err("term API should reject invalid binomial responses");
+        ) {
+            Ok(_) => panic!("term API should reject invalid binomial responses"),
+            Err(err) => err,
+        };
         assert!(err.contains("binomial response must be finite in [0,1]"));
     }
 
@@ -16819,13 +16820,15 @@ mod tests {
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
         };
 
-        let err = fit_binomial_location_scale_terms(
+        let err = match fit_binomial_location_scale_terms(
             data.view(),
             spec,
             &BlockwiseFitOptions::default(),
             &spatial_kappa_options(),
-        )
-        .expect_err("term API should reject data/y row mismatches");
+        ) {
+            Ok(_) => panic!("term API should reject data/y row mismatches"),
+            Err(err) => err,
+        };
         assert!(err.contains("data row count must match response length"));
     }
 
@@ -18516,7 +18519,8 @@ mod tests {
             false,
         )
         .expect("wiggle block");
-        let (z, _) = compute_geometric_constraint_transform(&knots, degree, penalty_order)
+        let (z, _): (Array2<f64>, Array2<f64>) =
+            compute_geometric_constraint_transform(&knots, degree, penalty_order)
             .expect("constraint transform");
         let g = compute_greville_abscissae(&knots, degree).expect("greville abscissae");
 
@@ -18579,9 +18583,10 @@ mod tests {
         )
         .expect("full basis");
         let full = (*basis).clone();
-        let (z, _) = compute_geometric_constraint_transform(&knots, degree, penalty_order)
+        let (z, _): (Array2<f64>, Array2<f64>) =
+            compute_geometric_constraint_transform(&knots, degree, penalty_order)
             .expect("constraint transform");
-        let expected = full.dot(&z);
+        let expected: Array2<f64> = full.dot(&z);
 
         let got = match &block.design {
             DesignMatrix::Dense(x) => x.clone(),

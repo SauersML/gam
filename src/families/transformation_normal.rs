@@ -118,9 +118,6 @@ pub struct TransformationNormalFamily {
     // --- Covariate side (rebuilt on κ change) ---
     /// Original covariate design used on the right side of the tensor product.
     covariate_design: DesignMatrix,
-    /// Number of covariate basis columns.
-    p_cov: usize,
-
     // --- Tensor penalties ---
     tensor_penalties: Vec<PenaltyMatrix>,
 
@@ -224,7 +221,6 @@ impl TransformationNormalFamily {
             response_val_basis: resp_val,
             response_deriv_basis: resp_deriv,
             covariate_design,
-            p_cov,
             tensor_penalties,
             monotonicity_constraints,
             initial_beta,
@@ -323,7 +319,6 @@ impl TransformationNormalFamily {
             response_val_basis,
             response_deriv_basis,
             covariate_design,
-            p_cov,
             tensor_penalties,
             monotonicity_constraints,
             initial_beta,

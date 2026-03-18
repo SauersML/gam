@@ -618,17 +618,17 @@ pub struct ExactJeffreysTerm {
 }
 
 impl ExactJeffreysTerm {
-    pub fn new(operator: std::sync::Arc<super::FirthDenseOperator>) -> Self {
+    pub(crate) fn new(operator: std::sync::Arc<super::FirthDenseOperator>) -> Self {
         Self { operator }
     }
 
     #[inline]
-    pub fn value(&self) -> f64 {
+    pub(crate) fn value(&self) -> f64 {
         self.operator.jeffreys_logdet()
     }
 
     #[inline]
-    pub fn operator(&self) -> &super::FirthDenseOperator {
+    pub(crate) fn operator(&self) -> &super::FirthDenseOperator {
         self.operator.as_ref()
     }
 }

@@ -603,11 +603,15 @@ fn firth_jeffreys_logp_and_grad(
         return Ok((0.0, Array1::zeros(data.dim)));
     }
 
-    let op = FirthDenseOperator::build_with_observation_weights(
-        data.x.as_ref(),
-        eta,
-        data.weights.view(),
-    )
+    let op = if data.weights.iter().all(|&w| w == 1.0) {
+        FirthDenseOperator::build(data.x.as_ref(), eta)
+    } else {
+        FirthDenseOperator::build_with_observation_weights(
+            data.x.as_ref(),
+            eta,
+            data.weights.view(),
+        )
+    }
     .map_err(|e| format!("Firth Jeffreys operator failed: {e}"))?;
     Ok(op.jeffreys_logdet_and_beta_gradient())
 }
@@ -1003,7 +1007,7 @@ mod tests {
             seed: 654,
         };
 
-        let err = run_nuts_sampling_flattened_family(
+        let err = match run_nuts_sampling_flattened_family(
             LikelihoodFamily::BinomialProbit,
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
@@ -1015,8 +1019,10 @@ mod tests {
                 firth_bias_reduction: false,
             }),
             &cfg,
-        )
-        .expect_err("non-SPD Hessian should fail after probit routes to the NUTS path");
+        ) {
+            Ok(_) => panic!("non-SPD Hessian should fail after probit routes to the NUTS path"),
+            Err(err) => err,
+        };
 
         assert!(
             err.contains("Hessian Cholesky decomposition failed"),
@@ -1040,7 +1046,7 @@ mod tests {
             seed: 111,
         };
 
-        let err = run_nuts_sampling_flattened_family(
+        let err = match run_nuts_sampling_flattened_family(
             LikelihoodFamily::PoissonLog,
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
@@ -1052,8 +1058,10 @@ mod tests {
                 firth_bias_reduction: true,
             }),
             &cfg,
-        )
-        .expect_err("Poisson Firth should be rejected explicitly");
+        ) {
+            Ok(_) => panic!("Poisson Firth should be rejected explicitly"),
+            Err(err) => err,
+        };
 
         assert!(
             err.contains("NUTS with Firth is only supported for Binomial Logit"),
@@ -1085,16 +1093,20 @@ mod tests {
             likelihood_family: LikelihoodFamily::PoissonLog,
             mode: mode.view(),
             hessian: hessian.view(),
-            penalty_roots: vec![penalty_root],
-            penalty_nullspace_dims: vec![0],
+            penalty_roots: vec![CanonicalPenalty::from_dense_root(
+                penalty_root.clone(),
+                penalty_root.ncols(),
+            )],
             rho_mode: rho_mode.view(),
             nuts_family: NutsFamily::PoissonLog,
             firth_bias_reduction: true,
             trigger_skewness: 0.75,
         };
 
-        let err = run_joint_beta_rho_sampling(&inputs, &cfg)
-            .expect_err("Poisson joint HMC Firth should be rejected explicitly");
+        let err = match run_joint_beta_rho_sampling(&inputs, &cfg) {
+            Ok(_) => panic!("Poisson joint HMC Firth should be rejected explicitly"),
+            Err(err) => err,
+        };
 
         assert!(
             err.contains("Joint HMC with Firth is only supported for Binomial Logit"),
@@ -2846,8 +2858,6 @@ struct JointBetaRhoPosterior {
     n_rho: usize,
     /// Canonical penalties in the transformed basis.
     penalty_canonical: Vec<crate::construction::CanonicalPenalty>,
-    /// Structural nullspace dimension of each penalty matrix.
-    penalty_nullspace_dims: Vec<usize>,
     /// Prior std dev on ρ (weakly informative Gaussian)
     rho_prior_sd: f64,
     /// LAML-converged ρ (used as centering for ρ prior)
@@ -2864,7 +2874,6 @@ impl JointBetaRhoPosterior {
         mode: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
         penalty_canonical: Vec<crate::construction::CanonicalPenalty>,
-        penalty_nullspace_dims: Vec<usize>,
         rho_mode: ArrayView1<f64>,
         nuts_family: NutsFamily,
         firth_enabled: bool,
@@ -2922,7 +2931,6 @@ impl JointBetaRhoPosterior {
             n_beta,
             n_rho,
             penalty_canonical,
-            penalty_nullspace_dims,
             rho_prior_sd,
             rho_mode: rho_mode.to_owned(),
             firth_enabled,
@@ -3069,7 +3077,6 @@ pub struct JointBetaRhoInputs<'a> {
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
     pub penalty_roots: Vec<CanonicalPenalty>,
-    pub penalty_nullspace_dims: Vec<usize>,
     pub rho_mode: ArrayView1<'a, f64>,
     pub nuts_family: NutsFamily,
     pub firth_bias_reduction: bool,
@@ -3113,7 +3120,6 @@ pub fn run_joint_beta_rho_sampling(
         inputs.mode,
         inputs.hessian,
         inputs.penalty_roots.clone(),
-        inputs.penalty_nullspace_dims.clone(),
         inputs.rho_mode,
         inputs.nuts_family,
         inputs.firth_bias_reduction,
