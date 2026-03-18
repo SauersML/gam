@@ -8,7 +8,6 @@ The current CLI supports:
 - Location-scale models (which jointly predict noise)
 - Survival models
 - Various surface models
-- Various 
 - Posterior sampling
 - Rich penalty structures
 - And more
@@ -16,13 +15,12 @@ The current CLI supports:
 ## Differences from other GAM libraries
 - We primarily use REML and LAML.
 - We aim to automatically support all sizes of data.
-- The default penalty structure has seperate penalties for magnitude, gradient, and curvature, instead of the common approach of having one (curvature) or two (curvature, and magnitude + gradient combined).
-- Support for using smooths as offsets from a known function, such that the known function acts as a prior. For example, you may choose to select a probit link with a spline offset, allowing the data to fix link misspecification, while still encoding the belief that probit is approximately correct. This is particularly useful because a flexible link function can fix arbitrary miscalibration of the model, similar to a post-hoc calibration step (but jointly fit). There's also support for smooth offsets from surival model time basis functions.
+- The default penalty structure has separate penalties for magnitude, gradient, and curvature, instead of the common approach of having one (curvature) or two (curvature, and magnitude + gradient combined).
+- Support for using smooths as offsets from a known function, such that the known function acts as a prior. For example, you may choose to select a probit link with a spline offset, allowing the data to fix link misspecification, while still encoding the belief that probit is approximately correct. This is particularly useful because a flexible link function can fix arbitrary miscalibration of the model, similar to a post-hoc calibration step (but jointly fit). There's also support for smooth offsets from survival model time basis functions.
 - Support for surface smooths, such as multidimensional Duchon splines.
 - Adaptive length scaling: the ability to shrink each axis or feature separately, even when they are part of a single, joint smooth.
 - Support for a locally adaptive smoothness penalty, so certain regions can demand faster transitions, while still remaining smooth overall.
-- The ability to mix aspects of different splines categories together. For example, you can have the kernel basis of a Duchon spline, but also have the global kappa scaling of a Matérn spline (if you for some reason wanted to).
-
+- The ability to mix aspects of different spline categories together. For example, you can have the kernel basis of a Duchon spline, but also have the global kappa scaling of a Matern spline (if you for some reason wanted to).
 
 ## Install
 
@@ -36,377 +34,214 @@ curl -fsSL https://raw.githubusercontent.com/SauersML/gam/main/install.sh | bash
 
 ### Build from source
 
-```bash
-cargo build --release --bin gam
-./target/release/gam --help
-```
-
-If `gam` is not on your `PATH`, use `./target/release/gam` in the examples below.
-
-## Command Overview
-
-| Command | Purpose | Required arguments | Output |
-| --- | --- | --- | --- |
-| `gam fit` | Fit a model | `<DATA> <FORMULA>` | No file unless `--out` is provided |
-| `gam predict` | Score new data | `<MODEL> <NEW_DATA>` plus `--out` | Prediction CSV |
-| `gam report` | Build a standalone HTML report | `<MODEL> [DATA] [OUT]` | `[OUT]` or `<model-stem>.report.html` in the current directory |
-| `gam diagnose` | Run terminal diagnostics | `<MODEL> <DATA>` | Prints a diagnostics table |
-| `gam sample` | Draw posterior samples | `<MODEL> <DATA>` | `posterior_samples.csv` by default, plus a summary CSV |
-| `gam generate` | Sample synthetic outcomes conditional on input rows | `<MODEL> <DATA>` | `synthetic.csv` by default |
-
-Aliases:
-
-- `gam train` -> `gam fit`
-- `gam simulate` -> `gam generate`
-
-Inspect full options with:
+Requires [Rust](https://rustup.rs/).
 
 ```bash
-gam <command> --help
+git clone https://github.com/SauersML/gam.git
+cd gam
+cargo build --release
 ```
 
-## Verified Quickstart
+The binary is at `./target/release/gam`. Add it to your `PATH` or use the full path in the examples below.
 
-These commands were checked against the current binary and the checked-in `lidar` dataset.
+## Quick start
 
 ```bash
-# 1) Fit a Gaussian GAM
-gam fit bench/datasets/lidar.csv \
-  'logratio ~ smooth(range)' \
-  --out lidar.model.json
+# Fit a smooth to the lidar dataset
+gam fit bench/datasets/lidar.csv 'logratio ~ smooth(range)' --out model.json
 
-# 2) Predict with uncertainty
-gam predict lidar.model.json bench/datasets/lidar.csv \
-  --out lidar.pred.csv --uncertainty
+# Predict with uncertainty intervals
+gam predict model.json bench/datasets/lidar.csv --out predictions.csv --uncertainty
 
-# 3) Build an HTML report
-gam report lidar.model.json bench/datasets/lidar.csv
-# writes: lidar.model.report.html
+# Build a standalone HTML report
+gam report model.json bench/datasets/lidar.csv
 
-# 4) Generate synthetic response draws
-gam generate lidar.model.json bench/datasets/lidar.csv \
-  --n-draws 3 \
-  --out lidar.synthetic.csv
+# Draw posterior samples
+gam sample model.json bench/datasets/lidar.csv --out samples.csv
+
+# Generate synthetic response draws
+gam generate model.json bench/datasets/lidar.csv --n-draws 5 --out synthetic.csv
 ```
 
-## Formula Language
+## Commands
 
-`gam fit` expects:
+| Command | What it does | Usage |
+| --- | --- | --- |
+| `fit` | Fit a model | `gam fit <DATA> <FORMULA> [--out model.json]` |
+| `predict` | Score new data | `gam predict <MODEL> <DATA> --out predictions.csv` |
+| `report` | Standalone HTML report | `gam report <MODEL> [DATA] [OUT]` |
+| `diagnose` | Terminal diagnostics | `gam diagnose <MODEL> <DATA>` |
+| `sample` | Posterior draws (NUTS) | `gam sample <MODEL> <DATA> [--out samples.csv]` |
+| `generate` | Synthetic outcomes | `gam generate <MODEL> <DATA> [--out synthetic.csv]` |
 
-```text
+`train` is an alias for `fit`. `simulate` is an alias for `generate`.
+
+Run `gam <command> --help` for full options.
+
+## Formula language
+
+```
 response ~ term + term + ...
 ```
 
-Response forms:
+### Response
 
-- Standard regression/classification: `y`
-- Survival: `Surv(entry, exit, event)`
+- Continuous or binary: `y`
+- Survival: `Surv(entry_time, exit_time, event)`
 
-Important constraints:
+### Terms
 
-- `Surv(...)` currently requires exactly three columns
-- Intercept removal (`0` or `-1`) is not supported
-- At most one `link(...)`, one `linkwiggle(...)`, one `timewiggle(...)`, and one `survmodel(...)` may appear in a formula
+**Linear and constrained coefficients:**
 
-### Bare RHS terms
+| Syntax | Effect |
+| --- | --- |
+| `x` or `linear(x)` | Penalized linear term |
+| `linear(x, min=0)` | Non-negative coefficient |
+| `linear(x, min=..., max=...)` | Box-constrained coefficient |
+| `nonnegative(x)` | Sugar for `linear(x, min=0)` |
+| `nonpositive(x)` | Sugar for `linear(x, max=0)` |
+| `bounded(x, min=0, max=1)` | Exact interval transform (no ridge) |
+| `bounded(x, ..., prior=uniform)` | Flat prior on bounded scale |
+| `bounded(x, ..., target=0.5, strength=3)` | Informative interior prior |
 
-A bare column on the right-hand side is interpreted from the training schema:
+**Random effects:**
 
-- Continuous or binary column: penalized linear term
-- Categorical column: random-effect block
+| Syntax | Effect |
+| --- | --- |
+| `group(id)` or `re(id)` | Random intercept per level of `id` |
 
-### Term wrappers
+**Smooths:**
 
-Linear and constrained coefficients:
+| Syntax | Default basis |
+| --- | --- |
+| `smooth(x)` or `s(x)` | P-spline (B-spline + difference penalty) |
+| `smooth(x1, x2)` | Thin-plate spline |
+| `thinplate(x1, x2)` or `tps(x1, x2)` | Thin-plate spline |
+| `matern(x1, x2, ...)` | Matern radial basis |
+| `duchon(x1, x2, ...)` | Duchon spline (scale-free) |
+| `tensor(x, z)` or `te(x, z)` | Tensor-product B-splines |
 
-- `linear(x)`
-- `linear(x, min=..., max=...)`
-- `constrain(x, min=..., max=...)`
-- `nonnegative(x)` / `nonnegative_coef(x)`
-- `nonpositive(x)` / `nonpositive_coef(x)`
-- `bounded(x, min=..., max=...)`
+Common smooth options: `knots=`, `k=`, `centers=`, `degree=`, `penalty_order=`, `double_penalty=true|false`, `type=ps|tps|matern|duchon`.
 
-`bounded(...)` also supports:
+Spatial smooths support per-axis anisotropy via `scale_dims=true` or the global `--scale-dimensions` flag.
 
-- `prior=none|uniform|log-jacobian|center`
-- `beta_a=..., beta_b=...`
-- `target=..., strength=...`
+**Formula-level configuration:**
 
-Random effects:
+| Syntax | Effect |
+| --- | --- |
+| `link(type=logit)` | Set link function |
+| `linkwiggle(knots=10)` | Spline deviation from the base link |
+| `timewiggle(knots=8)` | Spline deviation from the time basis (survival) |
+| `survmodel(spec=net, distribution=gaussian)` | Survival model configuration |
 
-- `group(x)` or `re(x)`
+### Auto-detection
 
-Smooths:
+- Binary `{0, 1}` response: binomial with logit link
+- Everything else: Gaussian with identity link
+- Override with `link(type=...)` in the formula
 
-- `smooth(...)` or `s(...)`
-- `thinplate(...)`, `thin_plate(...)`, `tps(...)`
-- `matern(...)`
-- `duchon(...)`
-- `tensor(...)`, `interaction(...)`, `te(...)`
+## Fit modes
 
-Formula-level configuration terms:
-
-- `link(type=...)`
-- `linkwiggle(...)`
-- `timewiggle(...)`
-- `survmodel(spec=..., distribution=...)`
-
-### Smooth defaults
-
-- `smooth(x)` with one variable defaults to a B-spline / P-spline style basis
-- `smooth(x1, x2, ...)` defaults to thin-plate
-- `te(...)` defaults to tensor-product B-splines
-
-Notable smooth options:
-
-- B-spline: `degree`, `knots`, `k`, `penalty_order`
-- Thin-plate: `centers` or `k`
-- Matérn: `centers` or `k`, `nu`, `length_scale`
-- Duchon: `centers` or `k`, `power`, `order`, optional `length_scale`
-- Tensor: `k` / `basis_dim` for marginal basis size
-
-Spatial smooths can use per-axis anisotropy:
-
-- Global CLI flag: `--scale-dimensions`
-- Per-term override: `scale_dims=true` or `scale_dims=false`
-
-## Fit Modes
-
-### 1. Standard mean-only fits
+### Standard
 
 ```bash
-gam fit train.csv 'y ~ age + smooth(bmi) + group(site)' --out model.json
+gam fit data.csv 'y ~ age + smooth(bmi) + group(site)' --out model.json
 ```
 
-Auto family resolution:
-
-- Binary `{0,1}` response -> binomial logit
-- Anything else -> gaussian identity
-- `--predict-noise` does not change that default; write `link(type=probit)` (or another explicit link) in the mean formula when you want a different binomial base link
-
-### 2. Location-scale fits
-
-Use a second formula for the scale/noise block:
+### Location-scale (jointly model noise)
 
 ```bash
-gam fit train.csv 'y ~ x1 + smooth(x2)' \
+gam fit data.csv 'y ~ smooth(x1) + smooth(x2)' \
   --predict-noise 'y ~ smooth(x1)' \
-  --out locscale.model.json
+  --out model.json
 ```
 
-If you want a probit-vs-probit comparison between mean-only and location-scale
-fits, declare the link explicitly in both formulas:
+Works for Gaussian and binomial families. For survival formulas, `--predict-noise` routes to the survival location-scale fitter.
+
+### Survival
 
 ```bash
-gam fit train.csv 'y ~ x1 + smooth(x2) + link(type=probit)' \
-  --out probit.model.json
-
-gam fit train.csv 'y ~ x1 + smooth(x2) + link(type=probit)' \
-  --predict-noise 'y ~ smooth(x1)' \
-  --out probit.locscale.model.json
-```
-
-The CLI exposes this path for Gaussian and binomial families, and for `Surv(...)` formulas it routes into the survival location-scale fitter. Runtime behavior is still uneven enough that you should treat it as experimental and verify it on your exact formula/data combination before relying on it.
-
-### 3. Survival fits
-
-Use `Surv(entry, exit, event)` on the left-hand side:
-
-```bash
-gam fit train.csv \
-  'Surv(entry_time, exit_time, event) ~ age + smooth(bmi) + survmodel(spec=net, distribution=gaussian)' \
+gam fit data.csv \
+  'Surv(t0, t1, event) ~ age + smooth(bmi) + survmodel(spec=net, distribution=gaussian)' \
   --survival-likelihood transformation \
-  --out survival.model.json
+  --out model.json
 ```
 
-Current survival likelihood modes:
+Likelihood modes: `transformation`, `weibull`, `location-scale`.
 
-- `transformation`
-- `weibull`
-- `location-scale`
-
-Distributional survival fits can use a second formula for log-sigma:
+Add `--predict-noise` for distributional (location-scale) survival:
 
 ```bash
-gam fit train.csv \
-  'Surv(entry_time, exit_time, event) ~ age + smooth(bmi) + survmodel(spec=net, distribution=gaussian)' \
-  --predict-noise 'Surv(entry_time, exit_time, event) ~ smooth(age)' \
-  --out survival-ls.model.json
+gam fit data.csv \
+  'Surv(t0, t1, event) ~ age + smooth(bmi) + survmodel(spec=net, distribution=gaussian)' \
+  --predict-noise 'Surv(t0, t1, event) ~ smooth(age)' \
+  --out model.json
 ```
 
-When `--predict-noise` is present on a `Surv(...)` formula, the CLI uses the survival `location-scale` fit path.
+### Bernoulli marginal-slope
 
-Current survival-specific formula/config support:
-
-- `survmodel(spec=net, distribution=...)`
-- `timewiggle(...)`
-- `link(...)`
-- `linkwiggle(...)` only in supported survival sub-modes
-
-### 4. Bernoulli marginal-slope fits
-
-This is an advanced binary-response mode that adds a second formula for the log-slope surface plus an auxiliary standardized score column:
+Binary response with a second formula for the log-slope surface:
 
 ```bash
-gam fit scores.csv \
+gam fit data.csv \
   'case ~ smooth(age) + matern(pc1, pc2, pc3)' \
   --logslope-formula 'case ~ matern(pc1, pc2, pc3)' \
   --z-column prs_z \
-  --out marginal.model.json
+  --out model.json
 ```
 
-Current restrictions:
+## Link functions
 
-- Response must be binary `{0,1}`
-- `--predict-noise` is not allowed
-- `--firth` is not allowed
-- `link(...)` and `linkwiggle(...)` are not allowed in this family or in `--logslope-formula`
+Set via `link(type=...)` in the formula.
 
-## Link Functions
+| Link | Syntax |
+| --- | --- |
+| Identity | `link(type=identity)` |
+| Logit | `link(type=logit)` |
+| Probit | `link(type=probit)` |
+| Complementary log-log | `link(type=cloglog)` |
+| SAS (sinh-arcsinh) | `link(type=sas)` |
+| Beta-logistic | `link(type=beta-logistic)` |
+| Blended mixture | `link(type=blended(logit, probit))` |
+| Flexible (data-driven) | `link(type=flexible(logit))` |
 
-Links are configured in-formula via `link(type=...)`.
+Flexible links add a spline offset to the base link, letting the data correct for link misspecification.
 
-Supported `type` values:
+## Prediction output
 
-- `identity`
-- `logit`
-- `probit`
-- `cloglog`
-- `sas`
-- `beta-logistic`
-- `blended(a,b,...)` / `mixture(a,b,...)`
-- `flexible(<single-link>)`
-- `flexible(blended(...))`
+| Model type | Default columns | With `--uncertainty` |
+| --- | --- | --- |
+| Standard / binomial | `eta, mean` | `+ effective_se, mean_lower, mean_upper` |
+| Gaussian location-scale | `eta, mean, sigma` | `+ mean_lower, mean_upper` |
+| Survival | `eta, mean, survival_prob, risk_score, failure_prob` | `+ effective_se, mean_lower, mean_upper` |
 
-Advanced link parameters:
+## Other outputs
 
-- `rho=` for blended/mixture links
-- `sas_init="epsilon,log_delta"`
-- `beta_logistic_init="epsilon,delta"`
+**`gam report`** writes a standalone HTML file with model summary, smooth plots, and diagnostics. Pass training data for data-dependent diagnostics.
 
-## Output and Data Semantics
+**`gam sample`** writes posterior draws (`beta_0, beta_1, ...`) and a summary CSV. Uses NUTS (No-U-Turn Sampler).
 
-### Saved models
+**`gam generate`** writes a matrix of synthetic outcomes (rows = draws, columns = data rows).
 
-- `gam fit` writes nothing unless `--out` is provided
-- Saved model JSON includes training schema and header metadata
-- Prediction-like commands reload new data using that saved schema
-- If a model predates current metadata requirements, refit it with the current CLI
-
-### Prediction CSV schema
-
-Standard and Bernoulli marginal-slope models:
-
-- default: `eta,mean`
-- with `--uncertainty`: `eta,mean,effective_se,mean_lower,mean_upper`
-
-Gaussian location-scale models, when the fit path succeeds:
-
-- default: `eta,mean,sigma`
-- with `--uncertainty`: `eta,mean,sigma,mean_lower,mean_upper`
-
-Survival models:
-
-- default: `eta,mean,survival_prob,risk_score,failure_prob`
-- with `--uncertainty`: `eta,mean,survival_prob,risk_score,failure_prob,effective_se,mean_lower,mean_upper`
-
-Notes:
-
-- In survival output, `mean` is the same quantity as `survival_prob`
-- `risk_score` is risk-oriented and currently tracks the linear predictor direction
-- `effective_se` is estimator uncertainty, not observation noise
-
-### Sampling output
-
-`gam sample` writes:
-
-- Raw draws CSV with columns `beta_0`, `beta_1`, ...
-- A second summary CSV at `<out with extension summary.csv>`
-
-Defaults when `--out` is omitted:
-
-- Draws: `posterior_samples.csv`
-- Summary: `posterior_samples.summary.csv`
-
-Current sampling support:
-
-- Standard models
-- Survival models on the non-location-scale path
-
-Not currently available for:
-
-- Gaussian location-scale models
-- Binomial location-scale models
-- Bernoulli marginal-slope models
-
-### Synthetic generation output
-
-`gam generate` writes a numeric matrix:
-
-- One row per sampled dataset
-- One column per conditioning-data row
-- Column names are `draw_0`, `draw_1`, ... indexed by input row position
-
-Defaults when `--out` is omitted:
-
-- `synthetic.csv`
-
-Not currently available for:
-
-- Survival models
-- Bernoulli marginal-slope models
-
-### Report output
-
-`gam report <MODEL> [DATA] [OUT]` writes:
-
-- `[OUT]` if provided
-- Otherwise `<model-stem>.report.html` in the current working directory
-
-The report is standalone HTML. With data input it includes data-dependent diagnostics; without data input those sections are omitted.
-
-### Schema compatibility
-
-Prediction, reporting, sampling, and generation expect the new data to match the saved training schema:
-
-- Column names must match
-- Column types must match
-- Unseen categorical levels are treated as errors
-
-## Current CLI Limitations
-
-- `diagnose` currently only exposes `--alo`
-- `diagnose --alo` is not supported for models containing `bounded(...)` coefficients
-- `--predict-noise` is exposed in the CLI, but current Gaussian, binomial, and survival location-scale fits still have rough edges; verify behavior on your exact workload before depending on that path
-- `linkwiggle(...)` belongs in the mean formula, not `--predict-noise`
-- Flexible links are only supported in specific binomial and survival paths
-- Some benchmark datasets in `bench/datasets/` are meant for harness scenarios rather than copy-paste README demos
+**`gam diagnose`** prints terminal diagnostics. Supports `--alo` for approximate leave-one-out.
 
 ## Development
-
-Common local checks:
 
 ```bash
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
-cargo test --all-features -- --nocapture
+cargo test --all-features
 ```
 
-Benchmark harness:
+Benchmark suite:
 
 ```bash
 python3 bench/run_suite.py --help
 python3 bench/run_suite.py
 ```
 
-Repository layout:
+Layout:
 
-- `src/`: CLI, model code, fitting/inference, smooth construction, and survival machinery
-- `bench/`: benchmark harness, scenario configs, datasets, and comparison tooling
-- `tests/`: Rust integration tests plus benchmark helper tools
-
-Lean checks for the Rust-matched `.lean` files under `src/`:
-
-```bash
-./scripts/lean-check-all.sh
-```
+- `src/` -- CLI, fitting engine, inference, smooth construction, survival machinery
+- `bench/` -- benchmark harness, scenario configs, datasets, comparison tooling
+- `tests/` -- integration tests
