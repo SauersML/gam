@@ -16,12 +16,14 @@ use crate::families::gamlss::{
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
 use crate::families::survival_location_scale::{
-    SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
+    DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalLocationScaleTermFitResult,
+    SurvivalLocationScaleTermSpec,
     fit_survival_location_scale_terms, fit_survival_location_scale_terms_with_selected_wiggle,
     select_survival_link_wiggle_basis_from_pilot,
 };
 use crate::families::survival_marginal_slope::{
-    SurvivalMarginalSlopeFitResult, SurvivalMarginalSlopeTermSpec,
+    DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeFitResult,
+    SurvivalMarginalSlopeTermSpec,
     fit_survival_marginal_slope_terms,
 };
 use crate::families::transformation_normal::{
@@ -89,6 +91,14 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
     pub optimize_inverse_link: bool,
 }
 
+pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> bool {
+    match link {
+        InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => true,
+        InverseLink::Mixture(state) => !state.rho.is_empty(),
+        InverseLink::Standard(_) => false,
+    }
+}
+
 pub struct BernoulliMarginalSlopeFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: BernoulliMarginalSlopeTermSpec,
@@ -138,6 +148,28 @@ pub struct SurvivalLocationScaleFitResult {
     pub inverse_link: InverseLink,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
+}
+
+struct SurvivalLocationScaleProfile {
+    fit: SurvivalLocationScaleTermFitResult,
+    inverse_link: InverseLink,
+    wiggle_knots: Option<Array1<f64>>,
+    wiggle_degree: Option<usize>,
+}
+
+impl SurvivalLocationScaleProfile {
+    fn objective(&self) -> f64 {
+        self.fit.fit.reml_score
+    }
+
+    fn into_result(self) -> SurvivalLocationScaleFitResult {
+        SurvivalLocationScaleFitResult {
+            fit: self.fit,
+            inverse_link: self.inverse_link,
+            wiggle_knots: self.wiggle_knots,
+            wiggle_degree: self.wiggle_degree,
+        }
+    }
 }
 
 pub enum FitResult {
@@ -378,21 +410,18 @@ fn fit_binomial_location_scale_model(
 fn fit_survival_location_scale_model(
     request: SurvivalLocationScaleFitRequest<'_>,
 ) -> Result<SurvivalLocationScaleFitResult, String> {
-    fn fit_survival_with_link(
+    // Profile one coherent survival subproblem at a fixed inverse-link state:
+    // select/apply the link-wiggle basis for that state, then solve the full
+    // penalized location-scale fit on the resulting model.
+    fn profile_survival_location_scale(
         data: ArrayView2<'_, f64>,
         spec: SurvivalLocationScaleTermSpec,
         wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<
-        (
-            SurvivalLocationScaleTermFitResult,
-            Option<Array1<f64>>,
-            Option<usize>,
-        ),
-        String,
-    > {
+    ) -> Result<SurvivalLocationScaleProfile, String> {
         let mut wiggle_knots = None;
         let mut wiggle_degree = None;
+        let inverse_link = spec.inverse_link.clone();
 
         let fit = if let Some(wiggle) = wiggle {
             let mut pilot_spec = spec.clone();
@@ -420,24 +449,42 @@ fn fit_survival_location_scale_model(
             fit_survival_location_scale_terms(data, spec, kappa_options)?
         };
 
-        Ok((fit, wiggle_knots, wiggle_degree))
+        Ok(SurvivalLocationScaleProfile {
+            fit,
+            inverse_link,
+            wiggle_knots,
+            wiggle_degree,
+        })
     }
 
-    fn optimize_survival_inverse_link(
+    fn profile_survival_location_scale_with_inverse_link(
+        data: ArrayView2<'_, f64>,
+        spec: &SurvivalLocationScaleTermSpec,
+        inverse_link: InverseLink,
+        wiggle: Option<LinkWiggleConfig>,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<SurvivalLocationScaleProfile, String> {
+        let mut spec_at_link = spec.clone();
+        spec_at_link.inverse_link = inverse_link;
+        profile_survival_location_scale(data, spec_at_link, wiggle, kappa_options)
+    }
+
+    fn optimize_survival_inverse_link_profile(
         data: ArrayView2<'_, f64>,
         spec: &SurvivalLocationScaleTermSpec,
         wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<InverseLink, String> {
+    ) -> Result<SurvivalLocationScaleProfile, String> {
         let optimize_link_parameters = |init: Array1<f64>,
                                         name: &str,
+                                        final_wiggle: Option<LinkWiggleConfig>,
                                         mut objective: Box<
             dyn FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
         >,
                                         recover: Box<
             dyn Fn(&Array1<f64>) -> Option<InverseLink>,
         >|
-         -> Option<InverseLink> {
+         -> Result<Option<SurvivalLocationScaleProfile>, String> {
             let dim = init.len();
             let mut seed_config = crate::seeding::SeedConfig::default();
             seed_config.max_seeds = 8;
@@ -459,16 +506,23 @@ fn fit_survival_location_scale_model(
                             result.converged,
                             result.final_value
                         );
-                        Some(link)
+                        profile_survival_location_scale_with_inverse_link(
+                            data,
+                            spec,
+                            link,
+                            final_wiggle.clone(),
+                            kappa_options,
+                        )
+                        .map(Some)
                     } else {
-                        None
+                        Ok(None)
                     }
                 }
                 Err(err) => {
                     eprintln!(
                         "[survival link opt] {name} optimization failed; using initial params: {err}"
                     );
-                    None
+                    Ok(None)
                 }
             }
         };
@@ -477,27 +531,27 @@ fn fit_survival_location_scale_model(
             InverseLink::Sas(state0) => {
                 let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
                 let wiggle_cfg = wiggle.clone();
-                Ok(optimize_link_parameters(
+                let optimized = optimize_link_parameters(
                     init,
                     "SAS",
+                    wiggle.clone(),
                     Box::new(|theta: &Array1<f64>| {
                         let state = state_from_sasspec(SasLinkSpec {
                             initial_epsilon: theta[0],
                             initial_log_delta: theta[1],
                         })
                         .map_err(EstimationError::InvalidInput)?;
-                        let mut spec_at_theta = spec.clone();
-                        spec_at_theta.inverse_link = InverseLink::Sas(state);
-                        Ok(fit_survival_with_link(
-                            data,
-                            spec_at_theta,
-                            wiggle_cfg.clone(),
-                            kappa_options,
+                        Ok(
+                            profile_survival_location_scale_with_inverse_link(
+                                data,
+                                spec,
+                                InverseLink::Sas(state),
+                                wiggle_cfg.clone(),
+                                kappa_options,
+                            )
+                            .map_err(EstimationError::InvalidInput)?
+                            .objective(),
                         )
-                        .map_err(EstimationError::InvalidInput)?
-                        .0
-                        .fit
-                        .reml_score)
                     }),
                     Box::new(|rho| {
                         state_from_sasspec(SasLinkSpec {
@@ -507,33 +561,37 @@ fn fit_survival_location_scale_model(
                         .ok()
                         .map(InverseLink::Sas)
                     }),
-                )
-                .unwrap_or(spec.inverse_link.clone()))
+                )?;
+                if let Some(profile) = optimized {
+                    Ok(profile)
+                } else {
+                    profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options)
+                }
             }
             InverseLink::BetaLogistic(state0) => {
                 let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
                 let wiggle_cfg = wiggle.clone();
-                Ok(optimize_link_parameters(
+                let optimized = optimize_link_parameters(
                     init,
                     "BetaLogistic",
+                    wiggle.clone(),
                     Box::new(|theta: &Array1<f64>| {
                         let state = state_from_beta_logisticspec(SasLinkSpec {
                             initial_epsilon: theta[0],
                             initial_log_delta: theta[1],
                         })
                         .map_err(EstimationError::InvalidInput)?;
-                        let mut spec_at_theta = spec.clone();
-                        spec_at_theta.inverse_link = InverseLink::BetaLogistic(state);
-                        Ok(fit_survival_with_link(
-                            data,
-                            spec_at_theta,
-                            wiggle_cfg.clone(),
-                            kappa_options,
+                        Ok(
+                            profile_survival_location_scale_with_inverse_link(
+                                data,
+                                spec,
+                                InverseLink::BetaLogistic(state),
+                                wiggle_cfg.clone(),
+                                kappa_options,
+                            )
+                            .map_err(EstimationError::InvalidInput)?
+                            .objective(),
                         )
-                        .map_err(EstimationError::InvalidInput)?
-                        .0
-                        .fit
-                        .reml_score)
                     }),
                     Box::new(|rho| {
                         state_from_beta_logisticspec(SasLinkSpec {
@@ -543,34 +601,38 @@ fn fit_survival_location_scale_model(
                         .ok()
                         .map(InverseLink::BetaLogistic)
                     }),
-                )
-                .unwrap_or(spec.inverse_link.clone()))
+                )?;
+                if let Some(profile) = optimized {
+                    Ok(profile)
+                } else {
+                    profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options)
+                }
             }
             InverseLink::Mixture(state0) if !state0.rho.is_empty() => {
                 let components = state0.components.clone();
                 let components_recover = components.clone();
                 let wiggle_cfg = wiggle.clone();
-                Ok(optimize_link_parameters(
+                let optimized = optimize_link_parameters(
                     state0.rho.clone(),
                     "mixture",
+                    wiggle.clone(),
                     Box::new(move |rho: &Array1<f64>| {
                         let state = state_fromspec(&MixtureLinkSpec {
                             components: components.clone(),
                             initial_rho: rho.clone(),
                         })
                         .map_err(EstimationError::InvalidInput)?;
-                        let mut spec_at_theta = spec.clone();
-                        spec_at_theta.inverse_link = InverseLink::Mixture(state);
-                        Ok(fit_survival_with_link(
-                            data,
-                            spec_at_theta,
-                            wiggle_cfg.clone(),
-                            kappa_options,
+                        Ok(
+                            profile_survival_location_scale_with_inverse_link(
+                                data,
+                                spec,
+                                InverseLink::Mixture(state),
+                                wiggle_cfg.clone(),
+                                kappa_options,
+                            )
+                            .map_err(EstimationError::InvalidInput)?
+                            .objective(),
                         )
-                        .map_err(EstimationError::InvalidInput)?
-                        .0
-                        .fit
-                        .reml_score)
                     }),
                     Box::new(move |rho| {
                         state_fromspec(&MixtureLinkSpec {
@@ -580,34 +642,34 @@ fn fit_survival_location_scale_model(
                         .ok()
                         .map(InverseLink::Mixture)
                     }),
-                )
-                .unwrap_or(spec.inverse_link.clone()))
+                )?;
+                if let Some(profile) = optimized {
+                    Ok(profile)
+                } else {
+                    profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options)
+                }
             }
-            _ => Ok(spec.inverse_link.clone()),
+            _ => profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options),
         }
     }
 
-    let inverse_link = if request.optimize_inverse_link {
-        optimize_survival_inverse_link(
+    let profile = if request.optimize_inverse_link {
+        optimize_survival_inverse_link_profile(
             request.data,
             &request.spec,
             request.wiggle.clone(),
             &request.kappa_options,
         )?
     } else {
-        request.spec.inverse_link.clone()
+        profile_survival_location_scale(
+            request.data,
+            request.spec.clone(),
+            request.wiggle.clone(),
+            &request.kappa_options,
+        )?
     };
-    let mut spec = request.spec;
-    spec.inverse_link = inverse_link.clone();
-    let (fit, wiggle_knots, wiggle_degree) =
-        fit_survival_with_link(request.data, spec, request.wiggle, &request.kappa_options)?;
 
-    Ok(SurvivalLocationScaleFitResult {
-        fit,
-        inverse_link,
-        wiggle_knots,
-        wiggle_degree,
-    })
+    Ok(profile.into_result())
 }
 
 fn fit_bernoulli_marginal_slope_model(
@@ -1170,8 +1232,7 @@ fn materialize_survival<'a>(
                 event_target: event,
                 weights: Array1::ones(n),
                 inverse_link: survival_inverse_link,
-                derivative_guard: 1e-6,
-                derivative_softness: 0.0,
+                derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
                 time_anchor: None,
                 max_iter: 200,
                 tol: 1e-7,
@@ -1194,7 +1255,9 @@ fn materialize_survival<'a>(
                         double_penalty: cfg.double_penalty,
                     }),
                     kappa_options,
-                    optimize_inverse_link: true,
+                    optimize_inverse_link: survival_inverse_link_has_free_parameters(
+                        &spec.inverse_link,
+                    ),
                 }),
                 inference_notes,
             })
@@ -1219,7 +1282,7 @@ fn materialize_survival<'a>(
                 event_target: event,
                 weights: Array1::ones(n),
                 z,
-                derivative_guard: 1e-6,
+                derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                 time_block,
                 logslopespec,
             };

@@ -2303,7 +2303,7 @@ where
             match approach {
                 EstimationApproach::Reml => {}
                 EstimationApproach::JointHmc => {
-                    let firth_bias_reduction = selected_pirls_res.firth_log_det().is_some();
+                    let firth_bias_reduction = selected_pirls_res.jeffreys_logdet().is_some();
                     if firth_bias_reduction && !opts.family.supports_firth() {
                         return Err(EstimationError::InvalidInput(format!(
                             "joint HMC Firth refinement requires a Firth-supported family; {} does not support it",

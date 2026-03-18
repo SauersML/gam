@@ -608,6 +608,31 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
     }
 }
 
+/// Exact Jeffreys/Firth term used by the unified outer evaluator.
+///
+/// The scalar contribution and all outer derivatives must be sourced from the
+/// same operator in the same coefficient basis.
+#[derive(Clone)]
+pub struct ExactJeffreysTerm {
+    operator: std::sync::Arc<super::FirthDenseOperator>,
+}
+
+impl ExactJeffreysTerm {
+    pub fn new(operator: std::sync::Arc<super::FirthDenseOperator>) -> Self {
+        Self { operator }
+    }
+
+    #[inline]
+    pub fn value(&self) -> f64 {
+        self.operator.jeffreys_logdet()
+    }
+
+    #[inline]
+    pub fn operator(&self) -> &super::FirthDenseOperator {
+        self.operator.as_ref()
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Log-barrier support for constrained coefficients
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2129,14 +2154,8 @@ pub struct InnerSolution<'dp> {
     /// Gradient of the TK correction with respect to ρ.
     pub tk_gradient: Option<Array1<f64>>,
 
-    /// Firth/Jeffreys prior log-determinant contribution.
-    pub firth_logdet: f64,
-
-    /// Optional Firth dense operator for computing Firth gradient and Hessian
-    /// contributions internally. When present, `reml_laml_evaluate` and
-    /// `compute_outer_hessian` compute the Firth gradient ∂Φ/∂ρ and Hessian
-    /// ∂²Φ/∂ρ² inline, eliminating the need for callers to pre-compute them.
-    pub(crate) firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+    /// Optional exact Jeffreys/Firth term in the active coefficient basis.
+    pub firth: Option<ExactJeffreysTerm>,
 
     // === Model dimensions ===
     /// Number of observations.
@@ -2188,8 +2207,7 @@ pub struct InnerSolutionBuilder<'dp> {
     deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
     tk_correction: f64,
     tk_gradient: Option<Array1<f64>>,
-    firth_logdet: f64,
-    firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+    firth: Option<ExactJeffreysTerm>,
     nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
     ext_coords: Vec<HyperCoord>,
@@ -2223,8 +2241,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
             tk_gradient: None,
-            firth_logdet: 0.0,
-            firth_op: None,
+            firth: None,
             nullspace_dim_override: None,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -2245,13 +2262,8 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    pub fn firth(
-        mut self,
-        logdet: f64,
-        op: Option<std::sync::Arc<super::FirthDenseOperator>>,
-    ) -> Self {
-        self.firth_logdet = logdet;
-        self.firth_op = op;
+    pub fn firth(mut self, op: Option<std::sync::Arc<super::FirthDenseOperator>>) -> Self {
+        self.firth = op.map(ExactJeffreysTerm::new);
         self
     }
 
@@ -2318,8 +2330,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             deriv_provider: self.deriv_provider,
             tk_correction: self.tk_correction,
             tk_gradient: self.tk_gradient,
-            firth_logdet: self.firth_logdet,
-            firth_op: self.firth_op,
+            firth: self.firth,
             n_observations: self.n_observations,
             nullspace_dim,
             dispersion: self.dispersion,
@@ -2533,7 +2544,7 @@ pub fn reml_laml_evaluate(
                 cost += 0.5 * log_det_h
                     + (solution.nullspace_dim / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
                     + solution.tk_correction
-                    + solution.firth_logdet;
+                    + solution.firth.as_ref().map_or(0.0, ExactJeffreysTerm::value);
             }
             if *include_logdet_s {
                 cost -= 0.5 * log_det_s;
@@ -2613,7 +2624,7 @@ pub fn reml_laml_evaluate(
         .zip(lambdas.iter().copied())
         .map(|(coord, lambda)| penalty_a_k_beta(coord, &solution.beta, lambda))
         .collect();
-    let need_rho_v = effective_deriv.has_corrections() || solution.firth_op.is_some();
+    let need_rho_v = effective_deriv.has_corrections() || solution.firth.is_some();
     let rho_v_ks: Option<Vec<Array1<f64>>> = if need_rho_v {
         Some(
             rho_a_k_betas
@@ -2899,7 +2910,8 @@ pub fn reml_laml_evaluate(
     // Computed internally from the FirthDenseOperator when present. The mode
     // response v_k = H⁻¹(A_k β̂) is re-derived here (cheap relative to the
     // trace computation) to avoid storing intermediate vectors.
-    if let Some(ref firth_op) = solution.firth_op {
+    if let Some(ref firth) = solution.firth {
+        let firth_op = firth.operator();
         for idx in 0..k {
             let v_k = &rho_v_ks
                 .as_ref()
@@ -3717,14 +3729,14 @@ fn compute_outer_hessian(
         }
     }
 
-    // ── Firth Hessian contribution (computed internally from firth_op) ──
+    // ── Firth Hessian contribution (computed internally from the exact Jeffreys term) ──
     //
     // ∂²Φ/∂ρₖ∂ρₗ is computed using the precomputed v_ks, h_k_matrices,
     // a_k_betas, and penalty_coords that are already available. This replaces
     // the formerly caller-injected Firth Hessian.
-    if let Some(ref firth_op) = solution.firth_op {
+    if let Some(ref firth) = solution.firth {
         let fh = compute_firth_hessian_contribution(
-            firth_op,
+            firth.operator(),
             hop,
             &solution.beta,
             &v_ks,
@@ -6586,8 +6598,7 @@ mod tests {
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
             tk_gradient: None,
-            firth_logdet: 0.0,
-            firth_op: None,
+            firth: None,
             n_observations: 100,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
@@ -6712,8 +6723,7 @@ mod tests {
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
             tk_gradient: None,
-            firth_logdet: 0.0,
-            firth_op: None,
+            firth: None,
             n_observations: n,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,

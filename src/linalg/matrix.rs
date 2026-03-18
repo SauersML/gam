@@ -310,19 +310,7 @@ impl AsRef<SparseColMat<usize, f64>> for SparseDesignMatrix {
 /// etc.) that can perform matvecs and Gram-matrix assembly without forming the
 /// full dense matrix.  Wrap implementations in `DesignMatrix::Operator(Arc<..>)`
 /// to integrate them with the rest of the codebase.
-pub trait DesignOperator: Send + Sync {
-    fn nrows(&self) -> usize;
-    fn ncols(&self) -> usize;
-    fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
-    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
-    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
-
-    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
-        // Default: extract diagonal of X'WX.
-        let xtwx = self.diag_xtw_x(weights)?;
-        Ok(Array1::from_iter((0..self.ncols()).map(|j| xtwx[[j, j]])))
-    }
-
+pub trait DesignOperator: LinearOperator + Send + Sync {
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         // Default: X'(w ⊙ y) via apply_transpose.
         let n = self.nrows();
@@ -370,32 +358,6 @@ pub trait DesignOperator: Send + Sync {
             start = end;
         }
         Ok(out)
-    }
-
-    fn apply_weighted_normal(
-        &self,
-        weights: &Array1<f64>,
-        vector: &Array1<f64>,
-        penalty: Option<&Array2<f64>>,
-        ridge: f64,
-    ) -> Array1<f64> {
-        let xv = self.apply(vector);
-        let mut weighted = xv;
-        for i in 0..weighted.len() {
-            weighted[i] *= weights[i].max(0.0);
-        }
-        let mut out = self.apply_transpose(&weighted);
-        if let Some(pen) = penalty {
-            out += &pen.dot(vector);
-        }
-        if ridge > 0.0 {
-            out += &vector.mapv(|x| ridge * x);
-        }
-        out
-    }
-
-    fn uses_matrix_free_pcg(&self) -> bool {
-        false
     }
 
     /// Extract a dense row chunk without materializing the full matrix.
@@ -476,7 +438,7 @@ impl ReparamOperator {
     }
 }
 
-impl DesignOperator for ReparamOperator {
+impl LinearOperator for ReparamOperator {
     fn nrows(&self) -> usize {
         self.n
     }
@@ -505,20 +467,6 @@ impl DesignOperator for ReparamOperator {
         Ok(fast_ab(&tmp, &self.qs))
     }
 
-    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
-        // Qs^T · X^T(w ⊙ y)
-        let xtwy = self.x_original.compute_xtwy(weights, y)?;
-        Ok(fast_atv(&self.qs, &xtwy))
-    }
-
-    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        // diag(X Qs M Qs^T X^T) = diag(X · (Qs M Qs^T) · X^T)
-        // Compute M_orig = Qs · M · Qs^T (p×p), then delegate to x_original.
-        let qm = fast_ab(&self.qs, middle);
-        let m_orig = fast_ab(&qm, &self.qs.t().to_owned());
-        self.x_original.quadratic_form_diag(&m_orig)
-    }
-
     fn apply_weighted_normal(
         &self,
         weights: &Array1<f64>,
@@ -542,6 +490,22 @@ impl DesignOperator for ReparamOperator {
             out += &vector.mapv(|x| ridge * x);
         }
         out
+    }
+}
+
+impl DesignOperator for ReparamOperator {
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        // Qs^T · X^T(w ⊙ y)
+        let xtwy = self.x_original.compute_xtwy(weights, y)?;
+        Ok(fast_atv(&self.qs, &xtwy))
+    }
+
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        // diag(X Qs M Qs^T X^T) = diag(X · (Qs M Qs^T) · X^T)
+        // Compute M_orig = Qs · M · Qs^T (p×p), then delegate to x_original.
+        let qm = fast_ab(&self.qs, middle);
+        let m_orig = fast_ab(&qm, &self.qs.t().to_owned());
+        self.x_original.quadratic_form_diag(&m_orig)
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -673,7 +637,7 @@ impl RandomEffectOperator {
     }
 }
 
-impl DesignOperator for RandomEffectOperator {
+impl LinearOperator for RandomEffectOperator {
     fn nrows(&self) -> usize {
         self.n
     }
@@ -727,17 +691,6 @@ impl DesignOperator for RandomEffectOperator {
         Ok(diag)
     }
 
-    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
-        let mut out = Array1::<f64>::zeros(self.num_groups);
-        for i in 0..self.n {
-            if let Some(g) = self.group_ids[i] {
-                let wi = weights[i].max(0.0);
-                out[g] += wi * y[i];
-            }
-        }
-        Ok(out)
-    }
-
     /// Fused X'WXβ + Sβ + ridge·β.  O(n + q).
     fn apply_weighted_normal(
         &self,
@@ -770,6 +723,23 @@ impl DesignOperator for RandomEffectOperator {
         out
     }
 
+    fn uses_matrix_free_pcg(&self) -> bool {
+        true
+    }
+}
+
+impl DesignOperator for RandomEffectOperator {
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let mut out = Array1::<f64>::zeros(self.num_groups);
+        for i in 0..self.n {
+            if let Some(g) = self.group_ids[i] {
+                let wi = weights[i].max(0.0);
+                out[g] += wi * y[i];
+            }
+        }
+        Ok(out)
+    }
+
     /// diag(X M X') for one-hot X: out[i] = M[group[i], group[i]].
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         let mut out = Array1::<f64>::zeros(self.n);
@@ -779,10 +749,6 @@ impl DesignOperator for RandomEffectOperator {
             }
         }
         Ok(out)
-    }
-
-    fn uses_matrix_free_pcg(&self) -> bool {
-        true
     }
 
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
@@ -1183,7 +1149,7 @@ impl BlockDesignOperator {
     }
 }
 
-impl DesignOperator for BlockDesignOperator {
+impl LinearOperator for BlockDesignOperator {
     fn nrows(&self) -> usize {
         self.n
     }
@@ -1256,14 +1222,6 @@ impl DesignOperator for BlockDesignOperator {
         Ok(out)
     }
 
-    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
-        let mut wy = Array1::<f64>::zeros(self.n);
-        for i in 0..self.n {
-            wy[i] = weights[i].max(0.0) * y[i];
-        }
-        Ok(self.apply_transpose(&wy))
-    }
-
     fn apply_weighted_normal(
         &self,
         weights: &Array1<f64>,
@@ -1285,6 +1243,26 @@ impl DesignOperator for BlockDesignOperator {
             out += &vector.mapv(|x| ridge * x);
         }
         out
+    }
+
+    fn uses_matrix_free_pcg(&self) -> bool {
+        // Enable PCG when any block is non-dense (RE, Operator, or Intercept).
+        self.blocks.iter().any(|b| {
+            matches!(
+                b,
+                DesignBlock::RandomEffect(_) | DesignBlock::Operator(_) | DesignBlock::Intercept(_)
+            )
+        })
+    }
+}
+
+impl DesignOperator for BlockDesignOperator {
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let mut wy = Array1::<f64>::zeros(self.n);
+        for i in 0..self.n {
+            wy[i] = weights[i].max(0.0) * y[i];
+        }
+        Ok(self.apply_transpose(&wy))
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
@@ -1327,16 +1305,6 @@ impl DesignOperator for BlockDesignOperator {
             *v = v.max(0.0);
         }
         Ok(out)
-    }
-
-    fn uses_matrix_free_pcg(&self) -> bool {
-        // Enable PCG when any block is non-dense (RE, Operator, or Intercept).
-        self.blocks.iter().any(|b| {
-            matches!(
-                b,
-                DesignBlock::RandomEffect(_) | DesignBlock::Operator(_) | DesignBlock::Intercept(_)
-            )
-        })
     }
 
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
@@ -1404,7 +1372,7 @@ impl ReparamDesignOperator {
     }
 }
 
-impl DesignOperator for ReparamDesignOperator {
+impl LinearOperator for ReparamDesignOperator {
     fn nrows(&self) -> usize {
         self.n
     }
@@ -1458,7 +1426,14 @@ impl DesignOperator for ReparamDesignOperator {
     fn uses_matrix_free_pcg(&self) -> bool {
         self.inner.uses_matrix_free_pcg()
     }
+}
 
+// ReparamDesignOperator contains Arc<dyn DesignOperator> which is Send + Sync,
+// so the type is safe to send/share across threads.
+unsafe impl Send for ReparamDesignOperator {}
+unsafe impl Sync for ReparamDesignOperator {}
+
+impl DesignOperator for ReparamDesignOperator {
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         let inner_chunk = self.inner.row_chunk(rows);
         fast_ab(&inner_chunk, &self.q)
@@ -1529,7 +1504,7 @@ impl MultiChannelOperator {
     }
 }
 
-impl DesignOperator for MultiChannelOperator {
+impl LinearOperator for MultiChannelOperator {
     fn nrows(&self) -> usize {
         self.n_per_channel * self.channels.len()
     }
@@ -1594,6 +1569,12 @@ impl DesignOperator for MultiChannelOperator {
         Ok(diag)
     }
 
+    fn uses_matrix_free_pcg(&self) -> bool {
+        true
+    }
+}
+
+impl DesignOperator for MultiChannelOperator {
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         let n = self.n_per_channel;
         let total = self.nrows();
@@ -1622,10 +1603,6 @@ impl DesignOperator for MultiChannelOperator {
             out.slice_mut(s![i * n..(i + 1) * n]).assign(&ch_diag);
         }
         Ok(out)
-    }
-
-    fn uses_matrix_free_pcg(&self) -> bool {
-        true
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -1905,7 +1882,7 @@ impl TensorProductDesignOperator {
     }
 }
 
-impl DesignOperator for TensorProductDesignOperator {
+impl LinearOperator for TensorProductDesignOperator {
     fn nrows(&self) -> usize {
         self.n
     }
@@ -2067,7 +2044,9 @@ impl DesignOperator for TensorProductDesignOperator {
     fn uses_matrix_free_pcg(&self) -> bool {
         true
     }
+}
 
+impl DesignOperator for TensorProductDesignOperator {
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         if middle.nrows() != self.total_cols || middle.ncols() != self.total_cols {
             return Err(format!(
@@ -2128,7 +2107,7 @@ impl RowwiseKroneckerOperator {
     }
 }
 
-impl DesignOperator for RowwiseKroneckerOperator {
+impl LinearOperator for RowwiseKroneckerOperator {
     fn nrows(&self) -> usize {
         self.n
     }
@@ -2270,7 +2249,9 @@ impl DesignOperator for RowwiseKroneckerOperator {
     fn uses_matrix_free_pcg(&self) -> bool {
         true
     }
+}
 
+impl DesignOperator for RowwiseKroneckerOperator {
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         let p_total = self.p_cov * self.p_time;
         if middle.nrows() != p_total || middle.ncols() != p_total {
@@ -2362,7 +2343,7 @@ impl ConditionedDesign {
     }
 }
 
-impl DesignOperator for ConditionedDesign {
+impl LinearOperator for ConditionedDesign {
     fn nrows(&self) -> usize {
         self.inner.nrows()
     }
@@ -2444,6 +2425,16 @@ impl DesignOperator for ConditionedDesign {
         Ok(result)
     }
 
+    fn uses_matrix_free_pcg(&self) -> bool {
+        match &self.inner {
+            DesignMatrix::Dense(_) => true,
+            DesignMatrix::Sparse(_) => false,
+            DesignMatrix::Operator(op) => op.uses_matrix_free_pcg(),
+        }
+    }
+}
+
+impl DesignOperator for ConditionedDesign {
     /// X_c'(w⊙y) = a⊙(X'(w⊙y)) - d·Σ(w⊙y)
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         let mut result = self.inner.compute_xtwy(weights, y)?;
@@ -2496,14 +2487,6 @@ impl DesignOperator for ConditionedDesign {
             result[i] = (result[i] - 2.0 * x_amd[i] + dtmd).max(0.0);
         }
         Ok(result)
-    }
-
-    fn uses_matrix_free_pcg(&self) -> bool {
-        match &self.inner {
-            DesignMatrix::Dense(_) => true,
-            DesignMatrix::Sparse(_) => false,
-            DesignMatrix::Operator(op) => op.uses_matrix_free_pcg(),
-        }
     }
 
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
@@ -2936,10 +2919,15 @@ impl FactorizedSystem for MatrixFreeNormalFactor {
 }
 
 pub trait LinearOperator {
+    fn nrows(&self) -> usize;
+    fn ncols(&self) -> usize;
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
-    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String>;
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let xtwx = self.diag_xtw_x(weights)?;
+        Ok(Array1::from_iter((0..self.ncols()).map(|j| xtwx[[j, j]])))
+    }
     fn apply_weighted_normal(
         &self,
         weights: &Array1<f64>,
@@ -3115,8 +3103,6 @@ pub trait LinearOperator {
     }
 
     // Backward-compatible aliases.
-    fn nrows(&self) -> usize;
-    fn ncols(&self) -> usize;
     fn matvec(&self, vector: &Array1<f64>) -> Array1<f64> {
         self.apply(vector)
     }
@@ -3126,8 +3112,6 @@ pub trait LinearOperator {
     fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         self.diag_xtw_x(weights)
     }
-    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String>;
-    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String>;
 }
 
 impl LinearOperator for DesignMatrix {
@@ -3421,6 +3405,9 @@ impl LinearOperator for DesignMatrix {
         }
     }
 
+}
+
+impl DesignOperator for DesignMatrix {
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.nrows() || y.len() != self.nrows() {
             return Err(format!(
@@ -3506,6 +3493,14 @@ impl LinearOperator for DesignMatrix {
             Self::Operator(op) => op.quadratic_form_diag(middle),
         }
     }
+
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        DesignMatrix::row_chunk(self, rows)
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        DesignMatrix::to_dense(self)
+    }
 }
 
 impl LinearOperator for DenseRightProductView<'_> {
@@ -3571,7 +3566,10 @@ impl LinearOperator for DenseRightProductView<'_> {
         Ok(self.diag_xtw_x(weights)?.diag().to_owned())
     }
 
-    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+}
+
+impl DenseRightProductView<'_> {
+    pub fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.nrows() || y.len() != self.nrows() {
             return Err(format!(
                 "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
@@ -3591,7 +3589,7 @@ impl LinearOperator for DenseRightProductView<'_> {
         Ok(out)
     }
 
-    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         let dense = self.materialize();
         DesignMatrix::Dense(Arc::new(dense)).quadratic_form_diag(middle)
     }
@@ -3637,7 +3635,10 @@ impl LinearOperator for DenseRowScaledView<'_> {
         Ok(self.diag_xtw_x(weights)?.diag().to_owned())
     }
 
-    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+}
+
+impl DenseRowScaledView<'_> {
+    pub fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.nrows() || y.len() != self.nrows() {
             return Err(format!(
                 "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
@@ -3654,7 +3655,7 @@ impl LinearOperator for DenseRowScaledView<'_> {
         ))
     }
 
-    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         if middle.nrows() != self.ncols() || middle.ncols() != self.ncols() {
             return Err(format!(
                 "quadratic_form_diag dimension mismatch: matrix is {}x{}, expected {}x{}",
@@ -3725,7 +3726,10 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
         Ok(out)
     }
 
-    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+}
+
+impl EmbeddedColumnBlock<'_> {
+    pub fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.nrows() || y.len() != self.nrows() {
             return Err(format!(
                 "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
@@ -3741,7 +3745,7 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
         Ok(out)
     }
 
-    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         let middle_local = middle
             .slice(ndarray::s![
                 self.global_range.clone(),
@@ -4081,7 +4085,7 @@ impl DesignMatrix {
         weights: &Array1<f64>,
         y: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        <Self as LinearOperator>::compute_xtwy(self, weights, y)
+        <Self as DesignOperator>::compute_xtwy(self, weights, y)
     }
 
     pub fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
@@ -4089,7 +4093,7 @@ impl DesignMatrix {
     }
 
     pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        <Self as LinearOperator>::quadratic_form_diag(self, middle)
+        <Self as DesignOperator>::quadratic_form_diag(self, middle)
     }
 
     pub fn apply_weighted_normal(

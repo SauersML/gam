@@ -99,8 +99,8 @@ struct BernoulliMarginalSlopeFamily {
     y: Array1<f64>,
     weights: Array1<f64>,
     z: Array1<f64>,
-    marginal_design: Array2<f64>,
-    logslope_design: Array2<f64>,
+    marginal_design: DesignMatrix,
+    logslope_design: DesignMatrix,
     quadrature_nodes: Array1<f64>,
     quadrature_weights: Array1<f64>,
     score_warp: Option<DeviationRuntime>,
@@ -194,6 +194,10 @@ impl DeviationRuntime {
         }
         Ok(raw.dot(&self.transform))
     }
+}
+
+fn design_row_owned(design: &DesignMatrix, row: usize) -> Array1<f64> {
+    design.row_chunk(row..row + 1).row(0).to_owned()
 }
 
 fn deviation_grid_from_knots(
@@ -1242,13 +1246,9 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
         let mut out = Array1::<f64>::zeros(primary.total);
-        out[0] = self
-            .marginal_design
-            .row(row)
+        out[0] = design_row_owned(&self.marginal_design, row)
             .dot(&d_beta_flat.slice(s![slices.marginal.clone()]).to_owned());
-        out[1] = self
-            .logslope_design
-            .row(row)
+        out[1] = design_row_owned(&self.logslope_design, row)
             .dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned());
         if let (Some(block_range), Some(primary_range)) = (slices.h.as_ref(), primary.h.as_ref()) {
             out.slice_mut(s![primary_range.start..primary_range.end])
@@ -1472,9 +1472,9 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(slices.total);
         out.slice_mut(s![slices.marginal.clone()])
-            .assign(&(&self.marginal_design.row(row).to_owned() * primary_vec[0]));
+            .assign(&(&design_row_owned(&self.marginal_design, row) * primary_vec[0]));
         out.slice_mut(s![slices.logslope.clone()])
-            .assign(&(&self.logslope_design.row(row).to_owned() * primary_vec[1]));
+            .assign(&(&design_row_owned(&self.logslope_design, row) * primary_vec[1]));
         if let Some(primary_h) = primary.h.as_ref() {
             if let Some(block_h) = slices.h.as_ref() {
                 out.slice_mut(s![block_h.clone()]).assign(
@@ -1702,8 +1702,8 @@ impl BernoulliMarginalSlopeFamily {
         primary: &PrimarySlices,
         primary_hessian: &Array2<f64>,
     ) {
-        let x_row = self.marginal_design.row(row).to_owned();
-        let g_row = self.logslope_design.row(row).to_owned();
+        let x_row = design_row_owned(&self.marginal_design, row);
+        let g_row = design_row_owned(&self.logslope_design, row);
         let xx = x_row
             .view()
             .insert_axis(Axis(1))
@@ -1992,11 +1992,13 @@ impl BernoulliMarginalSlopeFamily {
                         cache.score_warp_obs.as_ref(),
                     )?;
 
-                    for (local_idx, value) in self.marginal_design.row(row).iter().enumerate() {
+                    let marginal_row = design_row_owned(&self.marginal_design, row);
+                    for (local_idx, value) in marginal_row.iter().enumerate() {
                         chunk_diag[slices.marginal.start + local_idx] +=
                             value * value * row_hessian[[0, 0]];
                     }
-                    for (local_idx, value) in self.logslope_design.row(row).iter().enumerate() {
+                    let logslope_row = design_row_owned(&self.logslope_design, row);
+                    for (local_idx, value) in logslope_row.iter().enumerate() {
                         chunk_diag[slices.logslope.start + local_idx] +=
                             value * value * row_hessian[[1, 1]];
                     }
@@ -2979,8 +2981,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         y: spec.y.clone(),
         weights: spec.weights.clone(),
         z: spec.z.clone(),
-        marginal_design: marginal_design.design.to_dense(),
-        logslope_design: logslope_design.design.to_dense(),
+        marginal_design: marginal_design.design.clone(),
+        logslope_design: logslope_design.design.clone(),
         quadrature_nodes: quad_nodes.clone(),
         quadrature_weights: quad_weights.clone(),
         score_warp: None,
@@ -3118,8 +3120,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
             y: y.clone(),
             weights: weights.clone(),
             z: z.clone(),
-            marginal_design: marginal_design.design.to_dense(),
-            logslope_design: logslope_design.design.to_dense(),
+            marginal_design: marginal_design.design.clone(),
+            logslope_design: logslope_design.design.clone(),
             quadrature_nodes: quad_nodes.clone(),
             quadrature_weights: quad_weights.clone(),
             score_warp: score_warp_runtime.clone(),
@@ -3364,8 +3366,8 @@ mod tests {
             y: Array1::zeros(seed.len()),
             weights: Array1::ones(seed.len()),
             z: seed.clone(),
-            marginal_design: Array2::zeros((seed.len(), 0)),
-            logslope_design: Array2::zeros((seed.len(), 0)),
+            marginal_design: DesignMatrix::Dense(Arc::new(Array2::zeros((seed.len(), 0)))),
+            logslope_design: DesignMatrix::Dense(Arc::new(Array2::zeros((seed.len(), 0)))),
             quadrature_nodes: array![0.0],
             quadrature_weights: array![1.0],
             score_warp: None,

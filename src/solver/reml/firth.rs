@@ -1156,6 +1156,72 @@ mod tests {
     }
 
     #[test]
+    fn rank_deficient_and_explicit_reduced_designs_share_same_jeffreys_objective() {
+        // Column 3 is exactly column 1 + column 2, so the original design is
+        // rank-deficient but its identifiable subspace is represented exactly by
+        // the explicit two-column reduced design below.
+        let x_full = array![
+            [1.0, -1.2, -0.2],
+            [1.0, -0.4, 0.6],
+            [1.0, 0.1, 1.1],
+            [1.0, 0.7, 1.7],
+            [1.0, 1.3, 2.3],
+        ];
+        let x_reduced = array![
+            [1.0, -1.2],
+            [1.0, -0.4],
+            [1.0, 0.1],
+            [1.0, 0.7],
+            [1.0, 1.3],
+        ];
+        let beta_full = array![0.25, -0.5, 0.15];
+        let beta_reduced = array![beta_full[0] + beta_full[2], beta_full[1] + beta_full[2]];
+        let eta_full = x_full.dot(&beta_full);
+        let eta_reduced = x_reduced.dot(&beta_reduced);
+        let observation_weights = array![1.0, 0.5, 1.75, 0.9, 1.2];
+
+        for i in 0..eta_full.len() {
+            assert!(
+                (eta_full[i] - eta_reduced[i]).abs() < 1e-12,
+                "eta mismatch at row {i}: full={} reduced={}",
+                eta_full[i],
+                eta_reduced[i]
+            );
+        }
+
+        let op_full = FirthDenseOperator::build_with_observation_weights(
+            &x_full,
+            &eta_full,
+            observation_weights.view(),
+        )
+        .expect("full firth operator");
+        let op_reduced = FirthDenseOperator::build_with_observation_weights(
+            &x_reduced,
+            &eta_reduced,
+            observation_weights.view(),
+        )
+        .expect("reduced firth operator");
+
+        assert!(
+            (op_full.jeffreys_logdet() - op_reduced.jeffreys_logdet()).abs() < 1e-12,
+            "Jeffreys logdet mismatch between rank-deficient full design and its explicit reduced identifiable basis: full={} reduced={}",
+            op_full.jeffreys_logdet(),
+            op_reduced.jeffreys_logdet()
+        );
+
+        let hat_full = op_full.pirls_hat_diag();
+        let hat_reduced = op_reduced.pirls_hat_diag();
+        for i in 0..hat_full.len() {
+            assert!(
+                (hat_full[i] - hat_reduced[i]).abs() < 1e-12,
+                "PIRLS hat-diagonal mismatch at row {i}: full={} reduced={}",
+                hat_full[i],
+                hat_reduced[i]
+            );
+        }
+    }
+
+    #[test]
     fn firth_mixedsecond_direction_apply_is_symmetric_in_direction_order() {
         let x = array![
             [1.0, -1.0, 0.2],

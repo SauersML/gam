@@ -1541,7 +1541,7 @@ pub struct BinomialLocationScalePredictor {
 }
 
 impl BinomialLocationScalePredictor {
-    /// Compute q0 = -eta_t / sigma for each observation, where
+    /// Compute q0 = -eta_t * exp(-eta_s) for each observation, where
     /// eta_t is the threshold linear predictor and sigma = exp(eta_s).
     ///
     /// Returns (q0_base, sigma, eta_t).
@@ -1649,8 +1649,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                     let dphi = jet.d1;
                     let scale = dq_dq0[i];
                     let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
-                    // dq/dη_ls = κ · η_t / σ where κ = (dσ/dη_ls)/σ.
-                    // For standard exp link κ=1; on the safe_exp plateau κ=0.
+                    // dq/dη_ls = eta_t / σ for the exact exp link.
                     let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
                     for j in 0..p_t {
                         grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
@@ -1823,9 +1822,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                                         [cov_ts[i], var_s[i].max(0.0)],
                                     ],
                                     |eta_threshold, eta_log_sigma| {
-                                        let sigma =
-                                            eta_log_sigma.clamp(-500.0, 500.0).exp().max(1e-12);
-                                        let q0 = -eta_threshold / sigma;
+                                        let q0 = -eta_threshold * (-eta_log_sigma).exp();
                                         let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
                                             &self.inverse_link,
                                             q0,
@@ -1926,8 +1923,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                         [eta_t[i], eta_s[i]],
                         [[var_t, cov_tls], [cov_tls, var_ls]],
                         |t, ls| {
-                            let sigma = ls.exp().max(1e-12);
-                            let q0 = (-t / sigma).clamp(-30.0, 30.0);
+                            let q0 = -t * (-ls).exp();
                             let xw = runtime
                                 .basis_row_scalar(q0)
                                 .map_err(EstimationError::InvalidInput)?;
@@ -1982,7 +1978,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
 /// Survival location-scale predictor: two blocks (threshold + log-sigma).
 ///
 /// Predicts survival probability via:
-///   q0 = -eta_threshold / exp(eta_log_sigma)
+///   q0 = -eta_threshold * exp(-eta_log_sigma)
 ///   survival_prob = 1 - inverse_link(q0)
 ///
 /// The "design" in `PredictInput` is the threshold design matrix, and
@@ -2027,7 +2023,7 @@ impl SurvivalPredictor {
         })
     }
 
-    /// Compute q0 = -eta_threshold / sigma and survival_prob = 1 - F(q0).
+    /// Compute q0 = -eta_threshold * exp(-eta_log_sigma) and survival_prob = 1 - F(q0).
     fn compute_survival(
         &self,
         eta_threshold: &Array1<f64>,
@@ -2040,8 +2036,7 @@ impl SurvivalPredictor {
         );
         let mut survival_prob = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let sigma = eta_log_sigma[i].exp();
-            let q0 = -eta_threshold[i] / sigma;
+            let q0 = -eta_threshold[i] * (-eta_log_sigma[i]).exp();
             // survival = 1 - F(q0) = F(-q0)
             let jet = strategy.inverse_link_jet(-q0)?;
             survival_prob[i] = jet.mu.clamp(0.0, 1.0);
@@ -2113,12 +2108,12 @@ impl PredictableModel for SurvivalPredictor {
                 let rows_in_chunk = eta_t_chunk.len();
                 let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_t + p_s));
                 for i in 0..rows_in_chunk {
-                    let sigma = eta_ls_chunk[i].exp();
-                    let q0 = -eta_t_chunk[i] / sigma;
+                    let inv_sigma = (-eta_ls_chunk[i]).exp();
+                    let q0 = -eta_t_chunk[i] * inv_sigma;
                     let jet = strategy.inverse_link_jet(-q0).map_err(|e| e.to_string())?;
                     let phi_neg_q0 = jet.d1;
-                    let dsurv_deta_t = phi_neg_q0 / sigma;
-                    let dsurv_deta_s = -phi_neg_q0 * eta_t_chunk[i] / sigma;
+                    let dsurv_deta_t = phi_neg_q0 * inv_sigma;
+                    let dsurv_deta_s = -phi_neg_q0 * eta_t_chunk[i] * inv_sigma;
                     for j in 0..p_t {
                         grad[[i, j]] = dsurv_deta_t * x_t[[i, j]];
                     }
@@ -2247,8 +2242,7 @@ impl PredictableModel for SurvivalPredictor {
                                         [cov_ts[i], var_s[i].max(0.0)],
                                     ],
                                     |threshold, log_sigma| {
-                                        let sigma = log_sigma.clamp(-500.0, 500.0).exp().max(1e-12);
-                                        let survival_eta = threshold / sigma;
+                                        let survival_eta = threshold * (-log_sigma).exp();
                                         let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
                                             &self.inverse_link,
                                             survival_eta,
@@ -2988,8 +2982,7 @@ mod tests {
         )
         .expect("royston-parmar point prediction");
         let expected_eta = array![0.4, 1.2];
-        let expected_mean =
-            expected_eta.mapv(|eta: f64| (-(eta.clamp(-30.0, 30.0).exp())).exp().clamp(0.0, 1.0));
+        let expected_mean = expected_eta.mapv(|eta: f64| (-(eta.exp())).exp().clamp(0.0, 1.0));
         // Approximate comparison: delta-regularization bias can introduce ~1e-15 drift
         for i in 0..out.eta.len() {
             assert!(

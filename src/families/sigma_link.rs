@@ -281,70 +281,27 @@ mod tests {
     }
 
     #[test]
-    fn safe_exp_returns_finite_at_overflow_boundary() {
+    fn safe_exp_matches_native_exp_semantics() {
         assert!(safe_exp(0.0).is_finite());
         assert!(safe_exp(700.0).is_finite());
         assert!(safe_exp(-700.0).is_finite());
-        assert!(safe_exp(1000.0).is_finite());
-        assert!(safe_exp(-1000.0).is_finite());
-        assert!(safe_exp(f64::MAX).is_finite());
-        assert!(safe_exp(f64::MIN).is_finite());
-        // Verify it still matches exp() in the normal range
+        assert!(safe_exp(1000.0).is_infinite());
+        assert_eq!(safe_exp(-1000.0), 0.0);
+        assert!(safe_exp(f64::MAX).is_infinite());
+        assert_eq!(safe_exp(f64::MIN), 0.0);
         assert!((safe_exp(1.0) - 1.0_f64.exp()).abs() < 1e-15);
         assert!((safe_exp(-5.0) - (-5.0_f64).exp()).abs() < 1e-15);
     }
 
     #[test]
-    fn exp_sigma_derivatives_follow_the_clamped_safe_exp_definition() {
-        // Test deep in the plateau (η=±710) so every FD stencil point is also
-        // clamped.  Use h=1.0 so the FD denominator is O(1), keeping the
-        // cancellation noise from exp(700) ≈ 1e304 well below any reasonable
-        // tolerance.  (With h=1e-3, the denominator h^4=1e-12 amplifies the
-        // roundoff in (1−4+6−4+1)*exp(700) ≈ eps*exp(700) to ~1e300.)
-        let h = 1.0;
-        // Tolerance: all stencil points return the same exp(±700), so the
-        // FD numerator is exactly 0 in exact arithmetic.  In FP the residual
-        // is bounded by ~10 * eps * exp(700) / h^k for the k-th derivative.
-        let plateau_val = safe_exp(710.0); // = exp(700)
-        let tol_d1 = 10.0 * f64::EPSILON * plateau_val / h;
-        let tol_d2 = 10.0 * f64::EPSILON * plateau_val / (h * h);
-        let tol_d3 = 10.0 * f64::EPSILON * plateau_val / (h * h * h);
-        let tol_d4 = 10.0 * f64::EPSILON * plateau_val / (h * h * h * h);
-
-        for &eta in &[710.0, -710.0] {
-            let (_, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth_scalar(eta);
-            let f = |x: f64| exp_sigma_from_eta_scalar(x);
-            let d1fd = (f(eta + h) - f(eta - h)) / (2.0 * h);
-            let d2fd = (f(eta + h) - 2.0 * f(eta) + f(eta - h)) / (h * h);
-            let d3fd = (f(eta + 2.0 * h) - 2.0 * f(eta + h) + 2.0 * f(eta - h) - f(eta - 2.0 * h))
-                / (2.0 * h * h * h);
-            let d4fd = (f(eta + 2.0 * h) - 4.0 * f(eta + h) + 6.0 * f(eta) - 4.0 * f(eta - h)
-                + f(eta - 2.0 * h))
-                / h.powi(4);
-
-            // Analytic derivatives must be exactly 0 on the plateau.
-            assert_eq!(d1, 0.0, "d1 should be exactly 0 at eta={eta}");
-            assert_eq!(d2, 0.0, "d2 should be exactly 0 at eta={eta}");
-            assert_eq!(d3, 0.0, "d3 should be exactly 0 at eta={eta}");
-            assert_eq!(d4, 0.0, "d4 should be exactly 0 at eta={eta}");
-
-            // FD should also be ~0, up to floating-point cancellation noise.
-            assert!(
-                d1fd.abs() < tol_d1,
-                "FD d1 should be ~0 at eta={eta}; got {d1fd} (tol={tol_d1})"
-            );
-            assert!(
-                d2fd.abs() < tol_d2,
-                "FD d2 should be ~0 at eta={eta}; got {d2fd} (tol={tol_d2})"
-            );
-            assert!(
-                d3fd.abs() < tol_d3,
-                "FD d3 should be ~0 at eta={eta}; got {d3fd} (tol={tol_d3})"
-            );
-            assert!(
-                d4fd.abs() < tol_d4,
-                "FD d4 should be ~0 at eta={eta}; got {d4fd} (tol={tol_d4})"
-            );
+    fn exp_sigma_derivatives_match_exact_exp_in_far_tails() {
+        for &eta in &[709.0, -745.0] {
+            let (sigma, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth_scalar(eta);
+            assert_eq!(sigma, eta.exp());
+            assert_eq!(d1, sigma);
+            assert_eq!(d2, sigma);
+            assert_eq!(d3, sigma);
+            assert_eq!(d4, sigma);
         }
     }
 }

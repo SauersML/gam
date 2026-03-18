@@ -286,11 +286,23 @@ impl<'a> RemlState<'a> {
         let b_depends_on_beta = !is_gaussian_identity;
 
         // Firth operator (Firth-logit only).
+        // Match the active coefficient basis exactly: when constraints project
+        // to β = Z β_free, the Jeffreys objects for τ/ψ derivatives must use
+        // the projected design X_eff = X Z rather than the cached full-basis
+        // operator from the unconstrained transformed space.
         let firth_logit_active = self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit);
         let firth_op = if firth_logit_active {
-            if let Some(cached) = bundle.firth_dense_operator.as_ref() {
-                Some(cached.as_ref().clone())
+            if free_basis_opt.is_none() {
+                if let Some(cached) = bundle.firth_dense_operator.as_ref() {
+                    Some(cached.as_ref().clone())
+                } else {
+                    Some(Self::build_firth_dense_operator(
+                        x_dense,
+                        &pirls_result.final_eta,
+                        self.weights,
+                    )?)
+                }
             } else {
                 Some(Self::build_firth_dense_operator(
                     x_dense,
