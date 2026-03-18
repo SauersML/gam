@@ -2460,6 +2460,157 @@ fn run_predict_survival(
         return Ok(());
     }
 
+    if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        let z_name = model
+            .z_column
+            .as_ref()
+            .ok_or_else(|| "saved survival marginal-slope model missing z_column".to_string())?;
+        let &z_col = col_map
+            .get(z_name)
+            .ok_or_else(|| format!("prediction data is missing z column '{z_name}'"))?;
+        let z = data.column(z_col).to_owned();
+        let logslopespec = resolve_termspec_for_prediction(
+            &model.resolved_termspec_noise,
+            training_headers,
+            col_map,
+            "resolved_termspec_noise",
+        )?;
+        let logslope_design = build_term_collection_design(data, &logslopespec)
+            .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
+        let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+        let blocks = &fit_saved.blocks;
+        if blocks.len() < 3 {
+            return Err(format!(
+                "saved survival marginal-slope model requires 3 blocks [time, marginal, slope], got {}",
+                blocks.len()
+            ));
+        }
+        let beta_time = &blocks[0].beta;
+        let beta_marginal = &blocks[1].beta;
+        let beta_slope = &blocks[2].beta;
+        let baseline_slope = model.logslope_baseline.unwrap_or(0.0);
+        if beta_time.len() != time_build.x_exit_time.ncols() {
+            return Err(format!(
+                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but time basis has {} columns",
+                beta_time.len(),
+                time_build.x_exit_time.ncols()
+            ));
+        }
+        if beta_marginal.len() != cov_design.design.ncols() {
+            return Err(format!(
+                "saved survival marginal-slope marginal coefficient mismatch: beta has {} entries but baseline design has {} columns",
+                beta_marginal.len(),
+                cov_design.design.ncols()
+            ));
+        }
+        if beta_slope.len() != logslope_design.design.ncols() {
+            return Err(format!(
+                "saved survival marginal-slope slope coefficient mismatch: beta has {} entries but slope design has {} columns",
+                beta_slope.len(),
+                logslope_design.design.ncols()
+            ));
+        }
+        let q_exit = time_build.x_exit_time.dot(beta_time)
+            + cov_design.design.dot(beta_marginal)
+            + &eta_offset_exit;
+        let slope = logslope_design
+            .design
+            .dot(beta_slope)
+            .mapv(|v| v + baseline_slope);
+        let c = slope.mapv(|b| (1.0 + b * b).sqrt());
+        let eta = &q_exit * &c + &(&slope * &z);
+        let deterministic_mean = eta.mapv(|v| normal_cdf(-v));
+        let need_uncertainty = args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
+        let posterior_mean = if need_uncertainty {
+            let cov_mat = covariance_from_model(model, args.covariance_mode)?;
+            let mut eta_var = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let c_i = c[i];
+                let q_i = q_exit[i];
+                let b_i = slope[i];
+                let slope_grad_scale = q_i * b_i / c_i + z[i];
+                let mut grad = Array1::<f64>::zeros(beta_time.len() + beta_marginal.len() + beta_slope.len());
+                let mut cursor = 0usize;
+                grad.slice_mut(s![cursor..cursor + beta_time.len()])
+                    .assign(&(&time_build.x_exit_time.row(i).to_owned() * c_i));
+                cursor += beta_time.len();
+                grad.slice_mut(s![cursor..cursor + beta_marginal.len()])
+                    .assign(&(&cov_design.design.row_chunk(i..i + 1).row(0).to_owned() * c_i));
+                cursor += beta_marginal.len();
+                grad.slice_mut(s![cursor..cursor + beta_slope.len()]).assign(
+                    &(&logslope_design.design.row_chunk(i..i + 1).row(0).to_owned() * slope_grad_scale),
+                );
+                eta_var[i] = grad.dot(&cov_mat.dot(&grad)).max(0.0);
+            }
+            let eta_se = eta_var.mapv(f64::sqrt);
+            let posterior = Array1::from_iter(
+                eta.iter()
+                    .zip(eta_var.iter())
+                    .map(|(&mu, &var)| normal_cdf(-mu / (1.0 + var).sqrt())),
+            );
+            let mean = if args.mode == PredictModeArg::PosteriorMean {
+                posterior.clone()
+            } else {
+                deterministic_mean.clone()
+            };
+            if args.uncertainty {
+                if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                    return Err(format!("--level must be in (0,1), got {}", args.level));
+                }
+                let z_alpha = standard_normal_quantile(0.5 + args.level * 0.5)?;
+                let eta_lo = &eta - &(eta_se.mapv(|v| z_alpha * v));
+                let eta_hi = &eta + &(eta_se.mapv(|v| z_alpha * v));
+                let mean_lo = eta_hi.mapv(|v| normal_cdf(-v));
+                let mean_hi = eta_lo.mapv(|v| normal_cdf(-v));
+                progress.advance_workflow(4);
+                progress.set_stage("predict", "writing survival predictions");
+                write_survival_prediction_csv(
+                    &args.out,
+                    eta.view(),
+                    mean.view(),
+                    Some(eta_se.view()),
+                    Some(mean_lo.view()),
+                    Some(mean_hi.view()),
+                )?;
+            } else {
+                progress.advance_workflow(4);
+                progress.set_stage("predict", "writing survival predictions");
+                write_survival_prediction_csv(
+                    &args.out,
+                    eta.view(),
+                    mean.view(),
+                    Some(eta_se.view()),
+                    None,
+                    None,
+                )?;
+            }
+            println!(
+                "wrote predictions: {} (rows={})",
+                args.out.display(),
+                mean.len()
+            );
+            return Ok(());
+        } else {
+            deterministic_mean
+        };
+        progress.advance_workflow(4);
+        progress.set_stage("predict", "writing survival predictions");
+        write_survival_prediction_csv(
+            &args.out,
+            eta.view(),
+            posterior_mean.view(),
+            None,
+            None,
+            None,
+        )?;
+        println!(
+            "wrote predictions: {} (rows={})",
+            args.out.display(),
+            posterior_mean.len()
+        );
+        return Ok(());
+    }
+
     let p_time = time_build.x_exit_time.ncols();
     let p_timewiggle = saved_timewiggle
         .as_ref()
@@ -4082,6 +4233,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             event_target: event_target.mapv(f64::from),
             weights: weights.clone(),
             z,
+            marginalspec: termspec.clone(),
             derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
             time_block: TimeBlockInput {
                 design_entry: time_design_entry.clone(),
@@ -4128,14 +4280,58 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
         };
         println!(
-            "survival marginal-slope fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e} | baseline_logslope={:.4}",
+            "survival marginal-slope fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e} | baseline_slope={:.4}",
             fit.fit.outer_converged,
             fit.fit.outer_iterations,
             fit.fit.log_likelihood,
             fit.fit.reml_score,
-            fit.baseline_logslope,
+            fit.baseline_slope,
         );
         progress.advance_workflow(3);
+        if let Some(out) = args.out {
+            progress.set_stage("fit", "writing survival marginal-slope model");
+            let mut payload = FittedModelPayload::new(
+                MODEL_VERSION,
+                formula,
+                ModelKind::Survival,
+                FittedFamily::Survival {
+                    likelihood: LikelihoodFamily::RoystonParmar,
+                    survival_likelihood: Some(
+                        survival_likelihood_modename(likelihood_mode).to_string(),
+                    ),
+                    survival_distribution: Some("probit".to_string()),
+                },
+                family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+            );
+            payload.unified = Some(fit.fit.clone());
+            payload.fit_result = Some(fit.fit.clone());
+            payload.data_schema = Some(ds.schema.clone());
+            payload.survival_entry = Some(args.entry);
+            payload.survival_exit = Some(args.exit);
+            payload.survival_event = Some(args.event);
+            payload.survivalspec = Some(effectivespec.clone());
+            payload.survival_baseline_target =
+                Some(survival_baseline_targetname(baseline_cfg.target).to_string());
+            payload.survival_baseline_scale = baseline_cfg.scale;
+            payload.survival_baseline_shape = baseline_cfg.shape;
+            payload.survival_baseline_rate = baseline_cfg.rate;
+            payload.survival_baseline_makeham = baseline_cfg.makeham;
+            payload.survival_time_basis = Some(time_build.basisname.clone());
+            payload.survival_time_degree = time_build.degree;
+            payload.survival_time_knots = time_build.knots.clone();
+            payload.survival_time_keep_cols = time_build.keep_cols.clone();
+            payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+            payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
+            payload.survival_likelihood =
+                Some(survival_likelihood_modename(likelihood_mode).to_string());
+            payload.training_headers = Some(ds.headers.clone());
+            payload.resolved_termspec = Some(fit.marginalspec_resolved.clone());
+            payload.resolved_termspec_noise = Some(fit.logslopespec_resolved.clone());
+            payload.z_column = args.z_column.clone();
+            payload.logslope_baseline = Some(fit.baseline_slope);
+            write_payload_json(&out, payload)?;
+            progress.advance_workflow(survival_total_steps);
+        }
         progress.finish_progress("survival marginal-slope fit complete");
         return Ok(());
     }

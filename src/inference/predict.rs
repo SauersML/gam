@@ -1050,7 +1050,7 @@ impl BernoulliMarginalSlopePredictor {
                 logslope_chunk = Some(design_logslope.row_chunk(chunk_start..chunk_end));
             }
             let q = marginal_eta[i];
-            let slope = logslope_eta[i].exp();
+            let slope = logslope_eta[i]; // signed slope (no exp)
             let intercept = if flex_active {
                 self.solve_intercept_scalar_with_nodes(
                     q,
@@ -1096,7 +1096,8 @@ impl BernoulliMarginalSlopePredictor {
                         row_grad[j] = a_q * mc[[li, j]];
                     }
 
-                    let g_scale = slope * (a_b + warped_z[i]);
+                    // beta = g (signed, no exp), so d_eta/d_g = d_eta/d_beta.
+                    let g_scale = a_b + warped_z[i];
                     for j in 0..logslope_dim {
                         row_grad[logslope_offset + j] = g_scale * lc[[li, j]];
                     }
@@ -1140,7 +1141,8 @@ impl BernoulliMarginalSlopePredictor {
                     for j in 0..marginal_dim {
                         row_grad[j] = c * mc[[li, j]];
                     }
-                    let g_scale = q * slope * slope / c + slope * warped_z[i];
+                    // beta = g (signed, no exp): d_eta/d_beta = q*beta/c + z.
+                    let g_scale = q * slope / c + warped_z[i];
                     for j in 0..logslope_dim {
                         row_grad[logslope_offset + j] = g_scale * lc[[li, j]];
                     }
