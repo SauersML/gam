@@ -2543,6 +2543,17 @@ pub enum DesignMatrix {
     Operator(Arc<dyn DesignOperator>),
 }
 
+impl std::fmt::Debug for DesignMatrix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense(m) => write!(f, "DesignMatrix::Dense({}x{})", m.nrows(), m.ncols()),
+            Self::Sparse(s) => write!(f, "DesignMatrix::Sparse({}x{})", s.nrows(), s.ncols()),
+            Self::Operator(op) => write!(f, "DesignMatrix::Operator({}x{})", op.nrows(), op.ncols()),
+        }
+    }
+}
+
+
 /// A unified representation of a symmetric matrix, typically an assembled Hessian.
 #[derive(Clone, Debug)]
 pub enum SymmetricMatrix {
