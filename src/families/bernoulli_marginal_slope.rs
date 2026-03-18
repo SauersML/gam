@@ -655,6 +655,11 @@ impl MultiDirJet {
     }
 
     pub fn set_coeff(&mut self, mask: usize, value: f64) {
+        debug_assert!(
+            mask < self.coeffs.len(),
+            "MultiDirJet::set_coeff: mask={mask} exceeds capacity={}",
+            self.coeffs.len(),
+        );
         self.coeffs[mask] = value;
     }
 

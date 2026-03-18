@@ -92,13 +92,15 @@ pub struct PenaltyPseudologdet {
 }
 
 impl PenaltyPseudologdet {
+    /// Compute tr(A B) = Σ_i Σ_k A[i,k] B[k,i] without materializing the product.
     #[inline]
     fn trace_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-        let n = a.nrows().min(b.nrows());
+        let diag_len = a.nrows().min(b.ncols());
+        let inner_len = a.ncols().min(b.nrows());
         let mut total = 0.0;
-        for i in 0..n {
-            for j in 0..a.ncols().min(b.ncols()) {
-                total += a[[i, j]] * b[[j, i]];
+        for i in 0..diag_len {
+            for k in 0..inner_len {
+                total += a[[i, k]] * b[[k, i]];
             }
         }
         total
@@ -518,50 +520,16 @@ impl PenaltyPseudologdet {
     /// Compute the leakage matrix L = U₊^T M U₀ for the moving-nullspace correction.
     ///
     /// Returns `None` if the nullspace is empty (no correction needed).
+    /// Compute W^T M U₀ for the moving-nullspace correction.
+    ///
+    /// Returns the rank × nullity matrix whose row j is (w_j^T M U₀).
+    /// The downstream `moving_nullspace_correction` weights each row by
+    /// σ_j^{-1} = √(inv_evals_sq[j]) to form the trace without ever
+    /// materializing L = U₊^T M U₀ explicitly.
     fn leakage(&self, m: &Array2<f64>) -> Option<Array2<f64>> {
         let u_null = self.u_null.as_ref()?;
-        // U₊ = W · diag(√σ_i), but we need U₊^T M U₀.
-        // U₊[:, j] = w_factor[:, j] * √σ_j = w_factor[:, j] / inv_sqrt(σ_j).
-        // Actually, w_factor[:, j] = u_j / √σ_j, so u_j = w_factor[:, j] * √σ_j.
-        // We need U₊^T = [u_j^T] so U₊^T M = [u_j^T M].
-        //
-        // More efficiently: L = diag(√σ) · W^T M U₀, since U₊ = W diag(√σ).
-        // But we stored 1/σ² as inv_evals_sq, so √σ = 1/√(1/σ²)^{1/2} = σ^{1/2}.
-        // Simpler: σ_j = 1 / (inv_evals_sq[j])^{1/2}.
-        //
-        // Let's just compute W^T M U₀ and then scale rows by √σ_j.
-        let wt_m = self.w_factor.t().dot(m); // rank × p
-        let wt_m_u0 = wt_m.dot(u_null); // rank × nullity
-
-        // Scale row j by √σ_j: since w_factor[:, j] = u_j/√σ_j and we want u_j^T M U₀,
-        // we need to multiply row j of W^T M U₀ by √σ_j.
-        // √σ_j = 1 / √(inv_evals_sq[j])^{1/2} ... let's just use σ_j = inv_evals_sq[j]^{-1/2}.
-        // inv_evals_sq[j] = σ_j^{-2}, so σ_j = inv_evals_sq[j]^{-1/2}.
-        // √σ_j = inv_evals_sq[j]^{-1/4}... this is getting convoluted.
-        //
-        // Direct approach: U₊^T M U₀ where U₊[:, j] = evecs[:, nullity+j].
-        // Since we didn't store evecs, reconstruct: u_j = w_factor[:, j] * √σ_j,
-        // and √σ_j = 1/√(inv_evals_sq[j]^{1/2})... Let's store what we need.
-        //
-        // Actually simplest: W^T M U₀ gives rows (u_j/√σ_j)^T M U₀ = (1/√σ_j) u_j^T M U₀.
-        // We want u_j^T M U₀, so multiply row j by √σ_j = (inv_evals_sq[j])^{-1/4}.
-        // Wait: inv_evals_sq[j] = 1/σ_j², so σ_j = 1/sqrt(inv_evals_sq[j]),
-        // and √σ_j = 1/(inv_evals_sq[j])^{1/4}.
-        //
-        // This is error-prone. Let's use a cleaner formulation.
-        // The correction is 2 tr(Σ₊⁻² L L^T) where L = U₊^T M U₀.
-        // tr(Σ₊⁻² L L^T) = Σ_j σ_j^{-2} Σ_m L_{j,m}²
-        //                 = Σ_j σ_j^{-2} ||L_j||²
-        //
-        // Now L_j = u_j^T M U₀ = √σ_j · (w_j^T M U₀) = √σ_j · (wt_m_u0)[j, :].
-        // So L_{j,m}² = σ_j · (wt_m_u0)[j,m]².
-        // And σ_j^{-2} · L_{j,m}² = σ_j^{-2} · σ_j · (wt_m_u0)[j,m]² = σ_j^{-1} · (wt_m_u0)[j,m]².
-        // And σ_j^{-1} = √(inv_evals_sq[j]).
-        //
-        // So tr(Σ₊⁻² L L^T) = Σ_j √(inv_evals_sq[j]) · Σ_m (wt_m_u0)[j,m]².
-        //
-        // We don't actually need L itself, just the trace. Let's provide a direct method.
-        Some(wt_m_u0)
+        let wt_m = self.w_factor.t().dot(m);
+        Some(wt_m.dot(u_null))
     }
 
     /// Compute the moving-nullspace correction: 2 tr(Σ₊⁻² L_i L_j^T)
