@@ -81,6 +81,10 @@ pub struct FittedModelPayload {
     pub linkwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
     pub linkwiggle_degree: Option<usize>,
+    /// When `true`, the link-wiggle uses an I-spline basis (structurally monotone).
+    /// Absent or `false` in legacy models that use B-spline + Z-transform.
+    #[serde(default)]
+    pub linkwiggle_ispline: Option<bool>,
     #[serde(default)]
     pub beta_link_wiggle: Option<Vec<f64>>,
     #[serde(default)]
@@ -191,6 +195,7 @@ impl FittedModelPayload {
             gaussian_response_scale: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
+            linkwiggle_ispline: None,
             beta_link_wiggle: None,
             baseline_timewiggle_knots: None,
             baseline_timewiggle_degree: None,
@@ -300,6 +305,9 @@ pub struct SavedLinkWiggleRuntime {
     pub knots: Vec<f64>,
     pub degree: usize,
     pub beta: Vec<f64>,
+    /// When `true`, the wiggle basis uses I-splines (structurally monotone).
+    /// When `false` (legacy), uses B-spline + Z-transform.
+    pub use_ispline: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -353,12 +361,23 @@ impl SavedLinkWiggleRuntime {
         basis_options: BasisOptions,
     ) -> Result<Array2<f64>, String> {
         let knot_arr = Array1::from_vec(self.knots.clone());
-        let constrained = monotone_wiggle_basis_with_derivative_order(
-            q0.view(),
-            &knot_arr,
-            self.degree,
-            basis_options.derivative_order,
-        )?;
+        let constrained = if self.use_ispline {
+            // New path: I-spline basis (structurally monotone)
+            monotone_wiggle_basis_with_derivative_order(
+                q0.view(),
+                &knot_arr,
+                self.degree,
+                basis_options.derivative_order,
+            )?
+        } else {
+            // Legacy path: B-spline + Z-transform for old saved models
+            legacy_bspline_z_wiggle_basis(
+                q0.view(),
+                &knot_arr,
+                self.degree,
+                basis_options.derivative_order,
+            )?
+        };
         if constrained.ncols() != self.beta.len() {
             return Err(format!(
                 "saved link-wiggle dimension mismatch: coefficients have {} entries but basis has {} columns",
@@ -402,6 +421,64 @@ impl SavedBaselineTimeWiggleRuntime {
     pub fn validate_global_monotonicity(&self) -> Result<(), String> {
         validate_monotone_wiggle_beta_nonnegative(&self.beta, "saved baseline-timewiggle")
     }
+}
+
+/// Legacy B-spline + Z-transform wiggle basis for backward-compatible saved models.
+///
+/// Old saved models store knots generated for B-spline degree `d` and beta vectors
+/// in the Z-transformed basis. This function reproduces that path exactly.
+fn legacy_bspline_z_wiggle_basis(
+    seed: ndarray::ArrayView1<'_, f64>,
+    knots: &ndarray::Array1<f64>,
+    degree: usize,
+    derivative_order: usize,
+) -> Result<ndarray::Array2<f64>, String> {
+    use crate::basis::compute_geometric_constraint_transform;
+
+    let num_basis = knots.len().saturating_sub(degree + 1);
+    let (z, _) =
+        compute_geometric_constraint_transform(knots, degree, 2).map_err(|e| e.to_string())?;
+    if derivative_order == 0 {
+        let (basis, _) = create_basis::<Dense>(
+            seed,
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(basis.as_ref().dot(&z));
+    }
+    let mut out = ndarray::Array2::<f64>::zeros((seed.len(), z.ncols()));
+    if derivative_order > degree || num_basis == 0 || z.ncols() == 0 {
+        return Ok(out);
+    }
+    let knot_view = knots.view();
+    let mut raw = vec![0.0; num_basis];
+    for (row_idx, &x) in seed.iter().enumerate() {
+        raw.fill(0.0);
+        match derivative_order {
+            1 => crate::basis::evaluate_bspline_derivative_scalar(x, knot_view, degree, &mut raw),
+            2 => crate::basis::evaluate_bsplinesecond_derivative_scalar(
+                x, knot_view, degree, &mut raw,
+            ),
+            3 => crate::basis::evaluate_bsplinethird_derivative_scalar(
+                x, knot_view, degree, &mut raw,
+            ),
+            4 => crate::basis::evaluate_bspline_fourth_derivative_scalar(
+                x, knot_view, degree, &mut raw,
+            ),
+            _ => return Err(format!("unsupported legacy wiggle derivative order {derivative_order}")),
+        }
+        .map_err(|e| format!("legacy wiggle derivative evaluation failed: {e}"))?;
+        for col in 0..z.ncols() {
+            let mut value = 0.0;
+            for raw_col in 0..num_basis {
+                value += raw[raw_col] * z[[raw_col, col]];
+            }
+            out[[row_idx, col]] = if value.abs() <= 1e-12 { 0.0 } else { value };
+        }
+    }
+    Ok(out)
 }
 
 impl SavedAnchoredDeviationRuntime {
@@ -701,6 +778,7 @@ impl FittedModel {
             knots,
             degree,
             beta,
+            use_ispline: payload.linkwiggle_ispline.unwrap_or(false),
         }))
     }
 

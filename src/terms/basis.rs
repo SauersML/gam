@@ -11914,23 +11914,53 @@ pub fn create_ispline_derivative_dense(
         let num_ispline_basis = num_bspline_basis.saturating_sub(1);
         return Ok(Array2::zeros((data.len(), num_ispline_basis)));
     }
-    // Evaluate B-spline k-th derivatives at the internal degree (degree+1).
-    let bspline_options = match derivative_order {
-        1 => BasisOptions::first_derivative(),
-        2 => BasisOptions::second_derivative(),
-        _ => BasisOptions {
-            derivative_order,
-            basis_family: BasisFamily::BSpline,
-        },
+    let num_bspline_cols = knot_vector.len().saturating_sub(bs_degree + 1);
+    let db = match derivative_order {
+        1 | 2 => {
+            let bspline_options = match derivative_order {
+                1 => BasisOptions::first_derivative(),
+                2 => BasisOptions::second_derivative(),
+                _ => unreachable!(),
+            };
+            let (db_arc, _) = create_basis::<Dense>(
+                data,
+                KnotSource::Provided(knot_vector.view()),
+                bs_degree,
+                bspline_options,
+            )?;
+            db_arc.as_ref().clone()
+        }
+        3 | 4 => {
+            let mut db = Array2::<f64>::zeros((data.len(), num_bspline_cols));
+            for (row_idx, &x) in data.iter().enumerate() {
+                let row = db
+                    .slice_mut(s![row_idx, ..])
+                    .into_slice()
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(
+                            "I-spline derivative row is not contiguous".to_string(),
+                        )
+                    })?;
+                match derivative_order {
+                    3 => evaluate_bsplinethird_derivative_scalar(
+                        x,
+                        knot_vector.view(),
+                        bs_degree,
+                        row,
+                    )?,
+                    4 => evaluate_bspline_fourth_derivative_scalar(
+                        x,
+                        knot_vector.view(),
+                        bs_degree,
+                        row,
+                    )?,
+                    _ => unreachable!(),
+                }
+            }
+            db
+        }
+        _ => unreachable!(),
     };
-    let (db_arc, _) = create_basis::<Dense>(
-        data,
-        KnotSource::Provided(knot_vector.view()),
-        bs_degree,
-        bspline_options,
-    )?;
-    let db = db_arc.as_ref();
-    let num_bspline_cols = db.ncols();
     let num_ispline_cols = num_bspline_cols.saturating_sub(1);
     if num_ispline_cols == 0 {
         return Ok(Array2::zeros((data.len(), 0)));
