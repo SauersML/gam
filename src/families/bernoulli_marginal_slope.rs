@@ -3641,7 +3641,7 @@ mod tests {
             quadrature_nodes: array![-0.25, 0.25],
             quadrature_weights: array![0.5, 0.5],
             score_warp: Some(prepared.runtime.clone()),
-            score_warp_obs_design: Some(prepared.block.design.to_dense().as_ref().clone()),
+            score_warp_obs_design: Some((*prepared.block.design.to_dense()).clone()),
             link_dev: None,
         };
         let block_states = vec![
