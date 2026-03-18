@@ -610,8 +610,8 @@ pub fn build_survival_time_basis(
             }
 
             Ok(SurvivalTimeBuildOutput {
-                x_entry_time: entry_basis.design,
-                x_exit_time: exit_basis.design,
+                x_entry_time: entry_basis.design.to_dense(),
+                x_exit_time: exit_basis.design.to_dense(),
                 x_derivative_time,
                 nullspace_dims: entry_basis.nullspace_dims,
                 penalties: entry_basis.penalties,
@@ -978,7 +978,10 @@ pub fn build_survival_timewiggle_from_baseline(
         design_entry,
         design_exit,
         design_derivative_exit,
-        penalties: combined_block.penalties,
+        penalties: {
+            let p = combined_block.design.ncols();
+            combined_block.penalties.into_iter().map(|ps| ps.to_global(p)).collect()
+        },
         knots,
         degree: cfg.degree,
     })
@@ -1198,7 +1201,7 @@ pub fn build_time_varying_survival_covariate_template(
 
     let time_build = build_bspline_basis_1d(log_exit.view(), &time_spec)
         .map_err(|e| format!("failed to build {block_name} time-margin B-spline basis: {e}"))?;
-    let time_design_exit = time_build.design;
+    let time_design_exit = time_build.design.to_dense();
 
     let knots = match &time_build.metadata {
         BasisMetadata::BSpline1D { knots, .. } => knots.clone(),
@@ -1220,7 +1223,7 @@ pub fn build_time_varying_survival_covariate_template(
         },
     )
     .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;
-    let time_design_entry = time_build_entry.design;
+    let time_design_entry = time_build_entry.design.to_dense();
     let p_time = time_design_exit.ncols();
     let mut time_design_derivative_exit = Array2::<f64>::zeros((age_exit.len(), p_time));
     let mut deriv_buf = vec![0.0_f64; p_time];
@@ -1228,9 +1231,7 @@ pub fn build_time_varying_survival_covariate_template(
         deriv_buf.fill(0.0);
         evaluate_bspline_derivative_scalar(
             log_exit[i],
-            knots
-                .as_slice()
-                .ok_or_else(|| format!("{block_name} time-margin knots are not contiguous"))?,
+            knots.view(),
             time_degree,
             &mut deriv_buf,
         )
