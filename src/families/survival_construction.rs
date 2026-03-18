@@ -17,8 +17,9 @@ use crate::basis::{
     KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
 use crate::families::gamlss::{
-    WiggleBlockConfig, buildwiggle_block_input_from_knots, buildwiggle_block_input_from_seed,
-    monotone_wiggle_basis_with_derivative_order,
+    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
+    buildwiggle_block_input_from_seed, monotone_wiggle_basis_with_derivative_order,
+    split_wiggle_penalty_orders,
 };
 use crate::families::survival_location_scale::{
     ResidualDistribution, SurvivalCovariateTermBlockTemplate,
@@ -712,7 +713,8 @@ pub fn build_survival_time_basis(
                 };
                 if keep_cols.is_empty() {
                     return Err(
-                        "internal error: ispline basis has no shape-varying time columns".to_string(),
+                        "internal error: ispline basis has no shape-varying time columns"
+                            .to_string(),
                     );
                 }
                 if keep_cols.iter().any(|&j| j >= p_time_full) {
@@ -744,10 +746,9 @@ pub fn build_survival_time_basis(
                     x_derivative_time[[i, j_new]] = d_i_log_full[j_old] * chain;
                 }
             }
-            if let Some((row, col)) = x_derivative_time
-                .indexed_iter()
-                .find_map(|((i, j), v)| if v.is_finite() { None } else { Some((i, j)) })
-            {
+            if let Some((row, col)) = x_derivative_time.indexed_iter().find_map(|((i, j), v)| {
+                if v.is_finite() { None } else { Some((i, j)) }
+            }) {
                 return Err(format!(
                     "survival ispline derivative basis produced non-finite value at row {}, column {}",
                     row + 1,
@@ -970,16 +971,10 @@ pub fn build_survival_timewiggle_from_baseline(
         seed[i] = eta_entry[i];
         seed[n + i] = eta_exit[i];
     }
-    // Use the user's minimum qualified penalty order (≥ 2) as the primary
-    // geometric-constraint penalty.  This ensures the penalty geometry matches
-    // the user's intent rather than always defaulting to order 2.
-    let primary_order = cfg
-        .penalty_orders
-        .iter()
-        .copied()
-        .filter(|&o| o >= 2)
-        .min()
-        .unwrap_or(2);
+    // Use the smallest requested positive penalty order as the primary
+    // geometric-constraint penalty so the fitted wiggle penalty system matches
+    // the public formula exactly, including the slope (`order = 1`) case.
+    let (primary_order, extra_orders) = split_wiggle_penalty_orders(2, &cfg.penalty_orders);
     let wiggle_cfg = WiggleBlockConfig {
         degree: cfg.degree,
         num_internal_knots: cfg.num_internal_knots,
@@ -987,18 +982,7 @@ pub fn build_survival_timewiggle_from_baseline(
         double_penalty: cfg.double_penalty,
     };
     let (mut combined_block, knots) = buildwiggle_block_input_from_seed(seed.view(), &wiggle_cfg)?;
-    // Add difference penalties for all requested orders except the primary
-    // (which is already represented by the geometric-constraint penalty).
-    let extra_orders: Vec<usize> = cfg
-        .penalty_orders
-        .iter()
-        .copied()
-        .filter(|&o| o != primary_order)
-        .collect();
-    crate::families::gamlss::append_selected_wiggle_penalty_orders(
-        &mut combined_block,
-        &extra_orders,
-    )?;
+    append_selected_wiggle_penalty_orders(&mut combined_block, &extra_orders)?;
     let design_entry = match buildwiggle_block_input_from_knots(
         eta_entry.view(),
         &knots,

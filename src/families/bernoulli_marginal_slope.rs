@@ -633,7 +633,7 @@ impl MultiDirJet {
     }
 
     pub fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
-        debug_assert!(
+        assert!(
             first.len() <= n_dirs,
             "MultiDirJet::linear: first.len()={} exceeds n_dirs={}",
             first.len(),
@@ -655,7 +655,7 @@ impl MultiDirJet {
     }
 
     pub fn set_coeff(&mut self, mask: usize, value: f64) {
-        debug_assert!(
+        assert!(
             mask < self.coeffs.len(),
             "MultiDirJet::set_coeff: mask={mask} exceeds capacity={}",
             self.coeffs.len(),
@@ -3685,5 +3685,126 @@ mod tests {
             bernoulli_exact_outer_derivative_order(10_000, 8, 6),
             ExactOuterDerivativeOrder::First
         );
+    }
+
+    /// Exercises the w-only (link_dev without score_warp) layout through the
+    /// full gradient + Hessian path, verifying that:
+    ///   (a) no index-out-of-bounds panic occurs,
+    ///   (b) all outputs are finite,
+    ///   (c) the Hessian is symmetric.
+    ///
+    /// This guards against arity bookkeeping bugs where the directional-jet or
+    /// block-slice code assumes both h and w blocks are present.
+    #[test]
+    fn w_only_gradient_hessian_finite_and_symmetric() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                derivative_grid_size: 16,
+                ..DeviationBlockConfig::default()
+            },
+            None,
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        // Non-trivial link coefficients to exercise all jet branches.
+        let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0)));
+
+        let family = BernoulliMarginalSlopeFamily {
+            y: array![0.0, 1.0, 0.0, 1.0, 0.0],
+            weights: Array1::ones(seed.len()),
+            z: seed.clone(),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            quadrature_nodes: array![0.0],
+            quadrature_weights: array![1.0],
+            score_warp: None,
+            score_warp_obs_design: None,
+            link_dev: Some(prepared.runtime.clone()),
+            score_warp_constraints: None,
+            link_dev_constraints: Some(prepared.constraints.clone()),
+        };
+
+        // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
+        // eta is irrelevant for zero-column designs; use zeros.
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(beta_link.clone(), seed.len()),
+        ];
+
+        let slices = block_slices(&block_states, false, true);
+        assert!(slices.h.is_none(), "score-warp absent → no h slice");
+        let primary = primary_slices(&slices);
+        assert!(primary.h.is_none(), "primary h absent");
+        assert_eq!(primary.total, 2 + link_dim);
+
+        let h_nodes = &family.quadrature_nodes;
+
+        // Exercise every row — different z values exercise different link
+        // regimes (negative tail, near zero, positive tail).
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states, h_nodes, None)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+
+            let (grad, hess) = family
+                .compute_row_primary_gradient_hessian(
+                    row,
+                    &block_states,
+                    &primary,
+                    &row_ctx,
+                    h_nodes,
+                    None, // h_node_design: absent when no score_warp
+                    None, // score_warp_obs: absent
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: compute_row_primary_gradient_hessian failed: {e}")
+                });
+
+            assert_eq!(
+                grad.len(),
+                primary.total,
+                "row {row}: gradient length mismatch"
+            );
+            assert_eq!(
+                hess.dim(),
+                (primary.total, primary.total),
+                "row {row}: hessian shape mismatch"
+            );
+            assert!(
+                grad.iter().all(|v| v.is_finite()),
+                "row {row}: non-finite gradient entry: {grad:?}"
+            );
+            assert!(
+                hess.iter().all(|v| v.is_finite()),
+                "row {row}: non-finite hessian entry"
+            );
+
+            // Symmetry check.
+            for a in 0..primary.total {
+                for b in 0..a {
+                    let diff = (hess[[a, b]] - hess[[b, a]]).abs();
+                    assert!(
+                        diff < 1e-10,
+                        "row {row}: hessian asymmetry at ({a},{b}): \
+                         H[{a},{b}]={:.6e} vs H[{b},{a}]={:.6e}, diff={diff:.3e}",
+                        hess[[a, b]],
+                        hess[[b, a]]
+                    );
+                }
+            }
+        }
     }
 }

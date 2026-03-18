@@ -175,7 +175,8 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::estimate::EstimationError;
 use crate::mixture_link::{
-    beta_logistic_inverse_link_jet, component_inverse_link_jet, sas_inverse_link_jet,
+    beta_logistic_inverse_link_jet, component_inverse_link_jet, logit_inverse_link_jet5,
+    sas_inverse_link_jet,
 };
 use crate::types::{LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkState, SasLinkState};
 use statrs::function::erf::erfc;
@@ -1297,6 +1298,79 @@ fn cloglog_survival_extreme_asymptotic(
     None
 }
 
+// ── Cloglog negative-tail asymptotics ────────────────────────────────────
+//
+// For the cloglog link μ(η) = 1 − exp(−exp(η)), when η ≪ 0:
+//   μ(η)   ≈ exp(η)                          (since exp(η)→0)
+//   μ'(η)  = exp(η)·exp(−exp(η)) ≈ exp(η)   (since exp(−exp(η))→1)
+//
+// For the integrated (Gaussian-convolved) mean E[μ(η+σZ)]:
+//   E[μ(η+σZ)] ≈ E[exp(η+σZ)] = exp(η + σ²/2)
+//   d/dη E[μ(η+σZ)] ≈ exp(η + σ²/2)
+//
+// These asymptotics are accurate to O(exp(2η)) and replace the previous
+// hard-zero derivative outside the clamp window, which introduced a
+// discontinuity at η = −30 and discarded real (though small) derivative mass.
+
+/// Pointwise cloglog mean in the deep negative tail.
+#[inline]
+fn cloglog_negative_tail_mean(eta: f64) -> f64 {
+    // μ(η) = 1 − exp(−exp(η)).  For η < −30, exp(η) < 1e-13, so
+    // exp(−exp(η)) ≈ 1 − exp(η) and μ ≈ exp(η).
+    // Direct exp avoids the intermediate exp(exp(η)) overflow path.
+    if eta < -745.0 {
+        // exp(-745) underflows to 0.0 in f64.
+        0.0
+    } else {
+        // Use expm1(−exp(η)) = exp(−exp(η)) − 1, so μ = −expm1(−exp(η)).
+        // This is more accurate than 1 − exp(−exp(η)) near zero.
+        let ex = eta.exp();
+        -(-ex).exp_m1()
+    }
+}
+
+/// Pointwise cloglog derivative dμ/dη in the deep negative tail.
+#[inline]
+fn cloglog_negative_tail_derivative(eta: f64) -> f64 {
+    // dμ/dη = exp(η) · exp(−exp(η)).  For η ≪ 0 this simplifies to ≈ exp(η).
+    if eta < -745.0 {
+        0.0
+    } else {
+        let ex = eta.exp();
+        (ex * (-ex).exp()).max(0.0)
+    }
+}
+
+/// Integrated cloglog mean E[μ(η+σZ)] in the deep negative tail.
+#[inline]
+fn cloglog_negative_tail_integrated_mean(eta: f64, sigma: f64) -> f64 {
+    // E[1 − exp(−exp(η+σZ))] ≈ E[exp(η+σZ)] = exp(η + σ²/2).
+    let log_val = eta + 0.5 * sigma * sigma;
+    if log_val < -745.0 {
+        0.0
+    } else if log_val > 500.0 {
+        // Saturating toward 1; the asymptotic is no longer valid, but the
+        // caller should have routed through the non-tail branch.
+        1.0
+    } else {
+        log_val.exp()
+    }
+}
+
+/// Integrated cloglog derivative d/dη E[μ(η+σZ)] in the deep negative tail.
+#[inline]
+fn cloglog_negative_tail_integrated_derivative(eta: f64, sigma: f64) -> f64 {
+    // d/dη E[exp(η+σZ)] = exp(η + σ²/2).
+    let log_val = eta + 0.5 * sigma * sigma;
+    if log_val < -745.0 {
+        0.0
+    } else if log_val > 500.0 {
+        0.0
+    } else {
+        log_val.exp()
+    }
+}
+
 #[inline]
 fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     // Small-variance heat-kernel expansion.
@@ -1329,9 +1403,21 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     let f4 = surv * (ex - 7.0 * e2x + 6.0 * e3x - e4x);
     let f5 = surv * (ex - 15.0 * e2x + 25.0 * e3x - 10.0 * e4x + e5x);
     IntegratedMeanDerivative {
-        mean: f0 + 0.5 * s2 * f2 + (s4 / 24.0) * f4,
+        mean: if clamp_active && mu < -30.0 {
+            // Negative tail with small sigma: E[μ(η+σZ)] ≈ E[exp(η+σZ)]
+            // = exp(η + σ²/2) via the Gaussian moment-generating function.
+            cloglog_negative_tail_integrated_mean(mu, sigma)
+        } else {
+            f0 + 0.5 * s2 * f2 + (s4 / 24.0) * f4
+        },
         dmean_dmu: if clamp_active {
-            0.0
+            if mu < -30.0 {
+                // Negative tail: d/dμ E[μ(η+σZ)] ≈ exp(μ + σ²/2).
+                cloglog_negative_tail_integrated_derivative(mu, sigma)
+            } else {
+                // Positive tail: genuinely negligible (double-exponential decay).
+                0.0
+            }
         } else {
             (f1 + 0.5 * s2 * f3 + (s4 / 24.0) * f5).max(0.0)
         },
@@ -2127,9 +2213,21 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
         let ez = z.exp();
         let surv = (-ez).exp();
         return IntegratedMeanDerivative {
-            mean: 1.0 - surv,
+            mean: if clamp_active && mu < -30.0 {
+                // Negative tail: μ(η) = 1−exp(−exp(η)) ≈ exp(η) when η≪0.
+                cloglog_negative_tail_mean(mu)
+            } else {
+                1.0 - surv
+            },
             dmean_dmu: if clamp_active {
-                0.0
+                if mu < -30.0 {
+                    // Negative tail: dμ/dη = exp(η)·exp(−exp(η)) ≈ exp(η).
+                    cloglog_negative_tail_derivative(mu)
+                } else {
+                    // Positive tail: dμ/dη = exp(η)·exp(−exp(η)) is below f64
+                    // precision for η > 30 (double-exponential decay).
+                    0.0
+                }
             } else {
                 (ez * surv).max(0.0)
             },
@@ -2833,46 +2931,8 @@ fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
 
 #[inline]
 fn logit_point_jet(x: f64) -> (f64, f64, f64, f64) {
-    // Numerically stable sigmoid derivatives.
-    //
-    // The naive form d1 = p*(1-p) where p = sigmoid(x) suffers catastrophic
-    // cancellation when p rounds to 0.0 or 1.0 in the tails.  Instead we
-    // use the identity  sigmoid'(x) = z/(1+z)^2  where z = exp(-|x|), which
-    // stays representable across the full f64 range.
-    if x.is_nan() {
-        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
-    }
-    if !x.is_finite() {
-        // +inf → (1,0,0,0), -inf → (0,0,0,0)
-        return if x > 0.0 { (1.0, 0.0, 0.0, 0.0) } else { (0.0, 0.0, 0.0, 0.0) };
-    }
-    // Branch so that z = exp(-|x|) ≤ 1, avoiding overflow in exp().
-    let (mu, d1, d2, d3) = if x >= 0.0 {
-        let z = (-x).exp();
-        let opz = 1.0 + z;
-        let opz2 = opz * opz;
-        let opz3 = opz2 * opz;
-        let opz4 = opz3 * opz;
-        (
-            1.0 / opz,
-            z / opz2,
-            z * (z - 1.0) / opz3,
-            z * (z * z - 4.0 * z + 1.0) / opz4,
-        )
-    } else {
-        let z = x.exp();
-        let opz = 1.0 + z;
-        let opz2 = opz * opz;
-        let opz3 = opz2 * opz;
-        let opz4 = opz3 * opz;
-        (
-            z / opz,
-            z / opz2,
-            z * (1.0 - z) / opz3,
-            z * (1.0 - 4.0 * z + z * z) / opz4,
-        )
-    };
-    (mu, d1, d2, d3)
+    let jet = logit_inverse_link_jet5(x);
+    (jet.mu, jet.d1, jet.d2, jet.d3)
 }
 
 #[inline]
@@ -2921,11 +2981,7 @@ fn cloglog_point_jet(x: f64) -> (f64, f64, f64, f64) {
     // When t overflows, log_d1 = x - inf = -inf, so d1 = 0 naturally.
     // Guard against log_d1 being so negative that exp underflows — that
     // just gives 0.0, which is the correct limiting value.
-    let d1 = if log_d1 < -745.0 {
-        0.0
-    } else {
-        log_d1.exp()
-    };
+    let d1 = if log_d1 < -745.0 { 0.0 } else { log_d1.exp() };
 
     // Higher derivatives: d_k = d1 * P_k(t) for degree-(k-1) polynomials.
     // When d1 is zero (or negligible), d_k = 0 as well — no clamp needed.
@@ -4481,9 +4537,21 @@ mod tests {
         // because the stable formulation allows them to decay smoothly rather
         // than hard-clamping to zero.
         let cloglog = cloglog_point_jet(-40.0);
-        assert!(cloglog.1.abs() < 1e-15, "d1 should be near-zero: {}", cloglog.1);
-        assert!(cloglog.2.abs() < 1e-15, "d2 should be near-zero: {}", cloglog.2);
-        assert!(cloglog.3.abs() < 1e-15, "d3 should be near-zero: {}", cloglog.3);
+        assert!(
+            cloglog.1.abs() < 1e-15,
+            "d1 should be near-zero: {}",
+            cloglog.1
+        );
+        assert!(
+            cloglog.2.abs() < 1e-15,
+            "d2 should be near-zero: {}",
+            cloglog.2
+        );
+        assert!(
+            cloglog.3.abs() < 1e-15,
+            "d3 should be near-zero: {}",
+            cloglog.3
+        );
     }
 
     #[test]

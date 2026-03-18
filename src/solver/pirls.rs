@@ -12,6 +12,7 @@ use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
 use crate::mixture_link::{
     InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
+    logit_inverse_link_jet5,
 };
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
@@ -4597,7 +4598,11 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         penalty_diag.rank()
     } else {
         // Compute penalty root rank cheaply from canonical penalties.
-        penalty.canonical_penalties.iter().map(|cp| cp.rank()).sum::<usize>()
+        penalty
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.rank())
+            .sum::<usize>()
     };
     let mut workspace = PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), ebrows, erows);
     let solver_decision = if let Some((_, _, _)) = kronecker_runtime.as_ref() {
@@ -4687,10 +4692,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             &reparam.qs,
             penalty.coefficient_lower_bounds,
         );
-        let tl = build_transformed_linear_constraints(
-            &reparam.qs,
-            penalty.linear_constraints_original,
-        );
+        let tl =
+            build_transformed_linear_constraints(&reparam.qs, penalty.linear_constraints_original);
         merge_linear_constraints(tb, tl)
     } else {
         // Sparse-native without dense reparam: constraints stay in original
@@ -4701,10 +4704,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             &qs_identity,
             penalty.coefficient_lower_bounds,
         );
-        let tl = build_transformed_linear_constraints(
-            &qs_identity,
-            penalty.linear_constraints_original,
-        );
+        let tl =
+            build_transformed_linear_constraints(&qs_identity, penalty.linear_constraints_original);
         merge_linear_constraints(tb, tl)
     };
 
@@ -5519,6 +5520,40 @@ fn standard_inverse_link_jet(
     )
 }
 
+#[inline]
+fn bernoulli_logit_geometry_from_jet(
+    eta_raw: f64,
+    eta_used: f64,
+    y: f64,
+    priorweight: f64,
+    jet: crate::mixture_link::LogitJet5,
+    applyweight_floor: bool,
+    zero_on_nonsmooth: bool,
+) -> WorkingBernoulliGeometry {
+    const MIN_WEIGHT: f64 = 1e-12;
+    const MIN_D_FOR_Z: f64 = 1e-6;
+
+    let fisher = jet.d1;
+    let fisher_effective = if applyweight_floor {
+        fisher.max(MIN_WEIGHT)
+    } else {
+        fisher
+    };
+    let nonsmooth = eta_raw != eta_used || fisher <= MIN_WEIGHT;
+    let (c, d) = if nonsmooth && zero_on_nonsmooth {
+        (0.0, 0.0)
+    } else {
+        (priorweight * jet.d2, priorweight * jet.d3)
+    };
+    WorkingBernoulliGeometry {
+        mu: jet.mu,
+        weight: priorweight * fisher_effective,
+        z: eta_used + (y - jet.mu) / jet.d1.max(MIN_D_FOR_Z),
+        c,
+        d,
+    }
+}
+
 /// Compute working IRLS geometry for a single Bernoulli observation.
 ///
 /// The weight returned is the **Fisher** (expected information) weight
@@ -5697,52 +5732,30 @@ pub fn update_glmvectors(
         && inverse_link.mixture_state().is_none()
         && inverse_link.sas_state().is_none()
     {
-        const MIN_WEIGHT: f64 = 1e-12;
-        const MIN_D_FOR_Z: f64 = 1e-6;
-        const PROB_EPS: f64 = 1e-8;
-
         let mut derivatives = derivatives;
         for i in 0..n {
             let eta_raw = eta[i];
             let eta_c = eta_raw.clamp(-700.0, 700.0);
-            // Numerically stable logistic
-            let mu_i = if eta_c >= 0.0 {
-                let ex = (-eta_c).exp();
-                1.0 / (1.0 + ex)
-            } else {
-                let ex = eta_c.exp();
-                ex / (1.0 + ex)
-            };
-            let d1 = mu_i * (1.0 - mu_i);
-            let v = d1.max(PROB_EPS);
-            // For logit: fisher = d1^2 / v, and since v ≈ d1, fisher ≈ d1
-            let fisher = (d1 * d1) / v;
-            let fisher_eff = fisher.max(MIN_WEIGHT);
-            mu[i] = mu_i;
-            weights[i] = priorweights[i] * fisher_eff;
-            z[i] = eta_c + (y[i] - mu_i) / d1.max(MIN_D_FOR_Z);
+            let jet = logit_inverse_link_jet5(eta_c);
+            let geom = bernoulli_logit_geometry_from_jet(
+                eta_raw,
+                eta_c,
+                y[i],
+                priorweights[i],
+                jet,
+                true,
+                logit_clampzero_enabled(),
+            );
+            mu[i] = geom.mu;
+            weights[i] = geom.weight;
+            z[i] = geom.z;
 
             if let Some(derivs) = derivatives.as_mut() {
-                let nonsmooth = eta_raw != eta_c || fisher <= MIN_WEIGHT;
-                let d2 = d1 * (1.0 - 2.0 * mu_i);
-                let d3 = d1 * (1.0 - 6.0 * d1);
-                if nonsmooth {
-                    derivs.c[i] = 0.0;
-                    derivs.d[i] = 0.0;
-                } else {
-                    let n0 = d1 * d1;
-                    let v1 = d1 * (1.0 - 2.0 * mu_i);
-                    let v2 = d2 * (1.0 - 2.0 * mu_i) - 2.0 * d1 * d1;
-                    let n1 = 2.0 * d1 * d2;
-                    let n2 = 2.0 * (d2 * d2 + d1 * d3);
-                    let numer1 = n1 * v - n0 * v1;
-                    derivs.c[i] = priorweights[i] * numer1 / (v * v);
-                    derivs.d[i] = priorweights[i]
-                        * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
-                }
-                derivs.dmu_deta[i] = d1;
-                derivs.d2mu_deta2[i] = d2;
-                derivs.d3mu_deta3[i] = d3;
+                derivs.c[i] = geom.c;
+                derivs.d[i] = geom.d;
+                derivs.dmu_deta[i] = jet.d1;
+                derivs.d2mu_deta2[i] = jet.d2;
+                derivs.d3mu_deta3[i] = jet.d3;
             }
         }
         return Ok(());
@@ -5768,15 +5781,27 @@ pub fn update_glmvectors(
                     LinkFunction::Identity => eta[i],
                 };
                 let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                let geom = bernoulli_geometry_from_jet(
-                    eta[i],
-                    eta_used,
-                    y[i],
-                    priorweights[i],
-                    jet,
-                    true,
-                    zero_on_nonsmooth,
-                );
+                let geom = if matches!(link, LinkFunction::Logit) {
+                    bernoulli_logit_geometry_from_jet(
+                        eta[i],
+                        eta_used,
+                        y[i],
+                        priorweights[i],
+                        logit_inverse_link_jet5(eta_used),
+                        true,
+                        zero_on_nonsmooth,
+                    )
+                } else {
+                    bernoulli_geometry_from_jet(
+                        eta[i],
+                        eta_used,
+                        y[i],
+                        priorweights[i],
+                        jet,
+                        true,
+                        zero_on_nonsmooth,
+                    )
+                };
                 mu[i] = geom.mu;
                 weights[i] = geom.weight;
                 z[i] = geom.z;
@@ -6658,6 +6683,16 @@ pub fn observed_weight_binomial_logit(n_trials: f64, p: f64, pw: f64) -> (f64, f
     (w, c, d)
 }
 
+#[inline]
+fn observed_weight_binomial_logit_from_jet(
+    n_trials: f64,
+    jet: MixtureInverseLinkJet,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let scale = pw * n_trials;
+    (scale * jet.d1, scale * jet.d2, scale * jet.d3)
+}
+
 /// Family tag for the observed-information weight dispatch.
 ///
 /// This is a simplified family tag that identifies the variance function,
@@ -6726,11 +6761,7 @@ pub fn observed_weight_dispatch(
             observed_weight_gaussian_inverse(y, eta, phi, prior_weight)
         }
         (WeightFamily::Binomial, WeightLink::Logit) => {
-            // Binomial-logit closed form: w = mu(1-mu), c = 1-2mu, d = -2.
-            // binomial_n validates the variance jet: V(mu) = mu(1-mu).
-            let vj = VarianceJet::binomial_n(mu);
-            assert!((vj.v - mu * (1.0 - mu)).abs() < 1e-12);
-            observed_weight_binomial_logit(1.0, mu, prior_weight)
+            observed_weight_binomial_logit_from_jet(1.0, jet, prior_weight)
         }
         _ => {
             // Generic noncanonical path via the full variance-function jet.
@@ -6762,7 +6793,7 @@ pub fn fisher_weight_dispatch(
         }
         (WeightFamily::Binomial, WeightLink::Logit) => {
             // Fisher = observed for canonical link; delegate.
-            observed_weight_binomial_logit(1.0, mu, prior_weight)
+            observed_weight_binomial_logit_from_jet(1.0, jet, prior_weight)
         }
         _ => {
             let vj = variance_jet_for_weight_family(family, mu);
@@ -7251,7 +7282,8 @@ mod tests {
         compute_observed_hessian_curvature_arrays, default_beta_guess_external,
         fit_model_for_fixed_rho, logit_clampzero_enabled, should_log_pirls_decision_summary,
         should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
-        solve_newton_directionwith_lower_bounds, working_set_kkt_diagnostics_frommultipliers,
+        solve_newton_directionwith_lower_bounds, update_glmvectors,
+        working_set_kkt_diagnostics_frommultipliers,
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
@@ -7699,6 +7731,46 @@ mod tests {
                 max_relative = 1e-7
             );
         }
+    }
+
+    #[test]
+    fn pure_logit_working_state_preserves_tail_fisher_mass() {
+        let y = array![1.0];
+        let eta = array![50.0];
+        let priorweights = array![1.0];
+        let inverse_link = InverseLink::Standard(LinkFunction::Logit);
+        let mut mu = Array1::zeros(1);
+        let mut weights = Array1::zeros(1);
+        let mut z = Array1::zeros(1);
+
+        update_glmvectors(
+            y.view(),
+            &eta,
+            &inverse_link,
+            priorweights.view(),
+            &mut mu,
+            &mut weights,
+            &mut z,
+            None,
+        )
+        .expect("pure logit working state");
+
+        let jet = crate::mixture_link::logit_inverse_link_jet5(eta[0]);
+        assert!(jet.d1 > 0.0);
+        assert!(
+            (weights[0] - jet.d1).abs() < 1e-30,
+            "pure logit PIRLS weight should equal the stable tail formula at eta={}; got {} vs {}",
+            eta[0],
+            weights[0],
+            jet.d1
+        );
+        assert!(
+            (mu[0] - jet.mu).abs() < 1e-30,
+            "pure logit PIRLS mu mismatch at eta={}; got {} vs {}",
+            eta[0],
+            mu[0],
+            jet.mu
+        );
     }
 
     #[test]

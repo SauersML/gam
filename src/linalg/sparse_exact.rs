@@ -1032,52 +1032,42 @@ impl TakahashiInverse {
         out
     }
 
-    /// tr(H⁻¹ S) where S is given as sparse CSC (symmetric, upper or full).
-    /// Only accesses entries in the filled pattern of Z.
+    /// tr(H⁻¹ S) where S is given as sparse CSC, symmetric in either upper-
+    /// triangle-only or full (both triangles stored) format.
+    ///
+    /// The algorithm iterates over the upper triangle of S (entries with
+    /// row ≤ col), doubles off-diagonals, and skips lower-triangle entries.
+    /// This is correct for both storage conventions:
+    ///
+    /// - **Upper-triangle-only** (from `embed_dense_block_to_sparse_symmetric_upper`):
+    ///   every off-diagonal pair has exactly one stored entry with row < col,
+    ///   which we double.
+    ///
+    /// - **Full symmetric** (from `dense_to_sparse`): each off-diagonal pair
+    ///   has entries at both (i,j) and (j,i).  We process only the row < col
+    ///   entry and double it; the row > col mirror is skipped.  The diagonal
+    ///   is stored once and counted once.
+    ///
+    /// In both cases: tr(Z S) = Σ_diag Z[i,i] S[i,i] + 2 Σ_{i<j} Z[i,j] S[i,j].
     pub fn trace_product_sparse(&self, s: &SparseColMat<usize, f64>) -> f64 {
         let (symbolic, values) = s.parts();
         let s_col_ptr = symbolic.col_ptr();
         let s_row_idx = symbolic.row_idx();
-
-        // Detect storage format: if any entry has row > col, the matrix uses
-        // full symmetric storage and off-diagonals must NOT be doubled.
-        // If only upper-triangle entries are present, off-diagonals must be
-        // doubled to account for the implicit lower triangle.
-        let has_lower = (0..s.ncols()).any(|col| {
-            let start = s_col_ptr[col];
-            let end = s_col_ptr[col + 1];
-            (start..end).any(|idx| s_row_idx[idx] > col)
-        });
-
         let mut trace = 0.0;
-        if has_lower {
-            // Full storage: every (i,j) and (j,i) pair is explicitly stored,
-            // so tr(Z S) = sum over all stored entries of Z[i,j] * S[i,j].
-            for col in 0..s.ncols() {
-                let col_start = s_col_ptr[col];
-                let col_end = s_col_ptr[col + 1];
-                for idx in col_start..col_end {
-                    let row = s_row_idx[idx];
-                    let val = values[idx];
-                    let z_ij = self.get(row, col);
-                    trace += z_ij * val;
+        for col in 0..s.ncols() {
+            let col_start = s_col_ptr[col];
+            let col_end = s_col_ptr[col + 1];
+            for idx in col_start..col_end {
+                let row = s_row_idx[idx];
+                if row > col {
+                    continue; // skip lower triangle (handled via its mirror)
                 }
-            }
-        } else {
-            // Upper-triangle-only storage: double the off-diagonal contributions
-            // to account for the implicit lower triangle.
-            for col in 0..s.ncols() {
-                let col_start = s_col_ptr[col];
-                let col_end = s_col_ptr[col + 1];
-                for idx in col_start..col_end {
-                    let row = s_row_idx[idx];
-                    let val = values[idx];
-                    let z_ij = self.get(row, col);
-                    if row == col {
-                        trace += z_ij * val;
-                    } else {
-                        trace += 2.0 * z_ij * val;
-                    }
+                let val = values[idx];
+                let z_ij = self.get(row, col);
+                if row == col {
+                    trace += z_ij * val;
+                } else {
+                    trace += 2.0 * z_ij * val;
                 }
             }
         }

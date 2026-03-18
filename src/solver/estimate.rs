@@ -2513,14 +2513,14 @@ where
         // small-to-medium models. For large models, fall back to diagonal-only
         // standard errors from the Hessian diagonal.
         const COV_MAX_P: usize = 5_000;
-        let p_cov = penalized_hessian.as_ref().map_or(0, |h| h.nrows());
+        let p_cov = penalized_hessian.as_ref().map_or(0, |h: &Array2<f64>| h.nrows());
         beta_covariance = if p_cov > COV_MAX_P {
             log::warn!(
                 "skipping full posterior covariance inversion (p={p_cov} > {COV_MAX_P}): \
                  using diagonal-only standard errors"
             );
             // Diagonal-only SE from Hessian diagonal inverse
-            penalized_hessian.as_ref().map(|h| {
+            penalized_hessian.as_ref().map(|h: &Array2<f64>| {
                 let mut diag_inv = Array2::<f64>::zeros(h.dim());
                 for i in 0..h.nrows() {
                     let d = h[[i, i]];

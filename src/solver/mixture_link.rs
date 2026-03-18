@@ -20,6 +20,16 @@ pub struct InverseLinkJet {
     pub d3: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LogitJet5 {
+    pub mu: f64,
+    pub d1: f64,
+    pub d2: f64,
+    pub d3: f64,
+    pub d4: f64,
+    pub d5: f64,
+}
+
 #[inline]
 fn canonicalzero(v: f64) -> f64 {
     if v.abs() < f64::MIN_POSITIVE { 0.0 } else { v }
@@ -58,20 +68,90 @@ fn stable_nonnegative_poly_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
 }
 
 #[inline]
-fn logistic_stable(eta: f64) -> f64 {
+pub(crate) fn logit_inverse_link_jet5(eta: f64) -> LogitJet5 {
     if eta.is_nan() {
-        f64::NAN
-    } else if eta == f64::INFINITY {
-        1.0
-    } else if eta == f64::NEG_INFINITY {
-        0.0
-    } else if eta >= 0.0 {
+        return LogitJet5 {
+            mu: f64::NAN,
+            d1: f64::NAN,
+            d2: f64::NAN,
+            d3: f64::NAN,
+            d4: f64::NAN,
+            d5: f64::NAN,
+        };
+    }
+    if eta == f64::INFINITY {
+        return LogitJet5 {
+            mu: 1.0,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+            d4: 0.0,
+            d5: 0.0,
+        };
+    }
+    if eta == f64::NEG_INFINITY {
+        return LogitJet5 {
+            mu: 0.0,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+            d4: 0.0,
+            d5: 0.0,
+        };
+    }
+
+    let jet = if eta >= 0.0 {
         let z = (-eta).exp();
-        1.0 / (1.0 + z)
+        let opz = 1.0 + z;
+        let opz2 = opz * opz;
+        let opz3 = opz2 * opz;
+        let opz4 = opz3 * opz;
+        let opz5 = opz4 * opz;
+        let opz6 = opz5 * opz;
+        let z2 = z * z;
+        let z3 = z2 * z;
+        let z4 = z3 * z;
+        LogitJet5 {
+            mu: 1.0 / opz,
+            d1: z / opz2,
+            d2: z * (z - 1.0) / opz3,
+            d3: z * (z2 - 4.0 * z + 1.0) / opz4,
+            d4: z * (z3 - 11.0 * z2 + 11.0 * z - 1.0) / opz5,
+            d5: z * (z4 - 26.0 * z3 + 66.0 * z2 - 26.0 * z + 1.0) / opz6,
+        }
     } else {
         let z = eta.exp();
-        z / (1.0 + z)
+        let opz = 1.0 + z;
+        let opz2 = opz * opz;
+        let opz3 = opz2 * opz;
+        let opz4 = opz3 * opz;
+        let opz5 = opz4 * opz;
+        let opz6 = opz5 * opz;
+        let z2 = z * z;
+        let z3 = z2 * z;
+        let z4 = z3 * z;
+        LogitJet5 {
+            mu: z / opz,
+            d1: z / opz2,
+            d2: z * (1.0 - z) / opz3,
+            d3: z * (1.0 - 4.0 * z + z2) / opz4,
+            d4: z * (1.0 - 11.0 * z + 11.0 * z2 - z3) / opz5,
+            d5: z * (1.0 - 26.0 * z + 66.0 * z2 - 26.0 * z3 + z4) / opz6,
+        }
+    };
+    LogitJet5 {
+        mu: jet.mu,
+        d1: canonicalzero(jet.d1),
+        d2: canonicalzero(jet.d2),
+        d3: canonicalzero(jet.d3),
+        d4: canonicalzero(jet.d4),
+        d5: canonicalzero(jet.d5),
     }
+}
+
+#[inline]
+fn logistic_stable(eta: f64) -> f64 {
+    logit_inverse_link_jet5(eta).mu
 }
 
 #[inline]
@@ -164,32 +244,7 @@ fn chain_inverse_link_jet(base: InverseLinkJet, z1: f64, z2: f64, z3: f64) -> In
 fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64) -> f64 {
     match component {
         LinkComponent::Probit => probit_pdfthird_derivative(eta),
-        LinkComponent::Logit => {
-            // Logistic link:
-            //   mu'   = d1 = mu(1-mu)
-            //   d1'   = d2 = d1(1-2mu)
-            //   d2'   = d3 = d1(1-6mu+6mu²)
-            //   d3'   = d4 = d1(1-14mu+36mu²-24mu³).
-            if eta.is_nan() {
-                return f64::NAN;
-            }
-            if !eta.is_finite() {
-                return 0.0;
-            }
-            if eta >= 0.0 {
-                let z = (-eta).exp();
-                let opz = 1.0 + z;
-                canonicalzero(
-                    z * (z * z * z - 11.0 * z * z + 11.0 * z - 1.0) / (opz * opz * opz * opz * opz),
-                )
-            } else {
-                let z = eta.exp();
-                let opz = 1.0 + z;
-                canonicalzero(
-                    z * (1.0 - 11.0 * z + 11.0 * z * z - z * z * z) / (opz * opz * opz * opz * opz),
-                )
-            }
-        }
+        LinkComponent::Logit => logit_inverse_link_jet5(eta).d4,
         LinkComponent::CLogLog => {
             // CLogLog link:
             //   mu = 1 - exp(-t),  t = exp(eta),  d1 = t exp(-t).
@@ -255,19 +310,7 @@ fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64
 fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f64) -> f64 {
     match component {
         LinkComponent::Probit => probit_pdffourth_derivative(eta),
-        LinkComponent::Logit => {
-            // d5 = d1(1 - 30mu + 150mu² - 240mu³ + 120mu⁴)
-            if eta.is_nan() {
-                return f64::NAN;
-            }
-            if !eta.is_finite() {
-                return 0.0;
-            }
-            let mu = logistic_stable(eta);
-            let d1 = mu * (1.0 - mu);
-            let mu2 = mu * mu;
-            d1 * (1.0 - 30.0 * mu + 150.0 * mu2 - 240.0 * mu2 * mu + 120.0 * mu2 * mu2)
-        }
+        LinkComponent::Logit => logit_inverse_link_jet5(eta).d5,
         LinkComponent::CLogLog => {
             // d5 = d1(t^4 - 10t^3 + 25t^2 - 15t + 1)  where t = exp(eta)
             if eta.is_nan() {
@@ -533,37 +576,13 @@ pub fn state_fromspec(spec: &MixtureLinkSpec) -> Result<MixtureLinkState, String
 pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> InverseLinkJet {
     canonicalize_jet(match component {
         LinkComponent::Logit => {
-            if eta.is_nan() {
-                return InverseLinkJet {
-                    mu: f64::NAN,
-                    d1: f64::NAN,
-                    d2: f64::NAN,
-                    d3: f64::NAN,
-                };
+            let jet = logit_inverse_link_jet5(eta);
+            InverseLinkJet {
+                mu: jet.mu,
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
             }
-            let mu = logistic_stable(eta);
-            // Stable derivatives using z/(1+z)^2 to avoid catastrophic
-            // cancellation when mu rounds to 1.0 at large positive eta.
-            let (d1, d2, d3) = if !eta.is_finite() {
-                (0.0, 0.0, 0.0)
-            } else if eta >= 0.0 {
-                let z = (-eta).exp();
-                let opz = 1.0 + z;
-                (
-                    z / (opz * opz),
-                    z * (z - 1.0) / (opz * opz * opz),
-                    z * (z * z - 4.0 * z + 1.0) / (opz * opz * opz * opz),
-                )
-            } else {
-                let z = eta.exp();
-                let opz = 1.0 + z;
-                (
-                    z / (opz * opz),
-                    z * (1.0 - z) / (opz * opz * opz),
-                    z * (1.0 - 4.0 * z + z * z) / (opz * opz * opz * opz),
-                )
-            };
-            InverseLinkJet { mu, d1, d2, d3 }
         }
         LinkComponent::Probit => probit_jet(eta),
         LinkComponent::CLogLog => {
@@ -2182,11 +2201,14 @@ mod tests {
         let stable_d2 = z * (z - 1.0) / denom.powi(3);
         let stable_d3 = z * (z * z - 4.0 * z + 1.0) / denom.powi(4);
         let stable_d4 = z * (z * z * z - 11.0 * z * z + 11.0 * z - 1.0) / denom.powi(5);
+        let stable_d5 =
+            z * (z * z * z * z - 26.0 * z * z * z + 66.0 * z * z - 26.0 * z + 1.0) / denom.powi(6);
 
         assert!(stable_d1 > 0.0);
         assert!(stable_d2 < 0.0);
         assert!(stable_d3 > 0.0);
         assert!(stable_d4 < 0.0);
+        assert!(stable_d5 > 0.0);
 
         let jet = component_inverse_link_jet(LinkComponent::Logit, eta);
         assert!(
@@ -2218,6 +2240,18 @@ mod tests {
             "logit d4 should equal the stable tail formula z(z^3-11z^2+11z-1)/(1+z)^5 at eta={eta}; got {} vs {}",
             d4,
             stable_d4
+        );
+
+        let d5 = inverse_link_pdffourth_derivative_for_inverse_link(
+            &InverseLink::Standard(LinkFunction::Logit),
+            eta,
+        )
+        .expect("logit d5");
+        assert!(
+            (d5 - stable_d5).abs() < 1e-30,
+            "logit d5 should equal the stable tail formula z(z^4-26z^3+66z^2-26z+1)/(1+z)^6 at eta={eta}; got {} vs {}",
+            d5,
+            stable_d5
         );
     }
 

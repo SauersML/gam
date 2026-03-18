@@ -67,17 +67,47 @@ fn softplus(x: f64) -> f64 {
     }
 }
 
-/// Clamp threshold for `exp(-eta_ls)` to prevent overflow.  The largest finite
-/// f64 is ~1.8e308, so `exp(709)` is the hard ceiling.  We use 500 to leave
-/// headroom for subsequent multiplications (inv_sigma * eta_t, etc.) which
-/// would otherwise overflow to inf and produce NaN via inf*0 or inf-inf.
+// ---------------------------------------------------------------------------
+// Overflow-safe arithmetic for the survival exact-Newton chain
+// ---------------------------------------------------------------------------
+//
+// The survival location-scale model computes inv_sigma = exp(-eta_ls) and
+// multiplies it through many intermediate quantities (q0, qdot, g, ...).
+// When eta_ls is very negative (sigma → 0, distribution very concentrated),
+// exp(-eta_ls) can overflow to inf, poisoning downstream sums with NaN via
+// inf * 0 or inf - inf patterns.
+//
+// The protection strategy is layered:
+//
+//   Layer 1 – `exp_neg_stable`: clamp the exp argument to [-500, 500] so
+//     inv_sigma ≤ exp(500) ≈ 1.4e217.  This is the primary guard and
+//     prevents overflow at the source.  With this clamp, products like
+//     inv_sigma * eta_t stay finite for any eta_t below ~1e91.
+//
+//   Layer 2 – `survival_q0_from_eta`: uses log-space arithmetic to detect
+//     when |eta_t * inv_sigma| would exceed the clamp ceiling and saturates
+//     to ±MAX instead of overflowing.
+//
+//   Layer 3 – `safe_product` / `safe_sum2`: defense-in-depth guards that
+//     clamp inf products to MAX/MIN and map inf + (-inf) → 0.  With layers
+//     1–2 working, these should rarely trigger; they exist to prevent NaN
+//     propagation if a future code path bypasses layers 1–2.
+//
+//   Layer 4 – `exact_row_kernel`: splits the old `!g.is_finite()` hard error
+//     into NaN (hard error for genuinely bad data) and ±inf (clamped to MAX
+//     so the monotonicity guard can apply).
+//
+// The invariant: no NaN ever reaches the solver; all overflow paths saturate
+// to large finite values that the monotonicity floor and penalty then control.
+// ---------------------------------------------------------------------------
+
+/// Maximum exponent argument for overflow-safe exp in the survival chain.
+/// exp(500) ≈ 1.4e217 leaves ~91 orders of magnitude of headroom before
+/// reaching MAX ≈ 1.8e308, sufficient for any reasonable multiplicative chain.
 const EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
 
 #[inline]
 fn exp_neg_stable(x: f64) -> f64 {
-    // Clamp the *negated* argument so that exp never exceeds exp(500).
-    // When eta_ls << -500 the raw exp(-eta_ls) would overflow; clamping
-    // saturates inv_sigma at a very large but finite value.
     let arg = (-x).clamp(-EXP_NEG_STABLE_MAX_ARG, EXP_NEG_STABLE_MAX_ARG);
     arg.exp()
 }
@@ -87,14 +117,16 @@ fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
     exp_neg_stable(eta)
 }
 
+/// Layer 3 defense: clamp products that overflow to ±inf back to ±MAX.
+/// With layer 1 (exp_neg_stable) active this should not trigger in normal
+/// operation; it guards against edge cases where two independently large
+/// (but sub-overflow) factors multiply to exceed MAX.
 #[inline]
 fn safe_product(lhs: f64, rhs: f64) -> f64 {
     if lhs == 0.0 || rhs == 0.0 {
         0.0
     } else {
         let v = lhs * rhs;
-        // Clamp overflow to large finite values so that downstream sums
-        // (d_raw - qdot) produce finite differences instead of NaN (inf-inf).
         if v == f64::INFINITY {
             f64::MAX
         } else if v == f64::NEG_INFINITY {
@@ -105,6 +137,14 @@ fn safe_product(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
+/// Layer 3 defense: when a + b produces NaN from inf + (-inf), return 0.
+///
+/// In the survival chain, g = d_raw - qdot1 where both terms scale as
+/// inv_sigma × (something).  When inv_sigma is very large, both terms
+/// overflow independently even though their difference is finite.  Mapping
+/// the cancellation to 0 is conservative: it says "the correction is
+/// negligible", and the monotonicity guard in exact_row_kernel will floor
+/// g upward if needed.
 #[inline]
 fn safe_sum2(a: f64, b: f64) -> f64 {
     let sum = a + b;
@@ -114,7 +154,6 @@ fn safe_sum2(a: f64, b: f64) -> f64 {
         } else if b == 0.0 {
             return a;
         }
-        // inf + (-inf) or (-inf) + inf → treat as catastrophic cancellation → 0.
         if (a == f64::INFINITY && b == f64::NEG_INFINITY)
             || (a == f64::NEG_INFINITY && b == f64::INFINITY)
         {
@@ -131,16 +170,17 @@ fn safe_sum3(a: f64, b: f64, c: f64) -> f64 {
     safe_sum2(safe_sum2(a, b), c)
 }
 
+/// Layer 2 defense: compute q0 = -eta_t * exp(-eta_ls) with log-space
+/// overflow detection.  When log|q0| = ln|eta_t| + (-eta_ls) exceeds the
+/// clamp ceiling, the product would overflow; we saturate to ±MAX instead.
 #[inline]
 fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
     if eta_t == 0.0 {
         return 0.0;
     }
-    // Use log-space to avoid overflow: q0 = -eta_t * exp(-eta_ls).
-    // |q0| = exp(ln|eta_t| + (-eta_ls)), sign = -sign(eta_t).
-    let log_abs = eta_t.abs().ln() + (-eta_ls).clamp(-EXP_NEG_STABLE_MAX_ARG, EXP_NEG_STABLE_MAX_ARG);
+    let log_abs =
+        eta_t.abs().ln() + (-eta_ls).clamp(-EXP_NEG_STABLE_MAX_ARG, EXP_NEG_STABLE_MAX_ARG);
     if log_abs > EXP_NEG_STABLE_MAX_ARG {
-        // Saturate to large finite value.
         if eta_t > 0.0 { -f64::MAX } else { f64::MAX }
     } else {
         -eta_t * exp_sigma_inverse_from_eta_scalar(eta_ls)
@@ -914,6 +954,11 @@ struct SurvivalPredictorState {
     q0: f64,
     /// q evaluated at exit time.
     q1: f64,
+    /// max(|d_raw|, |qdot|): the magnitude of the two terms whose difference
+    /// produced `g`.  Used to set an adaptive roundoff slack in the
+    /// monotonicity guard — when both operands are large, their difference
+    /// loses proportionally more significant digits.
+    cancellation_scale: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1973,6 +2018,7 @@ impl SurvivalLocationScaleFamily {
             g,
             q0,
             q1,
+            cancellation_scale: d_raw.abs().max(qdot1.abs()),
         }
     }
 
@@ -2017,21 +2063,34 @@ impl SurvivalLocationScaleFamily {
 
         let guard = self.time_derivative_lower_bound();
         let mut g = state.g;
-        // Genuine NaN (from corrupted d_raw or qdot inputs) is still a hard
-        // error.  Overflow-induced cancellation is handled upstream in
-        // row_predictor_state via safe_sum2, so NaN here means bad data.
+        // Layer 4: NaN is a hard error (genuinely bad data or upstream logic
+        // bug).  ±inf is clamped to finite extremes so downstream log(g) is
+        // well-defined; the monotonicity guard will then floor g if needed.
         if g.is_nan() {
             return Err(format!(
                 "survival location-scale time derivative is non-finite at row {row}: d_eta/dt={g}"
             ));
         }
-        // Clamp ±inf to finite extremes so downstream log(g) is well-defined.
         if g == f64::INFINITY {
             g = f64::MAX;
         } else if g == f64::NEG_INFINITY {
             g = f64::MIN;
         }
-        let roundoff_slack = 1e-12
+        // Adaptive roundoff slack for the monotonicity guard.
+        //
+        // g = d_raw − qdot suffers catastrophic cancellation when both
+        // operands are large (extreme sigma regime).  The number of reliable
+        // digits in g is roughly log10(cancellation_scale) fewer than 16.
+        // We use two complementary estimates and take the wider one:
+        //
+        //  (a) cancellation_scale × 64ε — proportional to the operands that
+        //      produced g; accounts for the ~6 chained multiplications in
+        //      compose_survival_dynamic_q whose rounding errors accumulate.
+        //
+        //  (b) legacy (1e-12) × (1 + max|state vars|) — the original formula,
+        //      retained as a lower bound for moderate-scale inputs.
+        let cancellation_slack = 64.0 * f64::EPSILON * state.cancellation_scale;
+        let legacy_slack = 1e-12
             * (1.0
                 + state
                     .h0
@@ -2039,13 +2098,16 @@ impl SurvivalLocationScaleFamily {
                     .max(state.h1.abs())
                     .max(state.q0.abs())
                     .max(state.q1.abs()));
+        let roundoff_slack = cancellation_slack.max(legacy_slack);
         if g < guard && g >= guard - roundoff_slack {
             g = guard;
         }
         if g < guard {
             return Err(format!(
-                "survival location-scale monotonicity violated at row {row}: d_eta/dt={g:.3e} < lower_bound={:.3e}",
-                guard
+                "survival location-scale monotonicity violated at row {row}: \
+                 d_eta/dt={g:.3e} < lower_bound={guard:.3e} \
+                 (cancellation_scale={:.3e}, roundoff_slack={roundoff_slack:.3e})",
+                state.cancellation_scale
             ));
         }
         let (log_g, d_log_g, d2_log_g, d3_log_g, ..) = Self::logwith_derivatives_positive(g);
@@ -3994,7 +4056,7 @@ fn compose_survival_dynamic_q(
             safe_product(m3, safe_product(safe_product(b, b), r)),
             safe_product(
                 m2,
-                safe_sum2(safe_product(d, r), 3.0 * safe_product(b, r_ls)),
+                safe_sum2(safe_product(d, r), 2.0 * safe_product(b, r_ls)),
             ),
             safe_product(m1, r_ll),
         ),
@@ -8261,6 +8323,56 @@ mod tests {
         family.x_threshold = sparse_design_from_dense(&array![[1.0], [0.4], [-0.6]]);
         family.x_log_sigma = sparse_design_from_dense(&array![[1.0], [-0.3], [0.5]]);
         family
+    }
+
+    #[test]
+    fn compose_survival_dynamic_q_uses_correct_qdot_ll_coefficient() {
+        let base = survival_base_q_scalars(0.8, -0.35);
+        let eta_t_deriv = 1.4;
+        let eta_ls_deriv = -0.6;
+        let wiggle_value = 0.2;
+        let dq_dq0 = 1.1;
+        let d2q_dq02 = -0.7;
+        let d3q_dq03 = 0.45;
+        let d4q_dq04 = -0.15;
+
+        let dyn_q = compose_survival_dynamic_q(
+            base,
+            eta_t_deriv,
+            eta_ls_deriv,
+            wiggle_value,
+            dq_dq0,
+            d2q_dq02,
+            d3q_dq03,
+            d4q_dq04,
+        );
+
+        let a = base.q_t;
+        let b = base.q_ls;
+        let d = base.q_ll;
+        let e = base.q_tl_ls;
+        let f = base.q_ll_ls;
+        let r = safe_sum2(safe_product(a, eta_t_deriv), safe_product(b, eta_ls_deriv));
+        let r_ls = safe_sum2(
+            safe_product(base.q_tl, eta_t_deriv),
+            safe_product(d, eta_ls_deriv),
+        );
+        let r_ll = safe_sum2(safe_product(e, eta_t_deriv), safe_product(f, eta_ls_deriv));
+        let expected = safe_sum3(
+            safe_product(d3q_dq03, safe_product(safe_product(b, b), r)),
+            safe_product(
+                d2q_dq02,
+                safe_sum2(safe_product(d, r), 2.0 * safe_product(b, r_ls)),
+            ),
+            safe_product(dq_dq0, r_ll),
+        );
+
+        assert!(
+            (dyn_q.qdot_ll - expected).abs() <= 1e-12,
+            "qdot_ll mismatch: got {}, expected {}",
+            dyn_q.qdot_ll,
+            expected
+        );
     }
 
     fn survival_exact_newton_test_states(beta_t: f64) -> Vec<ParameterBlockState> {

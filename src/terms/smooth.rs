@@ -31,7 +31,9 @@ use crate::matrix::{
     BlockDesignOperator, DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix,
     TensorProductDesignOperator,
 };
-use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use crate::mixture_link::{
+    logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
+};
 use crate::pirls::LinearInequalityConstraints;
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
@@ -2546,14 +2548,15 @@ pub fn build_smooth_design_withworkspace(
             let inner_dense = match design_t {
                 DesignMatrix::Dense(d) => d,
                 DesignMatrix::Sparse(sp) => {
-                    crate::matrix::DenseDesignMatrix::from(sp.to_dense())
+                    crate::matrix::DenseDesignMatrix::from(sp.to_dense_arc())
                 }
             };
             let coeff_op = crate::matrix::CoefficientTransformOperator::new(inner_dense, t.clone())
-                .map_err(|e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")))?;
-            design_t = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Arc::new(coeff_op),
-            ));
+                .map_err(|e| {
+                    BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}"))
+                })?;
+            design_t =
+                DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(coeff_op)));
             penalties_t = penalties_t
                 .into_iter()
                 .map(|s_local| {
@@ -5599,13 +5602,12 @@ fn evaluate_standard_familyobservations(
                 log_likelihood += -0.5 * w * resid * resid;
             }
             LikelihoodFamily::BinomialLogit => {
-                let mu_i = stable_sigmoid(eta_i);
-                let curvature = (mu_i * (1.0 - mu_i)).max(0.0);
-                mu[i] = mu_i;
-                score[i] = w * (yi - mu_i);
-                fisherweight[i] = curvature.max(MU_DERIV_EPS);
-                neghessian_eta[i] = curvature;
-                neghessian_eta_derivative[i] = curvature * (1.0 - 2.0 * mu_i);
+                let jet = logit_inverse_link_jet5(eta_i);
+                mu[i] = jet.mu;
+                score[i] = w * (yi - jet.mu);
+                fisherweight[i] = jet.d1.max(MU_DERIV_EPS);
+                neghessian_eta[i] = jet.d1;
+                neghessian_eta_derivative[i] = jet.d2;
                 let logmu = -stable_softplus(-eta_i);
                 let log_one_minusmu = -stable_softplus(eta_i);
                 log_likelihood += w * (yi * logmu + (1.0 - yi) * log_one_minusmu);
@@ -14379,23 +14381,22 @@ mod tests {
         .expect("stable logit observations");
 
         for i in 0..eta.len() {
-            let mu = stable_sigmoid(eta[i]);
-            let target = mu * (1.0 - mu);
-            let d_target = target * (1.0 - 2.0 * mu);
+            let jet = logit_inverse_link_jet5(eta[i]);
             assert!(
-                (obs.neghessian_eta[i] - target).abs() <= 1e-12 * (1.0 + target.abs()),
-                "eta={} y={} curvature={} target={target}",
+                (obs.neghessian_eta[i] - jet.d1).abs() <= 1e-12 * (1.0 + jet.d1.abs()),
+                "eta={} y={} curvature={} target={}",
                 eta[i],
                 y[i],
-                obs.neghessian_eta[i]
+                obs.neghessian_eta[i],
+                jet.d1
             );
             assert!(
-                (obs.neghessian_eta_derivative[i] - d_target).abs()
-                    <= 1e-12 * (1.0 + d_target.abs()),
-                "eta={} y={} dcurvature={} target={d_target}",
+                (obs.neghessian_eta_derivative[i] - jet.d2).abs() <= 1e-12 * (1.0 + jet.d2.abs()),
+                "eta={} y={} dcurvature={} target={}",
                 eta[i],
                 y[i],
-                obs.neghessian_eta_derivative[i]
+                obs.neghessian_eta_derivative[i],
+                jet.d2
             );
             assert!(
                 obs.neghessian_eta[i].is_finite()
