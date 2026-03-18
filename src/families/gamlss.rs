@@ -1,7 +1,8 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
-    evaluate_bspline_derivative_scalar, evaluate_bspline_fourth_derivative_scalar,
-    evaluate_bsplinesecond_derivative_scalar, evaluate_bsplinethird_derivative_scalar,
+    BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
+    create_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
+    evaluate_bspline_fourth_derivative_scalar, evaluate_bsplinesecond_derivative_scalar,
+    evaluate_bsplinethird_derivative_scalar,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -399,11 +400,13 @@ pub fn buildwiggle_block_input_from_knots(
         nullspace_dims.push(0);
     } else {
         let effective_order = penalty_order.max(1).min(p - 1);
+        let (_, constrained_penalty) =
+            compute_geometric_constraint_transform(knots, degree, effective_order)
+                .map_err(|e| e.to_string())?;
         penalties.push(crate::solver::estimate::PenaltySpec::Dense(
-            create_difference_penalty_matrix(p, effective_order, None)
-                .map_err(|e| e.to_string())?,
+            constrained_penalty,
         ));
-        nullspace_dims.push(effective_order);
+        nullspace_dims.push(effective_order.saturating_sub(2));
     }
     if double_penalty {
         penalties.push(crate::solver::estimate::PenaltySpec::Dense(
@@ -445,10 +448,12 @@ pub(crate) fn monotone_wiggle_basis_from_knots(
         seed,
         KnotSource::Provided(knots.view()),
         degree,
-        BasisOptions::i_spline(),
+        BasisOptions::value(),
     )
     .map_err(|e| e.to_string())?;
-    Ok(basis.as_ref().clone())
+    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
+        .map_err(|e| e.to_string())?;
+    Ok(basis.as_ref().dot(&z))
 }
 
 pub fn monotone_wiggle_basis_with_derivative_order(
@@ -466,38 +471,32 @@ pub fn monotone_wiggle_basis_with_derivative_order(
         ));
     }
 
-    create_basis::<Dense>(
-        seed,
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::i_spline(),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let bs_degree = degree + 1;
-    let num_bspline_basis = knots.len().saturating_sub(bs_degree + 1);
-    let num_ispline_basis = num_bspline_basis.saturating_sub(1);
-    let mut out = Array2::<f64>::zeros((seed.len(), num_ispline_basis));
-    if derivative_order > bs_degree || num_ispline_basis == 0 {
+    let num_basis = knots.len().saturating_sub(degree + 1);
+    let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)
+        .map_err(|e| e.to_string())?;
+    let mut out = Array2::<f64>::zeros((seed.len(), z.ncols()));
+    if derivative_order > degree || num_basis == 0 || z.ncols() == 0 {
         return Ok(out);
     }
 
     let knot_view = knots.view();
-    let mut raw = vec![0.0; num_bspline_basis];
+    let mut raw = vec![0.0; num_basis];
     for (row_idx, &x) in seed.iter().enumerate() {
         raw.fill(0.0);
         match derivative_order {
-            1 => evaluate_bspline_derivative_scalar(x, knot_view, bs_degree, &mut raw),
-            2 => evaluate_bsplinesecond_derivative_scalar(x, knot_view, bs_degree, &mut raw),
-            3 => evaluate_bsplinethird_derivative_scalar(x, knot_view, bs_degree, &mut raw),
-            4 => evaluate_bspline_fourth_derivative_scalar(x, knot_view, bs_degree, &mut raw),
+            1 => evaluate_bspline_derivative_scalar(x, knot_view, degree, &mut raw),
+            2 => evaluate_bsplinesecond_derivative_scalar(x, knot_view, degree, &mut raw),
+            3 => evaluate_bsplinethird_derivative_scalar(x, knot_view, degree, &mut raw),
+            4 => evaluate_bspline_fourth_derivative_scalar(x, knot_view, degree, &mut raw),
             _ => unreachable!(),
         }
         .map_err(|e| format!("failed to evaluate monotone wiggle derivative basis: {e}"))?;
-        let mut running = 0.0_f64;
-        for j in (1..num_bspline_basis).rev() {
-            running += raw[j];
-            out[[row_idx, j - 1]] = if running.abs() <= 1e-12 { 0.0 } else { running };
+        for col in 0..z.ncols() {
+            let mut value = 0.0;
+            for raw_col in 0..num_basis {
+                value += raw[raw_col] * z[[raw_col, col]];
+            }
+            out[[row_idx, col]] = if value.abs() <= 1e-12 { 0.0 } else { value };
         }
     }
     Ok(out)
@@ -981,7 +980,7 @@ fn binomial_location_scalewarm_start(
             design: threshold_block.design.clone(),
             offset: threshold_block.offset.clone(),
             penalties: threshold_block.penalties.clone(),
-            nullspace_dims: vec![],
+            nullspace_dims: threshold_block.nullspace_dims.clone(),
             initial_log_lambdas: threshold_block.initial_log_lambdas.clone(),
             initial_beta: mean_beta_hint.cloned(),
         },
@@ -990,7 +989,7 @@ fn binomial_location_scalewarm_start(
             design: log_sigma_block.design.clone(),
             offset: log_sigma_block.offset.clone(),
             penalties: log_sigma_block.penalties.clone(),
-            nullspace_dims: vec![],
+            nullspace_dims: log_sigma_block.nullspace_dims.clone(),
             initial_log_lambdas: log_sigma_block.initial_log_lambdas.clone(),
             initial_beta: noise_beta_hint.cloned(),
         },
@@ -1652,7 +1651,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             design: mean_design.design.clone(),
             offset: Array1::zeros(self.y.len()),
             penalties: mean_design.penalties_as_penalty_matrix(),
-            nullspace_dims: vec![],
+            nullspace_dims: mean_design.nullspace_dims.clone(),
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
         };
@@ -1671,7 +1670,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             )?)),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design.penalties_as_penalty_matrix(),
-            nullspace_dims: vec![],
+            nullspace_dims: noise_design.nullspace_dims.clone(),
             initial_log_lambdas: noise_log_lambdas,
             initial_beta: noise_beta_hint,
         };
@@ -1878,7 +1877,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                         })
                         .collect()
                 },
-                nullspace_dims: vec![],
+                nullspace_dims: self.wiggle_block.nullspace_dims.clone(),
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
             },
@@ -4043,12 +4042,13 @@ impl ExactNewtonJointPsiWorkspace for GaussianLocationScaleExactNewtonJointPsiWo
 
 #[derive(Clone)]
 struct GaussianJointRowScalars {
+    obs_weight: Array1<f64>,
     w: Array1<f64>,
     m: Array1<f64>,
     n: Array1<f64>,
-    /// κ = (dσ/dη_ls)/σ: 1 in the active exp region, 0 on the safe_exp
-    /// plateau (|η_ls| ≥ 700).  The cross Hessian block H_{μ,ls} carries an
-    /// overall κ factor and the scale-scale block H_{ls,ls} carries κ².
+    /// κ = (dσ/dη_ls)/σ for the active sigma link.
+    /// The cross Hessian block H_{μ,ls} carries an overall κ factor and the
+    /// scale-scale block H_{ls,ls} carries κ².
     kappa: Array1<f64>,
 }
 
@@ -4094,6 +4094,7 @@ fn gaussian_jointrow_scalars(
     if etamu.len() != nobs || eta_ls.len() != nobs || weights.len() != nobs {
         return Err("Gaussian joint row scalar input size mismatch".to_string());
     }
+    let mut obs_weight = Array1::<f64>::uninit(nobs);
     let mut w = Array1::<f64>::uninit(nobs);
     let mut m = Array1::<f64>::uninit(nobs);
     let mut n = Array1::<f64>::uninit(nobs);
@@ -4104,17 +4105,25 @@ fn gaussian_jointrow_scalars(
         let ki = jet.d1 / s; // κ = (dσ/dη_ls)/σ
         let wi = weights[i] / (s * s);
         let ri = y[i] - etamu[i];
+        obs_weight[i].write(weights[i]);
         w[i].write(wi);
         m[i].write(ri * wi);
         n[i].write(ri * ri * wi);
         kappa[i].write(ki);
     }
     // SAFETY: all elements written in the loop above.
+    let obs_weight = unsafe { obs_weight.assume_init() };
     let w = unsafe { w.assume_init() };
     let m = unsafe { m.assume_init() };
     let n = unsafe { n.assume_init() };
     let kappa = unsafe { kappa.assume_init() };
-    Ok(GaussianJointRowScalars { w, m, n, kappa })
+    Ok(GaussianJointRowScalars {
+        obs_weight,
+        w,
+        m,
+        n,
+        kappa,
+    })
 }
 
 fn gaussian_joint_first_directionalweights(
@@ -4200,7 +4209,6 @@ fn gaussian_joint_psi_firstweights(
     let mut dhmu_ls = Array1::<f64>::uninit(nobs);
     let mut dh_ls_ls = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
-        let wi = scalars.w[i];
         let mi = scalars.m[i];
         let ni = scalars.n[i];
         let ki = scalars.kappa[i];
@@ -4209,7 +4217,8 @@ fn gaussian_joint_psi_firstweights(
         // κ-scaled log-sigma direction.
         let sea = ki * ea;
         let smu = -mi;
-        let sls = ki * (1.0 - ni);
+        let sls = ki * (scalars.obs_weight[i] - ni);
+        let wi = scalars.w[i];
         scoremu[i].write(smu);
         score_ls[i].write(sls);
         dscoremu[i].write(wi * ma + 2.0 * mi * sea);
@@ -4275,7 +4284,7 @@ fn gaussian_joint_psisecondweights(
         // Score_μ = -m, Score_ls = κ(1-n). Hessian blocks carry κ, κ².
         objective_psi_psirow[i].write(
             wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * sea_seb - mi * mab
-                + ki * (1.0 - ni) * eta_ab[i],
+                + ki * (scalars.obs_weight[i] - ni) * eta_ab[i],
         );
         d2scoremu[i].write(wi * mab - 2.0 * wi * cross - 4.0 * mi * sea_seb + 2.0 * mi * seab);
         d2score_ls[i].write(
@@ -4673,63 +4682,17 @@ impl GaussianLocationScaleFamily {
     pub const BLOCK_MU: usize = 0;
     pub const BLOCK_LOG_SIGMA: usize = 1;
 
-    /// Get or compute the per-observation row scalars, caching the result.
-    /// Uses a (eta_mu[0], eta_ls[0]) fingerprint to detect when etas change.
     fn get_or_compute_row_scalars(
         &self,
         etamu: &Array1<f64>,
         eta_ls: &Array1<f64>,
     ) -> Result<Arc<GaussianJointRowScalars>, String> {
-        // Use a more robust fingerprint: first, last, and middle elements
-        // of both eta vectors. The old fingerprint only checked eta[0],
-        // which could miss changes when the first observation's eta doesn't
-        // move but others do (e.g., sparse designs or zero-weighted first row).
-        let n = etamu.len();
-        let mid = n / 2;
-        let key = (
-            etamu.get(0).copied().unwrap_or(f64::NAN),
-            eta_ls.get(0).copied().unwrap_or(f64::NAN),
-            etamu.get(mid).copied().unwrap_or(f64::NAN),
-            eta_ls.get(mid).copied().unwrap_or(f64::NAN),
-            etamu.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN),
-            eta_ls.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN),
-        );
-        {
-            let cache = self
-                .cached_row_scalars
-                .read()
-                .expect("cached_row_scalars lock poisoned");
-            if let Some((k0, k1, k2, k3, k4, k5, ref scalars)) = *cache {
-                if k0 == key.0
-                    && k1 == key.1
-                    && k2 == key.2
-                    && k3 == key.3
-                    && k4 == key.4
-                    && k5 == key.5
-                {
-                    return Ok(Arc::clone(scalars));
-                }
-            }
-        }
-        let scalars = Arc::new(gaussian_jointrow_scalars(
+        Ok(Arc::new(gaussian_jointrow_scalars(
             &self.y,
             etamu,
             eta_ls,
             &self.weights,
-        )?);
-        *self
-            .cached_row_scalars
-            .write()
-            .expect("cached_row_scalars lock poisoned") = Some((
-            key.0,
-            key.1,
-            key.2,
-            key.3,
-            key.4,
-            key.5,
-            Arc::clone(&scalars),
-        ));
-        Ok(scalars)
+        )?))
     }
 
     pub fn parameternames() -> &'static [&'static str] {
@@ -6393,51 +6356,12 @@ impl GaussianLocationScaleWiggleFamily {
         q: &Array1<f64>,
         eta_ls: &Array1<f64>,
     ) -> Result<Arc<GaussianJointRowScalars>, String> {
-        let n = q.len();
-        let mid = n / 2;
-        let key = (
-            q.get(0).copied().unwrap_or(f64::NAN),
-            eta_ls.get(0).copied().unwrap_or(f64::NAN),
-            q.get(mid).copied().unwrap_or(f64::NAN),
-            eta_ls.get(mid).copied().unwrap_or(f64::NAN),
-            q.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN),
-            eta_ls.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN),
-        );
-        {
-            let cache = self
-                .cached_row_scalars
-                .read()
-                .expect("cached_row_scalars lock poisoned");
-            if let Some((k0, k1, k2, k3, k4, k5, ref scalars)) = *cache
-                && k0 == key.0
-                && k1 == key.1
-                && k2 == key.2
-                && k3 == key.3
-                && k4 == key.4
-                && k5 == key.5
-            {
-                return Ok(Arc::clone(scalars));
-            }
-        }
-        let scalars = Arc::new(gaussian_jointrow_scalars(
+        Ok(Arc::new(gaussian_jointrow_scalars(
             &self.y,
             q,
             eta_ls,
             &self.weights,
-        )?);
-        *self
-            .cached_row_scalars
-            .write()
-            .expect("cached_row_scalars lock poisoned") = Some((
-            key.0,
-            key.1,
-            key.2,
-            key.3,
-            key.4,
-            key.5,
-            Arc::clone(&scalars),
-        ));
-        Ok(scalars)
+        )?))
     }
 
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
@@ -15833,28 +15757,24 @@ mod tests {
         let eta0 = 701.0_f64;
         let eta = array![eta0];
         let (sigma, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth_array(eta.view());
-        let coded_sigma = |x: f64| safe_exp(x);
-        let h = 1e-6;
-        let fd1 = (coded_sigma(eta0 + h) - coded_sigma(eta0 - h)) / (2.0 * h);
-        let fd2 =
-            (coded_sigma(eta0 + h) - 2.0 * coded_sigma(eta0) + coded_sigma(eta0 - h)) / (h * h);
+        let coded_sigma = safe_exp(eta0);
         assert!(
-            (sigma[0] - coded_sigma(eta0)).abs() < 1e-30,
+            (sigma[0] - coded_sigma).abs() < 1e-30,
             "Gaussian sigma helper should evaluate the exact exp sigma link at eta={eta0}; got {} vs {}",
             sigma[0],
-            coded_sigma(eta0)
+            coded_sigma
         );
         assert!(
-            (d1[0] - fd1).abs() < 1e-30,
-            "Gaussian sigma helper first derivative should match the exact exp sigma link at eta={eta0}; got {} vs {}",
+            (d1[0] - sigma[0]).abs() / sigma[0] < 1e-12,
+            "Gaussian sigma helper first derivative should equal exp(eta) at eta={eta0}; got {} vs {}",
             d1[0],
-            fd1
+            sigma[0]
         );
         assert!(
-            (d2[0] - fd2).abs() < 1e-30,
-            "Gaussian sigma helper second derivative should match the exact exp sigma link at eta={eta0}; got {} vs {}",
+            (d2[0] - sigma[0]).abs() / sigma[0] < 1e-12,
+            "Gaussian sigma helper second derivative should equal exp(eta) at eta={eta0}; got {} vs {}",
             d2[0],
-            fd2
+            sigma[0]
         );
         assert!(
             (d3[0] - sigma[0]).abs() / sigma[0] < 1e-12,

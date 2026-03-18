@@ -59,9 +59,8 @@ impl<'a> RemlState<'a> {
             }
             Ok(out)
         } else {
-            let x_dense = design.as_dense().ok_or_else(|| {
-                EstimationError::InvalidInput("design matrix should be dense or sparse".to_string())
-            })?;
+            let x_dense_cow = design.as_dense_cow();
+            let x_dense = x_dense_cow.as_ref();
             let mut out = Array1::<f64>::zeros(x_dense.ncols());
             for j in 0..x_dense.ncols() {
                 let mut acc = 0.0;

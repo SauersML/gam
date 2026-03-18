@@ -29,7 +29,7 @@ use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -561,50 +561,39 @@ pub(crate) fn unary_derivatives_log_normal_pdf(x: f64) -> [f64; 5] {
     [-0.5 * x * x - c, -x, -1.0, 0.0, 0.0]
 }
 
-pub(crate) fn subset_partition_table() -> &'static Vec<Vec<Vec<usize>>> {
-    fn build_partitions(mask: usize) -> Vec<Vec<usize>> {
-        if mask == 0 {
-            return vec![Vec::new()];
-        }
-        let first = mask & mask.wrapping_neg();
-        let rest = mask ^ first;
-        let mut out = Vec::new();
-        let mut subset = rest;
-        loop {
-            let block = first | subset;
-            for mut remainder in build_partitions(rest ^ subset) {
-                remainder.push(block);
-                out.push(remainder);
-            }
-            if subset == 0 {
-                break;
-            }
-            subset = (subset - 1) & rest;
-        }
-        out
+fn subset_partitions(mask: usize) -> Vec<Vec<usize>> {
+    if mask == 0 {
+        return vec![Vec::new()];
     }
-
-    static TABLE: OnceLock<Vec<Vec<Vec<usize>>>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = vec![Vec::new(); 16];
-        for mask in 0..16 {
-            table[mask] = build_partitions(mask);
+    let first = mask & mask.wrapping_neg();
+    let rest = mask ^ first;
+    let mut out = Vec::new();
+    let mut subset = rest;
+    loop {
+        let block = first | subset;
+        for mut remainder in subset_partitions(rest ^ subset) {
+            remainder.push(block);
+            out.push(remainder);
         }
-        table
-    })
+        if subset == 0 {
+            break;
+        }
+        subset = (subset - 1) & rest;
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct MultiDirJet {
     pub n_dirs: usize,
-    pub coeffs: [f64; 16],
+    pub coeffs: Vec<f64>,
 }
 
 impl MultiDirJet {
     pub fn zero(n_dirs: usize) -> Self {
         Self {
             n_dirs,
-            coeffs: [0.0; 16],
+            coeffs: vec![0.0; 1usize << n_dirs],
         }
     }
 
@@ -677,16 +666,15 @@ impl MultiDirJet {
 
     pub fn compose_unary(&self, derivs: [f64; 5]) -> Self {
         let mut out = Self::constant(self.n_dirs, derivs[0]);
-        let partitions = subset_partition_table();
         for mask in 1..=self.full_mask() {
             let mut total = 0.0;
-            for partition in &partitions[mask] {
+            for partition in subset_partitions(mask) {
                 let order = partition.len();
                 if order == 0 || order >= derivs.len() {
                     continue;
                 }
                 let mut prod = 1.0;
-                for &block in partition {
+                for block in partition {
                     prod *= self.coeffs[block];
                 }
                 total += derivs[order] * prod;

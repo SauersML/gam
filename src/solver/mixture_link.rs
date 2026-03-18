@@ -22,7 +22,7 @@ pub struct InverseLinkJet {
 
 #[inline]
 fn canonicalzero(v: f64) -> f64 {
-    if v.abs() < 1e-12 { 0.0 } else { v }
+    if v.abs() < f64::MIN_POSITIVE { 0.0 } else { v }
 }
 
 #[inline]
@@ -176,9 +176,21 @@ fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64
             if !eta.is_finite() {
                 return 0.0;
             }
-            let mu = logistic_stable(eta);
-            let d1 = mu * (1.0 - mu);
-            d1 * (1.0 - 14.0 * mu + 36.0 * mu * mu - 24.0 * mu * mu * mu)
+            if eta >= 0.0 {
+                let z = (-eta).exp();
+                let opz = 1.0 + z;
+                canonicalzero(
+                    z * (z * z * z - 11.0 * z * z + 11.0 * z - 1.0)
+                        / (opz * opz * opz * opz * opz),
+                )
+            } else {
+                let z = eta.exp();
+                let opz = 1.0 + z;
+                canonicalzero(
+                    z * (1.0 - 11.0 * z + 11.0 * z * z - z * z * z)
+                        / (opz * opz * opz * opz * opz),
+                )
+            }
         }
         LinkComponent::CLogLog => {
             // CLogLog link:
@@ -539,19 +551,19 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             } else if eta >= 0.0 {
                 let z = (-eta).exp();
                 let opz = 1.0 + z;
-                let w = z / (opz * opz); // = mu*(1-mu), stable
-                let one_minus_2mu = (z - 1.0) / opz; // = 1 - 2*mu, stable
-                let d2v = w * one_minus_2mu;
-                let d3v = w * (1.0 - 6.0 * w);
-                (w, d2v, d3v)
+                (
+                    z / (opz * opz),
+                    z * (z - 1.0) / (opz * opz * opz),
+                    z * (z * z - 4.0 * z + 1.0) / (opz * opz * opz * opz),
+                )
             } else {
                 let z = eta.exp();
                 let opz = 1.0 + z;
-                let w = z / (opz * opz); // = mu*(1-mu), stable
-                let one_minus_2mu = (1.0 - z) / opz; // = 1 - 2*mu, stable
-                let d2v = w * one_minus_2mu;
-                let d3v = w * (1.0 - 6.0 * w);
-                (w, d2v, d3v)
+                (
+                    z / (opz * opz),
+                    z * (1.0 - z) / (opz * opz * opz),
+                    z * (1.0 - 4.0 * z + z * z) / (opz * opz * opz * opz),
+                )
             };
             InverseLinkJet { mu, d1, d2, d3 }
         }
