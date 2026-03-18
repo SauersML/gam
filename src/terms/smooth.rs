@@ -603,11 +603,17 @@ impl KroneckerPenaltySystem {
         }
         let mut eigensystems = Vec::with_capacity(marginal_penalties.len());
         for (k, s_k) in marginal_penalties.iter().enumerate() {
-            let (evals, evecs) = s_k
-                .eigh(faer::Side::Lower)
-                .map_err(|e| BasisError::InvalidInput(format!(
-                    "KroneckerPenaltySystem: eigendecomp of marginal {k}: {e}"
-                )))?;
+            let mat_faer = crate::construction::array_to_faer(s_k);
+            let (evals_vec, evecs_mat) = crate::construction::robust_eigh_faer(
+                &mat_faer,
+                faer::Side::Lower,
+                &format!("KroneckerPenaltySystem marginal {k}"),
+            )
+            .map_err(|e| BasisError::InvalidInput(format!(
+                "KroneckerPenaltySystem: eigendecomp of marginal {k}: {e}"
+            )))?;
+            let evals = Array1::from_vec(evals_vec);
+            let evecs = crate::construction::mat_to_array(&evecs_mat);
             eigensystems.push((evals, evecs));
         }
         Ok(Self {
@@ -655,7 +661,7 @@ impl KroneckerPenaltySystem {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TermCollectionDesign {
     /// The full design matrix.  When random effects are present this is an
     /// operator-based `BlockDesignOperator` wrapping a dense core and O(n)
@@ -2552,6 +2558,7 @@ pub fn build_smooth_design_withworkspace(
                     matrix,
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
+                    kronecker_factors: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3168,6 +3175,7 @@ fn apply_spatial_orthogonality_to_parametric(
                     matrix,
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
+                    kronecker_factors: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -9496,7 +9504,7 @@ fn spatial_aniso_matches(left: Option<&[f64]>, right: Option<&[f64]>) -> bool {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct FrozenTermCollectionIncrementalRealizer<'d> {
     data: ArrayView2<'d, f64>,
     spec: TermCollectionSpec,

@@ -173,12 +173,12 @@ impl PenaltyMatrix {
     }
 }
 
-fn array_to_faer(array: &Array2<f64>) -> Mat<f64> {
+pub(crate) fn array_to_faer(array: &Array2<f64>) -> Mat<f64> {
     let (rows, cols) = array.dim();
     Mat::from_fn(rows, cols, |i, j| array[[i, j]])
 }
 
-fn mat_to_array(mat: &Mat<f64>) -> Array2<f64> {
+pub(crate) fn mat_to_array(mat: &Mat<f64>) -> Array2<f64> {
     let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
     for i in 0..mat.nrows() {
         for j in 0..mat.ncols() {
@@ -364,7 +364,7 @@ where
     unreachable!("robust_eighwith_policy should return or error within 4 attempts")
 }
 
-fn robust_eigh_faer(
+pub(crate) fn robust_eigh_faer(
     matrix: &Mat<f64>,
     side: Side,
     context: &str,

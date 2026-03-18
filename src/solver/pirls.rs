@@ -5415,7 +5415,7 @@ fn write_gamma_log_working_state(
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
-    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+    mut derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
     const MIN_MU: f64 = 1e-10;
     for i in 0..eta.len() {
