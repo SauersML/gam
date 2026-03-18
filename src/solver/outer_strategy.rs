@@ -999,11 +999,26 @@ fn run_outer_with_plan(
             seeds.len(),
         );
         let screen_start = std::time::Instant::now();
-        if screen_max > 0 {
-            if let Some(cap) = config.screening_cap.as_ref() {
-                cap.store(screen_max, Ordering::Relaxed);
+        struct ScreeningCapGuard<'a> {
+            cap: Option<&'a Arc<AtomicUsize>>,
+        }
+        impl Drop for ScreeningCapGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(cap) = self.cap {
+                    cap.store(0, Ordering::Relaxed);
+                }
             }
         }
+        let screening_cap_guard = if screen_max > 0 {
+            if let Some(cap) = config.screening_cap.as_ref() {
+                cap.store(screen_max, Ordering::Relaxed);
+                Some(ScreeningCapGuard { cap: Some(cap) })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut scored: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
         for (i, rho) in seeds.iter().enumerate() {
             obj.reset();
@@ -1017,9 +1032,7 @@ fn run_outer_with_plan(
                 },
             ));
         }
-        if let Some(cap) = config.screening_cap.as_ref() {
-            cap.store(0, Ordering::Relaxed);
-        }
+        drop(screening_cap_guard);
         // Reset after screening so cached partial-iteration results don't
         // leak into the real optimizer.
         obj.reset();

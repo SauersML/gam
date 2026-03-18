@@ -132,7 +132,6 @@ mod tests {
             false,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
         let pr = bundle.pirls_result.as_ref();
 
@@ -187,9 +186,6 @@ mod tests {
 
         let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
         let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
-        state_plus.clearwarm_start();
-        state_minus.clearwarm_start();
-
         let bundle_plus = state_plus.obtain_eval_bundle(&rho).expect("bundle+");
         let bundle_minus = state_minus.obtain_eval_bundle(&rho).expect("bundle-");
         let beta_plus = beta_original_from_bundle(&bundle_plus);
@@ -317,8 +313,6 @@ mod tests {
             None,
         )
         .expect("state");
-        state.clearwarm_start();
-
         let rho = array![0.1, -0.2];
         let bundle = state.obtain_eval_bundle(&rho).expect("exact firth bundle");
         let h_exact = state
@@ -410,7 +404,6 @@ mod tests {
             false,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clearwarm_start();
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
         let pr = bundle.pirls_result.as_ref();
         let e = &pr.reparam_result.e_transformed;
@@ -496,7 +489,6 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clearwarm_start();
         let g = single_directional_tau_gradient(&state, &rho, hyper)
             .expect("firth penalty-only directional gradient should evaluate");
         assert!(
@@ -533,7 +525,6 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clearwarm_start();
         let g = single_directional_tau_gradient(&state, &rho, hyper)
             .expect("firth design-moving directional gradient should evaluate");
         assert!(
@@ -563,7 +554,6 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clearwarm_start();
         let rho = array![0.0];
         let theta = array![0.0, 0.0, 0.0];
         let hyper_dirs = vec![
@@ -630,7 +620,6 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clearwarm_start();
         let rho = array![0.0];
         let psi = array![0.7, -0.4];
         let theta = array![rho[0], psi[0], psi[1]];
@@ -681,9 +670,6 @@ mod tests {
 
             let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
             let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
-            state_plus.clearwarm_start();
-            state_minus.clearwarm_start();
-
             for i in 0..hyper_dirs.len() {
                 let g_plus =
                     single_directional_tau_gradient(&state_plus, &rho, hyper_dirs[i].clone())
@@ -774,7 +760,6 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        state.clearwarm_start();
         let rho = array![0.0];
         let psi = array![0.0, 0.0];
         let hyper_dirs = vec![
@@ -832,9 +817,6 @@ mod tests {
 
             let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
             let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
-            state_plus.clearwarm_start();
-            state_minus.clearwarm_start();
-
             for i in 0..hyper_dirs.len() {
                 let g_plus =
                     single_directional_tau_gradient(&state_plus, &rho, hyper_dirs[i].clone())

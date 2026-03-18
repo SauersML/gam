@@ -987,10 +987,11 @@ impl TakahashiInverse {
         slice.binary_search(&row).ok().map(|pos| start + pos)
     }
 
-    /// Compute the Takahashi selected inverse from a simplicial Cholesky factor.
+    /// Compute the selected inverse from a simplicial Cholesky factor.
     ///
-    /// Given H = LLᵀ, this computes Z = H⁻¹ restricted to the sparsity pattern
-    /// of L, using the Takahashi recursion processed from right to left.
+    /// Given H = LLᵀ in the permuted basis, this solves for the exact inverse
+    /// columns and stores only the entries that live in the sparsity pattern of
+    /// L. The public interface remains the same as the Takahashi-style path.
     pub fn compute(factor: &SimplicialFactor) -> Self {
         let n = factor.n;
         let col_ptr = factor.l_col_ptr.clone();
@@ -998,56 +999,54 @@ impl TakahashiInverse {
         let nnz = factor.l_values.len();
         let mut z_values = vec![0.0f64; nnz];
 
-        // Process columns from right to left
-        for j in (0..n).rev() {
-            let col_start = col_ptr[j];
-            let col_end = col_ptr[j + 1];
-            let l_jj = factor.l_values[col_start]; // diagonal L[j,j]
-            let inv_ljj = 1.0 / l_jj;
-
-            // Number of subdiagonal entries in column j
-            let n_sub = col_end - col_start - 1;
-
-            // Diagonal entry:
-            // Z[j,j] = 1/L[j,j]² - (1/L[j,j]) * Σ_{i>j in col j} L[i,j] * Z[i,j]
-            let mut diag_sum = 0.0f64;
-            for idx in (col_start + 1)..col_end {
-                let l_ij = factor.l_values[idx];
-                diag_sum += l_ij * z_values[idx]; // Z[i,j] at same position
+        // Build row access for forward solves in the permuted basis.
+        let mut rows_lower: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for col in 0..n {
+            for idx in col_ptr[col]..col_ptr[col + 1] {
+                let row = row_idx[idx];
+                rows_lower[row].push((col, factor.l_values[idx]));
             }
-            z_values[col_start] = inv_ljj * inv_ljj - diag_sum * inv_ljj;
+        }
 
-            // Off-diagonal entries: for each i > j in column j,
-            // Z[i,j] = -(1/L[j,j]) * Σ_{k≥i, k>j in col j} L[k,j] * Z[k,i]
-            //
-            // We iterate subdiagonal entries. For the entry at position `a`
-            // (row = i), we sum over all subdiagonal entries at position `b`
-            // (row = k) where k >= i, accumulating L[k,j] * Z[k,i].
-            // Z[k,i] is stored in lower-triangular CSC at row=k, col=i (k >= i).
-            // We also include the contribution from k = i: L[i,j] * Z[i,i].
-            for a in 0..n_sub {
-                let idx_a = col_start + 1 + a;
-                let i = row_idx[idx_a];
-                let mut off_sum = 0.0f64;
+        // Compute the exact inverse columns in the permuted basis and store the
+        // entries that live in the sparsity pattern of L. This preserves the
+        // public selected-inverse interface while avoiding recursion drift.
+        let mut rhs = vec![0.0f64; n];
+        let mut forward = vec![0.0f64; n];
+        let mut solution = vec![0.0f64; n];
+        for j in 0..n {
+            rhs.fill(0.0);
+            rhs[j] = 1.0;
 
-                // k = i contribution: L[i,j] * Z[i,i]
-                let l_ij = factor.l_values[idx_a];
-                let z_ii_pos = col_ptr[i]; // diagonal of column i
-                off_sum += l_ij * z_values[z_ii_pos];
-
-                // k > i contributions
-                for b in (a + 1)..n_sub {
-                    let idx_b = col_start + 1 + b;
-                    let k = row_idx[idx_b];
-                    let l_kj = factor.l_values[idx_b];
-                    // Z[k,i] is at row=k, col=i in lower-triangular CSC
-                    if let Some(z_pos) = Self::find_entry(&col_ptr, &row_idx, k, i) {
-                        off_sum += l_kj * z_values[z_pos];
+            for row in 0..n {
+                let mut sum = rhs[row];
+                let mut diag = None;
+                for &(col, value) in &rows_lower[row] {
+                    if col < row {
+                        sum -= value * forward[col];
+                    } else if col == row {
+                        diag = Some(value);
                     }
-                    // If not in pattern, Z[k,i] = 0 (not in selected inverse)
                 }
+                let l_rr = diag.expect("simplicial factor row should contain its diagonal");
+                forward[row] = sum / l_rr;
+            }
 
-                z_values[idx_a] = -off_sum * inv_ljj;
+            for row in (0..n).rev() {
+                let col_start = col_ptr[row];
+                let col_end = col_ptr[row + 1];
+                let mut sum = forward[row];
+                let l_rr = factor.l_values[col_start];
+                for idx in (col_start + 1)..col_end {
+                    let lower_row = row_idx[idx];
+                    sum -= factor.l_values[idx] * solution[lower_row];
+                }
+                solution[row] = sum / l_rr;
+            }
+
+            for idx in col_ptr[j]..col_ptr[j + 1] {
+                let row = row_idx[idx];
+                z_values[idx] = solution[row];
             }
         }
 

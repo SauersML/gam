@@ -152,17 +152,7 @@ impl ResidualDistributionOps for ResidualDistribution {
                 component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).mu
             }
             ResidualDistribution::Logistic => {
-                if z == f64::INFINITY {
-                    1.0
-                } else if z == f64::NEG_INFINITY {
-                    0.0
-                } else if z >= 0.0 {
-                    let e = (-z).exp();
-                    1.0 / (1.0 + e)
-                } else {
-                    let e = z.exp();
-                    e / (1.0 + e)
-                }
+                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).mu
             }
         }
     }
@@ -9484,7 +9474,27 @@ mod tests {
         );
         let x_threshold_dense = array![[1.0, -0.2], [0.0, 0.6]];
         let x_log_sigma_dense = array![[1.0, 0.3], [0.0, -0.4]];
-        let xwiggle_dense = array![[1.0, 0.1], [0.0, -0.2]];
+        let eta_t =
+            x_threshold_dense.dot(&fit.beta_threshold()) + Array1::from_vec(vec![0.7, -0.2]);
+        let eta_ls =
+            x_log_sigma_dense.dot(&fit.beta_log_sigma()) + Array1::from_vec(vec![0.4, 0.1]);
+        let q0 = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(eta_ls.iter())
+                .map(|(&t, &ls)| -t * exp_sigma_inverse_from_eta_scalar(ls)),
+        );
+        let link_wiggle_degree = 2usize;
+        let link_wiggle_knots =
+            crate::families::gamlss::initializewiggle_knots_from_seed(q0.view(), 2, 1)
+                .expect("link wiggle knots");
+        let xwiggle_dense = survival_wiggle_basis_with_options(
+            q0.view(),
+            &link_wiggle_knots,
+            link_wiggle_degree,
+            BasisOptions::value(),
+        )
+        .expect("link wiggle design");
         let dense_input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5], [1.0, -0.3]],
             eta_time_offset_exit: array![0.2, -0.1],
@@ -9493,8 +9503,8 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(Arc::new(x_log_sigma_dense.clone())),
             eta_log_sigma_offset: array![0.4, 0.1],
             x_link_wiggle: Some(DesignMatrix::Dense(Arc::new(xwiggle_dense.clone()))),
-            link_wiggle_knots: None,
-            link_wiggle_degree: None,
+            link_wiggle_knots: Some(link_wiggle_knots.clone()),
+            link_wiggle_degree: Some(link_wiggle_degree),
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let sparse_input = SurvivalLocationScalePredictInput {
@@ -9695,24 +9705,45 @@ mod tests {
 
     #[test]
     fn wiggle_posterior_mean_reduction_matches_4d_ghq_small_case() {
-        let input = SurvivalLocationScalePredictInput {
-            x_time_exit: array![[1.0, 0.5]],
-            eta_time_offset_exit: array![0.2],
-            x_threshold: DesignMatrix::Dense(Arc::new(array![[1.0, -0.2]])),
-            eta_threshold_offset: array![0.0],
-            x_log_sigma: DesignMatrix::Dense(Arc::new(array![[1.0, 0.3]])),
-            eta_log_sigma_offset: array![0.0],
-            x_link_wiggle: Some(DesignMatrix::Dense(Arc::new(array![[1.0, 0.1]]))),
-            link_wiggle_knots: None,
-            link_wiggle_degree: None,
-            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-        };
         let fit = test_survival_fit(
             array![0.4, -0.1],
             array![0.2, 0.3],
             array![-0.5, 0.1],
             Some(array![0.05, -0.02]),
         );
+        let x_threshold_dense = array![[1.0, -0.2]];
+        let x_log_sigma_dense = array![[1.0, 0.3]];
+        let eta_t = x_threshold_dense.dot(&fit.beta_threshold());
+        let eta_ls = x_log_sigma_dense.dot(&fit.beta_log_sigma());
+        let q0 = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(eta_ls.iter())
+                .map(|(&t, &ls)| -t * exp_sigma_inverse_from_eta_scalar(ls)),
+        );
+        let link_wiggle_degree = 2usize;
+        let link_wiggle_knots =
+            crate::families::gamlss::initializewiggle_knots_from_seed(q0.view(), 2, 1)
+                .expect("link wiggle knots");
+        let x_link_wiggle = survival_wiggle_basis_with_options(
+            q0.view(),
+            &link_wiggle_knots,
+            link_wiggle_degree,
+            BasisOptions::value(),
+        )
+        .expect("link wiggle design");
+        let input = SurvivalLocationScalePredictInput {
+            x_time_exit: array![[1.0, 0.5]],
+            eta_time_offset_exit: array![0.2],
+            x_threshold: DesignMatrix::Dense(Arc::new(x_threshold_dense)),
+            eta_threshold_offset: array![0.0],
+            x_log_sigma: DesignMatrix::Dense(Arc::new(x_log_sigma_dense)),
+            eta_log_sigma_offset: array![0.0],
+            x_link_wiggle: Some(DesignMatrix::Dense(Arc::new(x_link_wiggle))),
+            link_wiggle_knots: Some(link_wiggle_knots),
+            link_wiggle_degree: Some(link_wiggle_degree),
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+        };
         let covariance = array![
             [0.03, 0.01, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0],
             [0.01, 0.02, 0.0, 0.0, 0.0, 0.0, -0.005, 0.0],

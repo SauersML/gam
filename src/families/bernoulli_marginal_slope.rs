@@ -616,7 +616,7 @@ impl MultiDirJet {
     }
 
     pub fn coeff(&self, mask: usize) -> f64 {
-        self.coeffs[mask]
+        self.coeffs.get(mask).copied().unwrap_or(0.0)
     }
 
     pub fn set_coeff(&mut self, mask: usize, value: f64) {
@@ -626,7 +626,7 @@ impl MultiDirJet {
     pub fn add(&self, other: &Self) -> Self {
         let mut out = Self::zero(self.n_dirs);
         for mask in 0..=self.full_mask() {
-            out.coeffs[mask] = self.coeffs[mask] + other.coeffs[mask];
+            out.coeffs[mask] = self.coeff(mask) + other.coeff(mask);
         }
         out
     }
@@ -634,7 +634,7 @@ impl MultiDirJet {
     pub fn sub(&self, other: &Self) -> Self {
         let mut out = Self::zero(self.n_dirs);
         for mask in 0..=self.full_mask() {
-            out.coeffs[mask] = self.coeffs[mask] - other.coeffs[mask];
+            out.coeffs[mask] = self.coeff(mask) - other.coeff(mask);
         }
         out
     }
@@ -653,7 +653,7 @@ impl MultiDirJet {
             let mut total = 0.0;
             let mut submask = mask;
             loop {
-                total += self.coeffs[submask] * other.coeffs[mask ^ submask];
+                total += self.coeff(submask) * other.coeff(mask ^ submask);
                 if submask == 0 {
                     break;
                 }

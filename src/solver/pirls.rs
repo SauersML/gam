@@ -3514,30 +3514,40 @@ where
                     cached_sparse_regularized = Some(sparse_reg);
                     Ok(())
                 }
-            } else if let Some(lin) = options.linear_constraints.as_ref() {
-                solve_newton_directionwith_linear_constraints(
-                    regularized.as_dense().expect("dense regularized Hessian"),
-                    &state.gradient,
-                    beta.as_ref(),
-                    lin,
-                    &mut newton_direction,
-                    linear_active_hint.as_mut(),
-                )
-            } else if let Some(lb) = options.coefficient_lower_bounds.as_ref() {
-                solve_newton_directionwith_lower_bounds(
-                    regularized.as_dense().expect("dense regularized Hessian"),
-                    &state.gradient,
-                    beta.as_ref(),
-                    lb,
-                    &mut newton_direction,
-                    bound_active_hint.as_mut(),
-                )
             } else {
-                solve_newton_direction_dense(
-                    regularized.as_dense().expect("dense regularized Hessian"),
-                    &state.gradient,
-                    &mut newton_direction,
-                )
+                // Dense path: extract the concrete Array2 once — the compiler
+                // ensures we never pass an unresolved SymmetricMatrix downstream.
+                let dense_reg = regularized.as_dense().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "PIRLS Newton step requires a dense Hessian but got a non-dense variant"
+                            .to_string(),
+                    )
+                })?;
+                if let Some(lin) = options.linear_constraints.as_ref() {
+                    solve_newton_directionwith_linear_constraints(
+                        dense_reg,
+                        &state.gradient,
+                        beta.as_ref(),
+                        lin,
+                        &mut newton_direction,
+                        linear_active_hint.as_mut(),
+                    )
+                } else if let Some(lb) = options.coefficient_lower_bounds.as_ref() {
+                    solve_newton_directionwith_lower_bounds(
+                        dense_reg,
+                        &state.gradient,
+                        beta.as_ref(),
+                        lb,
+                        &mut newton_direction,
+                        bound_active_hint.as_mut(),
+                    )
+                } else {
+                    solve_newton_direction_dense(
+                        dense_reg,
+                        &state.gradient,
+                        &mut newton_direction,
+                    )
+                }
             } {
                 Ok(()) => &newton_direction,
                 Err(e) => {
