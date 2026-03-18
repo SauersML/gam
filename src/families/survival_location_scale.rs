@@ -996,7 +996,6 @@ struct SurvivalLocationScaleFamily {
     x_time_entry: Arc<Array2<f64>>,
     x_time_exit: Arc<Array2<f64>>,
     x_time_deriv: Arc<Array2<f64>>,
-    offset_time_deriv: Array1<f64>,
     x_time_deriv_constraints: Array2<f64>,
     offset_time_deriv_constraints: Array1<f64>,
     /// Exit design for threshold block (always present; used as main design).
@@ -3327,7 +3326,7 @@ fn prepare_survival_location_scale_model(
         x_time_entry: Arc::new(time_prepared.design_entry.clone()),
         x_time_exit: Arc::new(time_prepared.design_exit.clone()),
         x_time_deriv: Arc::new(time_prepared.design_derivative_exit.clone()),
-        offset_time_deriv: spec.time_block.derivative_offset_exit.clone(),
+
         x_time_deriv_constraints: time_prepared.constraint_design_derivative.clone(),
         offset_time_deriv_constraints: time_prepared.constraint_derivative_offset.clone(),
         x_threshold: threshold_prep.design_exit.clone(),
@@ -8342,7 +8341,7 @@ mod tests {
             x_time_entry: array![[1.0], [1.0], [1.0]],
             x_time_exit: array![[1.2], [0.9], [1.4]],
             x_time_deriv: array![[1.0], [1.0], [1.0]],
-            offset_time_deriv: array![0.5, 0.7, 0.6],
+
             x_time_deriv_constraints: array![[1.0], [1.0], [1.0]],
             offset_time_deriv_constraints: array![0.5, 0.7, 0.6],
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
@@ -9813,7 +9812,7 @@ mod tests {
         let eta_ls = array![1.0, 0.3].dot(&fit.beta_log_sigma()) + input.eta_log_sigma_offset[0];
         let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
         let h = array![1.0, 0.5].dot(&fit.beta_time()) + input.eta_time_offset_exit[0];
-        let expected_eta = -h - eta_t * inv_sigma;
+        let expected_eta = h - eta_t * inv_sigma;
         let expected_survival =
             inverse_link_survival_prob_checked(&input.inverse_link, expected_eta)
                 .expect("expected survival");
@@ -10016,7 +10015,7 @@ mod tests {
             |h, t, ls| {
                 inverse_link_survival_probvalue(
                     &input.inverse_link,
-                    -h - t * exp_sigma_inverse_from_eta_scalar(ls),
+                    h - t * exp_sigma_inverse_from_eta_scalar(ls),
                 )
             },
         );
@@ -10194,7 +10193,7 @@ mod tests {
             |x| {
                 inverse_link_survival_probvalue(
                     &input.inverse_link,
-                    -x[0] - x[1] * exp_sigma_inverse_from_eta_scalar(x[2]) + x[3],
+                    x[0] - x[1] * exp_sigma_inverse_from_eta_scalar(x[2]) + x[3],
                 )
             },
         );
@@ -10455,7 +10454,7 @@ mod tests {
             x_time_entry: x_entry,
             x_time_exit: x_exit.clone(),
             x_time_deriv: x_deriv.clone(),
-            offset_time_deriv: offset_deriv.clone(),
+
             x_time_deriv_constraints: x_deriv.clone(),
             offset_time_deriv_constraints: offset_deriv.clone(),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
@@ -10598,7 +10597,7 @@ mod tests {
             x_time_entry: Array2::zeros((n, 1)),
             x_time_exit: Array2::ones((n, 1)),
             x_time_deriv: Array2::ones((n, 1)),
-            offset_time_deriv: Array1::zeros(n),
+
             x_time_deriv_constraints: Array2::ones((n, 1)),
             offset_time_deriv_constraints: Array1::zeros(n),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
@@ -10784,6 +10783,21 @@ mod tests {
             "cloglog survival helper should evaluate exp(-exp(eta)) itself, not a clamped surrogate, at eta={eta}; got {} vs {}",
             helper,
             stable_survival
+        );
+    }
+
+    #[test]
+    fn positive_log_cumulative_hazard_maps_to_baseline_cloglog_survival() {
+        let cumulative_hazard = 4.0_f64;
+        let eta = cumulative_hazard.ln();
+        let survival =
+            inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::CLogLog), eta);
+        let expected = (-cumulative_hazard).exp();
+        assert!(
+            (survival - expected).abs() < 1e-15,
+            "baseline cloglog survival should be exp(-H0) when eta = log(H0); got {} vs {}",
+            survival,
+            expected
         );
     }
 }

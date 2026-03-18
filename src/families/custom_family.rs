@@ -3209,7 +3209,7 @@ fn split_log_lambdas(
     Ok(out)
 }
 
-fn buildblock_states<F: CustomFamily>(
+fn buildblock_states<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
 ) -> Result<Vec<ParameterBlockState>, String> {
@@ -3230,7 +3230,7 @@ fn buildblock_states<F: CustomFamily>(
     Ok(states)
 }
 
-fn refresh_all_block_etas<F: CustomFamily>(
+fn refresh_all_block_etas<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &mut [ParameterBlockState],
@@ -3241,7 +3241,7 @@ fn refresh_all_block_etas<F: CustomFamily>(
     Ok(())
 }
 
-fn refresh_single_block_eta<F: CustomFamily>(
+fn refresh_single_block_eta<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &mut [ParameterBlockState],
@@ -3947,7 +3947,7 @@ pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
     }
 }
 
-fn exact_newton_joint_hessian_symmetrized<F: CustomFamily>(
+fn exact_newton_joint_hessian_symmetrized<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
@@ -4087,7 +4087,7 @@ fn symmetrized_square_matrix(
 ///
 /// This eliminates the previously duplicated exact-Newton and surrogate
 /// code blocks in `outerobjectivegradienthessian_internal`.
-fn build_joint_hessian_closures<'a, F: CustomFamily>(
+fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &'a F,
     block_states: &'a [ParameterBlockState],
     specs: &'a [ParameterBlockSpec],
@@ -4420,7 +4420,7 @@ fn use_exact_newton_strict_spd<F: CustomFamily + ?Sized>(family: &F) -> bool {
     family.exact_newton_outerobjective() == ExactNewtonOuterObjective::StrictPseudoLaplace
 }
 
-fn blockwise_logdet_terms<F: CustomFamily>(
+fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &mut [ParameterBlockState],
@@ -4649,7 +4649,7 @@ impl BlockEtaCheckpoint {
     }
 }
 
-fn inner_blockwise_fit<F: CustomFamily>(
+fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     block_log_lambdas: &[Array1<f64>],
@@ -5612,7 +5612,7 @@ fn joint_outer_evaluate(
 /// Inner loop: cyclic blockwise penalized weighted regressions.
 /// Outer loop: trust-region optimization of all log-smoothing parameters using
 /// exact cost/gradient samples.
-fn outerobjectivegradienthessian_internal<F: CustomFamily>(
+fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -5635,7 +5635,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily>(
     .map_err(String::from)
 }
 
-fn outerobjectivegradienthessian<F: CustomFamily>(
+fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -5662,7 +5662,7 @@ fn outerobjectivegradienthessian<F: CustomFamily>(
 }
 
 #[cfg(test)]
-fn outerobjective_andgradient<F: CustomFamily>(
+fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -5864,7 +5864,7 @@ fn assemble_block_local_s_psi_psi(
 ///   ld_s = tr(S₊⁻¹ S_ψ)
 ///
 /// where S_ψ is the assembled penalty derivative in joint coefficient space.
-pub fn build_psi_hyper_coords<F: CustomFamily>(
+pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
@@ -6936,7 +6936,7 @@ fn set_states_from_flat_beta(
     Ok(())
 }
 
-fn synchronized_states_from_flat_beta<F: CustomFamily>(
+fn synchronized_states_from_flat_beta<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
@@ -6948,7 +6948,7 @@ fn synchronized_states_from_flat_beta<F: CustomFamily>(
     Ok(synced)
 }
 
-fn penalizedobjective_at_beta<F: CustomFamily>(
+fn penalizedobjective_at_beta<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
@@ -7030,7 +7030,7 @@ fn exact_newton_joint_stationarity_inf_norm(
     Ok(Some(inf_norm))
 }
 
-fn compute_joint_hessian_from_objective<F: CustomFamily>(
+fn compute_joint_hessian_from_objective<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
@@ -7111,7 +7111,7 @@ fn compute_joint_hessian_from_objective<F: CustomFamily>(
     Ok(h)
 }
 
-fn compute_joint_covariance<F: CustomFamily>(
+fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
@@ -7153,7 +7153,7 @@ fn compute_joint_covariance<F: CustomFamily>(
     }
 }
 
-fn compute_joint_covariance_required<F: CustomFamily>(
+fn compute_joint_covariance_required<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
@@ -7171,7 +7171,7 @@ fn compute_joint_covariance_required<F: CustomFamily>(
 }
 
 /// Compute joint working-set geometry at convergence for ALO diagnostics.
-fn compute_joint_geometry<F: CustomFamily>(
+fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
@@ -7206,7 +7206,7 @@ fn compute_joint_geometry<F: CustomFamily>(
     })
 }
 
-pub fn fit_custom_family<F: CustomFamily>(
+pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
