@@ -1112,6 +1112,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         if let Some((wiggle_knots, wiggle_degree)) = standard_wiggle_meta {
             payload.linkwiggle_knots = Some(wiggle_knots);
             payload.linkwiggle_degree = Some(wiggle_degree);
+            payload.linkwiggle_ispline = Some(true);
         }
         match &saved_fit.fitted_link {
             FittedLinkState::Mixture { covariance, .. } => {
@@ -1592,6 +1593,7 @@ fn run_fitwith_predict_noise(
             if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
                 model.linkwiggle_knots = Some(knots.mapv(|v| v * response_scale).to_vec());
                 model.linkwiggle_degree = Some(degree);
+                model.linkwiggle_ispline = Some(true);
                 model.beta_link_wiggle = Some(
                     beta_link_wiggle
                         .into_iter()
@@ -1774,6 +1776,7 @@ fn run_fitwith_predict_noise(
         if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
             model.linkwiggle_knots = Some(knots.to_vec());
             model.linkwiggle_degree = Some(degree);
+            model.linkwiggle_ispline = Some(true);
             model.beta_link_wiggle = Some(beta_link_wiggle);
         }
         write_model_json(out, &model)?;
@@ -3405,25 +3408,13 @@ fn saved_linkwiggle_basis(
         Some(runtime) => {
             runtime.derivative_q0(q0).map(|_| ())?;
             let knot_arr = Array1::from_vec(runtime.knots.clone());
-            match basis_options.derivative_order {
-                0 => runtime.design(q0).map(Some),
-                1 => {
-                    let (raw_derivative, _) = create_basis::<Dense>(
-                        q0.view(),
-                        KnotSource::Provided(knot_arr.view()),
-                        runtime.degree,
-                        BasisOptions::first_derivative(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let (link_transform, _) =
-                        compute_geometric_constraint_transform(&knot_arr, runtime.degree, 2)
-                            .map_err(|e| e.to_string())?;
-                    Ok(Some(raw_derivative.as_ref().dot(&link_transform)))
-                }
-                other => Err(format!(
-                    "unsupported saved link-wiggle derivative order {other}"
-                )),
-            }
+            gam::gamlss::monotone_wiggle_basis_with_derivative_order(
+                q0.view(),
+                &knot_arr,
+                runtime.degree,
+                basis_options.derivative_order,
+            )
+            .map(Some)
         }
     }
 }
@@ -3973,6 +3964,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.data_schema = Some(ds.schema.clone());
             payload.link = Some(inverse_link_to_saved_string(&fitted_inverse_link));
             payload.linkwiggle_degree = fit.wiggle_degree;
+            payload.linkwiggle_ispline = fit.wiggle_degree.map(|_| true);
             payload.beta_link_wiggle = fit.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
             payload.linkwiggle_knots = fit.wiggle_knots.as_ref().map(|k| k.to_vec());
             payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
@@ -5172,8 +5164,16 @@ fn run_sample_standard_link_wiggle(
     let wiggle_lambdas = wiggle_lambdas_owned.view();
     let degree = wiggle_runtime.degree;
     let knot_arr = Array1::from_vec(wiggle_runtime.knots.clone());
-    let (z_transform, _) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
-        .map_err(|e| format!("link-wiggle transform failed: {e}"))?;
+    let use_ispline = wiggle_runtime.use_ispline;
+    // For I-spline models, the transform is the identity (I-spline basis IS the
+    // constrained basis). For legacy B-spline+Z models, compute the Z-transform.
+    let z_transform = if use_ispline {
+        Array2::eye(p_wiggle)
+    } else {
+        let (z, _) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
+            .map_err(|e| format!("link-wiggle transform failed: {e}"))?;
+        z
+    };
 
     // Build wiggle penalty matrices in the structural monotone basis.
     let mut wiggle_penalties = Vec::new();
@@ -5213,6 +5213,7 @@ fn run_sample_standard_link_wiggle(
         knot_vector: knot_arr,
         link_transform: z_transform,
         degree,
+        use_ispline,
     };
 
     // Map family to NutsFamily

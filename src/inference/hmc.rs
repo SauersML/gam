@@ -2784,10 +2784,14 @@ pub struct LinkWiggleSplineArtifacts {
     pub knot_range: (f64, f64),
     /// Full knot vector for B-splines
     pub knot_vector: Array1<f64>,
-    /// Constraint transform Z (raw basis → constrained basis)
+    /// Constraint transform Z (raw basis → constrained basis).
+    /// For I-spline models this is an identity matrix (the I-spline basis IS
+    /// the constrained basis).
     pub link_transform: Array2<f64>,
-    /// B-spline degree
+    /// B-spline degree (for legacy) or I-spline degree (for new models)
     pub degree: usize,
+    /// When true, evaluate I-spline basis directly instead of B-spline + Z-transform.
+    pub use_ispline: bool,
 }
 
 /// Whitened log-posterior target for joint (β_eta, β_wiggle) with analytical gradients.
@@ -2895,11 +2899,16 @@ impl LinkWigglePosterior {
         }
 
         let (z_raw, z_c, _) = self.standardized_z(u);
+        let basis_options = if self.spline.use_ispline {
+            BasisOptions::i_spline()
+        } else {
+            BasisOptions::value()
+        };
         let Ok((b_raw_arc, _)) = create_basis::<Dense>(
             z_c.view(),
             KnotSource::Provided(self.spline.knot_vector.view()),
             self.spline.degree,
-            BasisOptions::value(),
+            basis_options,
         ) else {
             return (Array2::zeros((n, n_c)), u.clone());
         };
@@ -2914,27 +2923,42 @@ impl LinkWigglePosterior {
                 break;
             }
         }
-        if needs_ext
-            && let Ok((b_prime_arc, _)) = create_basis::<Dense>(
-                z_c.view(),
-                KnotSource::Provided(self.spline.knot_vector.view()),
-                self.spline.degree,
-                BasisOptions::first_derivative(),
-            )
-        {
-            let b_prime = b_prime_arc.as_ref();
-            for i in 0..n {
-                let dz = z_raw[i] - z_c[i];
-                if dz.abs() <= 1e-12 {
-                    continue;
-                }
-                for j in 0..b_raw.ncols() {
-                    b_raw[[i, j]] += dz * b_prime[[i, j]];
+        if needs_ext {
+            let b_prime_result = if self.spline.use_ispline {
+                crate::basis::create_ispline_derivative_dense(
+                    z_c.view(),
+                    &self.spline.knot_vector,
+                    self.spline.degree,
+                    1,
+                )
+                .map(|m| (m, ()))
+            } else {
+                create_basis::<Dense>(
+                    z_c.view(),
+                    KnotSource::Provided(self.spline.knot_vector.view()),
+                    self.spline.degree,
+                    BasisOptions::first_derivative(),
+                )
+                .map(|(arc, meta)| (arc.as_ref().clone(), ()))
+                .map_err(|e| e)
+            };
+            if let Ok((b_prime, _)) = b_prime_result {
+                for i in 0..n {
+                    let dz = z_raw[i] - z_c[i];
+                    if dz.abs() <= 1e-12 {
+                        continue;
+                    }
+                    for j in 0..b_raw.ncols().min(b_prime.ncols()) {
+                        b_raw[[i, j]] += dz * b_prime[[i, j]];
+                    }
                 }
             }
         }
 
-        let b = if self.spline.link_transform.nrows() == n_raw {
+        let b = if self.spline.use_ispline {
+            // I-spline basis is already the constrained basis — no transform needed
+            b_raw
+        } else if self.spline.link_transform.nrows() == n_raw {
             b_raw.dot(&self.spline.link_transform)
         } else {
             Array2::zeros((n, n_c))
@@ -2958,19 +2982,31 @@ impl LinkWigglePosterior {
             return g;
         }
 
-        let Ok((b_prime_raw_arc, _)) = create_basis::<Dense>(
-            z_c.view(),
-            KnotSource::Provided(self.spline.knot_vector.view()),
-            self.spline.degree,
-            BasisOptions::first_derivative(),
-        ) else {
-            return g;
+        let b_prime_constrained = if self.spline.use_ispline {
+            match crate::basis::create_ispline_derivative_dense(
+                z_c.view(),
+                &self.spline.knot_vector,
+                self.spline.degree,
+                1,
+            ) {
+                Ok(m) => m,
+                Err(_) => return g,
+            }
+        } else {
+            let Ok((b_prime_raw_arc, _)) = create_basis::<Dense>(
+                z_c.view(),
+                KnotSource::Provided(self.spline.knot_vector.view()),
+                self.spline.degree,
+                BasisOptions::first_derivative(),
+            ) else {
+                return g;
+            };
+            let b_prime_raw = b_prime_raw_arc.as_ref();
+            if self.spline.link_transform.nrows() != n_raw {
+                return g;
+            }
+            b_prime_raw.dot(&self.spline.link_transform)
         };
-        let b_prime_raw = b_prime_raw_arc.as_ref();
-        if self.spline.link_transform.nrows() != n_raw {
-            return g;
-        }
-        let b_prime_constrained = b_prime_raw.dot(&self.spline.link_transform);
         let dwiggle_dz = b_prime_constrained.dot(theta);
         for i in 0..n {
             g[i] = 1.0 + dwiggle_dz[i] / rw;

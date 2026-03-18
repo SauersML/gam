@@ -4,7 +4,7 @@ use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
-use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, Axis, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
@@ -421,6 +421,21 @@ fn robust_eigh(
     let matrix_faer = array_to_faer(matrix);
     let (eigenvalues, eigenvectors) = robust_eigh_faer(&matrix_faer, side, context)?;
     Ok((Array1::from_vec(eigenvalues), mat_to_array(&eigenvectors)))
+}
+
+pub(crate) fn kronecker_marginal_eigensystems(
+    marginal_penalties: &[Array2<f64>],
+    context: &str,
+) -> Result<Vec<(Array1<f64>, Array2<f64>)>, EstimationError> {
+    let mut eigensystems = Vec::with_capacity(marginal_penalties.len());
+    for (k, penalty) in marginal_penalties.iter().enumerate() {
+        eigensystems.push(robust_eigh(
+            penalty,
+            Side::Lower,
+            &format!("{context} marginal {k}"),
+        )?);
+    }
+    Ok(eigensystems)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2164,7 +2179,7 @@ impl KroneckerReparamResult {
 /// and `kronecker_reparameterization_engine`.  Iterates over the ∏q_j
 /// multi-index grid in O(d · ∏q_j) time with no O(p²) storage.
 pub fn kronecker_logdet_and_derivatives(
-    marginal_eigenvalues: &[Array1<f64>],
+    marginal_eigenvalues: &[ArrayView1<'_, f64>],
     marginal_dims: &[usize],
     lambdas: &[f64],
     has_double_penalty: bool,
@@ -2253,8 +2268,6 @@ pub fn kronecker_reparameterization_engine(
     has_double_penalty: bool,
     penalty_shrinkage_floor: Option<f64>,
 ) -> Result<KroneckerReparamResult, EstimationError> {
-    use crate::faer_ndarray::FaerEigh;
-
     let d = marginal_dims.len();
     if marginal_designs.len() != d || marginal_penalties.len() != d {
         return Err(EstimationError::LayoutError(format!(
@@ -2265,15 +2278,14 @@ pub fn kronecker_reparameterization_engine(
         )));
     }
 
-    // Eigendecompose each marginal penalty.
+    // Eigendecompose each marginal penalty once through the same robust path
+    // used by KroneckerPenaltySystem so every Kronecker caller sees the same
+    // eigensystem and pseudo-logdet surface.
     let mut marginal_eigenvalues = Vec::with_capacity(d);
     let mut marginal_qs = Vec::with_capacity(d);
-    for (k, s_k) in marginal_penalties.iter().enumerate() {
-        let (evals, evecs) = s_k.eigh(Side::Lower).map_err(|e| {
-            EstimationError::LayoutError(format!(
-                "kronecker_reparameterization_engine: eigendecomp of marginal {k}: {e}"
-            ))
-        })?;
+    for (evals, evecs) in
+        kronecker_marginal_eigensystems(marginal_penalties, "kronecker_reparameterization_engine")?
+    {
         marginal_eigenvalues.push(evals);
         marginal_qs.push(evecs);
     }
@@ -2322,8 +2334,10 @@ pub fn kronecker_reparameterization_engine(
         0.0
     };
 
+    let marginal_eigenvalue_views: Vec<_> =
+        marginal_eigenvalues.iter().map(|evals| evals.view()).collect();
     let (log_det, det1, det2) = kronecker_logdet_and_derivatives(
-        &marginal_eigenvalues,
+        &marginal_eigenvalue_views,
         marginal_dims,
         lambdas,
         has_double_penalty,

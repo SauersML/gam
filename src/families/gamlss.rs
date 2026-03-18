@@ -432,10 +432,21 @@ pub(crate) fn initializewiggle_knots_from_seed(
             num_internal_knots,
         },
         degree,
-        BasisOptions::i_spline(),
+        BasisOptions::value(),
     )
     .map_err(|e| e.to_string())?;
     Ok(knots)
+}
+
+fn initialize_monotone_wiggle_knots_from_seed(
+    seed: ArrayView1<'_, f64>,
+    degree: usize,
+    num_internal_knots: usize,
+) -> Result<Array1<f64>, String> {
+    let bs_degree = degree
+        .checked_add(1)
+        .ok_or_else(|| "monotone wiggle degree overflow while initializing knots".to_string())?;
+    initializewiggle_knots_from_seed(seed, bs_degree, num_internal_knots)
 }
 
 pub fn buildwiggle_block_input_from_knots(
@@ -459,13 +470,13 @@ pub fn buildwiggle_block_input_from_knots(
         nullspace_dims.push(0);
     } else {
         let effective_order = penalty_order.max(1).min(p - 1);
-        let (_, constrained_penalty) =
-            compute_geometric_constraint_transform(knots, degree, effective_order)
+        let diff_penalty =
+            create_difference_penalty_matrix(p, effective_order, None)
                 .map_err(|e| e.to_string())?;
         penalties.push(crate::solver::estimate::PenaltySpec::Dense(
-            constrained_penalty,
+            diff_penalty,
         ));
-        nullspace_dims.push(effective_order.saturating_sub(2));
+        nullspace_dims.push(effective_order);
     }
     if double_penalty {
         penalties.push(crate::solver::estimate::PenaltySpec::Dense(
@@ -487,7 +498,7 @@ pub fn buildwiggle_block_input_from_seed(
     seed: ArrayView1<'_, f64>,
     cfg: &WiggleBlockConfig,
 ) -> Result<(ParameterBlockInput, Array1<f64>), String> {
-    let knots = initializewiggle_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
+    let knots = initialize_monotone_wiggle_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
     let block = buildwiggle_block_input_from_knots(
         seed,
         &knots,
@@ -507,12 +518,10 @@ pub(crate) fn monotone_wiggle_basis_from_knots(
         seed,
         KnotSource::Provided(knots.view()),
         degree,
-        BasisOptions::value(),
+        BasisOptions::i_spline(),
     )
     .map_err(|e| e.to_string())?;
-    let (z, _) =
-        compute_geometric_constraint_transform(knots, degree, 2).map_err(|e| e.to_string())?;
-    Ok(basis.as_ref().dot(&z))
+    Ok(basis.as_ref().clone())
 }
 
 pub fn monotone_wiggle_basis_with_derivative_order(
@@ -524,41 +533,8 @@ pub fn monotone_wiggle_basis_with_derivative_order(
     if derivative_order == 0 {
         return monotone_wiggle_basis_from_knots(seed, knots, degree);
     }
-    if derivative_order > 4 {
-        return Err(format!(
-            "unsupported monotone wiggle derivative order {derivative_order}"
-        ));
-    }
-
-    let num_basis = knots.len().saturating_sub(degree + 1);
-    let (z, _) =
-        compute_geometric_constraint_transform(knots, degree, 2).map_err(|e| e.to_string())?;
-    let mut out = Array2::<f64>::zeros((seed.len(), z.ncols()));
-    if derivative_order > degree || num_basis == 0 || z.ncols() == 0 {
-        return Ok(out);
-    }
-
-    let knot_view = knots.view();
-    let mut raw = vec![0.0; num_basis];
-    for (row_idx, &x) in seed.iter().enumerate() {
-        raw.fill(0.0);
-        match derivative_order {
-            1 => evaluate_bspline_derivative_scalar(x, knot_view, degree, &mut raw),
-            2 => evaluate_bsplinesecond_derivative_scalar(x, knot_view, degree, &mut raw),
-            3 => evaluate_bsplinethird_derivative_scalar(x, knot_view, degree, &mut raw),
-            4 => evaluate_bspline_fourth_derivative_scalar(x, knot_view, degree, &mut raw),
-            _ => unreachable!(),
-        }
-        .map_err(|e| format!("failed to evaluate monotone wiggle derivative basis: {e}"))?;
-        for col in 0..z.ncols() {
-            let mut value = 0.0;
-            for raw_col in 0..num_basis {
-                value += raw[raw_col] * z[[raw_col, col]];
-            }
-            out[[row_idx, col]] = if value.abs() <= 1e-12 { 0.0 } else { value };
-        }
-    }
-    Ok(out)
+    create_ispline_derivative_dense(seed, knots, degree, derivative_order)
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn monotone_wiggle_nonnegative_constraints(
@@ -605,8 +581,8 @@ pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
 
 /// Resolve a requested wiggle penalty-order set into:
 ///
-/// - the primary order used by the geometric-constraint penalty, and
-/// - the remaining plain difference-penalty orders to append on the reduced basis.
+/// - the primary order used by the monotone I-spline coefficient penalty, and
+/// - the remaining plain difference-penalty orders to append on the same basis.
 ///
 /// The primary order is the smallest positive requested order. If no positive
 /// order is requested, `fallback_primary` is used instead. Extra orders are
@@ -633,12 +609,9 @@ pub fn split_wiggle_penalty_orders(
 
 /// Append raw difference penalties for the given orders to an existing block.
 ///
-/// These are plain difference penalties `D_k^T D_k` on `p` coefficients, whose
-/// nullspace is the set of polynomial sequences of degree ≤ k−1, giving
-/// `nullspace_dim = k`.  This differs from the geometric-constraint penalty in
-/// [`buildwiggle_block_input_from_knots`], which projects the raw penalty
-/// through the geometric constraint transform and therefore removes the
-/// constant and linear directions from its structural nullspace bookkeeping.
+/// These are plain difference penalties `D_k^T D_k` on the monotone I-spline
+/// coefficients, whose nullspace is the set of polynomial sequences of degree
+/// ≤ k−1, giving `nullspace_dim = k`.
 pub fn append_selected_wiggle_penalty_orders(
     block: &mut ParameterBlockInput,
     penalty_orders: &[usize],
@@ -15185,10 +15158,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::{
-        CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu,
-        compute_geometric_constraint_transform, compute_greville_abscissae,
-    };
+    use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
     use ndarray::{Array2, Axis, array};
     use num_dual::{
@@ -15290,22 +15260,24 @@ mod tests {
         basis
     }
 
-    fn constrainedwiggle_basis_scalar_numdual<D: DualNum<f64> + Copy>(
+    fn monotone_wiggle_basis_scalar_numdual<D: DualNum<f64> + Copy>(
         x: D,
         knots: &Array1<f64>,
         degree: usize,
     ) -> Array1<D> {
-        let (z, _): (Array2<f64>, Array2<f64>) =
-            compute_geometric_constraint_transform(knots, degree, 2)
-                .expect("wiggle constraint transform");
-        let full = bspline_basis_scalar_numdual(x, knots, degree);
-        let mut constrained = Array1::<D>::from_elem(z.ncols(), D::zero());
-        for j in 0..z.nrows() {
-            for k in 0..z.ncols() {
-                constrained[k] += full[j] * D::from(z[[j, k]]);
-            }
+        let bs_degree = degree + 1;
+        let left = knots[bs_degree];
+        let full = bspline_basis_scalar_numdual(x, knots, bs_degree);
+        let left_full = bspline_basis_scalar_numdual(D::from(left), knots, bs_degree);
+        let mut out = Array1::<D>::from_elem(full.len().saturating_sub(1), D::zero());
+        let mut running = D::zero();
+        let mut left_running = D::zero();
+        for j in (1..full.len()).rev() {
+            running += full[j];
+            left_running += left_full[j];
+            out[j - 1] = running - left_running;
         }
-        constrained
+        out
     }
 
     fn wiggle_negloglik_threshold_numdual<D: DualNum<f64> + Copy>(
@@ -15319,7 +15291,7 @@ mod tests {
     ) -> D {
         let sigma = D::from(beta_ls).exp();
         let q0 = -beta_t / sigma;
-        let basis = constrainedwiggle_basis_scalar_numdual(q0, knots, degree);
+        let basis = monotone_wiggle_basis_scalar_numdual(q0, knots, degree);
         let mut etaw = D::zero();
         for j in 0..betaw.len() {
             etaw += basis[j] * D::from(betaw[j]);
@@ -18476,7 +18448,7 @@ mod tests {
     }
 
     #[test]
-    fn wiggle_constraint_removes_constant_and_linear_modes() {
+    fn wiggle_basis_is_structurally_monotone_for_nonnegative_coefficients() {
         let q_seed = Array1::linspace(-2.0, 2.0, 17);
         let degree = 3usize;
         let num_internal_knots = 6usize;
@@ -18490,26 +18462,18 @@ mod tests {
             false,
         )
         .expect("wiggle block");
-        let (z, _): (Array2<f64>, Array2<f64>) =
-            compute_geometric_constraint_transform(&knots, degree, penalty_order)
-                .expect("constraint transform");
-        let g = compute_greville_abscissae(&knots, degree).expect("greville abscissae");
-
-        assert_eq!(block.design.ncols(), z.ncols());
-
-        let beta = Array1::from_vec(vec![0.2; z.ncols()]);
-        let theta = z.dot(&beta);
-        let c0 = theta.sum();
-        let c1 = theta.dot(&g);
+        let design = match &block.design {
+            DesignMatrix::Dense(x) => x.to_dense_arc(),
+            DesignMatrix::Sparse(_) => panic!("expected dense wiggle design"),
+        };
+        let beta = Array1::from_elem(design.ncols(), 0.2);
+        let derivative = monotone_wiggle_basis_with_derivative_order(q_seed.view(), &knots, degree, 1)
+            .expect("wiggle derivative basis")
+            .dot(&beta);
         assert!(
-            c0.abs() < 1e-9,
-            "constant mode leaked through wiggle constraint: {}",
-            c0
-        );
-        assert!(
-            c1.abs() < 1e-9,
-            "linear mode leaked through wiggle constraint: {}",
-            c1
+            derivative.iter().all(|&value| value >= -1e-12),
+            "I-spline wiggle derivative must stay non-negative for non-negative coefficients: min={}",
+            derivative.iter().fold(f64::INFINITY, |acc, &v| acc.min(v))
         );
     }
 
@@ -18517,10 +18481,11 @@ mod tests {
     fn degeneratewiggle_seed_uses_broad_fallback_domain() {
         let q_seed = Array1::zeros(9);
         let degree = 3usize;
-        let knots = initializewiggle_knots_from_seed(q_seed.view(), degree, 5)
+        let knots = initialize_monotone_wiggle_knots_from_seed(q_seed.view(), degree, 5)
             .expect("initialize degenerate wiggle knots");
-        let domain_min = knots[degree];
-        let domain_max = knots[knots.len() - degree - 1];
+        let bs_degree = degree + 1;
+        let domain_min = knots[bs_degree];
+        let domain_max = knots[knots.len() - bs_degree - 1];
         assert!(
             domain_min <= -2.9,
             "unexpected left fallback boundary: {domain_min}"
@@ -18532,7 +18497,7 @@ mod tests {
     }
 
     #[test]
-    fn wiggle_block_design_matches_constrained_basis_projection() {
+    fn wiggle_block_design_matches_ispline_basis() {
         let q_seed = Array1::linspace(-1.0, 1.0, 11);
         let degree = 2usize;
         let num_internal_knots = 4usize;
@@ -18550,14 +18515,10 @@ mod tests {
             q_seed.view(),
             KnotSource::Provided(knots.view()),
             degree,
-            BasisOptions::value(),
+            BasisOptions::i_spline(),
         )
-        .expect("full basis");
-        let full = (*basis).clone();
-        let (z, _): (Array2<f64>, Array2<f64>) =
-            compute_geometric_constraint_transform(&knots, degree, penalty_order)
-                .expect("constraint transform");
-        let expected: Array2<f64> = full.dot(&z);
+        .expect("I-spline basis");
+        let expected = (*basis).clone();
 
         let got = match &block.design {
             DesignMatrix::Dense(x) => x.to_dense_arc(),
@@ -18600,7 +18561,7 @@ mod tests {
             .expect("selected wiggle basis");
 
         assert_eq!(selected.block.penalties.len(), 2);
-        assert_eq!(selected.block.nullspace_dims, vec![0, 3]);
+        assert_eq!(selected.block.nullspace_dims, vec![1, 3]);
     }
 
     #[test]

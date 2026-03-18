@@ -13,7 +13,9 @@ use crate::basis::{
     build_thin_plate_basis_log_kappa_derivative, build_thin_plate_basis_log_kappasecond_derivative,
     estimate_penalty_nullity, filter_active_penalty_candidates,
 };
-use crate::construction::{kronecker_logdet_and_derivatives, kronecker_product};
+use crate::construction::{
+    kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
+};
 use crate::custom_family::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
@@ -603,23 +605,9 @@ impl KroneckerPenaltySystem {
                 marginal_dims.len()
             )));
         }
-        let mut eigensystems = Vec::with_capacity(marginal_penalties.len());
-        for (k, s_k) in marginal_penalties.iter().enumerate() {
-            let mat_faer = crate::construction::array_to_faer(s_k);
-            let (evals_vec, evecs_mat) = crate::construction::robust_eigh_faer(
-                &mat_faer,
-                faer::Side::Lower,
-                &format!("KroneckerPenaltySystem marginal {k}"),
-            )
-            .map_err(|e| {
-                BasisError::InvalidInput(format!(
-                    "KroneckerPenaltySystem: eigendecomp of marginal {k}: {e}"
-                ))
-            })?;
-            let evals = Array1::from_vec(evals_vec);
-            let evecs = crate::construction::mat_to_array(&evecs_mat);
-            eigensystems.push((evals, evecs));
-        }
+        let eigensystems =
+            kronecker_marginal_eigensystems(&marginal_penalties, "KroneckerPenaltySystem")
+                .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
         Ok(Self {
             marginal_penalties,
             marginal_eigensystems: eigensystems,
@@ -650,10 +638,10 @@ impl KroneckerPenaltySystem {
     ) -> (f64, Array1<f64>, Array2<f64>) {
         let n_pen = self.num_penalties();
         assert_eq!(lambdas.len(), n_pen, "lambda count mismatch");
-        let marginal_evals: Vec<Array1<f64>> = self
+        let marginal_evals: Vec<_> = self
             .marginal_eigensystems
             .iter()
-            .map(|(evals, _)| evals.clone())
+            .map(|(evals, _)| evals.view())
             .collect();
         kronecker_logdet_and_derivatives(
             &marginal_evals,
@@ -10666,7 +10654,7 @@ mod tests {
         SpatialIdentifiability, ThinPlateBasisSpec,
     };
     use crate::estimate::AdaptiveRegularizationOptions;
-    use crate::faer_ndarray::FaerSvd;
+    use crate::faer_ndarray::{FaerEigh, FaerSvd};
     use ndarray::array;
 
     fn numerical_rank(x: &Array2<f64>) -> usize {
@@ -10737,6 +10725,79 @@ mod tests {
             .zip(b.iter())
             .map(|(&x, &y)| (x - y).abs())
             .fold(0.0_f64, f64::max)
+    }
+
+    fn dense_kronecker_pseudo_logdet_reference(
+        marginal_penalties: &[Array2<f64>],
+        lambdas: &[f64],
+        ridge: f64,
+    ) -> (f64, Array1<f64>, Array2<f64>) {
+        let p_total: usize = marginal_penalties.iter().map(|penalty| penalty.nrows()).product();
+        let mut s_dense = Array2::<f64>::zeros((p_total, p_total));
+        for (axis, penalty) in marginal_penalties.iter().enumerate() {
+            let mut kron_term = Array2::<f64>::eye(1);
+            for (other_axis, other_penalty) in marginal_penalties.iter().enumerate() {
+                let factor = if axis == other_axis {
+                    penalty.clone()
+                } else {
+                    Array2::<f64>::eye(other_penalty.nrows())
+                };
+                kron_term = crate::construction::kronecker_product(&kron_term, &factor);
+            }
+            s_dense.scaled_add(lambdas[axis], &kron_term);
+        }
+        if ridge > 0.0 {
+            for idx in 0..p_total {
+                s_dense[[idx, idx]] += ridge;
+            }
+        }
+        let (evals_dense, evecs_dense): (Array1<f64>, Array2<f64>) =
+            s_dense.eigh(faer::Side::Lower).expect("dense Kronecker eigh");
+        let tol = 1e-12;
+        let positive_indices: Vec<usize> = evals_dense
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &value)| (value > tol).then_some(idx))
+            .collect();
+        let logdet = positive_indices.iter().map(|&idx| evals_dense[idx].ln()).sum();
+        let mut grad = Array1::<f64>::zeros(lambdas.len());
+        let mut hess = Array2::<f64>::zeros((lambdas.len(), lambdas.len()));
+        for (axis, penalty) in marginal_penalties.iter().enumerate() {
+            let mut kron_term = Array2::<f64>::eye(1);
+            for (other_axis, other_penalty) in marginal_penalties.iter().enumerate() {
+                let factor = if axis == other_axis {
+                    penalty.clone()
+                } else {
+                    Array2::<f64>::eye(other_penalty.nrows())
+                };
+                kron_term = crate::construction::kronecker_product(&kron_term, &factor);
+            }
+            for &eig_idx in &positive_indices {
+                let eigval = evals_dense[eig_idx];
+                let eigvec = evecs_dense.column(eig_idx).to_owned();
+                let projected = kron_term.dot(&eigvec);
+                let ck = lambdas[axis] * eigvec.dot(&projected);
+                grad[axis] += ck / eigval;
+                hess[[axis, axis]] += ck / eigval - (ck * ck) / (eigval * eigval);
+                for other_axis in (axis + 1)..lambdas.len() {
+                    let mut other_kron = Array2::<f64>::eye(1);
+                    for (inner_axis, inner_penalty) in marginal_penalties.iter().enumerate() {
+                        let factor = if other_axis == inner_axis {
+                            inner_penalty.clone()
+                        } else {
+                            Array2::<f64>::eye(inner_penalty.nrows())
+                        };
+                        other_kron = crate::construction::kronecker_product(&other_kron, &factor);
+                    }
+                    let other_projected = other_kron.dot(&eigvec);
+                    let cl = lambdas[other_axis] * eigvec.dot(&other_projected);
+                    let off = -(ck * cl) / (eigval * eigval);
+                    hess[[axis, other_axis]] += off;
+                    hess[[other_axis, axis]] += off;
+                }
+            }
+        }
+        (logdet, grad, hess)
     }
 
     fn max_abs_diff_vector(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
