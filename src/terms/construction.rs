@@ -2334,8 +2334,10 @@ pub fn kronecker_reparameterization_engine(
         0.0
     };
 
-    let marginal_eigenvalue_views: Vec<_> =
-        marginal_eigenvalues.iter().map(|evals| evals.view()).collect();
+    let marginal_eigenvalue_views: Vec<_> = marginal_eigenvalues
+        .iter()
+        .map(|evals| evals.view())
+        .collect();
     let (log_det, det1, det2) = kronecker_logdet_and_derivatives(
         &marginal_eigenvalue_views,
         marginal_dims,
