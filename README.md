@@ -2,25 +2,15 @@
 
 `gam` is a formula-first CLI and Rust engine for generalized additive models.
 
-The current CLI supports:
+It fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms, random effects, location-scale extensions, survival likelihoods, and flexible/learnable link functions. Smoothing parameters are selected by REML or LAML. Posterior sampling uses NUTS.
 
-- Standard models with linear terms, random effects, and smooths
-- Location-scale models (which jointly predict noise)
-- Survival models
-- Various surface models
-- Posterior sampling
-- Rich penalty structures
-- And more
+## What's different
 
-## Differences from other GAM libraries
-- We primarily use REML and LAML.
-- We aim to automatically support all sizes of data.
-- The default penalty structure has separate penalties for magnitude, gradient, and curvature, instead of the common approach of having one (curvature) or two (curvature, and magnitude + gradient combined).
-- Support for using smooths as offsets from a known function, such that the known function acts as a prior. For example, you may choose to select a probit link with a spline offset, allowing the data to fix link misspecification, while still encoding the belief that probit is approximately correct. This is particularly useful because a flexible link function can fix arbitrary miscalibration of the model, similar to a post-hoc calibration step (but jointly fit). There's also support for smooth offsets from survival model time basis functions.
-- Support for surface smooths, such as multidimensional Duchon splines.
-- Adaptive length scaling: the ability to shrink each axis or feature separately, even when they are part of a single, joint smooth.
-- Support for a locally adaptive smoothness penalty, so certain regions can demand faster transitions, while still remaining smooth overall.
-- The ability to mix aspects of different spline categories together. For example, you can have the kernel basis of a Duchon spline, but also have the global kappa scaling of a Matern spline (if you for some reason wanted to).
+- **Three-part penalty structure.** Each smooth gets separate penalties for magnitude, gradient, and curvature. Most GAM libraries use one (curvature only) or two (curvature + combined magnitude/gradient). The three-part structure gives the smoother more degrees of freedom to distinguish flat-but-offset functions from wiggly ones.
+- **Flexible link functions.** A spline offset from a base link (e.g. probit) lets the data correct for link misspecification while encoding the belief that the base link is approximately right. This is equivalent to joint fitting with post-hoc calibration. The same mechanism applies to survival time basis functions.
+- **Surface smooths.** Thin-plate splines, Duchon splines, and Matern covariance-based smooths in arbitrary dimension, with automatic knot placement.
+- **Adaptive anisotropy.** Per-axis length-scale optimization (`--scale-dimensions`) lets the model shrink or stretch each feature axis independently within a single joint smooth, instead of assuming isotropic smoothness.
+- **Composable basis/kernel.** You can combine the kernel of one spline family with the length-scale behavior of another (e.g. Duchon kernel with Matern-style global kappa scaling).
 
 ## Install
 
@@ -86,8 +76,8 @@ response ~ term + term + ...
 
 ### Response
 
-- Continuous or binary: `y`
-- Survival: `Surv(entry_time, exit_time, event)`
+- Continuous, binary, count, or positive continuous: `y`
+- Survival (interval-censored): `Surv(entry_time, exit_time, event)`
 
 ### Terms
 
@@ -117,7 +107,7 @@ response ~ term + term + ...
 | `smooth(x)` or `s(x)` | P-spline (B-spline + difference penalty) |
 | `smooth(x1, x2)` | Thin-plate spline |
 | `thinplate(x1, x2)` or `tps(x1, x2)` | Thin-plate spline |
-| `matern(x1, x2, ...)` | Matern radial basis |
+| `matern(x1, x2, ...)` | Matern covariance smooth |
 | `duchon(x1, x2, ...)` | Duchon spline (scale-free) |
 | `tensor(x, z)` or `te(x, z)` | Tensor-product B-splines |
 
@@ -136,9 +126,12 @@ Spatial smooths support per-axis anisotropy via `scale_dims=true` or the global 
 
 ### Auto-detection
 
-- Binary `{0, 1}` response: binomial with logit link
+The family is inferred from the response column:
+
+- Binary `{0, 1}`: binomial with logit link
 - Everything else: Gaussian with identity link
-- Override with `link(type=...)` in the formula
+
+Override with `link(type=...)` in the formula. Poisson and Gamma families are available via explicit link specification.
 
 ## Fit modes
 
@@ -148,7 +141,7 @@ Spatial smooths support per-axis anisotropy via `scale_dims=true` or the global 
 gam fit data.csv 'y ~ age + smooth(bmi) + group(site)' --out model.json
 ```
 
-### Location-scale (jointly model noise)
+### Location-scale (jointly model mean and variance)
 
 ```bash
 gam fit data.csv 'y ~ smooth(x1) + smooth(x2)' \
