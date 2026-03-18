@@ -482,12 +482,13 @@ impl<'a> RemlState<'a> {
                 for kk in 0..k {
                     let v_kk = &v_ks[kk];
                     // Ḣ_l v_k = A_l v_k + X^T(c ⊙ x_vl ⊙ X v_k)
-                    let rl_vk = r_l.dot(v_kk);
+                    let v_kk_block = v_kk.slice(s![rl.start..rl.end]);
+                    let rl_vk = cp_l.root.dot(&v_kk_block);
                     let mut h_dot_l_vk = Array1::<f64>::zeros(p);
-                    for a in 0..p {
-                        h_dot_l_vk[a] = lambdas[l]
-                            * (0..r_l.nrows())
-                                .map(|row| r_l[[row, a]] * rl_vk[row])
+                    for a in 0..cp_l.block_dim() {
+                        h_dot_l_vk[rl.start + a] = lambdas[l]
+                            * (0..cp_l.rank())
+                                .map(|row| cp_l.root[[row, a]] * rl_vk[row])
                                 .sum::<f64>();
                     }
                     let x_vkk = &x_vks[kk];
@@ -2756,7 +2757,6 @@ impl<'a> RemlState<'a> {
             mode,
             hessian_op,
             beta,
-            Vec::new(),
             penalty_logdet,
             deriv_provider,
             0.0,
@@ -2823,7 +2823,6 @@ impl<'a> RemlState<'a> {
             rho,
             hessian_op,
             beta,
-            Vec::new(),
             penalty_logdet,
             deriv_provider,
             0.0,
@@ -3114,17 +3113,10 @@ impl<'a> RemlState<'a> {
         // Build InnerSolution with ext_coords injected.
         let n_observations = self.y.len();
         let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
-            if self.canonical_penalties.len() == penalty_roots.len() {
-                self.canonical_penalties
-                    .iter()
-                    .map(|cp| cp.to_penalty_coordinate())
-                    .collect()
-            } else {
-                penalty_roots
-                    .into_iter()
-                    .map(super::unified::PenaltyCoordinate::from_dense_root)
-                    .collect()
-            };
+            self.canonical_penalties
+                .iter()
+                .map(|cp| cp.to_penalty_coordinate())
+                .collect();
         let mut builder = InnerSolutionBuilder::new(
             log_likelihood,
             pirls_result.stable_penalty_term,
@@ -3315,7 +3307,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         hessian_op: Box<dyn super::unified::HessianOperator>,
         beta: Array1<f64>,
-        _penalty_roots: Vec<Array2<f64>>,
         penalty_logdet: super::unified::PenaltyLogdetDerivs,
         deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
         tk_correction: f64,
@@ -3538,7 +3529,6 @@ impl<'a> RemlState<'a> {
             rho,
             hessian_op,
             beta,
-            Vec::new(), // canonical_penalties used directly inside
             penalty_logdet,
             deriv_provider,
             tk_correction,

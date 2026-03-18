@@ -848,17 +848,7 @@ impl CanonicalPenalty {
         g
     }
 
-    /// Global penalty: `p x p` matrix (embeds into full space). Use sparingly.
-    pub fn global_penalty(&self) -> Array2<f64> {
-        if !self.is_block_local() {
-            return self.local.clone();
-        }
-        let mut g = Array2::zeros((self.total_dim, self.total_dim));
-        let r = &self.col_range;
-        g.slice_mut(s![r.start..r.end, r.start..r.end])
-            .assign(&self.local);
-        g
-    }
+
 
     /// Convert to a PenaltyCoordinate for the unified REML evaluator.
     pub fn to_penalty_coordinate(
@@ -1298,7 +1288,7 @@ pub fn precompute_reparam_invariant_from_canonical(
 
     if m == 0 {
         return Ok(ReparamInvariant {
-            split: SubspaceSplit::identity(p),
+            split: SubspaceSplit::identity(p_total),
             qs_base: Array2::eye(p_total),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
@@ -1345,11 +1335,7 @@ pub fn precompute_reparam_invariant_from_canonical(
 
     if overlapping {
         // Fallback: global p×p eigendecomposition.
-        let global_roots: Vec<Array2<f64>> =
-            penalties.iter().map(|cp| cp.global_root()).collect();
-        let rs_faer: Vec<Mat<f64>> = global_roots.iter().map(array_to_faer).collect();
-
-        let mut s_balanced = Mat::<f64>::zeros(p, p);
+        let mut s_balanced = Mat::<f64>::zeros(p_total, p_total);
         for cp in penalties {
             if cp.rank() == 0 {
                 continue;
@@ -1370,7 +1356,7 @@ pub fn precompute_reparam_invariant_from_canonical(
         let (bal_eigenvalues, bal_eigenvectors) =
             robust_eigh_faer(&s_balanced, Side::Lower, "balanced penalty matrix")?;
 
-        let mut order: Vec<usize> = (0..p).collect();
+        let mut order: Vec<usize> = (0..p_total).collect();
         order.sort_by(|&i, &j| {
             bal_eigenvalues[j]
                 .partial_cmp(&bal_eigenvalues[i])
@@ -1378,9 +1364,9 @@ pub fn precompute_reparam_invariant_from_canonical(
                 .then(i.cmp(&j))
         });
 
-        let mut qs = Mat::<f64>::zeros(p, p);
+        let mut qs = Mat::<f64>::zeros(p_total, p_total);
         for (col_idx, &idx) in order.iter().enumerate() {
-            for row in 0..p {
+            for row in 0..p_total {
                 qs[(row, col_idx)] = bal_eigenvectors[(row, idx)];
             }
         }
@@ -1394,7 +1380,7 @@ pub fn precompute_reparam_invariant_from_canonical(
             .iter()
             .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
             .count();
-        let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p)?;
+        let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p_total)?;
 
         return Ok(ReparamInvariant {
             split,
@@ -1411,13 +1397,13 @@ pub fn precompute_reparam_invariant_from_canonical(
     // Q_pen and Q_null are assembled by embedding block-local eigenvectors.
 
     // Track which columns are covered by any penalty.
-    let mut covered = vec![false; p];
+    let mut covered = vec![false; p_total];
     for cp in penalties {
         for j in cp.col_range.clone() {
             covered[j] = true;
         }
     }
-    let uncovered_cols: Vec<usize> = (0..p).filter(|j| !covered[*j]).collect();
+    let uncovered_cols: Vec<usize> = (0..p_total).filter(|j| !covered[*j]).collect();
 
     struct BlockResult {
         col_range: Range<usize>,
@@ -1518,7 +1504,7 @@ pub fn precompute_reparam_invariant_from_canonical(
     // Compute column offsets for each block in the global Q_pen / Q_null layout.
     let total_pen_rank: usize = block_results.iter().map(|br| br.q_pen_local.ncols()).sum();
     let total_null: usize =
-        block_results.iter().map(|br| br.q_null_local.ncols()).sum() + uncovered_cols.len();
+        block_results.iter().map(|br| br.q_null_local.ncols()).sum::<usize>() + uncovered_cols.len();
     {
         let mut pen_off = 0usize;
         let mut null_off = 0usize;
@@ -1530,8 +1516,8 @@ pub fn precompute_reparam_invariant_from_canonical(
         }
     }
 
-    let mut q_pen = Array2::zeros((p, total_pen_rank));
-    let mut q_null = Array2::zeros((p, total_null));
+    let mut q_pen = Array2::zeros((p_total, total_pen_rank));
+    let mut q_null = Array2::zeros((p_total, total_null));
 
     for br in &block_results {
         let start = br.col_range.start;

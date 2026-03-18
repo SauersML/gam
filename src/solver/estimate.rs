@@ -1469,10 +1469,7 @@ pub fn optimize_external_design<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from_blockwise).collect();
-    optimize_external_designwith_heuristic_lambdas_andwarm_start(
-        y, w, x, offset, specs, None, None, opts,
-    )
+    optimize_external_designwith_heuristic_lambdas(y, w, x, offset, s_list, None, opts)
 }
 
 /// Same as `optimize_external_design`, but allows heuristic λ warm-start seeds

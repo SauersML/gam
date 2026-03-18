@@ -42,9 +42,6 @@ use std::sync::Arc;
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
-const WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL: usize = 8;
-const WIGGLE_MONOTONICITY_GUARD_FRACTION: f64 = 1e-6;
-const WIGGLE_MONOTONICITY_GUARD: f64 = 1e-10;
 
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
@@ -453,7 +450,7 @@ pub(crate) fn monotone_wiggle_basis_with_derivative_order(
         ));
     }
 
-    let _ = create_basis::<Dense>(
+    create_basis::<Dense>(
         seed,
         KnotSource::Provided(knots.view()),
         degree,
@@ -504,43 +501,6 @@ pub(crate) fn monotone_wiggle_nonnegative_constraints(
         a,
         b: Array1::zeros(beta_dim),
     })
-}
-
-pub fn wiggle_monotonicity_collocation_points(knots: &Array1<f64>) -> Array1<f64> {
-    if knots.len() < 2 {
-        return Array1::zeros(0);
-    }
-
-    let mut grid = Vec::<f64>::new();
-    let mut last_point = None::<f64>;
-    for interval_idx in 0..knots.len() - 1 {
-        let left = knots[interval_idx];
-        let right = knots[interval_idx + 1];
-        if !left.is_finite() || !right.is_finite() || right <= left {
-            continue;
-        }
-
-        let width = right - left;
-        let guard = (width * WIGGLE_MONOTONICITY_GUARD_FRACTION)
-            .max(WIGGLE_MONOTONICITY_GUARD)
-            .min(0.5 * width);
-        let start = left + guard;
-        let end = right - guard;
-        if end <= start {
-            continue;
-        }
-
-        for step in 1..=WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL {
-            let frac = step as f64 / (WIGGLE_MONOTONICITY_POINTS_PER_INTERVAL + 1) as f64;
-            let point = start + frac * (end - start);
-            if last_point.is_none_or(|prev| (point - prev).abs() > 1e-12) {
-                grid.push(point);
-                last_point = Some(point);
-            }
-        }
-    }
-
-    Array1::from_vec(grid)
 }
 
 pub(crate) fn project_monotone_wiggle_beta(mut beta: Array1<f64>) -> Array1<f64> {
