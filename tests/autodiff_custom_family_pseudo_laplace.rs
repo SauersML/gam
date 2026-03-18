@@ -160,7 +160,9 @@ fn scalar_pseudo_laplace_psiobjective_f64(psi: f64) -> f64 {
 fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
     let spec = ParameterBlockSpec {
         name: "rho_block".to_string(),
-        design: gam::matrix::DesignMatrix::Dense(Arc::new(array![[1.0]])),
+        design: gam::matrix::DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[
+            1.0
+        ]])),
         offset: array![0.0],
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
         nullspace_dims: vec![0],
@@ -219,7 +221,9 @@ fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
 fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
     let spec = ParameterBlockSpec {
         name: "psi_block".to_string(),
-        design: gam::matrix::DesignMatrix::Dense(Arc::new(array![[1.0]])),
+        design: gam::matrix::DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[
+            1.0
+        ]])),
         offset: array![0.0],
         penalties: vec![],
         nullspace_dims: vec![],

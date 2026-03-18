@@ -30,7 +30,9 @@ use crate::families::custom_family::{
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::families::gamlss::initializewiggle_knots_from_seed;
-use crate::matrix::{DesignMatrix, DesignOperator, LinearOperator, SymmetricMatrix};
+use crate::matrix::{
+    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
+};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -271,8 +273,7 @@ impl TransformationNormalFamily {
 
         // Row-wise Kronecker product (operator form).
         let x_val_kron = KroneckerDesign::new(&response_val_basis, covariate_design.clone())?;
-        let x_deriv_kron =
-            KroneckerDesign::new(&response_deriv_basis, covariate_design.clone())?;
+        let x_deriv_kron = KroneckerDesign::new(&response_deriv_basis, covariate_design.clone())?;
         let p_total = p_resp * p_cov;
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
@@ -331,7 +332,7 @@ impl TransformationNormalFamily {
     pub fn block_spec(&self) -> ParameterBlockSpec {
         ParameterBlockSpec {
             name: self.block_name.clone(),
-            design: DesignMatrix::Operator(Arc::new(self.x_val_kron.clone())),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(self.x_val_kron.clone()))),
             offset: Array1::zeros(self.x_val_kron.nrows()),
             penalties: self.tensor_penalties.clone(),
             nullspace_dims: vec![],
@@ -361,7 +362,6 @@ impl TransformationNormalFamily {
         let h_prime = self.x_deriv_kron.forward_mul(beta);
         (h, h_prime)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +810,7 @@ fn rowwise_kronecker(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 #[derive(Clone)]
 enum KroneckerDesign {
     Factored {
-        left: Array2<f64>,  // n × p_a
+        left: Array2<f64>,   // n × p_a
         right: DesignMatrix, // n × p_b
     },
 }
@@ -955,7 +955,7 @@ impl LinearOperator for KroneckerDesign {
 unsafe impl Send for KroneckerDesign {}
 unsafe impl Sync for KroneckerDesign {}
 
-impl DesignOperator for KroneckerDesign {
+impl DenseDesignOperator for KroneckerDesign {
     fn row_chunk(&self, rows: std::ops::Range<usize>) -> Array2<f64> {
         match self {
             KroneckerDesign::Factored { left, right } => {
@@ -1334,7 +1334,10 @@ impl TensorKroneckerPsiOperator {
         self.p_resp() * self.p_cov()
     }
 
-    fn cov_deriv(&self, axis: usize) -> Result<&CustomFamilyBlockPsiDerivative, crate::terms::basis::BasisError> {
+    fn cov_deriv(
+        &self,
+        axis: usize,
+    ) -> Result<&CustomFamilyBlockPsiDerivative, crate::terms::basis::BasisError> {
         self.covariate_derivs.get(axis).ok_or_else(|| {
             crate::terms::basis::BasisError::InvalidInput(format!(
                 "tensor Kronecker psi axis {axis} out of bounds for {} axes",
@@ -1524,7 +1527,8 @@ impl TensorKroneckerPsiOperator {
                 weighted_v[i] = resp_basis[[i, j]] * v[i];
             }
             let cov_block = self.cov_transpose_first(axis, &weighted_v.view())?;
-            out.slice_mut(s![j * p_cov..(j + 1) * p_cov]).assign(&cov_block);
+            out.slice_mut(s![j * p_cov..(j + 1) * p_cov])
+                .assign(&cov_block);
         }
         Ok(out)
     }
@@ -1574,16 +1578,13 @@ impl TensorKroneckerPsiOperator {
                 weighted_v[i] = resp_basis[[i, j]] * v[i];
             }
             let cov_block = self.cov_transpose_second(axis_d, axis_e, &weighted_v.view())?;
-            out.slice_mut(s![j * p_cov..(j + 1) * p_cov]).assign(&cov_block);
+            out.slice_mut(s![j * p_cov..(j + 1) * p_cov])
+                .assign(&cov_block);
         }
         Ok(out)
     }
 
-    fn materialize_lifted(
-        &self,
-        resp_basis: &Array2<f64>,
-        cov: &Array2<f64>,
-    ) -> Array2<f64> {
+    fn materialize_lifted(&self, resp_basis: &Array2<f64>, cov: &Array2<f64>) -> Array2<f64> {
         rowwise_kronecker(resp_basis, cov)
     }
 
@@ -1622,7 +1623,8 @@ impl TensorKroneckerPsiOperator {
             for b in 0..p_right_resp {
                 let mut pair_weights = Array1::<f64>::zeros(n);
                 for i in 0..n {
-                    pair_weights[i] = weights[i] * left_resp_basis[[i, a]] * right_resp_basis[[i, b]];
+                    pair_weights[i] =
+                        weights[i] * left_resp_basis[[i, a]] * right_resp_basis[[i, b]];
                 }
                 let block = if let Some(cov_psi) = cov_psi_dense {
                     let mut block = Array2::<f64>::zeros((p_cov, p_cov));
@@ -1645,11 +1647,8 @@ impl TensorKroneckerPsiOperator {
                     }
                     block
                 };
-                out.slice_mut(s![
-                    a * p_cov..(a + 1) * p_cov,
-                    b * p_cov..(b + 1) * p_cov
-                ])
-                .assign(&block);
+                out.slice_mut(s![a * p_cov..(a + 1) * p_cov, b * p_cov..(b + 1) * p_cov])
+                    .assign(&block);
             }
         }
         Ok(out)
@@ -1779,14 +1778,13 @@ pub fn build_tensor_psi_derivatives(
     let p_resp = family.response_val_basis.ncols();
     let n_axes = covariate_psi_derivs.len();
     let eye_resp = Array2::<f64>::eye(p_resp);
-    let shared_operator: Arc<dyn CustomFamilyPsiDerivativeOperator> = Arc::new(
-        TensorKroneckerPsiOperator {
+    let shared_operator: Arc<dyn CustomFamilyPsiDerivativeOperator> =
+        Arc::new(TensorKroneckerPsiOperator {
             response_val_basis: Arc::new(family.response_val_basis.clone()),
             response_deriv_basis: Arc::new(family.response_deriv_basis.clone()),
             covariate_design: family.covariate_design.clone(),
             covariate_derivs: covariate_psi_derivs.to_vec(),
-        },
-    );
+        });
 
     let mut derivs = Vec::with_capacity(n_axes);
     for a in 0..n_axes {

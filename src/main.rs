@@ -1,6 +1,4 @@
 #![deny(unused_variables)]
-use std::sync::Arc;
-
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
 use csv::WriterBuilder;
@@ -46,8 +44,7 @@ use gam::inference::formula_dsl::{
     LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, effectivelinkwiggle_formulaspec,
     formula_rhs_text, inverse_link_supports_joint_wiggle, linkchoice_supports_joint_wiggle,
     linkname, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
-    parse_surv_response,
-    validate_auxiliary_formula_controls,
+    parse_surv_response, validate_auxiliary_formula_controls,
 };
 use gam::inference::model::{
     DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, ModelKind,
@@ -62,19 +59,17 @@ use gam::mixture_link::{
 use gam::probability::{normal_cdf, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
-    SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
-    TensorBSplineIdentifiability, TermCollectionSpec, build_term_collection_design,
-    weighted_blockwise_penalty_sum,
+    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TensorBSplineIdentifiability,
+    TermCollectionSpec, build_term_collection_design, weighted_blockwise_penalty_sum,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-    append_survival_timewiggle_columns, build_survival_baseline_offsets,
-    build_survival_time_basis, build_survival_time_monotonicity_collocation,
-    build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
-    build_time_varying_survival_covariate_template, evaluate_survival_baseline,
-    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    append_survival_timewiggle_columns, build_survival_baseline_offsets, build_survival_time_basis,
+    build_survival_time_monotonicity_collocation, build_survival_timewiggle_derivative_design,
+    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    evaluate_survival_baseline, normalize_survival_time_pair, parse_survival_baseline_config,
+    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, survival_baseline_targetname,
     survival_basis_supports_structural_monotonicity, survival_likelihood_modename,
 };
@@ -1890,7 +1885,9 @@ fn build_predict_input_for_model(
             Ok(PredictInput {
                 design: design.design.clone(),
                 offset,
-                design_noise: Some(DesignMatrix::Dense(Arc::new(prepared_noise_design))),
+                design_noise: Some(DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
+                    prepared_noise_design,
+                ))),
                 offset_noise: Some(Array1::zeros(n)),
                 auxiliary_scalar: None,
             })
@@ -2346,7 +2343,9 @@ fn run_predict_survival(
             eta_time_offset_exit: eta_offset_exit.clone(),
             x_threshold: threshold_design.design.clone(),
             eta_threshold_offset: Array1::zeros(n),
-            x_log_sigma: DesignMatrix::Dense(Arc::new(prepared_sigma_design)),
+            x_log_sigma: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
+                prepared_sigma_design,
+            )),
             eta_log_sigma_offset: Array1::zeros(n),
             x_link_wiggle: None,
             link_wiggle_knots,
@@ -2640,12 +2639,7 @@ fn run_predict_binomial_location_scale(
         "binomial-location-scale model is missing link state/metadata".to_string()
     })?;
     let inv_sigma = eta_noise.mapv(gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar);
-    let q0 = Array1::from_iter(
-        eta_t
-            .iter()
-            .zip(inv_sigma.iter())
-            .map(|(&t, &r)| -t * r),
-    );
+    let q0 = Array1::from_iter(eta_t.iter().zip(inv_sigma.iter()).map(|(&t, &r)| -t * r));
     let eta = apply_saved_linkwiggle(&q0, model)?;
     let wiggle_design = saved_linkwiggle_design(&q0, model)?;
     let dq_dq0 = saved_linkwiggle_derivative_q0(&q0, model)?;
@@ -3410,12 +3404,9 @@ fn saved_linkwiggle_basis(
                         BasisOptions::first_derivative(),
                     )
                     .map_err(|e| e.to_string())?;
-                    let (link_transform, _) = compute_geometric_constraint_transform(
-                        &knot_arr,
-                        runtime.degree,
-                        2,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let (link_transform, _) =
+                        compute_geometric_constraint_transform(&knot_arr, runtime.degree, 2)
+                            .map_err(|e| e.to_string())?;
                     Ok(Some(raw_derivative.as_ref().dot(&link_transform)))
                 }
                 other => Err(format!(
@@ -3494,7 +3485,7 @@ fn saved_baseline_timewiggle_components(
             )?
             .design
             {
-                DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
+                DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
                 _ => return Err("saved baseline-timewiggle entry design must be dense".to_string()),
             };
             let exit = match buildwiggle_block_input_from_knots(
@@ -3506,7 +3497,7 @@ fn saved_baseline_timewiggle_components(
             )?
             .design
             {
-                DesignMatrix::Dense(m) => Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()),
+                DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
                 _ => return Err("saved baseline-timewiggle exit design must be dense".to_string()),
             };
             let betaw = beta;
@@ -5548,12 +5539,7 @@ fn run_generate_binomial_location_scale(
     };
     let eta_noise = preparednoise_design.dot(&beta_noise);
     let sigma = eta_noise.mapv(f64::exp);
-    let q0 = Array1::from_iter(
-        eta_t
-            .iter()
-            .zip(sigma.iter())
-            .map(|(&t, &s)| -t / s),
-    );
+    let q0 = Array1::from_iter(eta_t.iter().zip(sigma.iter()).map(|(&t, &s)| -t / s));
     let eta = apply_saved_linkwiggle(&q0, model)?;
     let mean = Array1::from_iter(
         eta.iter()
@@ -6250,8 +6236,7 @@ fn compute_probit_q0_from_eta(
     }
     let mut q0 = Array1::<f64>::zeros(eta_t.len());
     for i in 0..q0.len() {
-        q0[i] = -eta_t[i]
-            * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
+        q0[i] = -eta_t[i] * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
     }
     Ok(q0)
 }
@@ -8495,8 +8480,8 @@ mod tests {
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FittedFamily, LikelihoodFamily, LinkChoice, LinkMode,
         MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
-        SurvivalBaselineTarget, SurvivalTimeBasisConfig,
-        apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
+        SurvivalBaselineTarget, SurvivalTimeBasisConfig, apply_saved_linkwiggle,
+        build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
@@ -9370,7 +9355,7 @@ mod tests {
             let t = beta_t + l11 * z1;
             let ls = beta_ls + l21 * z1 + l22 * z2;
             acc += gam::probability::normal_cdf(
-                            -t * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls),
+                -t * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls),
             );
         }
         acc / draws.max(1) as f64
@@ -9394,8 +9379,7 @@ mod tests {
             let z_ls: f64 = StandardNormal.sample(&mut rng);
             let t = beta_t + cov_diag[0].max(0.0).sqrt() * z_t;
             let ls = beta_ls + cov_diag[1].max(0.0).sqrt() * z_ls;
-            q0_draws[i] =
-                -t * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls);
+            q0_draws[i] = -t * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls);
             for j in 0..beta_link_wiggle.len() {
                 let zw: f64 = StandardNormal.sample(&mut rng);
                 beta_draws[[i, j]] = beta_link_wiggle[j] + cov_diag[2 + j].max(0.0).sqrt() * zw;
@@ -12161,8 +12145,8 @@ mod tests {
         let q0 =
             compute_probit_q0_from_eta(eta_t.view(), eta_ls.view()).expect("compute probit q0");
         for i in 0..q0.len() {
-            let expected = -eta_t[i]
-                * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
+            let expected =
+                -eta_t[i] * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
             assert!((q0[i] - expected).abs() < 1e-12);
         }
     }

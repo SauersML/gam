@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::LinkComponent;
 use ndarray::ShapeBuilder;
 
 impl<'a> RemlState<'a> {
@@ -80,6 +81,22 @@ impl<'a> RemlState<'a> {
             .and(scale.view())
             .for_each(|mut row, w| row *= *w);
         out
+    }
+
+    #[inline]
+    fn logit_fisher_weight_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
+        let jet =
+            crate::solver::mixture_link::component_inverse_link_jet(LinkComponent::Logit, eta);
+        let link = InverseLink::Standard(LinkFunction::Logit);
+        let w3 = crate::solver::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+            &link, eta,
+        )
+        .expect("standard logit should expose exact third derivative of the inverse-link pdf");
+        let w4 = crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+            &link, eta,
+        )
+        .expect("standard logit should expose exact fourth derivative of the inverse-link pdf");
+        (jet.d1, jet.d2, jet.d3, w3, w4)
     }
 
     pub(crate) fn weighted_cross(
@@ -319,44 +336,14 @@ impl FirthDenseOperator {
         let mut w2 = Array1::<f64>::zeros(n);
         let mut w3 = Array1::<f64>::zeros(n);
         let mut w4 = Array1::<f64>::zeros(n);
-        let logisticweight = |z: f64| {
-            crate::solver::mixture_link::component_inverse_link_jet(LinkComponent::Logit, z).d1
-        };
-        let h12 = 2e-5;
-        let h34 = 1e-3;
-        let w2fd = |z: f64| {
-            (logisticweight(z + h12) - 2.0 * logisticweight(z) + logisticweight(z - h12))
-                / (h12 * h12)
-        };
-        let w3fd = |z: f64| (w2fd(z + h34) - w2fd(z - h34)) / (2.0 * h34);
         for i in 0..n {
             let ei = eta[i];
-            let jet = crate::solver::mixture_link::component_inverse_link_jet(LinkComponent::Logit, ei);
-            let mi = jet.mu;
-            let wi = jet.d1;
+            let (wi, wi1, wi2, wi3, wi4) = RemlState::logit_fisher_weight_derivatives(ei);
             w[i] = wi;
-            w1[i] = jet.d2;
-            w2[i] = jet.d3;
-            w3[i] = crate::solver::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                &InverseLink::Standard(LinkFunction::Logit),
-                ei,
-            )
-            .unwrap_or(0.0);
-            w4[i] = crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                &InverseLink::Standard(LinkFunction::Logit),
-                ei,
-            )
-            .unwrap_or_else(|_| {
-                let w4fd = (w3fd(ei + h34) - w3fd(ei - h34)) / (2.0 * h34);
-                if w4fd.is_finite() {
-                    w4fd
-                } else {
-                    let m2 = mi * mi;
-                    let m3 = m2 * mi;
-                    let m4 = m3 * mi;
-                    wi * (1.0 - 30.0 * mi + 150.0 * m2 - 240.0 * m3 + 120.0 * m4)
-                }
-            });
+            w1[i] = wi1;
+            w2[i] = wi2;
+            w3[i] = wi3;
+            w4[i] = wi4;
         }
         let basis_design = if let Some(scale) = observation_weight_sqrt.as_ref() {
             RemlState::row_scale(x_dense, scale)
@@ -1174,13 +1161,7 @@ mod tests {
             [1.0, 0.7, 1.7],
             [1.0, 1.3, 2.3],
         ];
-        let x_reduced = array![
-            [1.0, -1.2],
-            [1.0, -0.4],
-            [1.0, 0.1],
-            [1.0, 0.7],
-            [1.0, 1.3],
-        ];
+        let x_reduced = array![[1.0, -1.2], [1.0, -0.4], [1.0, 0.1], [1.0, 0.7], [1.0, 1.3],];
         let beta_full: ndarray::Array1<f64> = array![0.25, -0.5, 0.15];
         let beta_reduced = array![beta_full[0] + beta_full[2], beta_full[1] + beta_full[2]];
         let eta_full = x_full.dot(&beta_full);

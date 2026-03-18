@@ -2551,7 +2551,10 @@ pub fn reml_laml_evaluate(
                 cost += 0.5 * log_det_h
                     + (solution.nullspace_dim / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
                     + solution.tk_correction
-                    + solution.firth.as_ref().map_or(0.0, ExactJeffreysTerm::value);
+                    + solution
+                        .firth
+                        .as_ref()
+                        .map_or(0.0, ExactJeffreysTerm::value);
             }
             if *include_logdet_s {
                 cost -= 0.5 * log_det_s;

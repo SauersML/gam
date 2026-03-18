@@ -7471,52 +7471,31 @@ fn compute_joint_geometry<F: CustomFamily>(
     per_block_log_lambdas: &[Array1<f64>],
 ) -> Option<FitGeometry> {
     let eval = family.evaluate(states).ok()?;
-    let mut all_working_weights = Vec::new();
-    let mut all_working_responses = Vec::new();
-    for ws in &eval.blockworking_sets {
-        match ws {
-            BlockWorkingSet::Diagonal {
-                working_response,
-                working_weights,
-            } => {
-                all_working_weights.push(working_weights.clone());
-                all_working_responses.push(working_response.clone());
-            }
-            BlockWorkingSet::ExactNewton { .. } => return None,
-        }
-    }
-    if all_working_weights.is_empty() {
+    if specs.len() != 1 || per_block_log_lambdas.len() != 1 {
         return None;
     }
-    // FitGeometry is row-wise. Multi-block families expose one working pair per
-    // block, so they must stay on the explicit blockwise paths instead of
-    // fabricating a stacked diagonal geometry with mismatched semantics.
-    if all_working_weights.len() != 1 {
+    // FitGeometry is a single row-wise working system. Multi-block families
+    // need an explicit blockwise representation instead of a stacked vector.
+    let [
+        BlockWorkingSet::Diagonal {
+            working_response,
+            working_weights,
+        },
+    ] = eval.blockworking_sets.as_slice()
+    else {
         return None;
-    }
-    let ranges = block_param_ranges(specs);
-    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    if total == 0 {
-        return None;
-    }
-    let mut h = Array2::<f64>::zeros((total, total));
-    for (b, spec) in specs.iter().enumerate() {
-        let (start, end) = ranges[b];
-        let w = &all_working_weights[b];
-        let xtw = spec.design.diag_xtw_x(w).ok()?;
-        h.slice_mut(ndarray::s![start..end, start..end])
-            .assign(&xtw);
-        let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
-        for (k, s) in spec.penalties.iter().enumerate() {
-            let s_dense = s.as_dense_cow();
-            h.slice_mut(ndarray::s![start..end, start..end])
-                .scaled_add(lambdas[k], &*s_dense);
-        }
+    };
+    let spec = &specs[0];
+    let lambdas = per_block_log_lambdas[0].mapv(f64::exp);
+    let mut h = spec.design.diag_xtw_x(working_weights).ok()?;
+    for (k, s) in spec.penalties.iter().enumerate() {
+        let s_dense = s.as_dense_cow();
+        h.scaled_add(lambdas[k], &*s_dense);
     }
     Some(FitGeometry {
         penalized_hessian: h,
-        working_weights: all_working_weights[0].clone(),
-        working_response: all_working_responses[0].clone(),
+        working_weights: working_weights.clone(),
+        working_response: working_response.clone(),
     })
 }
 
@@ -7640,9 +7619,13 @@ pub fn fit_custom_family<F: CustomFamily>(
             ) {
                 Ok((cost, _, _, warm)) => {
                     outer.warm_cache = Some(warm);
+                    outer.last_error = None;
                     Ok(cost)
                 }
-                Err(e) => Err(EstimationError::RemlOptimizationFailed(e)),
+                Err(e) => {
+                    outer.last_error = Some(e.clone());
+                    Err(EstimationError::RemlOptimizationFailed(e))
+                }
             }
         },
         eval_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
@@ -7852,7 +7835,7 @@ mod tests {
 
         let specs = vec![ParameterBlockSpec {
             name: "x".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
             nullspace_dims: vec![],
@@ -8524,7 +8507,7 @@ mod tests {
         // 0.5 * ridge * beta^2 even when no smoothing penalties are present.
         let spec = ParameterBlockSpec {
             name: "b0".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             nullspace_dims: vec![],
@@ -8561,7 +8544,7 @@ mod tests {
         let family = OneBlockGaussianFamily { y: array![1.0] };
         let spec = ParameterBlockSpec {
             name: "b0".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
             nullspace_dims: vec![],
@@ -8602,7 +8585,10 @@ mod tests {
         let y = Array1::from_vec(vec![0.4, -0.2, 0.8, 1.0, -0.5, 0.3, 0.1, -0.7]);
         let spec = ParameterBlockSpec {
             name: "b0".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -8671,7 +8657,7 @@ mod tests {
     fn outergradient_prefers_joint_exact_pathwhen_available() {
         let spec = ParameterBlockSpec {
             name: "joint_exact".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -8705,7 +8691,10 @@ mod tests {
     fn outergradient_uses_joint_surrogate_formultiblock_diagonal_family() {
         let spec0 = ParameterBlockSpec {
             name: "block0".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0]
+            ])),
             offset: array![0.0, 0.0],
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -8714,7 +8703,10 @@ mod tests {
         };
         let spec1 = ParameterBlockSpec {
             name: "block1".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0]
+            ])),
             offset: array![0.0, 0.0],
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -8749,7 +8741,7 @@ mod tests {
     fn exact_newton_pseudo_laplace_objective_uses_logdet_h_without_logdet_s() {
         let spec = ParameterBlockSpec {
             name: "pseudo_laplace".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             nullspace_dims: vec![],
@@ -8781,7 +8773,7 @@ mod tests {
     fn exact_newton_joint_psi_hook_can_supply_fixed_beta_termswithout_quadratic_spsi() {
         let spec = ParameterBlockSpec {
             name: "psi_hook".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             nullspace_dims: vec![],
@@ -8828,7 +8820,7 @@ mod tests {
     fn pseudo_laplace_exact_newton_rejects_non_spdhessian() {
         let spec = ParameterBlockSpec {
             name: "indefinite".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             nullspace_dims: vec![],
@@ -8876,7 +8868,10 @@ mod tests {
     fn pseudo_laplace_exact_newton_symmetrizes_nearly_symmetrichessian() {
         let spec = ParameterBlockSpec {
             name: "nearly_symmetric".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0, 0.0],
+                [0.0, 1.0]
+            ])),
             offset: array![0.0, 0.0],
             penalties: vec![],
             nullspace_dims: vec![],
@@ -8905,8 +8900,12 @@ mod tests {
         let n = 7usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0)));
-        let log_sigma_design = DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0)));
+        let threshold_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        ));
+        let log_sigma_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        ));
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: threshold_design.clone(),
@@ -9039,7 +9038,10 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9048,7 +9050,10 @@ mod tests {
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9136,7 +9141,10 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9145,7 +9153,10 @@ mod tests {
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9233,7 +9244,10 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9242,7 +9256,10 @@ mod tests {
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9369,7 +9386,7 @@ mod tests {
             .expect("sparse matrix build should succeed");
 
         let beta_dense = solve_blockweighted_system(
-            &DesignMatrix::Dense(Arc::new(x_dense.clone())),
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_dense.clone())),
             &y_star,
             &w,
             &s_lambda,
@@ -9406,7 +9423,10 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9415,7 +9435,10 @@ mod tests {
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(n),
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9515,7 +9538,7 @@ mod tests {
         let s_lambda = array![[0.0, 0.0], [0.0, -1e-12]];
 
         let beta = solve_blockweighted_system(
-            &DesignMatrix::Dense(Arc::new(x_dense)),
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_dense)),
             &y_star,
             &w,
             &s_lambda,
@@ -9539,7 +9562,7 @@ mod tests {
     fn exact_newton_block_enforces_linear_constraints() {
         let spec = ParameterBlockSpec {
             name: "exact_block".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             nullspace_dims: vec![],
@@ -9641,7 +9664,10 @@ mod tests {
         // the real evaluation error instead of returning an opaque line-search failure.
         let spec = ParameterBlockSpec {
             name: "err_block".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0]
+            ])),
             offset: array![0.0, 0.0],
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
@@ -9668,7 +9694,10 @@ mod tests {
     fn fit_fails_when_requested_covariance_cannot_be_computed() {
         let spec = ParameterBlockSpec {
             name: "cov_block".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0], [1.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0]
+            ])),
             offset: array![0.0, 0.0],
             penalties: vec![],
             nullspace_dims: vec![],
@@ -9794,7 +9823,9 @@ mod tests {
         vec![
             ParameterBlockSpec {
                 name: "mu".to_string(),
-                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 1), 1.0))),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::from_elem((n, 1), 1.0),
+                )),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 nullspace_dims: vec![],
@@ -9803,7 +9834,9 @@ mod tests {
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::from_elem((n, 2), 1.0),
+                )),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 nullspace_dims: vec![],
@@ -9930,7 +9963,10 @@ mod tests {
         let family = OneBlockNonFiniteJointDhFamily;
         let specs = vec![ParameterBlockSpec {
             name: "beta".to_string(),
-            design: DesignMatrix::Dense(Arc::new(Array2::from_elem((2, 1), 1.0))),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (2, 1),
+                1.0,
+            ))),
             offset: Array1::zeros(2),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -10079,7 +10115,9 @@ mod tests {
             ParameterBlockSpec {
                 name: "big_block".to_string(),
                 // 3n rows — mimics survival time block stacking
-                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((3 * n, p0), 1.0))),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::from_elem((3 * n, p0), 1.0),
+                )),
                 offset: Array1::zeros(3 * n),
                 penalties: vec![],
                 nullspace_dims: vec![],
@@ -10089,7 +10127,9 @@ mod tests {
             ParameterBlockSpec {
                 name: "small_block".to_string(),
                 // n rows — mimics threshold/log-sigma block
-                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, p1), 1.0))),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::from_elem((n, p1), 1.0),
+                )),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 nullspace_dims: vec![],
@@ -10134,7 +10174,9 @@ mod tests {
         let specs = vec![
             ParameterBlockSpec {
                 name: "block_a".to_string(),
-                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::from_elem((n, 2), 1.0),
+                )),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 nullspace_dims: vec![],
@@ -10143,7 +10185,9 @@ mod tests {
             },
             ParameterBlockSpec {
                 name: "block_b".to_string(),
-                design: DesignMatrix::Dense(Arc::new(Array2::from_elem((n, 2), 1.0))),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::from_elem((n, 2), 1.0),
+                )),
                 offset: Array1::zeros(n),
                 penalties: vec![],
                 nullspace_dims: vec![],

@@ -1394,11 +1394,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             }
             Ok(Some(LinearInequalityConstraints {
                 a: constraint_rows.clone(),
-                b: Array1::from_iter(
-                    constraint_offsets
-                        .iter()
-                        .map(|&o| derivative_guard - o),
-                ),
+                b: Array1::from_iter(constraint_offsets.iter().map(|&o| derivative_guard - o)),
             }))
         } else {
             Ok(None)
@@ -1416,7 +1412,7 @@ fn build_time_blockspec(
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "time_surface".to_string(),
-        design: DesignMatrix::Dense(Arc::new(design_exit.clone())),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_exit.clone())),
         offset: Array1::zeros(design_exit.nrows()),
         penalties: time_block
             .penalties

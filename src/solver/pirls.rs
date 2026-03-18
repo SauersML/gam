@@ -2,8 +2,8 @@ use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array1_to_col_matmut,
-    array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array1_to_col_matmut, array2_to_matmut,
+    fast_ab, fast_atb, fast_atv, fast_av_into,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
@@ -588,7 +588,9 @@ impl FirthDiagnostics {
     pub fn jeffreys_logdet(&self) -> Option<f64> {
         match self {
             Self::Inactive => None,
-            Self::Active { jeffreys_logdet, .. } => Some(*jeffreys_logdet),
+            Self::Active {
+                jeffreys_logdet, ..
+            } => Some(*jeffreys_logdet),
         }
     }
 }
@@ -1397,6 +1399,7 @@ impl<'a> GamWorkingModel<'a> {
         match design {
             DesignMatrix::Dense(x) => {
                 let p = x.ncols();
+                let x_dense = x.to_dense_arc();
                 workspace.fill_sqrtweights(weights);
                 // Reuse workspace hessian buffer to avoid per-iteration allocation.
                 if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
@@ -1407,7 +1410,7 @@ impl<'a> GamWorkingModel<'a> {
                 PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
                     &workspace.sqrtw,
                     &mut workspace.weighted_x_chunk,
-                    x,
+                    x_dense.as_ref(),
                     &mut workspace.hessian_buf,
                     get_global_parallelism(),
                 );
@@ -1708,7 +1711,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     // stores s_transformed in the Qs basis, so we need X in that
                     // same basis.  Materialize X·Qs on demand (Firth models are
                     // typically small clinical logistic regressions).
-                    let x_t_dense = fast_ab(&self.x_original.to_dense(), &transform.materialize_dense());
+                    let x_t_dense =
+                        fast_ab(&self.x_original.to_dense(), &transform.materialize_dense());
                     compute_jeffreys_pirls_diagnostics(
                         x_t_dense.view(),
                         self.workspace.eta_buf.view(),
@@ -1982,7 +1986,6 @@ impl SparseXtWxCache {
 
         Ok(())
     }
-
 }
 
 fn sparse_xtwx_par(ncols: usize) -> Par {
@@ -3542,11 +3545,7 @@ where
                         bound_active_hint.as_mut(),
                     )
                 } else {
-                    solve_newton_direction_dense(
-                        dense_reg,
-                        &state.gradient,
-                        &mut newton_direction,
-                    )
+                    solve_newton_direction_dense(dense_reg, &state.gradient, &mut newton_direction)
                 }
             } {
                 Ok(()) => &newton_direction,
@@ -3654,7 +3653,9 @@ where
                         && eta_ok
                     {
                         let accepted_state = if options.firth_bias_reduction {
-                            match model.update_with_curvature(&candidate_beta, state.hessian_curvature) {
+                            match model
+                                .update_with_curvature(&candidate_beta, state.hessian_curvature)
+                            {
                                 Ok(state) => state,
                                 Err(_) if loop_lambda < 1e12 => {
                                     loop_lambda *= lambda_factor;
@@ -3701,10 +3702,8 @@ where
                         beta = candidate_beta;
 
                         // Update Iteration Info
-                        let candidategrad_norm = accepted_state
-                            .gradient
-                            .dot(&accepted_state.gradient)
-                            .sqrt();
+                        let candidategrad_norm =
+                            accepted_state.gradient.dot(&accepted_state.gradient).sqrt();
                         let deviance_change = actual_reduction;
 
                         iteration_callback(&WorkingModelIterationInfo {
@@ -4109,7 +4108,9 @@ impl PirlsResult {
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
-            x_transformed: DesignMatrix::Dense(Arc::new(Array2::zeros((0, 0)))),
+            x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((0, 0)),
+            )),
             coordinate_frame: self.coordinate_frame.clone(),
             cache_compacted: true,
         }
@@ -4190,9 +4191,8 @@ impl PirlsResult {
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
-            x_transformed: DesignMatrix::Operator(Arc::new(ReparamOperator::new(
-                x_original.clone(),
-                qs_arc,
+            x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(
+                ReparamOperator::new(x_original.clone(), qs_arc),
             ))),
             coordinate_frame: self.coordinate_frame.clone(),
             cache_compacted: false,
@@ -4648,7 +4648,9 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         None
     } else {
         Some(WorkingReparamTransform::Dense(Arc::clone(
-            qs_arc.as_ref().expect("dense Qs should exist for non-Kronecker transformed path"),
+            qs_arc
+                .as_ref()
+                .expect("dense Qs should exist for non-Kronecker transformed path"),
         )))
     };
     let penalty_active = if let Some((_, _, penalty_diag)) = kronecker_runtime.as_ref() {
@@ -5090,9 +5092,8 @@ fn make_reparam_operator(
     if use_sparse_native {
         x_original.clone()
     } else {
-        DesignMatrix::Operator(Arc::new(ReparamOperator::new(
-            x_original.clone(),
-            Arc::clone(qs_arc),
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(
+            ReparamOperator::new(x_original.clone(), Arc::clone(qs_arc)),
         )))
     }
 }
@@ -5206,6 +5207,7 @@ fn solve_penalized_least_squares_implicit(
     let xtwx_orig = match x_original {
         DesignMatrix::Dense(x_dense) => {
             let p = x_dense.ncols();
+            let x_dense = x_dense.to_dense_arc();
             if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
                 workspace.hessian_buf = Array2::zeros((p, p).f());
             } else {
@@ -5214,7 +5216,7 @@ fn solve_penalized_least_squares_implicit(
             PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
                 &workspace.sqrtw,
                 &mut workspace.weighted_x_chunk,
-                x_dense,
+                x_dense.as_ref(),
                 &mut workspace.hessian_buf,
                 get_global_parallelism(),
             );
@@ -7037,7 +7039,9 @@ fn calculate_edf_with_penalty(
     penalty: &PirlsPenalty,
 ) -> Result<f64, EstimationError> {
     match penalty {
-        PirlsPenalty::Dense { e_transformed, .. } => calculate_edf(penalized_hessian, e_transformed),
+        PirlsPenalty::Dense { e_transformed, .. } => {
+            calculate_edf(penalized_hessian, e_transformed)
+        }
         PirlsPenalty::Diagonal {
             diag,
             positive_indices,
@@ -7206,12 +7210,11 @@ mod tests {
     use super::{
         InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet,
-        calculate_deviance, compress_activeworking_set,
-        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
-        default_beta_guess_external, fit_model_for_fixed_rho, logit_clampzero_enabled,
-        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
-        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        working_set_kkt_diagnostics_frommultipliers,
+        calculate_deviance, compress_activeworking_set, compute_constraint_kkt_diagnostics,
+        compute_observed_hessian_curvature_arrays, default_beta_guess_external,
+        fit_model_for_fixed_rho, logit_clampzero_enabled, should_log_pirls_decision_summary,
+        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
+        solve_newton_directionwith_lower_bounds, working_set_kkt_diagnostics_frommultipliers,
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
@@ -7222,7 +7225,6 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, array};
-    use std::sync::Arc;
 
     /// Calculate scale parameter correctly for different link functions.
     ///
@@ -7453,7 +7455,10 @@ mod tests {
 
     #[test]
     fn sparse_native_decision_rejects_dense_design() {
-        let x = DesignMatrix::Dense(Arc::new(array![[1.0, 0.0], [0.0, 1.0]]));
+        let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+            [1.0, 0.0],
+            [0.0, 1.0]
+        ]));
         let s = array![[1.0, 0.0], [0.0, 1.0]];
         let mut workspace = PirlsWorkspace::new(2, 2, 0, 0);
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None);

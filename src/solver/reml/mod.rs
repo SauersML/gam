@@ -296,10 +296,9 @@ mod tests {
         let p = x.ncols();
         use crate::estimate::PenaltySpec;
         let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
-        let canonical =
-            crate::construction::canonicalize_penalty_specs(&specs, &[1, 1], p, "test")
-                .map(|(canonical, _)| canonical)
-                .expect("canonicalize");
+        let canonical = crate::construction::canonicalize_penalty_specs(&specs, &[1, 1], p, "test")
+            .map(|(canonical, _)| canonical)
+            .expect("canonicalize");
         let state = RemlState::newwith_offset(
             y.view(),
             x.clone(),
@@ -1644,11 +1643,11 @@ pub(crate) struct FirthDenseOperator {
     // Reduced design used for M = Z K_r Zᵀ. Name kept for compatibility with
     // existing callsites; Z equals x_reduced for the current implementation.
     z_reduced: Array2<f64>,
-    // Optional fixed case-weight square roots used when the Jeffreys term is
-    // formed from Xᵀ diag(case_weight ⊙ w(η)) X rather than Xᵀ diag(w(η)) X.
-    // Current contract: weighted operators are used only for Jeffreys
-    // value/gradient extraction in HMC. The exact directional REML derivatives
-    // remain the unweighted path.
+    // Optional fixed case-weight square roots used when the Jeffreys/Firth
+    // operator is formed from Xᵀ diag(case_weight ⊙ w(η)) X rather than
+    // Xᵀ diag(w(η)) X. The exact directional tau derivatives must project and
+    // row-scale with the same weights so the reduced Fisher, hat diagonals,
+    // and tau kernels all live on one consistent identifiable subspace.
     observation_weight_sqrt: Option<Array1<f64>>,
     // I_r^{-1}
     k_reduced: Array2<f64>,

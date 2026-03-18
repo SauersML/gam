@@ -396,7 +396,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
     let specs = vec![
         ParameterBlockSpec {
             name: "shape".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![0],
@@ -405,7 +405,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
         },
         ParameterBlockSpec {
             name: "aux".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             nullspace_dims: vec![],
@@ -479,7 +479,7 @@ fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space()
     let family = LowerBoundConstrainedExactFamily { target, lower };
     let specs = vec![ParameterBlockSpec {
         name: "constrained".to_string(),
-        design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+        design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
         offset: array![0.0],
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
         nullspace_dims: vec![0],
@@ -552,7 +552,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
     let specs = vec![
         ParameterBlockSpec {
             name: "shape".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![0],
@@ -561,7 +561,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
         },
         ParameterBlockSpec {
             name: "aux".to_string(),
-            design: DesignMatrix::Dense(Arc::new(array![[1.0]])),
+            design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
             nullspace_dims: vec![],
