@@ -882,15 +882,12 @@ struct SurvivalLocationScaleFamily {
 struct SurvivalPredictorState {
     h0: f64,
     h1: f64,
-    d_raw: f64,
     g: f64,
     /// q evaluated at entry time. When the threshold/sigma blocks are
     /// time-invariant, q0 == q1.
     q0: f64,
     /// q evaluated at exit time.
     q1: f64,
-    /// Exit-time derivative dq/dt.
-    qdot1: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -921,8 +918,6 @@ struct SurvivalRowDerivatives {
     /// Exit-only derivatives with respect to qdot1 = dq/dt at the event time.
     d1_qdot1: f64,
     d2_qdot1: f64,
-    d3_qdot1: f64,
-    d4_qdot1: f64,
     grad_time_eta_h0: f64,
     grad_time_eta_h1: f64,
     grad_time_eta_d: f64,
@@ -994,8 +989,6 @@ struct SurvivalJointQuantities {
     /// Exit-only derivatives of ell w.r.t. qdot1 = dq/dt.
     d1_qdot1: Array1<f64>,
     d2_qdot1: Array1<f64>,
-    d3_qdot1: Array1<f64>,
-    d4_qdot1: Array1<f64>,
     h_time_h0: Array1<f64>,
     h_time_h1: Array1<f64>,
     h_time_d: Array1<f64>,
@@ -1153,10 +1146,6 @@ impl SurvivalLocationScaleFamily {
         offsets
     }
 
-    fn has_dynamic_wiggle(&self) -> bool {
-        self.x_link_wiggle.is_some() && self.wiggle_knots.is_some() && self.wiggle_degree.is_some()
-    }
-
     fn wiggle_geometry(
         &self,
         q0: ndarray::ArrayView1<'_, f64>,
@@ -1201,7 +1190,6 @@ impl SurvivalLocationScaleFamily {
             basis,
             basis_d1,
             basis_d2,
-            basis_d3,
             dq_dq0,
             d2q_dq02,
             d3q_dq03,
@@ -1339,8 +1327,6 @@ impl SurvivalLocationScaleFamily {
         let mut d4_q1 = Array1::<f64>::zeros(n);
         let mut d1_qdot1 = Array1::<f64>::zeros(n);
         let mut d2_qdot1 = Array1::<f64>::zeros(n);
-        let mut d3_qdot1 = Array1::<f64>::zeros(n);
-        let mut d4_qdot1 = Array1::<f64>::zeros(n);
         let mut h_time_h0 = Array1::<f64>::zeros(n);
         let mut h_time_h1 = Array1::<f64>::zeros(n);
         let mut h_time_d = Array1::<f64>::zeros(n);
@@ -1375,8 +1361,6 @@ impl SurvivalLocationScaleFamily {
             d4_q1[i] = row.d4_q1;
             d1_qdot1[i] = row.d1_qdot1;
             d2_qdot1[i] = row.d2_qdot1;
-            d3_qdot1[i] = row.d3_qdot1;
-            d4_qdot1[i] = row.d4_qdot1;
             h_time_h0[i] = row.h_time_h0;
             h_time_h1[i] = row.h_time_h1;
             h_time_d[i] = row.h_time_d;
@@ -1401,8 +1385,6 @@ impl SurvivalLocationScaleFamily {
             d4_q1,
             d1_qdot1,
             d2_qdot1,
-            d3_qdot1,
-            d4_qdot1,
             h_time_h0,
             h_time_h1,
             h_time_d,
@@ -1954,11 +1936,9 @@ impl SurvivalLocationScaleFamily {
         SurvivalPredictorState {
             h0,
             h1,
-            d_raw,
             g: d_raw - qdot1,
             q0,
             q1,
-            qdot1,
         }
     }
 
@@ -2141,8 +2121,6 @@ impl SurvivalLocationScaleFamily {
             d4_q1,
             d1_qdot1: -kernel.w * kernel.d * kernel.d_log_g,
             d2_qdot1: kernel.w * kernel.d * kernel.d2_log_g,
-            d3_qdot1: -kernel.w * kernel.d * kernel.d3_log_g,
-            d4_qdot1: kernel.w * kernel.d * kernel.d4_log_g,
             grad_time_eta_h0: -kernel.w * kernel.r0,
             grad_time_eta_h1: -kernel.w
                 * (kernel.d * kernel.dlogphi1 + (1.0 - kernel.d) * (-kernel.r1)),
@@ -2369,25 +2347,6 @@ fn chain_rule_weights(
 ///
 /// When `d2q`/`d3q` are None, the second and third terms are omitted
 /// (threshold block where all higher dq derivatives vanish).
-fn directional_hessian_weights(
-    d1_q: &Array1<f64>,
-    d2_q: &Array1<f64>,
-    d3_q: &Array1<f64>,
-    dq: &Array1<f64>,
-    d2q: Option<&Array1<f64>>,
-    d3q: Option<&Array1<f64>>,
-    d_eta: &Array1<f64>,
-) -> Array1<f64> {
-    let mut w = -(&(d3_q * &dq.mapv(|v| v * v * v)));
-    if let Some(d2q) = d2q {
-        w = &w - &(d2_q * &(3.0 * dq * d2q));
-    }
-    if let Some(d3q) = d3q {
-        w = &w - &(d1_q * d3q);
-    }
-    &w * d_eta
-}
-
 fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(), String> {
     if b.design.nrows() != n {
         return Err(format!(
@@ -3861,7 +3820,6 @@ struct SurvivalWiggleGeometry {
     basis: Array2<f64>,
     basis_d1: Array2<f64>,
     basis_d2: Array2<f64>,
-    basis_d3: Array2<f64>,
     dq_dq0: Array1<f64>,
     d2q_dq02: Array1<f64>,
     d3q_dq03: Array1<f64>,
@@ -3910,8 +3868,6 @@ struct SurvivalDynamicQScalars {
 struct SurvivalDynamicGeometry {
     eta_ls_exit: Array1<f64>,
     eta_ls_entry: Array1<f64>,
-    q0_exit: Array1<f64>,
-    q0_entry: Array1<f64>,
     q_exit: Array1<f64>,
     q_entry: Array1<f64>,
     qdot_exit: Array1<f64>,
@@ -4255,8 +4211,6 @@ impl SurvivalLocationScaleFamily {
         Ok(SurvivalDynamicGeometry {
             eta_ls_exit: eta_ls_exit.to_owned(),
             eta_ls_entry: eta_ls_entry.to_owned(),
-            q0_exit,
-            q0_entry,
             q_exit,
             q_entry,
             qdot_exit,
