@@ -2654,8 +2654,6 @@ mod tests {
         let p = q1 * q2;
         let i1 = Array2::<f64>::eye(q1);
         let i2 = Array2::<f64>::eye(q2);
-        let s1_kron = kronecker_product(&i2, &s1); // I_q2 ⊗ S1 = (q1*q2) x (q1*q2)
-
         // Actually the standard tensor ordering for our code is:
         // dim 0 varies slowest: penalty_dim0 = I_{q1} ⊗ ... but let me just do it simply.
         // For 2D: penalty_0 = S1 ⊗ I_{q2}, penalty_1 = I_{q1} ⊗ S2

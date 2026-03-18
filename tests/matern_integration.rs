@@ -94,6 +94,8 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("Matérn term-collection fit should succeed");
@@ -106,7 +108,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     assert!(fitted.fit.edf_total().is_some_and(f64::is_finite));
 
     let pred = predict_gam(
-        fitted.design.design.view(),
+        fitted.design.design.to_dense(),
         fitted.fit.beta.view(),
         offset.view(),
         LikelihoodFamily::GaussianIdentity,
@@ -192,6 +194,8 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                 weight_ceiling: 1e8,
             }),
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("exact adaptive Matérn term-collection fit should succeed");
@@ -208,7 +212,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
     assert!(fitted.fit.reml_score.is_finite());
 
     let pred = predict_gam(
-        fitted.design.design.view(),
+        fitted.design.design.to_dense(),
         fitted.fit.beta.view(),
         offset.view(),
         LikelihoodFamily::GaussianIdentity,
@@ -330,9 +334,11 @@ fn matern_3d_aniso_fits_successfully() {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
-            &kappa_options,
-        )
+        &kappa_options,
+    )
         .expect("anisotropic Matérn 3D fit should succeed");
 
     // Coefficients must be finite.
@@ -371,7 +377,7 @@ fn matern_3d_aniso_fits_successfully() {
 
     // Prediction quality check.
     let pred = predict_gam(
-        fitted.design.design.view(),
+        fitted.design.design.to_dense(),
         fitted.fit.beta.view(),
         offset.view(),
         LikelihoodFamily::GaussianIdentity,

@@ -1,4 +1,5 @@
 use gam::estimate::{ExternalOptimOptions, evaluate_externalgradients};
+use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 
@@ -9,7 +10,7 @@ fn make_problem(
     Array1<f64>,
     Array1<f64>,
     Array1<f64>,
-    Vec<Array2<f64>>,
+    Vec<BlockwisePenalty>,
 ) {
     let n = 400usize;
     let p = 6usize;
@@ -46,7 +47,7 @@ fn make_problem(
         s2[[j, j]] = 1.0;
     }
 
-    (x, y, w, offset, vec![s1, s2])
+    (x, y, w, offset, vec![BlockwisePenalty::new(0..p, s1), BlockwisePenalty::new(0..p, s2)])
 }
 
 #[test]

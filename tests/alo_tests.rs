@@ -2,7 +2,9 @@ use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_pirls;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
 use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
-use gam::types::{InverseLink, LinkFunction, LogSmoothingParamsView};
+use gam::types::{
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, LogSmoothingParamsView,
+};
 use ndarray::{Array1, Array2, Axis};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -45,6 +47,7 @@ fn fit_unpenalized(
     let offset = Array1::<f64>::zeros(x.nrows());
     let canonical: Vec<gam::construction::CanonicalPenalty> = Vec::new();
     let cfg = PirlsConfig {
+        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,
         convergence_tolerance: 1e-10,
@@ -67,6 +70,7 @@ fn fit_unpenalized(
             coefficient_lower_bounds: None,
             linear_constraints_original: None,
             penalty_shrinkage_floor: None,
+            kronecker_factored: None,
         },
         &cfg,
         None,
@@ -126,7 +130,7 @@ fn alo_se_calculation_correct() {
     let mut u = x_dense.clone();
     let sqrtw_col = sqrtw.view().insert_axis(Axis(1));
     u *= &sqrtw_col;
-    let k = fit.penalized_hessian_transformed.clone();
+    let k = fit.penalized_hessian_transformed.to_dense();
     let p_dim = k.nrows();
     let kview = FaerArrayView::new(&k);
     let factor = factorize_symmetricwith_fallback(kview.as_ref(), Side::Lower).unwrap();
@@ -210,7 +214,7 @@ fn alo_matches_exact_linearized_loo_small_n_binomial() {
     let sqrtw_col = sqrtw.view().insert_axis(Axis(1));
     u *= &sqrtw_col;
 
-    let mut h = fit.penalized_hessian_transformed.clone();
+    let mut h = fit.penalized_hessian_transformed.to_dense();
     for d in 0..h.nrows() {
         h[[d, d]] += 1e-12;
     }
@@ -269,7 +273,7 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
     let mut u = x_dense.clone();
     let sqrtw_col = sqrtw.view().insert_axis(Axis(1));
     u *= &sqrtw_col;
-    let k = fit.penalized_hessian_transformed.clone();
+    let k = fit.penalized_hessian_transformed.to_dense();
     let kview = FaerArrayView::new(&k);
     let factor = factorize_symmetricwith_fallback(kview.as_ref(), Side::Lower).unwrap();
     let mut naive_se = Array1::<f64>::zeros(n);

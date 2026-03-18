@@ -22,6 +22,7 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
 };
 use gam::faer_ndarray::{FaerCholesky, FaerEigh};
+use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, Axis, array};
 
@@ -53,6 +54,14 @@ fn test_design(n: usize, p: usize) -> (Array2<f64>, Array1<f64>) {
         .collect::<Vec<_>>()
         .into();
     (x, y)
+}
+
+fn blockwise_penalties(s_list: Vec<Array2<f64>>) -> Vec<BlockwisePenalty> {
+    let p = s_list[0].ncols();
+    s_list
+        .into_iter()
+        .map(|s| BlockwisePenalty::new(0..p, s))
+        .collect()
 }
 
 /// Central FD of a scalar function.
@@ -140,11 +149,11 @@ fn invert_spd(a: &Array2<f64>) -> Array2<f64> {
 }
 
 /// Build S_total = Σ λ_k S_k.
-fn build_s_total(s_list: &[Array2<f64>], rho: &Array1<f64>) -> Array2<f64> {
-    let p = s_list[0].ncols();
+fn build_s_total(s_list: &[BlockwisePenalty], rho: &Array1<f64>) -> Array2<f64> {
+    let p = s_list[0].local.ncols();
     let mut s_total = Array2::<f64>::zeros((p, p));
     for (k, s_k) in s_list.iter().enumerate() {
-        s_total.scaled_add(rho[k].exp(), s_k);
+        s_total.scaled_add(rho[k].exp(), &s_k.local);
     }
     s_total
 }
@@ -163,7 +172,7 @@ fn test_component_a_envelope_theorem() {
     for j in 1..5 {
         s1[[j, j]] = 1.0;
     }
-    let s_list = vec![s1];
+    let s_list = blockwise_penalties(vec![s1]);
     let rho = array![2.0];
 
     let cost_a = |rho: &Array1<f64>| -> f64 {
@@ -179,7 +188,7 @@ fn test_component_a_envelope_theorem() {
     let (beta, _, _, _, _, _) = solve_pirls_logit(&y, &x, &s_total);
     let mut analytic_a = Array1::<f64>::zeros(rho.len());
     for k in 0..rho.len() {
-        analytic_a[k] = 0.5 * rho[k].exp() * beta.dot(&s_list[k].dot(&beta));
+        analytic_a[k] = 0.5 * rho[k].exp() * beta.dot(&s_list[k].local.dot(&beta));
     }
 
     eprintln!("=== COMPONENT A: envelope theorem ===");
@@ -201,7 +210,7 @@ fn test_component_b_hessian_logdet() {
     for j in 1..5 {
         s1[[j, j]] = 1.0;
     }
-    let s_list = vec![s1];
+    let s_list = blockwise_penalties(vec![s1]);
     let rho = array![2.0];
     let n = y.len();
     let p = x.ncols();
@@ -240,11 +249,11 @@ fn test_component_b_hessian_logdet() {
 
         // tr(H⁻¹ λ_k S_k)
         let trace_h_inv_s_k: f64 = (0..p)
-            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k[[j, i]]).sum::<f64>())
+            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k.local[[j, i]]).sum::<f64>())
             .sum();
 
         // v_k = H⁻¹(λ_k S_k β̂)
-        let v_k = h_inv.dot(&(s_k.dot(&beta) * lambda_k));
+        let v_k = h_inv.dot(&(s_k.local.dot(&beta) * lambda_k));
         let x_v_k = x.dot(&v_k);
         let tracethird: f64 = (0..n).map(|i| c_vec[i] * leverage[i] * x_v_k[i]).sum();
 
@@ -271,7 +280,7 @@ fn test_component_b1_simple_trace() {
     for j in 1..5 {
         s1[[j, j]] = 1.0;
     }
-    let s_list = vec![s1];
+    let s_list = blockwise_penalties(vec![s1]);
     let rho = array![2.0];
     let p = x.ncols();
 
@@ -304,7 +313,7 @@ fn test_component_b1_simple_trace() {
         let lambda_k = rho[k].exp();
         let s_k = &s_list[k];
         let trace: f64 = (0..p)
-            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k[[j, i]]).sum::<f64>())
+            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k.local[[j, i]]).sum::<f64>())
             .sum();
         analytic_b1[k] = 0.5 * lambda_k * trace;
     }
@@ -327,7 +336,7 @@ fn test_component_c_penalty_logdet() {
     for j in 1..p {
         s1[[j, j]] = 1.0;
     }
-    let s_list = vec![s1];
+    let s_list = blockwise_penalties(vec![s1]);
     let nullspace_dims = vec![1usize];
     let rho = array![2.0];
 
@@ -361,7 +370,7 @@ fn test_component_c_penalty_logdet() {
         for &(idx, ev_raw) in eig_pairs.iter().take(penalty_rank) {
             let ev = ev_raw.max(1e-14);
             let u = evecs_s.column(idx).to_owned();
-            det1_k += u.dot(&s_k.dot(&u)) / ev;
+            det1_k += u.dot(&s_k.local.dot(&u)) / ev;
         }
         analytic_c[k] = -0.5 * lambda_k * det1_k;
     }
@@ -385,7 +394,7 @@ fn test_component_c_penalty_logdet() {
 fn standalone_laml_cost(
     y: &Array1<f64>,
     x: &Array2<f64>,
-    s_list: &[Array2<f64>],
+    s_list: &[BlockwisePenalty],
     rho: &Array1<f64>,
     nullspace_dims: &[usize],
 ) -> f64 {
@@ -424,7 +433,7 @@ fn test_standalone_cost_fd_vs_library_cost_fd() {
     for j in 1..5 {
         s1[[j, j]] = 1.0;
     }
-    let s_list = vec![s1.clone()];
+    let s_list = blockwise_penalties(vec![s1.clone()]);
     let rho = array![2.0];
 
     let opts = ExternalOptimOptions {
@@ -457,7 +466,7 @@ fn test_standalone_cost_fd_vs_library_cost_fd() {
             Array1::ones(n).view(),
             x.view(),
             Array1::zeros(n).view(),
-            &[s1.clone()],
+            &s_list,
             &opts,
             rho,
         )
@@ -473,7 +482,7 @@ fn test_standalone_cost_fd_vs_library_cost_fd() {
         Array1::ones(n).view(),
         x.view(),
         Array1::zeros(n).view(),
-        &[s1.clone()],
+        &s_list,
         &opts,
         &rho,
     )
@@ -533,6 +542,7 @@ fn test_single_penalty_logit_gradient() {
     for j in 1..5 {
         s1[[j, j]] = 1.0;
     }
+    let s_list = blockwise_penalties(vec![s1]);
 
     let opts = ExternalOptimOptions {
         mixture_link: None,
@@ -556,7 +566,7 @@ fn test_single_penalty_logit_gradient() {
         Array1::ones(n).view(),
         x.view(),
         Array1::zeros(n).view(),
-        &[s1],
+        &s_list,
         &opts,
         &rho,
     )
@@ -585,6 +595,7 @@ fn test_two_overlapping_penalties_logit_gradient() {
     for j in 3..5 {
         s2[[j, j]] = 1.0;
     }
+    let s_list = blockwise_penalties(vec![s1, s2]);
 
     let opts = ExternalOptimOptions {
         mixture_link: None,
@@ -608,7 +619,7 @@ fn test_two_overlapping_penalties_logit_gradient() {
         Array1::ones(n).view(),
         x.view(),
         Array1::zeros(n).view(),
-        &[s1, s2],
+        &s_list,
         &opts,
         &rho,
     )
@@ -640,6 +651,7 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
     for j in 3..5 {
         s2[[j, j]] = 1.0;
     }
+    let s_list = blockwise_penalties(vec![s1, s2]);
 
     let opts = ExternalOptimOptions {
         mixture_link: None,
@@ -663,7 +675,7 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
         Array1::ones(n).view(),
         x.view(),
         Array1::zeros(n).view(),
-        &[s1, s2],
+        &s_list,
         &opts,
         &rho,
     )
@@ -710,6 +722,7 @@ fn test_gaussian_gradient_vs_fd() {
     for j in 3..p {
         s2[[j, j]] = 1.0;
     }
+    let s_list = blockwise_penalties(vec![s1, s2]);
 
     let opts = ExternalOptimOptions {
         mixture_link: None,
@@ -733,7 +746,7 @@ fn test_gaussian_gradient_vs_fd() {
         Array1::ones(n).view(),
         x.view(),
         Array1::zeros(n).view(),
-        &[s1, s2],
+        &s_list,
         &opts,
         &rho,
     )
@@ -759,6 +772,7 @@ fn test_probit_single_penalty_gradient() {
     for j in 1..5 {
         s1[[j, j]] = 1.0;
     }
+    let s_list = blockwise_penalties(vec![s1]);
 
     let opts = ExternalOptimOptions {
         mixture_link: None,
@@ -782,7 +796,7 @@ fn test_probit_single_penalty_gradient() {
         Array1::ones(n).view(),
         x.view(),
         Array1::zeros(n).view(),
-        &[s1],
+        &s_list,
         &opts,
         &rho,
     )
@@ -809,6 +823,7 @@ fn test_probit_overlapping_penalties_gradient() {
     for j in 3..5 {
         s2[[j, j]] = 1.0;
     }
+    let s_list = blockwise_penalties(vec![s1, s2]);
 
     let opts = ExternalOptimOptions {
         mixture_link: None,
@@ -832,7 +847,7 @@ fn test_probit_overlapping_penalties_gradient() {
         Array1::ones(n).view(),
         x.view(),
         Array1::zeros(n).view(),
-        &[s1, s2],
+        &s_list,
         &opts,
         &rho,
     )
@@ -883,7 +898,7 @@ fn test_tk_correction_derivative_missing() {
         for j in 1..5 {
             s1[[j, j]] = 1.0;
         }
-        vec![s1]
+        blockwise_penalties(vec![s1])
     };
     let rho = array![2.0];
 
@@ -966,7 +981,7 @@ fn test_standalone_gradient_matches_own_fd() {
     for j in 3..5 {
         s2[[j, j]] = 1.0;
     }
-    let s_list = vec![s1, s2];
+    let s_list = blockwise_penalties(vec![s1, s2]);
     let rho = array![2.0, -1.0];
     let p = x.ncols();
     let n = y.len();
@@ -1000,13 +1015,13 @@ fn test_standalone_gradient_matches_own_fd() {
         let s_k = &s_list[k];
 
         // Term A
-        let term_a = 0.5 * lambda_k * beta.dot(&s_k.dot(&beta));
+        let term_a = 0.5 * lambda_k * beta.dot(&s_k.local.dot(&beta));
 
         // Term B
         let trace_h_inv_s_k: f64 = (0..p)
-            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k[[j, i]]).sum::<f64>())
+            .map(|i| (0..p).map(|j| h_inv[[i, j]] * s_k.local[[j, i]]).sum::<f64>())
             .sum();
-        let v_k = h_inv.dot(&(s_k.dot(&beta) * lambda_k));
+        let v_k = h_inv.dot(&(s_k.local.dot(&beta) * lambda_k));
         let x_v_k = x.dot(&v_k);
         let tracethird: f64 = (0..n).map(|i| c_vec[i] * leverage[i] * x_v_k[i]).sum();
         let term_b = 0.5 * (lambda_k * trace_h_inv_s_k - tracethird);
@@ -1016,7 +1031,7 @@ fn test_standalone_gradient_matches_own_fd() {
         for &(idx, ev_raw) in eig_pairs.iter().take(penalty_rank) {
             let ev = ev_raw.max(1e-14);
             let u = evecs_s.column(idx).to_owned();
-            det1_k += u.dot(&s_k.dot(&u)) / ev;
+            det1_k += u.dot(&s_k.local.dot(&u)) / ev;
         }
         let term_c = -0.5 * lambda_k * det1_k;
 

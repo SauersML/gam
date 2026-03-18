@@ -2,8 +2,8 @@ use gam::estimate::{FitOptions, fit_gam};
 use gam::pirls::update_glmvectors_by_family;
 use gam::predict::predict_gam;
 use gam::probability::normal_cdf;
-use gam::types::GlmLikelihoodFamily;
-use gam::types::LikelihoodFamily;
+use gam::smooth::BlockwisePenalty;
+use gam::types::{GlmLikelihoodFamily, GlmLikelihoodSpec, LikelihoodFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -28,7 +28,7 @@ fn probit_fit_and_predict_fast_integration() {
     let offset = Array1::zeros(n);
     let mut s = Array2::<f64>::zeros((2, 2));
     s[[1, 1]] = 1.0;
-    let s_list = vec![s];
+    let s_list = vec![BlockwisePenalty::new(0..2, s)];
 
     let fit = fit_gam(
         x.view(),
@@ -49,6 +49,8 @@ fn probit_fit_and_predict_fast_integration() {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("probit fit should succeed");
@@ -93,7 +95,7 @@ fn probitworkingvectors_are_finite_for_extreme_eta() {
     update_glmvectors_by_family(
         y.view(),
         &eta,
-        GlmLikelihoodFamily::BinomialProbit,
+        GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialProbit),
         w.view(),
         &mut mu,
         &mut weights,
@@ -127,7 +129,7 @@ fn cloglog_fit_and_predict_fast_integration() {
     let offset = Array1::zeros(n);
     let mut s = Array2::<f64>::zeros((2, 2));
     s[[1, 1]] = 1.0;
-    let s_list = vec![s];
+    let s_list = vec![BlockwisePenalty::new(0..2, s)];
 
     let fit = fit_gam(
         x.view(),
@@ -148,6 +150,8 @@ fn cloglog_fit_and_predict_fast_integration() {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("cloglog fit should succeed");
@@ -179,7 +183,7 @@ fn cloglogworkingvectors_are_finite_for_extreme_eta() {
     update_glmvectors_by_family(
         y.view(),
         &eta,
-        GlmLikelihoodFamily::BinomialCLogLog,
+        GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialCLogLog),
         w.view(),
         &mut mu,
         &mut weights,

@@ -9,9 +9,8 @@ use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
     BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, CenterStrategy, Dense,
-    DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
-    create_difference_penalty_matrix,
+    KnotSource, MaternIdentifiability, SpatialIdentifiability,
+    compute_geometric_constraint_transform, create_basis, create_difference_penalty_matrix,
 };
 use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
@@ -32,8 +31,7 @@ use gam::families::scale_design::{
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
-    append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
-    monotone_wiggle_basis_with_derivative_order,
+    buildwiggle_block_input_from_knots,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
@@ -45,15 +43,15 @@ use gam::inference::data::{
     load_datasetwith_schema as load_dataset_auto_with_schema,
 };
 use gam::inference::formula_dsl::{
-    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
-    effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
-    linkchoice_supports_joint_wiggle, linkname, parse_formula, parse_link_choice,
-    parse_linkwiggle_formulaspec, parse_matching_auxiliary_formula, parse_surv_response,
+    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, effectivelinkwiggle_formulaspec,
+    formula_rhs_text, inverse_link_supports_joint_wiggle, linkchoice_supports_joint_wiggle,
+    linkname, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
+    parse_surv_response,
     validate_auxiliary_formula_controls,
 };
 use gam::inference::model::{
-    ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
-    ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
+    DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, ModelKind,
+    PredictModelClass, SavedAnchoredDeviationRuntime, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
 use gam::matrix::DesignMatrix;
@@ -63,15 +61,15 @@ use gam::mixture_link::{
 };
 use gam::probability::{normal_cdf, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
+    SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TensorBSplineIdentifiability, TermCollectionSpec, build_term_collection_design,
     weighted_blockwise_penalty_sum,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
-    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
-    SurvivalTimeBasisConfig, append_survival_timewiggle_columns, build_survival_baseline_offsets,
+    SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
+    append_survival_timewiggle_columns, build_survival_baseline_offsets,
     build_survival_time_basis, build_survival_time_monotonicity_collocation,
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, evaluate_survival_baseline,
@@ -88,10 +86,7 @@ use gam::survival_location_scale::{
 use gam::survival_marginal_slope::{
     DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeTermSpec,
 };
-use gam::term_builder::{
-    build_termspec, enable_scale_dimensions, heuristic_knots, heuristic_knots_for_column,
-    parse_duchon_order, parse_duchon_power, unique_count_column,
-};
+use gam::term_builder::{build_termspec, enable_scale_dimensions};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
@@ -452,8 +447,6 @@ enum PredictModeArg {
     PosteriorMean,
     Map,
 }
-
-#[derive(Clone, Debug)]
 
 const MODEL_VERSION: u32 = 2;
 
@@ -1239,6 +1232,11 @@ fn run_fit_bernoulli_marginal_slope(
         .ok_or_else(|| format!("z column '{z_column}' not found"))?;
     let z = ds.values.column(z_col).to_owned();
     let options = blockwise_options_from_fit_args(args)?;
+    let kappa_options = {
+        let mut opts = SpatialLengthScaleOptimizationOptions::default();
+        opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
+        opts
+    };
     progress.set_stage("fit", "optimizing bernoulli marginal-slope model");
     let solved = match fit_model(FitRequest::BernoulliMarginalSlope(
         BernoulliMarginalSlopeFitRequest {
@@ -1359,6 +1357,11 @@ fn run_fit_transformation_normal(
 
     let options = blockwise_options_from_fit_args(args)?;
     let config = TransformationNormalConfig::default();
+    let kappa_options = {
+        let mut opts = SpatialLengthScaleOptimizationOptions::default();
+        opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
+        opts
+    };
 
     progress.set_stage("fit", "optimizing transformation-normal model");
     let solved = match fit_model(FitRequest::TransformationNormal(
@@ -1465,6 +1468,11 @@ fn run_fitwith_predict_noise(
     ));
     emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(inference_notes);
+    let kappa_options = {
+        let mut opts = SpatialLengthScaleOptimizationOptions::default();
+        opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
+        opts
+    };
     if family == LikelihoodFamily::GaussianIdentity {
         let response_scale = sample_std(y.view()).max(1e-6);
         let y_scaled = y.mapv(|v| v / response_scale);
@@ -2631,7 +2639,7 @@ fn run_predict_binomial_location_scale(
     let saved_loc_link = saved_link_kind.ok_or_else(|| {
         "binomial-location-scale model is missing link state/metadata".to_string()
     })?;
-    let inv_sigma = eta_noise.mapv(crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar);
+    let inv_sigma = eta_noise.mapv(gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar);
     let q0 = Array1::from_iter(
         eta_t
             .iter()
@@ -2702,7 +2710,7 @@ fn run_predict_binomial_location_scale(
                                 integrated_inverse_link_mean_scalar(
                                     &quadctx,
                                     saved_loc_link,
-                                    -t * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls),
+                                    -t * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls),
                                     0.0,
                                 )
                             },
@@ -2778,7 +2786,7 @@ fn run_predict_binomial_location_scale(
                     [[var_t, cov_tls], [cov_tls, var_ls]],
                     |t, ls| {
                         let q0 =
-                            -t * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls);
+                            -t * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls);
                         let xw = saved_linkwiggle_basisrow_scalar(q0, model)?;
                         if xw.len() != pw {
                             return Err(format!(
@@ -3392,13 +3400,28 @@ fn saved_linkwiggle_basis(
         Some(runtime) => {
             runtime.derivative_q0(q0).map(|_| ())?;
             let knot_arr = Array1::from_vec(runtime.knots.clone());
-            let basis = monotone_wiggle_basis_with_derivative_order(
-                q0.view(),
-                &knot_arr,
-                runtime.degree,
-                basis_options.derivative_order,
-            )?;
-            Ok(Some(basis))
+            match basis_options.derivative_order {
+                0 => runtime.design(q0).map(Some),
+                1 => {
+                    let (raw_derivative, _) = create_basis::<Dense>(
+                        q0.view(),
+                        KnotSource::Provided(knot_arr.view()),
+                        runtime.degree,
+                        BasisOptions::first_derivative(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let (link_transform, _) = compute_geometric_constraint_transform(
+                        &knot_arr,
+                        runtime.degree,
+                        2,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(Some(raw_derivative.as_ref().dot(&link_transform)))
+                }
+                other => Err(format!(
+                    "unsupported saved link-wiggle derivative order {other}"
+                )),
+            }
         }
     }
 }
@@ -3455,7 +3478,7 @@ fn saved_baseline_timewiggle_components(
         None => Ok(None),
         Some(runtime) => {
             runtime.validate_global_monotonicity()?;
-            let crate::inference::model::SavedBaselineTimeWiggleRuntime {
+            let SavedBaselineTimeWiggleRuntime {
                 knots,
                 degree,
                 beta,
@@ -3581,7 +3604,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let survival_link_choice = parse_link_choice(effective_args.link.as_deref(), false)?;
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(formula_linkwiggle.as_ref(), survival_link_choice.as_ref());
-    let learn_linkwiggle = effective_linkwiggle.is_some();
     let effective_timewiggle = formula_timewiggle.clone();
     let learn_timewiggle = effective_timewiggle.is_some();
 
@@ -4796,8 +4818,22 @@ fn run_sample_survival(
             2,
             wiggle_cfg.double_penalty,
         )?;
-        append_selected_wiggle_penalty_orders(&mut block, &wiggle_cfg.penalty_orders)?;
+        for &order in &wiggle_cfg.penalty_orders {
+            if order <= 1 || order >= exit_w.ncols() {
+                continue;
+            }
+            let penalty = create_difference_penalty_matrix(exit_w.ncols(), order, None)
+                .map_err(|e| format!("baseline-timewiggle difference penalty failed: {e}"))?;
+            block
+                .penalties
+                .push(gam::estimate::PenaltySpec::Dense(penalty));
+            block.nullspace_dims.push(order);
+        }
         for (widx, s) in block.penalties.iter().enumerate() {
+            let s = match s {
+                gam::estimate::PenaltySpec::Block { local, .. } => local,
+                gam::estimate::PenaltySpec::Dense(m) => m,
+            };
             if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
                 penalty_blocks.push(PenaltyBlock {
                     matrix: s.clone(),
@@ -5131,6 +5167,9 @@ fn run_sample_standard_link_wiggle(
         .ok_or_else(|| "standard link-wiggle model is missing LinkWiggle lambdas".to_string())?;
     let wiggle_lambdas = wiggle_lambdas_owned.view();
     let degree = wiggle_runtime.degree;
+    let knot_arr = Array1::from_vec(wiggle_runtime.knots.clone());
+    let (z_transform, _) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
+        .map_err(|e| format!("link-wiggle transform failed: {e}"))?;
 
     // Build wiggle penalty matrices in the structural monotone basis.
     let mut wiggle_penalties = Vec::new();
@@ -6212,7 +6251,7 @@ fn compute_probit_q0_from_eta(
     let mut q0 = Array1::<f64>::zeros(eta_t.len());
     for i in 0..q0.len() {
         q0[i] = -eta_t[i]
-            * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
+            * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
     }
     Ok(q0)
 }
@@ -7749,7 +7788,7 @@ fn build_model_summary(
             Array1::from_elem(y.len(), baseline)
         }
     };
-    let null_dev = if let Ok(glm_family) = crate::types::GlmLikelihoodFamily::try_from(family) {
+    let null_dev = if let Ok(glm_family) = gam::types::GlmLikelihoodFamily::try_from(family) {
         gam::pirls::calculate_deviance(
             y,
             &nullmu,
@@ -7761,7 +7800,7 @@ fn build_model_summary(
             y,
             &nullmu,
             gam::types::GlmLikelihoodSpec::canonical(
-                crate::types::GlmLikelihoodFamily::GaussianIdentity,
+                gam::types::GlmLikelihoodFamily::GaussianIdentity,
             ),
             weights,
         )
@@ -8453,24 +8492,24 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, ColumnKindTag, DataSchema,
+        BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FittedFamily, LikelihoodFamily, LinkChoice, LinkMode,
-        MODEL_VERSION, ModelKind, ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs,
-        SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
+        MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
+        SurvivalBaselineTarget, SurvivalTimeBasisConfig,
         apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
-        parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
-        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_baseline_config,
-        parse_survival_inverse_link, parse_survival_time_basis_config, predict_standard_linkwiggle,
-        pretty_familyname, run_generate_gaussian_location_scale, run_generate_standard,
+        parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
+        parse_survival_baseline_config, parse_survival_inverse_link,
+        parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
+        run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, validate_cli_firth_configuration,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
-    use crate::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
+    use super::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
     use csv::StringRecord;
     use gam::basis::{
         BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
@@ -8480,13 +8519,20 @@ mod tests {
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };
-    use gam::inference::model::FittedModelPayload;
-    use gam::inference::model::SchemaColumn;
+    use gam::inference::formula_dsl::{ParsedTerm, parse_linkwiggle_formulaspec};
+    use gam::inference::model::{ColumnKindTag, FittedModelPayload, SchemaColumn};
     use gam::smooth::{
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
         SmoothTermSpec, TermCollectionSpec,
     };
-    use gam::types::{InverseLink, LinkComponent, LinkFunction};
+    use gam::survival_construction::SurvivalBaselineConfig;
+    use gam::term_builder::{
+        heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
+    };
+    use gam::types::{
+        InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
+        LogLikelihoodNormalization,
+    };
     use ndarray::{Array1, Array2, ArrayView1, array, s};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -9324,7 +9370,7 @@ mod tests {
             let t = beta_t + l11 * z1;
             let ls = beta_ls + l21 * z1 + l22 * z2;
             acc += gam::probability::normal_cdf(
-                -t * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls),
+                            -t * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls),
             );
         }
         acc / draws.max(1) as f64
@@ -9349,7 +9395,7 @@ mod tests {
             let t = beta_t + cov_diag[0].max(0.0).sqrt() * z_t;
             let ls = beta_ls + cov_diag[1].max(0.0).sqrt() * z_ls;
             q0_draws[i] =
-                -t * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls);
+                -t * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(ls);
             for j in 0..beta_link_wiggle.len() {
                 let zw: f64 = StandardNormal.sample(&mut rng);
                 beta_draws[[i, j]] = beta_link_wiggle[j] + cov_diag[2 + j].max(0.0).sqrt() * zw;
@@ -10555,7 +10601,7 @@ mod tests {
         let (eta_entry, eta_exit, derivative_exit) =
             super::build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)
                 .expect("baseline offsets");
-        let wiggle_cfg = super::parse_linkwiggle_formulaspec(
+        let wiggle_cfg = parse_linkwiggle_formulaspec(
             &BTreeMap::from([
                 ("degree".to_string(), "3".to_string()),
                 ("internal_knots".to_string(), "4".to_string()),
@@ -12116,7 +12162,7 @@ mod tests {
             compute_probit_q0_from_eta(eta_t.view(), eta_ls.view()).expect("compute probit q0");
         for i in 0..q0.len() {
             let expected = -eta_t[i]
-                * crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
+                * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
             assert!((q0[i] - expected).abs() < 1e-12);
         }
     }
@@ -12290,10 +12336,10 @@ mod tests {
     #[test]
     fn heuristic_knots_for_column_uses_uniquevalue_rule() {
         let col = array![0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-        assert_eq!(super::unique_count_column(col.view()), 6);
-        assert_eq!(super::heuristic_knots_for_column(col.view()), 4);
+        assert_eq!(unique_count_column(col.view()), 6);
+        assert_eq!(heuristic_knots_for_column(col.view()), 4);
         let bigger = Array1::from_iter((0..200).map(|v| v as f64));
-        assert_eq!(super::heuristic_knots_for_column(bigger.view()), 20);
+        assert_eq!(heuristic_knots_for_column(bigger.view()), 20);
     }
 
     #[test]

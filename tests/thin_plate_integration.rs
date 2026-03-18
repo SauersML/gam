@@ -3,6 +3,7 @@ use gam::construction::canonicalize_penalty_spec;
 use gam::estimate::PenaltySpec;
 use gam::estimate::{FitOptions, fit_gam};
 use gam::predict::predict_gam;
+use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -36,10 +37,13 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let s_list = vec![tps.penalty_bending.clone(), tps.penalty_ridge.clone()];
+    let s_list = vec![
+        BlockwisePenalty::new(0..tps.basis.ncols(), tps.penalty_bending.clone()),
+        BlockwisePenalty::new(0..tps.basis.ncols(), tps.penalty_ridge.clone()),
+    ];
 
     let fit = fit_gam(
-        tps.basis.view(),
+        tps.basis.clone(),
         y.view(),
         weights.view(),
         offset.view(),
@@ -57,6 +61,8 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("fit_gam with TPS should succeed");
@@ -66,7 +72,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
     assert!(fit.edf_total().is_some_and(f64::is_finite));
 
     let pred = predict_gam(
-        tps.basis.view(),
+        tps.basis.clone(),
         fit.beta.view(),
         offset.view(),
         LikelihoodFamily::GaussianIdentity,
@@ -115,12 +121,12 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
     let weights = Array1::ones(n_train);
     let offset = Array1::zeros(n_train);
     let s_list = vec![
-        tps_train.penalty_bending.clone(),
-        tps_train.penalty_ridge.clone(),
+        BlockwisePenalty::new(0..tps_train.basis.ncols(), tps_train.penalty_bending.clone()),
+        BlockwisePenalty::new(0..tps_train.basis.ncols(), tps_train.penalty_ridge.clone()),
     ];
 
     let fit = fit_gam(
-        tps_train.basis.view(),
+        tps_train.basis.clone(),
         y_train.view(),
         weights.view(),
         offset.view(),
@@ -140,6 +146,8 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("fit_gam with TPS should succeed");
@@ -165,7 +173,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
     let tps_test = gam::basis::create_thin_plate_spline_basis(x_test.view(), knots.view())
         .expect("TPS test basis");
     let pred = predict_gam(
-        tps_test.basis.view(),
+        tps_test.basis.clone(),
         fit.beta.view(),
         Array1::zeros(n_test).view(),
         LikelihoodFamily::GaussianIdentity,
@@ -212,11 +220,16 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
     let (tps_train, knots) =
         create_thin_plate_spline_basis_with_knot_count(x_train.view(), 36).expect("3D TPS basis");
     let s_list = vec![
-        tps_train.penalty_bending.clone(),
-        tps_train.penalty_ridge.clone(),
+        BlockwisePenalty::new(0..tps_train.basis.ncols(), tps_train.penalty_bending.clone()),
+        BlockwisePenalty::new(0..tps_train.basis.ncols(), tps_train.penalty_ridge.clone()),
     ];
-    let p = s_list[0].nrows();
-    let cp = canonicalize_penalty_spec(&PenaltySpec::Dense(s_list[0].clone()), p, 0, "3D TPS test")
+    let p = s_list[0].local.nrows();
+    let cp = canonicalize_penalty_spec(
+        &PenaltySpec::Dense(s_list[0].local.clone()),
+        p,
+        0,
+        "3D TPS test",
+    )
         .expect("canonicalize penalty")
         .expect("penalty should have positive rank");
     assert!(
@@ -235,7 +248,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
     let weights = Array1::ones(n_train);
     let offset = Array1::zeros(n_train);
     let fit = fit_gam(
-        tps_train.basis.view(),
+        tps_train.basis.clone(),
         y_train.view(),
         weights.view(),
         offset.view(),
@@ -253,6 +266,8 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("fit_gam with 3D TPS should succeed");
@@ -281,7 +296,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
     let tps_test = gam::basis::create_thin_plate_spline_basis(x_test.view(), knots.view())
         .expect("3D test basis");
     let pred = predict_gam(
-        tps_test.basis.view(),
+        tps_test.basis.clone(),
         fit.beta.view(),
         Array1::zeros(n_test).view(),
         LikelihoodFamily::GaussianIdentity,
