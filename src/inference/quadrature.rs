@@ -2310,10 +2310,26 @@ fn integrated_mixture_component_jet(
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet {
+    // Use the same controlled backends (exact/asymptotic/special-function)
+    // as integrated_inverse_link_jet so that the same (mu, sigma) always
+    // produces identical d2, d3 regardless of whether it enters as a
+    // standalone link or as a mixture component.
     match component {
-        LinkComponent::Logit => integrated_logit_jet_ghq(ctx, mu, sigma),
+        LinkComponent::Logit => integrate_inverse_link_jet_from_scalar_backend(
+            mu,
+            sigma,
+            |m, s| logit_posterior_meanwith_deriv_controlled(ctx, m, s),
+            logit_point_jet,
+        )
+        .unwrap_or_else(|_| integrated_logit_jet_ghq(ctx, mu, sigma)),
         LinkComponent::Probit => integrated_probit_jet(mu, sigma),
-        LinkComponent::CLogLog => integrated_cloglog_jet_ghq(ctx, mu, sigma),
+        LinkComponent::CLogLog => integrate_inverse_link_jet_from_scalar_backend(
+            mu,
+            sigma,
+            |m, s| Ok(cloglog_posterior_meanwith_deriv_controlled(ctx, m, s)),
+            cloglog_point_jet,
+        )
+        .unwrap_or_else(|_| integrated_cloglog_jet_ghq(ctx, mu, sigma)),
         LinkComponent::LogLog | LinkComponent::Cauchit => {
             let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
                 mixture_component_point_jet(component, x)
@@ -2817,14 +2833,115 @@ fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
 
 #[inline]
 fn logit_point_jet(x: f64) -> (f64, f64, f64, f64) {
-    let jet = component_inverse_link_jet(LinkComponent::Logit, x);
-    (jet.mu, jet.d1, jet.d2, jet.d3)
+    // Numerically stable sigmoid derivatives.
+    //
+    // The naive form d1 = p*(1-p) where p = sigmoid(x) suffers catastrophic
+    // cancellation when p rounds to 0.0 or 1.0 in the tails.  Instead we
+    // use the identity  sigmoid'(x) = z/(1+z)^2  where z = exp(-|x|), which
+    // stays representable across the full f64 range.
+    if x.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    }
+    if !x.is_finite() {
+        // +inf → (1,0,0,0), -inf → (0,0,0,0)
+        return if x > 0.0 { (1.0, 0.0, 0.0, 0.0) } else { (0.0, 0.0, 0.0, 0.0) };
+    }
+    // Branch so that z = exp(-|x|) ≤ 1, avoiding overflow in exp().
+    let (mu, d1, d2, d3) = if x >= 0.0 {
+        let z = (-x).exp();
+        let opz = 1.0 + z;
+        let opz2 = opz * opz;
+        let opz3 = opz2 * opz;
+        let opz4 = opz3 * opz;
+        (
+            1.0 / opz,
+            z / opz2,
+            z * (z - 1.0) / opz3,
+            z * (z * z - 4.0 * z + 1.0) / opz4,
+        )
+    } else {
+        let z = x.exp();
+        let opz = 1.0 + z;
+        let opz2 = opz * opz;
+        let opz3 = opz2 * opz;
+        let opz4 = opz3 * opz;
+        (
+            z / opz,
+            z / opz2,
+            z * (1.0 - z) / opz3,
+            z * (1.0 - 4.0 * z + z * z) / opz4,
+        )
+    };
+    (mu, d1, d2, d3)
 }
 
 #[inline]
 fn cloglog_point_jet(x: f64) -> (f64, f64, f64, f64) {
-    let jet = component_inverse_link_jet(LinkComponent::CLogLog, x);
-    (jet.mu, jet.d1, jet.d2, jet.d3)
+    // Numerically stable cloglog inverse-link jet.
+    //
+    //   mu(x) = 1 - exp(-exp(x))
+    //   d1    = exp(x) * exp(-exp(x))          = t * exp(-t)
+    //   d2    = t*(1 - t) * exp(-t)
+    //   d3    = t*(1 - 3t + t^2) * exp(-t)
+    //
+    // where t = exp(x).
+    //
+    // The naive computation overflows when t = exp(x) is large.  We avoid
+    // this by working in log-space: log(d1) = x - exp(x), which is always
+    // ≤ -1 and tends to -∞ in both tails.  For the positive tail (x large)
+    // the exp(x) term dominates so d1 decays super-exponentially; for the
+    // negative tail d1 ≈ exp(x) which decays exponentially.
+    //
+    // This replaces the previous hard-clamp approach that zeroed derivatives
+    // outside a fixed range, introducing step discontinuities.
+    if x.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    }
+    if x == f64::NEG_INFINITY {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    if x == f64::INFINITY {
+        return (1.0, 0.0, 0.0, 0.0);
+    }
+
+    // Compute t = exp(x), but guard against overflow for the mu and
+    // derivative paths separately.
+    let t = x.exp(); // may be +inf for x > ~709
+
+    // mu = 1 - exp(-t).  Use exp_m1 for accuracy when t is small.
+    let mu = if t.is_finite() {
+        -(-t).exp_m1() // = 1 - exp(-t), accurate even for tiny t
+    } else {
+        1.0 // t overflowed ⟹ exp(-t) = 0
+    };
+
+    // d1 = t * exp(-t) = exp(x - exp(x)).
+    // Compute via log-space to avoid overflow in the intermediate t.
+    let log_d1 = x - t;
+    // When t overflows, log_d1 = x - inf = -inf, so d1 = 0 naturally.
+    // Guard against log_d1 being so negative that exp underflows — that
+    // just gives 0.0, which is the correct limiting value.
+    let d1 = if log_d1 < -745.0 {
+        0.0
+    } else {
+        log_d1.exp()
+    };
+
+    // Higher derivatives: d_k = d1 * P_k(t) for degree-(k-1) polynomials.
+    // When d1 is zero (or negligible), d_k = 0 as well — no clamp needed.
+    let (d2, d3) = if d1 == 0.0 {
+        (0.0, 0.0)
+    } else if t.is_finite() {
+        // Normal range: use t directly.
+        (d1 * (1.0 - t), d1 * (1.0 - 3.0 * t + t * t))
+    } else {
+        // t overflowed but d1 was somehow nonzero (shouldn't happen, but
+        // defend against it).  The polynomial terms diverge with the
+        // opposite sign of d1, driving the product to zero.
+        (0.0, 0.0)
+    };
+
+    (mu, d1, d2, d3)
 }
 
 #[inline]
@@ -4360,10 +4477,13 @@ mod tests {
         assert_eq!(logit.2, 0.0);
         assert_eq!(logit.3, 0.0);
 
+        // At x = -40 the cloglog derivatives are tiny but nonzero (d1 ≈ exp(-40)),
+        // because the stable formulation allows them to decay smoothly rather
+        // than hard-clamping to zero.
         let cloglog = cloglog_point_jet(-40.0);
-        assert_eq!(cloglog.1, 0.0);
-        assert_eq!(cloglog.2, 0.0);
-        assert_eq!(cloglog.3, 0.0);
+        assert!(cloglog.1.abs() < 1e-15, "d1 should be near-zero: {}", cloglog.1);
+        assert!(cloglog.2.abs() < 1e-15, "d2 should be near-zero: {}", cloglog.2);
+        assert!(cloglog.3.abs() < 1e-15, "d3 should be near-zero: {}", cloglog.3);
     }
 
     #[test]
