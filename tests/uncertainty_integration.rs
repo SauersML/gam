@@ -6,9 +6,15 @@ use gam::predict::{
     coefficient_uncertainty, predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
 use gam::probability::try_inverse_link_array;
+use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 use gam::types::LinkComponent;
 use ndarray::{Array1, Array2};
+
+fn dense_penalty(local: Array2<f64>) -> BlockwisePenalty {
+    let p = local.ncols();
+    BlockwisePenalty::new(0..p, local)
+}
 
 #[test]
 fn fit_exposes_posterior_covariance_and_standard_errors() {
@@ -34,7 +40,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         y.view(),
         weights.view(),
         offset.view(),
-        &[s],
+        &[dense_penalty(s)],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
             mixture_link: None,
@@ -48,6 +54,8 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
             adaptive_regularization: None,
             linear_constraints: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("fit should succeed");
@@ -104,7 +112,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         y.view(),
         weights.view(),
         offset.view(),
-        &[s],
+        &[dense_penalty(s)],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
             mixture_link: None,
@@ -118,6 +126,8 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
             adaptive_regularization: None,
             linear_constraints: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("fit should succeed");
@@ -185,7 +195,7 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
         y.view(),
         weights.view(),
         offset.view(),
-        &[s],
+        &[dense_penalty(s)],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
             mixture_link: None,
@@ -199,6 +209,8 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
             adaptive_regularization: None,
             linear_constraints: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("fit should succeed");
@@ -252,7 +264,7 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
         y.view(),
         weights.view(),
         offset.view(),
-        &[s],
+        &[dense_penalty(s)],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
             mixture_link: None,
@@ -266,6 +278,8 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
             adaptive_regularization: None,
             linear_constraints: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("fit should succeed");
@@ -327,7 +341,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         y.view(),
         weights.view(),
         offset.view(),
-        &[s],
+        &[dense_penalty(s)],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
             mixture_link: None,
@@ -341,6 +355,8 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
             adaptive_regularization: None,
             linear_constraints: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("base fit should succeed");

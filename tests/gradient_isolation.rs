@@ -2,6 +2,7 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
     optimize_external_design,
 };
+use gam::smooth::BlockwisePenalty;
 use gam::types::{LikelihoodFamily, SasLinkSpec};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -11,7 +12,7 @@ fn make_binary_external_problem(
     seed: u64,
     n: usize,
     p: usize,
-) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<Array2<f64>>) {
+) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<BlockwisePenalty>) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
@@ -37,7 +38,7 @@ fn make_binary_external_problem(
     for j in 1..p {
         s[[j, j]] = 1.0;
     }
-    (x, y, w, vec![s])
+    (x, y, w, vec![BlockwisePenalty::new(0..p, s)])
 }
 
 fn default_logit_opts() -> ExternalOptimOptions {
@@ -254,7 +255,7 @@ fn conditioned_helpercost_matches_fittedobjective() {
 
     let mut s = Array2::<f64>::zeros((3, 3));
     s[[2, 2]] = 1.0;
-    let s_list = vec![s];
+    let s_list = vec![BlockwisePenalty::new(0..3, s)];
 
     let opts = ExternalOptimOptions {
         family: LikelihoodFamily::GaussianIdentity,

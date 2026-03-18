@@ -10251,9 +10251,10 @@ mod tests {
             },
         ];
 
-        let eval = family
-            .evaluate(&states)
-            .expect_err("non-finite d_eta/dt must be rejected");
+        let eval = match family.evaluate(&states) {
+            Ok(_) => panic!("non-finite d_eta/dt must be rejected"),
+            Err(err) => err,
+        };
         assert!(eval.contains("non-finite"));
     }
 

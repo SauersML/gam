@@ -1,6 +1,7 @@
 use ndarray::{Array1, Array2, array};
 
 use gam::estimate::{ExternalOptimOptions, evaluate_externalgradients};
+use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 
 #[inline]
@@ -111,7 +112,7 @@ fn exact_logit_oracle_eval_rho_2d(
 fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f64 {
     let w = Array1::ones(y.len());
     let offset = Array1::zeros(y.len());
-    let s_list = vec![Array2::eye(2)];
+    let s_list = vec![BlockwisePenalty::new(0..2, Array2::eye(2))];
     let opts = ExternalOptimOptions {
         mixture_link: None,
         optimize_mixture: false,
@@ -361,6 +362,10 @@ fn test_externalgradient_adapter_isolated_matchesfd_direction() {
     for j in 3..p {
         s2[[j, j]] = 1.0;
     }
+    let s_list = vec![
+        BlockwisePenalty::new(0..p, s1),
+        BlockwisePenalty::new(0..p, s2),
+    ];
 
     let opts = ExternalOptimOptions {
         mixture_link: None,
@@ -384,7 +389,7 @@ fn test_externalgradient_adapter_isolated_matchesfd_direction() {
         w.view(),
         x.view(),
         offset.view(),
-        &[s1, s2],
+        &s_list,
         &opts,
         &rho,
     )

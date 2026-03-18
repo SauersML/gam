@@ -1,6 +1,7 @@
 use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
 };
+use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -18,12 +19,12 @@ fn build_design(seed: u64, n: usize, p: usize) -> Array2<f64> {
     x
 }
 
-fn one_penalty(p: usize) -> Vec<Array2<f64>> {
+fn one_penalty(p: usize) -> Vec<BlockwisePenalty> {
     let mut s = Array2::<f64>::zeros((p, p));
     for j in 1..p {
         s[[j, j]] = 1.0;
     }
-    vec![s]
+    vec![BlockwisePenalty::new(0..p, s)]
 }
 
 fn fdgradient(
@@ -31,7 +32,7 @@ fn fdgradient(
     w: &Array1<f64>,
     x: &Array2<f64>,
     offset: &Array1<f64>,
-    s_list: &[Array2<f64>],
+    s_list: &[BlockwisePenalty],
     opts: &ExternalOptimOptions,
     rho: &Array1<f64>,
     h: f64,

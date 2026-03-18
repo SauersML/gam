@@ -98,6 +98,8 @@ fn fit_duchon_simulated_10d(
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("Duchon term-collection fit should succeed");
@@ -109,8 +111,9 @@ fn fit_duchon_simulated_10d(
     assert_eq!(fitted.fit.lambdas.len(), expected_lambda_count);
     assert!(fitted.fit.edf_total().is_some_and(f64::is_finite));
 
+    let design = fitted.design.design.to_dense();
     let pred = predict_gam(
-        fitted.design.design.view(),
+        design.view(),
         fitted.fit.beta.view(),
         offset.view(),
         LikelihoodFamily::GaussianIdentity,
@@ -208,6 +211,8 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                 weight_ceiling: 1e8,
             }),
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         },
     )
     .expect("exact adaptive Duchon term-collection fit should succeed");
@@ -223,8 +228,9 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
     assert_eq!(diag.maps.len(), 1);
     assert!(fitted.fit.standard_deviation.is_finite() && fitted.fit.standard_deviation > 0.0);
 
+    let design = fitted.design.design.to_dense();
     let pred = predict_gam(
-        fitted.design.design.view(),
+        design.view(),
         fitted.fit.beta.view(),
         offset.view(),
         LikelihoodFamily::GaussianIdentity,
@@ -360,6 +366,8 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
             &kappa_options,
         )
@@ -400,8 +408,9 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
     );
 
     // Prediction quality: the model should beat the baseline (predicting mean).
+    let design = fitted.design.design.to_dense();
     let pred = predict_gam(
-        fitted.design.design.view(),
+        design.view(),
         fitted.fit.beta.view(),
         offset.view(),
         LikelihoodFamily::GaussianIdentity,
@@ -494,6 +503,8 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
             &kappa_options,
         )

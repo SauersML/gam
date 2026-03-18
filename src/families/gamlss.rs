@@ -451,7 +451,7 @@ pub(crate) fn monotone_wiggle_basis_from_knots(
     Ok(basis.as_ref().clone())
 }
 
-pub(crate) fn monotone_wiggle_basis_with_derivative_order(
+pub fn monotone_wiggle_basis_with_derivative_order(
     seed: ArrayView1<'_, f64>,
     knots: &Array1<f64>,
     degree: usize,
@@ -545,7 +545,7 @@ pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
     Ok(())
 }
 
-pub(crate) fn append_selected_wiggle_penalty_orders(
+pub fn append_selected_wiggle_penalty_orders(
     block: &mut ParameterBlockInput,
     penalty_orders: &[usize],
 ) -> Result<(), String> {

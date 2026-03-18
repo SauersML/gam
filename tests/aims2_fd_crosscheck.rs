@@ -15,6 +15,7 @@
 use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
 };
+use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, array};
 
@@ -70,7 +71,7 @@ fn assert_gradient_fd_match(
 fn build_gaussian_external_problem(
     n: usize,
     p: usize,
-) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<Array2<f64>>) {
+) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<BlockwisePenalty>) {
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let t = (i as f64 + 0.5) / n as f64;
@@ -97,7 +98,7 @@ fn build_gaussian_external_problem(
     for j in 1..p {
         s[[j, j]] = 1.0;
     }
-    (x, y, w, vec![s])
+    (x, y, w, vec![BlockwisePenalty::new(0..p, s)])
 }
 
 fn gaussian_opts(nullspace_dim: usize) -> ExternalOptimOptions {
@@ -204,7 +205,10 @@ fn profiled_gaussian_reml_gradient_matches_fd_two_penalties() {
     let mut s2 = Array2::<f64>::zeros((p, p));
     s2[[3, 3]] = 1.0;
     s2[[4, 4]] = 1.0;
-    let s_list = vec![s1, s2];
+    let s_list = vec![
+        BlockwisePenalty::new(0..p, s1),
+        BlockwisePenalty::new(0..p, s2),
+    ];
 
     let opts = ExternalOptimOptions {
         family: LikelihoodFamily::GaussianIdentity,
@@ -291,7 +295,10 @@ fn profiled_gaussian_reml_hessian_fd_symmetric_and_finite() {
     let mut s2 = Array2::<f64>::zeros((p, p));
     s2[[3, 3]] = 1.0;
     s2[[4, 4]] = 1.0;
-    let s_list = vec![s1, s2];
+    let s_list = vec![
+        BlockwisePenalty::new(0..p, s1),
+        BlockwisePenalty::new(0..p, s2),
+    ];
 
     let opts = ExternalOptimOptions {
         family: LikelihoodFamily::GaussianIdentity,

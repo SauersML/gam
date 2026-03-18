@@ -5,6 +5,7 @@ use gam::inference::predict::{
     predict_gamwith_uncertainty,
 };
 use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_fromspec};
+use gam::smooth::BlockwisePenalty;
 use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -23,12 +24,12 @@ fn build_design(n: usize) -> Array2<f64> {
     x
 }
 
-fn one_penalty_for_non_intercept(p: usize) -> Vec<Array2<f64>> {
+fn one_penalty_for_non_intercept(p: usize) -> Vec<BlockwisePenalty> {
     let mut s = Array2::<f64>::zeros((p, p));
     for j in 1..p {
         s[[j, j]] = 1.0;
     }
-    vec![s]
+    vec![BlockwisePenalty::new(0..p, s)]
 }
 
 fn base_fit_options() -> FitOptions {
@@ -44,6 +45,8 @@ fn base_fit_options() -> FitOptions {
         linear_constraints: None,
         adaptive_regularization: None,
         penalty_shrinkage_floor: None,
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
     }
 }
 

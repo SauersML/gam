@@ -49,6 +49,11 @@ pub fn exp_sigma_from_eta_scalar(eta: f64) -> f64 {
 }
 
 #[inline]
+pub fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
+    (-eta).exp()
+}
+
+#[inline]
 pub fn exp_sigma_eta_for_sigma_scalar(sigma: f64) -> f64 {
     assert!(sigma.is_finite(), "sigma must be finite");
     assert!(sigma > 0.0, "sigma must be positive");

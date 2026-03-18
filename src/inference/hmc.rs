@@ -826,6 +826,7 @@ mod tests {
         SharedData, firth_jeffreys_logp_and_grad, run_joint_beta_rho_sampling,
         run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
     };
+    use crate::construction::CanonicalPenalty;
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
     use crate::types::LikelihoodFamily;
     use general_mcmc::generic_hmc::HamiltonianTarget;

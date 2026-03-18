@@ -1,7 +1,11 @@
 use gam::construction::CanonicalPenalty;
 use gam::estimate::{ExternalOptimOptions, PenaltySpec, evaluate_externalcost_andridge};
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
-use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, LogSmoothingParamsView};
+use gam::smooth::BlockwisePenalty;
+use gam::types::{
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodFamily, LinkFunction,
+    LogSmoothingParamsView,
+};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -23,7 +27,7 @@ fn canonicalize_test_penalties(s_list: &[Array2<f64>]) -> Vec<CanonicalPenalty> 
         .collect()
 }
 
-fn make_problem(seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<Array2<f64>>) {
+fn make_problem(seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>, Array2<f64>, Vec<BlockwisePenalty>) {
     let n = 100;
     let p = 10;
     let mut rng = StdRng::seed_from_u64(seed);
@@ -45,7 +49,7 @@ fn make_problem(seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<Array2
     for j in 1..p {
         s[[j, j]] = 1.0;
     }
-    (x, y, w, vec![s])
+    (x, y, w, s.clone(), vec![BlockwisePenalty::new(0..p, s)])
 }
 
 fn fit_beta_norm(
@@ -56,7 +60,9 @@ fn fit_beta_norm(
     rho: f64,
     firth: bool,
 ) -> f64 {
+    let p = x.ncols();
     let cfg = PirlsConfig {
+        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
         link_kind: InverseLink::Standard(LinkFunction::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
@@ -101,6 +107,7 @@ fn proxycostwith_pirls(
     firth: bool,
 ) -> f64 {
     let cfg = PirlsConfig {
+        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
         link_kind: InverseLink::Standard(LinkFunction::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
@@ -139,7 +146,7 @@ fn proxycostwith_pirls(
 
 #[test]
 fn firthfd_step_size_sensitivity() {
-    let (x, y, w, s_list) = make_problem(31);
+    let (x, y, w, s_dense, s_list) = make_problem(31);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
         mixture_link: None,
@@ -171,6 +178,7 @@ fn firthfd_step_size_sensitivity() {
         .map(|(c, _)| c)
         .expect("cost")
     };
+    assert!(s_dense.iter().all(|v| v.is_finite()));
     let wide_trend = cost_at(base_rho + 1.0) - cost_at(base_rho - 1.0);
     let trend_sign = wide_trend > 0.0;
     let step_sizes = [0.02, 0.01, 0.005, 0.002, 0.001, 0.0005];
@@ -186,8 +194,8 @@ fn firthfd_step_size_sensitivity() {
 
 #[test]
 fn firth_beta_monotonicity_comparison() {
-    let (x, y, w, s_list) = make_problem(31);
-    let penalties = canonicalize_test_penalties(&s_list);
+    let (x, y, w, s_dense, _) = make_problem(31);
+    let penalties = canonicalize_test_penalties(&[s_dense.clone()]);
     let deltas = [
         -0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010,
     ];
@@ -214,9 +222,10 @@ fn firth_beta_monotonicity_comparison() {
 
 #[test]
 fn firthcost_oscillationvs_no_firth() {
-    let (x, y, w, s_list) = make_problem(31);
-    let penalties = canonicalize_test_penalties(&s_list);
-    let s = &s_list[0];
+    let (x, y, w, s_dense, s_list) = make_problem(31);
+    let penalties = canonicalize_test_penalties(&[s_dense.clone()]);
+    let s = &s_dense;
+    assert_eq!(s_list.len(), 1);
     let steps: Vec<f64> = (-20..=20).map(|i| i as f64 * 0.001).collect();
     let cost_firth: Vec<f64> = steps
         .iter()
