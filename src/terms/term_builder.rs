@@ -10,8 +10,8 @@ use ndarray::ArrayView1;
 
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-    DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
-    SpatialIdentifiability, ThinPlateBasisSpec, default_num_centers,
+    DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability,
+    ThinPlateBasisSpec, default_num_centers,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
@@ -514,7 +514,9 @@ pub fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<usize, S
     }
 }
 
-pub fn parse_duchon_order(options: &BTreeMap<String, String>) -> Result<DuchonNullspaceOrder, String> {
+pub fn parse_duchon_order(
+    options: &BTreeMap<String, String>,
+) -> Result<DuchonNullspaceOrder, String> {
     match options.get("order") {
         None => Ok(DuchonNullspaceOrder::Zero),
         Some(raw) => match raw.parse::<usize>() {

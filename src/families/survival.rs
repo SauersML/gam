@@ -687,9 +687,7 @@ impl WorkingModelSurvival {
         ) {
             let activerows: Vec<usize> = (0..rows.nrows())
                 .filter(|&i| {
-                    rows.row(i)
-                        .iter()
-                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                    rows.row(i).iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
                         > DERIVATIVE_ROW_NORM_TOL
                 })
                 .collect();
@@ -730,7 +728,8 @@ impl WorkingModelSurvival {
                 for j in 0..p {
                     a[[r, j]] = derivative_row[j];
                 }
-                b[r] = self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
+                b[r] =
+                    self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
             }
             return Some(LinearInequalityConstraints { a, b });
         }
@@ -2930,13 +2929,8 @@ mod tests {
         inputs.monotonicity_constraint_rows = Some(x_derivative.view());
         inputs.monotonicity_constraint_offsets = Some(collocation_offsets.view());
 
-        let model = survival_model(
-            inputs,
-            penalties,
-            mono,
-            SurvivalSpec::Net,
-        )
-        .expect("construct linear survival model");
+        let model = survival_model(inputs, penalties, mono, SurvivalSpec::Net)
+            .expect("construct linear survival model");
 
         let constraints = model
             .monotonicity_linear_constraints()

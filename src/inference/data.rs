@@ -550,9 +550,8 @@ struct ColMeta {
 
 fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
     use arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array,
-        UInt8Array,
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::DataType;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -602,9 +601,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
                 // String/dictionary column → accumulate raw strings.
                 let strings = string_cols[j].as_mut().unwrap();
                 // Try to get as StringArray (handles Utf8, LargeUtf8, Dictionary).
-                let str_arr = col
-                    .as_any()
-                    .downcast_ref::<StringArray>();
+                let str_arr = col.as_any().downcast_ref::<StringArray>();
                 if let Some(arr) = str_arr {
                     for i in 0..n_rows {
                         if !arr.is_valid(i) {
@@ -619,10 +616,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
                 } else {
                     // Dictionary-encoded or LargeUtf8: cast to StringArray via arrow cast.
                     let casted = arrow::compute::cast(col, &DataType::Utf8).map_err(|e| {
-                        format!(
-                            "failed to cast column '{}' to string: {e}",
-                            &headers[j]
-                        )
+                        format!("failed to cast column '{}' to string: {e}", &headers[j])
                     })?;
                     let arr = casted
                         .as_any()
@@ -654,7 +648,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
                 // Check for nulls.
                 if col.null_count() > 0 {
                     for i in 0..n_rows {
-                        if col.is_null(i) {
+                        if !col.is_valid(i) {
                             return Err(format!(
                                 "null value at row {}, column '{}'",
                                 base_row + i + 1,
@@ -843,10 +837,7 @@ fn load_parquet_with_schema(
                     .iter()
                     .map(|lv| {
                         schema_level_map.get(lv.as_str()).copied().ok_or_else(|| {
-                            format!(
-                                "unseen level '{}' in categorical column '{}'",
-                                lv, name
-                            )
+                            format!("unseen level '{}' in categorical column '{}'", lv, name)
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;

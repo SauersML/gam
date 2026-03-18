@@ -123,7 +123,9 @@ impl PenaltySpec {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             PenaltySpec::Dense(m) => m.clone(),
-            PenaltySpec::Block { local, col_range, .. } => {
+            PenaltySpec::Block {
+                local, col_range, ..
+            } => {
                 let p = col_range.end.max(local.nrows());
                 // Caller should supply p externally when the total dim is larger;
                 // this is the best we can do without it.
@@ -144,7 +146,9 @@ impl PenaltySpec {
                 debug_assert_eq!(m.nrows(), p_total);
                 m.clone()
             }
-            PenaltySpec::Block { local, col_range, .. } => {
+            PenaltySpec::Block {
+                local, col_range, ..
+            } => {
                 let mut out = Array2::zeros((p_total, p_total));
                 out.slice_mut(s![col_range.clone(), col_range.clone()])
                     .assign(local);
@@ -588,10 +592,7 @@ impl ParametricColumnConditioning {
 
     /// Infer unpenalized columns from blockwise penalties via `col_range` — O(k),
     /// no matrix scanning needed.
-    fn infer_from_blockwise_penalties(
-        x: &DesignMatrix,
-        s_list: &[BlockwisePenalty],
-    ) -> Self {
+    fn infer_from_blockwise_penalties(x: &DesignMatrix, s_list: &[BlockwisePenalty]) -> Self {
         let p = x.ncols();
         let mut penalized = vec![false; p];
         for bp in s_list {
@@ -819,11 +820,7 @@ pub(crate) struct RemlConfig {
 }
 
 impl RemlConfig {
-    fn external(
-        likelihood: GlmLikelihoodSpec,
-        reml_tol: f64,
-        firth_bias_reduction: bool,
-    ) -> Self {
+    fn external(likelihood: GlmLikelihoodSpec, reml_tol: f64, firth_bias_reduction: bool) -> Self {
         Self {
             likelihood,
             link_kind: InverseLink::Standard(likelihood.link_function()),
@@ -1425,12 +1422,15 @@ fn validate_penalty_specs(
 ) -> Result<(), EstimationError> {
     for (idx, spec) in specs.iter().enumerate() {
         match spec {
-            PenaltySpec::Block { local, col_range, .. } => {
+            PenaltySpec::Block {
+                local, col_range, ..
+            } => {
                 let bd = col_range.len();
                 if local.nrows() != bd || local.ncols() != bd {
                     return Err(EstimationError::InvalidInput(format!(
                         "{context}: block penalty {idx} local matrix must be {bd}x{bd}, got {}x{}",
-                        local.nrows(), local.ncols()
+                        local.nrows(),
+                        local.ncols()
                     )));
                 }
                 if col_range.end > p {
@@ -1444,7 +1444,8 @@ fn validate_penalty_specs(
                 if m.nrows() != p || m.ncols() != p {
                     return Err(EstimationError::InvalidInput(format!(
                         "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
-                        m.nrows(), m.ncols()
+                        m.nrows(),
+                        m.ncols()
                     )));
                 }
             }
@@ -1486,7 +1487,10 @@ pub fn optimize_external_designwith_heuristic_lambdas<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from_blockwise).collect();
+    let specs: Vec<PenaltySpec> = s_list
+        .into_iter()
+        .map(PenaltySpec::from_blockwise)
+        .collect();
     optimize_external_designwith_heuristic_lambdas_andwarm_start(
         y,
         w,
@@ -2309,7 +2313,8 @@ where
 
                     let sampling_result = {
                         let x_dense = selected_pirls_res.x_transformed.to_dense_arc();
-                        let hessian_dense = selected_pirls_res.stabilizedhessian_transformed.to_dense();
+                        let hessian_dense =
+                            selected_pirls_res.stabilizedhessian_transformed.to_dense();
                         let hmc_inputs = crate::hmc::JointBetaRhoInputs {
                             x: x_dense.view(),
                             y: y_o.view(),
@@ -2317,7 +2322,10 @@ where
                             likelihood_family: opts.family,
                             mode: selected_pirls_res.beta_transformed.view(),
                             hessian: hessian_dense.view(),
-                            penalty_roots: selected_pirls_res.reparam_result.canonical_transformed.clone(),
+                            penalty_roots: selected_pirls_res
+                                .reparam_result
+                                .canonical_transformed
+                                .clone(),
                             penalty_nullspace_dims: opts.nullspace_dims.clone(),
                             rho_mode: selected_rho.view(),
                             nuts_family: match opts.family {
@@ -2484,10 +2492,7 @@ where
                 };
                 if let Ok(f) = candidate.factorize() {
                     if ridge > 0.0 {
-                        log::warn!(
-                            "Stabilized Hessian factorized with ridge {:.3e}",
-                            ridge,
-                        );
+                        log::warn!("Stabilized Hessian factorized with ridge {:.3e}", ridge,);
                     }
                     break f;
                 }
@@ -2501,7 +2506,12 @@ where
             }
         };
         let mut traces = vec![0.0f64; k];
-        for (kk, cp) in pirls_res.reparam_result.canonical_transformed.iter().enumerate() {
+        for (kk, cp) in pirls_res
+            .reparam_result
+            .canonical_transformed
+            .iter()
+            .enumerate()
+        {
             // Build the p × rank RHS with nonzeros only in [start..end] rows.
             let r = &cp.col_range;
             let rank = cp.rank();
@@ -2511,11 +2521,12 @@ where
                     rhs[[r.start + row, col]] = cp.root[[col, row]];
                 }
             }
-            let sol = factor.solvemulti(&rhs).map_err(|_| {
-                EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                }
-            })?;
+            let sol =
+                factor
+                    .solvemulti(&rhs)
+                    .map_err(|_| EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    })?;
             // Frobenius inner product: only the block rows of rhs are nonzero.
             let mut frob = 0.0f64;
             for col in 0..rank {
@@ -2526,7 +2537,12 @@ where
             traces[kk] = lambdas[kk] * frob;
         }
         edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
-        for (kk, cp) in pirls_res.reparam_result.canonical_transformed.iter().enumerate() {
+        for (kk, cp) in pirls_res
+            .reparam_result
+            .canonical_transformed
+            .iter()
+            .enumerate()
+        {
             let p_k = cp.rank() as f64;
             let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
             edf_by_block[kk] = edf_k;
@@ -2849,7 +2865,10 @@ pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let specs: Vec<PenaltySpec> = s_list.into_iter().map(PenaltySpec::from_blockwise).collect();
+    let specs: Vec<PenaltySpec> = s_list
+        .into_iter()
+        .map(PenaltySpec::from_blockwise)
+        .collect();
     validate_and_build_reml_state(
         y,
         w,

@@ -617,7 +617,8 @@ fn decompose_kronecker_factors(
         if q_j != factor.ncols() {
             return Err(EstimationError::InvalidInput(format!(
                 "{context}: Kronecker factor {j} must be square, got {}x{}",
-                factor.nrows(), factor.ncols()
+                factor.nrows(),
+                factor.ncols()
             )));
         }
         let is_identity = {
@@ -823,7 +824,11 @@ impl CanonicalPenalty {
         let r = &self.col_range;
         let m_block = m.slice(s![r.start..r.end, r.start..r.end]);
         let rm = self.root.dot(&m_block);
-        scale * rm.iter().zip(self.root.iter()).map(|(&a, &b)| a * b).sum::<f64>()
+        scale
+            * rm.iter()
+                .zip(self.root.iter())
+                .map(|(&a, &b)| a * b)
+                .sum::<f64>()
     }
 
     /// Compute `scale * v^T S_k v` (quadratic form).
@@ -836,19 +841,6 @@ impl CanonicalPenalty {
         let rv = self.root.dot(&v_block);
         scale * rv.dot(&rv)
     }
-
-    /// Global root: `rank x p` matrix (embeds block root into full column space).
-    pub fn global_root(&self) -> Array2<f64> {
-        if !self.is_block_local() {
-            return self.root.clone();
-        }
-        let mut g = Array2::zeros((self.rank(), self.total_dim));
-        g.slice_mut(s![.., self.col_range.start..self.col_range.end])
-            .assign(&self.root);
-        g
-    }
-
-
 
     /// Convert to a PenaltyCoordinate for the unified REML evaluator.
     pub fn to_penalty_coordinate(
@@ -882,7 +874,11 @@ pub fn canonicalize_penalty_spec(
     use crate::estimate::PenaltySpec;
 
     let (local_matrix, col_range, hint) = match spec {
-        PenaltySpec::Block { local, col_range, structure_hint } => {
+        PenaltySpec::Block {
+            local,
+            col_range,
+            structure_hint,
+        } => {
             let bd = col_range.len();
             if local.nrows() != bd || local.ncols() != bd {
                 return Err(EstimationError::InvalidInput(format!(
@@ -939,13 +935,11 @@ pub fn canonicalize_penalty_spec(
 
     // ── Kronecker fast path: single per-factor eigendecomposition ──
     if let Some(PenaltyStructureHint::Kronecker(factors)) = hint {
-        let decomps = match decompose_kronecker_factors(
-            factors,
-            &format!("{context} penalty {idx}"),
-        )? {
-            None => return Ok(None),
-            Some(d) => d,
-        };
+        let decomps =
+            match decompose_kronecker_factors(factors, &format!("{context} penalty {idx}"))? {
+                None => return Ok(None),
+                Some(d) => d,
+            };
         let (positive_eigenvalues, nullity) = kronecker_eigenvalues(&decomps, block_dim);
         if positive_eigenvalues.is_empty() {
             return Ok(None);
@@ -1094,7 +1088,11 @@ pub fn create_balanced_penalty_root_from_canonical(
         let (eigenvalues, eigenvectors) =
             robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
         let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-        let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+        let tolerance = if max_eig > 0.0 {
+            max_eig * 1e-12
+        } else {
+            1e-12
+        };
         let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
         if penalty_rank == 0 {
             return Ok(Array2::zeros((0, p)));
@@ -1115,7 +1113,7 @@ pub fn create_balanced_penalty_root_from_canonical(
     // Non-overlapping: eigendecompose per block at O(Σ p_k³).
     struct BlockRoot {
         col_range: Range<usize>,
-        root: Array2<f64>,  // rank_b × block_dim
+        root: Array2<f64>, // rank_b × block_dim
     }
     let mut total_rank = 0usize;
     let mut block_roots = Vec::with_capacity(block_groups.len());
@@ -1135,7 +1133,11 @@ pub fn create_balanced_penalty_root_from_canonical(
         let (eigenvalues, eigenvectors) =
             robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
         let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-        let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+        let tolerance = if max_eig > 0.0 {
+            max_eig * 1e-12
+        } else {
+            1e-12
+        };
         let block_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
         if block_rank == 0 {
@@ -1169,8 +1171,11 @@ pub fn create_balanced_penalty_root_from_canonical(
     let mut row_offset = 0;
     for br in &block_roots {
         let rank_b = br.root.nrows();
-        eb.slice_mut(s![row_offset..(row_offset + rank_b), br.col_range.start..br.col_range.end])
-            .assign(&br.root);
+        eb.slice_mut(s![
+            row_offset..(row_offset + rank_b),
+            br.col_range.start..br.col_range.end
+        ])
+        .assign(&br.root);
         row_offset += rank_b;
     }
 
@@ -1311,7 +1316,10 @@ pub fn precompute_reparam_invariant_from_canonical(
             has_nonzero = true;
         }
         let key = (cp.col_range.start, cp.col_range.end);
-        block_groups.entry(key).or_default().push(PenRef { penalty_index: i });
+        block_groups
+            .entry(key)
+            .or_default()
+            .push(PenRef { penalty_index: i });
     }
 
     if !has_nonzero {
@@ -1375,7 +1383,11 @@ pub fn precompute_reparam_invariant_from_canonical(
             .iter()
             .map(|&idx| bal_eigenvalues[idx].abs())
             .fold(0.0_f64, f64::max);
-        let rank_tol = if max_bal > 0.0 { max_bal * 1e-12 } else { 1e-12 };
+        let rank_tol = if max_bal > 0.0 {
+            max_bal * 1e-12
+        } else {
+            1e-12
+        };
         let penalized_rank = order
             .iter()
             .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
@@ -1407,8 +1419,8 @@ pub fn precompute_reparam_invariant_from_canonical(
 
     struct BlockResult {
         col_range: Range<usize>,
-        q_pen_local: Array2<f64>,   // block_dim × pen_rank
-        q_null_local: Array2<f64>,  // block_dim × null_rank
+        q_pen_local: Array2<f64>,  // block_dim × pen_rank
+        q_null_local: Array2<f64>, // block_dim × null_rank
         max_bal: f64,
         penalty_indices: Vec<usize>,
         /// Column offset of this block's penalized directions within global Q_pen.
@@ -1445,7 +1457,7 @@ pub fn precompute_reparam_invariant_from_canonical(
                 q_null_local: Array2::eye(block_dim),
                 max_bal: 0.0,
                 penalty_indices,
-                pen_col_offset: 0, // set later
+                pen_col_offset: 0,  // set later
                 null_col_offset: 0, // set later
             });
             continue;
@@ -1467,7 +1479,11 @@ pub fn precompute_reparam_invariant_from_canonical(
             .iter()
             .map(|&idx| bal_eigenvalues[idx].abs())
             .fold(0.0_f64, f64::max);
-        let rank_tol = if max_bal > 0.0 { max_bal * 1e-12 } else { 1e-12 };
+        let rank_tol = if max_bal > 0.0 {
+            max_bal * 1e-12
+        } else {
+            1e-12
+        };
         let penalized_rank = order
             .iter()
             .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
@@ -1496,15 +1512,18 @@ pub fn precompute_reparam_invariant_from_canonical(
             q_null_local,
             max_bal,
             penalty_indices,
-            pen_col_offset: 0, // set later
+            pen_col_offset: 0,  // set later
             null_col_offset: 0, // set later
         });
     }
 
     // Compute column offsets for each block in the global Q_pen / Q_null layout.
     let total_pen_rank: usize = block_results.iter().map(|br| br.q_pen_local.ncols()).sum();
-    let total_null: usize =
-        block_results.iter().map(|br| br.q_null_local.ncols()).sum::<usize>() + uncovered_cols.len();
+    let total_null: usize = block_results
+        .iter()
+        .map(|br| br.q_null_local.ncols())
+        .sum::<usize>()
+        + uncovered_cols.len();
     {
         let mut pen_off = 0usize;
         let mut null_off = 0usize;
@@ -1526,16 +1545,25 @@ pub fn precompute_reparam_invariant_from_canonical(
         let null_r = br.q_null_local.ncols();
         if pen_r > 0 {
             q_pen
-                .slice_mut(s![start..(start + bd), br.pen_col_offset..(br.pen_col_offset + pen_r)])
+                .slice_mut(s![
+                    start..(start + bd),
+                    br.pen_col_offset..(br.pen_col_offset + pen_r)
+                ])
                 .assign(&br.q_pen_local);
         }
         if null_r > 0 {
             q_null
-                .slice_mut(s![start..(start + bd), br.null_col_offset..(br.null_col_offset + null_r)])
+                .slice_mut(s![
+                    start..(start + bd),
+                    br.null_col_offset..(br.null_col_offset + null_r)
+                ])
                 .assign(&br.q_null_local);
         }
     }
-    let mut null_col = block_results.iter().map(|br| br.q_null_local.ncols()).sum::<usize>();
+    let mut null_col = block_results
+        .iter()
+        .map(|br| br.q_null_local.ncols())
+        .sum::<usize>();
     for &j in &uncovered_cols {
         q_null[[j, null_col]] = 1.0;
         null_col += 1;
@@ -1908,8 +1936,7 @@ pub fn stable_reparameterizationwith_invariant(
         );
     }
 
-    let rs_transformed_arr: Vec<Array2<f64>> =
-        rs_transformed.iter().map(mat_to_array).collect();
+    let rs_transformed_arr: Vec<Array2<f64>> = rs_transformed.iter().map(mat_to_array).collect();
     let canonical_transformed: Vec<CanonicalPenalty> = rs_transformed_arr
         .iter()
         .map(|r| CanonicalPenalty::from_dense_root(r.clone(), p))
@@ -2065,10 +2092,7 @@ impl KroneckerReparamResult {
         let s_transformed = self.materialize_s_transformed(lambdas);
 
         // Transform penalty roots: R_k_transformed = R_k · Qs
-        let rs_transformed: Vec<Array2<f64>> = rs_list
-            .iter()
-            .map(|r| r.dot(&qs))
-            .collect();
+        let rs_transformed: Vec<Array2<f64>> = rs_list.iter().map(|r| r.dot(&qs)).collect();
         // rs_transposed removed — canonical_transformed is the single source of truth.
 
         // Build e_transformed: combined penalty square root in transformed coords.
@@ -2400,8 +2424,7 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
 mod tests {
     use super::{
         CanonicalPenalty, SubspaceLeakageMetrics, assess_subspace_leakage,
-        precompute_reparam_invariant_from_canonical,
-        stable_reparameterizationwith_invariant,
+        precompute_reparam_invariant_from_canonical, stable_reparameterizationwith_invariant,
     };
     use faer::Mat;
     use ndarray::{Array2, array};
@@ -2479,7 +2502,8 @@ mod tests {
         let rs_list = vec![array![[1.0, 0.0, 0.0]]];
         let canonical = canonical_from_roots(&rs_list, p);
         let lambdas = vec![2.0];
-        let inv = precompute_reparam_invariant_from_canonical(&canonical, p).expect("precompute invariant");
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p)
+            .expect("precompute invariant");
         let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
@@ -2497,7 +2521,8 @@ mod tests {
         let p = 4usize;
         let canonical: Vec<CanonicalPenalty> = Vec::new();
         let lambdas: Vec<f64> = Vec::new();
-        let inv = precompute_reparam_invariant_from_canonical(&canonical, p).expect("precompute invariant");
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p)
+            .expect("precompute invariant");
         let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
             .expect("stable reparam");
         assert_eq!(rep.u_truncated, Array2::<f64>::eye(p));
@@ -2511,7 +2536,8 @@ mod tests {
         let rs_list = vec![array![[inv_sqrt2, inv_sqrt2, 0.0]]];
         let canonical = canonical_from_roots(&rs_list, p);
         let lambdas = vec![4.0];
-        let inv = precompute_reparam_invariant_from_canonical(&canonical, p).expect("precompute invariant");
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p)
+            .expect("precompute invariant");
         let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
@@ -2561,7 +2587,8 @@ mod tests {
         let canonical = canonical_from_roots(&rs_list, p);
         let lambdas = vec![5.0];
 
-        let inv = precompute_reparam_invariant_from_canonical(&canonical, p).expect("precompute invariant");
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p)
+            .expect("precompute invariant");
         let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
             .expect("stable reparam");
 
@@ -2650,9 +2677,7 @@ mod tests {
         }
 
         // Dense eigendecomposition for reference logdet.
-        let (evals_dense, _) = s_dense
-            .eigh(faer::Side::Lower)
-            .unwrap();
+        let (evals_dense, _) = s_dense.eigh(faer::Side::Lower).unwrap();
         let tol = 1e-12;
         let ref_logdet: f64 = evals_dense
             .iter()

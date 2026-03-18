@@ -105,7 +105,10 @@ impl<'a> RemlState<'a> {
                 ridge_passport.penalty_logdet_ridge(),
             )?
         } else {
-            (Array1::zeros(rho.len()), Array2::zeros((rho.len(), rho.len())))
+            (
+                Array1::zeros(rho.len()),
+                Array2::zeros((rho.len(), rho.len())),
+            )
         };
 
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
@@ -726,17 +729,20 @@ impl<'a> RemlState<'a> {
         // Use pre-built canonical penalties in the transformed coordinate frame.
         // When constraint projection is active, project the roots into the free subspace.
         let p_eff = x_eff_dense.ncols();
-        let tk_penalties: Vec<crate::construction::CanonicalPenalty> =
-            if let Some(z) = free_basis_opt.as_ref() {
-                pirls_result
-                    .reparam_result
-                    .canonical_transformed
-                    .iter()
-                    .map(|cp| crate::construction::CanonicalPenalty::from_dense_root(cp.root.dot(z), p_eff))
-                    .collect()
-            } else {
-                pirls_result.reparam_result.canonical_transformed.clone()
-            };
+        let tk_penalties: Vec<crate::construction::CanonicalPenalty> = if let Some(z) =
+            free_basis_opt.as_ref()
+        {
+            pirls_result
+                .reparam_result
+                .canonical_transformed
+                .iter()
+                .map(|cp| {
+                    crate::construction::CanonicalPenalty::from_dense_root(cp.root.dot(z), p_eff)
+                })
+                .collect()
+        } else {
+            pirls_result.reparam_result.canonical_transformed.clone()
+        };
         let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
         let beta = if let Some(z) = free_basis_opt.as_ref() {
             z.t()
@@ -1497,6 +1503,7 @@ impl<'a> RemlState<'a> {
             let firth_op = Arc::new(Self::build_firth_dense_operator(
                 x_dense.as_ref(),
                 &pirls_result.final_eta,
+                self.weights,
             )?);
             log::info!(
                 "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
@@ -1712,6 +1719,7 @@ impl<'a> RemlState<'a> {
             Some(Arc::new(Self::build_firth_dense_operator(
                 x_dense.as_ref(),
                 &pirls_result.final_eta,
+                self.weights,
             )?))
         } else {
             None
@@ -2494,6 +2502,7 @@ impl<'a> RemlState<'a> {
                 Some(std::sync::Arc::new(Self::build_firth_dense_operator(
                     x_dense.as_ref(),
                     &pirls_result.final_eta,
+                    self.weights,
                 )?))
             }
         } else {
@@ -2692,9 +2701,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        use super::unified::{
-            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator,
-        };
+        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
@@ -2782,9 +2789,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        use super::unified::{
-            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator,
-        };
+        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
 
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
@@ -2892,7 +2897,9 @@ impl<'a> RemlState<'a> {
                     if kron.has_double_penalty {
                         // Global ridge penalty: identity in eigenbasis.
                         let identity_root = ndarray::Array2::<f64>::eye(total_dim);
-                        coords.push(super::unified::PenaltyCoordinate::from_dense_root(identity_root));
+                        coords.push(super::unified::PenaltyCoordinate::from_dense_root(
+                            identity_root,
+                        ));
                     }
                     coords
                 } else {
@@ -3077,7 +3084,7 @@ impl<'a> RemlState<'a> {
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             &e_for_logdet,
-            &[],  // block-local path via canonical_penalties is preferred
+            &[], // block-local path via canonical_penalties is preferred
             ridge_passport,
             mode,
         )?;
@@ -3112,11 +3119,11 @@ impl<'a> RemlState<'a> {
 
         // Build InnerSolution with ext_coords injected.
         let n_observations = self.y.len();
-        let penalty_coords: Vec<super::unified::PenaltyCoordinate> =
-            self.canonical_penalties
-                .iter()
-                .map(|cp| cp.to_penalty_coordinate())
-                .collect();
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> = self
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.to_penalty_coordinate())
+            .collect();
         let mut builder = InnerSolutionBuilder::new(
             log_likelihood,
             pirls_result.stable_penalty_term,

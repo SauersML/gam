@@ -6529,6 +6529,23 @@ fn maybe_initialize_aniso_contrasts(
     centers: ArrayView2<'_, f64>,
     aniso: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
+    fn center(eta: &[f64]) -> Vec<f64> {
+        if eta.len() <= 1 {
+            return eta.to_vec();
+        }
+        let mean = eta.iter().sum::<f64>() / eta.len() as f64;
+        eta.iter()
+            .map(|&v| {
+                let centered = v - mean;
+                if centered.abs() <= 1e-15 {
+                    0.0
+                } else {
+                    centered
+                }
+            })
+            .collect()
+    }
+
     let eta = match aniso {
         Some(v) if v.len() > 1 => v,
         Some(v) => return Some(v.to_vec()),
@@ -6536,13 +6553,13 @@ fn maybe_initialize_aniso_contrasts(
     };
     let all_zero = eta.iter().all(|&e| e == 0.0);
     if !all_zero {
-        return Some(eta.to_vec());
+        return Some(center(eta));
     }
     let contrasts = initial_aniso_contrasts(centers);
     if contrasts.is_empty() {
-        Some(eta.to_vec())
+        Some(center(eta))
     } else {
-        Some(contrasts)
+        Some(center(&contrasts))
     }
 }
 

@@ -980,7 +980,11 @@ pub fn build_survival_timewiggle_from_baseline(
         design_derivative_exit,
         penalties: {
             let p = combined_block.design.ncols();
-            combined_block.penalties.into_iter().map(|ps| ps.to_global(p)).collect()
+            combined_block
+                .penalties
+                .into_iter()
+                .map(|ps| ps.to_global(p))
+                .collect()
         },
         knots,
         degree: cfg.degree,
@@ -1040,21 +1044,22 @@ pub fn resolved_survival_time_basis_config(
             ),
             smooth_lambda: time_build.smooth_lambda.unwrap_or(1e-2),
         }),
-        "ispline" => Ok(SurvivalTimeBasisConfig::ISpline {
-            degree: time_build
-                .degree
-                .ok_or_else(|| "survival time basis is missing ispline degree".to_string())?,
-            knots: Array1::from_vec(
-                time_build
-                    .knots
-                    .clone()
-                    .ok_or_else(|| "survival time basis is missing ispline knots".to_string())?,
-            ),
-            keep_cols: time_build.keep_cols.clone().ok_or_else(|| {
-                "survival time basis is missing ispline keep_cols".to_string()
-            })?,
-            smooth_lambda: time_build.smooth_lambda.unwrap_or(1e-2),
-        }),
+        "ispline" => {
+            Ok(SurvivalTimeBasisConfig::ISpline {
+                degree: time_build
+                    .degree
+                    .ok_or_else(|| "survival time basis is missing ispline degree".to_string())?,
+                knots: Array1::from_vec(
+                    time_build.knots.clone().ok_or_else(|| {
+                        "survival time basis is missing ispline knots".to_string()
+                    })?,
+                ),
+                keep_cols: time_build.keep_cols.clone().ok_or_else(|| {
+                    "survival time basis is missing ispline keep_cols".to_string()
+                })?,
+                smooth_lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+            })
+        }
         other => Err(format!("unsupported survival time basis '{other}'")),
     }
 }
@@ -1134,12 +1139,7 @@ pub fn build_survival_time_monotonicity_collocation(
     }
     let grid_times = Array1::from_iter(log_grid.into_iter().map(f64::exp));
     let time_cfg = resolved_survival_time_basis_config(time_build)?;
-    let collocation_time = build_survival_time_basis(
-        &grid_times,
-        &grid_times,
-        time_cfg,
-        None,
-    )?;
+    let collocation_time = build_survival_time_basis(&grid_times, &grid_times, time_cfg, None)?;
     let (_, eta_grid, derivative_grid_offset) =
         build_survival_baseline_offsets(&grid_times, &grid_times, baseline_cfg)?;
     let mut derivative_design = collocation_time.x_derivative_time;
@@ -1229,13 +1229,10 @@ pub fn build_time_varying_survival_covariate_template(
     let mut deriv_buf = vec![0.0_f64; p_time];
     for i in 0..age_exit.len() {
         deriv_buf.fill(0.0);
-        evaluate_bspline_derivative_scalar(
-            log_exit[i],
-            knots.view(),
-            time_degree,
-            &mut deriv_buf,
-        )
-        .map_err(|e| format!("failed to evaluate {block_name} time-margin derivative basis: {e}"))?;
+        evaluate_bspline_derivative_scalar(log_exit[i], knots.view(), time_degree, &mut deriv_buf)
+            .map_err(|e| {
+                format!("failed to evaluate {block_name} time-margin derivative basis: {e}")
+            })?;
         let chain = 1.0 / age_exit[i].max(1e-12);
         for j in 0..p_time {
             time_design_derivative_exit[[i, j]] = deriv_buf[j] * chain;

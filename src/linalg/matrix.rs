@@ -1018,8 +1018,7 @@ impl BlockDesignOperator {
             (DesignBlock::Intercept(_), other) => {
                 let pj = other.ncols();
                 let mut cross = Array2::<f64>::zeros((1, pj));
-                let weighted =
-                    Array1::from_shape_fn(self.n, |idx| weights[idx].max(0.0));
+                let weighted = Array1::from_shape_fn(self.n, |idx| weights[idx].max(0.0));
                 let row = other.apply_transpose(&weighted);
                 cross.row_mut(0).assign(&row);
                 Ok(cross)
@@ -1467,7 +1466,7 @@ impl DesignOperator for ReparamDesignOperator {
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         // diag(X_new M X_new') = diag(X_inner (Q M Q') X_inner')
-        let qm = fast_ab(&self.q, middle);   // (p_inner, p_new)
+        let qm = fast_ab(&self.q, middle); // (p_inner, p_new)
         let qmqt = fast_ab(&qm, &self.q.t()); // (p_inner, p_inner)
         self.inner.quadratic_form_diag(&qmqt)
     }
@@ -1787,11 +1786,9 @@ impl TensorProductDesignOperator {
             // corresponding tail marginal products and row-sum.
             //
             // Zero-copy reshape: β is contiguous and q₁·tail_total = total_cols.
-            let beta_view = ndarray::ArrayView2::from_shape(
-                (q0, tail_total),
-                vector.as_slice().unwrap(),
-            )
-            .expect("β reshape for GEMM");
+            let beta_view =
+                ndarray::ArrayView2::from_shape((q0, tail_total), vector.as_slice().unwrap())
+                    .expect("β reshape for GEMM");
             let temp = fast_ab(b0.as_ref(), &beta_view); // (n, tail_total)
 
             let mut out = Array1::<f64>::zeros(n);
@@ -2548,11 +2545,12 @@ impl std::fmt::Debug for DesignMatrix {
         match self {
             Self::Dense(m) => write!(f, "DesignMatrix::Dense({}x{})", m.nrows(), m.ncols()),
             Self::Sparse(s) => write!(f, "DesignMatrix::Sparse({}x{})", s.nrows(), s.ncols()),
-            Self::Operator(op) => write!(f, "DesignMatrix::Operator({}x{})", op.nrows(), op.ncols()),
+            Self::Operator(op) => {
+                write!(f, "DesignMatrix::Operator({}x{})", op.nrows(), op.ncols())
+            }
         }
     }
 }
-
 
 /// A unified representation of a symmetric matrix, typically an assembled Hessian.
 #[derive(Clone, Debug)]
@@ -4086,8 +4084,22 @@ impl DesignMatrix {
         <Self as LinearOperator>::compute_xtwy(self, weights, y)
     }
 
+    pub fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        <Self as LinearOperator>::diag_gram(self, weights)
+    }
+
     pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         <Self as LinearOperator>::quadratic_form_diag(self, middle)
+    }
+
+    pub fn apply_weighted_normal(
+        &self,
+        weights: &Array1<f64>,
+        vector: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge: f64,
+    ) -> Array1<f64> {
+        <Self as LinearOperator>::apply_weighted_normal(self, weights, vector, penalty, ridge)
     }
 
     pub fn solve_system(
@@ -4522,11 +4534,8 @@ mod tests {
             b2[[i, j2 + 1]] = frac2;
         }
 
-        let op = TensorProductDesignOperator::new(vec![
-            Arc::new(b1.clone()),
-            Arc::new(b2.clone()),
-        ])
-        .unwrap();
+        let op = TensorProductDesignOperator::new(vec![Arc::new(b1.clone()), Arc::new(b2.clone())])
+            .unwrap();
 
         // Build dense reference via explicit Kronecker row products.
         let p = q1 * q2;
@@ -4541,22 +4550,34 @@ mod tests {
 
         // Test to_dense.
         let op_dense = op.to_dense();
-        let max_diff = (&op_dense - &dense).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let max_diff = (&op_dense - &dense)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-14, "to_dense mismatch: max_diff={max_diff}");
 
         // Test apply.
         let beta = Array1::from_vec((0..p).map(|j| (j as f64 + 1.0) * 0.1).collect());
         let ref_result = dense.dot(&beta);
         let op_result = op.apply(&beta);
-        let max_diff = (&op_result - &ref_result).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let max_diff = (&op_result - &ref_result)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-12, "apply mismatch: max_diff={max_diff}");
 
         // Test apply_transpose.
         let v = Array1::from_vec((0..n).map(|i| (i as f64 + 1.0) * 0.3).collect());
         let ref_xt_v = dense.t().dot(&v);
         let op_xt_v = op.apply_transpose(&v);
-        let max_diff = (&op_xt_v - &ref_xt_v).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-        assert!(max_diff < 1e-12, "apply_transpose mismatch: max_diff={max_diff}");
+        let max_diff = (&op_xt_v - &ref_xt_v)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_diff < 1e-12,
+            "apply_transpose mismatch: max_diff={max_diff}"
+        );
 
         // Test diag_xtw_x.
         let w = Array1::from_vec((0..n).map(|i| 1.0 + i as f64 * 0.1).collect());
@@ -4572,7 +4593,10 @@ mod tests {
             out
         };
         let op_xtwx = op.diag_xtw_x(&w).unwrap();
-        let max_diff = (&op_xtwx - &ref_xtwx).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let max_diff = (&op_xtwx - &ref_xtwx)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-10, "diag_xtw_x mismatch: max_diff={max_diff}");
     }
 
@@ -4616,15 +4640,24 @@ mod tests {
         }
 
         let op_dense = op.to_dense();
-        let max_diff = (&op_dense - &dense).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-        assert!(max_diff < 1e-14, "3D to_dense mismatch: max_diff={max_diff}");
+        let max_diff = (&op_dense - &dense)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_diff < 1e-14,
+            "3D to_dense mismatch: max_diff={max_diff}"
+        );
 
         // Test round-trip: apply then apply_transpose.
         let beta = Array1::from_vec((0..p).map(|j| (j as f64).sin()).collect());
         let xb = op.apply(&beta);
         let xtxb = op.apply_transpose(&xb);
         let ref_xtxb = dense.t().dot(&dense.dot(&beta));
-        let max_diff = (&xtxb - &ref_xtxb).iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let max_diff = (&xtxb - &ref_xtxb)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-10, "3D X'Xβ mismatch: max_diff={max_diff}");
     }
 }

@@ -70,7 +70,9 @@ fn conditional_prediction_backend<'a>(
     label: &str,
 ) -> Option<PredictionCovarianceBackend<'a>> {
     if let Some(hessian) = usable_penalized_hessian(fit, expected_dim, label) {
-        match PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(hessian.clone())) {
+        match PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(
+            hessian.clone(),
+        )) {
             Ok(backend) => return Some(backend),
             Err(err) => {
                 log::warn!(

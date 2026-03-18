@@ -221,14 +221,14 @@ impl SurvivalMarginalSlopeFamily {
         // through log() are meaningless — return a constant penalty instead.
         let time_deriv_term = if di > 0.0 {
             let ad1_val = ad1_jet.coeff(0);
-            if ad1_val > 1e-300 {
+            if ad1_val > 0.0 {
                 ad1_jet
                     .compose_unary(unary_derivatives_log(ad1_val))
                     .scale(-wi * di)
             } else {
-                // At the floor: log(1e-300) is a large negative constant, derivatives are zero
-                // because the constraint should push us away from here
-                MultiDirJet::constant(k, (-wi * di) * (1e-300_f64).ln())
+                return Err(format!(
+                    "survival marginal-slope monotonicity violated at row {row}: transformed time derivative={ad1_val:.3e} must be positive"
+                ));
             }
         } else {
             MultiDirJet::zero(k)
@@ -838,7 +838,8 @@ impl SurvivalMarginalSlopeFamily {
                 let (g, h) = self.row_primary_gradient_hessian(row, c);
                 (g.clone(), h.clone())
             } else {
-                let (_, g, h) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                let (_, g, h) =
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                 (g, h)
             };
             let third = self.row_primary_third_contracted(row, block_states, &dir)?;
@@ -922,7 +923,8 @@ impl SurvivalMarginalSlopeFamily {
                 let (g, h) = self.row_primary_gradient_hessian(row, c);
                 (g.clone(), h.clone())
             } else {
-                let (_, g, h) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                let (_, g, h) =
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                 (g, h)
             };
             let third_i = self.row_primary_third_contracted(row, block_states, &dir_i)?;
@@ -1567,7 +1569,7 @@ fn pooled_survival_baseline(event: &Array1<f64>, z: &Array1<f64>, weights: &Arra
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
-            compute_inference: true,
+            compute_inference: false,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: Vec::new(),

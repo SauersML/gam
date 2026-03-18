@@ -27,39 +27,20 @@ pub(crate) struct SigmaJet4 {
     pub d4: f64,
 }
 
-const SAFE_EXP_MIN_ETA: f64 = -700.0;
-const SAFE_EXP_MAX_ETA: f64 = 700.0;
-
-/// Overflow-safe exponential. Clamps the argument to the representable
-/// range of f64::exp, preventing Inf/NaN from propagating into
-/// downstream Hessian and gradient computations.  The clamp boundaries
-/// are just inside the IEEE 754 overflow/underflow thresholds
-/// (exp(709.78) ≈ 1.8e308, exp(−745.13) ≈ 5e−324) so this guard
-/// only activates when the mathematical result would be
-/// indistinguishable from +Inf or 0 in f64 arithmetic.
+/// Exact exponential link on the native `f64` range.
+///
+/// This matches `exp(eta)` itself: values remain finite throughout the true
+/// representable range, overflow to `+inf` only when `f64::exp` overflows, and
+/// underflow to `0.0` only when `f64::exp` underflows.
 #[inline]
 pub fn safe_exp(eta: f64) -> f64 {
-    eta.clamp(SAFE_EXP_MIN_ETA, SAFE_EXP_MAX_ETA).exp()
-}
-
-#[inline]
-fn safe_exp_active_derivative(eta: f64, sigma: f64) -> f64 {
-    if eta.is_nan() {
-        f64::NAN
-    } else if eta <= SAFE_EXP_MIN_ETA || eta >= SAFE_EXP_MAX_ETA {
-        0.0
-    } else {
-        sigma
-    }
+    eta.exp()
 }
 
 #[inline]
 pub fn exp_sigma_jet1_scalar(eta: f64) -> SigmaJet1 {
-    // Compute only sigma and first derivative directly, avoiding the
-    // unnecessary computation of d2/d3/d4 in exp_sigma_jet4_scalar.
     let sigma = safe_exp(eta);
-    let d1 = safe_exp_active_derivative(eta, sigma);
-    SigmaJet1 { sigma, d1 }
+    SigmaJet1 { sigma, d1: sigma }
 }
 
 #[inline]
@@ -116,13 +97,12 @@ pub fn exp_sigma_derivs_up_to_third(
 #[inline]
 pub(crate) fn exp_sigma_jet4_scalar(eta: f64) -> SigmaJet4 {
     let sigma = safe_exp(eta);
-    let deriv = safe_exp_active_derivative(eta, sigma);
     SigmaJet4 {
         sigma,
-        d1: deriv,
-        d2: deriv,
-        d3: deriv,
-        d4: deriv,
+        d1: sigma,
+        d2: sigma,
+        d3: sigma,
+        d4: sigma,
     }
 }
 

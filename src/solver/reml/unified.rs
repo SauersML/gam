@@ -1518,11 +1518,20 @@ impl PenaltyCoordinate {
     pub fn rank(&self) -> usize {
         match self {
             Self::DenseRoot(root) | Self::BlockRoot { root, .. } => root.nrows(),
-            Self::KroneckerMarginal { eigenvalues, dim_index, .. } => {
+            Self::KroneckerMarginal {
+                eigenvalues,
+                dim_index,
+                ..
+            } => {
                 // Rank = number of nonzero marginal eigenvalues for this dim,
                 // times the product of all other dims.
-                let nz = eigenvalues[*dim_index].iter().filter(|&&v| v.abs() > 1e-12).count();
-                let other: usize = eigenvalues.iter().enumerate()
+                let nz = eigenvalues[*dim_index]
+                    .iter()
+                    .filter(|&&v| v.abs() > 1e-12)
+                    .count();
+                let other: usize = eigenvalues
+                    .iter()
+                    .enumerate()
                     .filter(|&(j, _)| j != *dim_index)
                     .map(|(_, e)| e.len())
                     .product::<usize>()
@@ -1535,12 +1544,17 @@ impl PenaltyCoordinate {
     pub fn dim(&self) -> usize {
         match self {
             Self::DenseRoot(root) => root.ncols(),
-            Self::BlockRoot { total_dim, .. } | Self::KroneckerMarginal { total_dim, .. } => *total_dim,
+            Self::BlockRoot { total_dim, .. } | Self::KroneckerMarginal { total_dim, .. } => {
+                *total_dim
+            }
         }
     }
 
     pub fn uses_operator_fast_path(&self) -> bool {
-        matches!(self, Self::BlockRoot { .. } | Self::KroneckerMarginal { .. })
+        matches!(
+            self,
+            Self::BlockRoot { .. } | Self::KroneckerMarginal { .. }
+        )
     }
 
     fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
@@ -1552,7 +1566,9 @@ impl PenaltyCoordinate {
             } => root.dot(&beta.slice(ndarray::s![*start..*end])),
             Self::KroneckerMarginal { .. } => {
                 // No single root for Kronecker — use apply_penalty instead.
-                panic!("apply_root not supported for KroneckerMarginal; use apply_penalty directly");
+                panic!(
+                    "apply_root not supported for KroneckerMarginal; use apply_penalty directly"
+                );
             }
         }
     }
@@ -1594,8 +1610,13 @@ impl PenaltyCoordinate {
                 let d = marginal_dims.len();
                 let k = *dim_index;
                 let q_k = marginal_dims[k];
-                let stride_k: usize = marginal_dims[k + 1..].iter().copied().product::<usize>().max(1);
-                let outer_size: usize = marginal_dims[..k].iter().copied().product::<usize>().max(1);
+                let stride_k: usize = marginal_dims[k + 1..]
+                    .iter()
+                    .copied()
+                    .product::<usize>()
+                    .max(1);
+                let outer_size: usize =
+                    marginal_dims[..k].iter().copied().product::<usize>().max(1);
                 let inner_size = stride_k;
                 let eigs = &eigenvalues[k];
 
@@ -1634,8 +1655,13 @@ impl PenaltyCoordinate {
                 let d = marginal_dims.len();
                 let k = *dim_index;
                 let q_k = marginal_dims[k];
-                let stride_k: usize = marginal_dims[k + 1..].iter().copied().product::<usize>().max(1);
-                let outer_size: usize = marginal_dims[..k].iter().copied().product::<usize>().max(1);
+                let stride_k: usize = marginal_dims[k + 1..]
+                    .iter()
+                    .copied()
+                    .product::<usize>()
+                    .max(1);
+                let outer_size: usize =
+                    marginal_dims[..k].iter().copied().product::<usize>().max(1);
                 let inner_size = stride_k;
                 let eigs = &eigenvalues[k];
 
@@ -1688,8 +1714,13 @@ impl PenaltyCoordinate {
                 let d = marginal_dims.len();
                 let k = *dim_index;
                 let q_k = marginal_dims[k];
-                let stride_k: usize = marginal_dims[k + 1..].iter().copied().product::<usize>().max(1);
-                let outer_size: usize = marginal_dims[..k].iter().copied().product::<usize>().max(1);
+                let stride_k: usize = marginal_dims[k + 1..]
+                    .iter()
+                    .copied()
+                    .product::<usize>()
+                    .max(1);
+                let outer_size: usize =
+                    marginal_dims[..k].iter().copied().product::<usize>().max(1);
                 let eigs = &eigenvalues[k];
 
                 let mut out = Array2::<f64>::zeros((*total_dim, *total_dim));
@@ -1736,7 +1767,10 @@ impl PenaltyCoordinate {
 
     /// Whether this coordinate has block structure (not full-rank dense).
     pub fn is_block_local(&self) -> bool {
-        matches!(self, Self::BlockRoot { .. } | Self::KroneckerMarginal { .. })
+        matches!(
+            self,
+            Self::BlockRoot { .. } | Self::KroneckerMarginal { .. }
+        )
     }
 
     /// Apply λ_k S_k to a vector v without materializing the full matrix.
@@ -1801,8 +1835,13 @@ impl PenaltyCoordinate {
                 // tr(M · diag(μ)) = Σ_i μ_i M_{ii}  (penalty is diagonal in eigenbasis)
                 let k = *dim_index;
                 let q_k = marginal_dims[k];
-                let stride_k: usize = marginal_dims[k + 1..].iter().copied().product::<usize>().max(1);
-                let outer_size: usize = marginal_dims[..k].iter().copied().product::<usize>().max(1);
+                let stride_k: usize = marginal_dims[k + 1..]
+                    .iter()
+                    .copied()
+                    .product::<usize>()
+                    .max(1);
+                let outer_size: usize =
+                    marginal_dims[..k].iter().copied().product::<usize>().max(1);
                 let eigs = &eigenvalues[k];
 
                 let mut trace = 0.0;
@@ -3377,8 +3416,7 @@ fn compute_outer_hessian(
                 // Diagonal: Ḧ_{kk} = Aₖ + correction(β_{kk}, vₖ, vₖ)
                 // Base is tr(G_ε Aₖ), NOT tr(G_ε Ḣₖ).
                 let base = if solution.penalty_coords[kk].is_block_local() {
-                    let (block, start, end) =
-                        solution.penalty_coords[kk].scaled_block_local(1.0);
+                    let (block, start, end) = solution.penalty_coords[kk].scaled_block_local(1.0);
                     hop.trace_logdet_block_local(&block, lambdas[kk], start, end)
                 } else {
                     hop.trace_logdet_gradient(&a_k_matrices[kk])
@@ -3510,7 +3548,8 @@ fn compute_outer_hessian(
                         solution.ext_coords[ext_idx].drift.apply(&v_ks[rho_idx])
                     };
                     let mut rhs = ext_h_v_rho;
-                    rhs += &solution.penalty_coords[rho_idx].scaled_matvec(&ext_v[ext_idx], lambdas[rho_idx]);
+                    rhs += &solution.penalty_coords[rho_idx]
+                        .scaled_matvec(&ext_v[ext_idx], lambdas[rho_idx]);
                     rhs -= &pair.g;
 
                     // Ḧ_{rho,ext}: second Hessian drift.
@@ -5641,13 +5680,12 @@ pub fn compute_block_penalty_logdet_derivs(
         } else {
             &[]
         };
-        let structural_nullity = if !block_nullspace_dims.is_empty()
-            && block_nullspace_dims.len() == penalties.len()
-        {
-            Some(exact_intersection_nullity(penalties, block_nullspace_dims))
-        } else {
-            None
-        };
+        let structural_nullity =
+            if !block_nullspace_dims.is_empty() && block_nullspace_dims.len() == penalties.len() {
+                Some(exact_intersection_nullity(penalties, block_nullspace_dims))
+            } else {
+                None
+            };
 
         // Single eigendecomposition via canonical PenaltyPseudologdet.
         let pld = PenaltyPseudologdet::from_components_with_nullity(

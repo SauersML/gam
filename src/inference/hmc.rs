@@ -24,8 +24,8 @@
 //! sharing across chains without duplication when general-mcmc clones the target.
 
 use super::polya_gamma::PolyaGamma;
-use crate::estimate::reml::FirthDenseOperator;
 use crate::construction::CanonicalPenalty;
+use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
 use crate::types::LikelihoodFamily;
 use crate::visualizer::VisualizerSession;

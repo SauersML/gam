@@ -1,5 +1,6 @@
 use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
+use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_matmut,
     array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
@@ -1566,9 +1567,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                         })?;
                         compute_firth_hat_and_half_logdet_sparse(
                             csr,
-                            weights.view(),
-                            &mut self.workspace,
-                            Some(&self.s_transformed),
+                            self.workspace.eta_buf.view(),
+                            self.priorweights,
                         )?
                     } else {
                         let x_dense = x_transformed.as_dense().ok_or_else(|| {
@@ -1578,9 +1578,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                         })?;
                         compute_firth_hat_and_half_logdet(
                             x_dense.view(),
-                            weights.view(),
-                            &mut self.workspace,
-                            Some(&self.s_transformed),
+                            self.workspace.eta_buf.view(),
+                            self.priorweights,
                         )?
                     }
                 }
@@ -1592,9 +1591,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     let x_t_dense = fast_ab(&self.x_original.to_dense(), qs);
                     compute_firth_hat_and_half_logdet(
                         x_t_dense.view(),
-                        weights.view(),
-                        &mut self.workspace,
-                        Some(&self.s_transformed),
+                        self.workspace.eta_buf.view(),
+                        self.priorweights,
                     )?
                 }
                 WorkingCoordinateDesign::OriginalSparseNative => {
@@ -1607,9 +1605,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                         })?;
                         compute_firth_hat_and_half_logdet_sparse(
                             csr,
-                            weights.view(),
-                            &mut self.workspace,
-                            Some(&self.s_transformed),
+                            self.workspace.eta_buf.view(),
+                            self.priorweights,
                         )?
                     } else {
                         let x_dense = self
@@ -1620,9 +1617,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             .map_err(EstimationError::InvalidInput)?;
                         compute_firth_hat_and_half_logdet(
                             x_dense.view(),
-                            weights.view(),
-                            &mut self.workspace,
-                            Some(&self.s_transformed),
+                            self.workspace.eta_buf.view(),
+                            self.priorweights,
                         )?
                     }
                 }
@@ -1886,50 +1882,14 @@ fn sparse_xtwx_par(ncols: usize) -> Par {
 
 fn compute_firth_hat_and_half_logdet_sparse(
     x_design_csr: &SparseRowMat<usize, f64>,
-    weights: ArrayView1<f64>,
-    workspace: &mut PirlsWorkspace,
-    s_transformed: Option<&Array2<f64>>,
+    eta: ArrayView1<f64>,
+    observation_weights: ArrayView1<f64>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
-    // This routine computes the Firth hat diagonal and 0.5*log|X^T W X|
-    // for a *specific* design matrix. It must be called with the same
-    // design basis used by PIRLS (transformed if reparameterized).
     let n = x_design_csr.nrows();
     let p = x_design_csr.ncols();
-
-    // Use efficient faer sparse multiplication
-    let xtwx_transformed =
-        workspace.computehessian_sparse_faer(x_design_csr, &weights.to_owned())?;
-
-    let mut stabilized = xtwx_transformed.clone();
-    if let Some(s) = s_transformed {
-        stabilized += s;
-    }
-    #[cfg(debug_assertions)]
-    debug_assert_symmetric_tol(&stabilized, "Firth Fisher information (sparse)", 1e-8);
-    // Firth correction for GAMs uses the penalized Fisher information (X' W X + S).
-    ensure_positive_definitewith_label(&mut stabilized, "Firth Fisher information")?;
-
-    let chol = stabilized.cholesky(Side::Lower).map_err(|_| {
-        EstimationError::HessianNotPositiveDefinite {
-            min_eigenvalue: f64::NEG_INFINITY,
-        }
-    })?;
-    let half_log_det = chol.diag().mapv(f64::ln).sum();
-
-    let mut identity = Array2::<f64>::zeros((p, p));
-    for i in 0..p {
-        identity[[i, i]] = 1.0;
-    }
-    chol.solve_mat_in_place(&mut identity);
-    let h_inv_arr = identity;
-
-    let mut hat_diag = Array1::<f64>::zeros(n);
+    let mut x_dense = Array2::<f64>::zeros((n, p));
     let xview = x_design_csr.as_ref();
     for i in 0..n {
-        let w = weights[i];
-        if w <= 0.0 {
-            continue;
-        }
         let vals = xview.val_of_row(i);
         let cols = xview.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
@@ -1937,95 +1897,24 @@ fn compute_firth_hat_and_half_logdet_sparse(
                 "sparse row structure mismatch: column/value lengths differ".to_string(),
             ));
         }
-        let mut quad = 0.0;
-        for (idx_a, &col_a) in cols.iter().enumerate() {
-            let val_a = vals[idx_a];
-            let col_a = col_a.unbound();
-            for (idx_b, &col_b) in cols.iter().enumerate() {
-                let val_b = vals[idx_b];
-                let col_b = col_b.unbound();
-                quad += val_a * h_inv_arr[[col_a, col_b]] * val_b;
-            }
+        for (idx, &col) in cols.iter().enumerate() {
+            x_dense[[i, col.unbound()]] = vals[idx];
         }
-        hat_diag[i] = w * quad;
     }
-
-    Ok((hat_diag, half_log_det))
+    compute_firth_hat_and_half_logdet(x_dense.view(), eta, observation_weights)
 }
 
 fn compute_firth_hat_and_half_logdet(
     x_design: ArrayView2<f64>,
-    weights: ArrayView1<f64>,
-    workspace: &mut PirlsWorkspace,
-    s_transformed: Option<&Array2<f64>>,
+    eta: ArrayView1<f64>,
+    observation_weights: ArrayView1<f64>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
-    let n = x_design.nrows();
-    let p = x_design.ncols();
-
-    workspace.fill_sqrtweights(&weights);
-    let mut stabilized = Array2::<f64>::zeros((p, p).f());
-    PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
-        &workspace.sqrtw,
-        &mut workspace.weighted_x_chunk,
-        &x_design,
-        &mut stabilized,
-        get_global_parallelism(),
-    );
-    if let Some(s) = s_transformed {
-        stabilized += s;
-    }
-    #[cfg(debug_assertions)]
-    debug_assert_symmetric_tol(&stabilized, "Firth Fisher information (dense)", 1e-8);
-    ensure_positive_definitewith_label(&mut stabilized, "Firth Fisher information")?;
-
-    let chol = stabilized.cholesky(Side::Lower).map_err(|_| {
-        EstimationError::HessianNotPositiveDefinite {
-            min_eigenvalue: f64::NEG_INFINITY,
-        }
-    })?;
-    let half_log_det = chol.diag().mapv(f64::ln).sum();
-
-    let mut hat_diag = Array1::<f64>::zeros(n);
-    if n > 0 && p > 0 {
-        // Compute hat diagonal exactly with batched solves of H * X = W^{1/2}X^T.
-        // This avoids materializing full P x N transpose/result matrices.
-        const FIRTH_HAT_TARGET_ELEMS: usize = (256 * 1024) / std::mem::size_of::<f64>();
-        let batch_cols = (FIRTH_HAT_TARGET_ELEMS / p).clamp(1, n);
-
-        if workspace.scaled_matrix.nrows() != p || workspace.scaled_matrix.ncols() != batch_cols {
-            workspace.scaled_matrix = Array2::zeros((p, batch_cols));
-        }
-        if workspace.final_aug_matrix.nrows() != p
-            || workspace.final_aug_matrix.ncols() != batch_cols
-        {
-            workspace.final_aug_matrix = Array2::zeros((p, batch_cols));
-        }
-
-        for col_start in (0..n).step_by(batch_cols) {
-            let cols_this = (n - col_start).min(batch_cols);
-
-            for local_col in 0..cols_this {
-                let obs = col_start + local_col;
-                let sqrtw = workspace.sqrtw[obs];
-                for k in 0..p {
-                    workspace.scaled_matrix[[k, local_col]] = x_design[[obs, k]] * sqrtw;
-                }
-            }
-
-            chol.solve_mat_into(&workspace.scaled_matrix, &mut workspace.final_aug_matrix);
-
-            for local_col in 0..cols_this {
-                let mut acc = 0.0;
-                for k in 0..p {
-                    acc += workspace.final_aug_matrix[[k, local_col]]
-                        * workspace.scaled_matrix[[k, local_col]];
-                }
-                hat_diag[col_start + local_col] = acc;
-            }
-        }
-    }
-
-    Ok((hat_diag, half_log_det))
+    let op = FirthDenseOperator::build_with_observation_weights(
+        &x_design.to_owned(),
+        &eta.to_owned(),
+        observation_weights,
+    )?;
+    Ok((op.pirls_hat_diag(), op.jeffreys_logdet()))
 }
 
 pub(crate) fn ensure_positive_definitewith_label(
@@ -2219,12 +2108,7 @@ fn should_use_sparse_native_pirls(
     s_lambda: &Array2<f64>,
     linear_constraints_original: Option<&LinearInequalityConstraints>,
 ) -> SparsePirlsDecision {
-    estimate_sparse_native_decision(
-        workspace,
-        x_original,
-        s_lambda,
-        linear_constraints_original,
-    )
+    estimate_sparse_native_decision(workspace, x_original, s_lambda, linear_constraints_original)
 }
 
 pub(crate) fn sparse_reml_penalized_hessian(
@@ -4533,23 +4417,21 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             lambdas_slice,
             penalty.p,
         );
-        (
-            PirlsCoordinateFrame::OriginalSparseNative,
-            sparse_reparam,
-        )
+        (PirlsCoordinateFrame::OriginalSparseNative, sparse_reparam)
     } else {
         // Lazy composition: do NOT materialize X·Qs.  The GamWorkingModel
         // will use TransformedImplicit to apply Qs on the coefficient side.
-        (
-            PirlsCoordinateFrame::TransformedQs,
-            reparam_result.clone(),
-        )
+        (PirlsCoordinateFrame::TransformedQs, reparam_result.clone())
     };
 
     if matches!(link_function, LinkFunction::Identity) {
         let (pls_result, _) = solve_penalized_least_squares_implicit(
             &x_original,
-            if use_sparse_native { None } else { Some(&qs_arc) },
+            if use_sparse_native {
+                None
+            } else {
+                Some(&qs_arc)
+            },
             y,
             priorweights,
             offset,
@@ -4588,16 +4470,18 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         } else {
             fast_atv(&qs_arc, &xt_wr)
         };
-        let s_beta = reparam_result_active.s_transformed.dot(beta_transformed.as_ref());
+        let s_beta = reparam_result_active
+            .s_transformed
+            .dot(beta_transformed.as_ref());
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
         let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
         let ridge_used = baseridge;
         let stabilizedhessian = if ridge_used > 0.0 {
-            penalized_hessian.addridge(ridge_used).map_err(|e| {
-                EstimationError::InvalidInput(format!("ridge addition failed: {e}"))
-            })?
+            penalized_hessian
+                .addridge(ridge_used)
+                .map_err(|e| EstimationError::InvalidInput(format!("ridge addition failed: {e}")))?
         } else {
             penalized_hessian.clone()
         };
@@ -4709,7 +4593,11 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 &config.link_kind,
                 InverseLink::Standard(LinkFunction::Logit)
             ),
-        if use_sparse_native { None } else { Some((*qs_arc).clone()) },
+        if use_sparse_native {
+            None
+        } else {
+            Some((*qs_arc).clone())
+        },
         quadctx,
     );
 
@@ -4852,11 +4740,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     // Store a lazy ReparamOperator instead of materializing X·Qs.
     // Consumers that truly need dense access can call .to_dense() on demand.
-    let x_transformed_final = make_reparam_operator(
-        &x_original_for_result,
-        &qs_arc,
-        use_sparse_native,
-    );
+    let x_transformed_final =
+        make_reparam_operator(&x_original_for_result, &qs_arc, use_sparse_native);
 
     let pirls_result = assemble_pirls_result(
         &working_summary,
@@ -4974,9 +4859,16 @@ fn solve_penalized_least_squares_implicit(
 
             // 1. Sparse penalized Hessian: H = X'diag(w)X + S_λ + ridge·I
             let (h_sparse, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
-                let ridge = if ridge == 0.0 { FIXED_STABILIZATION_RIDGE } else { ridge };
+                let ridge = if ridge == 0.0 {
+                    FIXED_STABILIZATION_RIDGE
+                } else {
+                    ridge
+                };
                 workspace.assemble_sparse_penalized_hessian(
-                    x_sparse, &weights_owned, s_transformed, ridge,
+                    x_sparse,
+                    &weights_owned,
+                    s_transformed,
+                    ridge,
                 )
             })?;
 
@@ -5004,8 +4896,11 @@ fn solve_penalized_least_squares_implicit(
             let standard_deviation = match link_function {
                 LinkFunction::Identity => {
                     let residuals = &y - &fitted_vals;
-                    let weighted_rss: f64 = weights.iter().zip(residuals.iter())
-                        .map(|(&w, &r)| w * r * r).sum();
+                    let weighted_rss: f64 = weights
+                        .iter()
+                        .zip(residuals.iter())
+                        .map(|(&w, &r)| w * r * r)
+                        .sum();
                     let effective_n = y.len() as f64;
                     (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
                 }
@@ -6524,17 +6419,7 @@ pub fn fisher_weight_dispatch(
         }
         _ => {
             let vj = variance_jet_for_weight_family(family, mu);
-            observed_weight_noncanonical(
-                mu,
-                mu,
-                jet.d1,
-                jet.d2,
-                jet.d3,
-                0.0,
-                vj,
-                phi,
-                prior_weight,
-            )
+            observed_weight_noncanonical(mu, mu, jet.d1, jet.d2, jet.d3, 0.0, vj, phi, prior_weight)
         }
     }
 }
@@ -6698,13 +6583,11 @@ pub fn calculate_deviance(
                     });
             2.0 * total_residual
         }
-        GlmLikelihoodFamily::GaussianIdentity => {
-            ndarray::Zip::from(y)
-                .and(mu)
-                .and(priorweights)
-                .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
-                .sum()
-        }
+        GlmLikelihoodFamily::GaussianIdentity => ndarray::Zip::from(y)
+            .and(mu)
+            .and(priorweights)
+            .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
+            .sum(),
         GlmLikelihoodFamily::PoissonLog => {
             let total =
                 ndarray::Zip::from(y)
@@ -6766,21 +6649,25 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 let mui_c = mui.clamp(EPS, 1.0 - EPS);
                 acc + wi * (yi * mui_c.ln() + (1.0 - yi) * (1.0 - mui_c).ln())
             }),
-        GlmLikelihoodFamily::PoissonLog => ndarray::Zip::from(y)
-            .and(mu)
-            .and(priorweights)
-            .fold(0.0, |acc, &yi, &mui, &wi| {
-                let mui_c = mui.max(EPS);
-                let log_term = if yi > 0.0 { yi * mui_c.ln() } else { 0.0 };
-                acc + wi * (log_term - mui_c)
-            }),
-        GlmLikelihoodFamily::GammaLog => ndarray::Zip::from(y)
-            .and(mu)
-            .and(priorweights)
-            .fold(0.0, |acc, &yi, &mui, &wi| {
-                let mui_c = mui.max(EPS);
-                acc + wi * likelihood.gamma_shape().unwrap_or(1.0) * (-mui_c.ln() - yi / mui_c)
-            }),
+        GlmLikelihoodFamily::PoissonLog => {
+            ndarray::Zip::from(y)
+                .and(mu)
+                .and(priorweights)
+                .fold(0.0, |acc, &yi, &mui, &wi| {
+                    let mui_c = mui.max(EPS);
+                    let log_term = if yi > 0.0 { yi * mui_c.ln() } else { 0.0 };
+                    acc + wi * (log_term - mui_c)
+                })
+        }
+        GlmLikelihoodFamily::GammaLog => {
+            ndarray::Zip::from(y)
+                .and(mu)
+                .and(priorweights)
+                .fold(0.0, |acc, &yi, &mui, &wi| {
+                    let mui_c = mui.max(EPS);
+                    acc + wi * likelihood.gamma_shape().unwrap_or(1.0) * (-mui_c.ln() - yi / mui_c)
+                })
+        }
     }
 }
 
@@ -6815,11 +6702,12 @@ fn calculate_edf(
     let rhs_arr = e_transformed.t().to_owned();
     // Use SymmetricMatrix::factorize() which dispatches to sparse Cholesky
     // for sparse Hessians and dense Cholesky for dense ones.
-    let factor = penalized_hessian
-        .factorize()
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
+    let factor =
+        penalized_hessian
+            .factorize()
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
     let sol = factor
         .solvemulti(&rhs_arr)
         .map_err(|_| EstimationError::ModelIsIllConditioned {
@@ -7266,17 +7154,20 @@ mod tests {
         let rho = Array1::<f64>::zeros(1);
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let rs = vec![array![[1.0]]];
-        let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
-            let local = r.t().dot(r);
-            crate::construction::CanonicalPenalty {
-                root: r.clone(),
-                col_range: 0..r.ncols(),
-                total_dim: r.ncols(),
-                nullity: 0,
-                local,
-                positive_eigenvalues: Vec::new(),
-            }
-        }).collect();
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs
+            .iter()
+            .map(|r| {
+                let local = r.t().dot(r);
+                crate::construction::CanonicalPenalty {
+                    root: r.clone(),
+                    col_range: 0..r.ncols(),
+                    total_dim: r.ncols(),
+                    nullity: 0,
+                    local,
+                    positive_eigenvalues: Vec::new(),
+                }
+            })
+            .collect();
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
@@ -7423,17 +7314,20 @@ mod tests {
         let offset = Array1::zeros(4);
         let rho = array![0.0];
         let rs = vec![array![[1.0]]];
-        let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
-            let local = r.t().dot(r);
-            crate::construction::CanonicalPenalty {
-                root: r.clone(),
-                col_range: 0..r.ncols(),
-                total_dim: r.ncols(),
-                nullity: 0,
-                local,
-                positive_eigenvalues: Vec::new(),
-            }
-        }).collect();
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs
+            .iter()
+            .map(|r| {
+                let local = r.t().dot(r);
+                crate::construction::CanonicalPenalty {
+                    root: r.clone(),
+                    col_range: 0..r.ncols(),
+                    total_dim: r.ncols(),
+                    nullity: 0,
+                    local,
+                    positive_eigenvalues: Vec::new(),
+                }
+            })
+            .collect();
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::PoissonLog),
             link_kind: InverseLink::Standard(LinkFunction::Log),
@@ -7799,17 +7693,20 @@ mod root_cause_tests {
         let rho = array![0.0]; // log(lambda) = 0, so lambda = 1
         // Penalty on the second coefficient only (leave intercept unpenalized).
         let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
-        let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
-            let local = r.t().dot(r);
-            crate::construction::CanonicalPenalty {
-                root: r.clone(),
-                col_range: 0..r.ncols(),
-                total_dim: r.ncols(),
-                nullity: 0,
-                local,
-                positive_eigenvalues: Vec::new(),
-            }
-        }).collect();
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs
+            .iter()
+            .map(|r| {
+                let local = r.t().dot(r);
+                crate::construction::CanonicalPenalty {
+                    root: r.clone(),
+                    col_range: 0..r.ncols(),
+                    total_dim: r.ncols(),
+                    nullity: 0,
+                    local,
+                    positive_eigenvalues: Vec::new(),
+                }
+            })
+            .collect();
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
             link_kind: InverseLink::Standard(LinkFunction::Identity),
@@ -7872,17 +7769,20 @@ mod root_cause_tests {
         let offset = Array1::zeros(n);
         let rho = array![0.0];
         let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
-        let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
-            let local = r.t().dot(r);
-            crate::construction::CanonicalPenalty {
-                root: r.clone(),
-                col_range: 0..r.ncols(),
-                total_dim: r.ncols(),
-                nullity: 0,
-                local,
-                positive_eigenvalues: Vec::new(),
-            }
-        }).collect();
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs
+            .iter()
+            .map(|r| {
+                let local = r.t().dot(r);
+                crate::construction::CanonicalPenalty {
+                    root: r.clone(),
+                    col_range: 0..r.ncols(),
+                    total_dim: r.ncols(),
+                    nullity: 0,
+                    local,
+                    positive_eigenvalues: Vec::new(),
+                }
+            })
+            .collect();
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
@@ -7965,17 +7865,20 @@ mod root_cause_tests {
                 array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
                 array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
             ];
-            let canonical: Vec<crate::construction::CanonicalPenalty> = rs.iter().map(|r| {
-                let local = r.t().dot(r);
-                crate::construction::CanonicalPenalty {
-                    root: r.clone(),
-                    col_range: 0..r.ncols(),
-                    total_dim: r.ncols(),
-                    nullity: 0,
-                    local,
-                    positive_eigenvalues: Vec::new(),
-                }
-            }).collect();
+            let canonical: Vec<crate::construction::CanonicalPenalty> = rs
+                .iter()
+                .map(|r| {
+                    let local = r.t().dot(r);
+                    crate::construction::CanonicalPenalty {
+                        root: r.clone(),
+                        col_range: 0..r.ncols(),
+                        total_dim: r.ncols(),
+                        nullity: 0,
+                        local,
+                        positive_eigenvalues: Vec::new(),
+                    }
+                })
+                .collect();
             let config = PirlsConfig {
                 likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
                 link_kind: InverseLink::Standard(LinkFunction::Logit),

@@ -191,8 +191,9 @@ impl<'a> RemlState<'a> {
     pub(super) fn build_firth_dense_operator(
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
+        observation_weights: ndarray::ArrayView1<'_, f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
-        FirthDenseOperator::build(x_dense, eta)
+        FirthDenseOperator::build_with_observation_weights(x_dense, eta, observation_weights)
     }
 
     pub(super) fn firth_exact_tau_kernel(
@@ -228,6 +229,11 @@ impl FirthDenseOperator {
         observation_weights: ndarray::ArrayView1<'_, f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
         Self::build_with_observation_weights_impl(x_dense, eta, Some(observation_weights))
+    }
+
+    #[inline]
+    pub(crate) fn pirls_hat_diag(&self) -> Array1<f64> {
+        &self.w * &self.h_diag
     }
 
     fn build_with_observation_weights_impl(

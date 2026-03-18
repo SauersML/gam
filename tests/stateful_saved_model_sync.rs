@@ -3,7 +3,10 @@ use gam::estimate::{
 };
 use gam::inference::model::{FittedFamily, FittedModel, FittedModelPayload, ModelKind};
 use gam::pirls::PirlsStatus;
-use gam::types::{LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization, SasLinkState};
+use gam::types::{
+    LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization,
+    SasLinkState,
+};
 use ndarray::{Array1, Array2};
 use tempfile::tempdir;
 

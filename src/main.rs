@@ -51,10 +51,6 @@ use gam::inference::formula_dsl::{
     parse_linkwiggle_formulaspec, parse_matching_auxiliary_formula, parse_surv_response,
     validate_auxiliary_formula_controls,
 };
-use gam::term_builder::{
-    build_termspec, enable_scale_dimensions, heuristic_knots, heuristic_knots_for_column,
-    parse_duchon_order, parse_duchon_power, unique_count_column,
-};
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
     ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
@@ -75,9 +71,8 @@ use gam::smooth::{
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
-    SurvivalTimeBasisConfig, append_survival_timewiggle_columns,
-    build_survival_baseline_offsets, build_survival_time_basis,
-    build_survival_time_monotonicity_collocation,
+    SurvivalTimeBasisConfig, append_survival_timewiggle_columns, build_survival_baseline_offsets,
+    build_survival_time_basis, build_survival_time_monotonicity_collocation,
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, evaluate_survival_baseline,
     normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
@@ -91,6 +86,10 @@ use gam::survival_location_scale::{
     residual_distribution_inverse_link,
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
+use gam::term_builder::{
+    build_termspec, enable_scale_dimensions, heuristic_knots, heuristic_knots_for_column,
+    parse_duchon_order, parse_duchon_power, unique_count_column,
+};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
@@ -455,7 +454,6 @@ enum PredictModeArg {
 #[derive(Clone, Debug)]
 
 const MODEL_VERSION: u32 = 2;
-
 
 struct CliFirthValidation<'a> {
     enabled: bool,
@@ -931,7 +929,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 effective_link,
                 LinkFunction::Sas | LinkFunction::BetaLogistic
             ),
-        compute_inference: true,
+        compute_inference: false,
         max_iter: fit_max_iter,
         tol: fit_tol,
         nullspace_dims: vec![],
@@ -998,7 +996,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 optimize_mixture: true,
                 sas_link: None,
                 optimize_sas: false,
-                compute_inference: true,
+                compute_inference: false,
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
@@ -1874,11 +1872,7 @@ fn build_predict_input_for_model(
             let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
                 let pred_d_dense = design.design.as_dense_cow();
                 let pred_dn_dense = design_noise_raw.design.as_dense_cow();
-                apply_scale_deviation_transform(
-                    &pred_d_dense,
-                    &pred_dn_dense,
-                    transform,
-                )?
+                apply_scale_deviation_transform(&pred_d_dense, &pred_dn_dense, transform)?
             } else {
                 design_noise_raw.design.to_dense()
             };
@@ -2324,11 +2318,7 @@ fn run_predict_survival(
             .assign(&dense_threshold_design);
         let dense_raw_sigma = raw_sigma_design.design.to_dense();
         let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-            apply_scale_deviation_transform(
-                &survival_primary_design,
-                &dense_raw_sigma,
-                transform,
-            )?
+            apply_scale_deviation_transform(&survival_primary_design, &dense_raw_sigma, transform)?
         } else {
             dense_raw_sigma
         };
@@ -2336,7 +2326,10 @@ fn run_predict_survival(
             .beta_link_wiggle
             .as_ref()
             .map(|v| Array1::from_vec(v.clone()));
-        let link_wiggle_knots = model.linkwiggle_knots.as_ref().map(|k| Array1::from_vec(k.clone()));
+        let link_wiggle_knots = model
+            .linkwiggle_knots
+            .as_ref()
+            .map(|k| Array1::from_vec(k.clone()));
         let link_wiggle_degree = model.linkwiggle_degree;
         let pred_input = SurvivalLocationScalePredictInput {
             x_time_exit: x_time_exit,
@@ -3276,7 +3269,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 optimize_mixture: false,
                 sas_link: None,
                 optimize_sas: false,
-                compute_inference: true,
+                compute_inference: false,
                 max_iter: 80,
                 tol: 1e-6,
                 nullspace_dims: design.nullspace_dims.clone(),
@@ -3362,8 +3355,6 @@ fn build_survival_feasible_initial_beta(
     beta
 }
 
-
-
 fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
     model.has_baseline_time_wiggle()
 }
@@ -3380,7 +3371,6 @@ fn saved_baseline_timewiggle_spec(
         })
     })
 }
-
 
 fn apply_saved_linkwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
     match model.saved_link_wiggle()? {
@@ -3771,18 +3761,18 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     )?;
     let time_monotonicity_collocation =
         if !survival_basis_supports_structural_monotonicity(&time_build.basisname) {
-        Some(build_survival_time_monotonicity_collocation(
-            &age_entry,
-            &age_exit,
-            &time_build,
-            &baseline_cfg,
-            timewiggle_build
-                .as_ref()
-                .map(|wiggle| (&wiggle.knots, wiggle.degree)),
-        )?)
-    } else {
-        None
-    };
+            Some(build_survival_time_monotonicity_collocation(
+                &age_entry,
+                &age_exit,
+                &time_build,
+                &baseline_cfg,
+                timewiggle_build
+                    .as_ref()
+                    .map(|wiggle| (&wiggle.knots, wiggle.degree)),
+            )?)
+        } else {
+            None
+        };
     progress.advance_workflow(2);
     if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         require_structural_survival_time_basis(&time_build.basisname, "survival fitting")?;
@@ -3855,7 +3845,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 weights: weights.clone(),
                 inverse_link,
                 derivative_guard: 0.0,
-                derivative_softness: 1e-6,
+                derivative_softness: 0.0,
                 time_anchor: args.survival_time_anchor,
                 max_iter: 400,
                 tol: 1e-6,
@@ -3872,11 +3862,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     constraint_derivative_offset: time_monotonicity_collocation
                         .as_ref()
                         .map(|(_, offsets)| offsets.clone()),
-                penalties: time_penalties.clone(),
-                nullspace_dims: time_nullspace_dims.clone(),
-                initial_log_lambdas: time_initial_log_lambdas.clone(),
-                initial_beta: Some(Array1::zeros(time_design_exit.ncols())),
-            },
+                    penalties: time_penalties.clone(),
+                    nullspace_dims: time_nullspace_dims.clone(),
+                    initial_log_lambdas: time_initial_log_lambdas.clone(),
+                    initial_beta: Some(Array1::zeros(time_design_exit.ncols())),
+                },
                 thresholdspec: termspec.clone(),
                 log_sigmaspec: log_sigmaspec.clone(),
                 threshold_template: threshold_template.clone(),
@@ -3996,10 +3986,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_beta_log_sigma = Some(fit.fit.fit.beta_log_sigma().to_vec());
             let dense_fit_threshold = fit.fit.threshold_design.design.to_dense();
             let dense_fit_log_sigma = fit.fit.log_sigma_design.design.to_dense();
-            let mut survival_primary_design = Array2::<f64>::zeros((
-                n,
-                time_design_exit.ncols() + dense_fit_threshold.ncols(),
-            ));
+            let mut survival_primary_design =
+                Array2::<f64>::zeros((n, time_design_exit.ncols() + dense_fit_threshold.ncols()));
             survival_primary_design
                 .slice_mut(s![.., 0..time_design_exit.ncols()])
                 .assign(&time_design_exit);
@@ -4183,15 +4171,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let penalties = PenaltyBlocks::new(penalty_blocks.clone());
 
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
-    let full_time_monotonicity_collocation = time_monotonicity_collocation
-        .as_ref()
-        .map(|(time_rows, offsets)| {
-            let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
-            full_rows
-                .slice_mut(s![.., 0..time_rows.ncols()])
-                .assign(time_rows);
-            (full_rows, offsets.clone())
-        });
+    let full_time_monotonicity_collocation =
+        time_monotonicity_collocation
+            .as_ref()
+            .map(|(time_rows, offsets)| {
+                let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
+                full_rows
+                    .slice_mut(s![.., 0..time_rows.ncols()])
+                    .assign(time_rows);
+                (full_rows, offsets.clone())
+            });
 
     let dense_cov_design = cov_design.design.to_dense();
     let mut model = gam::families::royston_parmar::working_model_from_time_covariateshared(
@@ -4231,21 +4220,20 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     // construction when time coefficients are non-negative.  Instead of building
     // O(n) derivative constraints (which explode at biobank scale via the KKT
     // augmented system), we simply enforce non-negativity on the time coefficients.
-    let structural_lower_bounds = if likelihood_mode != SurvivalLikelihoodMode::Weibull
-        && p_time_total > 0
-    {
-        let mut lb = Array1::from_elem(p, f64::NEG_INFINITY);
-        for j in 0..p_time_total {
-            lb[j] = 0.0;
-        }
-        // Feasible initial beta: just start with small positive time coefficients.
-        for j in 0..p_time_total {
-            beta0[j] = 1e-4;
-        }
-        Some(lb)
-    } else {
-        None
-    };
+    let structural_lower_bounds =
+        if likelihood_mode != SurvivalLikelihoodMode::Weibull && p_time_total > 0 {
+            let mut lb = Array1::from_elem(p, f64::NEG_INFINITY);
+            for j in 0..p_time_total {
+                lb[j] = 0.0;
+            }
+            // Feasible initial beta: just start with small positive time coefficients.
+            for j in 0..p_time_total {
+                beta0[j] = 1e-4;
+            }
+            Some(lb)
+        } else {
+            None
+        };
     let beta0_norm = beta0.dot(&beta0).sqrt();
     progress.set_stage("fit", "running survival pirls");
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
@@ -4732,19 +4720,19 @@ fn run_sample_survival(
         .map(|wiggle| Array1::from_vec(wiggle.knots.clone()));
     let time_monotonicity_collocation =
         if !survival_basis_supports_structural_monotonicity(&time_build.basisname) {
-        Some(build_survival_time_monotonicity_collocation(
-            &age_entry,
-            &age_exit,
-            &time_build,
-            &baseline_cfg,
-            saved_timewiggle_runtime
-                .as_ref()
-                .zip(saved_timewiggle_knots.as_ref())
-                .map(|(wiggle, knots)| (knots, wiggle.degree)),
-        )?)
-    } else {
-        None
-    };
+            Some(build_survival_time_monotonicity_collocation(
+                &age_entry,
+                &age_exit,
+                &time_build,
+                &baseline_cfg,
+                saved_timewiggle_runtime
+                    .as_ref()
+                    .zip(saved_timewiggle_knots.as_ref())
+                    .map(|(wiggle, knots)| (knots, wiggle.degree)),
+            )?)
+        } else {
+            None
+        };
     let p_time = time_build.x_exit_time.ncols();
     let p_timewiggle = saved_timewiggle
         .as_ref()
@@ -4872,15 +4860,16 @@ fn run_sample_survival(
         other => return Err(format!("unsupported saved survival spec '{other}'")),
     };
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
-    let full_time_monotonicity_collocation = time_monotonicity_collocation
-        .as_ref()
-        .map(|(time_rows, offsets)| {
-            let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
-            full_rows
-                .slice_mut(s![.., 0..time_rows.ncols()])
-                .assign(time_rows);
-            (full_rows, offsets.clone())
-        });
+    let full_time_monotonicity_collocation =
+        time_monotonicity_collocation
+            .as_ref()
+            .map(|(time_rows, offsets)| {
+                let mut full_rows = Array2::<f64>::zeros((time_rows.nrows(), p));
+                full_rows
+                    .slice_mut(s![.., 0..time_rows.ncols()])
+                    .assign(time_rows);
+                (full_rows, offsets.clone())
+            });
     let mut model_surv = gam::families::royston_parmar::working_model_from_flattened(
         penalties.clone(),
         monotonicity,
@@ -4993,7 +4982,7 @@ fn run_sample_standard(
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
-            compute_inference: true,
+            compute_inference: false,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: design.nullspace_dims.clone(),
@@ -5006,7 +4995,8 @@ fn run_sample_standard(
     )
     .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
     progress.advance_workflow(3);
-    let penalty = weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
+    let penalty =
+        weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
 
     run_nuts_sampling_flattened_family(
         family,
@@ -5132,7 +5122,8 @@ fn run_sample_standard_link_wiggle(
     }
 
     // Base penalty: Σ λ_k S_k (p_main × p_main)
-    let penalty_base = weighted_blockwise_penalty_sum(&design.penalties, base_lambdas.as_slice().unwrap(), p_main);
+    let penalty_base =
+        weighted_blockwise_penalty_sum(&design.penalties, base_lambdas.as_slice().unwrap(), p_main);
 
     // Wiggle penalty: rebuild constrained difference penalties for the saved
     // wiggle basis and weight them by the saved LinkWiggle lambdas.
@@ -5780,9 +5771,13 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 progress.advance_workflow(3);
 
                 let offset = Array1::<f64>::zeros(ds.values.nrows());
-                let pred =
-                    predict_gam(design.design.clone(), fit.beta.view(), offset.view(), family)
-                        .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
+                let pred = predict_gam(
+                    design.design.clone(),
+                    fit.beta.view(),
+                    offset.view(),
+                    family,
+                )
+                .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
                 let y = ds.values.column(y_col).to_owned();
                 n_obs = Some(y.len());
 
@@ -7107,7 +7102,6 @@ fn write_payload_json(path: &Path, payload: FittedModelPayload) -> Result<(), St
     write_model_json(path, &model)
 }
 
-
 fn print_inference_summary(notes: &[String]) {
     if notes.is_empty() {
         return;
@@ -7125,7 +7119,6 @@ fn load_dataset(path: &Path) -> Result<Dataset, String> {
 fn load_datasetwith_schema(path: &Path, schema: &DataSchema) -> Result<Dataset, String> {
     load_dataset_auto_with_schema(path, schema, UnseenCategoryPolicy::Error)
 }
-
 
 fn sample_std(v: ArrayView1<'_, f64>) -> f64 {
     if v.is_empty() {
@@ -8469,10 +8462,10 @@ mod tests {
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
-        parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
-        parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
-        parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
-        run_generate_gaussian_location_scale, run_generate_standard,
+        parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
+        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_baseline_config,
+        parse_survival_inverse_link, parse_survival_time_basis_config, predict_standard_linkwiggle,
+        pretty_familyname, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, validate_cli_firth_configuration,

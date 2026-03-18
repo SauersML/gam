@@ -257,8 +257,10 @@ mod tests {
         let covariance = factor
             .solvemulti(&Array2::eye(p))
             .expect("invert SPD precision via Cholesky");
-        let backend =
-            PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(precision.clone())).expect("factorize");
+        let backend = PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(
+            precision.clone(),
+        ))
+        .expect("factorize");
         let grads = array![[1.0, 0.0, 2.0], [0.5, -1.0, 0.0], [0.0, 1.0, 1.0]];
         let out = rowwise_local_covariances(&backend, 3, 1, |rows| {
             Ok(vec![grads.slice(s![rows, ..]).to_owned()])

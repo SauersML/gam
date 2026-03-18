@@ -496,7 +496,6 @@ impl PenaltyPseudologdet {
         })
     }
 
-
     /// log|S|₊.
     pub fn value(&self) -> f64 {
         self.value
