@@ -870,42 +870,6 @@ impl PirlsWorkspace {
             .for_each(|sqrtw, &w| *sqrtw = w.max(0.0).sqrt());
     }
 
-    pub fn computehessian_sparse_faer(
-        &mut self,
-        x: &SparseRowMat<usize, f64>,
-        weights: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        let csrrows = x.nrows();
-        if weights.len() != csrrows {
-            return Err(EstimationError::InvalidInput(format!(
-                "weights length {} does not match design rows {}",
-                weights.len(),
-                csrrows
-            )));
-        }
-
-        // Treat the CSR matrix as a transposed CSC view for sparse matmul.
-        let x_t = x.as_ref().transpose();
-        let cscview = x_t
-            .transpose()
-            .to_col_major()
-            .map_err(|_| EstimationError::InvalidInput("failed to view CSR as CSC".to_string()))?;
-
-        let rebuild = match self.sparse_xtwx_cache.as_ref() {
-            Some(cache) => !cache.matches(&cscview),
-            None => true,
-        };
-        if rebuild {
-            self.sparse_xtwx_cache = Some(SparseXtWxCache::new(&cscview)?);
-        }
-
-        let cache = self
-            .sparse_xtwx_cache
-            .as_mut()
-            .ok_or_else(|| EstimationError::InvalidInput("missing sparse cache".to_string()))?;
-        cache.compute_dense(&cscview, weights)
-    }
-
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
     fn ensure_sparse_penalty_cache(
         &mut self,
@@ -2126,13 +2090,6 @@ fn compute_jeffreys_pirls_diagnostics(
         observation_weights,
     )?;
     Ok((op.pirls_hat_diag(), op.jeffreys_logdet()))
-}
-
-pub(crate) fn ensure_positive_definitewith_label(
-    hess: &mut Array2<f64>,
-    label: &str,
-) -> Result<(), EstimationError> {
-    ensure_positive_definitewithridge(hess, label).map(|_| ())
 }
 
 fn ensure_positive_definitewithridge(
@@ -3890,19 +3847,12 @@ where
                             options.coefficient_lower_bounds.as_ref(),
                         );
                         let near_stationary_tol = options.convergence_tolerance.max(1e-6) * 50.0;
-                        let reduction_noise_floor = (current_penalized
-                            .abs()
-                            .max(candidate_penalized.abs())
-                            .max(1.0))
-                            * 1e-12;
+                        let reduction_noise_floor = current_penalized.abs().max(1.0) * 1e-12;
 
-                        // Near stationarity, objective deltas can collapse into floating-point
-                        // noise and LM gain-ratio logic may reject every candidate indefinitely.
-                        // Treat this as a valid stalled optimum rather than escalating damping.
-                        if candidate_penalized.is_finite()
-                            && projected_grad <= near_stationary_tol
+                        // Near stationarity: the screening rejected all candidates, but the
+                        // gradient is tiny. Treat this as converged rather than escalating damping.
+                        if projected_grad <= near_stationary_tol
                             && predicted_reduction.abs() <= reduction_noise_floor
-                            && actual_reduction >= -reduction_noise_floor
                         {
                             lastgradient_norm = stategrad_norm;
                             last_deviance_change = 0.0;
