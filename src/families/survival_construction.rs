@@ -942,6 +942,21 @@ pub fn build_survival_timewiggle_derivative_design(
     Ok(design_derivative_exit)
 }
 
+/// Build an additive baseline-correction ("timewiggle") block.
+///
+/// This is an **additive** correction to the fixed parametric baseline hazard,
+/// NOT a compositional transform of the full time predictor.  The baseline
+/// offsets `eta_entry`, `eta_exit`, `derivative_exit` are computed once from the
+/// parametric baseline target (Weibull, Gompertz, etc.) and do not change during
+/// fitting.  The wiggle basis `B(eta_baseline)` evaluated at these fixed offsets
+/// is therefore a fixed design matrix, and the timewiggle block is linear in its
+/// coefficients.  All derivatives (gradient, Hessian, REML outer) are correct
+/// for this additive model.
+///
+/// The model is:
+///   η_time = X_time · β_time + B(h_baseline) · θ_wiggle + offset
+///
+/// where `h_baseline = log H₀(t)` is the known parametric cumulative hazard.
 pub fn build_survival_timewiggle_from_baseline(
     eta_entry: &Array1<f64>,
     eta_exit: &Array1<f64>,

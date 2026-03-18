@@ -3407,14 +3407,9 @@ fn saved_linkwiggle_basis(
         None => Ok(None),
         Some(runtime) => {
             runtime.derivative_q0(q0).map(|_| ())?;
-            let knot_arr = Array1::from_vec(runtime.knots.clone());
-            gam::gamlss::monotone_wiggle_basis_with_derivative_order(
-                q0.view(),
-                &knot_arr,
-                runtime.degree,
-                basis_options.derivative_order,
-            )
-            .map(Some)
+            runtime
+                .constrained_basis(q0, basis_options)
+                .map(Some)
         }
     }
 }

@@ -355,7 +355,7 @@ impl SavedLinkWiggleRuntime {
         Ok(dq_dq0)
     }
 
-    fn constrained_basis(
+    pub fn constrained_basis(
         &self,
         q0: &Array1<f64>,
         basis_options: BasisOptions,

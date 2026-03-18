@@ -10732,7 +10732,10 @@ mod tests {
         lambdas: &[f64],
         ridge: f64,
     ) -> (f64, Array1<f64>, Array2<f64>) {
-        let p_total: usize = marginal_penalties.iter().map(|penalty| penalty.nrows()).product();
+        let p_total: usize = marginal_penalties
+            .iter()
+            .map(|penalty| penalty.nrows())
+            .product();
         let mut s_dense = Array2::<f64>::zeros((p_total, p_total));
         for (axis, penalty) in marginal_penalties.iter().enumerate() {
             let mut kron_term = Array2::<f64>::eye(1);
@@ -10751,15 +10754,19 @@ mod tests {
                 s_dense[[idx, idx]] += ridge;
             }
         }
-        let (evals_dense, evecs_dense): (Array1<f64>, Array2<f64>) =
-            s_dense.eigh(faer::Side::Lower).expect("dense Kronecker eigh");
+        let (evals_dense, evecs_dense): (Array1<f64>, Array2<f64>) = s_dense
+            .eigh(faer::Side::Lower)
+            .expect("dense Kronecker eigh");
         let tol = 1e-12;
         let positive_indices: Vec<usize> = evals_dense
             .iter()
             .enumerate()
             .filter_map(|(idx, &value)| (value > tol).then_some(idx))
             .collect();
-        let logdet = positive_indices.iter().map(|&idx| evals_dense[idx].ln()).sum();
+        let logdet = positive_indices
+            .iter()
+            .map(|&idx| evals_dense[idx].ln())
+            .sum();
         let mut grad = Array1::<f64>::zeros(lambdas.len());
         let mut hess = Array2::<f64>::zeros((lambdas.len(), lambdas.len()));
         for (axis, penalty) in marginal_penalties.iter().enumerate() {
@@ -10806,6 +10813,45 @@ mod tests {
             .zip(b.iter())
             .map(|(&x, &y)| (x - y).abs())
             .fold(0.0_f64, f64::max)
+    }
+
+    #[test]
+    fn kronecker_penalty_system_logdet_matches_dense_reference() {
+        let q1 = 3usize;
+        let q2 = 4usize;
+        let s1 = array![[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]];
+        let s2 = array![
+            [1.0, -1.0, 0.0, 0.0],
+            [-1.0, 2.0, -1.0, 0.0],
+            [0.0, -1.0, 2.0, -1.0],
+            [0.0, 0.0, -1.0, 1.0]
+        ];
+        let marginal_penalties = vec![s1, s2];
+        let lambdas = vec![2.5, 1.3];
+        let ridge = 0.0;
+
+        let system = KroneckerPenaltySystem::new(marginal_penalties.clone(), vec![q1, q2], false)
+            .expect("KroneckerPenaltySystem");
+        let (logdet, grad, hess) = system.logdet_and_derivatives(&lambdas, ridge);
+        let (dense_logdet, dense_grad, dense_hess) =
+            dense_kronecker_pseudo_logdet_reference(&marginal_penalties, &lambdas, ridge);
+
+        assert!(
+            (logdet - dense_logdet).abs() < 1e-8,
+            "KroneckerPenaltySystem logdet mismatch: factored={} dense={}",
+            logdet,
+            dense_logdet
+        );
+        let grad_diff = max_abs_diff_vector(&grad, &dense_grad);
+        assert!(
+            grad_diff < 1e-8,
+            "KroneckerPenaltySystem gradient mismatch: max diff={grad_diff}"
+        );
+        let hess_diff = max_abs_diff_matrix(&hess, &dense_hess);
+        assert!(
+            hess_diff < 1e-8,
+            "KroneckerPenaltySystem Hessian mismatch: max diff={hess_diff}"
+        );
     }
 
     fn assert_term_collection_designs_match(
