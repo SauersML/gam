@@ -100,6 +100,19 @@ impl InverseLink {
     }
 }
 
+/// Fixed prior family for smoothing parameters in joint HMC refinement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RhoPrior {
+    Flat,
+    Normal { mean: f64, sd: f64 },
+}
+
+impl Default for RhoPrior {
+    fn default() -> Self {
+        Self::Normal { mean: 0.0, sd: 3.0 }
+    }
+}
+
 /// Engine-level likelihood selector used by generic APIs.
 /// Some families remain restricted to domain-specific entrypoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -26,8 +26,11 @@
 use super::polya_gamma::PolyaGamma;
 use crate::construction::CanonicalPenalty;
 use crate::estimate::reml::FirthDenseOperator;
-use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
-use crate::types::LikelihoodFamily;
+use crate::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
+use crate::matrix::DesignMatrix;
+use crate::solver::mixture_link::inverse_link_jet_for_family;
+use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
 use crate::visualizer::VisualizerSession;
 use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
@@ -578,6 +581,21 @@ fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(),
     Ok(())
 }
 
+#[inline]
+fn validate_firth_likelihood_support(
+    family: LikelihoodFamily,
+    firth_enabled: bool,
+) -> Result<(), String> {
+    if firth_enabled && !family.supports_firth() {
+        return Err(format!(
+            "Joint HMC with Firth is only supported for {}; {} does not support it",
+            LikelihoodFamily::BinomialLogit.pretty_name(),
+            family.pretty_name()
+        ));
+    }
+    Ok(())
+}
+
 /// Compute the Jeffreys/Firth contribution 0.5 log|I(β)| and its β-gradient.
 ///
 /// HMC uses the same `FirthDenseOperator` as the REML exact-gradient path.
@@ -637,6 +655,59 @@ fn nuts_family_logp_and_grad(
         NutsFamily::Gaussian => gaussian_logp_and_grad(data, eta),
         NutsFamily::PoissonLog => poisson_log_logp_and_grad(data, eta),
         NutsFamily::GammaLog => gamma_log_logp_and_grad(data, eta),
+    }
+}
+
+fn joint_binomial_logp_and_grad(
+    family: LikelihoodFamily,
+    inverse_link: &InverseLink,
+    data: &SharedData,
+    eta: &Array1<f64>,
+) -> Result<(f64, Array1<f64>), String> {
+    let n = data.n_samples;
+    let mut ll = 0.0;
+    let mut residual = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let jet = inverse_link_jet_for_family(
+            family,
+            eta[i],
+            inverse_link.mixture_state(),
+            inverse_link.sas_state(),
+        )
+        .map_err(|err| err.to_string())?;
+        let mu = jet.mu.clamp(1.0e-15, 1.0 - 1.0e-15);
+        let dmu_deta = jet.d1;
+        let y_i = data.y[i];
+        let w_i = data.weights[i];
+        ll += w_i * (y_i * mu.ln() + (1.0 - y_i) * (1.0 - mu).ln());
+        residual[i] = w_i * (y_i - mu) * dmu_deta / (mu * (1.0 - mu)).max(1.0e-30);
+    }
+
+    Ok((ll, fast_atv(&data.x, &residual)))
+}
+
+fn joint_family_logp_and_grad(
+    family: LikelihoodFamily,
+    inverse_link: &InverseLink,
+    data: &SharedData,
+    eta: &Array1<f64>,
+) -> Result<(f64, Array1<f64>), String> {
+    match family {
+        LikelihoodFamily::BinomialLogit
+        | LikelihoodFamily::BinomialProbit
+        | LikelihoodFamily::BinomialCLogLog
+        | LikelihoodFamily::BinomialSas
+        | LikelihoodFamily::BinomialBetaLogistic
+        | LikelihoodFamily::BinomialMixture => {
+            joint_binomial_logp_and_grad(family, inverse_link, data, eta)
+        }
+        LikelihoodFamily::GaussianIdentity => Ok(gaussian_logp_and_grad(data, eta)),
+        LikelihoodFamily::PoissonLog => Ok(poisson_log_logp_and_grad(data, eta)),
+        LikelihoodFamily::GammaLog => Ok(gamma_log_logp_and_grad(data, eta)),
+        LikelihoodFamily::RoystonParmar => {
+            Err("Joint HMC fallback is not implemented for RoystonParmar".to_string())
+        }
     }
 }
 
@@ -822,13 +893,16 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
 #[cfg(test)]
 mod tests {
     use super::{
-        FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, NutsConfig, NutsFamily, NutsPosterior,
-        SharedData, firth_jeffreys_logp_and_grad, run_joint_beta_rho_sampling,
-        run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
+        FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior, NutsConfig,
+        NutsFamily, NutsPosterior, SharedData, firth_jeffreys_logp_and_grad,
+        joint_family_logp_and_grad, laplace_directional_cubic_diagnostic,
+        run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
+        run_nuts_sampling_flattened_family,
     };
     use crate::construction::CanonicalPenalty;
+    use crate::matrix::DesignMatrix;
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
-    use crate::types::LikelihoodFamily;
+    use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
     use general_mcmc::generic_hmc::HamiltonianTarget;
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
@@ -1092,6 +1166,7 @@ mod tests {
             y: y.view(),
             weights: w.view(),
             likelihood_family: LikelihoodFamily::PoissonLog,
+            inverse_link: InverseLink::Standard(LinkFunction::Log),
             mode: mode.view(),
             hessian: hessian.view(),
             penalty_roots: vec![CanonicalPenalty::from_dense_root(
@@ -1099,7 +1174,7 @@ mod tests {
                 penalty_root.ncols(),
             )],
             rho_mode: rho_mode.view(),
-            nuts_family: NutsFamily::PoissonLog,
+            rho_prior: RhoPrior::default(),
             firth_bias_reduction: true,
             trigger_skewness: 0.75,
         };
@@ -1113,6 +1188,187 @@ mod tests {
             err.contains("Joint HMC with Firth is only supported for Binomial Logit"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn joint_hmc_uses_combined_penalty_logdet_for_overlapping_penalties() {
+        let x = array![[0.0, 0.0]];
+        let y = array![0.0];
+        let w = array![0.0];
+        let mode = array![0.0, 0.0];
+        let hessian = array![[1.0, 0.0], [0.0, 1.0]];
+        let rho_mode = array![0.0, 0.0];
+        let penalty_1 = array![[1.0, 0.0], [0.0, 1.0]];
+        let penalty_2 = array![[2.0_f64.sqrt(), 0.0], [0.0, 1.0]];
+        let target = JointBetaRhoPosterior::new(
+            x.view(),
+            y.view(),
+            w.view(),
+            mode.view(),
+            hessian.view(),
+            vec![
+                CanonicalPenalty::from_dense_root(penalty_1, 2),
+                CanonicalPenalty::from_dense_root(penalty_2, 2),
+            ],
+            rho_mode.view(),
+            LikelihoodFamily::GaussianIdentity,
+            InverseLink::Standard(LinkFunction::Identity),
+            RhoPrior::Flat,
+            false,
+        )
+        .expect("joint target");
+
+        let params = array![0.0, 0.0, 0.0, 0.0];
+        let (_, grad) = target.compute_joint_logp_and_grad(&params);
+        assert!(
+            (grad[2] - 5.0 / 12.0).abs() < 1.0e-10,
+            "expected overlapping-penalty gradient 5/12, got {}",
+            grad[2]
+        );
+        assert!(
+            (grad[3] - 7.0 / 12.0).abs() < 1.0e-10,
+            "expected overlapping-penalty gradient 7/12, got {}",
+            grad[3]
+        );
+    }
+
+    #[test]
+    fn joint_hmc_target_does_not_depend_on_rho_mode_when_prior_is_fixed() {
+        let x = array![[0.0]];
+        let y = array![0.0];
+        let w = array![0.0];
+        let mode = array![0.0];
+        let hessian = array![[1.0]];
+        let penalty = CanonicalPenalty::from_dense_root(array![[1.0]], 1);
+        let prior = RhoPrior::Normal {
+            mean: 0.25,
+            sd: 1.7,
+        };
+
+        let target_a = JointBetaRhoPosterior::new(
+            x.view(),
+            y.view(),
+            w.view(),
+            mode.view(),
+            hessian.view(),
+            vec![penalty.clone()],
+            array![0.0].view(),
+            LikelihoodFamily::GaussianIdentity,
+            InverseLink::Standard(LinkFunction::Identity),
+            prior.clone(),
+            false,
+        )
+        .expect("target a");
+        let target_b = JointBetaRhoPosterior::new(
+            x.view(),
+            y.view(),
+            w.view(),
+            mode.view(),
+            hessian.view(),
+            vec![penalty],
+            array![2.5].view(),
+            LikelihoodFamily::GaussianIdentity,
+            InverseLink::Standard(LinkFunction::Identity),
+            prior,
+            false,
+        )
+        .expect("target b");
+
+        let params = array![0.0, -0.4];
+        let (lp_a, grad_a) = target_a.compute_joint_logp_and_grad(&params);
+        let (lp_b, grad_b) = target_b.compute_joint_logp_and_grad(&params);
+        assert!((lp_a - lp_b).abs() < 1.0e-12);
+        for i in 0..grad_a.len() {
+            assert!(
+                (grad_a[i] - grad_b[i]).abs() < 1.0e-12,
+                "rho_mode leaked into target gradient at {}: {} vs {}",
+                i,
+                grad_a[i],
+                grad_b[i]
+            );
+        }
+    }
+
+    #[test]
+    fn joint_hmc_binomial_sas_uses_runtime_link_state() {
+        let x = array![[1.0], [1.0]];
+        let y = array![1.0, 0.0];
+        let weights = array![1.0, 1.0];
+        let eta = array![0.3, -0.2];
+        let sas_state = crate::mixture_link::state_from_sasspec(crate::types::SasLinkSpec {
+            initial_epsilon: 0.4,
+            initial_log_delta: -0.2,
+        })
+        .expect("sas state");
+        let data = SharedData {
+            x: Arc::new(x),
+            y: Arc::new(y),
+            weights: Arc::new(weights),
+            penalty: Arc::new(Array2::zeros((1, 1))),
+            mode: Arc::new(Array1::zeros(1)),
+            n_samples: 2,
+            dim: 1,
+        };
+
+        let (ll_sas, _) = joint_family_logp_and_grad(
+            LikelihoodFamily::BinomialSas,
+            &InverseLink::Sas(sas_state),
+            &data,
+            &eta,
+        )
+        .expect("sas joint logp");
+        let (ll_logit, _) = joint_family_logp_and_grad(
+            LikelihoodFamily::BinomialLogit,
+            &InverseLink::Standard(LinkFunction::Logit),
+            &data,
+            &eta,
+        )
+        .expect("logit joint logp");
+
+        assert!(
+            (ll_sas - ll_logit).abs() > 1.0e-6,
+            "adaptive SAS link should not collapse to the logit likelihood"
+        );
+    }
+
+    #[test]
+    fn directional_cubic_diagnostic_is_rotation_invariant_for_hessian_eigenvectors() {
+        let x = array![[1.0, 0.5], [-0.3, 1.4], [0.8, -1.1]];
+        let c = array![0.7, -0.5, 0.2];
+        let h = array![[4.0, 0.0], [0.0, 1.0]];
+        let theta = std::f64::consts::FRAC_PI_4;
+        let q = array![[theta.cos(), -theta.sin()], [theta.sin(), theta.cos()],];
+        let x_rot = x.dot(&q);
+        let h_rot = q.t().dot(&h).dot(&q);
+
+        let (base_max, base_vals) = laplace_directional_cubic_diagnostic(
+            &h,
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
+            &c,
+        )
+        .expect("base diagnostic");
+        let (rot_max, rot_vals) = laplace_directional_cubic_diagnostic(
+            &h_rot,
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_rot)),
+            &c,
+        )
+        .expect("rotated diagnostic");
+
+        let mut base_abs: Vec<f64> = base_vals.iter().map(|v| v.abs()).collect();
+        let mut rot_abs: Vec<f64> = rot_vals.iter().map(|v| v.abs()).collect();
+        base_abs.sort_by(|a, b| a.partial_cmp(b).expect("finite compare"));
+        rot_abs.sort_by(|a, b| a.partial_cmp(b).expect("finite compare"));
+
+        assert!((base_max - rot_max).abs() < 1.0e-10);
+        for i in 0..base_abs.len() {
+            assert!(
+                (base_abs[i] - rot_abs[i]).abs() < 1.0e-10,
+                "directional diagnostic changed under rotation at {}: {} vs {}",
+                i,
+                base_abs[i],
+                rot_abs[i]
+            );
+        }
     }
 
     #[test]
@@ -2790,31 +3046,90 @@ pub fn run_link_wiggle_nuts_sampling(
 // is active, the sampled target also includes the Jeffreys term
 // 0.5 log|I(β)| in addition to the smoothing-parameter prior.
 
-/// Skewness diagnostic for the Laplace approximation.
+/// Directional cubic non-Gaussianity diagnostic for the Laplace approximation.
 ///
-/// Computes per-coefficient posterior skewness s_j = (H⁻¹)_{jj}^{3/2} · T_j
-/// where T_j = Σ_i c_i x_{ij}³ is the third-derivative projection.
+/// For each positive-curvature Hessian eigenpair `(lambda_r, v_r)`, this computes
 ///
-/// Returns (max_abs_skewness, per_coefficient_skewness).
-pub fn laplace_skewness_diagnostic(
-    h_inv_diag: &Array1<f64>,
-    third_deriv: &Array1<f64>,
-) -> (f64, Array1<f64>) {
-    let p = h_inv_diag.len().min(third_deriv.len());
-    let mut skewness = Array1::<f64>::zeros(p);
-    let mut max_abs = 0.0_f64;
-    for j in 0..p {
-        let s = h_inv_diag[j];
-        let s_j = s.sqrt() * s * third_deriv[j]; // s^{3/2} * T_j
-        skewness[j] = if s_j.is_finite() { s_j } else { 0.0 };
-        max_abs = max_abs.max(skewness[j].abs());
+///   gamma_r = T[v_r, v_r, v_r] / lambda_r^(3/2)
+///            = Σ_i c_i (x_i^T v_r)^3 / lambda_r^(3/2),
+///
+/// and reports `max_r |gamma_r|`. This is invariant to arbitrary coordinate
+/// relabeling and uses the full directional cubic contraction rather than only
+/// diagonal tensor entries.
+pub fn laplace_directional_cubic_diagnostic(
+    hessian: &Array2<f64>,
+    design: &DesignMatrix,
+    c_weights: &Array1<f64>,
+) -> Result<(f64, Array1<f64>), String> {
+    let p = hessian.nrows();
+    if p == 0 || hessian.ncols() != p {
+        return Ok((0.0, Array1::zeros(0)));
     }
-    (max_abs, skewness)
+
+    let sym_h = (hessian + &hessian.t()) * 0.5;
+    let (evals, evecs) = sym_h
+        .eigh(Side::Lower)
+        .map_err(|e| format!("directional cubic diagnostic eigendecomposition failed: {e}"))?;
+    let max_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let tol = (max_eval * 1.0e-12).max(1.0e-14);
+    let mut directional = Array1::<f64>::zeros(p);
+    let mut max_abs = 0.0_f64;
+
+    match design.as_sparse() {
+        Some(x_sparse) => {
+            let (symbolic, values) = x_sparse.as_ref().parts();
+            let col_ptr = symbolic.col_ptr();
+            let row_idx = symbolic.row_idx();
+            for r in 0..p {
+                let lambda = evals[r];
+                if lambda <= tol {
+                    continue;
+                }
+                let v = evecs.column(r);
+                let mut row_scores = vec![0.0_f64; x_sparse.nrows()];
+                for col in 0..x_sparse.ncols() {
+                    let coeff = v[col];
+                    for ptr in col_ptr[col]..col_ptr[col + 1] {
+                        row_scores[row_idx[ptr]] += values[ptr] * coeff;
+                    }
+                }
+                let mut cubic = 0.0_f64;
+                for i in 0..row_scores.len().min(c_weights.len()) {
+                    cubic += c_weights[i] * row_scores[i].powi(3);
+                }
+                let gamma = cubic / lambda.powf(1.5);
+                directional[r] = if gamma.is_finite() { gamma } else { 0.0 };
+                max_abs = max_abs.max(directional[r].abs());
+            }
+        }
+        None => {
+            let x_dense = design.as_dense_cow();
+            let x_dense = x_dense.as_ref();
+            for r in 0..p {
+                let lambda = evals[r];
+                if lambda <= tol {
+                    continue;
+                }
+                let v = evecs.column(r);
+                let mut cubic = 0.0_f64;
+                for i in 0..x_dense.nrows().min(c_weights.len()) {
+                    let proj = x_dense.row(i).dot(&v);
+                    cubic += c_weights[i] * proj.powi(3);
+                }
+                let gamma = cubic / lambda.powf(1.5);
+                directional[r] = if gamma.is_finite() { gamma } else { 0.0 };
+                max_abs = max_abs.max(directional[r].abs());
+            }
+        }
+    }
+
+    Ok((max_abs, directional))
 }
 
 /// Threshold for triggering joint (β, ρ) HMC.
-/// When max|skewness_j| exceeds this, the Laplace approximation is unreliable
-/// and NUTS on the joint space is used to refine smoothing parameters.
+/// When max directional cubic non-Gaussianity exceeds this, the Laplace
+/// approximation is considered unreliable and NUTS on the joint space is used
+/// to refine smoothing parameters.
 pub const SKEWNESS_HMC_THRESHOLD: f64 = 0.5;
 
 /// Result of joint (β, ρ) sampling.
@@ -2852,16 +3167,18 @@ struct JointBetaRhoPosterior {
     /// L' for chain rule
     chol_t: Array2<f64>,
     /// Family for log-likelihood computation
-    nuts_family: NutsFamily,
+    likelihood_family: LikelihoodFamily,
+    /// Exact runtime inverse-link state for adaptive binomial links.
+    inverse_link: InverseLink,
     /// Dimension of β
     n_beta: usize,
     /// Dimension of ρ
     n_rho: usize,
     /// Canonical penalties in the transformed basis.
     penalty_canonical: Vec<crate::construction::CanonicalPenalty>,
-    /// Prior std dev on ρ (weakly informative Gaussian)
-    rho_prior_sd: f64,
-    /// LAML-converged ρ (used as centering for ρ prior)
+    /// Fixed prior on rho used by the sampled target.
+    rho_prior: RhoPrior,
+    /// LAML-converged ρ (used only to initialize chains)
     rho_mode: Array1<f64>,
     /// Whether to add the Jeffreys/Firth term 0.5 log|I(β)| to the target
     firth_enabled: bool,
@@ -2876,14 +3193,14 @@ impl JointBetaRhoPosterior {
         hessian: ArrayView2<f64>,
         penalty_canonical: Vec<crate::construction::CanonicalPenalty>,
         rho_mode: ArrayView1<f64>,
-        nuts_family: NutsFamily,
+        likelihood_family: LikelihoodFamily,
+        inverse_link: InverseLink,
+        rho_prior: RhoPrior,
         firth_enabled: bool,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let n_beta = x.ncols();
         let n_rho = penalty_canonical.len();
-
-        validate_firth_support(nuts_family, firth_enabled)?;
 
         if rho_mode.len() != n_rho {
             return Err(format!(
@@ -2892,6 +3209,63 @@ impl JointBetaRhoPosterior {
                 n_rho
             ));
         }
+
+        match likelihood_family {
+            LikelihoodFamily::BinomialLogit => {
+                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
+                    return Err("Joint HMC BinomialLogit requires a logit inverse link".to_string());
+                }
+            }
+            LikelihoodFamily::BinomialProbit => {
+                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Probit)) {
+                    return Err(
+                        "Joint HMC BinomialProbit requires a probit inverse link".to_string()
+                    );
+                }
+            }
+            LikelihoodFamily::BinomialCLogLog => {
+                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::CLogLog)) {
+                    return Err(
+                        "Joint HMC BinomialCLogLog requires a cloglog inverse link".to_string()
+                    );
+                }
+            }
+            LikelihoodFamily::BinomialSas => {
+                if !matches!(&inverse_link, InverseLink::Sas(_)) {
+                    return Err("Joint HMC BinomialSas requires SAS link state".to_string());
+                }
+            }
+            LikelihoodFamily::BinomialBetaLogistic => {
+                if !matches!(&inverse_link, InverseLink::BetaLogistic(_)) {
+                    return Err(
+                        "Joint HMC BinomialBetaLogistic requires Beta-Logistic link state"
+                            .to_string(),
+                    );
+                }
+            }
+            LikelihoodFamily::BinomialMixture => {
+                if !matches!(&inverse_link, InverseLink::Mixture(_)) {
+                    return Err("Joint HMC BinomialMixture requires mixture link state".to_string());
+                }
+            }
+            LikelihoodFamily::GaussianIdentity => {
+                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Identity)) {
+                    return Err(
+                        "Joint HMC GaussianIdentity requires an identity inverse link".to_string(),
+                    );
+                }
+            }
+            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Log)) {
+                    return Err("Joint HMC log-link family requires a log inverse link".to_string());
+                }
+            }
+            LikelihoodFamily::RoystonParmar => {
+                return Err("Joint HMC fallback is not implemented for RoystonParmar".to_string());
+            }
+        }
+
+        validate_firth_likelihood_support(likelihood_family, firth_enabled)?;
 
         // Cholesky of H for β-whitening (same as NutsPosterior)
         let hessian_owned = hessian.to_owned();
@@ -2919,20 +3293,16 @@ impl JointBetaRhoPosterior {
             dim: n_beta,
         };
 
-        // Weakly informative prior on ρ: N(rho_mode, 3²)
-        // This is broad enough to let the data speak but prevents
-        // runaway smoothing parameters.
-        let rho_prior_sd = 3.0;
-
         Ok(Self {
             data,
             chol,
             chol_t,
-            nuts_family,
+            likelihood_family,
+            inverse_link,
             n_beta,
             n_rho,
             penalty_canonical,
-            rho_prior_sd,
+            rho_prior,
             rho_mode: rho_mode.to_owned(),
             firth_enabled,
         })
@@ -2965,12 +3335,25 @@ impl JointBetaRhoPosterior {
         let eta = self.data.x.dot(&beta);
 
         // ---- Log-likelihood ℓ(y|β) and ∇_β ℓ ----
-        // Delegates to shared family helpers (same code as NutsPosterior).
-        let (ll, mut grad_ll_beta) = nuts_family_logp_and_grad(self.nuts_family, &self.data, &eta);
+        let (ll, mut grad_ll_beta) = match joint_family_logp_and_grad(
+            self.likelihood_family,
+            &self.inverse_link,
+            &self.data,
+            &eta,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                log::warn!(
+                    "[Joint HMC] likelihood target became invalid at the current state: {}",
+                    err
+                );
+                return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+            }
+        };
 
         let mut firth_logdet = 0.0;
         if self.firth_enabled {
-            match firth_jeffreys_logp_and_grad(self.nuts_family, &self.data, &eta) {
+            match firth_jeffreys_logp_and_grad(NutsFamily::BinomialLogit, &self.data, &eta) {
                 Ok((value, grad_beta_firth)) => {
                     firth_logdet = value;
                     grad_ll_beta += &grad_beta_firth;
@@ -3013,31 +3396,48 @@ impl JointBetaRhoPosterior {
         }
 
         // ---- Structural penalty log-determinant: +0.5 log|S(ρ)|₊ and ρ-derivatives ----
-        // Block-local: log|λ_k S_k|₊ = rank_k * log(λ_k) + Σ_i log(e_i^k)
-        // where e_i^k are the positive eigenvalues of the unscaled penalty.
-        let mut log_det_s = 0.0;
-        let mut logdet_grad = Array1::<f64>::zeros(n_rho);
-        for (k, cp) in self.penalty_canonical.iter().enumerate() {
-            let rank_k = cp.positive_eigenvalues.len();
-            // Σ_i log(λ_k * e_i) = rank_k * ρ_k + Σ_i log(e_i)
-            let log_eig_sum: f64 = cp.positive_eigenvalues.iter().map(|&e| e.ln()).sum();
-            log_det_s += rank_k as f64 * rho[k] + log_eig_sum;
-            // ∂/∂ρ_k log|S|₊ = rank_k  (since ∂ρ_k of rank_k * ρ_k = rank_k)
-            logdet_grad[k] = rank_k as f64;
-        }
+        let (log_det_s, logdet_grad) = if self.penalty_canonical.is_empty() {
+            (0.0, Array1::zeros(n_rho))
+        } else {
+            match PenaltyPseudologdet::from_penalties(
+                &self.penalty_canonical,
+                lambdas.as_slice().unwrap_or(&[]),
+                0.0,
+                n_beta,
+            ) {
+                Ok(pld) => {
+                    let (det1, _) = pld.rho_derivatives_from_penalties(
+                        &self.penalty_canonical,
+                        lambdas.as_slice().unwrap_or(&[]),
+                    );
+                    (pld.value(), det1)
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[Joint HMC] structural penalty logdet became invalid at the current state: {}",
+                        err
+                    );
+                    return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                }
+            }
+        };
 
-        // Add logdet ρ-gradient: +0.5 ∂/∂ρ_k log|S|₊
         for k in 0..n_rho {
             grad_rho[k] += 0.5 * logdet_grad[k];
         }
 
-        // ---- Prior on ρ: N(rho_mode, σ²I) ----
+        // ---- Prior on ρ ----
         let mut rho_prior = 0.0;
-        let inv_var = 1.0 / (self.rho_prior_sd * self.rho_prior_sd);
-        for k in 0..n_rho {
-            let d = rho[k] - self.rho_mode[k];
-            rho_prior -= 0.5 * inv_var * d * d;
-            grad_rho[k] -= inv_var * d;
+        match self.rho_prior {
+            RhoPrior::Flat => {}
+            RhoPrior::Normal { mean, sd } => {
+                let inv_var = 1.0 / (sd * sd);
+                for k in 0..n_rho {
+                    let d = rho[k] - mean;
+                    rho_prior -= 0.5 * inv_var * d * d;
+                    grad_rho[k] -= inv_var * d;
+                }
+            }
         }
 
         // ---- Assemble ----
@@ -3071,15 +3471,13 @@ pub struct JointBetaRhoInputs<'a> {
     pub x: ArrayView2<'a, f64>,
     pub y: ArrayView1<'a, f64>,
     pub weights: ArrayView1<'a, f64>,
-    /// Original engine-level likelihood family. This remains the compatibility
-    /// authority even when the HMC target internally reuses a simpler
-    /// `NutsFamily` likelihood kernel.
     pub likelihood_family: LikelihoodFamily,
+    pub inverse_link: InverseLink,
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
     pub penalty_roots: Vec<CanonicalPenalty>,
     pub rho_mode: ArrayView1<'a, f64>,
-    pub nuts_family: NutsFamily,
+    pub rho_prior: RhoPrior,
     pub firth_bias_reduction: bool,
     /// Max posterior skewness that triggered this sampling
     pub trigger_skewness: f64,
@@ -3094,14 +3492,7 @@ pub fn run_joint_beta_rho_sampling(
     inputs: &JointBetaRhoInputs<'_>,
     config: &NutsConfig,
 ) -> Result<JointBetaRhoResult, String> {
-    if inputs.firth_bias_reduction && !inputs.likelihood_family.supports_firth() {
-        return Err(format!(
-            "Joint HMC with Firth is only supported for {}; {} does not support it",
-            LikelihoodFamily::BinomialLogit.pretty_name(),
-            inputs.likelihood_family.pretty_name()
-        ));
-    }
-    validate_firth_support(inputs.nuts_family, inputs.firth_bias_reduction)?;
+    validate_firth_likelihood_support(inputs.likelihood_family, inputs.firth_bias_reduction)?;
     let n_beta = inputs.mode.len();
     let n_rho = inputs.penalty_roots.len();
     let total_dim = n_beta + n_rho;
@@ -3122,7 +3513,9 @@ pub fn run_joint_beta_rho_sampling(
         inputs.hessian,
         inputs.penalty_roots.clone(),
         inputs.rho_mode,
-        inputs.nuts_family,
+        inputs.likelihood_family,
+        inputs.inverse_link.clone(),
+        inputs.rho_prior.clone(),
         inputs.firth_bias_reduction,
     )?;
 

@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 const TK_BLOCK_SIZE: usize = 128;
+const TK_MAX_OBSERVATIONS: usize = 20_000;
+const TK_MAX_COEFFICIENTS: usize = 2_000;
+const TK_MAX_DENSE_WORK: usize = 5_000_000;
 
 struct TkCorrectionTerms {
     value: f64,
@@ -18,6 +21,22 @@ struct TkCorrectionTerms {
 }
 
 impl<'a> RemlState<'a> {
+    fn tk_disabled_terms(rho: &Array1<f64>, mode: super::unified::EvalMode) -> TkCorrectionTerms {
+        TkCorrectionTerms {
+            value: 0.0,
+            gradient: if mode != super::unified::EvalMode::ValueOnly {
+                Some(Array1::zeros(rho.len()))
+            } else {
+                None
+            },
+            hessian: if mode == super::unified::EvalMode::ValueGradientHessian {
+                Some(Array2::zeros((rho.len(), rho.len())))
+            } else {
+                None
+            },
+        }
+    }
+
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
         match pirls_result.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
@@ -37,41 +56,6 @@ impl<'a> RemlState<'a> {
             .unwrap()
             .as_ref()
             .map(|bundle| bundle.ridge_passport.delta)
-    }
-
-    pub(crate) fn third_derivative_projection_from_design(
-        &self,
-        design: &DesignMatrix,
-        d_vec: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        if let Some(x_sparse) = design.as_sparse() {
-            let mut out = Array1::<f64>::zeros(x_sparse.ncols());
-            let (symbolic, values) = x_sparse.as_ref().parts();
-            let col_ptr = symbolic.col_ptr();
-            let row_idx = symbolic.row_idx();
-            for col in 0..x_sparse.ncols() {
-                let mut acc = 0.0;
-                for ptr in col_ptr[col]..col_ptr[col + 1] {
-                    let xij = values[ptr];
-                    acc += d_vec[row_idx[ptr]] * xij * xij * xij;
-                }
-                out[col] = acc;
-            }
-            Ok(out)
-        } else {
-            let x_dense_cow = design.as_dense_cow();
-            let x_dense = x_dense_cow.as_ref();
-            let mut out = Array1::<f64>::zeros(x_dense.ncols());
-            for j in 0..x_dense.ncols() {
-                let mut acc = 0.0;
-                for i in 0..x_dense.nrows() {
-                    let xij = x_dense[[i, j]];
-                    acc += d_vec[i] * xij * xij * xij;
-                }
-                out[j] = acc;
-            }
-            Ok(out)
-        }
     }
 
     fn dense_penalty_logdet_derivs(
@@ -624,6 +608,19 @@ impl<'a> RemlState<'a> {
 
         let compute_gradient = mode != super::unified::EvalMode::ValueOnly;
         let compute_hessian = mode == super::unified::EvalMode::ValueGradientHessian;
+        let n_x = self.x().nrows();
+        let p_x = self.x().ncols();
+        let dense_work = n_x.saturating_mul(p_x);
+        if n_x > TK_MAX_OBSERVATIONS || p_x > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK
+        {
+            log::warn!(
+                "disabling exact Tierney-Kadane correction for large model (n={}, p={}, n*p={}): exact TK is small-model-only",
+                n_x,
+                p_x,
+                dense_work
+            );
+            return Ok(Self::tk_disabled_terms(rho, mode));
+        }
 
         // Build Z = H⁻¹ X^T and solve closure, then call shared analytic core.
         if let Some(sparse) = bundle.sparse_exact.as_ref() {
@@ -705,23 +702,39 @@ impl<'a> RemlState<'a> {
             solved
         };
 
-        let h_eff_clone = h_eff_eval.clone();
+        // Pre-factor H once so the solve closure reuses the factorization
+        // instead of refactorizing on every call.
+        enum HFactor {
+            Cholesky(crate::linalg::faer_ndarray::FaerCholeskyFactor),
+            Eigh {
+                evals: Array1<f64>,
+                evecs: Array2<f64>,
+            },
+            None(usize),
+        }
+        let h_factor = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
+            HFactor::Cholesky(chol)
+        } else if let Ok((evals, evecs)) = h_eff_eval.eigh(Side::Lower) {
+            HFactor::Eigh { evals, evecs }
+        } else {
+            HFactor::None(p)
+        };
         let h_inv_solve = move |rhs: &Array1<f64>| -> Array1<f64> {
-            if let Ok(chol) = h_eff_clone.cholesky(Side::Lower) {
-                chol.solvevec(rhs)
-            } else if let Ok((evals, evecs)) = h_eff_clone.eigh(Side::Lower) {
-                let floor = 1e-12;
-                let mut sol = Array1::<f64>::zeros(rhs.len());
-                for m in 0..evals.len() {
-                    if evals[m] > floor {
-                        let u = evecs.column(m);
-                        let coeff = u.dot(rhs) / evals[m];
-                        sol.scaled_add(coeff, &u.to_owned());
+            match &h_factor {
+                HFactor::Cholesky(chol) => chol.solvevec(rhs),
+                HFactor::Eigh { evals, evecs } => {
+                    let floor = 1e-12;
+                    let mut sol = Array1::<f64>::zeros(rhs.len());
+                    for m in 0..evals.len() {
+                        if evals[m] > floor {
+                            let u = evecs.column(m);
+                            let coeff = u.dot(rhs) / evals[m];
+                            sol.scaled_add(coeff, &u.to_owned());
+                        }
                     }
+                    sol
                 }
-                sol
-            } else {
-                Array1::zeros(rhs.len())
+                HFactor::None(p) => Array1::zeros(*p),
             }
         };
 
@@ -1480,6 +1493,18 @@ impl<'a> RemlState<'a> {
         if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
         {
+            // Guard: Firth operator requires dense design materialization.
+            let firth_n = pirls_result.x_transformed.nrows();
+            let firth_p = pirls_result.x_transformed.ncols();
+            const FIRTH_MAX_DENSE_WORK: usize = 50_000_000;
+            if firth_n.saturating_mul(firth_p) > FIRTH_MAX_DENSE_WORK {
+                log::warn!(
+                    "disabling Firth bias reduction for large model (n={}, p={}): \
+                     Firth operator requires dense design and is a small-model-only feature",
+                    firth_n,
+                    firth_p,
+                );
+            } else {
             let x_dense = pirls_result
                 .x_transformed
                 .try_to_dense_arc(
@@ -1532,6 +1557,7 @@ impl<'a> RemlState<'a> {
                 h_total -= &hphi;
             }
             firth_dense_operator = Some(firth_op);
+            } // else (not too large for Firth)
         }
 
         // Add log-barrier Hessian diagonal for monotonicity-constrained coefficients.
@@ -1621,17 +1647,31 @@ impl<'a> RemlState<'a> {
         let firth_dense_operator_original = if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
         {
-            let x_dense = self
-                .x()
-                .try_to_dense_arc(
-                    "sparse exact REML runtime requires dense design for Firth operator",
-                )
-                .map_err(EstimationError::InvalidInput)?;
-            Some(Arc::new(Self::build_firth_dense_operator(
-                x_dense.as_ref(),
-                &pirls_result.final_eta,
-                self.weights,
-            )?))
+            // Guard: Firth operator requires dense design materialization.
+            let firth_n = self.x().nrows();
+            let firth_p = self.x().ncols();
+            const FIRTH_MAX_DENSE_WORK: usize = 50_000_000;
+            if firth_n.saturating_mul(firth_p) > FIRTH_MAX_DENSE_WORK {
+                log::warn!(
+                    "disabling Firth bias reduction for large model (n={}, p={}): \
+                     Firth operator requires dense design and is a small-model-only feature",
+                    firth_n,
+                    firth_p,
+                );
+                None
+            } else {
+                let x_dense = self
+                    .x()
+                    .try_to_dense_arc(
+                        "sparse exact REML runtime requires dense design for Firth operator",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                Some(Arc::new(Self::build_firth_dense_operator(
+                    x_dense.as_ref(),
+                    &pirls_result.final_eta,
+                    self.weights,
+                )?))
+            }
         } else {
             None
         };

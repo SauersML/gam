@@ -100,6 +100,7 @@ pub struct SurvivalTimeWiggleBuild {
     pub design_exit: Array2<f64>,
     pub design_derivative_exit: Array2<f64>,
     pub penalties: Vec<Array2<f64>>,
+    pub nullspace_dims: Vec<usize>,
     pub knots: Array1<f64>,
     pub degree: usize,
 }
@@ -710,14 +711,12 @@ pub fn build_survival_time_basis(
             }
 
             let p_time = keep_cols.len();
-            let mut x_entry_time = Array2::<f64>::zeros((n, p_time));
-            let mut x_exit_time = Array2::<f64>::zeros((n, p_time));
-            for i in 0..n {
-                for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                    x_entry_time[[i, j_new]] = x_entry_time_full[[i, j_old]];
-                    x_exit_time[[i, j_new]] = x_exit_time_full[[i, j_old]];
-                }
-            }
+            // Use ndarray::select for column projection — single copy, no element-wise loop.
+            let x_entry_time = x_entry_time_full.select(ndarray::Axis(1), keep_cols);
+            let x_exit_time = x_exit_time_full.select(ndarray::Axis(1), keep_cols);
+            // Drop full-width bases immediately to free memory before derivative computation.
+            drop(entry_arc);
+            drop(exit_arc);
 
             let mut x_derivative_time = Array2::<f64>::zeros((n, p_time));
             for i in 0..n {
@@ -943,6 +942,18 @@ pub fn build_survival_timewiggle_from_baseline(
             "baseline-timewiggle requires matching entry/exit/derivative lengths".to_string(),
         );
     }
+    // Guard: if baseline offsets are all zero (linear baseline), the timewiggle
+    // construction is degenerate — it adds only a constant, not time-varying structure.
+    let all_zero = eta_entry.iter().all(|&v| v.abs() < 1e-15)
+        && eta_exit.iter().all(|&v| v.abs() < 1e-15)
+        && derivative_exit.iter().all(|&v| v.abs() < 1e-15);
+    if all_zero {
+        return Err(
+            "timewiggle requires a non-linear scalar survival baseline target; \
+             the provided baseline offsets are all zero (linear baseline)"
+                .to_string(),
+        );
+    }
     let n = eta_exit.len();
     let mut seed = Array1::<f64>::zeros(2 * n);
     for i in 0..n {
@@ -955,7 +966,11 @@ pub fn build_survival_timewiggle_from_baseline(
         penalty_order: 2,
         double_penalty: cfg.double_penalty,
     };
-    let (combined_block, knots) = buildwiggle_block_input_from_seed(seed.view(), &wiggle_cfg)?;
+    let (mut combined_block, knots) = buildwiggle_block_input_from_seed(seed.view(), &wiggle_cfg)?;
+    crate::families::gamlss::append_selected_wiggle_penalty_orders(
+        &mut combined_block,
+        &cfg.penalty_orders,
+    )?;
     let design_entry =
         match buildwiggle_block_input_from_knots(eta_entry.view(), &knots, cfg.degree, 2, false)?
             .design
@@ -976,6 +991,7 @@ pub fn build_survival_timewiggle_from_baseline(
         design_entry,
         design_exit,
         design_derivative_exit,
+        nullspace_dims: combined_block.nullspace_dims.clone(),
         penalties: {
             let p = combined_block.design.ncols();
             combined_block

@@ -34,7 +34,7 @@ impl CustomFamily for ScalarPseudoLaplaceRhoFamily {
     }
 
     fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-        ExactNewtonOuterObjective::PseudoLaplace
+        ExactNewtonOuterObjective::StrictPseudoLaplace
     }
 
     fn exact_newton_joint_hessian(
@@ -84,7 +84,7 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
     }
 
     fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-        ExactNewtonOuterObjective::PseudoLaplace
+        ExactNewtonOuterObjective::StrictPseudoLaplace
     }
 
     fn exact_newton_hessian_directional_derivative(

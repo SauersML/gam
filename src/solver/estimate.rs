@@ -740,7 +740,10 @@ impl ParametricColumnConditioning {
             inf.reparam_qs = None;
         }
         result.constraint_kkt = None;
-        result.artifacts = FitArtifacts { pirls: None };
+        result.artifacts = FitArtifacts {
+            pirls: None,
+            ..Default::default()
+        };
         result
     }
 }
@@ -1242,6 +1245,8 @@ pub struct ExternalOptimOptions {
     /// Relative shrinkage floor for penalized block eigenvalues.
     /// See [`FitOptions::penalty_shrinkage_floor`] for details.
     pub penalty_shrinkage_floor: Option<f64>,
+    /// Fixed prior on smoothing parameters used by joint HMC fallback.
+    pub rho_prior: crate::types::RhoPrior,
     /// Kronecker-factored penalty system for tensor-product smooth terms.
     pub kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
     /// Full Kronecker factored basis for P-IRLS factored reparameterization.
@@ -2172,26 +2177,9 @@ where
     let (final_rho, pirls_res) = if !matches!(cfg.link_function(), LinkFunction::Identity)
         && !pirls_res.solve_c_array.is_empty()
     {
-        // Compute per-coefficient skewness diagnostic
         let h_eff = &pirls_res.stabilizedhessian_transformed;
         let p_eff = h_eff.ncols();
-        let h_inv_diag = if p_eff > 0 {
-            if let Ok(factor) = h_eff.factorize() {
-                let mut diag = Array1::<f64>::zeros(p_eff);
-                for j in 0..p_eff {
-                    let mut e_j = Array1::<f64>::zeros(p_eff);
-                    e_j[j] = 1.0;
-                    if let Ok(sol) = factor.solve(&e_j) {
-                        diag[j] = sol[j];
-                    }
-                }
-                diag
-            } else {
-                Array1::<f64>::zeros(p_eff)
-            }
-        } else {
-            Array1::<f64>::zeros(0)
-        };
+        let hessian_dense = h_eff.to_dense();
 
         let c_arr = {
             let mut c = pirls_res.solve_c_array.clone();
@@ -2202,16 +2190,12 @@ where
             }
             c
         };
-        let third_deriv = if let Ok(td) =
-            reml_state.third_derivative_projection_from_design(&pirls_res.x_transformed, &c_arr)
-        {
-            td
-        } else {
-            Array1::<f64>::zeros(p_eff)
-        };
-
-        let (max_skewness, skewness_vec) =
-            crate::hmc::laplace_skewness_diagnostic(&h_inv_diag, &third_deriv);
+        let (max_skewness, skewness_vec) = crate::hmc::laplace_directional_cubic_diagnostic(
+            &hessian_dense,
+            &pirls_res.x_transformed,
+            &c_arr,
+        )
+        .unwrap_or_else(|_| (0.0, Array1::zeros(p_eff)));
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum EstimationApproach {
             Reml,
@@ -2222,13 +2206,13 @@ where
         // This loop only handles cross-paradigm escalation from REML to joint HMC.
         let approaches = if max_skewness > crate::hmc::SKEWNESS_HMC_THRESHOLD {
             log::warn!(
-                "[REML] High posterior skewness detected (max |s_j| = {:.3}). \
+                "[REML] High directional cubic non-Gaussianity detected (max |gamma_r| = {:.3}). \
                  Escalating from REML to joint (β, ρ) HMC refinement.",
                 max_skewness,
             );
             let n_skewed = skewness_vec.iter().filter(|s| s.abs() > 0.3).count();
             log::info!(
-                "[Joint HMC] {}/{} coefficients have |skewness| > 0.3",
+                "[Joint HMC] {}/{} Hessian directions have |gamma_r| > 0.3",
                 n_skewed,
                 p_eff,
             );
@@ -2236,7 +2220,7 @@ where
         } else {
             if max_skewness > 0.1 {
                 log::info!(
-                    "[REML] Posterior skewness moderate (max |s_j| = {:.3}); \
+                    "[REML] Directional cubic non-Gaussianity moderate (max |gamma_r| = {:.3}); \
                      TK correction sufficient.",
                     max_skewness,
                 );
@@ -2260,14 +2244,36 @@ where
                     }
 
                     let sampling_result = {
+                        // Guard: joint HMC densifies design and Hessian — refuse at biobank scale.
+                        let hmc_n = selected_pirls_res.x_transformed.nrows();
+                        let hmc_p = selected_pirls_res.x_transformed.ncols();
+                        const HMC_MAX_DENSE_WORK: usize = 50_000_000;
+                        if hmc_n.saturating_mul(hmc_p) > HMC_MAX_DENSE_WORK {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "joint HMC requires dense design materialization (n={hmc_n}, p={hmc_p}); \
+                                 this is a small-model-only feature. Use --approach=laplace for large models."
+                            )));
+                        }
                         let x_dense = selected_pirls_res.x_transformed.to_dense_arc();
                         let hessian_dense =
                             selected_pirls_res.stabilizedhessian_transformed.to_dense();
+                        let hmc_inverse_link = if let Some(state) = final_mixture_state.clone() {
+                            InverseLink::Mixture(state)
+                        } else if let Some(state) = final_sas_state.clone() {
+                            if matches!(cfg.link_function(), LinkFunction::BetaLogistic) {
+                                InverseLink::BetaLogistic(state)
+                            } else {
+                                InverseLink::Sas(state)
+                            }
+                        } else {
+                            cfg.link_kind.clone()
+                        };
                         let hmc_inputs = crate::hmc::JointBetaRhoInputs {
                             x: x_dense.view(),
                             y: y_o.view(),
                             weights: w_o.view(),
                             likelihood_family: opts.family,
+                            inverse_link: hmc_inverse_link,
                             mode: selected_pirls_res.beta_transformed.view(),
                             hessian: hessian_dense.view(),
                             penalty_roots: selected_pirls_res
@@ -2275,32 +2281,7 @@ where
                                 .canonical_transformed
                                 .clone(),
                             rho_mode: selected_rho.view(),
-                            nuts_family: match opts.family {
-                                crate::types::LikelihoodFamily::GaussianIdentity => {
-                                    crate::hmc::NutsFamily::Gaussian
-                                }
-                                crate::types::LikelihoodFamily::BinomialLogit
-                                | crate::types::LikelihoodFamily::BinomialSas
-                                | crate::types::LikelihoodFamily::BinomialBetaLogistic
-                                | crate::types::LikelihoodFamily::BinomialMixture => {
-                                    crate::hmc::NutsFamily::BinomialLogit
-                                }
-                                crate::types::LikelihoodFamily::BinomialProbit => {
-                                    crate::hmc::NutsFamily::BinomialProbit
-                                }
-                                crate::types::LikelihoodFamily::BinomialCLogLog => {
-                                    crate::hmc::NutsFamily::BinomialCLogLog
-                                }
-                                crate::types::LikelihoodFamily::PoissonLog => {
-                                    crate::hmc::NutsFamily::PoissonLog
-                                }
-                                crate::types::LikelihoodFamily::GammaLog => {
-                                    crate::hmc::NutsFamily::GammaLog
-                                }
-                                crate::types::LikelihoodFamily::RoystonParmar => {
-                                    crate::hmc::NutsFamily::Gaussian
-                                }
-                            },
+                            rho_prior: opts.rho_prior.clone(),
                             firth_bias_reduction,
                             trigger_skewness: max_skewness,
                         };
@@ -2528,8 +2509,30 @@ where
 
     if opts.compute_inference {
         penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
-        beta_covariance =
-            matrix_inversewith_regularization(&penalized_hessian, "posterior covariance");
+        // Guard: full p×p covariance inversion is O(p³) and only viable for
+        // small-to-medium models. For large models, fall back to diagonal-only
+        // standard errors from the Hessian diagonal.
+        const COV_MAX_P: usize = 5_000;
+        let p_cov = penalized_hessian.as_ref().map_or(0, |h| h.nrows());
+        beta_covariance = if p_cov > COV_MAX_P {
+            log::warn!(
+                "skipping full posterior covariance inversion (p={p_cov} > {COV_MAX_P}): \
+                 using diagonal-only standard errors"
+            );
+            // Diagonal-only SE from Hessian diagonal inverse
+            penalized_hessian.as_ref().map(|h| {
+                let mut diag_inv = Array2::<f64>::zeros(h.dim());
+                for i in 0..h.nrows() {
+                    let d = h[[i, i]];
+                    if d > 0.0 {
+                        diag_inv[[i, i]] = 1.0 / d;
+                    }
+                }
+                diag_inv
+            })
+        } else {
+            matrix_inversewith_regularization(&penalized_hessian, "posterior covariance")
+        };
         smoothing_correction = reml_state.compute_smoothing_correction_auto(
             &final_rho,
             &pirls_res,
@@ -2602,6 +2605,7 @@ where
         constraint_kkt: pirls_res.constraint_kkt.clone(),
         artifacts: FitArtifacts {
             pirls: Some(pirls_res),
+            ..Default::default()
         },
         inference,
         reml_score: outer_result.final_value,
@@ -2865,6 +2869,11 @@ pub struct FitOptions {
     /// Typical value: `Some(1e-6)`. Set to `None` or `Some(0.0)` to disable.
     /// Default: `Some(1e-6)`.
     pub penalty_shrinkage_floor: Option<f64>,
+    /// Fixed prior on smoothing parameters used by joint HMC fallback.
+    ///
+    /// This prior is part of the sampled target itself, unlike `rho_mode`,
+    /// which is only used to initialize chains near the REML solution.
+    pub rho_prior: crate::types::RhoPrior,
     /// Kronecker-factored penalty system for tensor-product smooth terms.
     /// When set, the REML evaluator uses O(∏q_j) logdet and KroneckerMarginal
     /// penalty coordinates instead of O(p³) eigendecomposition.
@@ -2906,12 +2915,27 @@ impl Default for AdaptiveRegularizationOptions {
 pub struct FitArtifacts {
     #[serde(default, skip_serializing, skip_deserializing)]
     pub pirls: Option<crate::pirls::PirlsResult>,
+    #[serde(default)]
+    pub survival_link_wiggle_knots: Option<Array1<f64>>,
+    #[serde(default)]
+    pub survival_link_wiggle_degree: Option<usize>,
 }
 
 impl std::fmt::Debug for FitArtifacts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FitArtifacts")
             .field("pirls", &self.pirls.as_ref().map(|_| "..."))
+            .field(
+                "survival_link_wiggle_knots",
+                &self
+                    .survival_link_wiggle_knots
+                    .as_ref()
+                    .map(|knots| knots.len()),
+            )
+            .field(
+                "survival_link_wiggle_degree",
+                &self.survival_link_wiggle_degree,
+            )
             .finish()
     }
 }
@@ -4358,6 +4382,7 @@ where
         linear_constraints: opts.linear_constraints.clone(),
         firth_bias_reduction: None,
         penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+        rho_prior: Default::default(),
         kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
         kronecker_factored: opts.kronecker_factored.clone(),
     };
@@ -4835,6 +4860,7 @@ mod fd_policy_tests {
             linear_constraints: None,
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };
@@ -5052,6 +5078,7 @@ mod fd_policy_tests {
             linear_constraints: None,
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };
@@ -5209,6 +5236,7 @@ mod fd_policy_tests {
             linear_constraints: None,
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };

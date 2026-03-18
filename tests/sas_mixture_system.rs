@@ -45,6 +45,7 @@ fn base_fit_options() -> FitOptions {
         linear_constraints: None,
         adaptive_regularization: None,
         penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     }

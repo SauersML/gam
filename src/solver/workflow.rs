@@ -977,6 +977,7 @@ fn materialize_standard<'a>(
         linear_constraints: None,
         adaptive_regularization: None,
         penalty_shrinkage_floor: Some(1e-6),
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };
@@ -1113,9 +1114,9 @@ fn materialize_survival<'a>(
             &mut time_design_derivative,
             &tw,
         );
-        for p in &tw.penalties {
+        for (idx, p) in tw.penalties.iter().enumerate() {
             time_penalties.push(p.clone());
-            time_nullspace_dims.push(1);
+            time_nullspace_dims.push(tw.nullspace_dims.get(idx).copied().unwrap_or(0));
         }
         timewiggle_build = Some(tw);
     }

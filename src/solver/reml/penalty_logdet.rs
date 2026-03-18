@@ -92,6 +92,22 @@ pub struct PenaltyPseudologdet {
 }
 
 impl PenaltyPseudologdet {
+    #[inline]
+    fn trace_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        let n = a.nrows().min(b.nrows());
+        let mut total = 0.0;
+        for i in 0..n {
+            for j in 0..a.ncols().min(b.ncols()) {
+                total += a[[i, j]] * b[[j, i]];
+            }
+        }
+        total
+    }
+
+    fn pseudo_inverse_dense(&self) -> Array2<f64> {
+        self.w_factor.dot(&self.w_factor.t())
+    }
+
     /// Build from block-local `Penalty` values and current lambdas.
     ///
     /// When all penalties have disjoint column ranges, the eigendecomposition
@@ -605,15 +621,12 @@ impl PenaltyPseudologdet {
             det1[idx] = lambdas[idx] * tr;
         }
 
-        // Second derivatives: ∂²_ρk ρl L = δ_{kl} ∂_ρk L − λ_k λ_l tr(Y_k Y_l^T).
+        // Second derivatives: ∂²_ρk ρl L = δ_{kl} ∂_ρk L − λ_k λ_l tr(Y_k Y_l).
+        // Y_k is symmetric (W^T S_k W with S_k symmetric), so tr(Y_k Y_l) = tr(Y_k Y_l^T).
         let mut det2 = Array2::<f64>::zeros((k, k));
         for ki in 0..k {
             for li in 0..=ki {
-                let tr_ab: f64 = y_k[ki]
-                    .iter()
-                    .zip(y_k[li].t().iter())
-                    .map(|(&a, &b)| a * b)
-                    .sum();
+                let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
                 let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
                 if ki == li {
                     val += det1[ki];
@@ -658,11 +671,7 @@ impl PenaltyPseudologdet {
         let mut det2 = Array2::<f64>::zeros((k, k));
         for ki in 0..k {
             for li in 0..=ki {
-                let tr_ab: f64 = y_k[ki]
-                    .iter()
-                    .zip(y_k[li].t().iter())
-                    .map(|(&a, &b)| a * b)
-                    .sum();
+                let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
                 let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
                 if ki == li {
                     val += det1[ki];
@@ -709,19 +718,17 @@ impl PenaltyPseudologdet {
             return 0.0;
         }
 
-        let y_i = self.reduced(s_tau_i);
-        let y_j = self.reduced(s_tau_j);
+        let s_pinv = self.pseudo_inverse_dense();
 
         // tr(S⁺ S_{τ_i τ_j})
         let linear = if let Some(s_ij) = s_tau_ij {
-            let y_ij = self.reduced(s_ij);
-            (0..self.rank).map(|r| y_ij[[r, r]]).sum::<f64>()
+            Self::trace_dense_product(&s_pinv, s_ij)
         } else {
             0.0
         };
 
-        // tr(S⁺ S_{τ_i} S⁺ S_{τ_j}) = tr(Y_i Y_j^T)
-        let quad: f64 = y_i.iter().zip(y_j.t().iter()).map(|(&a, &b)| a * b).sum();
+        // tr(S⁺ S_{τ_i} S⁺ S_{τ_j})
+        let quad = Self::trace_dense_product(&s_pinv.dot(s_tau_i).dot(&s_pinv), s_tau_j);
 
         // Moving-nullspace correction: 2 tr(Σ₊⁻² L_i L_j^T).
         let nullspace_correction = if self.u_null.is_some() {
@@ -769,15 +776,13 @@ impl PenaltyPseudologdet {
             return 0.0;
         }
 
-        let y_k = self.reduced(s_k);
-        let y_tau = self.reduced(s_tau_i);
+        let s_pinv = self.pseudo_inverse_dense();
 
-        // −λ_k tr(Y_k Y_tau^T) = −λ_k tr(S⁺ S_k S⁺ S_{τ_i})
-        let quad: f64 = y_k.iter().zip(y_tau.t().iter()).map(|(&a, &b)| a * b).sum();
+        // −λ_k tr(S⁺ S_k S⁺ S_{τ_i})
+        let quad = Self::trace_dense_product(&s_pinv.dot(s_k).dot(&s_pinv), s_tau_i);
 
         let linear = if let Some(dsk) = ds_k_dtau_i {
-            let y_dsk = self.reduced(dsk);
-            (0..self.rank).map(|r| y_dsk[[r, r]]).sum::<f64>()
+            Self::trace_dense_product(&s_pinv, dsk)
         } else {
             0.0
         };
@@ -797,18 +802,13 @@ impl PenaltyPseudologdet {
             return 0.0;
         }
 
-        let start = penalty.col_range.start;
-        let end = penalty.col_range.end;
-        let w_block = self.w_factor.slice(s![start..end, ..]).to_owned();
-        let local_w = penalty.local.dot(&w_block);
-        let y_k = w_block.t().dot(&local_w);
-        let y_tau = self.reduced(s_tau_i);
-
-        let quad: f64 = y_k.iter().zip(y_tau.t().iter()).map(|(&a, &b)| a * b).sum();
+        let s_pinv = self.pseudo_inverse_dense();
+        let mut s_k = Array2::<f64>::zeros(s_pinv.raw_dim());
+        penalty.accumulate_weighted(&mut s_k, 1.0);
+        let quad = Self::trace_dense_product(&s_pinv.dot(&s_k).dot(&s_pinv), s_tau_i);
 
         let linear = if let Some(dsk) = ds_k_dtau_i {
-            let y_dsk = self.reduced(dsk);
-            (0..self.rank).map(|r| y_dsk[[r, r]]).sum::<f64>()
+            Self::trace_dense_product(&s_pinv, dsk)
         } else {
             0.0
         };
@@ -898,10 +898,18 @@ mod tests {
         let sp = make_s(tau0 + eps);
         let sm = make_s(tau0 - eps);
 
-        // S_τ ≈ (S(τ+ε) - S(τ-ε)) / 2ε
-        let s_tau = (&sp - &sm) / (2.0 * eps);
-        // S_ττ ≈ (S(τ+ε) - 2S(τ) + S(τ-ε)) / ε²
-        let s_tau_tau = (&sp - 2.0 * &s0 + &sm) / (eps * eps);
+        // Use the exact derivatives of the rotated SPD family instead of an
+        // ultra-small second finite difference, which is dominated by
+        // cancellation and can make the invariant logdet test itself flaky.
+        let two_tau = 2.0 * tau0;
+        let s_tau = array![
+            [-two_tau.sin(), two_tau.cos()],
+            [two_tau.cos(), two_tau.sin()]
+        ];
+        let s_tau_tau = array![
+            [-2.0 * two_tau.cos(), -2.0 * two_tau.sin()],
+            [-2.0 * two_tau.sin(), 2.0 * two_tau.cos()]
+        ];
 
         let pld = PenaltyPseudologdet::from_assembled(s0).unwrap();
 

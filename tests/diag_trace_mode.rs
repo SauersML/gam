@@ -74,6 +74,7 @@ fn tracethird_auto_correction_againstfd() {
         linear_constraints: None,
         firth_bias_reduction: Some(false),
         penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };

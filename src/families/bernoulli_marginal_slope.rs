@@ -271,6 +271,7 @@ fn deviation_transform(
 fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
+    extra_collocation: Option<&[f64]>,
 ) -> Result<DeviationPrepared, String> {
     let knots = initializewiggle_knots_from_seed(seed.view(), cfg.degree, cfg.num_internal_knots)?;
     let runtime = DeviationRuntime {
@@ -304,7 +305,24 @@ fn build_deviation_block_from_seed(
             Array2::<f64>::eye(dim),
         ));
     }
-    let derivative_grid = deviation_grid_from_knots(&knots, cfg.degree, cfg.derivative_grid_size)?;
+    let mut derivative_grid =
+        deviation_grid_from_knots(&knots, cfg.degree, cfg.derivative_grid_size)?;
+    // Extend collocation grid with evaluation-domain points that fall within the
+    // B-spline active support.  Outside the support the basis is zero so the
+    // deviation is identically zero and no constraint is needed.
+    if let Some(extra) = extra_collocation {
+        let left = knots[cfg.degree];
+        let right = knots[knots.len() - cfg.degree - 1];
+        let mut pts: Vec<f64> = derivative_grid.to_vec();
+        for &pt in extra {
+            if pt.is_finite() && pt >= left && pt <= right {
+                pts.push(pt);
+            }
+        }
+        pts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        pts.dedup_by(|a, b| (*a - *b).abs() <= 1e-10);
+        derivative_grid = Array1::from_vec(pts);
+    }
     let derivative_design = runtime.first_derivative_design(&derivative_grid)?;
     let constraints = LinearInequalityConstraints {
         a: derivative_design,
@@ -382,6 +400,7 @@ fn pooled_probit_baseline(
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         },
@@ -893,42 +912,97 @@ impl BernoulliMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64), String> {
         let target = normal_cdf(marginal_eta);
-        let mut intercept = marginal_eta * (1.0 + slope * slope).sqrt();
-        for _ in 0..20 {
-            let v = h_nodes.mapv(|h| intercept + slope * h);
+
+        // Evaluate the constraint function F(a) and its derivative F_a at a given intercept.
+        // F(a) = ∫ Φ(L(a + b·h)) w(h) dh − Φ(q)
+        // F_a(a) = ∫ φ(L(a + b·h)) · L'(a + b·h) · w(h) dh
+        let eval = |a: f64| -> Result<(f64, f64), String> {
+            let v = h_nodes.mapv(|h| a + slope * h);
             let (t, t1, _) = self.link_terms(&v, beta_w)?;
-            let f = self
+            let f_val = self
                 .quadrature_weights
                 .iter()
                 .zip(t.iter())
                 .map(|(&w, &tt)| w * normal_cdf(tt))
                 .sum::<f64>()
                 - target;
-            let fp = self
+            let f_deriv = self
                 .quadrature_weights
                 .iter()
                 .zip(t.iter().zip(t1.iter()))
                 .map(|(&w, (&tt, &tt1))| w * normal_pdf(tt) * tt1)
                 .sum::<f64>();
-            if !fp.is_finite() || fp <= 0.0 {
+            Ok((f_val, f_deriv))
+        };
+
+        // Initial guess: closed-form solution for the rigid (no link deviation) case.
+        let mut a = marginal_eta * (1.0 + slope * slope).sqrt();
+
+        // Track bracket [lo, hi] such that F(lo) < 0 < F(hi).
+        // F is monotone increasing in a when the link is monotone.
+        let mut lo = f64::NEG_INFINITY;
+        let mut hi = f64::INFINITY;
+
+        for _ in 0..40 {
+            let (f_val, f_deriv) = eval(a)?;
+
+            // Update bracket.
+            if f_val < 0.0 {
+                lo = a;
+            } else if f_val > 0.0 {
+                hi = a;
+            } else {
+                // Exact root.
+                return Ok((a, f_deriv));
+            }
+
+            // Check convergence on bracket width.
+            if lo.is_finite() && hi.is_finite() && (hi - lo) < 1e-12 {
                 break;
             }
-            let step = f / fp;
-            intercept -= step;
-            if step.abs() < 1e-10 {
-                break;
+
+            // Try Newton step if derivative is well-behaved.
+            let use_newton = f_deriv.is_finite() && f_deriv > 1e-30;
+            if use_newton {
+                let a_newton = a - f_val / f_deriv;
+                // Accept Newton step only if it stays within the bracket.
+                if lo.is_finite() && hi.is_finite() {
+                    if a_newton > lo && a_newton < hi {
+                        a = a_newton;
+                    } else {
+                        a = 0.5 * (lo + hi);
+                    }
+                } else {
+                    a = a_newton;
+                }
+            } else if lo.is_finite() && hi.is_finite() {
+                // Bisect within bracket.
+                a = 0.5 * (lo + hi);
+            } else {
+                // No bracket yet, no usable Newton step: expand search.
+                if f_val < 0.0 {
+                    a += 4.0;
+                } else {
+                    a -= 4.0;
+                }
             }
         }
 
-        let v = h_nodes.mapv(|h| intercept + slope * h);
-        let (t, t1, _) = self.link_terms(&v, beta_w)?;
-        let m_a = self
-            .quadrature_weights
-            .iter()
-            .zip(t.iter().zip(t1.iter()))
-            .map(|(&w, (&tt, &tt1))| w * normal_pdf(tt) * tt1)
-            .sum::<f64>();
-        Ok((intercept, m_a))
+        // Final evaluation and checks.
+        let (f_val, f_deriv) = eval(a)?;
+        if f_val.abs() > 1e-6 {
+            return Err(format!(
+                "bernoulli marginal-slope intercept solve failed: \
+                 residual={f_val:.3e} at a={a:.6}, target Φ(q)={target:.6}"
+            ));
+        }
+        if !f_deriv.is_finite() || f_deriv <= 0.0 {
+            return Err(format!(
+                "bernoulli marginal-slope intercept solve: \
+                 link monotonicity violated, F_a={f_deriv:.3e} at a={a:.6}"
+            ));
+        }
+        Ok((a, f_deriv))
     }
 
     fn link_basis_stack(
@@ -1154,7 +1228,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let a_jet = if self.flex_active() {
             let mut jet = MultiDirJet::constant(k, row_ctx.intercept);
-            let m_a = row_ctx.m_a.abs().max(1e-12);
+            let m_a = row_ctx.m_a;
             for order in 1..=k {
                 for mask in 1..=jet.full_mask() {
                     if mask.count_ones() as usize != order {
@@ -2914,7 +2988,7 @@ fn build_blockspec(
         design: design.design.clone(),
         offset: Array1::from_elem(design.design.nrows(), baseline),
         penalties: design.penalties_as_penalty_matrix(),
-        nullspace_dims: vec![],
+        nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }
@@ -2958,13 +3032,19 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let logslopespec_boot =
         freeze_spatial_length_scale_terms_from_design(&spec.logslopespec, &logslope_design)
             .map_err(|e| e.to_string())?;
+
+    // Compute quadrature nodes early so they can be used as collocation hints
+    // for the score-warp monotonicity constraints (fix #9a: the score-warp is
+    // evaluated at these nodes, so monotonicity must be enforced there too).
+    let (quad_nodes, quad_weights) = normal_expectation_nodes(spec.quadrature_points);
+
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
-        .map(|cfg| build_deviation_block_from_seed(&spec.z, cfg))
+        .map(|cfg| {
+            build_deviation_block_from_seed(&spec.z, cfg, Some(quad_nodes.as_slice().unwrap()))
+        })
         .transpose()?;
-
-    let (quad_nodes, quad_weights) = normal_expectation_nodes(spec.quadrature_points);
     let rigid_family = BernoulliMarginalSlopeFamily {
         y: spec.y.clone(),
         weights: spec.weights.clone(),
@@ -3004,10 +3084,30 @@ pub fn fit_bernoulli_marginal_slope_terms(
             marginal_eta[i] * (1.0 + b * b).sqrt() + b * spec.z[i]
         }))
     };
+    // Estimate the link-deviation evaluation domain from the rigid fit.
+    // During fitting, the link is evaluated at a_i + b_i * h_m where a_i is
+    // the intercept and b_i = exp(g_i) is the slope for each row, and h_m are
+    // the quadrature nodes.  We use the rigid-fit parameters to estimate the
+    // range of these values so the collocation grid covers them.
+    let link_dev_collocation_hints: Vec<f64> = {
+        let marginal_eta = &rigid_fit.block_states[0].eta;
+        let logslope_eta = &rigid_fit.block_states[1].eta;
+        let mut hints = Vec::new();
+        for i in 0..marginal_eta.len() {
+            let b = logslope_eta[i].exp();
+            let a_i = marginal_eta[i] * (1.0 + b * b).sqrt();
+            for &h in quad_nodes.iter() {
+                hints.push(a_i + b * h);
+            }
+        }
+        hints
+    };
     let link_dev_prepared = spec
         .link_dev
         .as_ref()
-        .map(|cfg| build_deviation_block_from_seed(&q0_seed, cfg))
+        .map(|cfg| {
+            build_deviation_block_from_seed(&q0_seed, cfg, Some(&link_dev_collocation_hints))
+        })
         .transpose()?;
 
     let extra_rho0 = {
@@ -3119,21 +3219,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
         }
     };
 
-    let analytic_joint_derivatives_available =
-        build_block_spatial_psi_derivatives(data, &marginalspec_boot, &marginal_design)
-            .and_then(|maybe| {
-                maybe
-                    .ok_or_else(|| "missing bernoulli marginal spatial psi derivatives".to_string())
-            })
-            .and_then(|_| {
-                build_block_spatial_psi_derivatives(data, &logslopespec_boot, &logslope_design)
-                    .and_then(|maybe| {
-                        maybe.ok_or_else(|| {
-                            "missing bernoulli logslope spatial psi derivatives".to_string()
-                        })
-                    })
-            })
-            .is_ok();
+    let marginal_psi_result =
+        build_block_spatial_psi_derivatives(data, &marginalspec_boot, &marginal_design);
+    let logslope_psi_result =
+        build_block_spatial_psi_derivatives(data, &logslopespec_boot, &logslope_design);
+    let analytic_joint_derivatives_available = marginal_psi_result.is_ok()
+        && logslope_psi_result.is_ok()
+        && (marginal_psi_result.as_ref().unwrap().is_some()
+            || logslope_psi_result.as_ref().unwrap().is_some());
     if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
         return Err(
             "exact bernoulli marginal-slope spatial optimization requires analytic joint psi derivatives"
@@ -3202,12 +3295,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let blocks = build_blocks(rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1]);
             let mut derivative_blocks = vec![
-                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
-                    || "missing bernoulli marginal spatial psi derivatives".to_string(),
-                )?,
-                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
-                    || "missing bernoulli logslope spatial psi derivatives".to_string(),
-                )?,
+                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
+                    .unwrap_or_default(),
+                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
+                    .unwrap_or_default(),
             ];
             if family.score_warp.is_some() {
                 derivative_blocks.push(Vec::new());
@@ -3342,6 +3433,7 @@ mod tests {
                 derivative_grid_size: 16,
                 ..DeviationBlockConfig::default()
             },
+            None,
         )
         .expect("build link deviation block");
         let link_dim = prepared

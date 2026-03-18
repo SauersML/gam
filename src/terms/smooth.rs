@@ -2540,8 +2540,19 @@ pub fn build_smooth_design_withworkspace(
             && use_box_reparam
         {
             let t = cumulative_sum_transform_matrix(p_local, order, sign);
+            // Coefficient-side transform: wrap the design in an operator that
+            // applies T on the coefficient side, preserving sparsity/operator
+            // structure of the inner design.
+            let inner_dense = match design_t {
+                DesignMatrix::Dense(d) => d,
+                DesignMatrix::Sparse(sp) => {
+                    crate::matrix::DenseDesignMatrix::from(sp.to_dense())
+                }
+            };
+            let coeff_op = crate::matrix::CoefficientTransformOperator::new(inner_dense, t.clone())
+                .map_err(|e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")))?;
             design_t = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                design_t.to_dense().dot(&t),
+                Arc::new(coeff_op),
             ));
             penalties_t = penalties_t
                 .into_iter()
@@ -2845,9 +2856,7 @@ pub fn build_term_collection_design(
         for term_design in &smooth.term_designs {
             match term_design {
                 DesignMatrix::Dense(dense) => blocks.push(DesignBlock::Dense(dense.clone())),
-                DesignMatrix::Sparse(_) => blocks.push(DesignBlock::Dense(
-                    crate::matrix::DenseDesignMatrix::from(Arc::new(term_design.clone())),
-                )),
+                DesignMatrix::Sparse(sparse) => blocks.push(DesignBlock::Sparse(sparse.clone())),
             }
         }
     }
@@ -5373,7 +5382,10 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 pirls_status: pirls_status_val,
                 max_abs_eta,
                 constraint_kkt: None,
-                artifacts: crate::estimate::FitArtifacts { pirls: None },
+                artifacts: crate::estimate::FitArtifacts {
+                    pirls: None,
+                    ..Default::default()
+                },
                 inner_cycles: 0,
             })?
         },
@@ -5447,6 +5459,7 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
         linear_constraints: design.linear_constraints.clone(),
         adaptive_regularization: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
+        rho_prior: Default::default(),
         kronecker_penalty_system: design.kronecker_penalty_system(),
         kronecker_factored: design
             .smooth
@@ -6662,7 +6675,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
     }
 
     fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-        ExactNewtonOuterObjective::PseudoLaplace
+        ExactNewtonOuterObjective::StrictPseudoLaplace
     }
 
     fn exact_newton_allows_semidefinitehessian(&self) -> bool {
@@ -7577,7 +7590,10 @@ fn fit_bounded_term_collection_with_design(
                 pirls_status: pirls_status_val,
                 max_abs_eta,
                 constraint_kkt: None,
-                artifacts: crate::estimate::FitArtifacts { pirls: None },
+                artifacts: crate::estimate::FitArtifacts {
+                    pirls: None,
+                    ..Default::default()
+                },
                 inner_cycles: 0,
             })?
         },
@@ -7799,6 +7815,7 @@ fn external_opts_for_design(
         linear_constraints: design.linear_constraints.clone(),
         firth_bias_reduction: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
+        rho_prior: options.rho_prior.clone(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     }
@@ -9829,9 +9846,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         for term_design in &self.design.smooth.term_designs {
             match term_design {
                 DesignMatrix::Dense(dense) => blocks.push(DesignBlock::Dense(dense.clone())),
-                DesignMatrix::Sparse(_) => blocks.push(DesignBlock::Dense(
-                    crate::matrix::DenseDesignMatrix::from(Arc::new(term_design.clone())),
-                )),
+                DesignMatrix::Sparse(sparse) => blocks.push(DesignBlock::Sparse(sparse.clone())),
             }
         }
         let block_op = BlockDesignOperator::new(blocks)
@@ -12041,6 +12056,7 @@ mod tests {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };
@@ -12881,6 +12897,7 @@ mod tests {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };
@@ -12991,6 +13008,7 @@ mod tests {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };
@@ -13070,6 +13088,7 @@ mod tests {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };
@@ -13280,6 +13299,7 @@ mod tests {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },
@@ -13786,6 +13806,7 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },
@@ -13873,6 +13894,7 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },
@@ -13943,6 +13965,7 @@ mod tests {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },
@@ -14144,6 +14167,7 @@ mod tests {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },
@@ -14320,6 +14344,7 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },

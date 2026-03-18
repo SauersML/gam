@@ -1,7 +1,7 @@
 use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use csv::{ReaderBuilder, StringRecord};
 use ndarray::Array2;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -54,10 +54,17 @@ fn detect_format(path: &Path) -> Result<DataFormat, String> {
 // ---------------------------------------------------------------------------
 
 pub fn load_dataset(path: &Path) -> Result<EncodedDataset, String> {
+    load_dataset_projected(path, &[])
+}
+
+pub fn load_dataset_projected(
+    path: &Path,
+    requested_columns: &[String],
+) -> Result<EncodedDataset, String> {
     match detect_format(path)? {
-        DataFormat::Csv => load_delimited_inferred(path, b','),
-        DataFormat::Tsv => load_delimited_inferred(path, b'\t'),
-        DataFormat::Parquet => load_parquet_inferred(path),
+        DataFormat::Csv => load_delimited_inferred(path, b',', requested_columns),
+        DataFormat::Tsv => load_delimited_inferred(path, b'\t', requested_columns),
+        DataFormat::Parquet => load_parquet_inferred(path, requested_columns),
     }
 }
 
@@ -66,10 +73,25 @@ pub fn load_datasetwith_schema(
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
 ) -> Result<EncodedDataset, String> {
+    load_datasetwith_schema_projected(path, schema, unseen_policy, &[])
+}
+
+pub fn load_datasetwith_schema_projected(
+    path: &Path,
+    schema: &DataSchema,
+    unseen_policy: UnseenCategoryPolicy,
+    requested_columns: &[String],
+) -> Result<EncodedDataset, String> {
     match detect_format(path)? {
-        DataFormat::Csv => load_delimited_with_schema(path, b',', schema, unseen_policy),
-        DataFormat::Tsv => load_delimited_with_schema(path, b'\t', schema, unseen_policy),
-        DataFormat::Parquet => load_parquet_with_schema(path, schema, unseen_policy),
+        DataFormat::Csv => {
+            load_delimited_with_schema(path, b',', schema, unseen_policy, requested_columns)
+        }
+        DataFormat::Tsv => {
+            load_delimited_with_schema(path, b'\t', schema, unseen_policy, requested_columns)
+        }
+        DataFormat::Parquet => {
+            load_parquet_with_schema(path, schema, unseen_policy, requested_columns)
+        }
     }
 }
 
@@ -78,7 +100,7 @@ pub fn load_datasetwith_schema(
 // ---------------------------------------------------------------------------
 
 pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, String> {
-    load_delimited_inferred(path, b',')
+    load_delimited_inferred(path, b',', &[])
 }
 
 pub fn load_csvwith_schema(
@@ -86,7 +108,7 @@ pub fn load_csvwith_schema(
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
 ) -> Result<EncodedDataset, String> {
-    load_delimited_with_schema(path, b',', schema, unseen_policy)
+    load_delimited_with_schema(path, b',', schema, unseen_policy, &[])
 }
 
 // ---------------------------------------------------------------------------
@@ -96,22 +118,67 @@ pub fn load_csvwith_schema(
 /// Maximum number of rows used for schema inference when no schema is provided.
 const SCHEMA_SAMPLE_ROWS: usize = 1024;
 
-fn load_delimited_inferred(path: &Path, delimiter: u8) -> Result<EncodedDataset, String> {
+fn resolve_requested_columns(
+    all_headers: &[String],
+    requested_columns: &[String],
+) -> Result<Vec<usize>, String> {
+    if requested_columns.is_empty() {
+        return Ok((0..all_headers.len()).collect());
+    }
+
+    let requested_set: HashSet<&str> = requested_columns.iter().map(String::as_str).collect();
+    let mut selected = Vec::with_capacity(requested_set.len());
+    for (idx, name) in all_headers.iter().enumerate() {
+        if requested_set.contains(name.as_str()) {
+            selected.push(idx);
+        }
+    }
+
+    if selected.len() != requested_set.len() {
+        let available: HashSet<&str> = all_headers.iter().map(String::as_str).collect();
+        let missing = requested_columns
+            .iter()
+            .filter(|name| !available.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "requested column(s) not found in data: {}",
+            missing.join(", ")
+        ));
+    }
+
+    Ok(selected)
+}
+
+fn projected_headers(all_headers: &[String], selected_indices: &[usize]) -> Vec<String> {
+    selected_indices
+        .iter()
+        .map(|&idx| all_headers[idx].clone())
+        .collect()
+}
+
+fn load_delimited_inferred(
+    path: &Path,
+    delimiter: u8,
+    requested_columns: &[String],
+) -> Result<EncodedDataset, String> {
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delimiter)
         .from_path(path)
         .map_err(|e| format!("failed to open '{}': {e}", path.display()))?;
 
-    let headers: Vec<String> = rdr
+    let all_headers: Vec<String> = rdr
         .headers()
         .map_err(|e| format!("failed to read headers: {e}"))?
         .iter()
         .map(|s| s.trim().to_string())
         .collect();
-    if headers.is_empty() {
+    if all_headers.is_empty() {
         return Err("file has no headers".to_string());
     }
+    let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
+    let headers = projected_headers(&all_headers, &selected_indices);
     let p = headers.len();
 
     // Phase 1: sample rows for schema inference, accumulate into column vecs.
@@ -131,18 +198,18 @@ fn load_delimited_inferred(path: &Path, delimiter: u8) -> Result<EncodedDataset,
         .read_record(&mut record)
         .map_err(|e| format!("failed reading row: {e}"))?
     {
-        if record.len() != p {
+        if record.len() != all_headers.len() {
             return Err(format!(
                 "row width mismatch at row {}: got {} fields, expected {}",
                 total_rows + 1,
                 record.len(),
-                p
+                all_headers.len()
             ));
         }
         total_rows += 1;
 
         for j in 0..p {
-            let raw = record.get(j).unwrap().trim();
+            let raw = record.get(selected_indices[j]).unwrap().trim();
             if raw.is_empty() {
                 return Err(format!(
                     "empty field at row {}, column '{}'",
@@ -288,6 +355,7 @@ fn load_delimited_with_schema(
     delimiter: u8,
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
+    requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
@@ -295,15 +363,17 @@ fn load_delimited_with_schema(
         .from_path(path)
         .map_err(|e| format!("failed to open '{}': {e}", path.display()))?;
 
-    let headers: Vec<String> = rdr
+    let all_headers: Vec<String> = rdr
         .headers()
         .map_err(|e| format!("failed to read headers: {e}"))?
         .iter()
         .map(|s| s.trim().to_string())
         .collect();
-    if headers.is_empty() {
+    if all_headers.is_empty() {
         return Err("file has no headers".to_string());
     }
+    let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
+    let headers = projected_headers(&all_headers, &selected_indices);
     let p = headers.len();
 
     // Build per-column metadata from schema.
@@ -367,18 +437,18 @@ fn load_delimited_with_schema(
         .read_record(&mut record)
         .map_err(|e| format!("failed reading row: {e}"))?
     {
-        if record.len() != p {
+        if record.len() != all_headers.len() {
             return Err(format!(
                 "row width mismatch at row {}: got {} fields, expected {}",
                 total_rows + 1,
                 record.len(),
-                p
+                all_headers.len()
             ));
         }
         total_rows += 1;
 
         for j in 0..p {
-            let raw = record.get(j).unwrap().trim();
+            let raw = record.get(selected_indices[j]).unwrap().trim();
             if raw.is_empty() {
                 return Err(format!(
                     "empty field at row {}, column '{}'",
@@ -548,13 +618,16 @@ struct ColMeta {
 // Parquet — columnar, zero StringRecord, schema from metadata
 // ---------------------------------------------------------------------------
 
-fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
+fn load_parquet_inferred(
+    path: &Path,
+    requested_columns: &[String],
+) -> Result<EncodedDataset, String> {
     use arrow::array::{
         Array as ArrowArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
         Int32Array, Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::DataType;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
     use std::fs::File;
 
     let file = File::open(path)
@@ -562,16 +635,24 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("failed to read parquet metadata '{}': {e}", path.display()))?;
 
-    let arrow_schema = builder.schema().clone();
-    let reader = builder
-        .build()
-        .map_err(|e| format!("failed to build parquet reader: {e}"))?;
-
-    let headers: Vec<String> = arrow_schema
+    let full_schema = builder.schema().clone();
+    let all_headers: Vec<String> = full_schema
         .fields()
         .iter()
         .map(|f| f.name().clone())
         .collect();
+    let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
+    let headers = projected_headers(&all_headers, &selected_indices);
+    let selected_fields = selected_indices
+        .iter()
+        .map(|&idx| full_schema.fields()[idx].clone())
+        .collect::<Vec<_>>();
+    let projection =
+        ProjectionMask::roots(builder.parquet_schema(), selected_indices.iter().copied());
+    let reader = builder
+        .with_projection(projection)
+        .build()
+        .map_err(|e| format!("failed to build parquet reader: {e}"))?;
     let p = headers.len();
 
     // Collect all batches.
@@ -580,7 +661,7 @@ fn load_parquet_inferred(path: &Path) -> Result<EncodedDataset, String> {
     let mut string_cols: Vec<Option<Vec<String>>> = (0..p).map(|_| None).collect();
     let mut is_string_col: Vec<bool> = vec![false; p];
 
-    for (j, field) in arrow_schema.fields().iter().enumerate() {
+    for (j, field) in selected_fields.iter().enumerate() {
         match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _) => {
                 is_string_col[j] = true;
@@ -797,9 +878,10 @@ fn load_parquet_with_schema(
     path: &Path,
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
+    requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
     // Load with inference first, then validate/re-encode against provided schema.
-    let inferred = load_parquet_inferred(path)?;
+    let inferred = load_parquet_inferred(path, requested_columns)?;
     let p = inferred.headers.len();
     let n = inferred.values.nrows();
 

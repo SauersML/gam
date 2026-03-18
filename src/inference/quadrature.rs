@@ -2817,35 +2817,14 @@ fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
 
 #[inline]
 fn logit_point_jet(x: f64) -> (f64, f64, f64, f64) {
-    let x_clamped = x.clamp(-700.0, 700.0);
-    let p = sigmoid(x);
-    let (d1, d2, d3) = if x_clamped == x {
-        let d1 = p * (1.0 - p);
-        let d2 = d1 * (1.0 - 2.0 * p);
-        let d3 = d1 * (1.0 - 6.0 * d1);
-        (d1, d2, d3)
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-    (p, d1, d2, d3)
+    let jet = component_inverse_link_jet(LinkComponent::Logit, x);
+    (jet.mu, jet.d1, jet.d2, jet.d3)
 }
 
 #[inline]
 fn cloglog_point_jet(x: f64) -> (f64, f64, f64, f64) {
-    let z = x.clamp(-30.0, 30.0);
-    let clamp_active = z != x;
-    let t = z.exp();
-    let s = (-t).exp();
-    let mean = 1.0 - s;
-    let (d1, d2, d3) = if clamp_active {
-        (0.0, 0.0, 0.0)
-    } else {
-        let d1 = t * s;
-        let d2 = d1 * (1.0 - t);
-        let d3 = d1 * (1.0 - 3.0 * t + t * t);
-        (d1, d2, d3)
-    };
-    (mean, d1, d2, d3)
+    let jet = component_inverse_link_jet(LinkComponent::CLogLog, x);
+    (jet.mu, jet.d1, jet.d2, jet.d3)
 }
 
 #[inline]

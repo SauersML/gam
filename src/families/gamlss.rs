@@ -5259,17 +5259,13 @@ impl GaussianLocationScaleFamily {
             &weights_a.dhmu_ls,
             &weights_a.dh_ls_ls,
         )?;
-        let hessian_psi = if hessian_psi_operator.is_some() {
-            Array2::<f64>::zeros((0, 0))
-        } else {
-            gaussian_joint_psihessian_fromweights(
-                xmu,
-                x_ls,
-                &dir_a.xmu_psi,
-                &dir_a.x_ls_psi,
-                &weights_a,
-            )?
-        };
+        let hessian_psi = gaussian_joint_psihessian_fromweights(
+            xmu,
+            x_ls,
+            &dir_a.xmu_psi,
+            &dir_a.x_ls_psi,
+            &weights_a,
+        )?;
 
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
             objective_psi,
@@ -10817,30 +10813,25 @@ impl BinomialLocationScaleFamily {
         let mut score_psi = Array1::<f64>::zeros(total);
         score_psi.slice_mut(s![0..pt]).assign(&score_t);
         score_psi.slice_mut(s![pt..pt + pls]).assign(&score_ls);
-        let hessian_psi = if hessian_psi_operator.is_some() {
-            Array2::<f64>::zeros((0, 0))
-        } else {
-            let h_tt_block = xt_diag_y_dense(&dir_a.x_t_psi, &h_tt, x_t)?
-                + &xt_diag_y_dense(x_t, &h_tt, &dir_a.x_t_psi)?
-                + &xt_diag_x_dense(x_t, &dh_tt)?;
-            let h_tl_block = xt_diag_y_dense(&dir_a.x_t_psi, &h_tl, x_ls)?
-                + &xt_diag_y_dense(x_t, &h_tl, &dir_a.x_ls_psi)?
-                + &xt_diag_y_dense(x_t, &dh_tl, x_ls)?;
-            let h_ll_block = xt_diag_y_dense(&dir_a.x_ls_psi, &h_ll, x_ls)?
-                + &xt_diag_y_dense(x_ls, &h_ll, &dir_a.x_ls_psi)?
-                + &xt_diag_x_dense(x_ls, &dh_ll)?;
+        let h_tt_block = xt_diag_y_dense(&dir_a.x_t_psi, &h_tt, x_t)?
+            + &xt_diag_y_dense(x_t, &h_tt, &dir_a.x_t_psi)?
+            + &xt_diag_x_dense(x_t, &dh_tt)?;
+        let h_tl_block = xt_diag_y_dense(&dir_a.x_t_psi, &h_tl, x_ls)?
+            + &xt_diag_y_dense(x_t, &h_tl, &dir_a.x_ls_psi)?
+            + &xt_diag_y_dense(x_t, &dh_tl, x_ls)?;
+        let h_ll_block = xt_diag_y_dense(&dir_a.x_ls_psi, &h_ll, x_ls)?
+            + &xt_diag_y_dense(x_ls, &h_ll, &dir_a.x_ls_psi)?
+            + &xt_diag_x_dense(x_ls, &dh_ll)?;
 
-            let mut hessian_psi = Array2::<f64>::zeros((total, total));
-            hessian_psi.slice_mut(s![0..pt, 0..pt]).assign(&h_tt_block);
-            hessian_psi
-                .slice_mut(s![0..pt, pt..pt + pls])
-                .assign(&h_tl_block);
-            hessian_psi
-                .slice_mut(s![pt..pt + pls, pt..pt + pls])
-                .assign(&h_ll_block);
-            mirror_upper_to_lower(&mut hessian_psi);
-            hessian_psi
-        };
+        let mut hessian_psi = Array2::<f64>::zeros((total, total));
+        hessian_psi.slice_mut(s![0..pt, 0..pt]).assign(&h_tt_block);
+        hessian_psi
+            .slice_mut(s![0..pt, pt..pt + pls])
+            .assign(&h_tl_block);
+        hessian_psi
+            .slice_mut(s![pt..pt + pls, pt..pt + pls])
+            .assign(&h_ll_block);
+        mirror_upper_to_lower(&mut hessian_psi);
 
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
             objective_psi,
