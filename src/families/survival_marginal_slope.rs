@@ -74,11 +74,11 @@ struct SurvivalMarginalSlopeFamily {
     design_entry: Array2<f64>,
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
-    constraint_design_derivative: Option<Array2<f64>>,
+    constraint_design_derivative: Array2<f64>,
     offset_entry: Array1<f64>,
     offset_exit: Array1<f64>,
     derivative_offset_exit: Array1<f64>,
-    constraint_derivative_offset: Option<Array1<f64>>,
+    constraint_derivative_offset: Array1<f64>,
     /// Log-slope block: standard single design.
     logslope_design: DesignMatrix,
 }
@@ -233,19 +233,18 @@ impl SurvivalMarginalSlopeFamily {
         // The model domain is enforced on qd1 itself, which is the same quantity
         // constrained by the time monotonicity inequalities. Since c = sqrt(1+beta^2)
         // is strictly positive, qd1 >= guard implies ad1 > 0 as required by log(ad1).
+        let qd1_lower = self.time_derivative_lower_bound();
+        let qd1_val = qd1_jet.coeff(0);
+        let ad1_val = ad1_jet.coeff(0);
+        if qd1_val < qd1_lower {
+            return Err(format!(
+                "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
+            ));
+        }
         let time_deriv_term = if di > 0.0 {
-            let qd1_lower = self.time_derivative_lower_bound();
-            let qd1_val = qd1_jet.coeff(0);
-            let ad1_val = ad1_jet.coeff(0);
-            if qd1_val >= qd1_lower {
-                ad1_jet
-                    .compose_unary(unary_derivatives_log(ad1_val))
-                    .scale(-wi * di)
-            } else {
-                return Err(format!(
-                    "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
-                ));
-            }
+            ad1_jet
+                .compose_unary(unary_derivatives_log(ad1_val))
+                .scale(-wi * di)
         } else {
             MultiDirJet::zero(k)
         };
@@ -1375,14 +1374,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     ) -> Result<Option<LinearInequalityConstraints>, String> {
         if block_idx == 0 {
             let derivative_guard = self.time_derivative_lower_bound();
-            let constraint_rows = self
-                .constraint_design_derivative
-                .as_ref()
-                .unwrap_or(&self.design_derivative_exit);
-            let constraint_offsets = self
-                .constraint_derivative_offset
-                .as_ref()
-                .unwrap_or(&self.derivative_offset_exit);
+            let constraint_rows = &self.constraint_design_derivative;
+            let constraint_offsets = &self.constraint_derivative_offset;
             // Monotonicity constraint: design_derivative_exit @ beta_time + offset >= guard
             // i.e. design_derivative_exit @ beta_time >= guard - offset
             if let Some(structural) = structural_nonnegative_time_constraints(
@@ -1545,31 +1538,24 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             "survival-marginal-slope time block design column mismatch: entry={p_entry}, exit={p_exit}, deriv={p_deriv}"
         ));
     }
-    if let Some(rows) = spec.time_block.constraint_design_derivative.as_ref() {
-        if rows.ncols() != p_entry {
-            return Err(format!(
-                "survival-marginal-slope time monotonicity constraint width mismatch: got {}, expected {p_entry}",
-                rows.ncols()
-            ));
-        }
-        let offsets = spec
-            .time_block
-            .constraint_derivative_offset
-            .as_ref()
-            .ok_or_else(|| {
-                "survival-marginal-slope monotonicity constraints are missing derivative offsets"
-                    .to_string()
-            })?;
-        if offsets.len() != rows.nrows() {
-            return Err(format!(
-                "survival-marginal-slope monotonicity constraint row mismatch: rows={} offsets={}",
-                rows.nrows(),
-                offsets.len()
-            ));
-        }
-    } else if spec.time_block.constraint_derivative_offset.is_some() {
+    if spec.time_block.constraint_design_derivative.ncols() != p_entry {
+        return Err(format!(
+            "survival-marginal-slope time monotonicity constraint width mismatch: got {}, expected {p_entry}",
+            spec.time_block.constraint_design_derivative.ncols()
+        ));
+    }
+    if spec.time_block.constraint_derivative_offset.len()
+        != spec.time_block.constraint_design_derivative.nrows()
+    {
+        return Err(format!(
+            "survival-marginal-slope monotonicity constraint row mismatch: rows={} offsets={}",
+            spec.time_block.constraint_design_derivative.nrows(),
+            spec.time_block.constraint_derivative_offset.len()
+        ));
+    }
+    if spec.time_block.constraint_design_derivative.nrows() == 0 {
         return Err(
-            "survival-marginal-slope monotonicity derivative offsets were provided without constraint rows"
+            "survival-marginal-slope requires explicit time monotonicity constraints; empty constraints do not define a valid model"
                 .to_string(),
         );
     }
@@ -1821,4 +1807,95 @@ pub fn fit_survival_marginal_slope_terms(
         baseline_logslope,
         time_block_penalties_len: time_penalties_len,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn empty_termspec() -> TermCollectionSpec {
+        TermCollectionSpec { terms: Vec::new() }
+    }
+
+    fn base_time_block() -> TimeBlockInput {
+        TimeBlockInput {
+            design_entry: Array2::zeros((1, 1)),
+            design_exit: Array2::zeros((1, 1)),
+            design_derivative_exit: Array2::ones((1, 1)),
+            constraint_design_derivative: Array2::ones((1, 1)),
+            offset_entry: Array1::zeros(1),
+            offset_exit: Array1::zeros(1),
+            derivative_offset_exit: Array1::zeros(1),
+            constraint_derivative_offset: Array1::zeros(1),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: None,
+            initial_beta: Some(Array1::zeros(1)),
+        }
+    }
+
+    #[test]
+    fn validate_spec_rejects_empty_time_monotonicity_constraints() {
+        let spec = SurvivalMarginalSlopeTermSpec {
+            age_entry: array![0.0],
+            age_exit: array![1.0],
+            event_target: array![0.0],
+            weights: array![1.0],
+            z: array![0.0],
+            derivative_guard: 1e-4,
+            time_block: TimeBlockInput {
+                constraint_design_derivative: Array2::zeros((0, 1)),
+                constraint_derivative_offset: Array1::zeros(0),
+                ..base_time_block()
+            },
+            logslopespec: empty_termspec(),
+        };
+
+        let err = validate_spec(&spec).expect_err("empty monotonicity constraints should fail");
+        assert!(
+            err.contains("requires explicit time monotonicity constraints"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn censored_rows_still_reject_invalid_time_derivative() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: array![0.0],
+            weights: array![1.0],
+            z: array![0.0],
+            derivative_guard: 1e-4,
+            design_entry: Array2::zeros((1, 1)),
+            design_exit: Array2::zeros((1, 1)),
+            design_derivative_exit: Array2::ones((1, 1)),
+            constraint_design_derivative: Array2::ones((1, 1)),
+            offset_entry: Array1::zeros(1),
+            offset_exit: Array1::zeros(1),
+            derivative_offset_exit: Array1::zeros(1),
+            constraint_derivative_offset: Array1::zeros(1),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.0],
+            },
+        ];
+
+        let err = family
+            .row_neglog_directional(0, &block_states, &[])
+            .expect_err("censored rows must still enforce the time-derivative domain");
+        assert!(
+            err.contains("monotonicity violated at row 0"),
+            "unexpected error: {err}"
+        );
+    }
 }

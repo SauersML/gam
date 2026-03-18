@@ -3874,13 +3874,19 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     design_derivative_exit: time_design_derivative_exit.clone(),
                     constraint_design_derivative: time_monotonicity_collocation
                         .as_ref()
-                        .map(|(rows, _)| rows.clone()),
+                        .map_or_else(
+                            || time_design_derivative_exit.clone(),
+                            |(rows, _)| rows.clone(),
+                        ),
                     offset_entry: eta_offset_entry.clone(),
                     offset_exit: eta_offset_exit.clone(),
                     derivative_offset_exit: derivative_offset_exit.clone(),
                     constraint_derivative_offset: time_monotonicity_collocation
                         .as_ref()
-                        .map(|(_, offsets)| offsets.clone()),
+                        .map_or_else(
+                            || derivative_offset_exit.clone(),
+                            |(_, offsets)| offsets.clone(),
+                        ),
                     penalties: time_penalties.clone(),
                     nullspace_dims: time_nullspace_dims.clone(),
                     initial_log_lambdas: time_initial_log_lambdas.clone(),
@@ -4102,15 +4108,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 design_entry: time_design_entry.clone(),
                 design_exit: time_design_exit.clone(),
                 design_derivative_exit: time_design_derivative_exit.clone(),
-                constraint_design_derivative: time_monotonicity_collocation
-                    .as_ref()
-                    .map(|(rows, _)| rows.clone()),
+                constraint_design_derivative: time_monotonicity_collocation.as_ref().map_or_else(
+                    || time_design_derivative_exit.clone(),
+                    |(rows, _)| rows.clone(),
+                ),
                 offset_entry: eta_offset_entry.clone(),
                 offset_exit: eta_offset_exit.clone(),
                 derivative_offset_exit: derivative_offset_exit.clone(),
-                constraint_derivative_offset: time_monotonicity_collocation
-                    .as_ref()
-                    .map(|(_, offsets)| offsets.clone()),
+                constraint_derivative_offset: time_monotonicity_collocation.as_ref().map_or_else(
+                    || derivative_offset_exit.clone(),
+                    |(_, offsets)| offsets.clone(),
+                ),
                 penalties: time_penalties.clone(),
                 nullspace_dims: time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,

@@ -247,7 +247,12 @@ fn compensated_difference(lhs: f64, rhs: f64) -> StableDifference {
         };
     }
     let value = high + low;
-    let roundoff_slack = low.abs() + 8.0 * f64::EPSILON * operand_scale.max(value.abs());
+    // |low| is the exact rounding error of the final lhs − rhs subtraction.
+    // The 128ε term bounds accumulated upstream error: d_raw and qdot each
+    // pass through ~45 chained safe_product / safe_sum operations, giving
+    // ≤90ε × operand_scale total propagated error.  128 rounds up to the
+    // next power of two for a conservative margin.
+    let roundoff_slack = low.abs() + 128.0 * f64::EPSILON * operand_scale.max(value.abs());
     StableDifference {
         value,
         roundoff_slack,
@@ -8338,8 +8343,8 @@ mod tests {
             x_time_exit: array![[1.2], [0.9], [1.4]],
             x_time_deriv: array![[1.0], [1.0], [1.0]],
             offset_time_deriv: array![0.5, 0.7, 0.6],
-            x_time_deriv_constraints: None,
-            offset_time_deriv_constraints: None,
+            x_time_deriv_constraints: array![[1.0], [1.0], [1.0]],
+            offset_time_deriv_constraints: array![0.5, 0.7, 0.6],
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
                 [1.0],
                 [0.4],
@@ -8582,12 +8587,12 @@ mod tests {
         let time_block = TimeBlockInput {
             design_entry,
             design_exit,
-            design_derivative_exit,
-            constraint_design_derivative: None,
+            design_derivative_exit: design_derivative_exit.clone(),
+            constraint_design_derivative: design_derivative_exit,
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
-            constraint_derivative_offset: None,
+            constraint_derivative_offset: Array1::zeros(3),
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
             initial_log_lambdas: None,
@@ -8625,12 +8630,12 @@ mod tests {
         let time_block = TimeBlockInput {
             design_entry,
             design_exit,
-            design_derivative_exit,
-            constraint_design_derivative: None,
+            design_derivative_exit: design_derivative_exit.clone(),
+            constraint_design_derivative: design_derivative_exit,
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
-            constraint_derivative_offset: None,
+            constraint_derivative_offset: Array1::zeros(3),
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
             initial_log_lambdas: None,
@@ -8672,12 +8677,12 @@ mod tests {
         let time_block = TimeBlockInput {
             design_entry,
             design_exit,
-            design_derivative_exit,
-            constraint_design_derivative: None,
+            design_derivative_exit: design_derivative_exit.clone(),
+            constraint_design_derivative: design_derivative_exit,
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
-            constraint_derivative_offset: None,
+            constraint_derivative_offset: Array1::zeros(3),
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
             initial_log_lambdas: None,
@@ -10360,12 +10365,12 @@ mod tests {
             time_block: TimeBlockInput {
                 design_entry,
                 design_exit,
-                design_derivative_exit,
-                constraint_design_derivative: None,
+                design_derivative_exit: design_derivative_exit.clone(),
+                constraint_design_derivative: design_derivative_exit,
                 offset_entry,
                 offset_exit,
-                derivative_offset_exit,
-                constraint_derivative_offset: None,
+                derivative_offset_exit: derivative_offset_exit.clone(),
+                constraint_derivative_offset: derivative_offset_exit,
                 penalties: vec![penalty.clone()],
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(array![0.0]),
@@ -10451,8 +10456,8 @@ mod tests {
             x_time_exit: x_exit.clone(),
             x_time_deriv: x_deriv.clone(),
             offset_time_deriv: offset_deriv.clone(),
-            x_time_deriv_constraints: None,
-            offset_time_deriv_constraints: None,
+            x_time_deriv_constraints: x_deriv.clone(),
+            offset_time_deriv_constraints: offset_deriv.clone(),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),
@@ -10594,8 +10599,8 @@ mod tests {
             x_time_exit: Array2::ones((n, 1)),
             x_time_deriv: Array2::ones((n, 1)),
             offset_time_deriv: Array1::zeros(n),
-            x_time_deriv_constraints: None,
-            offset_time_deriv_constraints: None,
+            x_time_deriv_constraints: Array2::ones((n, 1)),
+            offset_time_deriv_constraints: Array1::zeros(n),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),
