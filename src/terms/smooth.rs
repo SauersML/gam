@@ -1424,17 +1424,6 @@ impl LinearFitConditioning {
         out
     }
 
-    #[allow(dead_code)]
-    fn transform_penalties_to_internal(&self, penalties: &[Array2<f64>]) -> Vec<Array2<f64>> {
-        penalties
-            .iter()
-            .map(|penalty| {
-                let right = self.transform_matrix_columnswith_a(penalty);
-                self.transform_matrixrowswith_a_transpose(&right)
-            })
-            .collect()
-    }
-
     /// Transform blockwise penalties through the conditioning.
     ///
     /// For block-local penalties whose `col_range` does not overlap with any
