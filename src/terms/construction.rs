@@ -2416,6 +2416,8 @@ mod tests {
         CanonicalPenalty, SubspaceLeakageMetrics, assess_subspace_leakage,
         precompute_reparam_invariant_from_canonical, stable_reparameterizationwith_invariant,
     };
+    use crate::construction::kronecker_product;
+    use crate::linalg::faer_ndarray::FaerEigh;
     use faer::Mat;
     use ndarray::{Array2, array};
 
@@ -2667,12 +2669,13 @@ mod tests {
         }
 
         // Dense eigendecomposition for reference logdet.
-        let (evals_dense, _) = s_dense.eigh(faer::Side::Lower).unwrap();
+        let (evals_dense, _): (ndarray::Array1<f64>, ndarray::Array2<f64>) =
+            s_dense.eigh(faer::Side::Lower).unwrap();
         let tol = 1e-12;
         let ref_logdet: f64 = evals_dense
             .iter()
-            .filter(|&&v| v > tol)
-            .map(|&v| v.ln())
+            .filter(|&&v: &&f64| v > tol)
+            .map(|&v: &f64| v.ln())
             .sum();
 
         // Kronecker reparameterization engine.

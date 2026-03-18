@@ -676,10 +676,6 @@ impl RidgePlanner {
         self.ridge
     }
 
-    pub(crate) fn cond_estimate(&self) -> Option<f64> {
-        self.cond_estimate
-    }
-
     #[inline]
     fn estimate_conditionwithridge(&self, matrix: &Array2<f64>, ridge: f64) -> Option<f64> {
         let regularized = if ridge > 0.0 {

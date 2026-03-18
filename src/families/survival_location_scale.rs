@@ -959,7 +959,6 @@ struct SurvivalExactRowKernel {
     d_log_g: f64,
     d2_log_g: f64,
     d3_log_g: f64,
-    d4_log_g: f64,
 }
 
 impl SurvivalExactRowKernel {
@@ -1994,7 +1993,7 @@ impl SurvivalLocationScaleFamily {
                 guard
             ));
         }
-        let (log_g, d_log_g, d2_log_g, d3_log_g, d4_log_g) =
+        let (log_g, d_log_g, d2_log_g, d3_log_g, ..) =
             Self::logwith_derivatives_positive(g);
 
         Ok(Some(SurvivalExactRowKernel {
@@ -2019,7 +2018,6 @@ impl SurvivalLocationScaleFamily {
             d_log_g,
             d2_log_g,
             d3_log_g,
-            d4_log_g,
         }))
     }
 
@@ -2220,133 +2218,6 @@ pub(crate) fn q_chain_derivs_fourth_scalar(
     )
 }
 
-/// All chain-rule partial derivatives of
-/// q(eta_t, eta_ls) = -eta_t * exp(-eta_ls)
-/// with respect to the block linear predictors eta_t and eta_ls.
-///
-/// Includes 4th-order terms needed by the outer REML Hessian drift.
-struct QChainDerivs {
-    dq_t: Array1<f64>,       // ∂q/∂eta_t = -exp(-eta_ls)
-    dq_ls: Array1<f64>,      // ∂q/∂eta_ls = eta_t exp(-eta_ls)
-    d2q_tls: Array1<f64>,    // ∂²q/∂eta_t∂eta_ls = exp(-eta_ls)
-    d2q_ls: Array1<f64>,     // ∂²q/∂eta_ls² = -eta_t exp(-eta_ls)
-    d3q_tls_ls: Array1<f64>, // ∂³q/∂eta_t∂eta_ls² = -exp(-eta_ls)
-    d3q_ls: Array1<f64>,     // ∂³q/∂eta_ls³ = eta_t exp(-eta_ls)
-
-    /// ∂⁴q/∂η_ϑ∂η_s³ = u_ϑsss.
-    ///
-    /// This enters the (ϑ,s,s,s) block of the 4th-order Arbogast formula
-    /// via the m1·u_αβγδ term. See response.md Section 6.
-    d4q_tls_ls_ls: Array1<f64>,
-
-    /// ∂⁴q/∂η_s⁴ = u_ssss.
-    ///
-    /// This enters the (s,s,s,s) block of the 4th-order Arbogast formula
-    /// via the m1·u_αβγδ term. See response.md Section 6.
-    d4q_ls: Array1<f64>,
-}
-
-/// Compute all chain-rule derivatives of
-/// q = -eta_t * exp(-eta_ls) as length-n arrays,
-/// including 4th-order terms needed by the outer REML Hessian.
-fn compute_q_chain_derivs(
-    eta_t: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
-    eta_ls: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
-) -> QChainDerivs {
-    let n = eta_t.len();
-    // Use uninit — every element is written in the loop below.
-    let mut r = unsafe {
-        QChainDerivs {
-            dq_t: Array1::uninit(n).assume_init(),
-            dq_ls: Array1::uninit(n).assume_init(),
-            d2q_tls: Array1::uninit(n).assume_init(),
-            d2q_ls: Array1::uninit(n).assume_init(),
-            d3q_tls_ls: Array1::uninit(n).assume_init(),
-            d3q_ls: Array1::uninit(n).assume_init(),
-            d4q_tls_ls_ls: Array1::uninit(n).assume_init(),
-            d4q_ls: Array1::uninit(n).assume_init(),
-        }
-    };
-    for i in 0..n {
-        let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
-            q_chain_derivs_fourth_scalar(eta_t[i], eta_ls[i]);
-        r.dq_t[i] = q_t;
-        r.dq_ls[i] = q_ls;
-        r.d2q_tls[i] = q_tl;
-        r.d2q_ls[i] = q_ll;
-        r.d3q_tls_ls[i] = q_tl_ls;
-        r.d3q_ls[i] = q_ll_ls;
-        r.d4q_tls_ls_ls[i] = q_tl_ls_ls;
-        r.d4q_ls[i] = q_llll;
-    }
-    r
-}
-
-/// Compute chain-rule derivatives of q through 3rd order only (no 4th-order terms).
-///
-/// This is the inner-loop version used by the P-IRLS evaluate path, which
-/// only needs gradient and Hessian weights (not the outer REML Hessian drift).
-/// The 4th-order fields `d4q_tls_ls_ls` and `d4q_ls` are set to zero.
-fn compute_q_chain_derivs_third(
-    eta_t: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
-    eta_ls: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, ndarray::Ix1>,
-) -> QChainDerivs {
-    let n = eta_t.len();
-    // Use uninit for fields written in the loop; zeros for unused 4th-order fields.
-    let mut r = unsafe {
-        QChainDerivs {
-            dq_t: Array1::uninit(n).assume_init(),
-            dq_ls: Array1::uninit(n).assume_init(),
-            d2q_tls: Array1::uninit(n).assume_init(),
-            d2q_ls: Array1::uninit(n).assume_init(),
-            d3q_tls_ls: Array1::uninit(n).assume_init(),
-            d3q_ls: Array1::uninit(n).assume_init(),
-            d4q_tls_ls_ls: Array1::zeros(n),
-            d4q_ls: Array1::zeros(n),
-        }
-    };
-    for i in 0..n {
-        let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) =
-            q_chain_derivs_scalar(eta_t[i], eta_ls[i]);
-        r.dq_t[i] = q_t;
-        r.dq_ls[i] = q_ls;
-        r.d2q_tls[i] = q_tl;
-        r.d2q_ls[i] = q_ll;
-        r.d3q_tls_ls[i] = q_tl_ls;
-        r.d3q_ls[i] = q_ll_ls;
-        // d4q_tls_ls_ls and d4q_ls remain zero — not needed for P-IRLS.
-    }
-    r
-}
-
-/// Chain-rule gradient and negative Hessian diagonal weights for a single side
-/// (exit or entry) of a parameter block.
-///
-///   grad_eta[i] = d1_q[i] · dq[i]
-///   h_eta[i]    = -(d2_q[i] · dq[i]² + d1_q[i] · d2q[i])
-///
-/// When `d2q` is None the second term is omitted (e.g. threshold block where
-/// d²q_t/deta_t² = 0).
-fn chain_rule_weights(
-    d1_q: &Array1<f64>,
-    d2_q: &Array1<f64>,
-    dq: &Array1<f64>,
-    d2q: Option<&Array1<f64>>,
-) -> (Array1<f64>, Array1<f64>) {
-    let grad = d1_q * dq;
-    let mut hess = -(d2_q * &dq.mapv(|v| v * v));
-    if let Some(d2q) = d2q {
-        hess = &hess - &(d1_q * d2q);
-    }
-    (grad, hess)
-}
-
-/// Directional Hessian weights D_u[diag(h)] for a single side.
-///
-///   dh[i] = -[d3_q · dq³ + 3 · d2_q · dq · d2q + d1_q · d3q] · d_eta[i]
-///
-/// When `d2q`/`d3q` are None, the second and third terms are omitted
-/// (threshold block where all higher dq derivatives vanish).
 fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(), String> {
     if b.design.nrows() != n {
         return Err(format!(
@@ -8837,9 +8708,10 @@ mod tests {
         family.y[0] = 1.5;
         let states =
             survival_exact_newton_rebuild_states(&array![0.1], &array![0.2], &array![-0.15]);
-        let err = family
-            .log_likelihood_only(&states)
-            .expect_err("invalid event target should error");
+        let err = match family.log_likelihood_only(&states) {
+            Ok(_) => panic!("invalid event target should error"),
+            Err(err) => err,
+        };
         assert!(
             err.contains("event target must lie in [0,1]"),
             "expected explicit event-target validation error, got: {err}"

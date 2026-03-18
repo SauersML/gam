@@ -1424,6 +1424,7 @@ impl LinearFitConditioning {
         out
     }
 
+    #[allow(dead_code)]
     fn transform_penalties_to_internal(&self, penalties: &[Array2<f64>]) -> Vec<Array2<f64>> {
         penalties
             .iter()
@@ -10732,7 +10733,9 @@ mod tests {
         right: &TermCollectionDesign,
         label: &str,
     ) {
-        let design_diff = max_abs_diff_matrix(&left.design, &right.design);
+        let left_design = left.design.to_dense();
+        let right_design = right.design.to_dense();
+        let design_diff = max_abs_diff_matrix(&left_design, &right_design);
         assert!(
             design_diff <= 1e-10,
             "{label} design mismatch max_abs={design_diff}"
@@ -11120,14 +11123,14 @@ mod tests {
             }],
         };
         let design = build_term_collection_design(data.view(), &spec).unwrap();
+        let design_dense = design.design.to_dense();
         assert_eq!(design.design.nrows(), data.nrows());
         assert_eq!(design.intercept_range, 0..1);
         assert!(
-            design
-                .design
+            design_dense
                 .column(design.intercept_range.start)
                 .iter()
-                .all(|&v| (v - 1.0).abs() < 1e-12)
+                .all(|&v: &f64| (v - 1.0).abs() < 1e-12)
         );
         assert!(design.design.ncols() >= 2);
         assert_eq!(design.linear_ranges.len(), 1);
@@ -11166,14 +11169,14 @@ mod tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).unwrap();
+        let design_dense = design.design.to_dense();
         let smooth_start = 1usize;
         let smooth_end = smooth_start + design.smooth.total_smooth_cols();
         for col in smooth_start..smooth_end {
-            let is_all_ones = design
-                .design
+            let is_all_ones = design_dense
                 .column(col)
                 .iter()
-                .all(|&v| (v - 1.0).abs() < 1e-12);
+                .all(|&v: &f64| (v - 1.0).abs() < 1e-12);
             assert!(
                 !is_all_ones,
                 "smooth column {col} unexpectedly duplicated intercept"
@@ -11277,17 +11280,14 @@ mod tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).unwrap();
+        let design_dense = design.design.to_dense();
         let n = data.nrows();
         let mut c = Array2::<f64>::zeros((n, 2));
         c.column_mut(0).fill(1.0);
         c.column_mut(1).assign(&data.column(0));
         let smooth_start = 1 + spec.linear_terms.len();
-        let b = design
-            .design
-            .slice(s![
-                ..,
-                smooth_start..(smooth_start + design.smooth.total_smooth_cols())
-            ])
+        let b = design_dense
+            .slice(s![.., smooth_start..(smooth_start + design.smooth.total_smooth_cols())])
             .to_owned();
         let rel = orthogonality_relative_residual(b.view(), c.view());
         assert!(
@@ -11452,6 +11452,7 @@ mod tests {
                     .iter()
                     .zip(b_dense.iter())
                     .map(|(&x, &y)| (x - y).abs())
+                    .collect::<Vec<_>>()
             })
             .fold(0.0_f64, f64::max);
         assert!(
@@ -11977,7 +11978,8 @@ mod tests {
         )
         .unwrap();
         let residualvs_tensor = residual_norm_to_column_space(&sd_assembled, &ones);
-        let residualvs_full = residual_norm_to_column_space(&full.design, &ones);
+        let full_design_dense = full.design.to_dense();
+        let residualvs_full = residual_norm_to_column_space(&full_design_dense, &ones);
 
         // Tensor block alone must not be able to represent the constant surface.
         assert!(residualvs_tensor > 1e-6);
@@ -12034,6 +12036,8 @@ mod tests {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -12293,20 +12297,21 @@ mod tests {
 
         let linear_range = frozen_design.linear_ranges[0].1.clone();
         let random_range = frozen_design.random_effect_ranges[0].1.clone();
-        let updated_full = &realizer.design().design;
+        let fixed_before_dense = fixed_before.to_dense();
+        let updated_full_dense = realizer.design().design.to_dense();
         let linear_diff = max_abs_diff_matrix(
-            &fixed_before.slice(s![.., linear_range.clone()]).to_owned(),
-            &updated_full.slice(s![.., linear_range]).to_owned(),
+            &fixed_before_dense.slice(s![.., linear_range.clone()]).to_owned(),
+            &updated_full_dense.slice(s![.., linear_range]).to_owned(),
         );
         let random_diff = max_abs_diff_matrix(
-            &fixed_before.slice(s![.., random_range.clone()]).to_owned(),
-            &updated_full.slice(s![.., random_range]).to_owned(),
+            &fixed_before_dense.slice(s![.., random_range.clone()]).to_owned(),
+            &updated_full_dense.slice(s![.., random_range]).to_owned(),
         );
         let nonspatial_diff = max_abs_diff_matrix(
-            &fixed_before
+            &fixed_before_dense
                 .slice(s![.., full_nonspatial_range.clone()])
                 .to_owned(),
-            &updated_full
+            &updated_full_dense
                 .slice(s![.., full_nonspatial_range.clone()])
                 .to_owned(),
         );
@@ -12314,10 +12319,10 @@ mod tests {
         let full_spatial_range =
             (smooth_start + spatial_range.start)..(smooth_start + spatial_range.end);
         let spatial_change = max_abs_diff_matrix(
-            &fixed_before
+            &fixed_before_dense
                 .slice(s![.., full_spatial_range.clone()])
                 .to_owned(),
-            &updated_full.slice(s![.., full_spatial_range]).to_owned(),
+            &updated_full_dense.slice(s![.., full_spatial_range]).to_owned(),
         );
         assert!(
             linear_diff <= 1e-12,
@@ -12865,6 +12870,8 @@ mod tests {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -12973,6 +12980,8 @@ mod tests {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -13050,6 +13059,8 @@ mod tests {
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
         };
         let y = Array1::linspace(0.0, 1.0, data.nrows());
         let weights = Array1::ones(data.nrows());
@@ -13258,6 +13269,8 @@ mod tests {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
             &SpatialLengthScaleOptimizationOptions {
                 enabled: false,
@@ -13759,6 +13772,8 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
         )
         .expect("exact adaptive spatial fit should succeed");
@@ -13844,6 +13859,8 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
         )
         .expect("exact adaptive SAS fit should succeed");
@@ -13912,6 +13929,8 @@ mod tests {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
         )
         .expect("baseline fit");
@@ -14111,6 +14130,8 @@ mod tests {
                 linear_constraints: None,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
         )
         .expect("baseline fit");
@@ -14285,6 +14306,8 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
             },
         )
         .expect("high-center adaptive Duchon fit should not fail");

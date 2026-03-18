@@ -570,24 +570,6 @@ impl ParametricColumnConditioning {
         Self::from_column_indices(x, &unpenalized)
     }
 
-    /// Infer unpenalized columns by scanning dense penalty matrices.
-    fn infer_from_penalties(x: &DesignMatrix, s_list: &[Array2<f64>]) -> Self {
-        let p = x.ncols();
-        let mut penalized = vec![false; p];
-        for s in s_list {
-            for j in 0..p.min(s.ncols()) {
-                for i in 0..s.nrows() {
-                    if s[[i, j]] != 0.0 || s[[j, i]] != 0.0 {
-                        penalized[j] = true;
-                        break;
-                    }
-                }
-            }
-        }
-        let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
-        Self::from_column_indices(x, &unpenalized)
-    }
-
     fn is_active(&self) -> bool {
         !self.columns.is_empty()
     }
@@ -2293,7 +2275,6 @@ where
                                 .reparam_result
                                 .canonical_transformed
                                 .clone(),
-                            penalty_nullspace_dims: opts.nullspace_dims.clone(),
                             rho_mode: selected_rho.view(),
                             nuts_family: match opts.family {
                                 crate::types::LikelihoodFamily::GaussianIdentity => {
@@ -4797,6 +4778,31 @@ mod fd_policy_tests {
         vec![s]
     }
 
+    fn dense_penalty_test_inputs(
+        s_list: &[Array2<f64>],
+        p: usize,
+        context: &str,
+    ) -> (
+        Vec<PenaltySpec>,
+        Vec<crate::construction::CanonicalPenalty>,
+        Vec<usize>,
+    ) {
+        let penalty_specs = s_list
+            .iter()
+            .cloned()
+            .map(PenaltySpec::Dense)
+            .collect::<Vec<_>>();
+        let (canonical_penalties, active_nullspace_dims) =
+            crate::construction::canonicalize_penalty_specs(
+                &penalty_specs,
+                &vec![1; penalty_specs.len()],
+                p,
+                context,
+            )
+            .expect("canonicalize dense penalties");
+        (penalty_specs, canonical_penalties, active_nullspace_dims)
+    }
+
     #[test]
     fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
         let seed = 19_u64;
@@ -4837,9 +4843,14 @@ mod fd_policy_tests {
         let theta = array![0.10, 0.12, -0.18];
         let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
         assert!(effective_sas_link.is_some());
-        let conditioning = ParametricColumnConditioning::infer_from_penalties(
-            &DesignMatrix::Dense(Arc::new(x.clone())),
+        let (penalty_specs, canonical_penalties, active_nullspace_dims) = dense_penalty_test_inputs(
             &s_list,
+            x.ncols(),
+            "sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19",
+        );
+        let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(
+            &DesignMatrix::Dense(Arc::new(x.clone())),
+            &penalty_specs,
         );
         let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
         let mut reml_state = RemlState::newwith_offset(
@@ -4847,10 +4858,10 @@ mod fd_policy_tests {
             x_fit,
             w.view(),
             offset.view(),
-            s_list.clone(),
+            canonical_penalties.clone(),
             x.ncols(),
             &cfg,
-            Some(vec![1]),
+            Some(active_nullspace_dims.clone()),
             None,
             None,
         )
@@ -4972,10 +4983,10 @@ mod fd_policy_tests {
                 conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone()))),
                 w.view(),
                 offset.view(),
-                s_list.clone(),
+                canonical_penalties.clone(),
                 x.ncols(),
                 &cfg,
-                Some(vec![1]),
+                Some(active_nullspace_dims.clone()),
                 None,
                 None,
             )
@@ -5045,9 +5056,14 @@ mod fd_policy_tests {
         let theta = array![0.10, 0.12, -0.18];
         let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
         assert!(effective_sas_link.is_some());
-        let conditioning = ParametricColumnConditioning::infer_from_penalties(
-            &DesignMatrix::Dense(Arc::new(x.clone())),
+        let (penalty_specs, canonical_penalties, active_nullspace_dims) = dense_penalty_test_inputs(
             &s_list,
+            x.ncols(),
+            "sas_true_score_beta_jacobian_matchesfd_at_seed19",
+        );
+        let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(
+            &DesignMatrix::Dense(Arc::new(x.clone())),
+            &penalty_specs,
         );
         let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
         let mut reml_state = RemlState::newwith_offset(
@@ -5055,10 +5071,10 @@ mod fd_policy_tests {
             x_fit,
             w.view(),
             offset.view(),
-            s_list,
+            canonical_penalties,
             x.ncols(),
             &cfg,
-            Some(vec![1]),
+            Some(active_nullspace_dims),
             None,
             None,
         )
@@ -5196,9 +5212,14 @@ mod fd_policy_tests {
         let theta = array![0.10, 0.12, -0.18];
         let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
         assert!(effective_sas_link.is_some());
-        let conditioning = ParametricColumnConditioning::infer_from_penalties(
-            &DesignMatrix::Dense(Arc::new(x.clone())),
+        let (penalty_specs, canonical_penalties, active_nullspace_dims) = dense_penalty_test_inputs(
             &s_list,
+            x.ncols(),
+            "sas_pirlshessian_matches_true_score_jacobian_at_seed19",
+        );
+        let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(
+            &DesignMatrix::Dense(Arc::new(x.clone())),
+            &penalty_specs,
         );
         let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(Arc::new(x.clone())));
         let mut reml_state = RemlState::newwith_offset(
@@ -5206,10 +5227,10 @@ mod fd_policy_tests {
             x_fit,
             w.view(),
             offset.view(),
-            s_list,
+            canonical_penalties,
             x.ncols(),
             &cfg,
-            Some(vec![1]),
+            Some(active_nullspace_dims),
             None,
             None,
         )

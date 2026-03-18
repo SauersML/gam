@@ -23,8 +23,8 @@ pub(crate) mod unified;
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectionalHyperParam, EvalShared, FirthDenseOperator, GlmLikelihoodFamily, LinkFunction,
-        RemlConfig, RemlState,
+        DirectionalHyperParam, EvalShared, FirthDenseOperator, GlmLikelihoodFamily, RemlConfig,
+        RemlState,
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
@@ -298,15 +298,18 @@ mod tests {
             true,
         );
         let p = x.ncols();
+        use crate::estimate::PenaltySpec;
+        let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
+        let canonical =
+            crate::construction::canonicalize_penalty_specs(&specs, &[1, 1], p, "test")
+                .map(|(canonical, _)| canonical)
+                .expect("canonicalize");
         let state = RemlState::newwith_offset(
             y.view(),
             x.clone(),
             w.view(),
             offset.view(),
-            vec![
-                crate::terms::smooth::BlockwisePenalty::new(0..p, s0),
-                crate::terms::smooth::BlockwisePenalty::new(0..p, s1),
-            ],
+            canonical,
             p,
             &cfg,
             Some(vec![1, 1]),
@@ -740,10 +743,10 @@ mod tests {
             .expect("hyper direction with invalid second-order penalty index"),
         ];
 
-        let err = state
-            .compute_joint_hypercostgradienthessian(&theta, 1, &hyper_dirs)
-            .expect_err("invalid second-order penalty index should be rejected");
-        let msg = err.to_string();
+        let msg = match state.compute_joint_hypercostgradienthessian(&theta, 1, &hyper_dirs) {
+            Ok(_) => panic!("invalid second-order penalty index should be rejected"),
+            Err(err) => err.to_string(),
+        };
         assert!(
             msg.contains("out of bounds") || msg.contains("penalty_index"),
             "unexpected validation error: {msg}"

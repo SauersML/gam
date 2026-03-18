@@ -1570,7 +1570,7 @@ pub enum BasisMetadata {
 }
 
 /// Standardized basis build result for engine-level composition.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BasisBuildResult {
     pub design: DesignMatrix,
     pub penalties: Vec<Array2<f64>>,
@@ -12975,7 +12975,7 @@ mod tests {
         ];
         for spec in specs {
             let result = build_thin_plate_basis(data.view(), &spec).unwrap();
-            assert!(!result.design.is_empty());
+            assert!(result.design.nrows() > 0);
             assert_eq!(result.penalties.len(), 1);
             assert_eq!(result.penalties[0].nrows(), result.design.ncols());
             assert_eq!(result.penalties[0].ncols(), result.design.ncols());
@@ -15108,7 +15108,9 @@ mod tests {
         let plus = build_matern_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_matern_basis(data.view(), &spec_minus).expect("minus build");
 
-        let fd_design = (&plus.design - &minus.design) / (2.0 * eps);
+        let plus_design = plus.design.to_dense();
+        let minus_design = minus.design.to_dense();
+        let fd_design = (&plus_design - &minus_design) / (2.0 * eps);
         let fd_penalty = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
 
         let design_err = (&deriv.design_derivative - &fd_design)
@@ -15219,7 +15221,9 @@ mod tests {
         let plus = build_thin_plate_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_thin_plate_basis(data.view(), &spec_minus).expect("minus build");
 
-        let fd_design = (&plus.design - &minus.design) / (2.0 * eps);
+        let plus_design = plus.design.to_dense();
+        let minus_design = minus.design.to_dense();
+        let fd_design = (&plus_design - &minus_design) / (2.0 * eps);
         let fd_primary = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
         let design_err = (&deriv.design_derivative - &fd_design)
             .iter()
@@ -15274,7 +15278,11 @@ mod tests {
         let plus = build_thin_plate_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_thin_plate_basis(data.view(), &spec_minus).expect("minus build");
 
-        let fd_design = (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (eps * eps);
+        let plus_design = plus.design.to_dense();
+        let base_design = base.design.to_dense();
+        let minus_design = minus.design.to_dense();
+        let fd_design =
+            (&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps);
         let fd_primary = (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0)
             + &minus.penalties[0])
             / (eps * eps);
@@ -15336,7 +15344,10 @@ mod tests {
         spec_minus.length_scale = Some(ls_minus);
         let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
-        let fd_design = (&plus.design - &minus.design) / (2.0 * eps);
+
+        let plus_design = plus.design.to_dense();
+        let minus_design = minus.design.to_dense();
+        let fd_design = (&plus_design - &minus_design) / (2.0 * eps);
         let design_err = (&derivative.design_derivative - &fd_design)
             .iter()
             .map(|v| v * v)
@@ -15404,7 +15415,12 @@ mod tests {
         spec_minus.length_scale = Some(ls_minus);
         let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
-        let fd_design = (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (eps * eps);
+
+        let plus_design = plus.design.to_dense();
+        let base_design = base.design.to_dense();
+        let minus_design = minus.design.to_dense();
+        let fd_design =
+            (&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps);
         let design_err = (&second_derivative.designsecond_derivative - &fd_design)
             .iter()
             .map(|v| v * v)
@@ -16046,7 +16062,8 @@ mod tests {
         };
         let out =
             build_duchon_basis(data.view(), &spec).expect("pure Duchon default tuple should build");
-        assert!(out.design.iter().all(|v| v.is_finite()));
+        let out_design = out.design.to_dense();
+        assert!(out_design.iter().all(|v| v.is_finite()));
         assert_eq!(out.penalties.len(), 3);
         assert!(
             out.penalties
