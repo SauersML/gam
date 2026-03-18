@@ -6,8 +6,8 @@ use faer::Mat as FaerMat;
 use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
-    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, CenterStrategy, Dense,
-    KnotSource, MaternIdentifiability, SpatialIdentifiability, create_basis,
+    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, CenterStrategy,
+    MaternIdentifiability, SpatialIdentifiability,
     create_difference_penalty_matrix,
 };
 use gam::estimate::{

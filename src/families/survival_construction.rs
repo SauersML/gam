@@ -987,7 +987,7 @@ pub fn build_survival_timewiggle_from_baseline(
         seed[n + i] = eta_exit[i];
     }
     // Use the smallest requested positive penalty order as the primary
-    // geometric-constraint penalty so the fitted wiggle penalty system matches
+    // coefficient-space penalty so the fitted wiggle penalty system matches
     // the public formula exactly, including the slope (`order = 1`) case.
     let (primary_order, extra_orders) = split_wiggle_penalty_orders(2, &cfg.penalty_orders);
     let wiggle_cfg = WiggleBlockConfig {
@@ -1296,4 +1296,36 @@ pub fn build_time_varying_survival_covariate_template(
         time_basis_derivative_exit: time_design_derivative_exit,
         time_penalties: time_build.penalties,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_survival_timewiggle_from_baseline;
+    use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
+    use ndarray::array;
+
+    #[test]
+    fn survival_timewiggle_keeps_requested_order_one_penalty() {
+        let eta_entry = array![0.1, 0.3, 0.5, 0.8];
+        let eta_exit = array![0.4, 0.7, 1.0, 1.4];
+        let derivative_exit = array![0.9, 1.1, 1.2, 1.3];
+        let cfg = LinkWiggleFormulaSpec {
+            degree: 3,
+            num_internal_knots: 4,
+            penalty_orders: vec![1, 2, 3],
+            double_penalty: false,
+        };
+
+        let build =
+            build_survival_timewiggle_from_baseline(&eta_entry, &eta_exit, &derivative_exit, &cfg)
+                .expect("build survival timewiggle");
+
+        assert_eq!(build.penalties.len(), 3);
+        assert_eq!(build.nullspace_dims, vec![1, 2, 3]);
+        assert_eq!(build.design_entry.ncols(), build.design_exit.ncols());
+        assert_eq!(
+            build.design_exit.ncols(),
+            build.design_derivative_exit.ncols()
+        );
+    }
 }
