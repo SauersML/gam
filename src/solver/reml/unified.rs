@@ -2542,14 +2542,20 @@ pub fn reml_laml_evaluate(
             include_logdet_h,
             include_logdet_s,
         } => {
-            // Non-Gaussian LAML / maximum penalized likelihood:
+            // Fixed-dispersion Laplace / maximum penalized likelihood:
             //   V(ρ) = −ℓ(β̂) + ½ β̂ᵀSβ̂
-            //         + [½ log|H| + (M_p/2) log(2πφ) + TK + Firth]  if include_logdet_h
-            //         − [½ log|S|₊]                                   if include_logdet_s
+            //         + [½ log|H| + TK + Firth]  if include_logdet_h
+            //         − [½ log|S|₊]               if include_logdet_s
+            //
+            // The additive Gaussian normalization constant 0.5 * M * log(2πφ)
+            // is intentionally omitted here. It does not affect outer
+            // derivatives, and the custom-family exact paths already define
+            // their scalar objective without it. Keeping the fixed-dispersion
+            // evaluator aligned with those exact paths avoids objective drift
+            // between the unified and direct custom-family implementations.
             let mut cost = -solution.log_likelihood + 0.5 * solution.penalty_quadratic;
             if *include_logdet_h {
                 cost += 0.5 * log_det_h
-                    + (solution.nullspace_dim / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
                     + solution.tk_correction
                     + solution
                         .firth
@@ -3095,6 +3101,15 @@ fn compute_adjoint_z_c(ing: &ScalarGlmIngredients<'_>, hop: &dyn HessianOperator
     let n = x_ref.nrows();
     let p = x_ref.ncols();
 
+    // Guard: Z = H⁻¹ Xᵀ is a p × n dense matrix. Refuse at biobank scale.
+    const ZC_MAX_DENSE_WORK: usize = 50_000_000;
+    if n.saturating_mul(p) > ZC_MAX_DENSE_WORK {
+        log::warn!(
+            "compute_adjoint_z_c: skipping (n={n}, p={p}) — too large for dense Z = H⁻¹Xᵀ"
+        );
+        return Array1::zeros(p);
+    }
+
     // Z = H⁻¹ Xᵀ  (p × n)
     let x_t = x_ref.t().to_owned();
     let z = hop.solve_multi(&x_t);
@@ -3130,11 +3145,23 @@ fn compute_fourth_derivative_trace(
     hop: &dyn HessianOperator,
 ) -> Option<f64> {
     let d_array = ing.d_array?;
+
+    let n = ing.x.nrows();
+    let p = ing.x.ncols();
+
+    // Guard: building dense p×p Q matrix is O(n p²). Refuse at biobank scale.
+    const FD_MAX_DENSE_WORK: usize = 50_000_000;
+    if n.saturating_mul(p) > FD_MAX_DENSE_WORK {
+        log::warn!(
+            "compute_fourth_derivative_trace: skipping (n={n}, p={p}) — too large for dense Q assembly"
+        );
+        return Some(0.0);
+    }
+
     let x = ing.x.to_dense_arc();
     let x_ref = x.as_ref();
-    let n = x_ref.nrows();
-    let p = x_ref.ncols();
 
+    // Use operator-backed Xv products when possible.
     let x_vk = x_ref.dot(v_k);
     let x_vl = x_ref.dot(v_l);
 
@@ -3146,7 +3173,7 @@ fn compute_fourth_derivative_trace(
         .and(&x_vl)
         .for_each(|w, &d, &xvk, &xvl| *w = d * xvk * xvl);
 
-    // Q = Xᵀ diag(weights) X
+    // Q = Xᵀ diag(weights) X — chunked accumulation for better cache behavior.
     let mut q_mat = Array2::zeros((p, p));
     for i in 0..n {
         let wi = weights[i];

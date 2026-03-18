@@ -1509,6 +1509,11 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
         return Err("survival-marginal-slope requires finite z values".to_string());
     }
+    if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
+        return Err(
+            "survival-marginal-slope requires binary event indicators (0.0 or 1.0)".to_string(),
+        );
+    }
     if !spec.derivative_guard.is_finite() || spec.derivative_guard <= 0.0 {
         return Err(format!(
             "survival-marginal-slope requires derivative_guard > 0, got {}",
@@ -1567,7 +1572,7 @@ fn pooled_survival_baseline(event: &Array1<f64>, z: &Array1<f64>, weights: &Arra
     // Simple: regress event ~ z with probit link to get initial slope
     let n = event.len();
     if n == 0 {
-        return (-2.0_f64).ln(); // log(0.1) ~ small slope
+        return -2.0; // fallback: modest slope β ≈ 0.135
     }
     let fit = fit_gam(
         {
@@ -1594,6 +1599,7 @@ fn pooled_survival_baseline(event: &Array1<f64>, z: &Array1<f64>, weights: &Arra
             linear_constraints: None,
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         },
@@ -1603,7 +1609,7 @@ fn pooled_survival_baseline(event: &Array1<f64>, z: &Array1<f64>, weights: &Arra
             let b = result.beta.get(1).copied().unwrap_or(0.1).abs().max(1e-6);
             b.ln()
         }
-        Err(_) => (-2.0_f64).ln(),
+        Err(_) => -2.0,
     }
 }
 

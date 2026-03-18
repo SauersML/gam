@@ -746,7 +746,7 @@ pub struct SimplicialFactor {
     l_row_idx: Vec<usize>,
     /// Numeric values of L, length nnz(L)
     l_values: Vec<f64>,
-    /// AMD forward permutation: perm_fwd[original] = permuted
+    /// Forward permutation: perm_fwd[original] = permuted
     perm_fwd: Vec<usize>,
     /// Dimension
     n: usize,
@@ -904,7 +904,7 @@ pub struct TakahashiInverse {
     col_ptr: Vec<usize>,
     /// Row indices (owned copy from L)
     row_idx: Vec<usize>,
-    /// Forward permutation
+    /// Forward permutation: perm_fwd[original] = permuted
     perm_fwd: Vec<usize>,
     /// Dimension
     n: usize,
@@ -1045,6 +1045,9 @@ impl TakahashiInverse {
             for idx in col_start..col_end {
                 let row = s_row_idx[idx];
                 let val = values[idx];
+                if row > col {
+                    continue;
+                }
                 let z_ij = self.get(row, col);
                 if row == col {
                     trace += z_ij * val;

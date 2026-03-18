@@ -1032,6 +1032,7 @@ impl DenseDesignOperator for RandomEffectOperator {
 #[derive(Clone)]
 pub enum DesignBlock {
     Dense(DenseDesignMatrix),
+    Sparse(SparseDesignMatrix),
     RandomEffect(Arc<RandomEffectOperator>),
     /// Implicit all-ones intercept column: n rows, 1 column, zero storage.
     Intercept(usize),
@@ -1041,6 +1042,7 @@ impl DesignBlock {
     fn nrows(&self) -> usize {
         match self {
             Self::Dense(d) => d.nrows(),
+            Self::Sparse(s) => s.nrows(),
             Self::RandomEffect(op) => op.nrows(),
             Self::Intercept(n) => *n,
         }
@@ -1049,6 +1051,7 @@ impl DesignBlock {
     fn ncols(&self) -> usize {
         match self {
             Self::Dense(d) => d.ncols(),
+            Self::Sparse(s) => s.ncols(),
             Self::RandomEffect(op) => op.ncols(),
             Self::Intercept(_) => 1,
         }
@@ -1057,6 +1060,7 @@ impl DesignBlock {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
             Self::Dense(d) => d.apply(vector),
+            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).apply(vector),
             Self::RandomEffect(op) => op.apply(vector),
             Self::Intercept(n) => Array1::from_elem(*n, vector[0]),
         }
@@ -1065,6 +1069,7 @@ impl DesignBlock {
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
             Self::Dense(d) => d.apply_transpose(vector),
+            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).apply_transpose(vector),
             Self::RandomEffect(op) => op.apply_transpose(vector),
             Self::Intercept(_) => {
                 let sum: f64 = vector.iter().sum();
@@ -1076,6 +1081,7 @@ impl DesignBlock {
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         match self {
             Self::Dense(d) => d.row_chunk(rows),
+            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).row_chunk(rows),
             Self::RandomEffect(op) => op.row_chunk(rows),
             Self::Intercept(_) => Array2::ones((rows.end - rows.start, 1)),
         }
@@ -1084,6 +1090,7 @@ impl DesignBlock {
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         match self {
             Self::Dense(d) => d.diag_xtw_x(weights),
+            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).diag_xtw_x(weights),
             Self::RandomEffect(op) => op.diag_xtw_x(weights),
             Self::Intercept(_) => {
                 let sum: f64 = weights.iter().map(|w| w.max(0.0)).sum();
@@ -1095,6 +1102,7 @@ impl DesignBlock {
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
         match self {
             Self::Dense(d) => d.diag_gram(weights),
+            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).diag_gram(weights),
             Self::RandomEffect(op) => op.diag_gram(weights),
             Self::Intercept(_) => {
                 let sum: f64 = weights.iter().map(|w| w.max(0.0)).sum();
@@ -1107,6 +1115,7 @@ impl DesignBlock {
     fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Dense(d) => d.to_dense(),
+            Self::Sparse(s) => s.to_dense_arc().as_ref().clone(),
             Self::RandomEffect(op) => op.to_dense(),
             Self::Intercept(n) => Array2::ones((*n, 1)),
         }
@@ -1156,6 +1165,57 @@ impl BlockDesignOperator {
         })
     }
 
+    fn weighted_cross_chunked(
+        &self,
+        left: &DesignBlock,
+        right: &DesignBlock,
+        weights: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let pi = left.ncols();
+        let pj = right.ncols();
+        let mut cross = Array2::<f64>::zeros((pi, pj));
+        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+            let left_chunk = left.row_chunk(start..end);
+            let right_chunk = right.row_chunk(start..end);
+            for local in 0..(end - start) {
+                let wi = weights[start + local].max(0.0);
+                if wi == 0.0 {
+                    continue;
+                }
+                for a in 0..pi {
+                    let scaled = wi * left_chunk[[local, a]];
+                    if scaled == 0.0 {
+                        continue;
+                    }
+                    for b in 0..pj {
+                        cross[[a, b]] += scaled * right_chunk[[local, b]];
+                    }
+                }
+            }
+        }
+        Ok(cross)
+    }
+
+    fn quadratic_form_diag_cross_chunked(
+        &self,
+        block_a: &DesignBlock,
+        block_b: &DesignBlock,
+        m_ab: &Array2<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let mut out = Array1::<f64>::zeros(self.n);
+        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+            let a_chunk = block_a.row_chunk(start..end);
+            let b_chunk = block_b.row_chunk(start..end);
+            let a_m = fast_ab(&a_chunk, m_ab);
+            for local in 0..(end - start) {
+                out[start + local] = a_m.row(local).dot(&b_chunk.row(local));
+            }
+        }
+        Ok(out)
+    }
+
     /// Compute the cross-block X_i' diag(w) X_j for blocks i < j.
     fn cross_block(
         &self,
@@ -1187,6 +1247,13 @@ impl BlockDesignOperator {
                     }
                 }
                 Ok(cross)
+            }
+            (DesignBlock::Dense(_), DesignBlock::Sparse(_))
+            | (DesignBlock::Sparse(_), DesignBlock::Dense(_))
+            | (DesignBlock::Sparse(_), DesignBlock::Sparse(_))
+            | (DesignBlock::Sparse(_), DesignBlock::RandomEffect(_))
+            | (DesignBlock::RandomEffect(_), DesignBlock::Sparse(_)) => {
+                self.weighted_cross_chunked(&self.blocks[i], &self.blocks[j], weights)
             }
 
             // ── Dense × RandomEffect ────────────────────────────────────
@@ -1242,6 +1309,10 @@ impl BlockDesignOperator {
                 }
                 Ok(out)
             }
+            DesignBlock::Sparse(s) => {
+                let sparse = DesignMatrix::Sparse(s.clone());
+                sparse.quadratic_form_diag(m_kk)
+            }
             DesignBlock::RandomEffect(re) => {
                 let mut out = Array1::<f64>::zeros(self.n);
                 for i in 0..self.n {
@@ -1275,6 +1346,13 @@ impl BlockDesignOperator {
                     out[i] = da_m.row(i).dot(&db.row(i));
                 }
                 Ok(out)
+            }
+            (DesignBlock::Dense(_), DesignBlock::Sparse(_))
+            | (DesignBlock::Sparse(_), DesignBlock::Dense(_))
+            | (DesignBlock::Sparse(_), DesignBlock::Sparse(_))
+            | (DesignBlock::Sparse(_), DesignBlock::RandomEffect(_))
+            | (DesignBlock::RandomEffect(_), DesignBlock::Sparse(_)) => {
+                self.quadratic_form_diag_cross_chunked(block_a, block_b, m_ab)
             }
             (DesignBlock::Dense(d), DesignBlock::RandomEffect(re)) => {
                 let d = d.to_dense_arc();
@@ -2273,6 +2351,74 @@ impl DenseDesignOperator for TensorProductDesignOperator {
 
     fn to_dense(&self) -> Array2<f64> {
         self.row_chunk(0..self.n)
+    }
+}
+
+/// Coefficient-side transform operator: represents X_eff = X_inner * T without
+/// materializing the product. Preserves the sparsity/operator structure of the
+/// inner design by applying T on the coefficient side:
+///   apply(v) = X_inner * (T * v)
+///   apply_transpose(v) = T^T * (X_inner^T * v)
+///   diag_xtw_x(w) = T^T * (X_inner^T W X_inner) * T
+pub struct CoefficientTransformOperator {
+    inner: DenseDesignMatrix,
+    transform: Arc<Array2<f64>>,
+    n: usize,
+    p_out: usize,
+}
+
+impl CoefficientTransformOperator {
+    pub fn new(inner: DenseDesignMatrix, transform: Array2<f64>) -> Result<Self, String> {
+        let p_inner = inner.ncols();
+        if transform.nrows() != p_inner {
+            return Err(format!(
+                "CoefficientTransformOperator: inner has {} cols but transform has {} rows",
+                p_inner,
+                transform.nrows(),
+            ));
+        }
+        let n = inner.nrows();
+        let p_out = transform.ncols();
+        Ok(Self {
+            inner,
+            transform: Arc::new(transform),
+            n,
+            p_out,
+        })
+    }
+}
+
+impl LinearOperator for CoefficientTransformOperator {
+    fn nrows(&self) -> usize {
+        self.n
+    }
+    fn ncols(&self) -> usize {
+        self.p_out
+    }
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let tv = self.transform.dot(vector);
+        self.inner.apply(&tv)
+    }
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let xtv = self.inner.apply_transpose(vector);
+        self.transform.t().dot(&xtv)
+    }
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        let inner_xtwx = self.inner.diag_xtw_x(weights)?;
+        // T^T * (X^T W X) * T
+        let tmp = fast_ab(&self.transform.t().to_owned(), &inner_xtwx);
+        Ok(fast_ab(&tmp, &self.transform))
+    }
+}
+
+impl DenseDesignOperator for CoefficientTransformOperator {
+    fn to_dense(&self) -> Array2<f64> {
+        let x = self.inner.to_dense();
+        fast_ab(&x, &self.transform)
+    }
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let chunk = self.inner.row_chunk(rows);
+        fast_ab(&chunk, &self.transform)
     }
 }
 

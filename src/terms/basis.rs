@@ -3238,50 +3238,115 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    let (basis, knots) = match &spec.knotspec {
-        BSplineKnotSpec::Generate {
-            data_range,
-            num_internal_knots,
-        } => create_basis::<Dense>(
-            data,
-            KnotSource::Generate {
-                data_range: *data_range,
-                num_internal_knots: *num_internal_knots,
-            },
-            spec.degree,
-            BasisOptions::value(),
-        )?,
-        BSplineKnotSpec::Provided(knots) => create_basis::<Dense>(
-            data,
-            KnotSource::Provided(knots.view()),
-            spec.degree,
-            BasisOptions::value(),
-        )?,
-        BSplineKnotSpec::Automatic {
-            num_internal_knots,
-            placement,
-        } => {
-            let inferred = num_internal_knots
-                .unwrap_or_else(|| default_internal_knot_count_for_data(data.len(), spec.degree));
-            let knots = match placement {
-                BSplineKnotPlacement::Uniform => {
-                    let range = finite_data_range(data)?;
-                    internal::generate_full_knot_vector(range, inferred, spec.degree)?
-                }
-                BSplineKnotPlacement::Quantile => {
-                    internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
-                }
-            };
-            create_basis::<Dense>(
-                data,
-                KnotSource::Provided(knots.view()),
-                spec.degree,
-                BasisOptions::value(),
-            )?
+    let prefer_sparse_design = matches!(spec.identifiability, BSplineIdentifiability::None);
+    let (design_sparse_opt, design_dense_opt, knots) = if prefer_sparse_design {
+        match &spec.knotspec {
+            BSplineKnotSpec::Generate {
+                data_range,
+                num_internal_knots,
+            } => {
+                let (basis, knots) = create_basis::<Sparse>(
+                    data,
+                    KnotSource::Generate {
+                        data_range: *data_range,
+                        num_internal_knots: *num_internal_knots,
+                    },
+                    spec.degree,
+                    BasisOptions::value(),
+                )?;
+                (Some(basis), None, knots)
+            }
+            BSplineKnotSpec::Provided(knots) => {
+                let (basis, knots) = create_basis::<Sparse>(
+                    data,
+                    KnotSource::Provided(knots.view()),
+                    spec.degree,
+                    BasisOptions::value(),
+                )?;
+                (Some(basis), None, knots)
+            }
+            BSplineKnotSpec::Automatic {
+                num_internal_knots,
+                placement,
+            } => {
+                let inferred = num_internal_knots.unwrap_or_else(|| {
+                    default_internal_knot_count_for_data(data.len(), spec.degree)
+                });
+                let knots = match placement {
+                    BSplineKnotPlacement::Uniform => {
+                        let range = finite_data_range(data)?;
+                        internal::generate_full_knot_vector(range, inferred, spec.degree)?
+                    }
+                    BSplineKnotPlacement::Quantile => {
+                        internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
+                    }
+                };
+                let (basis, knots) = create_basis::<Sparse>(
+                    data,
+                    KnotSource::Provided(knots.view()),
+                    spec.degree,
+                    BasisOptions::value(),
+                )?;
+                (Some(basis), None, knots)
+            }
+        }
+    } else {
+        match &spec.knotspec {
+            BSplineKnotSpec::Generate {
+                data_range,
+                num_internal_knots,
+            } => {
+                let (basis, knots) = create_basis::<Dense>(
+                    data,
+                    KnotSource::Generate {
+                        data_range: *data_range,
+                        num_internal_knots: *num_internal_knots,
+                    },
+                    spec.degree,
+                    BasisOptions::value(),
+                )?;
+                (None, Some((*basis).clone()), knots)
+            }
+            BSplineKnotSpec::Provided(knots) => {
+                let (basis, knots) = create_basis::<Dense>(
+                    data,
+                    KnotSource::Provided(knots.view()),
+                    spec.degree,
+                    BasisOptions::value(),
+                )?;
+                (None, Some((*basis).clone()), knots)
+            }
+            BSplineKnotSpec::Automatic {
+                num_internal_knots,
+                placement,
+            } => {
+                let inferred = num_internal_knots.unwrap_or_else(|| {
+                    default_internal_knot_count_for_data(data.len(), spec.degree)
+                });
+                let knots = match placement {
+                    BSplineKnotPlacement::Uniform => {
+                        let range = finite_data_range(data)?;
+                        internal::generate_full_knot_vector(range, inferred, spec.degree)?
+                    }
+                    BSplineKnotPlacement::Quantile => {
+                        internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
+                    }
+                };
+                let (basis, knots) = create_basis::<Dense>(
+                    data,
+                    KnotSource::Provided(knots.view()),
+                    spec.degree,
+                    BasisOptions::value(),
+                )?;
+                (None, Some((*basis).clone()), knots)
+            }
         }
     };
-    let design_raw = (*basis).clone();
-    let p_raw = design_raw.ncols();
+    let p_raw = design_sparse_opt
+        .as_ref()
+        .map(|basis| basis.ncols())
+        .or_else(|| design_dense_opt.as_ref().map(Array2::ncols))
+        .expect("B-spline basis should be present");
     let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
     let s_bend_raw = create_difference_penalty_matrix(
         p_raw,
@@ -3311,32 +3376,59 @@ pub fn build_bspline_basis_1d(
         .iter()
         .map(|candidate| candidate.matrix.clone())
         .collect();
-    let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
-        design_raw,
-        penalties_raw_mats,
-        &knots,
-        spec.degree,
-        &spec.identifiability,
-    )?;
-    let transformed_candidates = penalties
-        .into_iter()
-        .zip(penalties_raw.into_iter())
-        .map(
-            |(matrix, candidate)| -> Result<PenaltyCandidate, BasisError> {
+    let (design, transformed_candidates, identifiability_transform) = if let Some(sparse_basis) =
+        design_sparse_opt
+    {
+        let transformed_candidates = penalties_raw
+            .into_iter()
+            .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
-                    matrix,
+                    nullspace_dim_hint: estimate_penalty_nullity(&candidate.matrix)?,
+                    matrix: candidate.matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale,
                     kronecker_factors: None,
                 })
-            },
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        (
+            DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse_basis)),
+            transformed_candidates,
+            None,
         )
-        .collect::<Result<Vec<_>, _>>()?;
+    } else {
+        let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
+            design_dense_opt.expect("dense B-spline basis should be present"),
+            penalties_raw_mats,
+            &knots,
+            spec.degree,
+            &spec.identifiability,
+        )?;
+        let transformed_candidates = penalties
+            .into_iter()
+            .zip(penalties_raw.into_iter())
+            .map(
+                |(matrix, candidate)| -> Result<PenaltyCandidate, BasisError> {
+                    Ok(PenaltyCandidate {
+                        nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                        matrix,
+                        source: candidate.source,
+                        normalization_scale: candidate.normalization_scale,
+                        kronecker_factors: None,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        (
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+            transformed_candidates,
+            identifiability_transform,
+        )
+    };
     let (penalties, nullspace_dims, penaltyinfo) =
         filter_active_penalty_candidates(transformed_candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        design,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -8940,7 +9032,8 @@ fn duchon_radial_jets(
     coeffs: &DuchonPartialFractionCoeffs,
 ) -> Result<DuchonRadialJets, BasisError> {
     let kappa = 1.0 / length_scale.max(1e-300);
-    let r_eval = r.max(DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8));
+    let r_floor = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
+    let r_eval = r.max(r_floor);
     let mut out = DuchonRadialJets::default();
 
     // Value path keeps the intrinsic diagonal convention used by the actual basis.
@@ -8997,25 +9090,25 @@ fn duchon_radial_jets(
     out.t_r = (out.q_rr - out.t) / r_eval;
     out.t_rr = (out.lap_rr + 2.0 * out.t - (k_dim as f64 + 4.0) * out.q_rr) / (r_eval * r_eval);
 
-    if r == 0.0 {
+    if r <= 16.0 * r_floor {
         // The off-origin derivative path uses a small-r evaluation floor to keep
         // the partial-fraction pieces numerically stable. At an exact collision we
         // do not want to inherit that surrogate for the operator scalars. Instead
-        // we impose the mathematically checked collision limits:
+        // we impose the mathematically checked collision limits and use the even
+        // Taylor structure of the radial operators to keep the tiny-r path
+        // continuous with the exact center collision.
         //   phi_r(0)   = 0
         //   q(0)       = phi_rr(0)
         //   Delta phi(0) = d * phi_rr(0).
         //
         // This keeps the raw radial jets aligned with the collision convention
         // used by the higher-level Duchon operator and psi-derivative code.
-        out.phi_r = 0.0;
         let (phi_rr, _, _) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
-        out.phi_rr = phi_rr;
-        out.q = phi_rr;
-        out.lap = k_dim as f64 * phi_rr;
-        out.q_r = 0.0;
-        out.lap_r = 0.0;
+        let t_collision =
+            duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 3.0;
+        let t_rr_collision =
+            duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 15.0;
 
         // Exact center-collision limits for the higher R-operator scalars:
         //   t(0)      = φ''''(0) / 3,
@@ -9023,15 +9116,19 @@ fn duchon_radial_jets(
         //   lap_rr(0) = (d + 2) t(0),
         //   t_r(0)    = 0,
         //   t_rr(0)   = φ⁽⁶⁾(0) / 15.
-        //
-        // The fourth- and sixth-order collision derivatives are assembled from
-        // analytic Taylor coefficients of the partial-fraction blocks.
-        out.t = duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 3.0;
-        out.q_rr = out.t;
-        out.lap_rr = (k_dim as f64 + 2.0) * out.t;
-        out.t_r = 0.0;
-        out.t_rr =
-            duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 15.0;
+        let r_small = r.min(16.0 * r_floor);
+        let r2 = r_small * r_small;
+        out.phi_r = phi_rr * r_small + 0.5 * t_collision * r_small * r2;
+        out.phi_rr = phi_rr + 1.5 * t_collision * r2;
+        out.q = phi_rr + 0.5 * t_collision * r2;
+        out.lap = k_dim as f64 * phi_rr + 0.5 * (k_dim as f64 + 2.0) * t_collision * r2;
+        out.q_r = t_collision * r_small;
+        out.q_rr = t_collision;
+        out.lap_r = (k_dim as f64 + 2.0) * t_collision * r_small;
+        out.lap_rr = (k_dim as f64 + 2.0) * t_collision;
+        out.t = t_collision + 0.5 * t_rr_collision * r2;
+        out.t_r = t_rr_collision * r_small;
+        out.t_rr = t_rr_collision;
     }
     if !out.phi_r.is_finite()
         || !out.phi_rr.is_finite()
@@ -13157,6 +13254,24 @@ mod tests {
             max_abs < 1e-10,
             "quantile penalty mismatch: max_abs_diff={max_abs:.3e}"
         );
+    }
+
+    #[test]
+    fn test_build_bspline_basis_1d_none_identifiability_prefers_sparse_design() {
+        let x = Array::linspace(0.0, 1.0, 32);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(6),
+                placement: BSplineKnotPlacement::Quantile,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+
+        let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
+        assert!(matches!(built.design, DesignMatrix::Sparse(_)));
     }
 
     #[test]

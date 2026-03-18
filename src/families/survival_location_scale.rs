@@ -78,6 +78,41 @@ fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
 }
 
 #[inline]
+fn safe_product(lhs: f64, rhs: f64) -> f64 {
+    if lhs == 0.0 || rhs == 0.0 {
+        0.0
+    } else {
+        lhs * rhs
+    }
+}
+
+#[inline]
+fn safe_sum2(a: f64, b: f64) -> f64 {
+    let sum = a + b;
+    if sum.is_nan() {
+        if a == 0.0 {
+            b
+        } else if b == 0.0 {
+            a
+        } else {
+            sum
+        }
+    } else {
+        sum
+    }
+}
+
+#[inline]
+fn safe_sum3(a: f64, b: f64, c: f64) -> f64 {
+    safe_sum2(safe_sum2(a, b), c)
+}
+
+#[inline]
+fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
+    -safe_product(eta_t, exp_sigma_inverse_from_eta_scalar(eta_ls))
+}
+
+#[inline]
 fn probit_survival_value(eta: f64) -> f64 {
     if eta.is_nan() {
         f64::NAN
@@ -470,6 +505,8 @@ pub struct SurvivalLocationScaleFitResultParts {
     pub beta_threshold: Array1<f64>,
     pub beta_log_sigma: Array1<f64>,
     pub beta_link_wiggle: Option<Array1<f64>>,
+    pub link_wiggle_knots: Option<Array1<f64>>,
+    pub link_wiggle_degree: Option<usize>,
     pub lambdas_time: Array1<f64>,
     pub lambdas_threshold: Array1<f64>,
     pub lambdas_log_sigma: Array1<f64>,
@@ -579,6 +616,8 @@ pub fn survival_fit_from_parts(
         beta_threshold,
         beta_log_sigma,
         beta_link_wiggle,
+        link_wiggle_knots,
+        link_wiggle_degree,
         lambdas_time,
         lambdas_threshold,
         lambdas_log_sigma,
@@ -613,6 +652,18 @@ pub fn survival_fit_from_parts(
             beta_wiggle.iter().copied(),
         )
         .map_err(|e| e.to_string())?;
+        let knots = link_wiggle_knots.as_ref().ok_or_else(|| {
+            "survival_fit.beta_link_wiggle requires link_wiggle_knots".to_string()
+        })?;
+        validate_all_finite_estimation("survival_fit.link_wiggle_knots", knots.iter().copied())
+            .map_err(|e| e.to_string())?;
+        if link_wiggle_degree.is_none() {
+            return Err("survival_fit.beta_link_wiggle requires link_wiggle_degree".to_string());
+        }
+    } else if link_wiggle_knots.is_some() || link_wiggle_degree.is_some() {
+        return Err(
+            "survival_fit link-wiggle metadata requires beta_link_wiggle coefficients".to_string(),
+        );
     }
     validate_all_finite_estimation("survival_fit.lambdas_time", lambdas_time.iter().copied())
         .map_err(|e| e.to_string())?;
@@ -749,7 +800,11 @@ pub fn survival_fit_from_parts(
         pirls_status: crate::pirls::PirlsStatus::Converged,
         max_abs_eta: 0.0,
         constraint_kkt: None,
-        artifacts: crate::solver::estimate::FitArtifacts { pirls: None },
+        artifacts: crate::solver::estimate::FitArtifacts {
+            pirls: None,
+            survival_link_wiggle_knots: link_wiggle_knots,
+            survival_link_wiggle_degree: link_wiggle_degree,
+        },
         inner_cycles: 0,
     })
     .map_err(|e| e.to_string())
@@ -1915,11 +1970,22 @@ impl SurvivalLocationScaleFamily {
             })?;
 
         let guard = self.time_derivative_lower_bound();
-        let g = state.g;
+        let mut g = state.g;
         if !g.is_finite() {
             return Err(format!(
                 "survival location-scale time derivative is non-finite at row {row}: d_eta/dt={g}"
             ));
+        }
+        let roundoff_slack = 1e-12
+            * (1.0
+                + state
+                    .h0
+                    .abs()
+                    .max(state.h1.abs())
+                    .max(state.q0.abs())
+                    .max(state.q1.abs()));
+        if g < guard && g >= guard - roundoff_slack {
+            g = guard;
         }
         if g < guard {
             return Err(format!(
@@ -2078,14 +2144,8 @@ impl SurvivalLocationScaleFamily {
 #[inline]
 pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, f64, f64, f64) {
     let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
-    (
-        -inv_sigma,
-        eta_t * inv_sigma,
-        inv_sigma,
-        -eta_t * inv_sigma,
-        -inv_sigma,
-        eta_t * inv_sigma,
-    )
+    let q = -safe_product(eta_t, inv_sigma);
+    (-inv_sigma, -q, inv_sigma, q, -inv_sigma, -q)
 }
 
 /// Extended scalar chain-rule derivatives of
@@ -2134,16 +2194,8 @@ pub(crate) fn q_chain_derivs_fourth_scalar(
     eta_ls: f64,
 ) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
     let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
-    (
-        -inv_sigma,
-        eta_t * inv_sigma,
-        inv_sigma,
-        -eta_t * inv_sigma,
-        -inv_sigma,
-        eta_t * inv_sigma,
-        inv_sigma,
-        -eta_t * inv_sigma,
-    )
+    let q = -safe_product(eta_t, inv_sigma);
+    (-inv_sigma, -q, inv_sigma, q, -inv_sigma, -q, inv_sigma, q)
 }
 
 fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(), String> {
@@ -3196,6 +3248,8 @@ fn finalize_survival_location_scale_fit(
         beta_threshold,
         beta_log_sigma,
         beta_link_wiggle,
+        link_wiggle_knots: prepared.family.wiggle_knots.clone(),
+        link_wiggle_degree: prepared.family.wiggle_degree,
         lambdas_time,
         lambdas_threshold,
         lambdas_log_sigma,
@@ -3763,7 +3817,7 @@ fn survival_base_q_scalars(eta_t: f64, eta_ls: f64) -> SurvivalBaseQScalars {
     let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
         q_chain_derivs_fourth_scalar(eta_t, eta_ls);
     SurvivalBaseQScalars {
-        q: -eta_t * exp_sigma_inverse_from_eta_scalar(eta_ls),
+        q: survival_q0_from_eta(eta_t, eta_ls),
         q_t,
         q_ls,
         q_tl,
@@ -3797,22 +3851,56 @@ fn compose_survival_dynamic_q(
     let m2 = d2q_dq02;
     let m3 = d3q_dq03;
     let m4 = d4q_dq04;
-    let r = a * eta_t_deriv + b * eta_ls_deriv;
-    let r_t = c * eta_ls_deriv;
-    let r_ls = c * eta_t_deriv + d * eta_ls_deriv;
-    let r_ll = e * eta_t_deriv + f * eta_ls_deriv;
-    let q_t = m1 * a;
-    let q_ls = m1 * b;
-    let q_tl = m2 * a * b + m1 * c;
-    let q_ll = m2 * b * b + m1 * d;
-    let q_tl_ls = m3 * a * b * b + m2 * (a * d + 2.0 * b * c) + m1 * e;
-    let q_ll_ls = m3 * b * b * b + 3.0 * m2 * b * d + m1 * f;
-    let q_tl_ls_ls = m4 * a * b * b * b
-        + m3 * (3.0 * b * b * c + 3.0 * a * b * d)
-        + m2 * (a * f + 3.0 * c * d + 3.0 * b * e)
-        + m1 * g;
-    let q_llll =
-        m4 * b * b * b * b + 6.0 * m3 * b * b * d + m2 * (3.0 * d * d + 4.0 * b * f) + m1 * h;
+    let r = safe_sum2(safe_product(a, eta_t_deriv), safe_product(b, eta_ls_deriv));
+    let r_t = safe_product(c, eta_ls_deriv);
+    let r_ls = safe_sum2(safe_product(c, eta_t_deriv), safe_product(d, eta_ls_deriv));
+    let r_ll = safe_sum2(safe_product(e, eta_t_deriv), safe_product(f, eta_ls_deriv));
+    let q_t = safe_product(m1, a);
+    let q_ls = safe_product(m1, b);
+    let q_tl = safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c));
+    let q_ll = safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d));
+    let q_tl_ls = safe_sum3(
+        safe_product(m3, safe_product(a, safe_product(b, b))),
+        safe_product(m2, safe_sum2(safe_product(a, d), 2.0 * safe_product(b, c))),
+        safe_product(m1, e),
+    );
+    let q_ll_ls = safe_sum3(
+        safe_product(m3, safe_product(b, safe_product(b, b))),
+        safe_product(m2, 3.0 * safe_product(b, d)),
+        safe_product(m1, f),
+    );
+    let q_tl_ls_ls = safe_sum3(
+        safe_product(m4, safe_product(a, safe_product(b, safe_product(b, b)))),
+        safe_product(
+            m3,
+            safe_sum2(
+                3.0 * safe_product(safe_product(b, b), c),
+                3.0 * safe_product(safe_product(a, b), d),
+            ),
+        ),
+        safe_sum2(
+            safe_product(
+                m2,
+                safe_sum3(
+                    safe_product(a, f),
+                    3.0 * safe_product(c, d),
+                    3.0 * safe_product(b, e),
+                ),
+            ),
+            safe_product(m1, g),
+        ),
+    );
+    let q_llll = safe_sum3(
+        safe_product(m4, safe_product(safe_product(b, b), safe_product(b, b))),
+        safe_product(m3, 6.0 * safe_product(safe_product(b, b), d)),
+        safe_sum2(
+            safe_product(
+                m2,
+                safe_sum2(3.0 * safe_product(d, d), 4.0 * safe_product(b, f)),
+            ),
+            safe_product(m1, h),
+        ),
+    );
 
     SurvivalDynamicQScalars {
         q: base.q + wiggle_value,
@@ -3824,18 +3912,39 @@ fn compose_survival_dynamic_q(
         q_ll_ls,
         q_tl_ls_ls,
         q_llll,
-        qdot: m1 * r,
-        qdot_t: m2 * a * r + m1 * r_t,
-        qdot_ls: m2 * b * r + m1 * r_ls,
+        qdot: safe_product(m1, r),
+        qdot_t: safe_sum2(safe_product(m2, safe_product(a, r)), safe_product(m1, r_t)),
+        qdot_ls: safe_sum2(safe_product(m2, safe_product(b, r)), safe_product(m1, r_ls)),
         qdot_td: q_t,
         qdot_lsd: q_ls,
-        qdot_tt: m3 * a * a * r + 2.0 * m2 * a * r_t,
-        qdot_tls: m3 * a * b * r + m2 * (c * r + a * r_ls + b * r_t) + m1 * e * eta_ls_deriv,
-        qdot_ttd: m2 * a * a,
-        qdot_tlsd: m2 * a * b + m1 * c,
-        qdot_ll: m3 * b * b * r + m2 * (d * r + 3.0 * b * r_ls) + m1 * r_ll,
-        qdot_lstd: m2 * a * b + m1 * c,
-        qdot_llsd: m2 * b * b + m1 * d,
+        qdot_tt: safe_sum2(
+            safe_product(m3, safe_product(safe_product(a, a), r)),
+            2.0 * safe_product(m2, safe_product(a, r_t)),
+        ),
+        qdot_tls: safe_sum3(
+            safe_product(m3, safe_product(safe_product(a, b), r)),
+            safe_product(
+                m2,
+                safe_sum3(
+                    safe_product(c, r),
+                    safe_product(a, r_ls),
+                    safe_product(b, r_t),
+                ),
+            ),
+            safe_product(m1, safe_product(e, eta_ls_deriv)),
+        ),
+        qdot_ttd: safe_product(m2, safe_product(a, a)),
+        qdot_tlsd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
+        qdot_ll: safe_sum3(
+            safe_product(m3, safe_product(safe_product(b, b), r)),
+            safe_product(
+                m2,
+                safe_sum2(safe_product(d, r), 3.0 * safe_product(b, r_ls)),
+            ),
+            safe_product(m1, r_ll),
+        ),
+        qdot_lstd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
+        qdot_llsd: safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d)),
     }
 }
 
@@ -3863,14 +3972,14 @@ impl SurvivalLocationScaleFamily {
         let q0_exit = Array1::from_iter(
             eta_t_exit
                 .iter()
-                .zip(inv_sigma_exit.iter())
-                .map(|(&t, &r)| -t * r),
+                .zip(eta_ls_exit.iter())
+                .map(|(&t, &ls)| survival_q0_from_eta(t, ls)),
         );
         let q0_entry = Array1::from_iter(
             eta_t_entry
                 .iter()
-                .zip(inv_sigma_entry.iter())
-                .map(|(&t, &r)| -t * r),
+                .zip(eta_ls_entry.iter())
+                .map(|(&t, &ls)| survival_q0_from_eta(t, ls)),
         );
         let beta_w = if self.x_link_wiggle.is_some() {
             Some(block_states[Self::BLOCK_LINK_WIGGLE].beta.view())
@@ -4097,14 +4206,25 @@ fn prediction_linear_predictors(
         input.x_threshold.matrixvectormultiply(&beta_threshold) + &input.eta_threshold_offset;
     let eta_ls =
         input.x_log_sigma.matrixvectormultiply(&beta_log_sigma) + &input.eta_log_sigma_offset;
-    let inv_sigma = eta_ls.mapv(exp_sigma_inverse_from_eta_scalar);
-    let q0 = Array1::from_iter(eta_t.iter().zip(inv_sigma.iter()).map(|(&t, &r)| -t * r));
+    let resolved_wiggle_knots = input
+        .link_wiggle_knots
+        .as_ref()
+        .or(fit.artifacts.survival_link_wiggle_knots.as_ref());
+    let resolved_wiggle_degree = input
+        .link_wiggle_degree
+        .or(fit.artifacts.survival_link_wiggle_degree);
+    let q0 = Array1::from_iter(
+        eta_t
+            .iter()
+            .zip(eta_ls.iter())
+            .map(|(&t, &ls)| survival_q0_from_eta(t, ls)),
+    );
     let (wiggle_design, dq_dq0, etaw) = if let Some(betaw) = beta_link_wiggle.as_ref() {
-        let knots = input.link_wiggle_knots.as_ref().ok_or_else(|| {
+        let knots = resolved_wiggle_knots.ok_or_else(|| {
             "predict_survival_location_scale: link-wiggle coefficients are missing knot metadata"
                 .to_string()
         })?;
-        let degree = input.link_wiggle_degree.ok_or_else(|| {
+        let degree = resolved_wiggle_degree.ok_or_else(|| {
             "predict_survival_location_scale: link-wiggle coefficients are missing degree metadata"
                 .to_string()
         })?;
@@ -7483,12 +7603,11 @@ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
         .log_sigma_design
         .design
         .dot(&pilot.fit.beta_log_sigma());
-    let inv_sigma = eta_log_sigma.mapv(exp_sigma_inverse_from_eta_scalar);
     let q_seed = Array1::from_iter(
         eta_threshold
             .iter()
-            .zip(inv_sigma.iter())
-            .map(|(&threshold, &r)| -threshold * r),
+            .zip(eta_log_sigma.iter())
+            .map(|(&threshold, &ls)| survival_q0_from_eta(threshold, ls)),
     );
     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
 }
@@ -7892,6 +8011,13 @@ pub fn predict_survival_location_scalewith_uncertainty(
     let p_ls = fit.beta_log_sigma().len();
     let beta_link_wiggle = fit.beta_link_wiggle();
     let pw = beta_link_wiggle.as_ref().map_or(0, |b| b.len());
+    let resolved_wiggle_knots = input
+        .link_wiggle_knots
+        .as_ref()
+        .or(fit.artifacts.survival_link_wiggle_knots.as_ref());
+    let resolved_wiggle_degree = input
+        .link_wiggle_degree
+        .or(fit.artifacts.survival_link_wiggle_degree);
     let p_total = p_time + p_t + p_ls + pw;
     if covariance.nrows() != p_total || covariance.ncols() != p_total {
         return Err(format!(
@@ -7904,8 +8030,8 @@ pub fn predict_survival_location_scalewith_uncertainty(
     }
     if pw > 0
         && (beta_link_wiggle.is_none()
-            || input.link_wiggle_knots.is_none()
-            || input.link_wiggle_degree.is_none())
+            || resolved_wiggle_knots.is_none()
+            || resolved_wiggle_degree.is_none())
     {
         return Err(
             "predict_survival_location_scalewith_uncertainty: dynamic link-wiggle metadata is incomplete"
@@ -8014,6 +8140,8 @@ mod tests {
             beta_threshold,
             beta_log_sigma,
             beta_link_wiggle,
+            link_wiggle_knots: None,
+            link_wiggle_degree: None,
             lambdas_time: Array1::zeros(0),
             lambdas_threshold: Array1::zeros(0),
             lambdas_log_sigma: Array1::zeros(0),

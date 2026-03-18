@@ -21,6 +21,7 @@ fn fit_gam_rejects_royston_parmar_and_points_to_survival_api() {
         linear_constraints: None,
         adaptive_regularization: None,
         penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };

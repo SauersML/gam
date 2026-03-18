@@ -345,8 +345,8 @@ pub enum BlockWorkingSet {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExactNewtonOuterObjective {
-    QuadraticReml,
-    PseudoLaplace,
+    RidgedQuadraticReml,
+    StrictPseudoLaplace,
 }
 
 /// Highest exact outer derivative order a family wants to expose at the
@@ -395,11 +395,16 @@ pub trait CustomFamily {
 
     /// Selects the outer objective semantics for exact-Newton families.
     ///
-    /// `QuadraticReml` is the classical blockwise REML/LAML surface:
+    /// `RidgedQuadraticReml` is the explicit ridged surrogate REML surface:
     ///
     ///   -loglik + penalty + 0.5 (log|H| - log|S|_+)
     ///
-    /// `PseudoLaplace` is the exact-mode pseudo-Laplace surface used by the
+    /// The determinant terms in this mode are evaluated on the stabilized
+    /// curvature surface declared by `ridge_policy`, so this objective is an
+    /// explicitly modified surrogate rather than an exact Laplace expansion
+    /// at an indefinite Hessian.
+    ///
+    /// `StrictPseudoLaplace` is the exact-mode pseudo-Laplace surface used by the
     /// Charbonnier spatial family:
     ///
     ///   -loglik + penalty + 0.5 log|H|
@@ -408,7 +413,7 @@ pub trait CustomFamily {
     /// normalization term because there is no tractable exact analogue for the
     /// nonquadratic prior without introducing the intractable prior normalizer.
     fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-        ExactNewtonOuterObjective::QuadraticReml
+        ExactNewtonOuterObjective::RidgedQuadraticReml
     }
 
     /// Whether the joint likelihood Hessian H_L depends on β.
@@ -417,11 +422,11 @@ pub trait CustomFamily {
     /// moving-design drift correction for ψ coordinates and marks
     /// `HyperCoord::b_depends_on_beta = true`.
     ///
-    /// Default: `true` for PseudoLaplace, `false` for QuadraticReml.
+    /// Default: `true` for StrictPseudoLaplace, `false` for RidgedQuadraticReml.
     /// Gaussian location-scale must override to `true` because their
-    /// joint Hessian depends on β even though outer objective is QuadraticReml.
+    /// joint Hessian depends on β even though outer objective is RidgedQuadraticReml.
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
-        self.exact_newton_outerobjective() != ExactNewtonOuterObjective::QuadraticReml
+        self.exact_newton_outerobjective() != ExactNewtonOuterObjective::RidgedQuadraticReml
     }
 
     /// Declares how much exact outer calculus this family wants to expose for
@@ -1152,15 +1157,22 @@ pub fn blockwise_fit_from_parts(
                 total_p, total_p, rows, cols
             ));
         }
-        if geom.working_weights.len() != n {
+        let geom_len = geom.working_weights.len();
+        if geom_len != geom.working_response.len() {
             return Err(format!(
-                "blockwise_fit.geometry.working_weights length mismatch: got {}, expected {n}",
+                "blockwise_fit.geometry working vector length mismatch: weights={}, response={}",
                 geom.working_weights.len(),
+                geom.working_response.len(),
             ));
         }
-        if geom.working_response.len() != n {
+        if geom_len != n && (n == 0 || geom_len % n != 0) {
             return Err(format!(
-                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n}",
+                "blockwise_fit.geometry.working_weights length mismatch: got {geom_len}, expected {n} or a stacked multiple of {n}",
+            ));
+        }
+        if geom.working_response.len() != n && (n == 0 || geom.working_response.len() % n != 0) {
+            return Err(format!(
+                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n} or a stacked multiple of {n}",
                 geom.working_response.len(),
             ));
         }
@@ -1214,7 +1226,10 @@ pub fn blockwise_fit_from_parts(
         pirls_status: crate::pirls::PirlsStatus::Converged,
         max_abs_eta: 0.0,
         constraint_kkt: None,
-        artifacts: crate::solver::estimate::FitArtifacts { pirls: None },
+        artifacts: crate::solver::estimate::FitArtifacts {
+            pirls: None,
+            ..Default::default()
+        },
         inner_cycles,
     })
     .map_err(|e| e.to_string())
@@ -3852,66 +3867,17 @@ fn stable_logdet_with_ridge_policy(
         }
         RidgeDeterminantMode::Auto => unreachable!("adaptive determinant mode must resolve"),
         RidgeDeterminantMode::PositivePart => {
-            // Positive-part determinant policy for numerically hostile exact
-            // Newton systems.
+            // Explicit ridged surrogate objective:
             //
-            // In the exact custom-family REML path we conceptually want
+            //   log |A + ridge I|_+ = Σ_{lambda_j > floor} log(lambda_j)
             //
-            //   log |H|_+ = sum_{lambda_j > floor} log(lambda_j),
-            //
-            // where H is the symmetric Hessian surface used for the determinant
-            // term and `floor` is the ridge-aware positivity threshold. The
-            // mathematically clean route is an eigendecomposition of H. In
-            // practice, the binomial spatial wiggle fit can drive the outer
-            // optimizer into regions where:
-            //
-            // 1. the symmetric eigensolver fails to converge,
-            // 2. an SVD fallback also fails to converge, or
-            // 3. the matrix is so ill-conditioned that even a ridged factor
-            //    fails numerically despite the surface being conceptually a
-            //    positive-part pseudo-determinant.
-            //
-            // The goal of the determinant term here is not to certify a
-            // high-precision spectral decomposition of a pathological matrix; it
-            // is to keep the outer objective finite enough that the optimizer can
-            // keep or reject the current rho iterate. So this code follows a
-            // descending sequence of numerically weaker but always-finite
-            // approximations:
-            //
-            //   eigh(H)          -> exact positive-part pseudo-logdet
-            //   svd(H)           -> singular-value surrogate when eigh fails
-            //   chol(H + bump I) -> ridged SPD surrogate if spectral methods fail
-            //   diag surrogate   -> last-resort finite approximation
-            //
-            // The last fallback is intentionally conservative: it is only used
-            // to avoid poisoning the objective with NaN/Inf. The important
-            // invariant for the exact wiggle path is "outer objective stays
-            // finite", not "every intermediate determinant is spectrally exact
-            // under all non-convergent linear algebra conditions".
+            // on the symmetrized matrix surface used by this mode. Unlike the
+            // historical implementation, this does not silently change the
+            // objective by falling back to singular-value, bumped-Cholesky, or
+            // diagonal surrogates when eigendecomposition fails.
             let floor = ridge.max(1e-14);
-            let evals = if let Ok((evals, _)) = crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower)
-            {
-                evals
-            } else if let Ok((_, singular, _)) = a.svd(false, false) {
-                singular
-            } else {
-                let mut ridged = a.clone();
-                let mut bump = floor.max(1e-10);
-                for _ in 0..8 {
-                    for d in 0..p {
-                        ridged[[d, d]] = a[[d, d]] + bump;
-                    }
-                    if let Ok(chol) = ridged.cholesky(Side::Lower) {
-                        return Ok(2.0 * chol.diag().mapv(f64::ln).sum());
-                    }
-                    bump *= 10.0;
-                }
-                let mut logdet = 0.0;
-                for i in 0..p {
-                    logdet += a[[i, i]].abs().max(floor).ln();
-                }
-                return Ok(logdet);
-            };
+            let (evals, _) = crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower)
+                .map_err(|e| format!("positive-part surrogate eigendecomposition failed: {e}"))?;
             let mut logdet = 0.0;
             for &ev in &evals {
                 if ev > floor {
@@ -4381,7 +4347,8 @@ fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(
     options.use_remlobjective
         && matches!(
             family.exact_newton_outerobjective(),
-            ExactNewtonOuterObjective::QuadraticReml | ExactNewtonOuterObjective::PseudoLaplace
+            ExactNewtonOuterObjective::RidgedQuadraticReml
+                | ExactNewtonOuterObjective::StrictPseudoLaplace
         )
 }
 
@@ -4421,12 +4388,12 @@ fn include_exact_newton_logdet_s<F: CustomFamily + ?Sized>(
     family: &F,
     options: &BlockwiseFitOptions,
 ) -> bool {
-    family.exact_newton_outerobjective() == ExactNewtonOuterObjective::QuadraticReml
+    family.exact_newton_outerobjective() == ExactNewtonOuterObjective::RidgedQuadraticReml
         && options.use_remlobjective
 }
 
 fn use_exact_newton_strict_spd<F: CustomFamily + ?Sized>(family: &F) -> bool {
-    family.exact_newton_outerobjective() == ExactNewtonOuterObjective::PseudoLaplace
+    family.exact_newton_outerobjective() == ExactNewtonOuterObjective::StrictPseudoLaplace
 }
 
 fn blockwise_logdet_terms<F: CustomFamily>(
@@ -6231,7 +6198,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily>(
 
             // Build drift: use block-local representation when possible to avoid
             // materializing full p×p dense matrices.
-            let drift = if psi_terms.hessian_psi.nrows() == 0 {
+            let drift = if psi_terms.hessian_psi_operator.is_some() {
                 // No dense Hessian contribution — penalty is block-local, operator
                 // (if present) handles the likelihood part. O(p_block²) fast path.
                 HyperCoordDrift::from_block_local_and_operator(
@@ -8310,7 +8277,7 @@ mod tests {
         }
 
         fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::PseudoLaplace
+            ExactNewtonOuterObjective::StrictPseudoLaplace
         }
 
         fn exact_newton_joint_hessian(
@@ -8353,7 +8320,7 @@ mod tests {
         }
 
         fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::PseudoLaplace
+            ExactNewtonOuterObjective::StrictPseudoLaplace
         }
 
         fn exact_newton_joint_hessian(
@@ -8411,7 +8378,7 @@ mod tests {
         }
 
         fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::PseudoLaplace
+            ExactNewtonOuterObjective::StrictPseudoLaplace
         }
 
         fn exact_newton_joint_hessian(
@@ -8447,7 +8414,7 @@ mod tests {
         }
 
         fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::PseudoLaplace
+            ExactNewtonOuterObjective::StrictPseudoLaplace
         }
 
         fn exact_newton_joint_hessian(
@@ -9815,7 +9782,7 @@ mod tests {
         }
 
         fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::PseudoLaplace
+            ExactNewtonOuterObjective::StrictPseudoLaplace
         }
     }
 

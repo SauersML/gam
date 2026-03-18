@@ -161,6 +161,7 @@ fn test_lamlgradient_nonfirthwell_conditioned() {
         linear_constraints: None,
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };
@@ -236,6 +237,7 @@ fn test_lamlgradient_logitwith_firthwell_conditioned() {
         linear_constraints: None,
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };
@@ -309,6 +311,7 @@ fn stress_test_firthgradientvs_conditioning() {
             linear_constraints: None,
             firth_bias_reduction: None,
             penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };

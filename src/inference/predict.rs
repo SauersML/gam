@@ -2916,7 +2916,10 @@ mod tests {
             pirls_status: PirlsStatus::Converged,
             max_abs_eta: 0.0,
             constraint_kkt: None,
-            artifacts: FitArtifacts { pirls: None },
+            artifacts: FitArtifacts {
+                pirls: None,
+                ..Default::default()
+            },
             inner_cycles: 0,
         })
         .expect("test fit")

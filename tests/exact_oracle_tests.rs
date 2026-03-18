@@ -126,6 +126,7 @@ fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f6
         linear_constraints: None,
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };
@@ -380,6 +381,7 @@ fn test_externalgradient_adapter_isolated_matchesfd_direction() {
         linear_constraints: None,
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };

@@ -4535,17 +4535,18 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     };
     let eb: &Array2<f64> = eb_cow.as_ref();
 
-    // Kronecker fast path: keep Q factored and the transformed penalty diagonal
-    // throughout the PIRLS solve. Dense ReparamResult materialization is deferred
-    // until the final result assembly for legacy downstream consumers.
-    let dense_reparam_result = if penalty.kronecker_factored.is_none() {
-        Some(stable_reparameterization_engine_canonical(
-            penalty.canonical_penalties,
-            lambdas_slice,
-            EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
-            penalty.reparam_invariant,
-            penalty.penalty_shrinkage_floor,
-        )?)
+    // Build a cheap weighted penalty sum for the sparse-native decision
+    // WITHOUT running the expensive eigendecomposition engine.
+    // The full reparameterization is deferred until we know which path we need.
+    let cheap_s_lambda: Option<Array2<f64>> = if penalty.kronecker_factored.is_none() {
+        let mut s = Array2::<f64>::zeros((penalty.p, penalty.p));
+        for (k, cp) in penalty.canonical_penalties.iter().enumerate() {
+            let lam = lambdas_slice.get(k).copied().unwrap_or(0.0);
+            if lam != 0.0 {
+                cp.accumulate_weighted(&mut s, lam);
+            }
+        }
+        Some(s)
     } else {
         None
     };
@@ -4564,35 +4565,23 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     } else {
         None
     };
-    let transformed_bounds = if let Some((_, transform, _)) = kronecker_runtime.as_ref() {
-        build_transformed_lower_bound_constraints_with_transform(
+    // Constraint transformation is deferred until after the sparse-native
+    // decision, because the dense reparameterization engine (which provides Qs)
+    // is now run lazily.  Kronecker constraints can be built eagerly since
+    // the Kronecker transform is already available.
+    let kronecker_constraints = if let Some((_, transform, _)) = kronecker_runtime.as_ref() {
+        let tb = build_transformed_lower_bound_constraints_with_transform(
             &WorkingReparamTransform::Kronecker(Arc::clone(transform)),
             penalty.coefficient_lower_bounds,
-        )
-    } else {
-        build_transformed_lower_bound_constraints(
-            &dense_reparam_result
-                .as_ref()
-                .expect("dense reparam result should be present outside Kronecker path")
-                .qs,
-            penalty.coefficient_lower_bounds,
-        )
-    };
-    let transformed_linear = if let Some((_, transform, _)) = kronecker_runtime.as_ref() {
-        build_transformed_linear_constraints_with_transform(
+        );
+        let tl = build_transformed_linear_constraints_with_transform(
             &WorkingReparamTransform::Kronecker(Arc::clone(transform)),
             penalty.linear_constraints_original,
-        )
+        );
+        Some(merge_linear_constraints(tb, tl))
     } else {
-        build_transformed_linear_constraints(
-            &dense_reparam_result
-                .as_ref()
-                .expect("dense reparam result should be present outside Kronecker path")
-                .qs,
-            penalty.linear_constraints_original,
-        )
+        None
     };
-    let linear_constraints = merge_linear_constraints(transformed_bounds, transformed_linear);
 
     let x_original: DesignMatrix = x.into();
     // Auto-detect sparse structure in dense designs so the sparse-native path
@@ -4607,11 +4596,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let erows = if let Some((_, _, penalty_diag)) = kronecker_runtime.as_ref() {
         penalty_diag.rank()
     } else {
-        dense_reparam_result
-            .as_ref()
-            .expect("dense reparam result should be present outside Kronecker path")
-            .e_transformed
-            .nrows()
+        // Compute penalty root rank cheaply from canonical penalties.
+        penalty.canonical_penalties.iter().map(|cp| cp.rank()).sum::<usize>()
     };
     let mut workspace = PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), ebrows, erows);
     let solver_decision = if let Some((_, _, _)) = kronecker_runtime.as_ref() {
@@ -4629,16 +4615,29 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         should_use_sparse_native_pirls(
             &mut workspace,
             &x_original,
-            &dense_reparam_result
+            cheap_s_lambda
                 .as_ref()
-                .expect("dense reparam result should be present outside Kronecker path")
-                .s_transformed,
+                .expect("cheap_s_lambda should be present outside Kronecker path"),
             penalty.linear_constraints_original,
         )
     };
     solver_decision.log_once();
 
     let use_sparse_native = matches!(solver_decision.path, PirlsLinearSolvePath::SparseNative);
+
+    // Run the expensive eigendecomposition engine ONLY for the dense-transformed
+    // path. Sparse-native fits skip this entirely during the PIRLS solve.
+    let dense_reparam_result = if !use_sparse_native && penalty.kronecker_factored.is_none() {
+        Some(stable_reparameterization_engine_canonical(
+            penalty.canonical_penalties,
+            lambdas_slice,
+            EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
+            penalty.reparam_invariant,
+            penalty.penalty_shrinkage_floor,
+        )?)
+    } else {
+        None
+    };
     let qs_arc = dense_reparam_result
         .as_ref()
         .map(|reparam_result| Arc::new(reparam_result.qs.clone()));
@@ -4656,18 +4655,20 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     let penalty_active = if let Some((_, _, penalty_diag)) = kronecker_runtime.as_ref() {
         penalty_diag.clone()
     } else if use_sparse_native {
-        let sparse_reparam = build_sparse_native_reparam_result(
-            dense_reparam_result
-                .as_ref()
-                .expect("dense reparam result should be present outside Kronecker path")
-                .clone(),
+        // Build sparse-native penalty directly from canonical penalties.
+        // No dense eigendecomposition needed for the PIRLS solve itself.
+        let s_lambda = cheap_s_lambda
+            .as_ref()
+            .expect("cheap_s_lambda should be present for sparse-native path")
+            .clone();
+        let e_root = stack_lambdaweighted_penalty_root_canonical(
             penalty.canonical_penalties,
             lambdas_slice,
             penalty.p,
         );
         PirlsPenalty::Dense {
-            s_transformed: sparse_reparam.s_transformed.clone(),
-            e_transformed: sparse_reparam.e_transformed.clone(),
+            s_transformed: s_lambda,
+            e_transformed: e_root,
         }
     } else {
         let dense = dense_reparam_result
@@ -4678,6 +4679,35 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             e_transformed: dense.e_transformed.clone(),
         }
     };
+    // Build transformed constraints now that dense_reparam_result is available.
+    let linear_constraints = if let Some(kc) = kronecker_constraints {
+        kc
+    } else if let Some(reparam) = dense_reparam_result.as_ref() {
+        let tb = build_transformed_lower_bound_constraints(
+            &reparam.qs,
+            penalty.coefficient_lower_bounds,
+        );
+        let tl = build_transformed_linear_constraints(
+            &reparam.qs,
+            penalty.linear_constraints_original,
+        );
+        merge_linear_constraints(tb, tl)
+    } else {
+        // Sparse-native without dense reparam: constraints stay in original
+        // coordinates (identity Qs).  Use an identity matrix of appropriate size.
+        let p = penalty.p;
+        let qs_identity = Array2::<f64>::eye(p);
+        let tb = build_transformed_lower_bound_constraints(
+            &qs_identity,
+            penalty.coefficient_lower_bounds,
+        );
+        let tl = build_transformed_linear_constraints(
+            &qs_identity,
+            penalty.linear_constraints_original,
+        );
+        merge_linear_constraints(tb, tl)
+    };
+
     let coordinate_frame = if use_sparse_native {
         PirlsCoordinateFrame::OriginalSparseNative
     } else {
@@ -4692,11 +4722,18 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 .collect();
             kron_result.materialize_dense_artifact_result(&rs_list, lambdas_slice, penalty.p)
         } else if use_sparse_native {
+            // Sparse-native path: run the eigendecomposition engine now (deferred
+            // from the PIRLS solve) to produce the REML-required log-determinant
+            // and derivative quantities, then override with identity Qs.
+            let base = stable_reparameterization_engine_canonical(
+                penalty.canonical_penalties,
+                lambdas_slice,
+                EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
+                penalty.reparam_invariant,
+                penalty.penalty_shrinkage_floor,
+            )?;
             Ok(build_sparse_native_reparam_result(
-                dense_reparam_result
-                    .as_ref()
-                    .expect("dense reparam result should be present outside Kronecker path")
-                    .clone(),
+                base,
                 penalty.canonical_penalties,
                 lambdas_slice,
                 penalty.p,

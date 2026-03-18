@@ -1,5 +1,4 @@
 use super::*;
-use crate::types::LinkComponent;
 use ndarray::ShapeBuilder;
 
 impl<'a> RemlState<'a> {
@@ -85,18 +84,28 @@ impl<'a> RemlState<'a> {
 
     #[inline]
     fn logit_fisher_weight_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
-        let jet =
-            crate::solver::mixture_link::component_inverse_link_jet(LinkComponent::Logit, eta);
-        let link = InverseLink::Standard(LinkFunction::Logit);
-        let w3 = crate::solver::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-            &link, eta,
-        )
-        .expect("standard logit should expose exact third derivative of the inverse-link pdf");
-        let w4 = crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-            &link, eta,
-        )
-        .expect("standard logit should expose exact fourth derivative of the inverse-link pdf");
-        (jet.d1, jet.d2, jet.d3, w3, w4)
+        // Logistic Fisher weight and its eta-derivatives are exactly the
+        // derivatives of the inverse-link derivative mu'(eta).
+        //
+        // Using the stable sigmoid avoids tail cancellation, and expressing the
+        // higher derivatives as w * P_k(mu) keeps all orders in one coherent
+        // recurrence instead of mixing multiple helper implementations.
+        let e = eta.clamp(-700.0, 700.0);
+        let mu = if e >= 0.0 {
+            let z = (-e).exp();
+            1.0 / (1.0 + z)
+        } else {
+            let z = e.exp();
+            z / (1.0 + z)
+        };
+        let w = mu * (1.0 - mu);
+        let w1 = w * (1.0 - 2.0 * mu);
+        let w2 = w * (1.0 - 6.0 * mu + 6.0 * mu * mu);
+        let w3 = w * (1.0 - 14.0 * mu + 36.0 * mu * mu - 24.0 * mu * mu * mu);
+        let w4 = w
+            * (1.0 - 30.0 * mu + 150.0 * mu * mu - 240.0 * mu * mu * mu
+                + 120.0 * mu * mu * mu * mu);
+        (w, w1, w2, w3, w4)
     }
 
     pub(crate) fn weighted_cross(

@@ -37,14 +37,15 @@ use gam::hmc::{
     run_link_wiggle_nuts_sampling, run_nuts_sampling_flattened_family,
 };
 use gam::inference::data::{
-    EncodedDataset as Dataset, UnseenCategoryPolicy, load_dataset as load_dataset_auto,
+    EncodedDataset as Dataset, UnseenCategoryPolicy,
+    load_dataset_projected as load_dataset_auto_projected,
     load_datasetwith_schema as load_dataset_auto_with_schema,
 };
 use gam::inference::formula_dsl::{
-    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, effectivelinkwiggle_formulaspec,
-    formula_rhs_text, inverse_link_supports_joint_wiggle, linkchoice_supports_joint_wiggle,
-    linkname, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
-    parse_surv_response, validate_auxiliary_formula_controls,
+    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
+    effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
+    linkchoice_supports_joint_wiggle, linkname, parse_formula, parse_link_choice,
+    parse_matching_auxiliary_formula, parse_surv_response, validate_auxiliary_formula_controls,
 };
 use gam::inference::model::{
     DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, ModelKind,
@@ -96,7 +97,7 @@ use gam::{
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
 use statrs::distribution::{ChiSquared, ContinuousCDF};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -530,7 +531,10 @@ fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
         inf.working_response = Array1::zeros(0);
         inf.reparam_qs = None;
     }
-    fit.artifacts = gam::estimate::FitArtifacts { pirls: None };
+    fit.artifacts = gam::estimate::FitArtifacts {
+        pirls: None,
+        ..Default::default()
+    };
 }
 
 fn run_fit(args: FitArgs) -> Result<(), String> {
@@ -598,7 +602,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     progress.start_workflow("Fit", fit_total_steps);
     progress.set_stage("fit", "parsing csv and inferring schema");
     progress.start_secondary_workflow("Data Loading", 3);
-    let ds = load_dataset(&args.data)?;
+    let requested_columns = required_columns_for_fit(&args, &parsed)?;
+    let ds = load_dataset_projected(&args.data, &requested_columns)?;
     progress.advance_secondary_workflow(1);
     progress.advance_workflow(1);
 
@@ -926,6 +931,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         linear_constraints: None,
         adaptive_regularization: adaptive_opts,
         penalty_shrinkage_floor: Some(1e-6),
+        rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };
@@ -993,6 +999,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 linear_constraints: design.linear_constraints.clone(),
                 firth_bias_reduction: Some(true),
                 penalty_shrinkage_floor: Some(1e-6),
+                rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },
@@ -2358,6 +2365,8 @@ fn run_predict_survival(
                 beta_threshold: beta_threshold.clone(),
                 beta_log_sigma: beta_log_sigma.clone(),
                 beta_link_wiggle: beta_link_wiggle.clone(),
+                link_wiggle_knots: link_wiggle_knots.clone(),
+                link_wiggle_degree,
                 lambdas_time: Array1::zeros(0),
                 lambdas_threshold: Array1::zeros(0),
                 lambdas_log_sigma: Array1::zeros(0),
@@ -3274,6 +3283,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 linear_constraints: design.linear_constraints.clone(),
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: Some(1e-6),
+                rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,
             },
@@ -3536,8 +3546,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     let survival_total_steps = if args.out.is_some() { 5 } else { 4 };
     progress.start_workflow("Survival Fit", survival_total_steps);
+    let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
+    let formula = format!("{response_expr} ~ {}", args.formula);
+    let parsed = parse_formula(&formula)?;
     progress.set_stage("fit", "loading survival data");
-    let ds = load_dataset(&args.data)?;
+    let requested_columns = required_columns_for_survival(&args, &parsed)?;
+    let ds = load_dataset_projected(&args.data, &requested_columns)?;
     progress.advance_workflow(1);
     let col_map: HashMap<String, usize> = ds
         .headers
@@ -3560,10 +3574,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     if n == 0 {
         return Err("survival dataset has no rows".to_string());
     }
-
-    let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
-    let formula = format!("{response_expr} ~ {}", args.formula);
-    let parsed = parse_formula(&formula)?;
     let formula_surv = parsed.survivalspec.clone();
     let formula_link = parsed.linkspec.clone();
     let formula_linkwiggle = parsed.linkwiggle.clone();
@@ -3799,7 +3809,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             wiggle,
         );
         time_penalties.extend(wiggle.penalties.clone());
-        time_nullspace_dims.extend(vec![0usize; wiggle.penalties.len()]);
+        time_nullspace_dims.extend(wiggle.nullspace_dims.clone());
     }
 
     if likelihood_mode == SurvivalLikelihoodMode::LocationScale {
@@ -5015,6 +5025,7 @@ fn run_sample_standard(
             linear_constraints: design.linear_constraints.clone(),
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
+            rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
         },
@@ -6766,7 +6777,10 @@ fn core_saved_fit_result(
             pirls_status: summary.pirls_status,
             max_abs_eta: summary.max_abs_eta,
             constraint_kkt: None,
-            artifacts: gam::estimate::FitArtifacts { pirls: None },
+            artifacts: gam::estimate::FitArtifacts {
+                pirls: None,
+                ..Default::default()
+            },
             inner_cycles: 0,
         })
         .expect("core_saved_fit_result called with invalid fit metrics")
@@ -7135,8 +7149,100 @@ fn print_inference_summary(notes: &[String]) {
     }
 }
 
-fn load_dataset(path: &Path) -> Result<Dataset, String> {
-    load_dataset_auto(path)
+fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
+    for term in terms {
+        match term {
+            ParsedTerm::Linear { name, .. }
+            | ParsedTerm::BoundedLinear { name, .. }
+            | ParsedTerm::RandomEffect { name } => {
+                out.insert(name.clone());
+            }
+            ParsedTerm::Smooth { vars, .. } => {
+                out.extend(vars.iter().cloned());
+            }
+            ParsedTerm::LinkWiggle { .. }
+            | ParsedTerm::TimeWiggle { .. }
+            | ParsedTerm::LinkConfig { .. }
+            | ParsedTerm::SurvivalConfig { .. } => {}
+        }
+    }
+}
+
+fn required_columns_for_formula(parsed: &ParsedFormula) -> Result<Vec<String>, String> {
+    let mut out = BTreeSet::<String>::new();
+    if let Some((entry, exit, event)) = parse_surv_response(&parsed.response)? {
+        out.insert(entry);
+        out.insert(exit);
+        out.insert(event);
+    } else {
+        out.insert(parsed.response.clone());
+    }
+    collect_term_column_names(&parsed.terms, &mut out);
+    Ok(out.into_iter().collect())
+}
+
+fn merge_required_columns(target: &mut BTreeSet<String>, cols: Vec<String>) {
+    target.extend(cols);
+}
+
+fn required_columns_for_fit(args: &FitArgs, parsed: &ParsedFormula) -> Result<Vec<String>, String> {
+    let mut required = BTreeSet::<String>::new();
+    merge_required_columns(&mut required, required_columns_for_formula(parsed)?);
+
+    if let Some(noise_formula_raw) = args.predict_noise.as_deref() {
+        let (_, parsed_noise) = parse_matching_auxiliary_formula(
+            noise_formula_raw,
+            &parsed.response,
+            "--predict-noise",
+        )?;
+        merge_required_columns(&mut required, required_columns_for_formula(&parsed_noise)?);
+    }
+
+    if let Some(logslope_formula_raw) = args.logslope_formula.as_deref() {
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            logslope_formula_raw,
+            &parsed.response,
+            "--logslope-formula",
+        )?;
+        merge_required_columns(
+            &mut required,
+            required_columns_for_formula(&parsed_logslope)?,
+        );
+    }
+
+    if let Some(z_column) = args.z_column.as_ref() {
+        required.insert(z_column.clone());
+    }
+
+    Ok(required.into_iter().collect())
+}
+
+fn required_columns_for_survival(
+    args: &SurvivalArgs,
+    parsed: &ParsedFormula,
+) -> Result<Vec<String>, String> {
+    let mut required = BTreeSet::<String>::new();
+    required.insert(args.entry.clone());
+    required.insert(args.exit.clone());
+    required.insert(args.event.clone());
+    merge_required_columns(&mut required, required_columns_for_formula(parsed)?);
+
+    if let Some(noise_formula_raw) = args.predict_noise.as_deref() {
+        let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
+        let (_, parsed_noise) =
+            parse_matching_auxiliary_formula(noise_formula_raw, &response_expr, "--predict-noise")?;
+        merge_required_columns(&mut required, required_columns_for_formula(&parsed_noise)?);
+    }
+
+    if let Some(z_column) = args.z_column.as_ref() {
+        required.insert(z_column.clone());
+    }
+
+    Ok(required.into_iter().collect())
+}
+
+fn load_dataset_projected(path: &Path, requested_columns: &[String]) -> Result<Dataset, String> {
+    load_dataset_auto_projected(path, requested_columns)
 }
 
 fn load_datasetwith_schema(path: &Path, schema: &DataSchema) -> Result<Dataset, String> {
@@ -8485,10 +8591,10 @@ mod tests {
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
-        parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
-        parse_survival_baseline_config, parse_survival_inverse_link,
+        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
+        parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
-        run_generate_gaussian_location_scale, run_generate_standard,
+        required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain,
         survival_basis_supports_structural_monotonicity, validate_cli_firth_configuration,
@@ -8637,6 +8743,56 @@ mod tests {
             err.contains("Binomial Logit"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn required_columns_for_fit_includes_auxiliary_formula_columns() {
+        let parsed = parse_formula("y ~ x + s(pc1, pc2, type=tensor)").expect("parse main formula");
+        let mut args = location_scale_fit_args(
+            PathBuf::from("train.csv"),
+            PathBuf::from("model.json"),
+            "y ~ x + s(pc1, pc2, type=tensor)",
+            "y ~ z + smooth(w)",
+        );
+        args.logslope_formula = Some("y ~ slope_x + slope_z".to_string());
+        args.z_column = Some("z_anchor".to_string());
+
+        let required = required_columns_for_fit(&args, &parsed).expect("required columns");
+
+        assert_eq!(
+            required,
+            vec![
+                "pc1".to_string(),
+                "pc2".to_string(),
+                "slope_x".to_string(),
+                "slope_z".to_string(),
+                "w".to_string(),
+                "x".to_string(),
+                "y".to_string(),
+                "z".to_string(),
+                "z_anchor".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_dataset_projected_keeps_only_requested_columns() {
+        let dir = tempdir().expect("tempdir");
+        let csv_path = dir.path().join("projected.csv");
+        fs::write(
+            &csv_path,
+            "unused_a,x,unused_b,y\n1,10,100,0\n2,11,101,1\n3,12,102,0\n",
+        )
+        .expect("write csv");
+
+        let ds = load_dataset_projected(&csv_path, &["x".to_string(), "y".to_string()])
+            .expect("load projected csv");
+
+        assert_eq!(ds.headers, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(ds.values.nrows(), 3);
+        assert_eq!(ds.values.ncols(), 2);
+        assert_eq!(ds.values[[1, 0]], 11.0);
+        assert_eq!(ds.values[[1, 1]], 1.0);
     }
 
     #[test]
