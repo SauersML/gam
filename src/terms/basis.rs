@@ -11878,6 +11878,85 @@ pub fn evaluate_ispline_scalarwith_scratch(
     Ok(())
 }
 
+/// Compute the k-th derivative of an I-spline basis as a dense matrix.
+///
+/// The I-spline of degree `degree` uses internal B-splines of degree `degree+1`.
+/// The k-th derivative of I-spline j is the right-cumulative sum of the k-th
+/// derivatives of those B-splines, starting from column j+1 down to j.
+///
+/// This produces `num_bspline_basis - 1` columns (same as the I-spline value
+/// basis), where `num_bspline_basis = len(knot_vector) - degree - 2`.
+pub fn create_ispline_derivative_dense(
+    data: ArrayView1<'_, f64>,
+    knot_vector: &Array1<f64>,
+    degree: usize,
+    derivative_order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if derivative_order == 0 {
+        // For order 0, return the I-spline value basis.
+        let (basis_arc, _) = create_basis::<Dense>(
+            data,
+            KnotSource::Provided(knot_vector.view()),
+            degree,
+            BasisOptions::i_spline(),
+        )?;
+        return Ok(basis_arc.as_ref().clone());
+    }
+    let bs_degree = degree
+        .checked_add(1)
+        .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
+    if derivative_order > bs_degree {
+        // Derivative order exceeds basis degree — result is identically zero.
+        let num_bspline_basis = knot_vector
+            .len()
+            .checked_sub(bs_degree + 1)
+            .unwrap_or(0);
+        let num_ispline_basis = num_bspline_basis.saturating_sub(1);
+        return Ok(Array2::zeros((data.len(), num_ispline_basis)));
+    }
+    // Evaluate B-spline k-th derivatives at the internal degree (degree+1).
+    let bspline_options = match derivative_order {
+        1 => BasisOptions::first_derivative(),
+        2 => BasisOptions::second_derivative(),
+        _ => BasisOptions {
+            derivative_order,
+            basis_family: BasisFamily::BSpline,
+        },
+    };
+    let (db_arc, _) = create_basis::<Dense>(
+        data,
+        KnotSource::Provided(knot_vector.view()),
+        bs_degree,
+        bspline_options,
+    )?;
+    let db = db_arc.as_ref();
+    let num_bspline_cols = db.ncols();
+    let num_ispline_cols = num_bspline_cols.saturating_sub(1);
+    if num_ispline_cols == 0 {
+        return Ok(Array2::zeros((data.len(), 0)));
+    }
+    // Right-cumulative sum: I-spline derivative column j = sum_{m=j+1..end} dB_m.
+    // In our indexing: output column j (0-based) = sum of dB columns j+1..num_bspline_cols.
+    let mut out = Array2::<f64>::zeros((data.len(), num_ispline_cols));
+    for i in 0..data.len() {
+        let mut running = 0.0_f64;
+        for j in (1..num_bspline_cols).rev() {
+            let term = db[[i, j]];
+            if term.is_finite() {
+                running += term;
+            }
+            out[[i, j - 1]] = running;
+        }
+    }
+    // Apply numerical floor for near-zero values.
+    for val in out.iter_mut() {
+        if val.abs() <= 1e-12 {
+            *val = 0.0;
+        }
+    }
+    Ok(out)
+}
+
 pub fn evaluate_ispline_scalar(
     x: f64,
     knot_vector: ArrayView1<f64>,

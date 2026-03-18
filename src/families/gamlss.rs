@@ -1,8 +1,6 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
-    create_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
-    evaluate_bspline_fourth_derivative_scalar, evaluate_bsplinesecond_derivative_scalar,
-    evaluate_bsplinethird_derivative_scalar,
+    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    create_ispline_derivative_dense,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -85,6 +83,67 @@ fn gaussian_log_sigma_irlsinfo_directional_derivative(
     let dg_deta = d2_sigma / sigma - d_sigma * d_sigma / (sigma * sigma);
     let dw = 4.0 * weight * g * dg_deta * d_eta;
     if dw.is_finite() { dw } else { 0.0 }
+}
+
+#[derive(Clone, Copy)]
+struct GaussianDiagonalRowKernel {
+    log_likelihood: f64,
+    location_working_weight: f64,
+    location_working_shift: f64,
+    log_sigma_working_weight: f64,
+    log_sigma_working_response: f64,
+}
+
+#[inline]
+fn gaussian_diagonal_row_kernel(
+    y: f64,
+    location_eta: f64,
+    eta_log_sigma: f64,
+    obs_weight: f64,
+    ln2pi: f64,
+) -> GaussianDiagonalRowKernel {
+    if obs_weight == 0.0 {
+        return GaussianDiagonalRowKernel {
+            log_likelihood: 0.0,
+            location_working_weight: 0.0,
+            location_working_shift: 0.0,
+            log_sigma_working_weight: 0.0,
+            log_sigma_working_response: eta_log_sigma,
+        };
+    }
+
+    let SigmaJet1 {
+        sigma: raw_sigma,
+        d1: raw_dsigma,
+    } = exp_sigma_jet1_scalar(eta_log_sigma);
+    let (sigma, d_sigma) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
+        (1e-12, 0.0)
+    } else {
+        (raw_sigma, raw_dsigma)
+    };
+    let inv_s2 = (sigma * sigma).recip().min(1e24);
+    let residual = y - location_eta;
+    let location_working_weight = floor_positiveweight(obs_weight * inv_s2, MIN_WEIGHT);
+    let dlog_sigma_deta = if d_sigma == 0.0 { 0.0 } else { d_sigma / sigma };
+    let log_sigma_working_weight = floor_positiveweight(
+        2.0 * obs_weight * dlog_sigma_deta * dlog_sigma_deta,
+        MIN_WEIGHT,
+    );
+    let log_sigma_score = obs_weight * (residual * residual * inv_s2 - 1.0) * dlog_sigma_deta;
+    let log_sigma_working_response = if log_sigma_working_weight == 0.0 {
+        eta_log_sigma
+    } else {
+        eta_log_sigma + log_sigma_score / log_sigma_working_weight
+    };
+
+    GaussianDiagonalRowKernel {
+        log_likelihood: obs_weight
+            * (-0.5 * (residual * residual * inv_s2 + ln2pi + 2.0 * sigma.ln())),
+        location_working_weight,
+        location_working_shift: residual,
+        log_sigma_working_weight,
+        log_sigma_working_response,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -373,7 +432,7 @@ pub(crate) fn initializewiggle_knots_from_seed(
             num_internal_knots,
         },
         degree,
-        BasisOptions::value(),
+        BasisOptions::i_spline(),
     )
     .map_err(|e| e.to_string())?;
     Ok(knots)
@@ -5658,91 +5717,27 @@ impl CustomFamily for GaussianLocationScaleFamily {
             w_ls.as_slice_memory_order_mut(),
         ) {
             for i in 0..n {
-                let weight_i = w_s[i];
-                // Fast path: skip expensive sigma computation for zero-weight observations.
-                if weight_i == 0.0 {
-                    wmu_s[i] = 0.0;
-                    zmu_s[i] = mu_s[i];
-                    wls_s[i] = 0.0;
-                    zls_s[i] = ls_s[i];
-                    continue;
-                }
-                let eta_ls_i = ls_s[i];
-                let SigmaJet1 {
-                    sigma: raw_sigma,
-                    d1: raw_dsigma,
-                } = exp_sigma_jet1_scalar(eta_ls_i);
-                let (sigma_i, d_sigma_i) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
-                    (1e-12, 0.0)
-                } else {
-                    (raw_sigma, raw_dsigma)
-                };
-                let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
-                let log_sigma_i = sigma_i.ln();
-                let r = y_s[i] - mu_s[i];
-                ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * log_sigma_i));
-
-                wmu_s[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
-                zmu_s[i] = mu_s[i] + r;
-
-                let dlogsigma_du = if d_sigma_i == 0.0 {
-                    0.0
-                } else {
-                    d_sigma_i / sigma_i
-                };
-                let info_u =
-                    floor_positiveweight(2.0 * weight_i * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
-                if info_u == 0.0 {
-                    wls_s[i] = 0.0;
-                    zls_s[i] = eta_ls_i;
-                } else {
-                    wls_s[i] = info_u;
-                    let score_ls = weight_i * (r * r * inv_s2 - 1.0) * dlogsigma_du;
-                    zls_s[i] = eta_ls_i + score_ls / info_u;
-                }
+                let row = gaussian_diagonal_row_kernel(y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi);
+                ll += row.log_likelihood;
+                wmu_s[i] = row.location_working_weight;
+                zmu_s[i] = mu_s[i] + row.location_working_shift;
+                wls_s[i] = row.log_sigma_working_weight;
+                zls_s[i] = row.log_sigma_working_response;
             }
         } else {
             for i in 0..n {
-                let weight_i = self.weights[i];
-                // Fast path: skip expensive sigma computation for zero-weight observations.
-                if weight_i == 0.0 {
-                    wmu[i] = 0.0;
-                    zmu[i] = etamu[i];
-                    w_ls[i] = 0.0;
-                    z_ls[i] = eta_log_sigma[i];
-                    continue;
-                }
-                let eta_ls_i = eta_log_sigma[i];
-                let SigmaJet1 {
-                    sigma: raw_sigma,
-                    d1: raw_dsigma,
-                } = exp_sigma_jet1_scalar(eta_ls_i);
-                let (sigma_i, d_sigma_i) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
-                    (1e-12, 0.0)
-                } else {
-                    (raw_sigma, raw_dsigma)
-                };
-                let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
-                let log_sigma_i = sigma_i.ln();
-                let r = self.y[i] - etamu[i];
-                ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * log_sigma_i));
-                wmu[i] = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
-                zmu[i] = etamu[i] + r;
-                let dlogsigma_du = if d_sigma_i == 0.0 {
-                    0.0
-                } else {
-                    d_sigma_i / sigma_i
-                };
-                let info_u =
-                    floor_positiveweight(2.0 * weight_i * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
-                if info_u == 0.0 {
-                    w_ls[i] = 0.0;
-                    z_ls[i] = eta_ls_i;
-                } else {
-                    w_ls[i] = info_u;
-                    let score_ls = weight_i * (r * r * inv_s2 - 1.0) * dlogsigma_du;
-                    z_ls[i] = eta_ls_i + score_ls / info_u;
-                }
+                let row = gaussian_diagonal_row_kernel(
+                    self.y[i],
+                    etamu[i],
+                    eta_log_sigma[i],
+                    self.weights[i],
+                    ln2pi,
+                );
+                ll += row.log_likelihood;
+                wmu[i] = row.location_working_weight;
+                zmu[i] = etamu[i] + row.location_working_shift;
+                w_ls[i] = row.log_sigma_working_weight;
+                z_ls[i] = row.log_sigma_working_response;
             }
         }
 
@@ -7792,46 +7787,15 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let mut zw = Array1::<f64>::zeros(n);
         let mut ww = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let SigmaJet1 {
-                sigma: raw_sigma,
-                d1: raw_dsigma,
-            } = exp_sigma_jet1_scalar(eta_ls[i]);
-            let (sigma_i, d_sigma_i) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
-                (1e-12, 0.0)
-            } else {
-                (raw_sigma, raw_dsigma)
-            };
-            let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
-            let log_sigma_i = sigma_i.ln();
-            let r = self.y[i] - q[i];
-            let weight_i = self.weights[i];
-            ll += weight_i * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * log_sigma_i));
-
-            if weight_i == 0.0 {
-                zmu[i] = eta_mu[i];
-                zw[i] = etaw[i];
-            } else {
-                let info_mu = floor_positiveweight(weight_i * inv_s2, MIN_WEIGHT);
-                wmu[i] = info_mu;
-                ww[i] = info_mu;
-                zmu[i] = eta_mu[i] + r;
-                zw[i] = etaw[i] + r;
-            }
-
-            let dlogsigma_du = if d_sigma_i == 0.0 {
-                0.0
-            } else {
-                d_sigma_i / sigma_i
-            };
-            let info_ls =
-                floor_positiveweight(2.0 * weight_i * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
-            if info_ls == 0.0 {
-                zls[i] = eta_ls[i];
-            } else {
-                wls[i] = info_ls;
-                let score_ls = weight_i * (r * r * inv_s2 - 1.0) * dlogsigma_du;
-                zls[i] = eta_ls[i] + score_ls / info_ls;
-            }
+            let row =
+                gaussian_diagonal_row_kernel(self.y[i], q[i], eta_ls[i], self.weights[i], ln2pi);
+            ll += row.log_likelihood;
+            wmu[i] = row.location_working_weight;
+            ww[i] = row.location_working_weight;
+            zmu[i] = eta_mu[i] + row.location_working_shift;
+            zw[i] = etaw[i] + row.location_working_shift;
+            wls[i] = row.log_sigma_working_weight;
+            zls[i] = row.log_sigma_working_response;
         }
 
         Ok(FamilyEvaluation {
@@ -15840,7 +15804,7 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_diagonal_log_sigma_block_matches_exact_exp_link_in_far_tail() {
+    fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_tail() {
         let family = GaussianLocationScaleFamily {
             y: array![0.0],
             weights: array![1.0],
@@ -15869,8 +15833,20 @@ mod tests {
                 working_response,
                 working_weights,
             } => {
-                assert!(working_weights[0] > 0.0);
-                assert_eq!(working_response[0], eta_ls0);
+                let sigma = safe_exp(eta_ls0);
+                let inv_s2 = (sigma * sigma).recip().min(1e24);
+                let residual = family.y[0] - eta_mu[0];
+                let expected_score = family.weights[0] * (residual * residual * inv_s2 - 1.0);
+                let expected_info = 2.0 * family.weights[0];
+                let expected_response = eta_ls0 + expected_score / expected_info;
+
+                assert!((working_weights[0] - expected_info).abs() < 1e-12);
+                assert!(
+                    (working_response[0] - expected_response).abs() < 1e-12,
+                    "working response mismatch: got {}, expected {}",
+                    working_response[0],
+                    expected_response
+                );
             }
             BlockWorkingSet::ExactNewton { .. } => {
                 panic!("expected diagonal Gaussian log-sigma block")
@@ -15883,11 +15859,15 @@ mod tests {
         let ll0 = loglik(eta_ls0);
         let ll_minus = loglik(eta_ls0 - h);
         let score_fd = (ll_plus - ll_minus) / (2.0 * h);
-        let info_fd = -(ll_plus - 2.0 * ll0 + ll_minus) / (h * h);
         assert!(score_fd.is_finite());
-        assert!(info_fd.is_finite());
-        assert!(score_fd.abs() > 0.0);
-        assert!(info_fd > 0.0);
+        assert!(
+            (score_fd + 1.0).abs() < 1e-6,
+            "far-tail score should be -1, got {score_fd}"
+        );
+        assert!(
+            (ll_plus - 2.0 * ll0 + ll_minus).abs() < 1e-5,
+            "far-tail Gaussian log-sigma block should have near-zero observed curvature"
+        );
     }
 
     #[test]

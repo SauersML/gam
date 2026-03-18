@@ -4742,10 +4742,10 @@ impl SurvivalLocationScaleFamily {
         let mut hessian_psi_psi = Array2::<f64>::zeros((p_total, p_total));
         let h_time_time = fast_xt_diag_x(
             &self.x_time_entry,
-            &(-(&q.d3_q0 * &q0_ab) - &(&q.d_h_h0 * &(&q0_i * &q0_j))),
+            &(-(&q.d3_q0 * &q0_ab) - &(&q.d2_h_h0 * &(&q0_i * &q0_j))),
         ) + fast_xt_diag_x(
             &self.x_time_exit,
-            &(-(&q.d3_q1 * &q1_ab) - &(&q.d_h_h1 * &(&q1_i * &q1_j))),
+            &(-(&q.d3_q1 * &q1_ab) - &(&q.d2_h_h1 * &(&q1_i * &q1_j))),
         );
         assign_symmetric_block(&mut hessian_psi_psi, offsets[0], offsets[0], &h_time_time);
 
@@ -5343,10 +5343,10 @@ impl SurvivalLocationScaleFamily {
 
         let time_time = fast_xt_diag_x(
             &self.x_time_entry,
-            &(-(&q.d_h_h0 * &entry_deltas.delta_q * q0_psi) - &(&q.d3_q0 * &q0_psi_u)),
+            &(-(&q.d2_h_h0 * &entry_deltas.delta_q * q0_psi) - &(&q.d3_q0 * &q0_psi_u)),
         ) + fast_xt_diag_x(
             &self.x_time_exit,
-            &(-(&q.d_h_h1 * &delta_q_exit * q1_psi) - &(&q.d3_q1 * &q1_psi_u)),
+            &(-(&q.d2_h_h1 * &delta_q_exit * q1_psi) - &(&q.d3_q1 * &q1_psi_u)),
         );
         assign_symmetric_block(&mut out, offsets[0], offsets[0], &time_time);
 
