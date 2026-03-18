@@ -67,7 +67,7 @@ fn coverage(true_p: &Array1<f64>, lo: &Array1<f64>, hi: &Array1<f64>) -> f64 {
 
 #[test]
 fn sas_fit_recovery_and_calibration_system() {
-    let n = 1800usize;
+    let n = 3000usize;
     let x = build_design(n);
     let beta_true = Array1::from_vec(vec![-0.35, 1.15, -0.65, 0.45]);
     let eps_true: f64 = 0.38;
@@ -104,11 +104,11 @@ fn sas_fit_recovery_and_calibration_system() {
         other => panic!("expected SAS fitted state, got {other:?}"),
     };
     assert!(
-        (eps_hat - eps_true).abs() < 0.45,
+        (eps_hat - eps_true).abs() < 0.20,
         "epsilon recovery off: hat={eps_hat:.4}, true={eps_true:.4}"
     );
     assert!(
-        (delta_hat - delta_true).abs() < 0.35,
+        (delta_hat - delta_true).abs() < 0.20,
         "delta recovery off: hat={delta_hat:.4}, true={delta_true:.4}"
     );
 
@@ -122,7 +122,7 @@ fn sas_fit_recovery_and_calibration_system() {
     )
     .expect("SAS predict");
     let brier = brier_score(&pred.mean, &y);
-    assert!(brier < 0.22, "SAS Brier too high: {brier:.4}");
+    assert!(brier < 0.20, "SAS Brier too high: {brier:.4}");
     let calib_gap = (pred.mean.mean().unwrap_or(0.0) - y.mean().unwrap_or(0.0)).abs();
     assert!(
         calib_gap < 0.04,
@@ -201,8 +201,8 @@ fn mixture_recovery_and_prediction_alignment_system() {
 
 #[test]
 fn posterior_mean_coverage_includes_sas_and_mixture() {
-    let n_train = 900usize;
-    let n_test = 700usize;
+    let n_train = 1500usize;
+    let n_test = 1000usize;
     let x_train = build_design(n_train);
     let x_test = build_design(n_test);
     let beta_true = Array1::from_vec(vec![-0.25, 0.95, -0.7, 0.35]);
@@ -248,10 +248,6 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         initial_log_delta: 0.0,
     });
     opts_sas.optimize_sas = true;
-    opts_sas.max_iter = 180;
-    opts_sas.tol = 1e-8;
-    opts_sas.max_iter = 150;
-    opts_sas.tol = 1e-8;
     opts_sas.max_iter = 120;
     opts_sas.tol = 1e-8;
     let fit_sas = fit_gam(
@@ -352,7 +348,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         ("logit", c_logit, meanwidth_logit),
         ("probit", c_probit, meanwidth_probit),
     ] {
-        assert!(c >= 0.75, "{name} 90% coverage too low: {c:.3}");
+        assert!(c >= 0.80, "{name} 90% coverage too low: {c:.3}");
         assert!(
             w < 0.60,
             "{name} intervals too wide on average: mean width={w:.3}"
@@ -363,8 +359,8 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         ("mixture", c_mix, meanwidth_mix),
     ] {
         assert!(
-            c.is_finite() && (0.0..=1.0).contains(&c),
-            "{name} coverage must be finite and in [0,1], got {c:.3}"
+            c >= 0.65,
+            "{name} 90% coverage too low: {c:.3} (extra parameter uncertainty expected)"
         );
         assert!(
             w < 0.60,

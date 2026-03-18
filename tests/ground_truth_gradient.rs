@@ -27,7 +27,8 @@ fn one_penalty(p: usize) -> Vec<BlockwisePenalty> {
     vec![BlockwisePenalty::new(0..p, s)]
 }
 
-fn fdgradient(
+/// Central finite-difference gradient at a single step size.
+fn fd_central(
     y: &Array1<f64>,
     w: &Array1<f64>,
     x: &Array2<f64>,
@@ -70,6 +71,27 @@ fn fdgradient(
         g[k] = (fp - fm) / (2.0 * h);
     }
     g
+}
+
+/// Richardson-extrapolated finite-difference gradient.
+///
+/// Computes central FD at step sizes h1 and h2 = h1/2, then combines:
+///   fd_rich = (4 * fd_h2 - fd_h1) / 3
+/// This cancels the O(h²) error term, yielding O(h⁴) accuracy.
+fn fdgradient(
+    y: &Array1<f64>,
+    w: &Array1<f64>,
+    x: &Array2<f64>,
+    offset: &Array1<f64>,
+    s_list: &[BlockwisePenalty],
+    opts: &ExternalOptimOptions,
+    rho: &Array1<f64>,
+    h1: f64,
+) -> Array1<f64> {
+    let h2 = h1 / 2.0;
+    let fd_h1 = fd_central(y, w, x, offset, s_list, opts, rho, h1);
+    let fd_h2 = fd_central(y, w, x, offset, s_list, opts, rho, h2);
+    (4.0 * &fd_h2 - &fd_h1) / 3.0
 }
 
 #[test]
@@ -197,10 +219,7 @@ fn test_lamlgradient_nonfirthwell_conditioned() {
     };
     let rel_l2 = (&analytic - &fd).mapv(|v| v * v).sum().sqrt() / n_f.max(n_a).max(1.0);
     assert!(cosine > 0.99, "cosine={cosine}");
-    // The directional check (cosine) is the primary correctness signal here.
-    // Absolute relative L2 can be noticeably looser for this configuration
-    // because finite-difference gradients are sensitive to ridge stabilization.
-    assert!(rel_l2 < 0.65, "rel_l2={rel_l2}");
+    assert!(rel_l2 < 0.05, "rel_l2={rel_l2}");
 }
 
 #[test]
@@ -273,7 +292,7 @@ fn test_lamlgradient_logitwith_firthwell_conditioned() {
     };
     let rel_l2 = (&analytic - &fd).mapv(|v| v * v).sum().sqrt() / n_f.max(n_a).max(1.0);
     assert!(cosine > 0.95, "cosine={cosine}");
-    assert!(rel_l2 < 0.2, "rel_l2={rel_l2}");
+    assert!(rel_l2 < 0.05, "rel_l2={rel_l2}");
 }
 
 #[test]
