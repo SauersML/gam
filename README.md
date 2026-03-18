@@ -47,20 +47,20 @@ The binary is at `./target/release/gam`. Add it to your `PATH` or use the full p
 ## Quick start
 
 ```bash
-# Fit a smooth to the lidar dataset
-gam fit bench/datasets/lidar.csv 'logratio ~ smooth(range)' --out model.json
+# Fit a GAM with a smooth term
+gam fit data.csv 'y ~ smooth(x)' --out model.json
 
 # Predict with uncertainty intervals
-gam predict model.json bench/datasets/lidar.csv --out predictions.csv --uncertainty
+gam predict model.json new_data.csv --out predictions.csv --uncertainty
 
 # Build a standalone HTML report
-gam report model.json bench/datasets/lidar.csv
+gam report model.json data.csv
 
 # Draw posterior samples
-gam sample model.json bench/datasets/lidar.csv --out samples.csv
+gam sample model.json data.csv --out samples.csv
 
 # Generate synthetic response draws
-gam generate model.json bench/datasets/lidar.csv --n-draws 5 --out synthetic.csv
+gam generate model.json data.csv --n-draws 5 --out synthetic.csv
 ```
 
 ## Commands
@@ -180,7 +180,7 @@ gam fit data.csv \
 
 ### Bernoulli marginal-slope
 
-Binary response with a second formula for the log-slope surface:
+Models `P(case | covariates, z)` where `z` is a standardized score (e.g. a polygenic risk score). The key idea: the baseline risk surface and the effect of `z` are decoupled into separate formulas. The main formula controls the population-level risk landscape (how risk varies with age, ancestry PCs, etc.), while `--logslope-formula` controls how strongly `z` modifies that risk at each point in covariate space. This decoupling lets you estimate spatially-varying effect sizes for `z` without the baseline absorbing signal that belongs to the slope, or vice versa.
 
 ```bash
 gam fit data.csv \
