@@ -2582,7 +2582,7 @@ fn run_predict_survival(
                     p_total
                 ));
             }
-            let eta_var = rowwise_local_covariances(&backend, n, 1, |rows| {
+            let local_covariances = rowwise_local_covariances(&backend, n, 1, |rows| {
                 let start = rows.start;
                 let end = rows.end;
                 let cs = end - start;
@@ -2618,7 +2618,15 @@ fn run_predict_survival(
             })
             .map_err(|e| {
                 format!("saved survival marginal-slope posterior covariance application failed: {e}")
-            })?[0][0]
+            })?;
+            let eta_var = local_covariances
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next())
+                .ok_or_else(|| {
+                    "saved survival marginal-slope posterior covariance application returned no local variances"
+                        .to_string()
+                })?
                 .mapv(|v| v.max(0.0));
             let eta_se = eta_var.mapv(f64::sqrt);
             let posterior = Array1::from_iter(
@@ -8475,13 +8483,21 @@ fn prediction_backend_from_model<'a>(
     if mode == CovarianceModeArg::Conditional
         && let Some(hessian) = fit.penalized_hessian()
     {
-        return PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(
-            hessian.clone(),
-        ))
-        .or_else(|_| Ok(PredictionCovarianceBackend::from_dense(covariance_from_model(model, mode)?.view())));
+        if let Ok(backend) = PredictionCovarianceBackend::from_factorized_hessian(
+            SymmetricMatrix::Dense(hessian.clone()),
+        ) {
+            return Ok(backend);
+        }
     }
-    let cov = covariance_from_model(model, mode)?;
-    Ok(PredictionCovarianceBackend::from_dense(cov.view()))
+    let covariance = match mode {
+        CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
+        CovarianceModeArg::Conditional => fit.beta_covariance(),
+    }
+    .ok_or_else(|| {
+        "nonlinear posterior-mean prediction requires covariance; refit model with current CLI"
+            .to_string()
+    })?;
+    Ok(PredictionCovarianceBackend::from_dense(covariance.view()))
 }
 
 fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCovarianceMode {
