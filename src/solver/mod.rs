@@ -4,6 +4,5 @@ pub(crate) mod optimize;
 pub mod outer_strategy;
 pub mod pirls;
 pub mod seeding;
-pub mod smoothing;
 pub mod visualizer;
 pub(crate) mod workflow;

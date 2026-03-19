@@ -4892,10 +4892,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
 
-    use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
-    };
+    use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
 
     struct SpatialAdaptiveOuterState {
         warm_cache: Option<CustomFamilyWarmStart>,
@@ -4949,40 +4946,34 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         (rho, adaptive_params)
     };
 
-    let outer_config = OuterConfig {
-        tolerance: options.tol,
-        max_iter: options.max_iter,
-        fd_step: 1e-4,
-        bounds: theta_bounds,
-        seed_config: crate::seeding::SeedConfig::default(),
-        rho_bound: 30.0,
-        heuristic_lambdas: None,
-        initial_rho: Some(initial_theta.clone()),
-        fallback_policy: FallbackPolicy::Automatic,
-        screening_cap: None,
-    };
-
-    let mut obj = ClosureObjective {
-        state: SpatialAdaptiveOuterState {
-            warm_cache: None,
-            last_eval: None,
-        },
-        cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: if crate::custom_family::joint_exact_analytic_outer_hessian_available(
+    let problem = OuterProblem::new(n_theta)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(
+            if crate::custom_family::joint_exact_analytic_outer_hessian_available(
                 blockspec.design.ncols(),
             ) {
                 Derivative::Analytic
             } else {
                 Derivative::Unavailable
             },
-            n_params: n_theta,
-            all_penalty_like: false,
-            has_psi_coords: true,
-            fixed_point_available: false,
-            barrier_config: None,
+        )
+        .with_psi_dim(n_theta.saturating_sub(rho_dim))
+        .with_tolerance(options.tol)
+        .with_max_iter(options.max_iter)
+        .with_fd_step(1e-4)
+        .with_initial_rho(initial_theta.clone());
+    let problem = if let Some((lo, hi)) = theta_bounds {
+        problem.with_bounds(lo, hi)
+    } else {
+        problem
+    };
+
+    let mut obj = problem.build_objective(
+        SpatialAdaptiveOuterState {
+            warm_cache: None,
+            last_eval: None,
         },
-        cost_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
+        |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
             let (rho, adaptive_params) = decode_theta(&theta);
             let family_eval =
@@ -5004,7 +4995,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             st.warm_cache = Some(result.warm_start);
             Ok(result.objective)
         },
-        eval_fn: |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
+        |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
 
             // Return cached result if theta has not moved.
@@ -5081,23 +5072,19 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 hessian: HessianResult::Analytic(hessian),
             })
         },
-        reset_fn: Some(|st: &mut SpatialAdaptiveOuterState| {
+        Some(|st: &mut SpatialAdaptiveOuterState| {
             st.warm_cache = None;
             st.last_eval = None;
         }),
-        efs_fn: None::<
+        None::<
             fn(
                 &mut SpatialAdaptiveOuterState,
                 &Array1<f64>,
             ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
         >,
-    };
+    );
 
-    let outer_result = crate::solver::outer_strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "exact spatial adaptive regularization",
-    )
+    let outer_result = problem.run(&mut obj, "exact spatial adaptive regularization")
     .map_err(|e| {
         EstimationError::InvalidInput(format!(
             "exact spatial adaptive outer optimization failed: {e}"
@@ -8713,7 +8700,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
+        Derivative, EfsEval, HessianResult, OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -8821,44 +8808,31 @@ fn try_exact_joint_spatial_aniso_optimization(
         .map_err(EstimationError::InvalidInput)?,
     };
 
-    let outer_config = exact_joint_multistart_outer_config(
+    let problem = exact_joint_multistart_outer_problem(
         theta0,
         lower,
         upper,
         rho_dim,
         psi_dim,
+        theta_dim,
+        Derivative::Analytic,
+        Derivative::Analytic,
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
         1e-5,
     );
 
-    let mut obj = ClosureObjective {
-        state: &mut ctx,
-        cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
-            n_params: theta_dim,
-            // ψ coordinates are NOT penalty-like (they move the design),
-            // so EFS is not appropriate.
-            all_penalty_like: false,
-            has_psi_coords: true,
-            fixed_point_available: false,
-            barrier_config: None,
-        },
-        cost_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
+    let mut obj = problem.build_objective(
+        &mut ctx,
+        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
             let cost = ctx.eval_cost(theta);
             ctx.track_best(theta, cost);
             Ok(cost)
         },
-        eval_fn: |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx
-            .eval_full(theta)
-        {
+        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx.eval_full(theta) {
             Ok((cost, grad, hess)) => {
                 ctx.track_best(theta, cost);
-                // No ψ projection: the all-ones direction in raw ψ-space is the
-                // real isotropic scale coordinate. Removing it would change the
-                // model, not just fix a gauge.
                 Ok(OuterEval {
                     cost,
                     gradient: grad,
@@ -8867,15 +8841,15 @@ fn try_exact_joint_spatial_aniso_optimization(
             }
             Err(_) => Ok(OuterEval::infeasible(theta.len())),
         },
-        reset_fn: None::<fn(&mut &mut AnisoJointContext<'_>)>,
-        efs_fn: None::<
+        None::<fn(&mut &mut AnisoJointContext<'_>)>,
+        None::<
             fn(&mut &mut AnisoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
-    };
+    );
 
-    let result =
-        crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, "aniso-psi joint REML")
-            .map_err(|e| {
+    let result = problem
+        .run(&mut obj, "aniso-psi joint REML")
+        .map_err(|e| {
             EstimationError::InvalidInput(format!(
                 "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
             ))
@@ -8925,7 +8899,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
+        Derivative, EfsEval, HessianResult, OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -9031,39 +9005,29 @@ fn try_exact_joint_spatial_isotropic_optimization(
         .map_err(EstimationError::InvalidInput)?,
     };
 
-    let outer_config = exact_joint_multistart_outer_config(
+    let problem = exact_joint_multistart_outer_problem(
         theta0,
         lower,
         upper,
         rho_dim,
         kappa_dim,
+        theta_dim,
+        Derivative::Analytic,
+        Derivative::Analytic,
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
         1e-5,
     );
 
-    let mut obj = ClosureObjective {
-        state: &mut ctx,
-        cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
-            n_params: theta_dim,
-            // κ coordinates move the design (like ψ in aniso), so EFS is
-            // not appropriate.
-            all_penalty_like: false,
-            has_psi_coords: true,
-            fixed_point_available: false,
-            barrier_config: None,
-        },
-        cost_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
+    let mut obj = problem.build_objective(
+        &mut ctx,
+        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
             let cost = ctx.eval_cost(theta);
             ctx.track_best(theta, cost);
             Ok(cost)
         },
-        eval_fn: |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| match ctx
-            .eval_full(theta)
-        {
+        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| match ctx.eval_full(theta) {
             Ok((cost, grad, hess)) => {
                 ctx.track_best(theta, cost);
                 Ok(OuterEval {
@@ -9074,15 +9038,15 @@ fn try_exact_joint_spatial_isotropic_optimization(
             }
             Err(_) => Ok(OuterEval::infeasible(theta.len())),
         },
-        reset_fn: None::<fn(&mut &mut IsoJointContext<'_>)>,
-        efs_fn: None::<
+        None::<fn(&mut &mut IsoJointContext<'_>)>,
+        None::<
             fn(&mut &mut IsoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
         >,
-    };
+    );
 
-    let result =
-        crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, "iso-kappa joint REML")
-            .map_err(|e| {
+    let result = problem
+        .run(&mut obj, "iso-kappa joint REML")
+        .map_err(|e| {
             EstimationError::InvalidInput(format!(
                 "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
             ))
@@ -10241,40 +10205,42 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
     }
 }
 
-pub(crate) fn exact_joint_multistart_outer_config(
+pub(crate) fn exact_joint_multistart_outer_problem(
     theta0: &Array1<f64>,
     lower: &Array1<f64>,
     upper: &Array1<f64>,
     rho_dim: usize,
     auxiliary_dim: usize,
+    n_params: usize,
+    gradient: crate::solver::outer_strategy::Derivative,
+    hessian: crate::solver::outer_strategy::Derivative,
     risk_profile: crate::seeding::SeedRiskProfile,
     tolerance: f64,
     max_iter: usize,
     fd_step: f64,
-) -> crate::solver::outer_strategy::OuterConfig {
+) -> crate::solver::outer_strategy::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
     }
 
-    crate::solver::outer_strategy::OuterConfig {
-        tolerance,
-        max_iter,
-        fd_step,
-        bounds: Some((lower.clone(), upper.clone())),
-        seed_config: crate::seeding::SeedConfig {
+    crate::solver::outer_strategy::OuterProblem::new(n_params)
+        .with_gradient(gradient)
+        .with_hessian(hessian)
+        .with_psi_dim(auxiliary_dim)
+        .with_tolerance(tolerance)
+        .with_max_iter(max_iter)
+        .with_fd_step(fd_step)
+        .with_bounds(lower.clone(), upper.clone())
+        .with_seed_config(crate::seeding::SeedConfig {
             max_seeds: 4,
             screening_budget: 2,
             risk_profile,
             num_auxiliary_trailing: auxiliary_dim,
             ..Default::default()
-        },
-        rho_bound: 12.0,
-        heuristic_lambdas: Some(seed_heuristic),
-        initial_rho: None,
-        fallback_policy: crate::solver::outer_strategy::FallbackPolicy::Automatic,
-        screening_cap: None,
-    }
+        })
+        .with_rho_bound(12.0)
+        .with_heuristic_lambdas(seed_heuristic)
 }
 
 pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn>(
@@ -10424,7 +10390,7 @@ where
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
 
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
+        Derivative, EfsEval, HessianResult, OuterEval,
     };
 
     let outer_config = exact_joint_multistart_outer_config(

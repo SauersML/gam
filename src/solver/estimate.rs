@@ -1563,36 +1563,24 @@ where
     }
     reml_state.setwarm_start_original_beta(warm_start_beta);
 
-    let smoothing_options = crate::solver::smoothing::SmoothingBfgsOptions {
-        max_iter: opts.max_iter,
-        tol: cfg.reml_convergence_tolerance,
-        finite_diff_step: 1e-3,
-        // External REML path below provides exact Hessians directly.
-        fdhessian_max_dim: 0,
-        optimizer_kind: crate::solver::smoothing::SmoothingOptimizerKind::Arc,
-        seed_config: SeedConfig {
-            bounds: (-12.0, 12.0),
-            max_seeds: if k <= 4 {
-                8
-            } else if k <= 12 {
-                10
-            } else {
-                12
-            },
-            screening_budget: if k <= 6 { 2 } else { 3 },
-            screen_max_inner_iterations: if matches!(cfg.link_function(), LinkFunction::Identity) {
-                3
-            } else {
-                5
-            },
-            risk_profile: if matches!(cfg.link_function(), LinkFunction::Identity) {
-                SeedRiskProfile::Gaussian
-            } else {
-                SeedRiskProfile::GeneralizedLinear
-            },
-            num_auxiliary_trailing: 0,
+    let reml_seed_config = SeedConfig {
+        bounds: (-12.0, 12.0),
+        max_seeds: if k <= 4 { 8 } else if k <= 12 { 10 } else { 12 },
+        screening_budget: if k <= 6 { 2 } else { 3 },
+        screen_max_inner_iterations: if matches!(cfg.link_function(), LinkFunction::Identity) {
+            3
+        } else {
+            5
         },
+        risk_profile: if matches!(cfg.link_function(), LinkFunction::Identity) {
+            SeedRiskProfile::Gaussian
+        } else {
+            SeedRiskProfile::GeneralizedLinear
+        },
+        num_auxiliary_trailing: 0,
     };
+    let reml_tol = cfg.reml_convergence_tolerance;
+    let reml_max_iter = opts.max_iter;
     let outer_eval_idx = AtomicUsize::new(0usize);
     let mixture_optspec = if opts.optimize_mixture {
         opts.mixture_link.clone()
@@ -1627,20 +1615,19 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::outer_strategy::{
-            ClosureObjective, Derivative, HessianResult, OuterEval, OuterProblem,
+            Derivative, HessianResult, OuterEval, OuterProblem,
         };
 
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Analytic)
-            .with_efs()
             .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
                 fit_linear_constraints.as_ref(),
             ))
-            .with_tolerance(smoothing_options.tol)
-            .with_max_iter(smoothing_options.max_iter)
-            .with_fd_step(smoothing_options.finite_diff_step)
-            .with_seed_config(smoothing_options.seed_config.clone())
+            .with_tolerance(reml_tol)
+            .with_max_iter(reml_max_iter)
+            .with_fd_step(1e-3)
+            .with_seed_config(reml_seed_config.clone())
             .with_rho_bound(crate::estimate::RHO_BOUND)
             .with_screening_cap(reml_state.screening_max_inner_iterations.clone());
         let problem = if let Some(ref h) = heuristic_lambdas {
@@ -1649,13 +1636,12 @@ where
             problem
         };
 
-        let mut obj = ClosureObjective {
-            state: &mut reml_state,
-            cap: problem.capability(),
-            cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+        let mut obj = problem.build_objective(
+            &mut reml_state,
+            |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_cost(rho)
             },
-            eval_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+            |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 outer_eval_idx.fetch_add(1, Ordering::Relaxed);
                 let cost = state.compute_cost(rho)?;
                 let grad = state.compute_gradient(rho)?;
@@ -1669,13 +1655,13 @@ where
                     },
                 })
             },
-            reset_fn: None::<fn(&mut &mut self::reml::RemlState<'_>)>,
-            efs_fn: Some(
+            None::<fn(&mut &mut self::reml::RemlState<'_>)>,
+            Some(
                 |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                     state.compute_efs_steps(rho)
                 },
             ),
-        };
+        );
 
         let strategy_result = problem.run(&mut obj, "standard REML")?;
         (
@@ -1725,42 +1711,34 @@ where
         } else {
             None
         };
-        let mut smoothing_options_mix = smoothing_options.clone();
-        smoothing_options_mix.fdhessian_max_dim = 0;
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
-        smoothing_options_mix.seed_config.num_auxiliary_trailing = aux_dim_outer;
+        let mut reml_seed_config_mix = reml_seed_config.clone();
+        reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
         use crate::solver::outer_strategy::{
-            ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
-            OuterConfig, OuterEval,
+            Derivative, EfsEval, HessianResult, OuterEval, OuterProblem,
         };
         let initial_link_kind = cfg.link_kind.clone();
-        let outer_config = OuterConfig {
-            tolerance: smoothing_options_mix.tol,
-            max_iter: smoothing_options_mix.max_iter,
-            fd_step: smoothing_options_mix.finite_diff_step,
-            bounds: None,
-            seed_config: smoothing_options_mix.seed_config.clone(),
-            rho_bound: crate::estimate::RHO_BOUND,
-            heuristic_lambdas: heuristic_theta_ref.map(|s| s.to_vec()),
-            initial_rho: None,
-            fallback_policy: FallbackPolicy::Automatic,
-            screening_cap: Some(reml_state.screening_max_inner_iterations.clone()),
+        let problem = OuterProblem::new(theta_dim)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable)
+            .with_psi_dim(mixture_dim + sas_dim)
+            .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
+                fit_linear_constraints.as_ref(),
+            ))
+            .with_tolerance(reml_tol)
+            .with_max_iter(reml_max_iter)
+            .with_fd_step(1e-3)
+            .with_seed_config(reml_seed_config_mix.clone())
+            .with_rho_bound(crate::estimate::RHO_BOUND)
+            .with_screening_cap(reml_state.screening_max_inner_iterations.clone());
+        let problem = if let Some(h) = heuristic_theta_ref {
+            problem.with_heuristic_lambdas(h.to_vec())
+        } else {
+            problem
         };
-        let mut obj = ClosureObjective {
-            state: &mut reml_state,
-            cap: OuterCapability {
-                gradient: Derivative::Analytic,
-                hessian: Derivative::Unavailable,
-                n_params: theta_dim,
-                // Mixture/SAS coords are design-moving (not penalty-like).
-                all_penalty_like: false,
-                has_psi_coords: true,
-                fixed_point_available: false,
-                barrier_config: self::reml::unified::BarrierConfig::from_constraints(
-                    fit_linear_constraints.as_ref(),
-                ),
-            },
-            cost_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
+        let mut obj = problem.build_objective(
+            &mut reml_state,
+            |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                 let rho = theta.slice(s![..k]).to_owned();
                 let mut cfg_eval = cfg.clone();
                 if use_mixture {
@@ -1829,7 +1807,7 @@ where
                 }
                 Ok(cost)
             },
-            eval_fn: |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
+            |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                 let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
                 let rho = theta.slice(s![..k]).to_owned();
                 let mut cfg_eval = cfg.clone();
@@ -1953,25 +1931,20 @@ where
                     hessian: HessianResult::Unavailable,
                 })
             },
-            reset_fn: Some(|state: &mut &mut self::reml::RemlState<'_>| {
+            Some(|state: &mut &mut self::reml::RemlState<'_>| {
                 state.set_link_states(
                     initial_link_kind.mixture_state().cloned(),
                     initial_link_kind.sas_state().copied(),
                 );
             }),
-            efs_fn: None::<
+            None::<
                 fn(
                     &mut &mut self::reml::RemlState<'_>,
                     &Array1<f64>,
                 ) -> Result<EfsEval, EstimationError>,
             >,
-        };
-        let strategy_result = crate::solver::outer_strategy::run_outer(
-            &mut obj,
-            &outer_config,
-            "mixture/SAS flexible link",
-        )?;
-        let outer_result = strategy_result.into_smoothing_result();
+        );
+        let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
         let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
@@ -4296,9 +4269,6 @@ pub use crate::inference::predict::{
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
     PredictableModel, coefficient_uncertainty, coefficient_uncertaintywith_mode,
     enrich_posterior_mean_bounds, predict_gam, predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
-};
-pub use crate::solver::smoothing::{
-    SmoothingBfgsOptions, SmoothingBfgsResult, SmoothingOptimizerKind,
 };
 
 /// Canonical engine entrypoint for external designs on supported GLM-style
