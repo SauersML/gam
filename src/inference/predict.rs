@@ -2364,7 +2364,7 @@ impl PredictableModel for SurvivalPredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
-        _confidence_level: Option<f64>,
+        confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         // Survival models are routed through run_predict_survival, not the
         // unified path, so bounds are computed there.  The eta_se here covers
@@ -2449,12 +2449,21 @@ impl PredictableModel for SurvivalPredictor {
         } else {
             point_mean.clone()
         };
+        let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
+            let z = crate::probability::standard_normal_quantile(0.5 + 0.5 * level)
+                .unwrap_or(1.96);
+            let lo = (&mean - &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
+            let hi = (&mean + &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
+            (Some(lo), Some(hi))
+        } else {
+            (None, None)
+        };
         Ok(PredictPosteriorMeanResult {
             eta: eta_threshold,
             eta_standard_error: eta_se,
             mean,
-            mean_lower: None,
-            mean_upper: None,
+            mean_lower,
+            mean_upper,
         })
     }
 
