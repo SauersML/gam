@@ -2632,6 +2632,55 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
+
+        // ── Rigid closed-form: scalar kernel + design row ops ────────
+        if !self.flex_active() {
+            let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut chunk_out, chunk_idx| -> Result<_, String> {
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        for row in start..end {
+                            let q = block_states[0].eta[row];
+                            let g = block_states[1].eta[row];
+                            let k = RigidProbitKernel::new(
+                                q, g, self.z[row], self.y[row], self.weights[row],
+                            );
+                            let h = k.primary_hessian(q);
+                            let v_q = self.marginal_design.dot_row_view(
+                                row,
+                                direction.slice(s![slices.marginal.clone()]),
+                            );
+                            let v_g = self.logslope_design.dot_row_view(
+                                row,
+                                direction.slice(s![slices.logslope.clone()]),
+                            );
+                            let a_q = h[0][0] * v_q + h[0][1] * v_g;
+                            let a_g = h[1][0] * v_q + h[1][1] * v_g;
+                            {
+                                let mut m = chunk_out.slice_mut(s![slices.marginal.clone()]);
+                                self.marginal_design.axpy_row_into(row, a_q, &mut m)?;
+                            }
+                            {
+                                let mut l = chunk_out.slice_mut(s![slices.logslope.clone()]);
+                                self.logslope_design.axpy_row_into(row, a_g, &mut l)?;
+                            }
+                        }
+                        Ok(chunk_out)
+                    },
+                )
+                .try_reduce(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut left, right| -> Result<_, String> {
+                        left += &right;
+                        Ok(left)
+                    },
+                )?;
+            return Ok(out);
+        }
+
         let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
@@ -2639,12 +2688,11 @@ impl BernoulliMarginalSlopeFamily {
                 |mut chunk_out, chunk_idx| -> Result<_, String> {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
-                    let flex = self.flex_active();
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                        let row_hessian = if flex {
+                        let row_hessian = if self.flex_active() {
                             self.compute_row_analytic_flex(
                                 row, block_states, primary, row_ctx,
                                 &cache.h_nodes, cache.h_node_design.as_ref(),
@@ -2682,6 +2730,47 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
+
+        // ── Rigid closed-form: no jets, no row contexts ──────────────
+        if !self.flex_active() {
+            let diagonal = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut chunk_diag, chunk_idx| -> Result<_, String> {
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        for row in start..end {
+                            let q = block_states[0].eta[row];
+                            let g = block_states[1].eta[row];
+                            let k = RigidProbitKernel::new(
+                                q, g, self.z[row], self.y[row], self.weights[row],
+                            );
+                            let h = k.primary_hessian(q);
+                            {
+                                let mut m = chunk_diag.slice_mut(s![slices.marginal.clone()]);
+                                self.marginal_design
+                                    .squared_axpy_row_into(row, h[0][0], &mut m)?;
+                            }
+                            {
+                                let mut l = chunk_diag.slice_mut(s![slices.logslope.clone()]);
+                                self.logslope_design
+                                    .squared_axpy_row_into(row, h[1][1], &mut l)?;
+                            }
+                        }
+                        Ok(chunk_diag)
+                    },
+                )
+                .try_reduce(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut left, right| -> Result<_, String> {
+                        left += &right;
+                        Ok(left)
+                    },
+                )?;
+            return Ok(diagonal);
+        }
+
         let diagonal = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
