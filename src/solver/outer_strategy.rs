@@ -73,7 +73,7 @@ pub struct OuterCapability {
     /// compared to O(dim(θ)) for BFGS.
     pub psi_dim: usize,
     /// Whether the objective actually implements `eval_efs()` for fixed-point
-    /// plans. Structural eligibility (`all_penalty_like` / `has_psi_coords`)
+    /// plans. Structural eligibility (`psi_dim == 0` / `psi_dim > 0`)
     /// is not sufficient by itself: if this is false, the planner must stay on
     /// Newton/BFGS-style plans even when EFS or Hybrid-EFS would otherwise be
     /// mathematically admissible.
@@ -1015,8 +1015,7 @@ impl OuterProblem {
             gradient: self.gradient,
             hessian: self.hessian,
             n_params: self.n_params,
-            all_penalty_like: self.psi_dim == 0,
-            has_psi_coords: self.psi_dim > 0,
+            psi_dim: self.psi_dim,
             fixed_point_available: self.efs_available,
             barrier_config: self.barrier_config.clone(),
         }
@@ -1515,8 +1514,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params: 3,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1531,8 +1529,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::FiniteDifference,
             n_params: 3,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1547,8 +1544,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 3,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1563,8 +1559,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 12,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1580,8 +1575,7 @@ mod tests {
                 gradient: Derivative::FiniteDifference,
                 hessian: Derivative::Unavailable,
                 n_params: n,
-                all_penalty_like: false,
-                has_psi_coords: false,
+                psi_dim: 0,
                 fixed_point_available: false,
                 barrier_config: None,
             };
@@ -1597,8 +1591,7 @@ mod tests {
             gradient: Derivative::FiniteDifference,
             hessian: Derivative::Analytic,
             n_params: 3,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1612,8 +1605,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 8,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1627,8 +1619,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 9,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1642,8 +1633,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 15,
-            all_penalty_like: true,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1658,8 +1648,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 15,
-            all_penalty_like: true,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1674,8 +1663,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 5,
-            all_penalty_like: true,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1690,8 +1678,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params: 20,
-            all_penalty_like: true,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1708,8 +1695,7 @@ mod tests {
             gradient: Derivative::Unavailable,
             hessian: Derivative::Unavailable,
             n_params: 20,
-            all_penalty_like: true,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1732,8 +1718,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 15,
-            all_penalty_like: true,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: true,
             barrier_config: Some(barrier),
         };
@@ -1755,8 +1740,7 @@ mod tests {
             gradient: Derivative::Unavailable,
             hessian: Derivative::Unavailable,
             n_params: 20,
-            all_penalty_like: true,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: true,
             barrier_config: Some(barrier),
         };
@@ -1805,8 +1789,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params: 0,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1833,8 +1816,7 @@ mod tests {
                 gradient: Derivative::Analytic,
                 hessian: Derivative::Unavailable,
                 n_params: 1,
-                all_penalty_like: false,
-                has_psi_coords: false,
+                psi_dim: 0,
                 fixed_point_available: false,
                 barrier_config: None,
             },
@@ -1871,8 +1853,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 15,
-            all_penalty_like: false,
-            has_psi_coords: true,
+            psi_dim: 1,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1887,8 +1868,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 15,
-            all_penalty_like: false,
-            has_psi_coords: true,
+            psi_dim: 1,
             fixed_point_available: false,
             barrier_config: None,
         };
@@ -1905,8 +1885,7 @@ mod tests {
             gradient: Derivative::Unavailable,
             hessian: Derivative::Unavailable,
             n_params: 15,
-            all_penalty_like: false,
-            has_psi_coords: true,
+            psi_dim: 1,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1922,8 +1901,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 5,
-            all_penalty_like: false,
-            has_psi_coords: true,
+            psi_dim: 1,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1940,8 +1918,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params: 20,
-            all_penalty_like: false,
-            has_psi_coords: true,
+            psi_dim: 1,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1957,8 +1934,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
             n_params: 15,
-            all_penalty_like: true,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
         };
@@ -1973,8 +1949,7 @@ mod tests {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
             n_params: 12,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         };

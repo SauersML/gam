@@ -1891,7 +1891,7 @@ pub fn fit_transformation_normal(
         &probe_blocks,
         options,
         joint_setup.rho_dim() + joint_setup.log_kappa_dim(),
-        joint_setup.log_kappa_dim() > 0,
+        joint_setup.log_kappa_dim(),
     );
     let analytic_gradient = analytic_psi_available
         && matches!(

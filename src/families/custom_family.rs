@@ -7844,7 +7844,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let n_rho = rho0.len();
     let total_joint_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let primary_cap = custom_family_outer_capability(family, specs, options, n_rho, false);
+    let primary_cap = custom_family_outer_capability(family, specs, options, n_rho, 0);
     let hessian = if matches!(primary_cap.hessian, Derivative::Analytic)
         && !joint_exact_analytic_outer_hessian_available(total_joint_p)
     {
@@ -8115,7 +8115,7 @@ mod tests {
             &specs,
             &BlockwiseFitOptions::default(),
             1,
-            false,
+            0,
         );
         assert_eq!(
             cap.gradient,

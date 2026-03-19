@@ -6230,7 +6230,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &initial_blocks,
         options,
         setup.theta0().len(),
-        setup.log_kappa_dim() > 0,
+        setup.log_kappa_dim(),
     );
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
         && matches!(
