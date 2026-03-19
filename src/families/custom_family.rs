@@ -6305,7 +6305,13 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 0.0
             };
 
-            HyperCoordPair { a, g, b_mat, ld_s }
+            HyperCoordPair {
+                a,
+                g,
+                b_mat,
+                b_operator: None,
+                ld_s,
+            }
         }) as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
     };
 
