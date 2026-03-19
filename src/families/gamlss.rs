@@ -5580,6 +5580,7 @@ impl GaussianLocationScaleFamily {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi,
+            hessian_psi_psi_operator: None,
         })
     }
 
@@ -7511,6 +7512,7 @@ impl GaussianLocationScaleWiggleFamily {
             hessian_psi_psi: gaussian_pack_wiggle_joint_symmetrichessian(
                 &h_mm, &h_ml, &h_mw, &h_ll, &h_lw, &h_ww,
             ),
+            hessian_psi_psi_operator: None,
         })
     }
 
@@ -11326,6 +11328,7 @@ impl BinomialLocationScaleFamily {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi,
+            hessian_psi_psi_operator: None,
         })
     }
 
@@ -13543,6 +13546,7 @@ impl BinomialLocationScaleWiggleFamily {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi,
+            hessian_psi_psi_operator: None,
         })
     }
 
