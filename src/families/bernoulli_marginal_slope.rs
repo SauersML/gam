@@ -825,117 +825,94 @@ fn subset_partitions(mask: usize) -> Vec<Vec<usize>> {
     out
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct MultiDirJet {
-    pub n_dirs: usize,
-    pub coeffs: Vec<f64>,
+fn directional_count(n_dirs: usize) -> usize {
+    1usize << n_dirs
 }
 
-impl MultiDirJet {
-    pub fn zero(n_dirs: usize) -> Self {
-        Self {
-            n_dirs,
-            coeffs: vec![0.0; 1usize << n_dirs],
-        }
-    }
+fn directional_full_mask(n_dirs: usize) -> usize {
+    directional_count(n_dirs) - 1
+}
 
-    pub fn constant(n_dirs: usize, value: f64) -> Self {
-        let mut out = Self::zero(n_dirs);
-        out.coeffs[0] = value;
-        out
-    }
+fn directional_zero(n_dirs: usize) -> Vec<f64> {
+    vec![0.0; directional_count(n_dirs)]
+}
 
-    pub fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
-        assert!(
-            first.len() <= n_dirs,
-            "MultiDirJet::linear: first.len()={} exceeds n_dirs={}",
-            first.len(),
-            n_dirs,
-        );
-        let mut out = Self::constant(n_dirs, base);
-        for (idx, &value) in first.iter().take(n_dirs).enumerate() {
-            out.coeffs[1usize << idx] = value;
-        }
-        out
-    }
+fn directional_constant(n_dirs: usize, value: f64) -> Vec<f64> {
+    let mut out = directional_zero(n_dirs);
+    out[0] = value;
+    out
+}
 
-    pub fn full_mask(&self) -> usize {
-        (1usize << self.n_dirs) - 1
+fn directional_linear(n_dirs: usize, base: f64, first: &[f64]) -> Vec<f64> {
+    assert!(
+        first.len() <= n_dirs,
+        "directional_linear: first.len()={} exceeds n_dirs={}",
+        first.len(),
+        n_dirs,
+    );
+    let mut out = directional_constant(n_dirs, base);
+    for (idx, &value) in first.iter().take(n_dirs).enumerate() {
+        out[1usize << idx] = value;
     }
+    out
+}
 
-    pub fn coeff(&self, mask: usize) -> f64 {
-        self.coeffs.get(mask).copied().unwrap_or(0.0)
+fn directional_add(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+    lhs.iter().zip(rhs.iter()).map(|(l, r)| l + r).collect()
+}
+
+fn directional_sub(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+    lhs.iter().zip(rhs.iter()).map(|(l, r)| l - r).collect()
+}
+
+fn directional_scale(x: &[f64], scalar: f64) -> Vec<f64> {
+    x.iter().map(|v| scalar * v).collect()
+}
+
+fn directional_axpy(out: &mut [f64], rhs: &[f64], scale: f64) {
+    for (o, r) in out.iter_mut().zip(rhs.iter()) {
+        *o += scale * r;
     }
+}
 
-    pub fn set_coeff(&mut self, mask: usize, value: f64) {
-        assert!(
-            mask < self.coeffs.len(),
-            "MultiDirJet::set_coeff: mask={mask} exceeds capacity={}",
-            self.coeffs.len(),
-        );
-        self.coeffs[mask] = value;
-    }
-
-    pub fn add(&self, other: &Self) -> Self {
-        let mut out = Self::zero(self.n_dirs);
-        for mask in 0..=self.full_mask() {
-            out.coeffs[mask] = self.coeff(mask) + other.coeff(mask);
-        }
-        out
-    }
-
-    pub fn sub(&self, other: &Self) -> Self {
-        let mut out = Self::zero(self.n_dirs);
-        for mask in 0..=self.full_mask() {
-            out.coeffs[mask] = self.coeff(mask) - other.coeff(mask);
-        }
-        out
-    }
-
-    pub fn scale(&self, scalar: f64) -> Self {
-        let mut out = Self::zero(self.n_dirs);
-        for mask in 0..=self.full_mask() {
-            out.coeffs[mask] = self.coeffs[mask] * scalar;
-        }
-        out
-    }
-
-    pub fn mul(&self, other: &Self) -> Self {
-        let mut out = Self::zero(self.n_dirs);
-        for mask in 0..=self.full_mask() {
-            let mut total = 0.0;
-            let mut submask = mask;
-            loop {
-                total += self.coeff(submask) * other.coeff(mask ^ submask);
-                if submask == 0 {
-                    break;
-                }
-                submask = (submask - 1) & mask;
+fn directional_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+    let count = lhs.len();
+    let mut out = vec![0.0; count];
+    for mask in 0..count {
+        let mut total = 0.0;
+        let mut submask = mask;
+        loop {
+            total += lhs[submask] * rhs[mask ^ submask];
+            if submask == 0 {
+                break;
             }
-            out.coeffs[mask] = total;
+            submask = (submask - 1) & mask;
         }
-        out
+        out[mask] = total;
     }
+    out
+}
 
-    pub fn compose_unary(&self, derivs: [f64; 5]) -> Self {
-        let mut out = Self::constant(self.n_dirs, derivs[0]);
-        for mask in 1..=self.full_mask() {
-            let mut total = 0.0;
-            for partition in subset_partitions(mask) {
-                let order = partition.len();
-                if order == 0 || order >= derivs.len() {
-                    continue;
-                }
-                let mut prod = 1.0;
-                for block in partition {
-                    prod *= self.coeffs[block];
-                }
-                total += derivs[order] * prod;
+fn directional_compose_unary(x: &[f64], derivs: [f64; 5]) -> Vec<f64> {
+    let count = x.len();
+    let mut out = vec![0.0; count];
+    out[0] = derivs[0];
+    for (mask, value) in out.iter_mut().enumerate().skip(1) {
+        let mut total = 0.0;
+        for partition in subset_partitions(mask) {
+            let order = partition.len();
+            if order == 0 || order >= derivs.len() {
+                continue;
             }
-            out.coeffs[mask] = total;
+            let mut prod = 1.0;
+            for block in partition {
+                prod *= x[block];
+            }
+            total += derivs[order] * prod;
         }
-        out
+        *value = total;
     }
+    out
 }
 
 /// Block-local psi derivative row: avoids allocating a full p-vector
@@ -1595,12 +1572,12 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    fn build_gamma_jets(
+    fn build_gamma_directionals(
         &self,
         primary: &PrimarySlices,
         beta_w: Option<&Array1<f64>>,
         dirs: &[Array1<f64>],
-    ) -> Vec<MultiDirJet> {
+    ) -> Vec<Vec<f64>> {
         let Some(range) = primary.w.as_ref() else {
             return Vec::new();
         };
@@ -1613,43 +1590,44 @@ impl BernoulliMarginalSlopeFamily {
                     .iter()
                     .map(|dir| dir[range.start + idx])
                     .collect::<Vec<_>>();
-                MultiDirJet::linear(dirs.len(), beta[idx], &first)
+                directional_linear(dirs.len(), beta[idx], &first)
             })
             .collect()
     }
 
-    fn apply_link_jet_from_rows(
+    fn apply_link_directionals_from_rows(
         &self,
-        eta_jet: &MultiDirJet,
-        gamma_jets: &[MultiDirJet],
+        eta: &[f64],
+        gamma: &[Vec<f64>],
         basis: &[f64],
         d1: &[f64],
         d2: &[f64],
         d3: &[f64],
         d4: &[f64],
-    ) -> MultiDirJet {
-        let mut out = eta_jet.clone();
+    ) -> Vec<f64> {
+        let mut out = eta.to_vec();
         for idx in 0..basis.len() {
-            let basis_jet = eta_jet.compose_unary([basis[idx], d1[idx], d2[idx], d3[idx], d4[idx]]);
-            out = out.add(&basis_jet.mul(&gamma_jets[idx]));
+            let basis_u =
+                directional_compose_unary(eta, [basis[idx], d1[idx], d2[idx], d3[idx], d4[idx]]);
+            directional_axpy(&mut out, &directional_mul(&basis_u, &gamma[idx]), 1.0);
         }
         out
     }
 
-    fn intercept_equation_jet(
+    fn intercept_equation_directionals(
         &self,
         primary: &PrimarySlices,
         dirs: &[Array1<f64>],
-        q_jet: &MultiDirJet,
-        b_jet: &MultiDirJet,
-        a_jet: &MultiDirJet,
+        q: &[f64],
+        b: &[f64],
+        a: &[f64],
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         h_nodes: &Array1<f64>,
         h_node_design: Option<&Array2<f64>>,
-        gamma_jets: &[MultiDirJet],
-    ) -> Result<MultiDirJet, String> {
+        gamma: &[Vec<f64>],
+    ) -> Result<Vec<f64>, String> {
         let k = dirs.len();
-        let mut out = MultiDirJet::zero(k);
+        let mut out = directional_zero(k);
         if let Some(link_stack) = row_ctx.node_link.as_ref() {
             for node in 0..h_nodes.len() {
                 let h_first =
@@ -1664,21 +1642,21 @@ impl BernoulliMarginalSlopeFamily {
                     } else {
                         vec![0.0; k]
                     };
-                let h_jet = MultiDirJet::linear(k, h_nodes[node], &h_first);
-                let u_jet = a_jet.add(&b_jet.mul(&h_jet));
-                let s_jet = self.apply_link_jet_from_rows(
-                    &u_jet,
-                    gamma_jets,
+                let h = directional_linear(k, h_nodes[node], &h_first);
+                let u = directional_add(a, &directional_mul(b, &h));
+                let s = self.apply_link_directionals_from_rows(
+                    &u,
+                    gamma,
                     link_stack.basis.row(node).as_slice().unwrap_or(&[]),
                     link_stack.d1.row(node).as_slice().unwrap_or(&[]),
                     link_stack.d2.row(node).as_slice().unwrap_or(&[]),
                     link_stack.d3.row(node).as_slice().unwrap_or(&[]),
                     link_stack.d4.row(node).as_slice().unwrap_or(&[]),
                 );
-                out = out.add(
-                    &s_jet
-                        .compose_unary(unary_derivatives_normal_cdf(s_jet.coeff(0)))
-                        .scale(self.quadrature_weights[node]),
+                directional_axpy(
+                    &mut out,
+                    &directional_compose_unary(&s, unary_derivatives_normal_cdf(s[0])),
+                    self.quadrature_weights[node],
                 );
             }
         } else {
@@ -1695,16 +1673,19 @@ impl BernoulliMarginalSlopeFamily {
                     } else {
                         vec![0.0; k]
                     };
-                let h_jet = MultiDirJet::linear(k, h_nodes[node], &h_first);
-                let u_jet = a_jet.add(&b_jet.mul(&h_jet));
-                out = out.add(
-                    &u_jet
-                        .compose_unary(unary_derivatives_normal_cdf(u_jet.coeff(0)))
-                        .scale(self.quadrature_weights[node]),
+                let h = directional_linear(k, h_nodes[node], &h_first);
+                let u = directional_add(a, &directional_mul(b, &h));
+                directional_axpy(
+                    &mut out,
+                    &directional_compose_unary(&u, unary_derivatives_normal_cdf(u[0])),
+                    self.quadrature_weights[node],
                 );
             }
         }
-        Ok(out.sub(&q_jet.compose_unary(unary_derivatives_normal_cdf(q_jet.coeff(0)))))
+        Ok(directional_sub(
+            &out,
+            &directional_compose_unary(q, unary_derivatives_normal_cdf(q[0])),
+        ))
     }
 
     fn row_neglog_directional_from_primary(
@@ -1724,47 +1705,49 @@ impl BernoulliMarginalSlopeFamily {
                 "row directional derivative expects 0..=4 directions, got {k}"
             ));
         }
+        let full_mask = directional_full_mask(k);
         let q_first = dirs.iter().map(|dir| dir[0]).collect::<Vec<_>>();
         let g_first = dirs.iter().map(|dir| dir[1]).collect::<Vec<_>>();
-        let q_jet = MultiDirJet::linear(k, block_states[0].eta[row], &q_first);
-        let g_jet = MultiDirJet::linear(k, block_states[1].eta[row], &g_first);
+        let q = directional_linear(k, block_states[0].eta[row], &q_first);
+        let g = directional_linear(k, block_states[1].eta[row], &g_first);
         // beta = g directly (signed slope, no exp transform).
-        let b_jet = g_jet.clone();
+        let b = g.clone();
         let beta_w = if self.link_dev.is_some() {
             block_states.last().map(|state| &state.beta)
         } else {
             None
         };
-        let gamma_jets = self.build_gamma_jets(primary, beta_w, dirs);
+        let gamma = self.build_gamma_directionals(primary, beta_w, dirs);
 
-        let a_jet = if self.flex_active() {
-            let mut jet = MultiDirJet::constant(k, row_ctx.intercept);
+        let a = if self.flex_active() {
+            let mut derivs = directional_constant(k, row_ctx.intercept);
             let m_a = row_ctx.m_a;
             for order in 1..=k {
-                for mask in 1..=jet.full_mask() {
+                for mask in 1..=full_mask {
                     if mask.count_ones() as usize != order {
                         continue;
                     }
-                    jet.set_coeff(mask, 0.0);
-                    let m_jet = self.intercept_equation_jet(
+                    derivs[mask] = 0.0;
+                    let m = self.intercept_equation_directionals(
                         primary,
                         dirs,
-                        &q_jet,
-                        &b_jet,
-                        &jet,
+                        &q,
+                        &b,
+                        &derivs,
                         row_ctx,
                         h_nodes,
                         h_node_design,
-                        &gamma_jets,
+                        &gamma,
                     )?;
-                    jet.set_coeff(mask, -m_jet.coeff(mask) / m_a);
+                    derivs[mask] = -m[mask] / m_a;
                 }
             }
-            jet
+            derivs
         } else {
-            let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&b_jet.mul(&b_jet));
-            let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
-            q_jet.mul(&c_jet)
+            let one_plus_b2 =
+                directional_add(&directional_constant(k, 1.0), &directional_mul(&b, &b));
+            let c = directional_compose_unary(&one_plus_b2, unary_derivatives_sqrt(one_plus_b2[0]));
+            directional_mul(&q, &c)
         };
 
         let h_obs_first = if let (Some(h_range), Some((obs_design, _))) =
@@ -1776,13 +1759,13 @@ impl BernoulliMarginalSlopeFamily {
         } else {
             vec![0.0; k]
         };
-        let h_obs_jet = MultiDirJet::linear(k, row_ctx.h_obs_base, &h_obs_first);
-        let eta_jet = a_jet.add(&b_jet.mul(&h_obs_jet));
+        let h_obs = directional_linear(k, row_ctx.h_obs_base, &h_obs_first);
+        let eta = directional_add(&a, &directional_mul(&b, &h_obs));
 
-        let s_jet = if let Some(link_stack) = row_ctx.obs_link.as_ref() {
-            self.apply_link_jet_from_rows(
-                &eta_jet,
-                &gamma_jets,
+        let s = if let Some(link_stack) = row_ctx.obs_link.as_ref() {
+            self.apply_link_directionals_from_rows(
+                &eta,
+                &gamma,
                 link_stack.basis.row(0).as_slice().unwrap_or(&[]),
                 link_stack.d1.row(0).as_slice().unwrap_or(&[]),
                 link_stack.d2.row(0).as_slice().unwrap_or(&[]),
@@ -1790,15 +1773,15 @@ impl BernoulliMarginalSlopeFamily {
                 link_stack.d4.row(0).as_slice().unwrap_or(&[]),
             )
         } else {
-            eta_jet
+            eta
         };
 
-        let signed_margin = s_jet.scale(2.0 * self.y[row] - 1.0);
-        let f_jet = signed_margin.compose_unary(unary_derivatives_neglog_phi(
-            signed_margin.coeff(0),
-            self.weights[row],
-        ));
-        Ok(f_jet.coeff(f_jet.full_mask()))
+        let signed_margin = directional_scale(&s, 2.0 * self.y[row] - 1.0);
+        let f = directional_compose_unary(
+            &signed_margin,
+            unary_derivatives_neglog_phi(signed_margin[0], self.weights[row]),
+        );
+        Ok(f[full_mask])
     }
 
 
@@ -2788,13 +2771,7 @@ impl BernoulliMarginalSlopeFamily {
                                 self.add_pullback_primary_hessian(hmat, i, slices, primary, &f_pipi);
                             }
                         } else {
-                            let row_neglog = self.row_neglog_directional_from_primary(
-                                i, block_states, primary, &[], row_ctx,
-                                &cache.h_nodes, cache.h_node_design.as_ref(),
-                                cache.score_warp_obs.as_ref(),
-                            )?;
-                            acc.0 -= row_neglog;
-                            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                            let (row_neglog, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                                 i, block_states, primary, row_ctx,
                                 &cache.h_nodes, cache.h_node_design.as_ref(),
                                 cache.score_warp_obs.as_ref(),
@@ -2897,7 +2874,7 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = Self::row_ctx(cache, row);
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                        let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
+                        let (_, _, row_hessian) = self.compute_row_primary_gradient_hessian(
                             row, block_states, primary, row_ctx,
                             &cache.h_nodes, cache.h_node_design.as_ref(),
                             cache.score_warp_obs.as_ref(),
@@ -5008,11 +4985,11 @@ mod tests {
         let dirs = (0..primary.total)
             .map(|idx| unit_primary_direction(&primary, idx))
             .collect::<Vec<_>>();
-        let gamma_jets = family.build_gamma_jets(&primary, Some(&beta_link), &dirs);
+        let gamma = family.build_gamma_directionals(&primary, Some(&beta_link), &dirs);
         assert_eq!(
-            gamma_jets.len(),
+            gamma.len(),
             link_dim,
-            "link-only layout must produce one gamma jet per link coefficient"
+            "link-only layout must produce one gamma directional expansion per link coefficient"
         );
 
         let basis_row = prepared
@@ -5022,10 +4999,10 @@ mod tests {
             .row(0)
             .to_vec();
         let zeros = vec![0.0; link_dim];
-        let eta_jet = MultiDirJet::constant(dirs.len(), 0.2);
-        let link_jet = family.apply_link_jet_from_rows(
-            &eta_jet,
-            &gamma_jets,
+        let eta = directional_constant(dirs.len(), 0.2);
+        let link = family.apply_link_directionals_from_rows(
+            &eta,
+            &gamma,
             &basis_row,
             &zeros,
             &zeros,
@@ -5033,8 +5010,8 @@ mod tests {
             &zeros,
         );
         assert!(
-            link_jet.coeff(0).is_finite(),
-            "link jet evaluation should remain finite with link_dev only"
+            link[0].is_finite(),
+            "link directional evaluation should remain finite with link_dev only"
         );
 
         let dummy_spec = dummy_blockspec(link_dim, seed.len());
