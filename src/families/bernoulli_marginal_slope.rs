@@ -6050,31 +6050,23 @@ mod tests {
         assert_eq!(primary_w.start, 2, "primary link slice should start at 2");
         assert_eq!(primary.total, 2 + link_dim);
 
-        let dirs = (0..primary.total)
-            .map(|idx| unit_primary_direction(&primary, idx))
-            .collect::<Vec<_>>();
-        let gamma = family.build_gamma_directionals(&primary, Some(&beta_link), &dirs);
-        assert_eq!(
-            gamma.len(),
-            link_dim,
-            "link-only layout must produce one gamma directional expansion per link coefficient"
-        );
-
-        let basis_row = prepared
-            .runtime
-            .design(&array![0.25])
-            .expect("link basis row")
-            .row(0)
-            .to_vec();
-        let zeros = vec![0.0; link_dim];
-        let eta = directional_constant(dirs.len(), 0.2);
-        let link = family.apply_link_directionals_from_rows(
-            &eta, &gamma, &basis_row, &zeros, &zeros, &zeros, &zeros,
-        );
-        assert!(
-            link[0].is_finite(),
-            "link directional evaluation should remain finite with link_dev only"
-        );
+        // Verify that the analytic IFT path produces finite gradient/Hessian
+        // for a link-dev-only family.
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("eval cache");
+        let row_ctx = family
+            .build_row_exact_context(0, &block_states, &cache.h_nodes, cache.score_warp_obs.as_ref(), LinkOrder::Full)
+            .expect("row context");
+        let (nll, grad, hess) = family
+            .compute_row_analytic_flex(
+                0, &block_states, &primary, &row_ctx,
+                &cache.h_nodes, cache.h_node_design.as_ref(), cache.score_warp_obs.as_ref(), true,
+            )
+            .expect("analytic flex eval");
+        assert!(nll.is_finite(), "neglog should be finite for link-dev-only");
+        assert!(grad.iter().all(|v| v.is_finite()), "gradient should be finite");
+        assert!(hess.iter().all(|v| v.is_finite()), "Hessian should be finite");
 
         let dummy_spec = dummy_blockspec(link_dim, seed.len());
         let constraints = family
@@ -6314,7 +6306,7 @@ mod tests {
 
         // 2 blocks × 500 cols = p=1000, each block has 10 penalties → K=20,
         // K_pairs=210, psi_elements = 210 × 1000² = 210M > 200M limit.
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::Materialized(
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             Array2::zeros((10, 500)),
         ));
         let specs: Vec<ParameterBlockSpec> = (0..2)

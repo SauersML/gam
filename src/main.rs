@@ -12007,6 +12007,7 @@ mod tests {
         }
         assert_eq!(p_time, keep_cols.len());
         assert_eq!(db_exit.ncols(), exit_full.ncols() + 1);
+        let derivative_time = built.x_derivative_time.as_dense_cow();
         for i in 0..age_exit.len() {
             let mut running = 0.0_f64;
             let mut d_i_full = vec![0.0_f64; exit_full.ncols()];
@@ -12017,7 +12018,7 @@ mod tests {
             let chain = 1.0 / age_exit[i].max(1e-9);
             for j in 0..p_time {
                 let expected = d_i_full[keep_cols[j]] * chain;
-                assert!((built.x_derivative_time[[i, j]] - expected).abs() <= 1e-12);
+                assert!((derivative_time[[i, j]] - expected).abs() <= 1e-12);
             }
         }
     }
@@ -12058,32 +12059,44 @@ mod tests {
         )
         .expect("build rescaled ispline time basis");
 
+        let entry_days = built_days.x_entry_time.as_dense_cow();
+        let entry_scaled = built_scaled.x_entry_time.as_dense_cow();
+        let exit_days = built_days.x_exit_time.as_dense_cow();
+        let exit_scaled = built_scaled.x_exit_time.as_dense_cow();
+        let deriv_days = built_days.x_derivative_time.as_dense_cow();
+        let deriv_scaled = built_scaled.x_derivative_time.as_dense_cow();
+
         assert_eq!(
-            built_days.x_entry_time.dim(),
-            built_scaled.x_entry_time.dim()
+            (built_days.x_entry_time.nrows(), built_days.x_entry_time.ncols()),
+            (built_scaled.x_entry_time.nrows(), built_scaled.x_entry_time.ncols())
         );
-        assert_eq!(built_days.x_exit_time.dim(), built_scaled.x_exit_time.dim());
         assert_eq!(
-            built_days.x_derivative_time.dim(),
-            built_scaled.x_derivative_time.dim()
+            (built_days.x_exit_time.nrows(), built_days.x_exit_time.ncols()),
+            (built_scaled.x_exit_time.nrows(), built_scaled.x_exit_time.ncols())
+        );
+        assert_eq!(
+            (
+                built_days.x_derivative_time.nrows(),
+                built_days.x_derivative_time.ncols()
+            ),
+            (
+                built_scaled.x_derivative_time.nrows(),
+                built_scaled.x_derivative_time.ncols()
+            )
         );
 
         for i in 0..built_days.x_entry_time.nrows() {
             for j in 0..built_days.x_entry_time.ncols() {
                 assert!(
-                    (built_days.x_entry_time[[i, j]] - built_scaled.x_entry_time[[i, j]]).abs()
-                        <= 1e-12,
+                    (entry_days[[i, j]] - entry_scaled[[i, j]]).abs() <= 1e-12,
                     "entry basis mismatch at ({i},{j})"
                 );
                 assert!(
-                    (built_days.x_exit_time[[i, j]] - built_scaled.x_exit_time[[i, j]]).abs()
-                        <= 1e-12,
+                    (exit_days[[i, j]] - exit_scaled[[i, j]]).abs() <= 1e-12,
                     "exit basis mismatch at ({i},{j})"
                 );
                 assert!(
-                    (built_days.x_derivative_time[[i, j]]
-                        - built_scaled.x_derivative_time[[i, j]] / time_scale)
-                        .abs()
+                    (deriv_days[[i, j]] - deriv_scaled[[i, j]] / time_scale).abs()
                         <= 1e-12,
                     "derivative basis mismatch at ({i},{j})"
                 );
@@ -12331,7 +12344,7 @@ mod tests {
         assert_eq!(built.basisname, "ispline");
         assert!(built.knots.as_ref().is_some_and(|k| !k.is_empty()));
         assert!(built.x_exit_time.ncols() > 0);
-        assert!(built.x_derivative_time.iter().all(|v| v.is_finite()));
+        assert!(built.x_derivative_time.as_dense_cow().iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -12361,14 +12374,14 @@ mod tests {
             assert!(k < upper_boundary);
         }
         assert!(built.x_exit_time.ncols() > 0);
-        assert!(built.x_derivative_time.iter().all(|v| v.is_finite()));
+        assert!(built.x_derivative_time.as_dense_cow().iter().all(|v| v.is_finite()));
     }
 
     #[test]
     fn survival_time_basis_inference_rejects_nonfinite_times_before_knot_retry() {
         let age_entry = Array1::from_vec(vec![1e-9; 4]);
         let age_exit = Array1::from_vec(vec![0.5, 1.0, f64::NAN, 4.0]);
-        let err = build_survival_time_basis(
+        let err = match build_survival_time_basis(
             &age_entry,
             &age_exit,
             SurvivalTimeBasisConfig::BSpline {
@@ -12377,8 +12390,10 @@ mod tests {
                 smooth_lambda: 1e-2,
             },
             Some((4, 1e-6)),
-        )
-        .expect_err("non-finite times should not retry through uniform knots");
+        ) {
+            Ok(_) => panic!("non-finite times should not retry through uniform knots"),
+            Err(err) => err,
+        };
 
         assert!(err.contains("survival time basis requires finite exit times (row 3)"));
     }
@@ -12458,7 +12473,7 @@ mod tests {
     fn survival_time_basis_rejects_reversed_intervals_before_basis_construction() {
         let age_entry = Array1::from_vec(vec![1.0, 3.0]);
         let age_exit = Array1::from_vec(vec![2.0, 2.5]);
-        let err = build_survival_time_basis(
+        let err = match build_survival_time_basis(
             &age_entry,
             &age_exit,
             SurvivalTimeBasisConfig::BSpline {
@@ -12467,8 +12482,10 @@ mod tests {
                 smooth_lambda: 1e-2,
             },
             Some((4, 1e-6)),
-        )
-        .expect_err("exit before entry should fail");
+        ) {
+            Ok(_) => panic!("exit before entry should fail"),
+            Err(err) => err,
+        };
 
         assert!(err.contains("survival time basis requires exit times >= entry times (row 2)"));
     }
@@ -12477,7 +12494,7 @@ mod tests {
     fn survival_time_basiszerowidth_data_surfaces_range_errorwithout_uniform_retry() {
         let age_entry = Array1::from_vec(vec![1.0; 4]);
         let age_exit = Array1::from_vec(vec![1.0; 4]);
-        let err = build_survival_time_basis(
+        let err = match build_survival_time_basis(
             &age_entry,
             &age_exit,
             SurvivalTimeBasisConfig::BSpline {
@@ -12486,8 +12503,10 @@ mod tests {
                 smooth_lambda: 1e-2,
             },
             Some((4, 1e-6)),
-        )
-        .expect_err("zero-width time support should fail");
+        ) {
+            Ok(_) => panic!("zero-width time support should fail"),
+            Err(err) => err,
+        };
 
         assert!(err.contains("Data range has zero width"));
     }
@@ -12512,13 +12531,15 @@ mod tests {
         )
         .expect("build ispline time basis");
 
+        let entry = built.x_entry_time.as_dense_cow();
+        let exit = built.x_exit_time.as_dense_cow();
         // The source I-spline basis should already exclude the zero anchored column.
         for j in 0..built.x_exit_time.ncols() {
             let mut minv = f64::INFINITY;
             let mut maxv = f64::NEG_INFINITY;
             for i in 0..built.x_exit_time.nrows() {
-                minv = minv.min(built.x_entry_time[[i, j]].min(built.x_exit_time[[i, j]]));
-                maxv = maxv.max(built.x_entry_time[[i, j]].max(built.x_exit_time[[i, j]]));
+                minv = minv.min(entry[[i, j]].min(exit[[i, j]]));
+                maxv = maxv.max(entry[[i, j]].max(exit[[i, j]]));
             }
             assert!(maxv - minv > 1e-12);
         }
@@ -12541,7 +12562,7 @@ mod tests {
         )
         .expect("build ispline time basis with zero entry times");
 
-        assert!(built.x_derivative_time.iter().all(|v| v.is_finite()));
+        assert!(built.x_derivative_time.as_dense_cow().iter().all(|v| v.is_finite()));
     }
 
     #[test]
