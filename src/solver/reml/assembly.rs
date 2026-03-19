@@ -121,6 +121,20 @@ impl<'dp> InnerAssembly<'dp> {
     }
 }
 
+/// Evaluate a pre-built `InnerSolution` through the unified evaluator.
+///
+/// Use this when the caller needs the `InnerSolution` to outlive the evaluation
+/// (e.g., for EFS step computation after evaluation). Prefer
+/// [`InnerAssembly::evaluate`] when the solution is not needed afterwards.
+pub fn evaluate_solution(
+    solution: &InnerSolution<'_>,
+    rho: &[f64],
+    mode: EvalMode,
+    prior: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
+) -> Result<RemlLamlResult, String> {
+    reml_laml_evaluate(solution, rho, mode, prior)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Penalty coordinate helpers for family modules
 // ═══════════════════════════════════════════════════════════════════════════

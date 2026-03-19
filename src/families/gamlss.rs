@@ -2907,36 +2907,49 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     };
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterEval,
-    };
+    use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval};
 
-    let mut obj = ClosureObjective {
-        state: MeanWiggleOuterState {
+    // Exact first-order AND second-order [rho, psi] calculus is available
+    // for all inverse links via the shared jet formulas plus the generic
+    // exact-Newton D_βH / D²_βH closures routed through
+    // evaluate_custom_family_joint_hyper -> joint_outer_evaluate ->
+    // BorrowedJointDerivProvider. This enables exact Newton for the outer
+    // REML optimization, eliminating the BFGS fallback that was previously
+    // required.
+    //
+    // Note: auxiliary coords are NOT design-moving (psi_dim=0). The seed
+    // config still needs num_auxiliary_trailing for proper multi-start seeding.
+    let mut seed_heuristic = theta0.to_vec();
+    for value in &mut seed_heuristic[..rho_dim] {
+        *value = value.exp();
+    }
+    let problem = crate::solver::outer_strategy::OuterProblem::new(theta_dim)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(if analytic_outer_hessian_available {
+            Derivative::Analytic
+        } else {
+            Derivative::Unavailable
+        })
+        .with_tolerance(options.outer_tol)
+        .with_max_iter(options.outer_max_iter)
+        .with_fd_step(1e-4)
+        .with_bounds(lower.clone(), upper.clone())
+        .with_seed_config(crate::seeding::SeedConfig {
+            max_seeds: 4,
+            screening_budget: 2,
+            risk_profile: crate::seeding::SeedRiskProfile::GeneralizedLinear,
+            num_auxiliary_trailing: theta_dim - rho_dim,
+            ..Default::default()
+        })
+        .with_rho_bound(12.0)
+        .with_heuristic_lambdas(seed_heuristic);
+
+    let mut obj = problem.build_objective(
+        MeanWiggleOuterState {
             warm_cache: None,
             last_eval: None,
         },
-        // Exact first-order AND second-order [rho, psi] calculus is available
-        // for all inverse links via the shared jet formulas plus the generic
-        // exact-Newton D_βH / D²_βH closures routed through
-        // evaluate_custom_family_joint_hyper -> joint_outer_evaluate ->
-        // BorrowedJointDerivProvider. This enables exact Newton for the outer
-        // REML optimization, eliminating the BFGS fallback that was previously
-        // required.
-        cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: if analytic_outer_hessian_available {
-                Derivative::Analytic
-            } else {
-                Derivative::Unavailable
-            },
-            n_params: theta_dim,
-            all_penalty_like: false,
-            has_psi_coords: false,
-            fixed_point_available: false,
-            barrier_config: None,
-        },
-        cost_fn: |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
+        |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
             if let Some((cached_theta, cached_cost, _, _, cached_warm)) = &state.last_eval
                 && cached_theta == theta
             {
@@ -2948,7 +2961,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.objective)
         },
-        eval_fn: |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
+        |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
             if let Some((cached_theta, cached_cost, cached_grad, cached_hess, cached_warm)) =
                 &state.last_eval
                 && cached_theta == theta
@@ -2989,33 +3002,18 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 hessian: hessian_result,
             })
         },
-        reset_fn: None::<fn(&mut MeanWiggleOuterState)>,
-        efs_fn: None::<
+        None::<fn(&mut MeanWiggleOuterState)>,
+        None::<
             fn(
                 &mut MeanWiggleOuterState,
                 &Array1<f64>,
             ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
         >,
-    };
-
-    let outer_config = crate::terms::smooth::exact_joint_multistart_outer_config(
-        &theta0,
-        &lower,
-        &upper,
-        rho_dim,
-        theta_dim - rho_dim,
-        crate::seeding::SeedRiskProfile::GeneralizedLinear,
-        options.outer_tol,
-        options.outer_max_iter,
-        1e-4,
     );
 
-    let outer = crate::solver::outer_strategy::run_outer(
-        &mut obj,
-        &outer_config,
-        "binomial mean wiggle exact spatial hyper",
-    )
-    .map_err(|e| e.to_string())?;
+    let outer = problem
+        .run(&mut obj, "binomial mean wiggle exact spatial hyper")
+        .map_err(|e| e.to_string())?;
     let theta_star = outer.rho;
 
     let log_kappa =
