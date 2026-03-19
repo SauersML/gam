@@ -27,7 +27,7 @@ use crate::smooth::{
     freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut1, Axis, s};
+use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -137,6 +137,58 @@ fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String
             "survival marginal-slope spatial psi loading requested for unsupported block {block_idx}"
         )),
     }
+}
+
+/// Derive a primary-space direction from a precomputed psi design row and beta,
+/// avoiding a redundant `psi_design_row_vector` call inside `row_primary_psi_direction`.
+fn primary_direction_from_psi_row(
+    block_idx: usize,
+    psi_row: &Array1<f64>,
+    beta_block: &Array1<f64>,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(N_PRIMARY);
+    let value = psi_row.dot(beta_block);
+    match block_idx {
+        1 => {
+            out[0] = value;
+            out[1] = value;
+        }
+        2 => {
+            out[3] = value;
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Derive a primary-space psi action on a direction from a precomputed psi design row.
+fn primary_psi_action_from_psi_row(
+    block_idx: usize,
+    psi_row: &Array1<f64>,
+    d_beta_block: ndarray::ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(N_PRIMARY);
+    let value = psi_row.dot(&d_beta_block);
+    match block_idx {
+        1 => {
+            out[0] = value;
+            out[1] = value;
+        }
+        2 => {
+            out[3] = value;
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Derive a primary-space second-order direction from a precomputed second psi design row.
+fn primary_second_direction_from_psi_row(
+    block_idx: usize,
+    psi_second_row: &Array1<f64>,
+    beta_block: &Array1<f64>,
+) -> Array1<f64> {
+    primary_direction_from_psi_row(block_idx, psi_second_row, beta_block)
 }
 
 // ── Block-local Hessian accumulator ────────────────────────────────────
@@ -3028,42 +3080,11 @@ pub fn fit_survival_marginal_slope_terms(
     let weights = Arc::new(spec.weights.clone());
     let z = Arc::new(spec.z.clone());
     let derivative_guard = spec.derivative_guard;
-    let build_time_design = |dense: &Array2<f64>| -> DesignMatrix {
-        let n = dense.nrows();
-        let p = dense.ncols();
-        if n == 0 || p == 0 {
-            return DesignMatrix::Dense(DenseDesignMatrix::from(dense.clone()));
-        }
-        let total = n * p;
-        let nnz: usize = dense.iter().filter(|&&v| v.abs() > 1e-15).count();
-        // B-spline / I-spline bases have only (degree+1) nonzeros per row,
-        // so they are almost always sparse.  Always convert when the nnz ratio
-        // is below 50 % — row-level outer products in the survival hot path
-        // become O(nnz_per_row²) instead of O(p²).
-        if nnz * 2 > total {
-            return DesignMatrix::Dense(DenseDesignMatrix::from(dense.clone()));
-        }
-        let mut triplets = Vec::with_capacity(nnz);
-        for i in 0..n {
-            for j in 0..p {
-                let value = dense[[i, j]];
-                if value.abs() > 1e-15 {
-                    triplets.push(faer::sparse::Triplet::new(i, j, value));
-                }
-            }
-        }
-        match faer::sparse::SparseColMat::try_new_from_triplets(n, p, &triplets) {
-            Ok(sparse) => DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse)),
-            Err(_) => DesignMatrix::Dense(DenseDesignMatrix::from(dense.clone())),
-        }
-    };
-    // Convert dense time designs to sparse DesignMatrix when the sparsity
-    // pattern warrants it (B-spline/I-spline bases have degree+1 nonzeros per
-    // row). This reduces memory from O(n × p_time) to O(n × degree) and makes
-    // row-level operations faster at biobank scale.
-    let design_entry = build_time_design(&spec.time_block.design_entry);
-    let design_exit = build_time_design(&spec.time_block.design_exit);
-    let design_derivative_exit = build_time_design(&spec.time_block.design_derivative_exit);
+    // Time designs arrive as DesignMatrix (already sparse for local-support
+    // bases like B-spline, or dense for I-spline).  No post-hoc scan needed.
+    let design_entry = spec.time_block.design_entry.clone();
+    let design_exit = spec.time_block.design_exit.clone();
+    let design_derivative_exit = spec.time_block.design_derivative_exit.clone();
     let offset_entry = Arc::new(spec.time_block.offset_entry.clone());
     let offset_exit = Arc::new(spec.time_block.offset_exit.clone());
     let derivative_offset_exit = Arc::new(spec.time_block.derivative_offset_exit.clone());

@@ -10,8 +10,6 @@
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
 use ndarray::{Array1, Array2, array, s};
-use std::sync::Arc;
-
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
     KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
@@ -589,8 +587,7 @@ pub fn build_survival_time_basis(
             // Build derivative basis as sparse triplets — B-spline derivatives
             // have the same local support as the basis itself (at most degree+1
             // nonzeros per row), so building dense first wastes memory.
-            let mut deriv_triplets: Vec<faer::sparse::Triplet<usize, f64>> =
-                Vec::with_capacity(n * (degree + 1));
+            let mut deriv_triplets = Vec::with_capacity(n * (degree + 1));
             let mut deriv_buf = vec![0.0_f64; p_time];
             for i in 0..n {
                 deriv_buf.fill(0.0);
@@ -743,8 +740,7 @@ pub fn build_survival_time_basis(
             // is a cumulative sum of B-spline derivatives and typically has
             // more nonzeros per row than a plain B-spline, but still much
             // fewer than p_time for modest bases.
-            let mut deriv_triplets: Vec<faer::sparse::Triplet<usize, f64>> =
-                Vec::with_capacity(n * p_time.min(16));
+            let mut deriv_triplets = Vec::with_capacity(n * p_time.min(16));
             let mut found_nonfinite: Option<(usize, usize)> = None;
             for i in 0..n {
                 let mut running = 0.0_f64;
