@@ -2645,37 +2645,31 @@ impl<'a> RemlState<'a> {
             Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
         >,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        use super::unified::{InnerSolutionBuilder, reml_laml_evaluate};
-
-        let n_observations = self.y.len();
-        let penalty_coords = self.build_penalty_coords();
-
-        let mut builder = InnerSolutionBuilder::new(
-            log_likelihood, penalty_quadratic, beta, n_observations,
-            hessian_op, penalty_coords, penalty_logdet, dispersion,
-        )
-        .deriv_provider(deriv_provider)
-        .tk(tk_correction, tk_gradient)
-        .firth(firth_op)
-        .nullspace_dim_override(nullspace_dim)
-        .barrier_config(barrier_config);
-
-        if !ext_coords.is_empty() {
-            builder = builder.ext_coords(ext_coords);
-        }
-        if let Some(f) = ext_coord_pair_fn {
-            builder = builder.ext_coord_pair_fn(f);
-        }
-        if let Some(f) = rho_ext_pair_fn {
-            builder = builder.rho_ext_pair_fn(f);
-        }
-
-        let inner_solution = builder.build();
         let prior = self.build_prior(rho, mode);
 
-        let result = reml_laml_evaluate(
-            &inner_solution, rho.as_slice().unwrap(), mode, prior,
-        ).map_err(|e| EstimationError::InvalidInput(e))?;
+        let result = super::assembly::InnerAssembly {
+            log_likelihood,
+            penalty_quadratic,
+            beta,
+            n_observations: self.y.len(),
+            hessian_op,
+            penalty_coords: self.build_penalty_coords(),
+            penalty_logdet,
+            dispersion,
+            deriv_provider: Some(deriv_provider),
+            tk_correction,
+            tk_gradient,
+            firth: firth_op,
+            nullspace_dim: Some(nullspace_dim),
+            barrier_config,
+            ext_coords,
+            ext_coord_pair_fn,
+            rho_ext_pair_fn,
+            fixed_drift_deriv: None,
+        }
+        .evaluate(rho.as_slice().unwrap(), mode, prior)
+        .map_err(EstimationError::InvalidInput)?;
+
         let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
         Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
@@ -2797,100 +2791,8 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        use super::unified::{DenseSpectralOperator, PenaltyLogdetDerivs};
-
-        let pirls_result = bundle.pirls_result.as_ref();
-        let ridge_passport = pirls_result.ridge_passport;
-
-        // Constraint projection: if active constraints reduce the effective
-        // dimension, project the Hessian and penalty roots into the free subspace.
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
-            (
-                Self::projectwith_basis(bundle.h_total.as_ref(), z),
-                pirls_result.reparam_result.e_transformed.dot(z),
-            )
-        } else {
-            (
-                bundle.h_total.as_ref().clone(),
-                pirls_result.reparam_result.e_transformed.clone(),
-            )
-        };
-
-        // Build HessianOperator from the (possibly projected) penalized Hessian.
-        let hessian_op = Box::new(
-            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "DenseSpectralOperator from PIRLS Hessian: {e}"
-                ))
-            })?,
-        );
-
-        // Penalty logdet derivatives from the reparameterization result.
-        let (penalty_rank, log_det_s) =
-            self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
-
-        // Penalty logdet derivatives — exact first and (optionally) second.
-        // Both `first` and `second` must come from the same eigendecomposition
-        // that produced `log_det_s` (the exact pseudo-logdet value). Using the
-        // surrogate det1 from `reparam_result` here would create a value/gradient
-        // mismatch: the optimizer would see an exact scalar objective but a
-        // surrogate gradient, which is not the gradient of any single function.
-        //
-        // Use the block-local path via canonical penalties — avoids materializing
-        // global p×p penalty matrices. The penalty logdet is invariant under the
-        // QS reparameterization, so block-local eigendecomposition on the original
-        // penalties gives the same result as the global path on transformed roots.
-        let lambdas = rho.mapv(f64::exp);
-        let (det1, det2) = self.structural_penalty_logdet_derivatives_block_local(
-            &lambdas,
-            ridge_passport.penalty_logdet_ridge(),
-        )?;
-        let penalty_logdet = PenaltyLogdetDerivs {
-            value: log_det_s,
-            first: det1,
-            second: if mode == super::unified::EvalMode::ValueGradientHessian {
-                Some(det2)
-            } else {
-                None
-            },
-        };
-
-        // Beta in the operator's basis.
-        let beta = if let Some(z) = free_basis_opt.as_ref() {
-            z.t()
-                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
-        } else {
-            pirls_result.beta_transformed.as_ref().clone()
-        };
-
-        // Nullspace dimension.
-        let p_eff_dim = h_for_operator.ncols();
-        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
-
-        // Build the family-dependent derivative context (deriv provider,
-        // dispersion, TK, Firth, barrier) via the shared helper.
-        let (
-            deriv_provider,
-            dispersion,
-            tk_correction,
-            tk_gradient,
-            log_likelihood,
-            firth_op,
-            barrier_config,
-        ) = self.build_dense_derivative_context(
-            pirls_result,
-            bundle,
-            &free_basis_opt,
-            true, // include Firth derivatives in deriv_provider
-        )?;
-
-        self.assemble_and_evaluate(
-            rho, bundle, mode, hessian_op, beta, penalty_logdet,
-            deriv_provider, tk_correction, tk_gradient, firth_op,
-            nullspace_dim, dispersion, log_likelihood,
-            pirls_result.stable_penalty_term, barrier_config,
-            Vec::new(), None, None,
+        self.evaluate_unified_with_ext_from_bundle(
+            rho, bundle, mode, Vec::new(), None, None,
         )
     }
 
