@@ -2621,19 +2621,6 @@ impl CustomFamilyJointPsiOperator {
         }
     }
 
-    pub(crate) fn with_dense_correction(
-        total_dim: usize,
-        channels: Vec<CustomFamilyJointDesignChannel>,
-        pair_contributions: Vec<CustomFamilyJointDesignPairContribution>,
-        dense_correction: Option<Array2<f64>>,
-    ) -> Self {
-        Self {
-            total_dim,
-            channels,
-            pair_contributions,
-            dense_correction,
-        }
-    }
 }
 
 impl HyperOperator for CustomFamilyJointPsiOperator {

@@ -130,34 +130,6 @@ pub fn build_row_kernel_cache<const K: usize>(
 
 // ── Generic assembly functions ───────────────────────────────────────
 
-/// Compute total NLL and coefficient-space gradient from cached row kernels.
-pub fn row_kernel_nll_and_gradient<const K: usize>(
-    kern: &(impl RowKernel<K> + ?Sized),
-    cache: &RowKernelCache<K>,
-) -> (f64, Array1<f64>) {
-    let p = cache.p;
-    let (total_nll, grad) = (0..cache.n)
-        .into_par_iter()
-        .fold(
-            || (0.0_f64, vec![0.0_f64; p]),
-            |(mut nll_acc, mut grad_acc), row| {
-                nll_acc += cache.nll[row];
-                kern.jacobian_transpose_action(row, &cache.gradients[row], &mut grad_acc);
-                (nll_acc, grad_acc)
-            },
-        )
-        .reduce(
-            || (0.0, vec![0.0; p]),
-            |(nll_a, mut grad_a), (nll_b, grad_b)| {
-                for i in 0..grad_a.len() {
-                    grad_a[i] += grad_b[i];
-                }
-                (nll_a + nll_b, grad_a)
-            },
-        );
-    (total_nll, Array1::from_vec(grad))
-}
-
 /// Hessian–vector product: H · v = Σ_i Jᵢᵀ Hᵢ Jᵢ v.
 ///
 /// Uses cached row Hessians. No dense p×p matrix is formed.

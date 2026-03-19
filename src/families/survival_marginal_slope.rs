@@ -1064,45 +1064,6 @@ impl SurvivalMarginalSlopeFamily {
 
     // ── Pullback through design matrices ──────────────────────────────
 
-    /// Map a primary-space vector [f_q0, f_q1, f_qd1, f_g] to coefficient space.
-    fn pullback_primary_vector(
-        &self,
-        row: usize,
-        slices: &BlockSlices,
-        primary_vec: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        let mut out = Array1::<f64>::zeros(slices.total);
-        // Time block: 3 primary scalars (q0, q1, qd1) all map to the same beta_time
-        {
-            let mut time = out.slice_mut(s![slices.time.clone()]);
-            self.design_entry
-                .axpy_row_into(row, primary_vec[0], &mut time)
-                .expect("time entry axpy dimension mismatch");
-            self.design_exit
-                .axpy_row_into(row, primary_vec[1], &mut time)
-                .expect("time exit axpy dimension mismatch");
-            self.design_derivative_exit
-                .axpy_row_into(row, primary_vec[2], &mut time)
-                .expect("time deriv axpy dimension mismatch");
-        }
-        // Baseline block: contributes equally to q0 and q1.
-        {
-            let mut marginal = out.slice_mut(s![slices.marginal.clone()]);
-            self.marginal_design.axpy_row_into(
-                row,
-                primary_vec[0] + primary_vec[1],
-                &mut marginal,
-            )?;
-        }
-        // Slope block: primary scalar g
-        {
-            let mut logslope = out.slice_mut(s![slices.logslope.clone()]);
-            self.logslope_design
-                .axpy_row_into(row, primary_vec[3], &mut logslope)?;
-        }
-        Ok(out)
-    }
-
     /// Accumulate the pullback of a primary-space Hessian into coefficient-space.
     ///
     /// Writes directly into `target` subslices via sparse-aware row primitives —
@@ -1251,164 +1212,6 @@ impl SurvivalMarginalSlopeFamily {
             .logslope_design
             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
         out
-    }
-
-    // ── Dense exact Hessian (streaming, uncached) ─────────────────────
-
-    fn joint_hessian_dense_streaming(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<Array2<f64>, String> {
-        let slices = block_slices(block_states);
-        let p = slices.total;
-        let hessian = (0..self.n)
-            .into_par_iter()
-            .try_fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut hessian, row| -> Result<_, String> {
-                    let (_, _, f_pipi) =
-                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                    self.add_pullback_primary_hessian(&mut hessian, row, &slices, &f_pipi);
-                    Ok(hessian)
-                },
-            )
-            .try_reduce(|| Array2::<f64>::zeros((p, p)), |a, b| Ok(a + b))?;
-        Ok(hessian)
-    }
-
-    // ── Hessian directional derivatives ───────────────────────────────
-
-    fn joint_hessian_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        let slices = block_slices(block_states);
-        let p = slices.total;
-        let out = (0..self.n)
-            .into_par_iter()
-            .try_fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut acc, row| -> Result<_, String> {
-                    let row_dir =
-                        self.row_primary_direction_from_flat(row, &slices, d_beta_flat);
-                    let third =
-                        self.row_primary_third_contracted(row, block_states, &row_dir)?;
-                    self.add_pullback_primary_hessian(&mut acc, row, &slices, &third);
-                    Ok(acc)
-                },
-            )
-            .try_reduce(|| Array2::<f64>::zeros((p, p)), |a, b| Ok(a + b))?;
-        Ok(Some(out))
-    }
-
-    fn joint_hessian_second_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        d_beta_u: &Array1<f64>,
-        d_beta_v: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        let slices = block_slices(block_states);
-        let p = slices.total;
-        let out = (0..self.n)
-            .into_par_iter()
-            .try_fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut acc, row| -> Result<_, String> {
-                    let row_u = self.row_primary_direction_from_flat(row, &slices, d_beta_u);
-                    let row_v = self.row_primary_direction_from_flat(row, &slices, d_beta_v);
-                    let fourth =
-                        self.row_primary_fourth_contracted(row, block_states, &row_u, &row_v)?;
-                    self.add_pullback_primary_hessian(&mut acc, row, &slices, &fourth);
-                    Ok(acc)
-                },
-            )
-            .try_reduce(|| Array2::<f64>::zeros((p, p)), |a, b| Ok(a + b))?;
-        Ok(Some(out))
-    }
-
-    fn joint_hessian_matvec_from_cache(
-        &self,
-        direction: &Array1<f64>,
-        cache: &EvalCache,
-    ) -> Result<Array1<f64>, String> {
-        let slices = &cache.slices;
-        let out = (0..self.n)
-            .into_par_iter()
-            .try_fold(
-                || Array1::<f64>::zeros(slices.total),
-                |mut acc, row| -> Result<_, String> {
-                    let row_dir = self.row_primary_direction_from_flat(row, slices, direction);
-                    let (_, row_hessian) = self.row_primary_gradient_hessian(row, cache);
-                    let row_action = row_hessian.dot(&row_dir);
-                    acc += &self.pullback_primary_vector(row, slices, &row_action)?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(|| Array1::<f64>::zeros(slices.total), |a, b| Ok(a + b))?;
-        Ok(out)
-    }
-
-    fn joint_hessian_diagonal_from_cache(&self, cache: &EvalCache) -> Result<Array1<f64>, String> {
-        let slices = &cache.slices;
-        let diagonal = (0..self.n)
-            .into_par_iter()
-            .fold(
-                || Array1::<f64>::zeros(slices.total),
-                |mut diagonal, row| {
-                    let (_, row_hessian) = self.row_primary_gradient_hessian(row, cache);
-
-                    let designs = [
-                        (0, &self.design_entry),
-                        (1, &self.design_exit),
-                        (2, &self.design_derivative_exit),
-                    ];
-                    for &(pi, ref des) in &designs {
-                        {
-                            let mut time_diag = diagonal.slice_mut(s![slices.time.clone()]);
-                            des.squared_axpy_row_into(
-                                row,
-                                row_hessian[[pi, pi]],
-                                &mut time_diag,
-                            )
-                            .expect("survival time squared_axpy_row_into dimension mismatch");
-                        }
-                        for &(pj, ref des_j) in &designs {
-                            if pj <= pi {
-                                continue;
-                            }
-                            let mut time_diag = diagonal.slice_mut(s![slices.time.clone()]);
-                            des.crossdiag_axpy_row_into(
-                                row,
-                                des_j,
-                                2.0 * row_hessian[[pi, pj]],
-                                &mut time_diag,
-                            )
-                            .expect("survival time crossdiag_axpy_row_into dimension mismatch");
-                        }
-                    }
-
-                    {
-                        let marginal_alpha =
-                            row_hessian[[0, 0]] + 2.0 * row_hessian[[0, 1]] + row_hessian[[1, 1]];
-                        let mut marginal_diag = diagonal.slice_mut(s![slices.marginal.clone()]);
-                        self.marginal_design
-                            .squared_axpy_row_into(row, marginal_alpha, &mut marginal_diag)
-                            .expect("survival marginal squared_axpy_row_into dimension mismatch");
-                    }
-
-                    {
-                        let mut logslope_diag = diagonal.slice_mut(s![slices.logslope.clone()]);
-                        self.logslope_design
-                            .squared_axpy_row_into(row, row_hessian[[3, 3]], &mut logslope_diag)
-                            .expect("survival logslope squared_axpy_row_into dimension mismatch");
-                    }
-
-                    diagonal
-                },
-            )
-            .reduce(|| Array1::<f64>::zeros(slices.total), |a, b| a + b);
-        Ok(diagonal)
     }
 
     // ── Psi (spatial length-scale) derivatives ────────────────────────
@@ -2032,31 +1835,11 @@ impl SurvivalMarginalSlopeFamily {
 
 // ── Workspace structs ─────────────────────────────────────────────────
 
-struct SurvivalMarginalSlopeHessianWorkspace {
-    family: SurvivalMarginalSlopeFamily,
-    block_states: Vec<ParameterBlockState>,
-    cache: EvalCache,
-}
-
 struct SurvivalMarginalSlopePsiWorkspace {
     family: SurvivalMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
     derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     cache: EvalCache,
-}
-
-impl SurvivalMarginalSlopeHessianWorkspace {
-    fn new(
-        family: SurvivalMarginalSlopeFamily,
-        block_states: Vec<ParameterBlockState>,
-    ) -> Result<Self, String> {
-        let cache = family.build_eval_cache(&block_states)?;
-        Ok(Self {
-            family,
-            block_states,
-            cache,
-        })
-    }
 }
 
 impl SurvivalMarginalSlopePsiWorkspace {
@@ -2072,40 +1855,6 @@ impl SurvivalMarginalSlopePsiWorkspace {
             derivative_blocks,
             cache,
         })
-    }
-}
-
-impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeHessianWorkspace {
-    fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
-        self.family
-            .joint_hessian_matvec_from_cache(beta_flat, &self.cache)
-            .map(Some)
-    }
-
-    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        self.family
-            .joint_hessian_diagonal_from_cache(&self.cache)
-            .map(Some)
-    }
-
-    fn directional_derivative(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
-    }
-
-    fn second_directional_derivative(
-        &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family.joint_hessian_second_directional_derivative(
-            &self.block_states,
-            d_beta_u_flat,
-            d_beta_v_flat,
-        )
     }
 }
 
