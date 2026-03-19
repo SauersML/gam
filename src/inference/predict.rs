@@ -2490,7 +2490,6 @@ impl PredictableModel for TransformationNormalPredictor {
         &self,
         input: &PredictInput,
     ) -> Result<PredictResult, EstimationError> {
-        // h values are in the offset (computed by build_predict_input_for_model)
         let h = input.offset.clone();
         Ok(PredictResult {
             eta: h.clone(),
@@ -2501,19 +2500,38 @@ impl PredictableModel for TransformationNormalPredictor {
     fn predict_with_uncertainty(
         &self,
         input: &PredictInput,
+    ) -> Result<PredictionWithSE, EstimationError> {
+        let h = input.offset.clone();
+        Ok(PredictionWithSE {
+            eta: h.clone(),
+            mean: h,
+            eta_se: None,
+            mean_se: None,
+        })
+    }
+
+    fn predict_full_uncertainty(
+        &self,
+        input: &PredictInput,
         _fit: &UnifiedFitResult,
-        _options: &PredictOptions,
+        options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let h = input.offset.clone();
         let n = h.len();
+        let zeros = Array1::zeros(n);
         Ok(PredictUncertaintyResult {
             eta: h.clone(),
-            eta_standard_error: Array1::zeros(n),
             mean: h.clone(),
+            eta_standard_error: zeros.clone(),
+            mean_standard_error: zeros,
+            eta_lower: h.clone(),
+            eta_upper: h.clone(),
             mean_lower: h.clone(),
             mean_upper: h,
             observation_lower: None,
             observation_upper: None,
+            covariance_mode_requested: options.covariance_mode,
+            covariance_corrected_used: false,
         })
     }
 
@@ -2528,7 +2546,7 @@ impl PredictableModel for TransformationNormalPredictor {
         Ok(PredictPosteriorMeanResult {
             eta: h.clone(),
             eta_standard_error: Array1::zeros(n),
-            mean: h.clone(),
+            mean: h,
             mean_lower: None,
             mean_upper: None,
         })
