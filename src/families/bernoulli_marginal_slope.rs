@@ -798,6 +798,17 @@ impl MultiDirJet {
     }
 }
 
+/// Block-local psi derivative row: avoids allocating a full p-vector
+/// when the psi derivative lives in a single channel (marginal or logslope).
+struct BlockPsiRow {
+    /// Which parameter block (0 = marginal, 1 = logslope).
+    block_idx: usize,
+    /// Coefficient range in global (flat) space for this block.
+    range: std::ops::Range<usize>,
+    /// The p_block-length psi design derivative row.
+    local_vec: Array1<f64>,
+}
+
 #[derive(Clone)]
 struct BlockSlices {
     marginal: std::ops::Range<usize>,
@@ -912,11 +923,12 @@ struct BernoulliMarginalSlopeRowExactContext {
 /// (intercept, M_a, link stacks) is pre-solved once in the eval cache.
 const ROW_CHUNK_SIZE: usize = 1024;
 
-/// Lightweight cache that stores shared precomputed state.  When the model is
-/// flex-active (score-warp or link-deviation), the cache also pre-solves and
-/// stores all per-row contexts (intercept, M_a, link stacks) so that workspace
-/// calls (matvec, diagonal, psi, directional derivatives) never redundantly
-/// re-solve the Newton intercept equation.
+/// Shared precomputed state plus pre-solved per-row contexts.  All row
+/// intercepts (and link stacks for flex models) are solved once during cache
+/// construction so that workspace calls (matvec, diagonal, psi, directional
+/// derivatives) never redundantly re-solve the Newton intercept equation.
+/// For rigid models the per-row context is just three cheap scalars with no
+/// link stacks.
 #[derive(Clone)]
 struct BernoulliMarginalSlopeExactEvalCache {
     slices: BlockSlices,
@@ -924,9 +936,8 @@ struct BernoulliMarginalSlopeExactEvalCache {
     h_nodes: Array1<f64>,
     h_node_design: Option<Array2<f64>>,
     score_warp_obs: Option<(DesignMatrix, Array1<f64>)>,
-    /// Pre-solved row contexts.  `None` in the rigid (non-flex) case where the
-    /// intercept is closed-form and cheap to recompute.
-    row_contexts: Option<Vec<BernoulliMarginalSlopeRowExactContext>>,
+    /// Pre-solved row contexts (intercept, M_a, link stacks).
+    row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
 }
 
 /// Maximum row-loop work proxy before downgrading to first-order:

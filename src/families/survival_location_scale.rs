@@ -5329,6 +5329,7 @@ impl SurvivalLocationScaleFamily {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi,
+            hessian_psi_psi_operator: None,
         })
     }
 

@@ -2351,14 +2351,15 @@ fn run_predict_survival(
             &model.survival_noise_scale,
             model.survival_noise_non_intercept_start,
         )?;
+        let x_time_exit_dense = time_build.x_exit_time.to_dense();
         let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
             let mut full =
-                Array2::<f64>::zeros((n, time_build.x_exit_time.ncols() + runtime.beta.len()));
-            full.slice_mut(s![.., 0..time_build.x_exit_time.ncols()])
-                .assign(&time_build.x_exit_time);
+                Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
+            full.slice_mut(s![.., 0..x_time_exit_dense.ncols()])
+                .assign(&x_time_exit_dense);
             full
         } else {
-            time_build.x_exit_time.clone()
+            x_time_exit_dense
         };
         let dense_threshold_design = threshold_design.design.to_dense();
         let mut survival_primary_design =
@@ -2586,7 +2587,7 @@ fn run_predict_survival(
                 let mut jac = Array2::<f64>::zeros((cs, p_total));
                 // Time block: scale rows by c_i
                 {
-                    let x_t = time_build.x_exit_time.slice(s![start..end, ..]);
+                    let x_t = time_build.x_exit_time.row_chunk(start..end);
                     let mut dst = jac.slice_mut(s![.., ..p_t]);
                     dst.assign(&x_t);
                     for i in 0..cs {
@@ -2695,10 +2696,11 @@ fn run_predict_survival(
         .as_ref()
         .map_or(0, |w| w.beta.len());
     let p = p_time + p_timewiggle + p_cov;
+    let x_exit_time_dense = time_build.x_exit_time.to_dense();
     let mut x_exit = Array2::<f64>::zeros((n, p));
     x_exit
         .slice_mut(s![.., ..p_time])
-        .assign(&time_build.x_exit_time);
+        .assign(&x_exit_time_dense);
     // Timewiggle columns are evaluated dynamically from the runtime
     // (the old frozen-column approach was removed). For the generic
     // survival path we do NOT support dynamic timewiggle — it is only
@@ -4309,13 +4311,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_beta_log_sigma = Some(fit.fit.fit.beta_log_sigma().to_vec());
             let dense_fit_threshold = fit.fit.threshold_design.design.to_dense();
             let dense_fit_log_sigma = fit.fit.log_sigma_design.design.to_dense();
+            let dense_time_exit = time_design_exit.to_dense();
             let mut survival_primary_design =
-                Array2::<f64>::zeros((n, time_design_exit.ncols() + dense_fit_threshold.ncols()));
+                Array2::<f64>::zeros((n, dense_time_exit.ncols() + dense_fit_threshold.ncols()));
             survival_primary_design
-                .slice_mut(s![.., 0..time_design_exit.ncols()])
-                .assign(&time_design_exit);
+                .slice_mut(s![.., 0..dense_time_exit.ncols()])
+                .assign(&dense_time_exit);
             survival_primary_design
-                .slice_mut(s![.., time_design_exit.ncols()..])
+                .slice_mut(s![.., dense_time_exit.ncols()..])
                 .assign(&dense_fit_threshold);
             let survival_noise_transform = build_scale_deviation_transform(
                 &survival_primary_design,
@@ -5101,14 +5104,17 @@ fn run_sample_survival(
         .map(|(_, exit, _)| exit.ncols())
         .unwrap_or(0);
     let p = p_time + p_timewiggle + p_cov;
+    let tb_entry_dense = time_build.x_entry_time.to_dense();
+    let tb_exit_dense = time_build.x_exit_time.to_dense();
+    let tb_deriv_dense = time_build.x_derivative_time.to_dense();
     let mut x_entry = Array2::<f64>::zeros((n, p));
     let mut x_exit = Array2::<f64>::zeros((n, p));
     let mut x_derivative = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         for j in 0..p_time {
-            x_entry[[i, j]] = time_build.x_entry_time[[i, j]];
-            x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
-            x_derivative[[i, j]] = time_build.x_derivative_time[[i, j]];
+            x_entry[[i, j]] = tb_entry_dense[[i, j]];
+            x_exit[[i, j]] = tb_exit_dense[[i, j]];
+            x_derivative[[i, j]] = tb_deriv_dense[[i, j]];
         }
         if let Some((entry_w, exit_w, deriv_w)) = saved_timewiggle.as_ref() {
             for j in 0..p_timewiggle {
