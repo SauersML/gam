@@ -2828,6 +2828,65 @@ impl BernoulliMarginalSlopeFamily {
             .as_ref()
             .map(|r| Array2::<f64>::zeros((r.len(), r.len())));
 
+        // Fast path: rigid model (no score-warp, no link-deviation).
+        // Use closed-form scalar kernel: η = q·c + g·z, ℓ = -w·logΦ(s·η).
+        // No jets, no intercept solve, no quadrature.
+        if !self.flex_active() {
+            for row in 0..self.y.len() {
+                let q = block_states[0].eta[row];
+                let g = block_states[1].eta[row];
+                let yi = self.y[row];
+                let wi = self.weights[row];
+                let zi = self.z[row];
+                let s = 2.0 * yi - 1.0;
+
+                let g2 = g * g;
+                let c = (1.0 + g2).sqrt();
+                let c1 = g2 / c;
+                let c2 = g2 * (g2 + 2.0) / (c * c * c);
+                let eta = q * c + g * zi;
+                let m = s * eta;
+
+                let (logcdf, lambda) = signed_probit_logcdf_and_mills_ratio(m);
+                ll += wi * logcdf;
+
+                let u1 = -wi * s * lambda;
+                let u2 = wi * lambda * (m + lambda);
+
+                let deta_dq = c;
+                let deta_dg = q * c1 + zi;
+
+                {
+                    let mut marginal = grad_marginal.view_mut();
+                    self.marginal_design
+                        .axpy_row_into(row, -(u1 * deta_dq), &mut marginal)?;
+                }
+                {
+                    let mut logslope = grad_logslope.view_mut();
+                    self.logslope_design
+                        .axpy_row_into(row, -(u1 * deta_dg), &mut logslope)?;
+                }
+                self.marginal_design
+                    .syr_row_into(row, u2 * deta_dq * deta_dq, &mut hess_marginal)?;
+                self.logslope_design
+                    .syr_row_into(row, u2 * deta_dg * deta_dg + u1 * q * c2, &mut hess_logslope)?;
+            }
+
+            return Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                blockworking_sets: vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_marginal,
+                        hessian: SymmetricMatrix::Dense(hess_marginal),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_logslope,
+                        hessian: SymmetricMatrix::Dense(hess_logslope),
+                    },
+                ],
+            });
+        }
+
         for row in 0..self.y.len() {
             let row_ctx = self.build_row_exact_context(
                 row,
