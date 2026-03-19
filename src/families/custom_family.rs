@@ -3719,6 +3719,18 @@ fn solve_kkt_step(
             m
         ));
     }
+    let zero_step = || Ok((Array1::zeros(p), Array1::zeros(m)));
+    if !hessian.iter().all(|v| v.is_finite())
+        || !gradient.iter().all(|v| v.is_finite())
+        || !active_a.iter().all(|v| v.is_finite())
+        || active_residual
+            .map(|residual| residual.iter().all(|v| v.is_finite()))
+            .unwrap_or(true)
+            == false
+    {
+        log::warn!("constrained KKT inputs non-finite; returning zero direction");
+        return zero_step();
+    }
     if m == 0 {
         let rhs = gradient.mapv(|v| -v);
         let solver = StableSolver::new("custom-family unconstrained kkt step");
@@ -3780,13 +3792,25 @@ fn solve_kkt_step(
 
     let solution = match solve_direct() {
         Ok(solution) => solution,
-        Err(_) => {
-            let (u_opt, singular, vt_opt) = kkt
-                .svd(true, true)
-                .map_err(|e| format!("constrained KKT SVD fallback failed: {e}"))?;
+        Err(direct_err) => {
+            let (u_opt, singular, vt_opt) = match kkt.svd(true, true) {
+                Ok(factors) => factors,
+                Err(e) => {
+                    log::warn!(
+                        "constrained KKT SVD fallback failed after direct solve error ({direct_err}); returning zero direction: {e}"
+                    );
+                    return zero_step();
+                }
+            };
             let u = u_opt.ok_or("constrained KKT SVD missing left singular vectors")?;
             let vt = vt_opt.ok_or("constrained KKT SVD missing right singular vectors")?;
             let max_sv = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+            if !max_sv.is_finite() {
+                log::warn!(
+                    "constrained KKT SVD singular spectrum non-finite; returning zero direction"
+                );
+                return zero_step();
+            }
             // Use a robust SVD threshold: drop components where the
             // singular value is below sqrt(eps) * max_sv.  The 1e-12
             // threshold was too tight for large KKT systems (n=300K+
@@ -3812,9 +3836,7 @@ fn solve_kkt_step(
                 // SVD reconstruction still non-finite: return a zero step
                 // rather than crashing, letting the outer solver apply
                 // damping and retry.
-                log::warn!(
-                    "constrained KKT SVD produced non-finite solution; returning zero step"
-                );
+                log::warn!("constrained KKT SVD produced non-finite solution; returning zero step");
                 Array1::<f64>::zeros(p + m)
             } else {
                 let residual = kkt.dot(&solution) - &rhs;
@@ -3978,8 +4000,9 @@ fn solve_quadraticwith_linear_constraints(
     let tol_dual = 1e-9;
     let feas_tol = 1e-8;
 
-    if let Some(beta_unconstrained) = StableSolver::new("custom-family constrained quadratic fast-path")
-        .solvevectorwithridge_retries(hessian, rhs, 0.0)
+    if let Some(beta_unconstrained) =
+        StableSolver::new("custom-family constrained quadratic fast-path")
+            .solvevectorwithridge_retries(hessian, rhs, 0.0)
         && beta_unconstrained.iter().all(|v| v.is_finite())
         && check_linear_feasibility(&beta_unconstrained, constraints, feas_tol).is_ok()
     {
@@ -4016,8 +4039,7 @@ fn solve_quadraticwith_linear_constraints(
         let compressed = compress_active_constraint_set(constraints, &active)?;
         let mut residualw = Array1::<f64>::zeros(compressed.constraints.a.nrows());
         for r in 0..compressed.constraints.a.nrows() {
-            residualw[r] =
-                compressed.constraints.b[r] - compressed.constraints.a.row(r).dot(&x);
+            residualw[r] = compressed.constraints.b[r] - compressed.constraints.a.row(r).dot(&x);
         }
         let (direction, lambda_sys) = solve_kkt_step(
             hessian,
@@ -8342,6 +8364,36 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct OneBlockConstrainedNaNHessianFamily;
+
+    impl CustomFamily for OneBlockConstrainedNaNHessianFamily {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![0.0],
+                    hessian: SymmetricMatrix::Dense(array![[f64::NAN]]),
+                }],
+            })
+        }
+
+        fn block_linear_constraints(
+            &self,
+            _: &[ParameterBlockState],
+            block_idx: usize,
+            _: &ParameterBlockSpec,
+        ) -> Result<Option<LinearInequalityConstraints>, String> {
+            if block_idx != 0 {
+                return Ok(None);
+            }
+            Ok(Some(LinearInequalityConstraints {
+                a: array![[1.0]],
+                b: array![0.0],
+            }))
+        }
+    }
+
+    #[derive(Clone)]
     struct PreferJointExactFamily;
 
     impl CustomFamily for PreferJointExactFamily {
@@ -9961,6 +10013,47 @@ mod tests {
 
         assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
         assert_eq!(active, vec![0]);
+    }
+
+    #[test]
+    fn constrained_exact_newton_nan_hessian_returns_feasible_noop_instead_of_failing() {
+        let spec = ParameterBlockSpec {
+            name: "exact_block".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+        };
+        let states = vec![ParameterBlockState {
+            beta: array![0.0],
+            eta: array![0.0],
+        }];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        };
+        let hessian = SymmetricMatrix::Dense(array![[f64::NAN]]);
+        let updater = ExactNewtonBlockUpdater {
+            gradient: &array![0.0],
+            hessian: &hessian,
+        };
+        let s_lambda = Array2::zeros((1, 1));
+        let update = updater
+            .compute_update_step(&BlockUpdateContext {
+                family: &OneBlockConstrainedNaNHessianFamily,
+                states: &states,
+                spec: &spec,
+                block_idx: 0,
+                s_lambda: &s_lambda,
+                options: &BlockwiseFitOptions::default(),
+                linear_constraints: Some(&constraints),
+                cached_active_set: None,
+            })
+            .expect("constrained exact-newton NaN Hessian should produce a no-op update");
+        assert_relative_eq!(update.beta_new_raw[0], 0.0, epsilon = 1e-14);
+        assert_eq!(update.active_set, Some(vec![0]));
     }
 
     #[test]
