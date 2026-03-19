@@ -38,7 +38,7 @@ use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
 use crate::solver::estimate::UnifiedFitResult;
@@ -8028,10 +8028,10 @@ pub(crate) fn fit_survival_location_scale_terms(
     let log_sigma_boot_design =
         build_term_collection_design(data, &spec.log_sigmaspec).map_err(|e| e.to_string())?;
     let threshold_bootspec =
-        freeze_spatial_length_scale_terms_from_design(&spec.thresholdspec, &threshold_boot_design)
+        freeze_term_collection_from_design(&spec.thresholdspec, &threshold_boot_design)
             .map_err(|e| e.to_string())?;
     let log_sigma_bootspec =
-        freeze_spatial_length_scale_terms_from_design(&spec.log_sigmaspec, &log_sigma_boot_design)
+        freeze_term_collection_from_design(&spec.log_sigmaspec, &log_sigma_boot_design)
             .map_err(|e| e.to_string())?;
 
     let threshold_boot_derivs = build_survival_covariate_block_psi_derivatives(

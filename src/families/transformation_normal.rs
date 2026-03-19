@@ -37,7 +37,7 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::UnifiedFitResult;
@@ -1927,9 +1927,8 @@ pub fn fit_transformation_normal(
         // ------------------------------------------------------------------
         let cov_design = build_term_collection_design(covariate_data, covariate_spec)
             .map_err(|e| format!("failed to build covariate design: {e}"))?;
-        let cov_spec_resolved =
-            freeze_spatial_length_scale_terms_from_design(covariate_spec, &cov_design)
-                .map_err(|e| format!("failed to freeze covariate spatial basis centers: {e}"))?;
+        let cov_spec_resolved = freeze_term_collection_from_design(covariate_spec, &cov_design)
+            .map_err(|e| format!("failed to freeze covariate spatial basis centers: {e}"))?;
 
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             resp_val,
@@ -1966,7 +1965,7 @@ pub fn fit_transformation_normal(
     // Build bootstrap covariate design and frozen spec.
     let boot_design = build_term_collection_design(covariate_data, covariate_spec)
         .map_err(|e| format!("failed to build bootstrap covariate design: {e}"))?;
-    let boot_spec = freeze_spatial_length_scale_terms_from_design(covariate_spec, &boot_design)
+    let boot_spec = freeze_term_collection_from_design(covariate_spec, &boot_design)
         .map_err(|e| format!("failed to freeze bootstrap covariate spatial basis centers: {e}"))?;
 
     // Build ExactJointHyperSetup for 1 block.

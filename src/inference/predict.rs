@@ -451,10 +451,17 @@ pub trait PredictableModel {
     ///
     /// This is the canonical response-scale prediction path for nonlinear
     /// models and the default semantics exposed by the CLI.
+    ///
+    /// When `confidence_level` is `Some(α)` with α ∈ (0, 1), the result
+    /// includes `mean_lower` / `mean_upper` confidence bounds.  Each predictor
+    /// computes bounds using the method natural to its parameterisation
+    /// (TransformEta for eta-scale SE, response-scale Delta for probability-
+    /// scale SE).
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
+        confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError>;
 
     /// Number of coefficient blocks in the model.
@@ -649,8 +656,9 @@ impl PredictableModel for StandardPredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
+        confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        if self.link_wiggle.is_none() {
+        let mut result = if self.link_wiggle.is_none() {
             let backend = posterior_mean_backend_or_warn(
                 fit,
                 self.covariance.as_ref(),
@@ -664,71 +672,78 @@ impl PredictableModel for StandardPredictor {
                 )
             })?;
             let strategy = strategy_from_fit(self.family, fit)?;
-            return predict_gam_posterior_mean_from_backend(
+            predict_gam_posterior_mean_from_backend(
                 input.design.clone(),
                 self.beta.view(),
                 input.offset.view(),
                 &backend,
                 &strategy,
                 "standard posterior mean",
-            );
-        }
-        let runtime = self.link_wiggle.as_ref().expect("checked above");
-        let plugin = self.predict_plugin_response(input)?;
-        let eta_base = input.design.dot(&self.beta) + &input.offset;
-        let backend = posterior_mean_backend_or_warn(
-            fit,
-            self.covariance.as_ref(),
-            self.beta.len() + runtime.beta.len(),
-            "standard link-wiggle posterior mean",
-        )
-        .ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "posterior-mean prediction requires beta covariance or penalized Hessian"
-                    .to_string(),
+            )?
+        } else {
+            let runtime = self.link_wiggle.as_ref().expect("checked above");
+            let plugin = self.predict_plugin_response(input)?;
+            let eta_base = input.design.dot(&self.beta) + &input.offset;
+            let backend = posterior_mean_backend_or_warn(
+                fit,
+                self.covariance.as_ref(),
+                self.beta.len() + runtime.beta.len(),
+                "standard link-wiggle posterior mean",
             )
-        })?;
-        let p_main = self.beta.len();
-        let p_w = runtime.beta.len();
-        let p_total = p_main + p_w;
-        if backend.nrows() != p_total {
-            return Err(EstimationError::InvalidInput(format!(
-                "standard link-wiggle posterior mean covariance mismatch: expected parameter dimension {}, got {}",
-                p_total,
-                backend.nrows()
-            )));
-        }
-        let eta_se = linear_predictor_se_from_backend(&backend, plugin.eta.len(), |rows| {
-            let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
-            let x_main = design_row_chunk(&input.design, rows.clone())?;
-            let wiggle_design = runtime.design(&q0_chunk)?;
-            let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
-            let rows_in_chunk = q0_chunk.len();
-            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-            for i in 0..rows_in_chunk {
-                for j in 0..p_main {
-                    grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
-                }
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "posterior-mean prediction requires beta covariance or penalized Hessian"
+                        .to_string(),
+                )
+            })?;
+            let p_main = self.beta.len();
+            let p_w = runtime.beta.len();
+            let p_total = p_main + p_w;
+            if backend.nrows() != p_total {
+                return Err(EstimationError::InvalidInput(format!(
+                    "standard link-wiggle posterior mean covariance mismatch: expected parameter dimension {}, got {}",
+                    p_total,
+                    backend.nrows()
+                )));
             }
-            grad.slice_mut(ndarray::s![.., p_main..p_total])
-                .assign(&wiggle_design);
-            Ok(vec![grad])
-        })?;
-        let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
-        let quadctx = crate::quadrature::QuadratureContext::new();
-        let mean = Array1::from_iter((0..plugin.eta.len()).map(|i| {
-            crate::quadrature::normal_expectation_1d_adaptive(
-                &quadctx,
-                plugin.eta[i],
-                eta_se[i],
-                |x| strategy.inverse_link(x).unwrap_or(plugin.mean[i]),
-            )
-        }));
-        Ok(PredictPosteriorMeanResult {
-            eta: plugin.eta,
-            eta_standard_error: eta_se,
-            mean,
-        })
+            let eta_se = linear_predictor_se_from_backend(&backend, plugin.eta.len(), |rows| {
+                let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
+                let x_main = design_row_chunk(&input.design, rows.clone())?;
+                let wiggle_design = runtime.design(&q0_chunk)?;
+                let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
+                let rows_in_chunk = q0_chunk.len();
+                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+                for i in 0..rows_in_chunk {
+                    for j in 0..p_main {
+                        grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
+                    }
+                }
+                grad.slice_mut(ndarray::s![.., p_main..p_total])
+                    .assign(&wiggle_design);
+                Ok(vec![grad])
+            })?;
+            let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
+            let quadctx = crate::quadrature::QuadratureContext::new();
+            let mean = Array1::from_iter((0..plugin.eta.len()).map(|i| {
+                crate::quadrature::normal_expectation_1d_adaptive(
+                    &quadctx,
+                    plugin.eta[i],
+                    eta_se[i],
+                    |x| strategy.inverse_link(x).unwrap_or(plugin.mean[i]),
+                )
+            }));
+            PredictPosteriorMeanResult {
+                eta: plugin.eta,
+                eta_standard_error: eta_se,
+                mean,
+                mean_lower: None,
+                mean_upper: None,
+            }
+        };
+        if let Some(level) = confidence_level {
+            enrich_posterior_mean_bounds(&mut result, level, self.family, self.link_kind.as_ref())?;
+        }
+        Ok(result)
     }
 
     fn n_blocks(&self) -> usize {
@@ -1425,6 +1440,7 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
+        confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         let plugin = self.predict_plugin_response(input)?;
         let eta_se = self.eta_standard_error(input, fit)?;
@@ -1435,10 +1451,31 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
                 .zip(eta_se.iter())
                 .map(|(&m, &s)| crate::probability::normal_cdf(m / (1.0 + s * s).sqrt())),
         );
+        // Bernoulli marginal-slope eta is probit-scale; TransformEta gives
+        // normal_cdf(eta ± z·se) which matches predict_full_uncertainty.
+        let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
+            let z = standard_normal_quantile(0.5 + 0.5 * level)
+                .map_err(EstimationError::InvalidInput)?;
+            let lo = plugin
+                .eta
+                .iter()
+                .zip(eta_se.iter())
+                .map(|(&e, &s)| crate::probability::normal_cdf(e - z * s).clamp(0.0, 1.0));
+            let hi = plugin
+                .eta
+                .iter()
+                .zip(eta_se.iter())
+                .map(|(&e, &s)| crate::probability::normal_cdf(e + z * s).clamp(0.0, 1.0));
+            (Some(Array1::from_iter(lo)), Some(Array1::from_iter(hi)))
+        } else {
+            (None, None)
+        };
         Ok(PredictPosteriorMeanResult {
             eta: plugin.eta,
             eta_standard_error: eta_se,
             mean,
+            mean_lower,
+            mean_upper,
         })
     }
 
@@ -1611,13 +1648,27 @@ impl PredictableModel for GaussianLocationScalePredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
+        confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         let result = self.predict_plugin_response(input)?;
         let eta_se = self.eta_standard_error(input, fit, result.eta.len())?;
+        // Gaussian identity link: mean == eta, so bounds are eta ± z·se.
+        let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
+            let z = standard_normal_quantile(0.5 + 0.5 * level)
+                .map_err(EstimationError::InvalidInput)?;
+            (
+                Some(&result.eta - &eta_se.mapv(|s| z * s)),
+                Some(&result.eta + &eta_se.mapv(|s| z * s)),
+            )
+        } else {
+            (None, None)
+        };
         Ok(PredictPosteriorMeanResult {
             eta: result.eta,
             eta_standard_error: eta_se,
             mean: result.mean,
+            mean_lower,
+            mean_upper,
         })
     }
 
@@ -1835,6 +1886,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
+        confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         // Validation target for this projected 2D GHQ path:
         // compare against 100K Monte Carlo draws under strong threshold/scale
@@ -2068,10 +2120,24 @@ impl PredictableModel for BinomialLocationScalePredictor {
         } else {
             point_prob.clone()
         };
+        // Binomial location-scale eta_se is response-scale (dprob/dθ chain
+        // rule), so bounds are mean ± z·se clamped to [0, 1].
+        let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
+            let z = standard_normal_quantile(0.5 + 0.5 * level)
+                .map_err(EstimationError::InvalidInput)?;
+            (
+                Some((&mean - &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0))),
+                Some((&mean + &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0))),
+            )
+        } else {
+            (None, None)
+        };
         Ok(PredictPosteriorMeanResult {
             eta,
             eta_standard_error: eta_se,
             mean,
+            mean_lower,
+            mean_upper,
         })
     }
 
@@ -2298,7 +2364,13 @@ impl PredictableModel for SurvivalPredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
+        _confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        // Survival models are routed through run_predict_survival, not the
+        // unified path, so bounds are computed there.  The eta_se here covers
+        // only the threshold block and cannot produce correct survival-
+        // probability intervals without also propagating sigma uncertainty.
+        //
         // Validation target for this survival posterior-mean path:
         // compare against 50K Monte Carlo draws from N(beta_hat, V) for a
         // simple Weibull-style location-scale survival fit and require
@@ -2381,6 +2453,8 @@ impl PredictableModel for SurvivalPredictor {
             eta: eta_threshold,
             eta_standard_error: eta_se,
             mean,
+            mean_lower: None,
+            mean_upper: None,
         })
     }
 
@@ -2421,7 +2495,77 @@ pub struct PredictPosteriorMeanResult {
     pub eta: Array1<f64>,
     pub eta_standard_error: Array1<f64>,
     pub mean: Array1<f64>,
+    /// Response-scale lower confidence bound (set by
+    /// [`enrich_posterior_mean_bounds`]).
+    pub mean_lower: Option<Array1<f64>>,
+    /// Response-scale upper confidence bound (set by
+    /// [`enrich_posterior_mean_bounds`]).
+    pub mean_upper: Option<Array1<f64>>,
 }
+
+/// Compute and attach TransformEta confidence bounds to a posterior-mean result.
+///
+/// This mirrors the bound construction in [`predict_gamwith_uncertainty`] using
+/// the `TransformEta` method: transform `eta ± z * eta_se` through the inverse
+/// link, then clamp to [0, 1] for bounded-response families.
+///
+/// Call this after [`PredictableModel::predict_posterior_mean`] whenever a
+/// confidence level is available so that `mean_lower` / `mean_upper` are
+/// always populated alongside `eta_standard_error`.
+pub fn enrich_posterior_mean_bounds(
+    result: &mut PredictPosteriorMeanResult,
+    confidence_level: f64,
+    family: crate::types::LikelihoodFamily,
+    link_kind: Option<&InverseLink>,
+) -> Result<(), EstimationError> {
+    if !(confidence_level.is_finite() && confidence_level > 0.0 && confidence_level < 1.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "confidence_level must be in (0,1), got {confidence_level}"
+        )));
+    }
+    let z = crate::probability::standard_normal_quantile(0.5 + 0.5 * confidence_level)
+        .map_err(EstimationError::InvalidInput)?;
+
+    let eta_lower = &result.eta - &result.eta_standard_error.mapv(|s| z * s);
+    let eta_upper = &result.eta + &result.eta_standard_error.mapv(|s| z * s);
+
+    let transformed_lower = apply_family_inverse_link(&eta_lower, family, link_kind)?;
+    let transformed_upper = apply_family_inverse_link(&eta_upper, family, link_kind)?;
+
+    // Handle potentially non-monotone transforms (e.g. survival).
+    let mut mean_lower = Array1::from_iter(
+        transformed_lower
+            .iter()
+            .zip(transformed_upper.iter())
+            .map(|(&lo, &hi)| lo.min(hi)),
+    );
+    let mut mean_upper = Array1::from_iter(
+        transformed_lower
+            .iter()
+            .zip(transformed_upper.iter())
+            .map(|(&lo, &hi)| lo.max(hi)),
+    );
+
+    // Clamp bounded-response families to [0, 1].
+    if matches!(
+        family,
+        crate::types::LikelihoodFamily::BinomialLogit
+            | crate::types::LikelihoodFamily::BinomialProbit
+            | crate::types::LikelihoodFamily::BinomialCLogLog
+            | crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialBetaLogistic
+            | crate::types::LikelihoodFamily::BinomialMixture
+            | crate::types::LikelihoodFamily::RoystonParmar
+    ) {
+        mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
+    }
+
+    result.mean_lower = Some(mean_lower);
+    result.mean_upper = Some(mean_upper);
+    Ok(())
+}
+
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InferenceCovarianceMode {
@@ -2531,6 +2675,8 @@ fn predict_gam_posterior_mean_from_backend(
         eta,
         eta_standard_error,
         mean: Array1::from_vec(means?),
+        mean_lower: None,
+        mean_upper: None,
     })
 }
 

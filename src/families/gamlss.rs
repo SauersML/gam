@@ -33,7 +33,7 @@ use crate::probability::normal_pdf;
 use crate::smooth::{
     BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
@@ -1575,11 +1575,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         build_term_collection_design(data, builder.meanspec()).map_err(|e| e.to_string())?;
     let noise_boot_design =
         build_term_collection_design(data, builder.noisespec()).map_err(|e| e.to_string())?;
-    let mean_bootspec =
-        freeze_spatial_length_scale_terms_from_design(builder.meanspec(), &mean_boot_design)
-            .map_err(|e| e.to_string())?;
+    let mean_bootspec = freeze_term_collection_from_design(builder.meanspec(), &mean_boot_design)
+        .map_err(|e| e.to_string())?;
     let noise_bootspec =
-        freeze_spatial_length_scale_terms_from_design(builder.noisespec(), &noise_boot_design)
+        freeze_term_collection_from_design(builder.noisespec(), &noise_boot_design)
             .map_err(|e| e.to_string())?;
 
     let require_exact_spatial_joint = builder.require_exact_spatial_joint();
@@ -3009,8 +3008,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .apply_tospec(&pilot_spec_cloned, &spatial_terms)
         .map_err(|e| e.to_string())?;
     let design = build_term_collection_design(data, &resolvedspec).map_err(|e| e.to_string())?;
-    let resolvedspec = freeze_spatial_length_scale_terms_from_design(&resolvedspec, &design)
-        .map_err(|e| e.to_string())?;
+    let resolvedspec =
+        freeze_term_collection_from_design(&resolvedspec, &design).map_err(|e| e.to_string())?;
     let fit = fit_binomial_mean_wiggle(
         BinomialMeanWiggleSpec {
             y: y_cloned,
@@ -16322,11 +16321,9 @@ mod tests {
         let noise_design =
             build_term_collection_design(data.view(), &noisespec).expect("build noise design");
         let meanspec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&meanspec, &mean_design)
-                .expect("freeze mean spec");
-        let noisespec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
-                .expect("freeze noise spec");
+            freeze_term_collection_from_design(&meanspec, &mean_design).expect("freeze mean spec");
+        let noisespec_resolved = freeze_term_collection_from_design(&noisespec, &noise_design)
+            .expect("freeze noise spec");
         let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
@@ -16409,11 +16406,9 @@ mod tests {
         let noise_design =
             build_term_collection_design(data.view(), &noisespec).expect("build noise design");
         let meanspec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&meanspec, &mean_design)
-                .expect("freeze mean spec");
-        let noisespec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
-                .expect("freeze noise spec");
+            freeze_term_collection_from_design(&meanspec, &mean_design).expect("freeze mean spec");
+        let noisespec_resolved = freeze_term_collection_from_design(&noisespec, &noise_design)
+            .expect("freeze noise spec");
         let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
@@ -16487,11 +16482,9 @@ mod tests {
         let noise_design =
             build_term_collection_design(data.view(), &noisespec).expect("build noise design");
         let meanspec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&meanspec, &mean_design)
-                .expect("freeze mean spec");
-        let noisespec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
-                .expect("freeze noise spec");
+            freeze_term_collection_from_design(&meanspec, &mean_design).expect("freeze mean spec");
+        let noisespec_resolved = freeze_term_collection_from_design(&noisespec, &noise_design)
+            .expect("freeze noise spec");
         let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
@@ -16575,11 +16568,9 @@ mod tests {
         let noise_design =
             build_term_collection_design(data.view(), &noisespec).expect("build noise design");
         let meanspec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&meanspec, &mean_design)
-                .expect("freeze mean spec");
-        let noisespec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
-                .expect("freeze noise spec");
+            freeze_term_collection_from_design(&meanspec, &mean_design).expect("freeze mean spec");
+        let noisespec_resolved = freeze_term_collection_from_design(&noisespec, &noise_design)
+            .expect("freeze noise spec");
         let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
@@ -16684,11 +16675,9 @@ mod tests {
         let noise_design =
             build_term_collection_design(data.view(), &noisespec).expect("build noise design");
         let meanspec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&meanspec, &mean_design)
-                .expect("freeze mean spec");
-        let noisespec_resolved =
-            freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
-                .expect("freeze noise spec");
+            freeze_term_collection_from_design(&meanspec, &mean_design).expect("freeze mean spec");
+        let noisespec_resolved = freeze_term_collection_from_design(&noisespec, &noise_design)
+            .expect("freeze noise spec");
         let rho = compose_theta_from_hints_test(
             builder.mean_penalty_count(&mean_design),
             builder.noise_penalty_count(&noise_design),
