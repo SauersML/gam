@@ -1089,7 +1089,14 @@ impl BernoulliMarginalSlopePredictor {
             None
         };
 
-        let link_dev_beta_ref = beta_link_dev.as_ref();
+        // Pre-compute owned beta_w once so the IFT body never clones per row.
+        let link_dev_beta_owned = beta_link_dev.as_ref().map(|v| v.to_owned());
+        // Scratch buffers reused across rows (num_nodes ≈ 20).
+        let num_nodes = warped_nodes.len();
+        let mut eta_nodes_buf = Array1::<f64>::zeros(num_nodes);
+        let mut wphi_buf = Array1::<f64>::zeros(num_nodes);
+        let mut wc1_buf = Array1::<f64>::zeros(num_nodes);
+
         for i in 0..n {
             let slope = logslope_eta[i];
             let q = marginal_eta[i];
@@ -1098,50 +1105,70 @@ impl BernoulliMarginalSlopePredictor {
                 slope,
                 &warped_nodes,
                 &quadrature_weights,
-                link_dev_beta_ref.cloned(),
+                beta_link_dev.clone(),
             )?;
 
             if !need_gradient {
                 continue;
             }
 
-            // Reuse converged intercept to compute IFT scalars in the same pass.
+            // Fill eta_nodes scratch from converged intercept (no allocation).
             let intercept = intercepts[i];
-            let eta_nodes = warped_nodes.mapv(|hz| intercept + slope * hz);
-            let linked_nodes = Self::link_values(
-                self.link_deviation_runtime.as_ref(),
-                link_dev_beta_ref.cloned(),
-                &eta_nodes,
-            )?;
-            let linked_d1 = Self::link_derivative(
-                self.link_deviation_runtime.as_ref(),
-                link_dev_beta_ref.cloned(),
-                &eta_nodes,
-            )?;
-            let phi_nodes = linked_nodes.mapv(crate::probability::normal_pdf);
-            let weighted_phi = &quadrature_weights * &phi_nodes;
-            let weighted_c1 = &weighted_phi * &linked_d1;
-            let m_a = weighted_c1.sum().max(1e-12);
+            for k in 0..num_nodes {
+                eta_nodes_buf[k] = intercept + slope * warped_nodes[k];
+            }
+
+            // Inline link_values + link_derivative to compute wphi/wc1 in-place,
+            // and keep the basis matrix for a_w without a redundant design() call.
+            let basis_for_aw = if let (Some(runtime), Some(beta_owned)) =
+                (self.link_deviation_runtime.as_ref(), link_dev_beta_owned.as_ref())
+            {
+                let basis = runtime
+                    .design(&eta_nodes_buf)
+                    .map_err(EstimationError::InvalidInput)?;
+                let d1_basis = runtime
+                    .first_derivative_design(&eta_nodes_buf)
+                    .map_err(EstimationError::InvalidInput)?;
+                for k in 0..num_nodes {
+                    let mut dev = 0.0;
+                    let mut d1_dev = 0.0;
+                    for j in 0..link_dev_dim {
+                        dev += basis[[k, j]] * beta_owned[j];
+                        d1_dev += d1_basis[[k, j]] * beta_owned[j];
+                    }
+                    let phi = crate::probability::normal_pdf(eta_nodes_buf[k] + dev);
+                    wphi_buf[k] = quadrature_weights[k] * phi;
+                    wc1_buf[k] = wphi_buf[k] * (d1_dev + 1.0);
+                }
+                if a_w_rows.is_some() { Some(basis) } else { None }
+            } else {
+                // Identity link: linked = eta, c'= 1.
+                for k in 0..num_nodes {
+                    let phi = crate::probability::normal_pdf(eta_nodes_buf[k]);
+                    wphi_buf[k] = quadrature_weights[k] * phi;
+                    wc1_buf[k] = wphi_buf[k];
+                }
+                None
+            };
+
+            let m_a = wc1_buf.sum().max(1e-12);
             a_q_vec.as_mut().unwrap()[i] = crate::probability::normal_pdf(q) / m_a;
-            a_b_vec.as_mut().unwrap()[i] = -weighted_c1.dot(&warped_nodes) / m_a;
+            a_b_vec.as_mut().unwrap()[i] = -wc1_buf.dot(&warped_nodes) / m_a;
 
             if let (Some(a_h_rows), Some(node_design)) =
                 (a_h_rows.as_mut(), score_warp_node_design.as_ref())
             {
-                let a_h = node_design
-                    .t()
-                    .dot(&weighted_c1)
-                    .mapv(|v| -(slope * v) / m_a);
+                let mut a_h = node_design.t().dot(&wc1_buf);
+                let factor = -slope / m_a;
+                a_h.mapv_inplace(|v| v * factor);
                 a_h_rows.row_mut(i).assign(&a_h);
             }
 
-            if let (Some(a_w_rows), Some(runtime)) =
-                (a_w_rows.as_mut(), self.link_deviation_runtime.as_ref())
+            if let (Some(a_w_rows), Some(basis)) =
+                (a_w_rows.as_mut(), basis_for_aw.as_ref())
             {
-                let basis_nodes = runtime
-                    .design(&eta_nodes)
-                    .map_err(EstimationError::InvalidInput)?;
-                let a_w = basis_nodes.t().dot(&weighted_phi).mapv(|v| -v / m_a);
+                let mut a_w = basis.t().dot(&wphi_buf);
+                a_w.mapv_inplace(|v| -v / m_a);
                 a_w_rows.row_mut(i).assign(&a_w);
             }
         }
@@ -1150,20 +1177,23 @@ impl BernoulliMarginalSlopePredictor {
         let eta_base = &intercepts + &(&logslope_eta * &warped_z);
 
         // Apply link deviation to eta if active (vectorized over all rows).
+        // Reuse link_dev_beta_owned (pre-computed before the solve loop).
         let mut link_c_obs: Option<Array1<f64>> = None;
         let mut link_basis_obs: Option<Array2<f64>> = None;
-        let final_eta = if let (Some(runtime), Some(beta_w)) =
-            (self.link_deviation_runtime.as_ref(), beta_link_dev.as_ref())
+        let final_eta = if let (Some(runtime), Some(beta_owned)) =
+            (self.link_deviation_runtime.as_ref(), link_dev_beta_owned.as_ref())
         {
             let basis = runtime
                 .design(&eta_base)
                 .map_err(EstimationError::InvalidInput)?;
-            let eta = &eta_base + &basis.dot(&beta_w.to_owned());
+            let eta = &eta_base + &basis.dot(beta_owned);
             if need_gradient {
                 let d1 = runtime
                     .first_derivative_design(&eta_base)
                     .map_err(EstimationError::InvalidInput)?;
-                link_c_obs = Some(d1.dot(&beta_w.to_owned()).mapv(|v| v + 1.0));
+                let mut c_obs = d1.dot(beta_owned);
+                c_obs.mapv_inplace(|v| v + 1.0);
+                link_c_obs = Some(c_obs);
                 link_basis_obs = Some(basis);
             }
             eta
