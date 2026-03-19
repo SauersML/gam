@@ -1952,11 +1952,16 @@ fn build_predict_input_for_model(
         PredictModelClass::TransformationNormal => {
             // Build the tensor product design: response_basis(y_new) ⊗ covariate_design(x_new)
             let payload = model.payload();
-            let response_knots = payload.transformation_response_knots.as_ref()
+            let response_knots = payload
+                .transformation_response_knots
+                .as_ref()
                 .ok_or("saved transformation-normal model missing response_knots")?;
-            let response_transform_vecs = payload.transformation_response_transform.as_ref()
+            let response_transform_vecs = payload
+                .transformation_response_transform
+                .as_ref()
                 .ok_or("saved transformation-normal model missing response_transform")?;
-            let response_degree = payload.transformation_response_degree
+            let response_degree = payload
+                .transformation_response_degree
                 .ok_or("saved transformation-normal model missing response_degree")?;
 
             // Reconstruct the transform matrix from nested vecs
@@ -1972,10 +1977,13 @@ fn build_predict_input_for_model(
 
             // Get response column from formula LHS
             let formula_text = &payload.formula;
-            let response_col_name = formula_text.split('~').next()
-                .map(|s| s.trim())
+            let response_col_name = formula_text
+                .split('~')
+                .next()
+                .map(|s: &str| s.trim())
                 .ok_or("cannot parse response column from formula")?;
-            let response_col_idx = *col_map.get(response_col_name)
+            let response_col_idx = *col_map
+                .get(response_col_name)
                 .ok_or_else(|| format!("response column '{}' not found in new data", response_col_name))?;
             let response_new = data.column(response_col_idx).to_owned();
 
@@ -1999,7 +2007,9 @@ fn build_predict_input_for_model(
             let cov_design_full = design;
 
             // Compute h = (resp_val ⊙_row cov_design) @ beta via factored multiply
-            let fit_saved = model.unified()?;
+            let fit_saved = model
+                .unified()
+                .ok_or("saved transformation-normal model missing unified fit")?;
             let beta = &fit_saved.blocks[0].beta;
             let p_cov = cov_design_full.design.ncols();
             if beta.len() != p_resp * p_cov {
@@ -2028,7 +2038,7 @@ fn build_predict_input_for_model(
             }
 
             Ok(PredictInput {
-                design: DesignMatrix::from_dense(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
+                design: DesignMatrix::from(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
                 offset: h,
                 design_noise: None,
                 offset_noise: None,

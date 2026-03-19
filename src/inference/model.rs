@@ -559,7 +559,7 @@ impl FittedModel {
     }
 
     #[inline]
-    fn payload(&self) -> &FittedModelPayload {
+    pub fn payload(&self) -> &FittedModelPayload {
         match self {
             Self::Standard { payload }
             | Self::LocationScale { payload }

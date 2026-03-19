@@ -1649,12 +1649,11 @@ impl BernoulliMarginalSlopeFamily {
 
         let mut lo;
         let mut hi;
-        let mut f_lo;
-        let mut f_hi;
+        let f_lo;
+        let f_hi;
         let mut bracket_step = (0.25 * (1.0 + a.abs())).max(1.0);
         if f_init < 0.0 {
             lo = a;
-            f_lo = f_init;
             let mut found = None;
             for _ in 0..64 {
                 let hi_try = a + bracket_step;
@@ -1664,7 +1663,6 @@ impl BernoulliMarginalSlopeFamily {
                     break;
                 }
                 lo = hi_try;
-                f_lo = f_try;
                 bracket_step *= 2.0;
             }
             let Some((hi_found, f_hi_found)) = found else {
@@ -1675,10 +1673,11 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok((lo, f_deriv_lo.max(1e-30)));
             };
             hi = hi_found;
+            let (f_lo_val, _) = eval(lo)?;
+            f_lo = f_lo_val;
             f_hi = f_hi_found;
         } else {
             hi = a;
-            f_hi = f_init;
             let mut found = None;
             for _ in 0..64 {
                 let lo_try = a - bracket_step;
@@ -1688,7 +1687,6 @@ impl BernoulliMarginalSlopeFamily {
                     break;
                 }
                 hi = lo_try;
-                f_hi = f_try;
                 bracket_step *= 2.0;
             }
             let Some((lo_found, f_lo_found)) = found else {
@@ -1696,6 +1694,8 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok((hi, f_deriv_hi.max(1e-30)));
             };
             lo = lo_found;
+            let (f_hi_val, _) = eval(hi)?;
+            f_hi = f_hi_val;
             f_lo = f_lo_found;
         }
 
@@ -1727,10 +1727,8 @@ impl BernoulliMarginalSlopeFamily {
 
             if f_val < 0.0 {
                 lo = a;
-                f_lo = f_val;
             } else {
                 hi = a;
-                f_hi = f_val;
             }
 
             if (hi - lo) <= 1e-12 * (1.0 + a.abs()) {

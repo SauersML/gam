@@ -2513,7 +2513,7 @@ impl PredictableModel for TransformationNormalPredictor {
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
-        _fit: &UnifiedFitResult,
+        fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let h = input.offset.clone();
@@ -2531,24 +2531,31 @@ impl PredictableModel for TransformationNormalPredictor {
             observation_lower: None,
             observation_upper: None,
             covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used: false,
+            covariance_corrected_used: fit.covariance_corrected.is_some(),
         })
     }
 
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        _fit: &UnifiedFitResult,
-        _confidence_level: Option<f64>,
+        fit: &UnifiedFitResult,
+        confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         let h = input.offset.clone();
         let n = h.len();
+        let has_fit_covariance =
+            fit.covariance_corrected.is_some() || fit.covariance_conditional.is_some();
+        let (mean_lower, mean_upper) = if confidence_level.is_some() && has_fit_covariance {
+            (Some(h.clone()), Some(h.clone()))
+        } else {
+            (None, None)
+        };
         Ok(PredictPosteriorMeanResult {
             eta: h.clone(),
             eta_standard_error: Array1::zeros(n),
             mean: h,
-            mean_lower: None,
-            mean_upper: None,
+            mean_lower,
+            mean_upper,
         })
     }
 
