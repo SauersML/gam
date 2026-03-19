@@ -572,7 +572,7 @@ impl HyperOperator for BlockHessianOperator {
     }
 
     fn is_implicit(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -1918,6 +1918,7 @@ impl SurvivalMarginalSlopeFamily {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi: acc.to_dense(&slices),
+            hessian_psi_psi_operator: None,
         }))
     }
 

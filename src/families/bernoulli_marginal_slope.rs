@@ -1280,8 +1280,30 @@ impl BernoulliMarginalSlopeFamily {
                 block_states,
                 &cache.h_nodes,
                 cache.score_warp_obs.as_ref(),
+                LinkOrder::Hessian,
             )
         }
+    }
+
+    /// Build a row context with full derivative stacks (d3+d4) for outer
+    /// higher-order paths.  Falls back to the cached Hessian-order context
+    /// when link deviation is inactive (d3/d4 are all zero anyway).
+    fn row_context_full_order(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
+        if self.link_dev.is_none() {
+            return self.row_context_from_cache(row, block_states, cache);
+        }
+        self.build_row_exact_context(
+            row,
+            block_states,
+            &cache.h_nodes,
+            cache.score_warp_obs.as_ref(),
+            LinkOrder::Full,
+        )
     }
 
     fn build_exact_eval_cache(
@@ -2743,6 +2765,7 @@ impl BernoulliMarginalSlopeFamily {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi,
+            hessian_psi_psi_operator: None,
         }))
     }
 
@@ -3590,73 +3613,47 @@ pub fn fit_bernoulli_marginal_slope_terms(
         .as_ref()
         .map(|cfg| build_deviation_block_from_seed(&spec.z, cfg))
         .transpose()?;
-    let rigid_family = BernoulliMarginalSlopeFamily {
-        y: Arc::clone(&y),
-        weights: Arc::clone(&weights),
-        z: Arc::clone(&z),
-        marginal_design: marginal_design.design.clone(),
-        logslope_design: logslope_design.design.clone(),
-        quadrature_nodes: quad_nodes.clone(),
-        quadrature_weights: quad_weights.clone(),
-        score_warp: None,
-        score_warp_obs_design: None,
-        cached_score_warp_constraints: None,
-        link_dev: None,
-        cached_link_dev_constraints: None,
-    };
-    let rigid_blocks = vec![
-        build_blockspec(
-            "marginal_surface",
-            &marginal_design,
-            baseline.0,
-            Array1::zeros(marginal_design.penalties.len()),
-            None,
-        ),
-        build_blockspec(
-            "logslope_surface",
-            &logslope_design,
-            baseline.1,
-            Array1::zeros(logslope_design.penalties.len()),
-            None,
-        ),
-    ];
-    let rigid_fit = inner_fit(&rigid_family, &rigid_blocks, options)?;
-    let q0_seed = {
-        let marginal_eta = &rigid_fit.block_states[0].eta;
-        let logslope_eta = &rigid_fit.block_states[1].eta;
-        Array1::from_iter((0..marginal_eta.len()).map(|i| {
-            let b = logslope_eta[i]; // signed slope (no exp)
-            marginal_eta[i] * (1.0 + b * b).sqrt() + b * spec.z[i]
-        }))
-    };
-    // Pad the link-deviation seed with a conservative envelope so the basis
-    // support covers the domain that will be reached during flexible joint
-    // optimization, not just the rigid-seed range.  The padding is 50% of
-    // the IQR on each side, which is generous enough to absorb score-warp
-    // induced shifts without letting the knots spread too thin.
-    let link_dev_seed = {
-        let mut sorted = q0_seed.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n_s = sorted.len();
-        if n_s >= 4 {
-            let q1 = sorted[n_s / 4];
-            let q3 = sorted[3 * n_s / 4];
-            let iqr = (q3 - q1).max(1.0);
-            let pad = 0.5 * iqr;
-            let lo = sorted[0] - pad;
-            let hi = sorted[n_s - 1] + pad;
-            let mut padded = q0_seed.to_vec();
-            padded.push(lo);
-            padded.push(hi);
-            Array1::from_vec(padded)
-        } else {
-            q0_seed.clone()
-        }
-    };
+    // Build the link-deviation block if requested.  The seed only determines
+    // knot placement for the deviation basis, so we use the closed-form
+    // pooled-intercept probit solution instead of a full rigid pilot solve
+    // (which would double total work at biobank scale):
+    //   q0 ≈ a0 · √(1 + b0²) + b0 · z[i]
+    // where (a0, b0) = pooled_probit_baseline.
     let link_dev_prepared = spec
         .link_dev
         .as_ref()
-        .map(|cfg| build_deviation_block_from_seed(&link_dev_seed, cfg))
+        .map(|cfg| {
+            let a0 = baseline.0;
+            let b0 = baseline.1;
+            let scale = (1.0 + b0 * b0).sqrt();
+            let q0_seed =
+                Array1::from_iter(spec.z.iter().map(|&zi| a0 * scale + b0 * zi));
+            // Pad with a conservative envelope so the basis support covers
+            // the domain reached during flexible joint optimization, not just
+            // the baseline range.  Padding is 50 % of the IQR on each side.
+            let link_dev_seed = {
+                let mut sorted = q0_seed.to_vec();
+                sorted.sort_by(|a, b| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let n_s = sorted.len();
+                if n_s >= 4 {
+                    let q1 = sorted[n_s / 4];
+                    let q3 = sorted[3 * n_s / 4];
+                    let iqr = (q3 - q1).max(1.0);
+                    let pad = 0.5 * iqr;
+                    let lo = sorted[0] - pad;
+                    let hi = sorted[n_s - 1] + pad;
+                    let mut padded = q0_seed.to_vec();
+                    padded.push(lo);
+                    padded.push(hi);
+                    Array1::from_vec(padded)
+                } else {
+                    q0_seed
+                }
+            };
+            build_deviation_block_from_seed(&link_dev_seed, cfg)
+        })
         .transpose()?;
 
     let extra_rho0 = {
