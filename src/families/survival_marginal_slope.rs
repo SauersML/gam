@@ -21,8 +21,6 @@ use crate::families::gamlss::{
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::families::survival_location_scale::TimeBlockInput;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
-#[cfg(test)]
-use crate::matrix::DenseDesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -2200,6 +2198,137 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
     }
 }
 
+// ── RowKernel<4> implementation ───────────────────────────────────────
+
+struct SurvivalMarginalSlopeRowKernel {
+    family: SurvivalMarginalSlopeFamily,
+    block_states: Vec<ParameterBlockState>,
+    slices: BlockSlices,
+}
+
+impl SurvivalMarginalSlopeRowKernel {
+    fn new(family: SurvivalMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
+        let slices = block_slices(&block_states);
+        Self { family, block_states, slices }
+    }
+}
+
+impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
+    fn n_rows(&self) -> usize { self.family.n }
+    fn n_coefficients(&self) -> usize { self.slices.total }
+
+    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+        let beta_time = &self.block_states[0].beta;
+        let beta_marginal = &self.block_states[1].beta;
+        let q0 = self.family.design_entry.dot_row(row, beta_time)
+            + self.family.offset_entry[row]
+            + self.family.marginal_design.dot_row(row, beta_marginal);
+        let q1 = self.family.design_exit.dot_row(row, beta_time)
+            + self.family.offset_exit[row]
+            + self.family.marginal_design.dot_row(row, beta_marginal);
+        let qd1 = self.family.design_derivative_exit.dot_row(row, beta_time)
+            + self.family.derivative_offset_exit[row];
+        let g = self.block_states[2].eta[row];
+        row_primary_closed_form(
+            q0, q1, qd1, g,
+            self.family.z[row], self.family.weights[row],
+            self.family.event[row], self.family.derivative_guard,
+        )
+    }
+
+    fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
+        let d_beta = ndarray::ArrayView1::from(d_beta);
+        let d_time = d_beta.slice(s![self.slices.time.clone()]);
+        let d_marginal = d_beta.slice(s![self.slices.marginal.clone()]);
+        let d_logslope = d_beta.slice(s![self.slices.logslope.clone()]);
+        [
+            self.family.design_entry.dot_row_view(row, d_time)
+                + self.family.marginal_design.dot_row_view(row, d_marginal),
+            self.family.design_exit.dot_row_view(row, d_time)
+                + self.family.marginal_design.dot_row_view(row, d_marginal),
+            self.family.design_derivative_exit.dot_row_view(row, d_time),
+            self.family.logslope_design.dot_row_view(row, d_logslope),
+        ]
+    }
+
+    fn jacobian_transpose_action(&self, row: usize, v: &[f64; 4], out: &mut [f64]) {
+        {
+            let mut time = ndarray::ArrayViewMut1::from(&mut out[self.slices.time.clone()]);
+            self.family.design_entry.axpy_row_into(row, v[0], &mut time)
+                .expect("time entry axpy dim mismatch");
+            self.family.design_exit.axpy_row_into(row, v[1], &mut time)
+                .expect("time exit axpy dim mismatch");
+            self.family.design_derivative_exit.axpy_row_into(row, v[2], &mut time)
+                .expect("time deriv axpy dim mismatch");
+        }
+        {
+            let mut marginal = ndarray::ArrayViewMut1::from(&mut out[self.slices.marginal.clone()]);
+            self.family.marginal_design.axpy_row_into(row, v[0] + v[1], &mut marginal)
+                .expect("marginal axpy dim mismatch");
+        }
+        {
+            let mut logslope = ndarray::ArrayViewMut1::from(&mut out[self.slices.logslope.clone()]);
+            self.family.logslope_design.axpy_row_into(row, v[3], &mut logslope)
+                .expect("logslope axpy dim mismatch");
+        }
+    }
+
+    fn add_pullback_hessian(&self, row: usize, h: &[[f64; 4]; 4], target: &mut Array2<f64>) {
+        let mut h_arr = Array2::<f64>::zeros((4, 4));
+        for a in 0..4 { for b in 0..4 { h_arr[[a, b]] = h[a][b]; } }
+        self.family.add_pullback_primary_hessian(target, row, &self.slices, &h_arr);
+    }
+
+    fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 4]; 4], diag: &mut [f64]) {
+        let designs: [(usize, &DesignMatrix); 3] = [
+            (0, &self.family.design_entry),
+            (1, &self.family.design_exit),
+            (2, &self.family.design_derivative_exit),
+        ];
+        for &(pi, des) in &designs {
+            {
+                let mut td = ndarray::ArrayViewMut1::from(&mut diag[self.slices.time.clone()]);
+                des.squared_axpy_row_into(row, h[pi][pi], &mut td)
+                    .expect("time squared_axpy dim mismatch");
+            }
+            for &(pj, des_j) in &designs {
+                if pj <= pi { continue; }
+                let mut td = ndarray::ArrayViewMut1::from(&mut diag[self.slices.time.clone()]);
+                des.crossdiag_axpy_row_into(row, des_j, 2.0 * h[pi][pj], &mut td)
+                    .expect("time crossdiag dim mismatch");
+            }
+        }
+        {
+            let alpha = h[0][0] + 2.0 * h[0][1] + h[1][1];
+            let mut md = ndarray::ArrayViewMut1::from(&mut diag[self.slices.marginal.clone()]);
+            self.family.marginal_design.squared_axpy_row_into(row, alpha, &mut md)
+                .expect("marginal squared_axpy dim mismatch");
+        }
+        {
+            let mut gd = ndarray::ArrayViewMut1::from(&mut diag[self.slices.logslope.clone()]);
+            self.family.logslope_design.squared_axpy_row_into(row, h[3][3], &mut gd)
+                .expect("logslope squared_axpy dim mismatch");
+        }
+    }
+
+    fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
+        let dir_arr = Array1::from_vec(dir.to_vec());
+        let out = self.family.row_primary_third_contracted(row, &self.block_states, &dir_arr)?;
+        let mut r = [[0.0; 4]; 4];
+        for a in 0..4 { for b in 0..4 { r[a][b] = out[[a, b]]; } }
+        Ok(r)
+    }
+
+    fn row_fourth_contracted(&self, row: usize, dir_u: &[f64; 4], dir_v: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
+        let u = Array1::from_vec(dir_u.to_vec());
+        let v = Array1::from_vec(dir_v.to_vec());
+        let out = self.family.row_primary_fourth_contracted(row, &self.block_states, &u, &v)?;
+        let mut r = [[0.0; 4]; 4];
+        for a in 0..4 { for b in 0..4 { r[a][b] = out[[a, b]]; } }
+        Ok(r)
+    }
+}
+
 impl SurvivalMarginalSlopeFamily {
     fn evaluate_blockwise_exact_newton(
         &self,
@@ -3362,9 +3491,9 @@ mod tests {
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
             derivative_guard: 1e-4,
-            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 1)))),
-            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 1)))),
-            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::ones((
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 1)))),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 1)))),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones((
                 1, 1,
             )))),
             offset_entry: Arc::new(Array1::zeros(1)),
@@ -3417,14 +3546,14 @@ mod tests {
             weights: Arc::new(array![1.2]),
             z: Arc::new(array![0.3]),
             derivative_guard: 1e-6,
-            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
-            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.8]])),
-            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.4]])),
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.8]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.4]])),
             offset_entry: Arc::new(array![0.1]),
             offset_exit: Arc::new(array![-0.2]),
             derivative_offset_exit: Arc::new(array![0.05]),
-            marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
-            logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             time_linear_constraints: None,
         };
         let block_states = vec![
@@ -3479,14 +3608,14 @@ mod tests {
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
             derivative_guard: 1e-4,
-            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.0]])),
-            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.0]])),
-            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![0.0]),
-            marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 0)))),
-            logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
             time_linear_constraints: None,
         };
         let block_states = vec![
@@ -3529,21 +3658,21 @@ mod tests {
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
             derivative_guard: 1e-6,
-            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, 0.0]])),
-            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, 0.0]])),
-            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0, 0.0
             ]])),
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![1e-6]),
-            marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 0)))),
-            logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
             time_linear_constraints: monotone_wiggle_nonnegative_constraints(2),
         };
         let spec = ParameterBlockSpec {
             name: "time_surface".to_string(),
-            design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
             offset: Array1::zeros(1),
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),

@@ -3540,7 +3540,7 @@ impl SparseHessianAccumulator {
     /// and `(cb, ca)` are mapped to the same upper-triangle slot.
     #[inline(always)]
     pub fn add_upper(&mut self, r: usize, c: usize, val: f64) {
-        debug_assert!(r <= c, "add_upper requires r <= c, got ({r}, {c})");
+        assert!(r <= c, "add_upper requires r <= c, got ({r}, {c})");
         let s = &*self.sym;
         if s.contiguous {
             // O(1) direct-index path: rows within each column are contiguous
