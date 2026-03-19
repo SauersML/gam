@@ -3532,17 +3532,21 @@ impl SparseHessianAccumulator {
 
     // ── accumulation ─────────────────────────────────────────────────
 
-    /// Add `val` to the upper-triangle entry `(row, col)`.
-    /// Caller must ensure `(min(row,col), max(row,col))` is in the pattern.
+    /// Add `val` to the upper-triangle entry `(r, c)`.
+    ///
+    /// **Caller must ensure `r <= c`.**  This method does NOT canonicalize —
+    /// it is the caller's responsibility to only emit upper-triangle pairs.
+    /// This avoids the double-counting bug that arises when both `(ca, cb)`
+    /// and `(cb, ca)` are mapped to the same upper-triangle slot.
     #[inline(always)]
-    pub fn add(&mut self, row: usize, col: usize, val: f64) {
-        let (r, c) = if row <= col { (row, col) } else { (col, row) };
+    pub fn add_upper(&mut self, r: usize, c: usize, val: f64) {
+        debug_assert!(r <= c, "add_upper requires r <= c, got ({r}, {c})");
         let s = &*self.sym;
         if s.contiguous {
             // O(1) direct-index path: rows within each column are contiguous
             // integers starting at first_row[c], so the offset is arithmetic.
             let idx = s.col_ptrs[c] + (r - s.first_row[c]);
-            debug_assert!(idx < s.col_ptrs[c + 1], "SparseHessianAccumulator::add contiguous OOB");
+            debug_assert!(idx < s.col_ptrs[c + 1], "add_upper contiguous OOB");
             unsafe { *self.values.get_unchecked_mut(idx) += val; }
         } else {
             // Fallback linear scan for non-contiguous patterns.
@@ -3556,7 +3560,7 @@ impl SparseHessianAccumulator {
                 }
             }
             #[cfg(debug_assertions)]
-            unreachable!("SparseHessianAccumulator::add: ({r}, {c}) not in pattern");
+            unreachable!("SparseHessianAccumulator::add_upper: ({r}, {c}) not in pattern");
         }
     }
 

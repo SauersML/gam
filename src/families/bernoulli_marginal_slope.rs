@@ -618,6 +618,144 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
     (weight * k1, weight * k2, weight * k3, weight * k4)
 }
 
+/// Rigid probit scalar kernel: closed-form derivatives up to 4th order.
+///
+/// η = q·c(g) + g·z,  c(g) = √(1+g²),  s = 2y−1,  m = s·η.
+/// u_k absorb weight and sign: u1=w·s·κ₁, u2=w·κ₂, u3=w·s·κ₃, u4=w·κ₄.
+struct RigidProbitKernel {
+    logcdf: f64,
+    u1: f64,
+    u2: f64,
+    u3: f64,
+    u4: f64,
+    c: f64,
+    c1: f64,
+    c2: f64,
+    c3: f64,
+    c4: f64,
+    eta_q: f64,
+    eta_g: f64,
+}
+
+impl RigidProbitKernel {
+    #[inline]
+    fn new(q: f64, g: f64, z: f64, y: f64, w: f64) -> Self {
+        let s = 2.0 * y - 1.0;
+        let g2 = g * g;
+        let c = (1.0 + g2).sqrt();
+        let c1 = g / c;
+        let c_inv3 = 1.0 / (c * c * c);
+        let c_inv5 = c_inv3 / (c * c);
+        let c_inv7 = c_inv5 / (c * c);
+        let eta = q * c + g * z;
+        let m = s * eta;
+        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
+        let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w);
+        Self {
+            logcdf,
+            u1: s * k1,
+            u2: k2,
+            u3: s * k3,
+            u4: k4,
+            c,
+            c1,
+            c2: c_inv3,
+            c3: -3.0 * g * c_inv5,
+            c4: (12.0 * g2 - 3.0) * c_inv7,
+            eta_q: c,
+            eta_g: q * c1 + z,
+        }
+    }
+
+    #[inline]
+    fn primary_hessian(&self, q: f64) -> [[f64; 2]; 2] {
+        let h00 = self.u2 * self.eta_q * self.eta_q;
+        let h01 = self.u2 * self.eta_q * self.eta_g + self.u1 * self.c1;
+        let h11 = self.u2 * self.eta_g * self.eta_g + self.u1 * q * self.c2;
+        [[h00, h01], [h01, h11]]
+    }
+
+    #[inline]
+    fn third_contracted(&self, q: f64, dq: f64, dg: f64) -> [[f64; 2]; 2] {
+        let dd = self.eta_q * dq + self.eta_g * dg;
+        let dd_q = self.c1 * dg;
+        let dd_g = self.c1 * dq + q * self.c2 * dg;
+        let dd_qg = self.c2 * dg;
+        let dd_gg = self.c2 * dq + q * self.c3 * dg;
+        let t00 = self.u3 * self.eta_q * self.eta_q * dd
+            + self.u2 * 2.0 * self.eta_q * dd_q;
+        let t01 = self.u3 * self.eta_q * self.eta_g * dd
+            + self.u2 * (self.c1 * dd + self.eta_q * dd_g + self.eta_g * dd_q)
+            + self.u1 * dd_qg;
+        let t11 = self.u3 * self.eta_g * self.eta_g * dd
+            + self.u2 * (q * self.c2 * dd + 2.0 * self.eta_g * dd_g)
+            + self.u1 * dd_gg;
+        [[t00, t01], [t01, t11]]
+    }
+
+    #[inline]
+    fn fourth_contracted(
+        &self,
+        q: f64,
+        uq: f64,
+        ug: f64,
+        vq: f64,
+        vg: f64,
+    ) -> [[f64; 2]; 2] {
+        let du = self.eta_q * uq + self.eta_g * ug;
+        let dv = self.eta_q * vq + self.eta_g * vg;
+        let du_a = [self.c1 * ug, self.c1 * uq + q * self.c2 * ug];
+        let dv_a = [self.c1 * vg, self.c1 * vq + q * self.c2 * vg];
+        let du_ab = [
+            [0.0, self.c2 * ug],
+            [self.c2 * ug, self.c2 * uq + q * self.c3 * ug],
+        ];
+        let dv_ab = [
+            [0.0, self.c2 * vg],
+            [self.c2 * vg, self.c2 * vq + q * self.c3 * vg],
+        ];
+        let dduv = self.c1 * (uq * vg + ug * vq) + q * self.c2 * ug * vg;
+        let dduv_a = [
+            self.c2 * ug * vg,
+            self.c2 * (uq * vg + ug * vq) + q * self.c3 * ug * vg,
+        ];
+        let dduv_ab = [
+            [0.0, self.c3 * ug * vg],
+            [
+                self.c3 * ug * vg,
+                self.c3 * (uq * vg + ug * vq) + q * self.c4 * ug * vg,
+            ],
+        ];
+        let eta_a = [self.eta_q, self.eta_g];
+        let eta_ab = [[0.0, self.c1], [self.c1, q * self.c2]];
+        let mut f = [[0.0f64; 2]; 2];
+        for a in 0..2 {
+            for b in a..2 {
+                let val = self.u4 * eta_a[a] * eta_a[b] * du * dv
+                    + self.u3
+                        * (eta_ab[a][b] * du * dv
+                            + du_a[a] * eta_a[b] * dv
+                            + dv_a[a] * eta_a[b] * du
+                            + du_a[b] * eta_a[a] * dv
+                            + dv_a[b] * eta_a[a] * du
+                            + dduv * eta_a[a] * eta_a[b])
+                    + self.u2
+                        * (eta_ab[a][b] * dduv
+                            + du_a[a] * dv_a[b]
+                            + dv_a[a] * du_a[b]
+                            + du_ab[a][b] * dv
+                            + dv_ab[a][b] * du
+                            + eta_a[b] * dduv_a[a]
+                            + eta_a[a] * dduv_a[b])
+                    + self.u1 * dduv_ab[a][b];
+                f[a][b] = val;
+                f[b][a] = val;
+            }
+        }
+        f
+    }
+}
+
 pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     let s = x.max(1e-300).sqrt();
     let x1 = x.max(1e-300);

@@ -2471,6 +2471,9 @@ impl SurvivalMarginalSlopeFamily {
                     }
 
                     // ── time Hessian: 3×3 cross-product scatter ──────────
+                    // Only emit upper-triangle entries (ca <= cb) to avoid
+                    // double-counting: SymmetricMatrix::Sparse mirrors the
+                    // upper triangle into the lower.
                     let row_slices: [(std::ops::Range<usize>, &[usize], &[f64]); 3] = [
                         (e_rp[row]..e_rp[row + 1], e_ci, e_v),
                         (x_rp[row]..x_rp[row + 1], x_ci, x_v),
@@ -2489,22 +2492,29 @@ impl SurvivalMarginalSlopeFamily {
                                 let ca = cia[pi];
                                 let xia = va[pi] * alpha;
                                 for pj in rb.clone() {
-                                    ht.add(ca, cib[pj], xia * vb[pj]);
+                                    let cb = cib[pj];
+                                    if ca <= cb {
+                                        ht.add_upper(ca, cb, xia * vb[pj]);
+                                    }
                                 }
                             }
                         }
                     }
 
                     // ── marginal Hessian: symmetric rank-1 scatter ───────
+                    // CSR column indices are sorted, so pj >= pi ⟹ cb >= ca,
+                    // giving us the upper triangle directly.
                     let alpha_m =
                         f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
                     if alpha_m != 0.0 {
                         let hm = &mut acc.5;
-                        for pi in m_rp[row]..m_rp[row + 1] {
+                        let m_start = m_rp[row];
+                        let m_end = m_rp[row + 1];
+                        for pi in m_start..m_end {
                             let ca = m_ci[pi];
                             let xia = m_v[pi] * alpha_m;
-                            for pj in m_rp[row]..m_rp[row + 1] {
-                                hm.add(ca, m_ci[pj], xia * m_v[pj]);
+                            for pj in pi..m_end {
+                                hm.add_upper(ca, m_ci[pj], xia * m_v[pj]);
                             }
                         }
                     }
@@ -2513,11 +2523,13 @@ impl SurvivalMarginalSlopeFamily {
                     let alpha_g = f_pipi[[3, 3]];
                     if alpha_g != 0.0 {
                         let hg = &mut acc.6;
-                        for pi in g_rp[row]..g_rp[row + 1] {
+                        let g_start = g_rp[row];
+                        let g_end = g_rp[row + 1];
+                        for pi in g_start..g_end {
                             let ca = g_ci[pi];
                             let xia = g_v[pi] * alpha_g;
-                            for pj in g_rp[row]..g_rp[row + 1] {
-                                hg.add(ca, g_ci[pj], xia * g_v[pj]);
+                            for pj in pi..g_end {
+                                hg.add_upper(ca, g_ci[pj], xia * g_v[pj]);
                             }
                         }
                     }
