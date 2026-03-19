@@ -905,12 +905,12 @@ impl BernoulliMarginalSlopePredictor {
         // Rigid warm start: a₀ = q·√(1+b²).  With affine link L(u) ≈ ℓ₀+ℓ₁·u,
         // exact intercept is (q·√(1+ℓ₁²b²) − ℓ₀) / ℓ₁.
         let mut intercept = marginal_eta * (1.0 + slope * slope).sqrt();
-        if let (Some(runtime), Some(beta)) =
-            (self.link_deviation_runtime.as_ref(), link_dev_beta)
-        {
+        if let (Some(runtime), Some(beta)) = (self.link_deviation_runtime.as_ref(), link_dev_beta) {
             eta_nodes_buf[0] = intercept;
             let one_pt = eta_nodes_buf.slice(ndarray::s![0..1]).to_owned();
-            let basis = runtime.design(&one_pt).map_err(EstimationError::InvalidInput)?;
+            let basis = runtime
+                .design(&one_pt)
+                .map_err(EstimationError::InvalidInput)?;
             let d1_basis = runtime
                 .first_derivative_design(&one_pt)
                 .map_err(EstimationError::InvalidInput)?;
@@ -1139,9 +1139,10 @@ impl BernoulliMarginalSlopePredictor {
 
             // Inline link_values + link_derivative to compute wphi/wc1 in-place,
             // and keep the basis matrix for a_w without a redundant design() call.
-            let basis_for_aw = if let (Some(runtime), Some(beta_owned)) =
-                (self.link_deviation_runtime.as_ref(), link_dev_beta_owned.as_ref())
-            {
+            let basis_for_aw = if let (Some(runtime), Some(beta_owned)) = (
+                self.link_deviation_runtime.as_ref(),
+                link_dev_beta_owned.as_ref(),
+            ) {
                 let basis = runtime
                     .design(&eta_nodes_buf)
                     .map_err(EstimationError::InvalidInput)?;
@@ -1159,7 +1160,11 @@ impl BernoulliMarginalSlopePredictor {
                     wphi_buf[k] = quadrature_weights[k] * phi;
                     wc1_buf[k] = wphi_buf[k] * (d1_dev + 1.0);
                 }
-                if a_w_rows.is_some() { Some(basis) } else { None }
+                if a_w_rows.is_some() {
+                    Some(basis)
+                } else {
+                    None
+                }
             } else {
                 // Identity link: linked = eta, c'= 1.
                 for k in 0..num_nodes {
@@ -1183,9 +1188,7 @@ impl BernoulliMarginalSlopePredictor {
                 a_h_rows.row_mut(i).assign(&a_h);
             }
 
-            if let (Some(a_w_rows), Some(basis)) =
-                (a_w_rows.as_mut(), basis_for_aw.as_ref())
-            {
+            if let (Some(a_w_rows), Some(basis)) = (a_w_rows.as_mut(), basis_for_aw.as_ref()) {
                 let mut a_w = basis.t().dot(&wphi_buf);
                 a_w.mapv_inplace(|v| -v / m_a);
                 a_w_rows.row_mut(i).assign(&a_w);
@@ -1199,9 +1202,10 @@ impl BernoulliMarginalSlopePredictor {
         // Reuse link_dev_beta_owned (pre-computed before the solve loop).
         let mut link_c_obs: Option<Array1<f64>> = None;
         let mut link_basis_obs: Option<Array2<f64>> = None;
-        let final_eta = if let (Some(runtime), Some(beta_owned)) =
-            (self.link_deviation_runtime.as_ref(), link_dev_beta_owned.as_ref())
-        {
+        let final_eta = if let (Some(runtime), Some(beta_owned)) = (
+            self.link_deviation_runtime.as_ref(),
+            link_dev_beta_owned.as_ref(),
+        ) {
             let basis = runtime
                 .design(&eta_base)
                 .map_err(EstimationError::InvalidInput)?;
@@ -1259,8 +1263,7 @@ impl BernoulliMarginalSlopePredictor {
                 {
                     let slope = logslope_eta[i];
                     for j in 0..score_warp_dim {
-                        row[score_warp_offset + j] =
-                            a_h_rows[[i, j]] + slope * obs_design[[i, j]];
+                        row[score_warp_offset + j] = a_h_rows[[i, j]] + slope * obs_design[[i, j]];
                     }
                 }
 

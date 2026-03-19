@@ -72,11 +72,7 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// Returns the K×K matrix of third derivatives contracted with one
     /// primary-space direction. Used for first directional derivatives of
     /// the Hessian (REML outer gradient).
-    fn row_third_contracted(
-        &self,
-        row: usize,
-        dir: &[f64; K],
-    ) -> Result<[[f64; K]; K], String>;
+    fn row_third_contracted(&self, row: usize, dir: &[f64; K]) -> Result<[[f64; K]; K], String>;
 
     /// Fourth-order contracted derivative: `∂⁴ℓ_i / (∂p_a ∂p_b ∂[dir_u] ∂[dir_v])`.
     ///

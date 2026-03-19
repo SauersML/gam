@@ -8900,9 +8900,21 @@ mod tests {
     #[test]
     fn identified_time_block_uses_nonnegative_time_constraints() {
         let time_block = TimeBlockInput {
-            design_entry: DesignMatrix::from(array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]]),
-            design_exit: DesignMatrix::from(array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]]),
-            design_derivative_exit: DesignMatrix::from(array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]]),
+            design_entry: DesignMatrix::from(array![
+                [1.0, 0.0, 0.2],
+                [1.0, 1.0, 0.5],
+                [1.0, 2.0, 1.0]
+            ]),
+            design_exit: DesignMatrix::from(array![
+                [1.0, 0.5, 0.3],
+                [1.0, 1.5, 0.8],
+                [1.0, 2.5, 1.4]
+            ]),
+            design_derivative_exit: DesignMatrix::from(array![
+                [0.0, 1.0, 0.2],
+                [0.0, 1.0, 0.3],
+                [0.0, 1.0, 0.4]
+            ]),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
