@@ -10,9 +10,9 @@ use crate::custom_family::{
 use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
-    MultiDirJet, signed_probit_logcdf_and_mills_ratio,
-    signed_probit_neglog_derivatives_up_to_fourth, unary_derivatives_log,
-    unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi, unary_derivatives_sqrt,
+    signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
+    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
+    unary_derivatives_sqrt,
 };
 use crate::families::gamlss::{
     monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta,
@@ -137,6 +137,120 @@ fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String
         _ => Err(format!(
             "survival marginal-slope spatial psi loading requested for unsupported block {block_idx}"
         )),
+    }
+}
+
+fn jet_subset_partitions(mask: usize) -> Vec<Vec<usize>> {
+    if mask == 0 {
+        return vec![Vec::new()];
+    }
+    let first = mask & mask.wrapping_neg();
+    let rest = mask ^ first;
+    let mut out = Vec::new();
+    let mut subset = rest;
+    loop {
+        let block = first | subset;
+        for mut remainder in jet_subset_partitions(rest ^ subset) {
+            remainder.push(block);
+            out.push(remainder);
+        }
+        if subset == 0 {
+            break;
+        }
+        subset = (subset - 1) & rest;
+    }
+    out
+}
+
+#[derive(Clone)]
+struct MultiDirJet {
+    coeffs: Vec<f64>,
+}
+
+impl MultiDirJet {
+    fn zero(n_dirs: usize) -> Self {
+        Self {
+            coeffs: vec![0.0; 1usize << n_dirs],
+        }
+    }
+
+    fn constant(n_dirs: usize, value: f64) -> Self {
+        let mut out = Self::zero(n_dirs);
+        out.coeffs[0] = value;
+        out
+    }
+
+    fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
+        let mut out = Self::constant(n_dirs, base);
+        for (idx, &value) in first.iter().take(n_dirs).enumerate() {
+            out.coeffs[1usize << idx] = value;
+        }
+        out
+    }
+
+    fn full_mask(&self) -> usize {
+        self.coeffs.len() - 1
+    }
+
+    fn coeff(&self, mask: usize) -> f64 {
+        self.coeffs[mask]
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        Self {
+            coeffs: self
+                .coeffs
+                .iter()
+                .zip(other.coeffs.iter())
+                .map(|(l, r)| l + r)
+                .collect(),
+        }
+    }
+
+    fn scale(&self, scalar: f64) -> Self {
+        Self {
+            coeffs: self.coeffs.iter().map(|v| scalar * v).collect(),
+        }
+    }
+
+    fn mul(&self, other: &Self) -> Self {
+        let count = self.coeffs.len();
+        let mut out = vec![0.0; count];
+        for mask in 0..count {
+            let mut total = 0.0;
+            let mut submask = mask;
+            loop {
+                total += self.coeffs[submask] * other.coeffs[mask ^ submask];
+                if submask == 0 {
+                    break;
+                }
+                submask = (submask - 1) & mask;
+            }
+            out[mask] = total;
+        }
+        Self { coeffs: out }
+    }
+
+    fn compose_unary(&self, derivs: [f64; 5]) -> Self {
+        let count = self.coeffs.len();
+        let mut out = vec![0.0; count];
+        out[0] = derivs[0];
+        for (mask, value) in out.iter_mut().enumerate().skip(1) {
+            let mut total = 0.0;
+            for partition in jet_subset_partitions(mask) {
+                let order = partition.len();
+                if order == 0 || order >= derivs.len() {
+                    continue;
+                }
+                let mut prod = 1.0;
+                for block in partition {
+                    prod *= self.coeffs[block];
+                }
+                total += derivs[order] * prod;
+            }
+            *value = total;
+        }
+        Self { coeffs: out }
     }
 }
 
@@ -3463,7 +3577,7 @@ pub fn fit_survival_marginal_slope_terms(
 mod tests {
     use super::*;
     use crate::custom_family::CustomFamily;
-    use crate::matrix::SymmetricMatrix;
+    use crate::matrix::{DenseDesignMatrix, SymmetricMatrix};
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::array;
 

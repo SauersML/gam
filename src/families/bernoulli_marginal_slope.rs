@@ -14,6 +14,7 @@ use crate::custom_family::{
 };
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::estimate::{fit_gam, FitOptions, UnifiedFitResult};
+use crate::estimate::reml::unified::HyperOperator;
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
 use crate::families::gamlss::{initializewiggle_knots_from_seed, ParameterBlockInput};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
@@ -1002,6 +1003,359 @@ fn unit_primary_direction(primary: &PrimarySlices, idx: usize) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(primary.total);
     out[idx] = 1.0;
     out
+}
+
+// ── Block-local Hessian accumulator for Bernoulli marginal-slope ─────
+//
+// The two large blocks are marginal (p_m) and logslope (p_g).
+// Optional h/w blocks are tiny (1-5 params each), so their contributions
+// go into a dense p_total x p_total correction matrix.  The main savings
+// is avoiding O(n * (p_m^2 + p_g^2)) dense accumulation into a full p*p target.
+
+struct BernoulliBlockHessianAccumulator {
+    h_mm: Array2<f64>,
+    h_gg: Array2<f64>,
+    h_mg: Array2<f64>,
+    dense_correction: Option<Array2<f64>>,
+}
+
+impl BernoulliBlockHessianAccumulator {
+    fn new(slices: &BlockSlices) -> Self {
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let has_hw = slices.h.is_some() || slices.w.is_some();
+        Self {
+            h_mm: Array2::zeros((p_m, p_m)),
+            h_gg: Array2::zeros((p_g, p_g)),
+            h_mg: Array2::zeros((p_m, p_g)),
+            dense_correction: if has_hw {
+                Some(Array2::zeros((slices.total, slices.total)))
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Accumulate a primary-space Hessian into block-local matrices.
+    /// The marginal block uses H[0,0], logslope uses H[1,1],
+    /// cross uses H[0,1].  All h/w cross-blocks go to dense_correction.
+    fn add_pullback(
+        &mut self,
+        family: &BernoulliMarginalSlopeFamily,
+        row: usize,
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        primary_hessian: &Array2<f64>,
+    ) {
+        let h = primary_hessian;
+
+        // marginal x marginal: H[0,0] * x_row outer x_row
+        family
+            .marginal_design
+            .syr_row_into(row, h[[0, 0]], &mut self.h_mm)
+            .expect("marginal syr_row_into dimension mismatch");
+
+        // logslope x logslope: H[1,1] * g_row outer g_row
+        family
+            .logslope_design
+            .syr_row_into(row, h[[1, 1]], &mut self.h_gg)
+            .expect("logslope syr_row_into dimension mismatch");
+
+        // marginal x logslope: H[0,1] * x_row outer g_row
+        if h[[0, 1]] != 0.0 {
+            let m_chunk = family.marginal_design.row_chunk(row..row + 1);
+            let m_row = m_chunk.row(0);
+            let g_chunk = family.logslope_design.row_chunk(row..row + 1);
+            let g_row = g_chunk.row(0);
+            ndarray::linalg::general_mat_mul(
+                h[[0, 1]],
+                &m_row.view().insert_axis(Axis(1)),
+                &g_row.view().insert_axis(Axis(0)),
+                1.0,
+                &mut self.h_mg,
+            );
+        }
+
+        // h/w cross-blocks -> dense_correction
+        if let Some(ref mut dc) = self.dense_correction {
+            family.add_pullback_primary_hessian_hw_only(dc, row, slices, primary, h);
+        }
+    }
+
+    /// Add a rank-1 update from psi_row (in the psi block) crossed with the
+    /// pullback of a primary-space vector.  Adds both left outer right and right outer left.
+    ///
+    /// psi_row lives in block `psi_block_idx` (0=marginal, 1=logslope).
+    /// right_primary is a primary-space vector; its [0] component maps to marginal,
+    /// [1] to logslope, and the rest to h/w (dense correction).
+    fn add_rank1_psi_cross(
+        &mut self,
+        family: &BernoulliMarginalSlopeFamily,
+        row: usize,
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        psi_block_idx: usize,
+        psi_row: &Array1<f64>,
+        right_primary: &Array1<f64>,
+    ) {
+        let psi_col = psi_row.view().insert_axis(Axis(1));
+
+        // Marginal component of right_primary
+        if right_primary[0] != 0.0 {
+            let m_chunk = family.marginal_design.row_chunk(row..row + 1);
+            let m_row = m_chunk.row(0);
+            match psi_block_idx {
+                0 => {
+                    // psi=marginal, right=marginal -> h_mm, symmetric rank-2
+                    ndarray::linalg::general_mat_mul(
+                        right_primary[0],
+                        &psi_col,
+                        &m_row.view().insert_axis(Axis(0)),
+                        1.0,
+                        &mut self.h_mm,
+                    );
+                    ndarray::linalg::general_mat_mul(
+                        right_primary[0],
+                        &m_row.view().insert_axis(Axis(1)),
+                        &psi_row.view().insert_axis(Axis(0)),
+                        1.0,
+                        &mut self.h_mm,
+                    );
+                }
+                1 => {
+                    // psi=logslope, right=marginal -> h_mg (marginal x logslope)
+                    ndarray::linalg::general_mat_mul(
+                        right_primary[0],
+                        &m_row.view().insert_axis(Axis(1)),
+                        &psi_row.view().insert_axis(Axis(0)),
+                        1.0,
+                        &mut self.h_mg,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Logslope component of right_primary
+        if right_primary[1] != 0.0 {
+            let g_chunk = family.logslope_design.row_chunk(row..row + 1);
+            let g_row = g_chunk.row(0);
+            match psi_block_idx {
+                0 => {
+                    // psi=marginal, right=logslope -> h_mg
+                    ndarray::linalg::general_mat_mul(
+                        right_primary[1],
+                        &psi_col,
+                        &g_row.view().insert_axis(Axis(0)),
+                        1.0,
+                        &mut self.h_mg,
+                    );
+                }
+                1 => {
+                    // psi=logslope, right=logslope -> h_gg, symmetric rank-2
+                    ndarray::linalg::general_mat_mul(
+                        right_primary[1],
+                        &psi_col,
+                        &g_row.view().insert_axis(Axis(0)),
+                        1.0,
+                        &mut self.h_gg,
+                    );
+                    ndarray::linalg::general_mat_mul(
+                        right_primary[1],
+                        &g_row.view().insert_axis(Axis(1)),
+                        &psi_row.view().insert_axis(Axis(0)),
+                        1.0,
+                        &mut self.h_gg,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // h/w components -> dense_correction
+        if let Some(ref mut dc) = self.dense_correction {
+            let psi_range = if psi_block_idx == 0 {
+                slices.marginal.clone()
+            } else {
+                slices.logslope.clone()
+            };
+            if let (Some(ph), Some(bh)) = (primary.h.as_ref(), slices.h.as_ref()) {
+                let h_part = right_primary.slice(ndarray::s![ph.start..ph.end]);
+                for (li, gi) in psi_range.clone().enumerate() {
+                    for (lj, gj) in bh.clone().enumerate() {
+                        let val = psi_row[li] * h_part[lj];
+                        dc[[gi, gj]] += val;
+                        dc[[gj, gi]] += val;
+                    }
+                }
+            }
+            if let (Some(pw), Some(bw)) = (primary.w.as_ref(), slices.w.as_ref()) {
+                let w_part = right_primary.slice(ndarray::s![pw.start..pw.end]);
+                for (li, gi) in psi_range.enumerate() {
+                    for (lj, gj) in bw.clone().enumerate() {
+                        let val = psi_row[li] * w_part[lj];
+                        dc[[gi, gj]] += val;
+                        dc[[gj, gi]] += val;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Add outer product of two psi block-local rows (possibly in different blocks).
+    /// Adds both alpha * (a outer b) and alpha * (b outer a) to maintain symmetry.
+    fn add_psi_psi_outer(
+        &mut self,
+        block_i: usize,
+        psi_row_i: &Array1<f64>,
+        block_j: usize,
+        psi_row_j: &Array1<f64>,
+        alpha: f64,
+    ) {
+        if alpha == 0.0 {
+            return;
+        }
+        let col_i = psi_row_i.view().insert_axis(Axis(1));
+        let row_j = psi_row_j.view().insert_axis(Axis(0));
+
+        if block_i == block_j {
+            // Same block: symmetric rank-2 update to diagonal block
+            let col_j = psi_row_j.view().insert_axis(Axis(1));
+            let row_i = psi_row_i.view().insert_axis(Axis(0));
+            let target = match block_i {
+                0 => &mut self.h_mm,
+                1 => &mut self.h_gg,
+                _ => return,
+            };
+            ndarray::linalg::general_mat_mul(alpha, &col_i, &row_j, 1.0, target);
+            ndarray::linalg::general_mat_mul(alpha, &col_j, &row_i, 1.0, target);
+        } else {
+            // Different blocks: one rank-1 update to h_mg.
+            // h_mg = marginal x logslope; the transpose is assembled automatically.
+            let (marginal_row, logslope_row) = if block_i == 0 {
+                (psi_row_i, psi_row_j)
+            } else {
+                (psi_row_j, psi_row_i)
+            };
+            let m_col = marginal_row.view().insert_axis(Axis(1));
+            let g_row = logslope_row.view().insert_axis(Axis(0));
+            ndarray::linalg::general_mat_mul(alpha, &m_col, &g_row, 1.0, &mut self.h_mg);
+        }
+    }
+
+    /// Merge another accumulator into this one (for parallel reduce).
+    fn add(&mut self, other: &BernoulliBlockHessianAccumulator) {
+        self.h_mm += &other.h_mm;
+        self.h_gg += &other.h_gg;
+        self.h_mg += &other.h_mg;
+        if let (Some(ref mut dc), Some(ref odc)) =
+            (self.dense_correction.as_mut(), other.dense_correction.as_ref())
+        {
+            dc.scaled_add(1.0, odc);
+        }
+    }
+
+    fn to_dense(&self, slices: &BlockSlices) -> Array2<f64> {
+        let mut out = Array2::zeros((slices.total, slices.total));
+        out.slice_mut(s![slices.marginal.clone(), slices.marginal.clone()])
+            .assign(&self.h_mm);
+        out.slice_mut(s![slices.logslope.clone(), slices.logslope.clone()])
+            .assign(&self.h_gg);
+        out.slice_mut(s![slices.marginal.clone(), slices.logslope.clone()])
+            .assign(&self.h_mg);
+        out.slice_mut(s![slices.logslope.clone(), slices.marginal.clone()])
+            .assign(&self.h_mg.t());
+        if let Some(ref dc) = self.dense_correction {
+            out += dc;
+        }
+        out
+    }
+
+    fn into_operator(self, slices: &BlockSlices) -> BernoulliBlockHessianOperator {
+        BernoulliBlockHessianOperator {
+            h_mm: self.h_mm,
+            h_gg: self.h_gg,
+            h_mg: self.h_mg,
+            dense_correction: self.dense_correction,
+            marginal: slices.marginal.clone(),
+            logslope: slices.logslope.clone(),
+            total: slices.total,
+        }
+    }
+}
+
+/// Block-structured HyperOperator for Bernoulli marginal-slope psi Hessians.
+/// Stores 3 block matrices (h_mm, h_gg, h_mg) plus an optional dense correction
+/// for h/w cross-blocks.  Matvec is O(p_m^2 + p_g^2 + p_m*p_g) for the block part,
+/// plus O(p_total^2) only if h/w blocks exist (which is rare and tiny).
+struct BernoulliBlockHessianOperator {
+    h_mm: Array2<f64>,
+    h_gg: Array2<f64>,
+    h_mg: Array2<f64>,
+    dense_correction: Option<Array2<f64>>,
+    marginal: std::ops::Range<usize>,
+    logslope: std::ops::Range<usize>,
+    total: usize,
+}
+
+impl HyperOperator for BernoulliBlockHessianOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let v_m = v.slice(s![self.marginal.clone()]);
+        let v_g = v.slice(s![self.logslope.clone()]);
+        let mut out = Array1::zeros(self.total);
+        {
+            let mut o_m = out.slice_mut(s![self.marginal.clone()]);
+            o_m += &self.h_mm.dot(&v_m);
+            o_m += &self.h_mg.dot(&v_g);
+        }
+        {
+            let mut o_g = out.slice_mut(s![self.logslope.clone()]);
+            o_g += &self.h_mg.t().dot(&v_m);
+            o_g += &self.h_gg.dot(&v_g);
+        }
+        if let Some(ref dc) = self.dense_correction {
+            out += &dc.dot(v);
+        }
+        out
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        let v_m = v.slice(s![self.marginal.clone()]);
+        let v_g = v.slice(s![self.logslope.clone()]);
+        let u_m = u.slice(s![self.marginal.clone()]);
+        let u_g = u.slice(s![self.logslope.clone()]);
+        // Diagonal blocks
+        let mut total = v_m.dot(&self.h_mm.dot(&u_m));
+        total += v_g.dot(&self.h_gg.dot(&u_g));
+        // Off-diagonal blocks (symmetric)
+        total += v_m.dot(&self.h_mg.dot(&u_g));
+        total += v_g.dot(&self.h_mg.t().dot(&u_m));
+        // Dense correction
+        if let Some(ref dc) = self.dense_correction {
+            total += v.dot(&dc.dot(u));
+        }
+        total
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::zeros((self.total, self.total));
+        out.slice_mut(s![self.marginal.clone(), self.marginal.clone()])
+            .assign(&self.h_mm);
+        out.slice_mut(s![self.logslope.clone(), self.logslope.clone()])
+            .assign(&self.h_gg);
+        out.slice_mut(s![self.marginal.clone(), self.logslope.clone()])
+            .assign(&self.h_mg);
+        out.slice_mut(s![self.logslope.clone(), self.marginal.clone()])
+            .assign(&self.h_mg.t());
+        if let Some(ref dc) = self.dense_correction {
+            out += dc;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
 }
 
 /// How many link-deviation derivative orders the caller actually needs.
@@ -2776,6 +3130,7 @@ impl BernoulliMarginalSlopeFamily {
                                 &cache.h_nodes, cache.h_node_design.as_ref(),
                                 cache.score_warp_obs.as_ref(),
                             )?;
+                            acc.0 -= row_neglog;
                             acc.1 -= &self.pullback_primary_vector(i, slices, primary, &f_pi)?;
                             if let Some(ref mut hmat) = acc.2 {
                                 self.add_pullback_primary_hessian(hmat, i, slices, primary, &f_pipi);
@@ -3263,15 +3618,16 @@ impl BernoulliMarginalSlopeFamily {
             }));
         }
 
-        let (objective_psi, score_psi, hessian_psi) = (0..((n + ROW_CHUNK_SIZE - 1)
+        // Block-local accumulator path: avoids O(n p^2) dense Hessian
+        let (objective_psi, score_psi, block_acc) = (0..((n + ROW_CHUNK_SIZE - 1)
             / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
                 || {
                     (
-                        0.0,
+                        0.0f64,
                         Array1::<f64>::zeros(slices.total),
-                        Array2::<f64>::zeros((slices.total, slices.total)),
+                        BernoulliBlockHessianAccumulator::new(slices),
                     )
                 },
                 |mut acc, chunk_idx| -> Result<_, String> {
@@ -3321,35 +3677,19 @@ impl BernoulliMarginalSlopeFamily {
                             &f_pipi.dot(&dir),
                         )?;
 
-                        let right_vec = self.pullback_primary_vector(
+                        // psi_row outer pullback(f_pipi[idx_primary,:]) + transpose
+                        let right_primary = f_pipi.row(idx_primary).to_owned();
+                        acc.2.add_rank1_psi_cross(
+                            self,
                             row,
                             slices,
                             primary,
-                            &f_pipi.row(idx_primary).to_owned(),
-                        )?;
-                        // Block-local outer product: left lives only in psi_row.range
-                        let right_slice = right_vec.view();
-                        {
-                            let mut block = acc.2.slice_mut(s![
-                                psi_row.range.clone(),
-                                ..
-                            ]);
-                            block += &psi_row
-                                .local_vec
-                                .view()
-                                .insert_axis(Axis(1))
-                                .dot(&right_slice.insert_axis(Axis(0)));
-                        }
-                        {
-                            let mut block = acc.2.slice_mut(s![
-                                ..,
-                                psi_row.range.clone()
-                            ]);
-                            block += &right_slice
-                                .insert_axis(Axis(1))
-                                .dot(&psi_row.local_vec.view().insert_axis(Axis(0)));
-                        }
-                        self.add_pullback_primary_hessian(&mut acc.2, row, slices, primary, &third);
+                            block_idx,
+                            &psi_row.local_vec,
+                            &right_primary,
+                        );
+                        // third tensor pullback
+                        acc.2.add_pullback(self, row, slices, primary, &third);
                     }
                     Ok(acc)
                 },
@@ -3357,23 +3697,23 @@ impl BernoulliMarginalSlopeFamily {
             .try_reduce(
                 || {
                     (
-                        0.0,
+                        0.0f64,
                         Array1::<f64>::zeros(slices.total),
-                        Array2::<f64>::zeros((slices.total, slices.total)),
+                        BernoulliBlockHessianAccumulator::new(slices),
                     )
                 },
                 |mut left, right| -> Result<_, String> {
                     left.0 += right.0;
                     left.1 += &right.1;
-                    left.2 += &right.2;
+                    left.2.add(&right.2);
                     Ok(left)
                 },
             )?;
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
-            hessian_psi,
-            hessian_psi_operator: None,
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(Box::new(block_acc.into_operator(slices))),
         }))
     }
 
@@ -3396,15 +3736,16 @@ impl BernoulliMarginalSlopeFamily {
         let idx_i = if block_i == 0 { 0 } else { 1 };
         let idx_j = if block_j == 0 { 0 } else { 1 };
         let n = self.y.len();
-        let (objective_psi_psi, score_psi_psi, hessian_psi_psi) = (0..((n + ROW_CHUNK_SIZE - 1)
+        // Block-local accumulator path for second-order psi terms
+        let (objective_psi_psi, score_psi_psi, block_acc) = (0..((n + ROW_CHUNK_SIZE - 1)
             / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
                 || {
                     (
-                        0.0,
+                        0.0f64,
                         Array1::<f64>::zeros(slices.total),
-                        Array2::<f64>::zeros((slices.total, slices.total)),
+                        BernoulliBlockHessianAccumulator::new(slices),
                     )
                 },
                 |mut acc, chunk_idx| -> Result<_, String> {
@@ -3487,6 +3828,7 @@ impl BernoulliMarginalSlopeFamily {
                             row, slices, derivative_blocks, psi_i, psi_j,
                         )?;
 
+                        // --- scalar and score accumulation (unchanged) ---
                         acc.0 += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
                         if let Some(ref bij) = br_ij {
                             let idx_ij = if bij.block_idx == 0 { 0 } else { 1 };
@@ -3510,74 +3852,59 @@ impl BernoulliMarginalSlopeFamily {
                             &third_i.dot(&dir_j),
                         )?;
 
+                        // --- Hessian: bij outer pullback(f_pipi[idx_ij,:]) + transpose ---
                         if let Some(ref bij) = br_ij {
-                            let idx_ij = if bij.block_idx == 0
-                            {
-                                0
-                            } else {
-                                1
-                            };
-                            let right_ij = self.pullback_primary_vector(
+                            let idx_ij = if bij.block_idx == 0 { 0 } else { 1 };
+                            let right_primary_ij = f_pipi.row(idx_ij).to_owned();
+                            acc.2.add_rank1_psi_cross(
+                                self,
                                 row,
                                 slices,
                                 primary,
-                                &f_pipi.row(idx_ij).to_owned(),
-                            )?;
-                            {
-                                let mut block = acc.2.slice_mut(s![bij.range.clone(), ..]);
-                                block += &bij.local_vec.view().insert_axis(Axis(1))
-                                    .dot(&right_ij.view().insert_axis(Axis(0)));
-                            }
-                            {
-                                let mut block = acc.2.slice_mut(s![.., bij.range.clone()]);
-                                block += &right_ij.view().insert_axis(Axis(1))
-                                    .dot(&bij.local_vec.view().insert_axis(Axis(0)));
-                            }
+                                bij.block_idx,
+                                &bij.local_vec,
+                                &right_primary_ij,
+                            );
                         }
 
+                        // --- br_i outer br_j * f_pipi[[idx_i, idx_j]] + transpose ---
                         let scalar_ij = f_pipi[[idx_i, idx_j]];
-                        {
-                            let mut block = acc.2.slice_mut(s![br_i.range.clone(), br_j.range.clone()]);
-                            block += &(br_i.local_vec.view().insert_axis(Axis(1))
-                                .dot(&br_j.local_vec.view().insert_axis(Axis(0))) * scalar_ij);
-                        }
-                        {
-                            let mut block = acc.2.slice_mut(s![br_j.range.clone(), br_i.range.clone()]);
-                            block += &(br_j.local_vec.view().insert_axis(Axis(1))
-                                .dot(&br_i.local_vec.view().insert_axis(Axis(0))) * scalar_ij);
-                        }
-
-                        let right_i = self.pullback_primary_vector(
-                            row, slices, primary, &third_j.row(idx_i).to_owned(),
-                        )?;
-                        {
-                            let mut block = acc.2.slice_mut(s![br_i.range.clone(), ..]);
-                            block += &br_i.local_vec.view().insert_axis(Axis(1))
-                                .dot(&right_i.view().insert_axis(Axis(0)));
-                        }
-                        {
-                            let mut block = acc.2.slice_mut(s![.., br_i.range.clone()]);
-                            block += &right_i.view().insert_axis(Axis(1))
-                                .dot(&br_i.local_vec.view().insert_axis(Axis(0)));
-                        }
-
-                        let right_j = self.pullback_primary_vector(
-                            row, slices, primary, &third_i.row(idx_j).to_owned(),
-                        )?;
-                        {
-                            let mut block = acc.2.slice_mut(s![br_j.range.clone(), ..]);
-                            block += &br_j.local_vec.view().insert_axis(Axis(1))
-                                .dot(&right_j.view().insert_axis(Axis(0)));
-                        }
-                        {
-                            let mut block = acc.2.slice_mut(s![.., br_j.range.clone()]);
-                            block += &right_j.view().insert_axis(Axis(1))
-                                .dot(&br_j.local_vec.view().insert_axis(Axis(0)));
-                        }
-
-                        self.add_pullback_primary_hessian(
-                            &mut acc.2, row, slices, primary, &fourth,
+                        acc.2.add_psi_psi_outer(
+                            block_i,
+                            &br_i.local_vec,
+                            block_j,
+                            &br_j.local_vec,
+                            scalar_ij,
                         );
+
+                        // --- br_i outer pullback(third_j[idx_i,:]) + transpose ---
+                        let right_primary_i = third_j.row(idx_i).to_owned();
+                        acc.2.add_rank1_psi_cross(
+                            self,
+                            row,
+                            slices,
+                            primary,
+                            block_i,
+                            &br_i.local_vec,
+                            &right_primary_i,
+                        );
+
+                        // --- br_j outer pullback(third_i[idx_j,:]) + transpose ---
+                        let right_primary_j = third_i.row(idx_j).to_owned();
+                        acc.2.add_rank1_psi_cross(
+                            self,
+                            row,
+                            slices,
+                            primary,
+                            block_j,
+                            &br_j.local_vec,
+                            &right_primary_j,
+                        );
+
+                        // --- fourth tensor pullback ---
+                        acc.2.add_pullback(self, row, slices, primary, &fourth);
+
+                        // --- third_ij tensor pullback ---
                         let third_ij = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
@@ -3585,9 +3912,7 @@ impl BernoulliMarginalSlopeFamily {
                             row_ctx,
                             &dir_ij,
                         )?;
-                        self.add_pullback_primary_hessian(
-                            &mut acc.2, row, slices, primary, &third_ij,
-                        );
+                        acc.2.add_pullback(self, row, slices, primary, &third_ij);
                     }
                     Ok(acc)
                 },
@@ -3595,23 +3920,23 @@ impl BernoulliMarginalSlopeFamily {
             .try_reduce(
                 || {
                     (
-                        0.0,
+                        0.0f64,
                         Array1::<f64>::zeros(slices.total),
-                        Array2::<f64>::zeros((slices.total, slices.total)),
+                        BernoulliBlockHessianAccumulator::new(slices),
                     )
                 },
                 |mut left, right| -> Result<_, String> {
                     left.0 += right.0;
                     left.1 += &right.1;
-                    left.2 += &right.2;
+                    left.2.add(&right.2);
                     Ok(left)
                 },
             )?;
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
-            hessian_psi_psi,
-            hessian_psi_psi_operator: None,
+            hessian_psi_psi: Array2::zeros((0, 0)),
+            hessian_psi_psi_operator: Some(Box::new(block_acc.into_operator(slices))),
         }))
     }
 
@@ -3631,11 +3956,14 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         };
         let idx_primary = if block_idx == 0 { 0 } else { 1 };
+        let has_hw = primary.h.is_some() || primary.w.is_some();
         let n = self.y.len();
-        let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
-                || Array2::<f64>::zeros((slices.total, slices.total)),
+                || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, chunk_idx| -> Result<_, String> {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
@@ -3687,23 +4015,17 @@ impl BernoulliMarginalSlopeFamily {
                             .ok_or_else(|| {
                                 "missing bernoulli marginal-slope psi vector".to_string()
                             })?;
-                        let right_vec = self.pullback_primary_vector(
+                        let right_primary = third_beta.row(idx_primary).to_owned();
+                        acc.add_rank1_psi_cross(
+                            self,
                             row,
                             slices,
                             primary,
-                            &third_beta.row(idx_primary).to_owned(),
-                        )?;
-                        {
-                            let mut block = acc.slice_mut(s![psi_row.range.clone(), ..]);
-                            block += &psi_row.local_vec.view().insert_axis(Axis(1))
-                                .dot(&right_vec.view().insert_axis(Axis(0)));
-                        }
-                        {
-                            let mut block = acc.slice_mut(s![.., psi_row.range.clone()]);
-                            block += &right_vec.view().insert_axis(Axis(1))
-                                .dot(&psi_row.local_vec.view().insert_axis(Axis(0)));
-                        }
-                        self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &fourth);
+                            psi_row.block_idx,
+                            &psi_row.local_vec,
+                            &right_primary,
+                        );
+                        acc.add_pullback(self, row, slices, primary, &fourth);
                         let third_action = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
@@ -3711,25 +4033,19 @@ impl BernoulliMarginalSlopeFamily {
                             row_ctx,
                             &psi_action,
                         )?;
-                        self.add_pullback_primary_hessian(
-                            &mut acc,
-                            row,
-                            slices,
-                            primary,
-                            &third_action,
-                        );
+                        acc.add_pullback(self, row, slices, primary, &third_action);
                     }
                     Ok(acc)
                 },
             )
             .try_reduce(
-                || Array2::<f64>::zeros((slices.total, slices.total)),
+                || BernoulliBlockHessianAccumulator::new(slices),
                 |mut left, right| -> Result<_, String> {
-                    left += &right;
+                    left.add(&right);
                     Ok(left)
                 },
             )?;
-        Ok(Some(out))
+        Ok(Some(block_acc.to_dense(slices)))
     }
 
     fn exact_newton_joint_hessian_directional_derivative_from_cache(
@@ -3743,11 +4059,14 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
 
         // ── Rigid closed-form: 3rd-order scalar kernel ───────────────
+        let has_hw = primary.h.is_some() || primary.w.is_some();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
         if !self.flex_active() {
-            let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
-                    || Array2::<f64>::zeros((slices.total, slices.total)),
+                    || BernoulliBlockHessianAccumulator::new(slices),
                     |mut acc, chunk_idx| -> Result<_, String> {
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
@@ -3765,22 +4084,22 @@ impl BernoulliMarginalSlopeFamily {
                             );
                             let t = k.third_contracted(q, dq, dg);
                             let t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
-                            self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &t_arr);
+                            acc.add_pullback(self, row, slices, primary, &t_arr);
                         }
                         Ok(acc)
                     },
                 )
                 .try_reduce(
-                    || Array2::<f64>::zeros((slices.total, slices.total)),
-                    |mut left, right| { left += &right; Ok(left) },
+                    || BernoulliBlockHessianAccumulator::new(slices),
+                    |mut left, right| { left.add(&right); Ok(left) },
                 )?;
-            return Ok(Some(out));
+            return Ok(Some(block_acc.to_dense(slices)));
         }
 
-        let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
-                || Array2::<f64>::zeros((slices.total, slices.total)),
+                || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, chunk_idx| -> Result<_, String> {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
@@ -3799,19 +4118,19 @@ impl BernoulliMarginalSlopeFamily {
                             row_ctx,
                             &row_dir,
                         )?;
-                        self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &third);
+                        acc.add_pullback(self, row, slices, primary, &third);
                     }
                     Ok(acc)
                 },
             )
             .try_reduce(
-                || Array2::<f64>::zeros((slices.total, slices.total)),
+                || BernoulliBlockHessianAccumulator::new(slices),
                 |mut left, right| -> Result<_, String> {
-                    left += &right;
+                    left.add(&right);
                     Ok(left)
                 },
             )?;
-        Ok(Some(out))
+        Ok(Some(block_acc.to_dense(slices)))
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative_from_cache(
@@ -3824,13 +4143,14 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
+        let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
         if !self.flex_active() {
-            let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
-                    || Array2::<f64>::zeros((slices.total, slices.total)),
+                    make_acc,
                     |mut acc, chunk_idx| -> Result<_, String> {
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
@@ -3854,25 +4174,25 @@ impl BernoulliMarginalSlopeFamily {
                             );
                             let f = k.fourth_contracted(q, uq, ug, vq, vg);
                             let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
-                            self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &f_arr);
+                            acc.add_pullback(self, row, slices, primary, &f_arr);
                         }
                         Ok(acc)
                     },
                 )
                 .try_reduce(
-                    || Array2::<f64>::zeros((slices.total, slices.total)),
+                    make_acc,
                     |mut left, right| -> Result<_, String> {
-                        left += &right;
+                        left.add(&right);
                         Ok(left)
                     },
                 )?;
-            return Ok(Some(out));
+            return Ok(Some(block_acc.to_dense(slices)));
         }
 
-        let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
-                || Array2::<f64>::zeros((slices.total, slices.total)),
+                make_acc,
                 |mut acc, chunk_idx| -> Result<_, String> {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
@@ -3898,19 +4218,19 @@ impl BernoulliMarginalSlopeFamily {
                             &row_u,
                             &row_v,
                         )?;
-                        self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &fourth);
+                        acc.add_pullback(self, row, slices, primary, &fourth);
                     }
                     Ok(acc)
                 },
             )
             .try_reduce(
-                || Array2::<f64>::zeros((slices.total, slices.total)),
+                make_acc,
                 |mut left, right| -> Result<_, String> {
-                    left += &right;
+                    left.add(&right);
                     Ok(left)
                 },
             )?;
-        Ok(Some(out))
+        Ok(Some(block_acc.to_dense(slices)))
     }
 
     fn evaluate_blockwise_exact_newton(
