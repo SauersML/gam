@@ -16,7 +16,7 @@ use crate::families::bernoulli_marginal_slope::{
 use crate::families::survival_location_scale::{
     TimeBlockInput, structural_nonnegative_constraints,
 };
-use crate::matrix::{DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -75,9 +75,11 @@ struct SurvivalMarginalSlopeFamily {
     z: Arc<Array1<f64>>,
     derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
-    design_entry: Arc<Array2<f64>>,
-    design_exit: Arc<Array2<f64>>,
-    design_derivative_exit: Arc<Array2<f64>>,
+    /// Stored as DesignMatrix to support sparse local-support bases at
+    /// biobank scale (B-spline/I-spline rows have only degree+1 nonzeros).
+    design_entry: DesignMatrix,
+    design_exit: DesignMatrix,
+    design_derivative_exit: DesignMatrix,
     offset_entry: Arc<Array1<f64>>,
     offset_exit: Arc<Array1<f64>>,
     derivative_offset_exit: Arc<Array1<f64>>,
@@ -111,8 +113,10 @@ fn block_slices(block_states: &[ParameterBlockState]) -> BlockSlices {
     }
 }
 
-fn dense_row_axpy_into(
-    design: &Array2<f64>,
+
+fn dense_row_crossdiag_axpy_into(
+    lhs: &DesignMatrix,
+    rhs: &DesignMatrix,
     row: usize,
     alpha: f64,
     out: &mut ArrayViewMut1<'_, f64>,
@@ -120,31 +124,12 @@ fn dense_row_axpy_into(
     if alpha == 0.0 {
         return;
     }
-    for (dst, &value) in out.iter_mut().zip(design.row(row).iter()) {
-        *dst += alpha * value;
-    }
-}
-
-fn dense_row_outer_into(
-    lhs: &Array2<f64>,
-    rhs: &Array2<f64>,
-    row: usize,
-    alpha: f64,
-    target: &mut Array2<f64>,
-) {
-    if alpha == 0.0 {
-        return;
-    }
-    let x = lhs.row(row);
-    let y = rhs.row(row);
-    for i in 0..x.len() {
-        let xi = x[i];
-        if xi == 0.0 {
-            continue;
-        }
-        for j in 0..y.len() {
-            target[[i, j]] += alpha * xi * y[j];
-        }
+    let lhs_chunk = lhs.row_chunk(row..row + 1);
+    let rhs_chunk = rhs.row_chunk(row..row + 1);
+    let x = lhs_chunk.row(0);
+    let y = rhs_chunk.row(0);
+    for idx in 0..out.len() {
+        out[idx] += alpha * x[idx] * y[idx];
     }
 }
 
@@ -399,14 +384,14 @@ impl SurvivalMarginalSlopeFamily {
         // different design matrices (entry, exit, derivative).
         let beta_time = &block_states[0].beta;
         let beta_marginal = &block_states[1].beta;
-        let q0_val = self.design_entry.row(row).dot(beta_time)
+        let q0_val = self.design_entry.dot_row(row, beta_time)
             + self.offset_entry[row]
             + self.marginal_design.dot_row(row, beta_marginal);
-        let q1_val = self.design_exit.row(row).dot(beta_time)
+        let q1_val = self.design_exit.dot_row(row, beta_time)
             + self.offset_exit[row]
             + self.marginal_design.dot_row(row, beta_marginal);
         let qd1_val =
-            self.design_derivative_exit.row(row).dot(beta_time) + self.derivative_offset_exit[row];
+            self.design_derivative_exit.dot_row(row, beta_time) + self.derivative_offset_exit[row];
         let g_val = block_states[2].eta[row];
 
         let q0_jet = MultiDirJet::linear(k, q0_val, &q0_first);
@@ -502,13 +487,13 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         let beta_time = &block_states[0].beta;
         let beta_marginal = &block_states[1].beta;
-        let q0 = self.design_entry.row(row).dot(beta_time)
+        let q0 = self.design_entry.dot_row(row, beta_time)
             + self.offset_entry[row]
             + self.marginal_design.dot_row(row, beta_marginal);
-        let q1 = self.design_exit.row(row).dot(beta_time)
+        let q1 = self.design_exit.dot_row(row, beta_time)
             + self.offset_exit[row]
             + self.marginal_design.dot_row(row, beta_marginal);
-        let qd1 = self.design_derivative_exit.row(row).dot(beta_time)
+        let qd1 = self.design_derivative_exit.dot_row(row, beta_time)
             + self.derivative_offset_exit[row];
         let g = block_states[2].eta[row];
         let (nll, grad_arr, hess_arr) = row_primary_closed_form(
@@ -613,9 +598,12 @@ impl SurvivalMarginalSlopeFamily {
         // Time block: 3 primary scalars (q0, q1, qd1) all map to the same beta_time
         {
             let mut time = out.slice_mut(s![slices.time.clone()]);
-            dense_row_axpy_into(&self.design_entry, row, primary_vec[0], &mut time);
-            dense_row_axpy_into(&self.design_exit, row, primary_vec[1], &mut time);
-            dense_row_axpy_into(&self.design_derivative_exit, row, primary_vec[2], &mut time);
+            self.design_entry.axpy_row_into(row, primary_vec[0], &mut time)
+                .expect("time entry axpy dimension mismatch");
+            self.design_exit.axpy_row_into(row, primary_vec[1], &mut time)
+                .expect("time exit axpy dimension mismatch");
+            self.design_derivative_exit.axpy_row_into(row, primary_vec[2], &mut time)
+                .expect("time deriv axpy dimension mismatch");
         }
         // Baseline block: contributes equally to q0 and q1.
         {
@@ -641,45 +629,14 @@ impl SurvivalMarginalSlopeFamily {
         primary_hessian: &Array2<f64>,
     ) {
         let mut tt = Array2::<f64>::zeros((slices.time.len(), slices.time.len()));
-        dense_row_outer_into(&self.design_entry, &self.design_entry, row, primary_hessian[[0, 0]], &mut tt);
-        dense_row_outer_into(&self.design_entry, &self.design_exit, row, primary_hessian[[0, 1]], &mut tt);
-        dense_row_outer_into(
-            &self.design_entry,
-            &self.design_derivative_exit,
-            row,
-            primary_hessian[[0, 2]],
-            &mut tt,
-        );
-        dense_row_outer_into(&self.design_exit, &self.design_entry, row, primary_hessian[[1, 0]], &mut tt);
-        dense_row_outer_into(&self.design_exit, &self.design_exit, row, primary_hessian[[1, 1]], &mut tt);
-        dense_row_outer_into(
-            &self.design_exit,
-            &self.design_derivative_exit,
-            row,
-            primary_hessian[[1, 2]],
-            &mut tt,
-        );
-        dense_row_outer_into(
-            &self.design_derivative_exit,
-            &self.design_entry,
-            row,
-            primary_hessian[[2, 0]],
-            &mut tt,
-        );
-        dense_row_outer_into(
-            &self.design_derivative_exit,
-            &self.design_exit,
-            row,
-            primary_hessian[[2, 1]],
-            &mut tt,
-        );
-        dense_row_outer_into(
-            &self.design_derivative_exit,
-            &self.design_derivative_exit,
-            row,
-            primary_hessian[[2, 2]],
-            &mut tt,
-        );
+        let time_designs = [&self.design_entry, &self.design_exit, &self.design_derivative_exit];
+        for a in 0..3 {
+            for b in 0..3 {
+                time_designs[a]
+                    .row_outer_into(row, time_designs[b], primary_hessian[[a, b]], &mut tt)
+                    .expect("time block row_outer_into dimension mismatch");
+            }
+        }
         target
             .slice_mut(s![slices.time.clone(), slices.time.clone()])
             .scaled_add(1.0, &tt);
@@ -720,7 +677,8 @@ impl SurvivalMarginalSlopeFamily {
             if alpha == 0.0 {
                 continue;
             }
-            let lhs = design.row(row);
+            let lhs_chunk = design.row_chunk(row..row + 1);
+            let lhs = lhs_chunk.row(0);
             for i in 0..lhs.len() {
                 let xi = lhs[i];
                 if xi == 0.0 {
@@ -748,7 +706,8 @@ impl SurvivalMarginalSlopeFamily {
             if alpha == 0.0 {
                 continue;
             }
-            let lhs = design.row(row);
+            let lhs_chunk = design.row_chunk(row..row + 1);
+            let lhs = lhs_chunk.row(0);
             for i in 0..lhs.len() {
                 let xi = lhs[i];
                 if xi == 0.0 {
@@ -784,15 +743,15 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(N_PRIMARY);
         let d_time = d_beta_flat.slice(s![slices.time.clone()]);
-        out[0] = self.design_entry.row(row).dot(&d_time);
+        out[0] = self.design_entry.dot_row_view(row, d_time);
         out[0] += self
             .marginal_design
             .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
-        out[1] = self.design_exit.row(row).dot(&d_time);
+        out[1] = self.design_exit.dot_row_view(row, d_time);
         out[1] += self
             .marginal_design
             .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
-        out[2] = self.design_derivative_exit.row(row).dot(&d_time);
+        out[2] = self.design_derivative_exit.dot_row_view(row, d_time);
         out[3] = self
             .logslope_design
             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
@@ -877,20 +836,25 @@ impl SurvivalMarginalSlopeFamily {
                 (2, &self.design_derivative_exit),
             ];
             for &(pi, ref des) in &designs {
-                for (local_idx, &value) in des.row(row).iter().enumerate() {
-                    diagonal[slices.time.start + local_idx] +=
-                        value * value * row_hessian[[pi, pi]];
+                {
+                    let mut time_diag = diagonal.slice_mut(s![slices.time.clone()]);
+                    des.squared_axpy_row_into(row, row_hessian[[pi, pi]], &mut time_diag)
+                        .expect(
+                            "survival time squared_axpy_row_into should match block dimensions",
+                        );
                 }
                 for &(pj, ref des_j) in &designs {
                     if pj <= pi {
                         continue;
                     }
-                    for local_idx in 0..des.ncols() {
-                        diagonal[slices.time.start + local_idx] += 2.0
-                            * des[[row, local_idx]]
-                            * des_j[[row, local_idx]]
-                            * row_hessian[[pi, pj]];
-                    }
+                    let mut time_diag = diagonal.slice_mut(s![slices.time.clone()]);
+                    dense_row_crossdiag_axpy_into(
+                        des,
+                        des_j,
+                        row,
+                        2.0 * row_hessian[[pi, pj]],
+                        &mut time_diag,
+                    );
                 }
             }
 
@@ -1658,14 +1622,12 @@ impl SurvivalMarginalSlopeFamily {
 
                     {
                         let mut time = acc.1.view_mut();
-                        dense_row_axpy_into(&self.design_entry, row, -f_pi[0], &mut time);
-                        dense_row_axpy_into(&self.design_exit, row, -f_pi[1], &mut time);
-                        dense_row_axpy_into(
-                            &self.design_derivative_exit,
-                            row,
-                            -f_pi[2],
-                            &mut time,
-                        );
+                        self.design_entry.axpy_row_into(row, -f_pi[0], &mut time)
+                            .expect("time entry axpy dim mismatch");
+                        self.design_exit.axpy_row_into(row, -f_pi[1], &mut time)
+                            .expect("time exit axpy dim mismatch");
+                        self.design_derivative_exit.axpy_row_into(row, -f_pi[2], &mut time)
+                            .expect("time deriv axpy dim mismatch");
                     }
                     self.marginal_design
                         .axpy_row_into(row, -(f_pi[0] + f_pi[1]), &mut acc.2.view_mut())
@@ -1681,9 +1643,9 @@ impl SurvivalMarginalSlopeFamily {
                     ];
                     for a in 0..3 {
                         for b in 0..3 {
-                            dense_row_outer_into(
-                                designs[a], designs[b], row, f_pipi[[a, b]], &mut acc.4,
-                            );
+                            designs[a]
+                                .row_outer_into(row, designs[b], f_pipi[[a, b]], &mut acc.4)
+                                .expect("time row_outer_into dim mismatch");
                         }
                     }
 
@@ -1880,15 +1842,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
 
 fn build_time_blockspec(
     time_block: &TimeBlockInput,
-    design_exit: &Arc<Array2<f64>>,
+    design_exit: &DesignMatrix,
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "time_surface".to_string(),
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::Materialized(Arc::clone(
-            design_exit,
-        ))),
+        design: design_exit.clone(),
         offset: Array1::zeros(design_exit.nrows()),
         penalties: time_block
             .penalties
@@ -2191,9 +2151,38 @@ pub fn fit_survival_marginal_slope_terms(
     let weights = Arc::new(spec.weights.clone());
     let z = Arc::new(spec.z.clone());
     let derivative_guard = spec.derivative_guard;
-    let design_entry = Arc::new(spec.time_block.design_entry.clone());
-    let design_exit = Arc::new(spec.time_block.design_exit.clone());
-    let design_derivative_exit = Arc::new(spec.time_block.design_derivative_exit.clone());
+    let build_time_design = |dense: &Array2<f64>| -> DesignMatrix {
+        let n = dense.nrows();
+        let p = dense.ncols();
+        if n == 0 || p <= 32 {
+            return DesignMatrix::Dense(DenseDesignMatrix::from(dense.clone()));
+        }
+        let total = n * p;
+        let nnz: usize = dense.iter().filter(|&&v| v.abs() > 1e-15).count();
+        if nnz > total * 3 / 10 {
+            return DesignMatrix::Dense(DenseDesignMatrix::from(dense.clone()));
+        }
+        let mut triplets = Vec::with_capacity(nnz);
+        for i in 0..n {
+            for j in 0..p {
+                let value = dense[[i, j]];
+                if value.abs() > 1e-15 {
+                    triplets.push(faer::sparse::Triplet::new(i, j, value));
+                }
+            }
+        }
+        match faer::sparse::SparseColMat::try_new_from_triplets(n, p, &triplets) {
+            Ok(sparse) => DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse)),
+            Err(_) => DesignMatrix::Dense(DenseDesignMatrix::from(dense.clone())),
+        }
+    };
+    // Convert dense time designs to sparse DesignMatrix when the sparsity
+    // pattern warrants it (B-spline/I-spline bases have degree+1 nonzeros per
+    // row). This reduces memory from O(n × p_time) to O(n × degree) and makes
+    // row-level operations faster at biobank scale.
+    let design_entry = build_time_design(&spec.time_block.design_entry);
+    let design_exit = build_time_design(&spec.time_block.design_exit);
+    let design_derivative_exit = build_time_design(&spec.time_block.design_derivative_exit);
     let offset_entry = Arc::new(spec.time_block.offset_entry.clone());
     let offset_exit = Arc::new(spec.time_block.offset_exit.clone());
     let derivative_offset_exit = Arc::new(spec.time_block.derivative_offset_exit.clone());
@@ -2210,9 +2199,9 @@ pub fn fit_survival_marginal_slope_terms(
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
             derivative_guard,
-            design_entry: Arc::clone(&design_entry),
-            design_exit: Arc::clone(&design_exit),
-            design_derivative_exit: Arc::clone(&design_derivative_exit),
+            design_entry: design_entry.clone(),
+            design_exit: design_exit.clone(),
+            design_derivative_exit: design_derivative_exit.clone(),
             offset_entry: Arc::clone(&offset_entry),
             offset_exit: Arc::clone(&offset_exit),
             derivative_offset_exit: Arc::clone(&derivative_offset_exit),
