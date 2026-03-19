@@ -1132,8 +1132,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     fn n_coefficients(&self) -> usize { self.slices.total }
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
-        let q = self.family.marginal_design.dot_row(row, &self.block_states[0].beta)
-            + self.block_states[0].offset[row];
+        let q = self.block_states[0].eta[row];
         let g = self.block_states[1].eta[row];
         let k = RigidProbitKernel::new(
             q, g, self.family.z[row], self.family.y[row], self.family.weights[row],
@@ -1204,8 +1203,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     }
 
     fn row_third_contracted(&self, row: usize, dir: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
-        let q = self.family.marginal_design.dot_row(row, &self.block_states[0].beta)
-            + self.block_states[0].offset[row];
+        let q = self.block_states[0].eta[row];
         let g = self.block_states[1].eta[row];
         let k = RigidProbitKernel::new(
             q, g, self.family.z[row], self.family.y[row], self.family.weights[row],
@@ -1214,8 +1212,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     }
 
     fn row_fourth_contracted(&self, row: usize, dir_u: &[f64; 2], dir_v: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
-        let q = self.family.marginal_design.dot_row(row, &self.block_states[0].beta)
-            + self.block_states[0].offset[row];
+        let q = self.block_states[0].eta[row];
         let g = self.block_states[1].eta[row];
         let k = RigidProbitKernel::new(
             q, g, self.family.z[row], self.family.y[row], self.family.weights[row],
@@ -2791,12 +2788,17 @@ impl BernoulliMarginalSlopeFamily {
                                 self.add_pullback_primary_hessian(hmat, i, slices, primary, &f_pipi);
                             }
                         } else {
-                            let (nll, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                            let row_neglog = self.row_neglog_directional_from_primary(
+                                i, block_states, primary, &[], row_ctx,
+                                &cache.h_nodes, cache.h_node_design.as_ref(),
+                                cache.score_warp_obs.as_ref(),
+                            )?;
+                            acc.0 -= row_neglog;
+                            let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                                 i, block_states, primary, row_ctx,
                                 &cache.h_nodes, cache.h_node_design.as_ref(),
                                 cache.score_warp_obs.as_ref(),
                             )?;
-                            acc.0 -= nll;
                             acc.1 -= &self.pullback_primary_vector(i, slices, primary, &f_pi)?;
                             if let Some(ref mut hmat) = acc.2 {
                                 self.add_pullback_primary_hessian(hmat, i, slices, primary, &f_pipi);
@@ -2895,19 +2897,11 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = Self::row_ctx(cache, row);
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                        let row_hessian = if self.flex_active() {
-                            self.compute_row_analytic_flex(
-                                row, block_states, primary, row_ctx,
-                                &cache.h_nodes, cache.h_node_design.as_ref(),
-                                cache.score_warp_obs.as_ref(), true,
-                            )?.2
-                        } else {
-                            self.compute_row_primary_gradient_hessian(
-                                row, block_states, primary, row_ctx,
-                                &cache.h_nodes, cache.h_node_design.as_ref(),
-                                cache.score_warp_obs.as_ref(),
-                            )?.2
-                        };
+                        let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
+                            row, block_states, primary, row_ctx,
+                            &cache.h_nodes, cache.h_node_design.as_ref(),
+                            cache.score_warp_obs.as_ref(),
+                        )?;
                         let row_action = row_hessian.dot(&row_dir);
                         chunk_out +=
                             &self.pullback_primary_vector(row, slices, primary, &row_action)?;
@@ -4282,7 +4276,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let cache = self.build_exact_eval_cache(block_states)?;
             self.exact_newton_joint_hessiansecond_directional_derivative_from_cache(
                 block_states, d_beta_u_flat, d_beta_v_flat, &cache,
-        )
+            )
+        }
     }
 
     fn exact_newton_joint_psi_terms(
