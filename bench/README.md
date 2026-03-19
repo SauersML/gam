@@ -49,7 +49,7 @@ Output:
 ## Scenario config
 
 Edit:
-- `/Users/user/gam/benchmarks/scenarios.json`
+- `/Users/user/gam/bench/scenarios.json`
 
 Default scenarios:
 - `small_dense` (`n=1000, p=10`)
@@ -92,4 +92,5 @@ Dataset files live in:
 - all scenarios: `rust_gam`, `r_mgcv`
 - gaussian scenarios: `r_mgcv_gaulss` (mean + scale via `mgcv::gaulss`), `r_gamboostlss` (mean + scale via `gamboostLSS::GaussianLSS`), `r_bamlss` (Bayesian distributional model with location-scale predictors), `r_brms` (Stan-backed Bayesian distributional model; typically slower)
 - all non-survival scenarios with formula mappings: `rust_gamlss` (Gaussian or Binomial-Probit location-scale), `r_gamlss` (Gaussian `NO()` or Binomial `BI()` with sigma sub-model)
-- survival scenarios only: `rust_gamlss_survival` (location-scale GAMLSS), `r_survival_coxph`, `r_mgcv_coxph`, `python_sksurv_rsf`, `python_sksurv_coxnet`, `python_lifelines_coxph_enet`, `r_glmnet_cox`, `python_sksurv_gb_coxph`, `python_sksurv_componentwise_gb_coxph`, `python_lifelines_weibull_aft`, `python_lifelines_lognormal_aft`, and `python_xgboost_aft`
+- binomial scenarios with formula mappings: `rust_gamlss_marginal_slope` (Bernoulli marginal-slope; benchmark harness uses the first smooth covariate as `z`, enforces exact train-fold population standardization for that column, and removes it from the baseline/logslope formulas)
+- survival scenarios only: `rust_gamlss_survival` (location-scale GAMLSS), `rust_gamlss_survival_marginal_slope` (survival marginal-slope; same exact benchmark `z` convention), `r_survival_coxph`, `r_mgcv_coxph`, `python_sksurv_rsf`, `python_sksurv_coxnet`, `python_lifelines_coxph_enet`, `r_glmnet_cox`, `python_sksurv_gb_coxph`, `python_sksurv_componentwise_gb_coxph`, `python_lifelines_weibull_aft`, `python_lifelines_lognormal_aft`, and `python_xgboost_aft`

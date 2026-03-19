@@ -4583,10 +4583,26 @@ impl DesignMatrix {
         }
         match (self, other) {
             (Self::Dense(lhs), Self::Dense(rhs)) => {
-                let lhs_dense = lhs.to_dense();
-                let rhs_dense = rhs.to_dense();
-                let x = lhs_dense.row(row);
-                let y = rhs_dense.row(row);
+                // Zero-copy borrow for materialized matrices; only Arc-clone
+                // (not data-clone) for lazy operators.
+                let lhs_owned;
+                let lhs_ref: &Array2<f64> = match lhs.as_dense_ref() {
+                    Some(r) => r,
+                    None => {
+                        lhs_owned = lhs.to_dense_arc();
+                        lhs_owned.as_ref()
+                    }
+                };
+                let rhs_owned;
+                let rhs_ref: &Array2<f64> = match rhs.as_dense_ref() {
+                    Some(r) => r,
+                    None => {
+                        rhs_owned = rhs.to_dense_arc();
+                        rhs_owned.as_ref()
+                    }
+                };
+                let x = lhs_ref.row(row);
+                let y = rhs_ref.row(row);
                 for i in 0..x.len() {
                     let xi = x[i];
                     if xi == 0.0 {

@@ -203,51 +203,6 @@ mod tests {
         let v_tau_analytic = single_directional_tau_gradient(&state, &rho, hyper.clone())
             .expect("analytic directional gradient");
 
-        let (ext_coords, _, _) = state
-            .build_tau_unified_objects_from_bundle(&rho, &bundle, std::slice::from_ref(&hyper))
-            .expect("ext coords");
-        let coord = &ext_coords[0];
-        let hop = super::unified::DenseSpectralOperator::from_symmetric(bundle.h_total.as_ref())
-            .expect("dense spectral operator");
-        let beta_tau = super::unified::HessianOperator::solve(&hop, &coord.g);
-        let x_eff = pr
-            .x_transformed
-            .try_to_dense_arc("directional_hyper_identities_match_finite_differences_logit")
-            .expect("dense transformed design");
-        let x_beta_tau = x_eff.dot(&beta_tau);
-        let corr_weights = &pr.solve_c_array * &x_beta_tau;
-        let mut correction = Array2::<f64>::zeros((x_eff.ncols(), x_eff.ncols()));
-        for row in 0..x_eff.nrows() {
-            let w_row = corr_weights[row];
-            if w_row == 0.0 {
-                continue;
-            }
-            let x_row = x_eff.row(row);
-            for a in 0..x_eff.ncols() {
-                let wa = w_row * x_row[a];
-                for b in a..x_eff.ncols() {
-                    let val = wa * x_row[b];
-                    correction[[a, b]] += val;
-                    if a != b {
-                        correction[[b, a]] += val;
-                    }
-                }
-            }
-        }
-        let drift = coord.drift.materialize();
-        let base_trace = 0.5 * super::unified::HessianOperator::trace_logdet_h_k(&hop, &drift, None);
-        let corr_trace =
-            0.5 * super::unified::HessianOperator::trace_logdet_gradient(&hop, &correction);
-        eprintln!(
-            "[tau-grad dbg] a={:.12e} base={:.12e} corr={:.12e} ld_s={:.12e} total={:.12e} fd={:.12e}",
-            coord.a,
-            base_trace,
-            corr_trace,
-            coord.ld_s,
-            v_tau_analytic,
-            v_taufd
-        );
-
         let b_num = (&b_analytic - &bfd).mapv(|v| v * v).sum().sqrt();
         let b_den = bfd.mapv(|v| v * v).sum().sqrt().max(1e-12);
         let b_rel = b_num / b_den;

@@ -3646,7 +3646,33 @@ struct TimeBlockPrepared {
     transform: TimeIdentifiabilityTransform,
 }
 
-fn project_onto_linear_constraints(
+pub(crate) fn time_derivative_lower_bound_constraints(
+    design_derivative_exit: &Array2<f64>,
+    derivative_offset_exit: &Array1<f64>,
+    lower_bound: f64,
+) -> Result<Option<LinearInequalityConstraints>, String> {
+    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
+        return Err(format!(
+            "time derivative constraints require matching rows/offsets: rows={}, offsets={}",
+            design_derivative_exit.nrows(),
+            derivative_offset_exit.len()
+        ));
+    }
+    if design_derivative_exit.ncols() == 0 {
+        return Ok(None);
+    }
+    if !lower_bound.is_finite() {
+        return Err(format!(
+            "time derivative lower bound must be finite, got {lower_bound}"
+        ));
+    }
+    Ok(Some(LinearInequalityConstraints {
+        a: design_derivative_exit.clone(),
+        b: derivative_offset_exit.mapv(|offset| lower_bound - offset),
+    }))
+}
+
+pub(crate) fn project_onto_linear_constraints(
     dim: usize,
     constraints: &LinearInequalityConstraints,
     beta0: Option<&Array1<f64>>,
@@ -8601,7 +8627,12 @@ mod tests {
             initial_beta: None,
         };
         let projected = family
-            .post_update_block_beta(&[], SurvivalLocationScaleFamily::BLOCK_TIME, &spec, array![-2.0, 0.5])
+            .post_update_block_beta(
+                &[],
+                SurvivalLocationScaleFamily::BLOCK_TIME,
+                &spec,
+                array![-2.0, 0.5],
+            )
             .expect("project time beta");
         assert_eq!(projected, array![0.0, 0.5]);
     }
