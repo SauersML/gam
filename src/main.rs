@@ -68,13 +68,11 @@ use gam::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
     append_zero_tail_columns, build_survival_baseline_offsets, build_survival_time_basis,
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
-    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    build_time_varying_survival_covariate_template, evaluate_survival_baseline,
-    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
-    survival_baseline_targetname,
-    survival_likelihood_modename,
+    build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
+    evaluate_survival_baseline, evaluate_survival_time_basis_row, normalize_survival_time_pair,
+    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
+    parse_survival_time_basis_config, require_structural_survival_time_basis,
+    resolve_survival_time_anchor_value, survival_baseline_targetname, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
@@ -1551,14 +1549,18 @@ fn run_fitwith_predict_noise(
                 .map(|b| b.beta.clone())
                 .unwrap_or_else(|| Array1::zeros(0))
                 .mapv(|v| v * response_scale);
-            let beta_covariance = fit
-                .covariance_conditional
-                .clone()
-                .map(|cov| cov.mapv(|v| v * response_scale * response_scale));
-            let beta_covariance_corrected = fit
-                .covariance_conditional
-                .clone()
-                .map(|cov| cov.mapv(|v| v * response_scale * response_scale));
+            let p_mean = beta_mean.len();
+            // The joint covariance covers all blocks (mean + log-sigma).
+            // Extract the mean-block submatrix (top-left p_mean × p_mean)
+            // so that the saved fit result dimensions are consistent.
+            let beta_covariance = fit.covariance_conditional.as_ref().map(|cov| {
+                cov.slice(ndarray::s![..p_mean, ..p_mean])
+                    .mapv(|v| v * response_scale * response_scale)
+            });
+            let beta_covariance_corrected = fit.covariance_conditional.as_ref().map(|cov| {
+                cov.slice(ndarray::s![..p_mean, ..p_mean])
+                    .mapv(|v| v * response_scale * response_scale)
+            });
             let fit_result = core_saved_fit_result(
                 beta_mean,
                 fit.lambdas.clone(),
@@ -2289,6 +2291,28 @@ fn run_predict_survival(
         eta_offset_entry[i] = eta_entry;
         eta_offset_exit[i] = eta_exit_i;
         derivative_offset_exit[i] = deriv_exit_i;
+    }
+    if matches!(
+        saved_likelihood_mode,
+        SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
+    ) {
+        let time_anchor = model
+            .survival_time_anchor
+            .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
+        let derivative_guard = if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
+            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD
+        } else {
+            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD
+        };
+        add_survival_time_derivative_guard_offset(
+            &age_entry,
+            &age_exit,
+            time_anchor,
+            derivative_guard,
+            &mut eta_offset_entry,
+            &mut eta_offset_exit,
+            &mut derivative_offset_exit,
+        )?;
     }
     let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
@@ -3313,7 +3337,7 @@ fn run_predict_standard(
 
     let mut eta_se = None;
 
-    if args.uncertainty && mean_lo.is_none() {
+    if se_opt.is_some() && mean_lo.is_none() {
         if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
             return Err(format!("--level must be in (0,1), got {}", args.level));
         }
@@ -3551,7 +3575,8 @@ fn resolved_survival_time_basis_config_from_build(
         "bspline" => Ok(SurvivalTimeBasisConfig::BSpline {
             degree: degree.ok_or_else(|| "survival bspline basis is missing degree".to_string())?,
             knots: Array1::from_vec(
-                knots.cloned()
+                knots
+                    .cloned()
                     .ok_or_else(|| "survival bspline basis is missing knots".to_string())?,
             ),
             smooth_lambda: smooth_lambda.unwrap_or(1e-2),
@@ -3559,7 +3584,8 @@ fn resolved_survival_time_basis_config_from_build(
         "ispline" => Ok(SurvivalTimeBasisConfig::ISpline {
             degree: degree.ok_or_else(|| "survival ispline basis is missing degree".to_string())?,
             knots: Array1::from_vec(
-                knots.cloned()
+                knots
+                    .cloned()
                     .ok_or_else(|| "survival ispline basis is missing knots".to_string())?,
             ),
             keep_cols: keep_cols
@@ -3569,6 +3595,34 @@ fn resolved_survival_time_basis_config_from_build(
         }),
         other => Err(format!("unsupported survival time basis '{other}'")),
     }
+}
+
+fn add_survival_time_derivative_guard_offset(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    anchor_time: f64,
+    derivative_guard: f64,
+    eta_offset_entry: &mut Array1<f64>,
+    eta_offset_exit: &mut Array1<f64>,
+    derivative_offset_exit: &mut Array1<f64>,
+) -> Result<(), String> {
+    if derivative_guard <= 0.0 {
+        return Ok(());
+    }
+    let n = age_entry.len();
+    if age_exit.len() != n
+        || eta_offset_entry.len() != n
+        || eta_offset_exit.len() != n
+        || derivative_offset_exit.len() != n
+    {
+        return Err("survival derivative-guard offset lengths must match".to_string());
+    }
+    for i in 0..n {
+        eta_offset_entry[i] += derivative_guard * (age_entry[i] - anchor_time);
+        eta_offset_exit[i] += derivative_guard * (age_exit[i] - anchor_time);
+        derivative_offset_exit[i] += derivative_guard;
+    }
+    Ok(())
 }
 
 fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
@@ -3946,8 +4000,24 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         age_exit[i] = t1;
         event_target[i] = if ev >= 0.5 { 1 } else { 0 };
     }
-    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+    let time_anchor = resolve_survival_time_anchor_value(&age_entry, args.survival_time_anchor)?;
+    let mut exact_derivative_guard = 0.0_f64;
+    if likelihood_mode == SurvivalLikelihoodMode::LocationScale {
+        exact_derivative_guard = DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
+    } else if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        exact_derivative_guard = DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD;
+    }
+    let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
+    add_survival_time_derivative_guard_offset(
+        &age_entry,
+        &age_exit,
+        time_anchor,
+        exact_derivative_guard,
+        &mut eta_offset_entry,
+        &mut eta_offset_exit,
+        &mut derivative_offset_exit,
+    )?;
     let timewiggle_build = if let Some(cfg) = effective_timewiggle.as_ref() {
         Some(build_survival_timewiggle_from_baseline(
             &eta_offset_entry,
@@ -3967,7 +4037,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_args.ridge_lambda,
         )),
     )?;
-    let time_anchor = resolve_survival_time_anchor_value(&age_entry, args.survival_time_anchor)?;
     let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
         &time_build.basisname,
         time_build.degree,
@@ -4069,7 +4138,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 weights: weights.clone(),
                 inverse_link,
                 derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-                time_anchor: Some(time_anchor),
                 max_iter: 400,
                 tol: 1e-6,
                 time_block: TimeBlockInput {
@@ -4974,8 +5042,22 @@ fn run_sample_survival(
         )?;
     }
     let baseline_cfg = survival_baseline_config_from_model(model)?;
-    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+    let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
+    if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        let time_anchor = model
+            .survival_time_anchor
+            .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
+        add_survival_time_derivative_guard_offset(
+            &age_entry,
+            &age_exit,
+            time_anchor,
+            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+            &mut eta_offset_entry,
+            &mut eta_offset_exit,
+            &mut derivative_offset_exit,
+        )?;
+    }
     let saved_timewiggle = saved_baseline_timewiggle_components(
         &eta_offset_entry,
         &eta_offset_exit,
@@ -9372,6 +9454,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
             survival_beta_time: None,
@@ -9455,6 +9538,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
             survival_beta_time: None,
@@ -9560,6 +9644,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
             survival_beta_time: None,
@@ -10840,6 +10925,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: Some("transformation".to_string()),
             survival_beta_time: None,
@@ -10917,6 +11003,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: Some("transformation".to_string()),
             survival_beta_time: None,
@@ -11028,6 +11115,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: Some(1e-4),
             survival_likelihood: Some("transformation".to_string()),
             survival_beta_time: None,
@@ -11160,6 +11248,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: Some(1e-4),
             survival_likelihood: Some("transformation".to_string()),
             survival_beta_time: None,
@@ -12492,6 +12581,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
             survival_beta_time: None,
@@ -12724,6 +12814,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
             survival_beta_time: None,
@@ -12796,6 +12887,7 @@ mod tests {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
             survival_beta_time: None,

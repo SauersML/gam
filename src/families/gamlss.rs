@@ -792,6 +792,7 @@ fn build_two_block_exact_joint_setup(
     mean_penalties: usize,
     noise_penalties: usize,
     extra_rho0: &[f64],
+    rho0_override: Option<&Array1<f64>>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
     // Exact-joint setup stores the spatial tail in log(kappa), not log(length_scale).
@@ -802,8 +803,12 @@ fn build_two_block_exact_joint_setup(
     let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
     let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
 
-    for (i, &rho_init) in extra_rho0.iter().enumerate() {
-        rho0vec[mean_penalties + noise_penalties + i] = rho_init;
+    if let Some(rho0) = rho0_override.filter(|rho0| rho0.len() == rho_dim) {
+        rho0vec.assign(rho0);
+    } else {
+        for (i, &rho_init) in extra_rho0.iter().enumerate() {
+            rho0vec[mean_penalties + noise_penalties + i] = rho_init;
+        }
     }
 
     // Use aniso-aware initialization: each aniso term gets d ψ entries.
@@ -831,6 +836,36 @@ fn build_two_block_exact_joint_setup(
         log_kappa_lower,
         log_kappa_upper,
     )
+}
+
+fn compose_theta_from_hints(
+    mean_penalty_count: usize,
+    noise_penalty_count: usize,
+    mean_log_lambda_hint: &Option<Array1<f64>>,
+    noise_log_lambda_hint: &Option<Array1<f64>>,
+    extra_rho0: &Array1<f64>,
+) -> Array1<f64> {
+    let layout =
+        GamlssLambdaLayout::withwiggle(mean_penalty_count, noise_penalty_count, extra_rho0.len());
+    let mut theta = Array1::<f64>::zeros(layout.total());
+    if let Some(v) = mean_log_lambda_hint
+        && v.len() == layout.k_mean
+    {
+        theta.slice_mut(s![0..layout.mean_end()]).assign(v);
+    }
+    if let Some(v) = noise_log_lambda_hint
+        && v.len() == layout.k_noise
+    {
+        theta
+            .slice_mut(s![layout.noise_start()..layout.noise_end()])
+            .assign(v);
+    }
+    if layout.kwiggle > 0 {
+        theta
+            .slice_mut(s![layout.wiggle_start()..layout.wiggle_end()])
+            .assign(extra_rho0);
+    }
+    theta
 }
 
 fn solve_penalizedweighted_projection(
@@ -1501,6 +1536,10 @@ trait LocationScaleFamilyBuilder {
         false
     }
 
+    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
+        crate::seeding::SeedRiskProfile::GeneralizedLinear
+    }
+
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         Ok(Array1::zeros(0))
     }
@@ -1529,6 +1568,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
     let mut mean_beta_hint: Option<Array1<f64>> = None;
     let mut noise_beta_hint: Option<Array1<f64>> = None;
+    let mut exact_joint_rho0_hint: Option<Array1<f64>> = None;
     let extra_rho0 = builder.extra_rho0()?;
 
     let mean_boot_design =
@@ -1568,6 +1608,43 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
     let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
+    // Seed the exact joint solve from a successful fixed-kappa fit when
+    // possible. Starting from zero mean/noise log-lambdas is too brittle for
+    // the binomial wiggle spatial path.
+    let baseline_theta0 = compose_theta_from_hints(
+        mean_penalty_count,
+        noise_penalty_count,
+        &mean_log_lambda_hint,
+        &noise_log_lambda_hint,
+        &extra_rho0,
+    );
+    if let Ok(blocks) = builder.build_blocks(
+        &baseline_theta0,
+        &mean_boot_design,
+        &noise_boot_design,
+        None,
+        None,
+    ) {
+        let family = builder.build_family(&mean_boot_design, &noise_boot_design);
+        if let Ok(fit) = fit_custom_family(&family, &blocks, options) {
+            let layout = GamlssLambdaLayout::withwiggle(
+                mean_penalty_count,
+                noise_penalty_count,
+                extra_rho0.len(),
+            );
+            if fit.log_lambdas.len() >= layout.total() {
+                exact_joint_rho0_hint =
+                    Some(fit.log_lambdas.slice(s![..layout.total()]).to_owned());
+                mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
+                noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
+            }
+            if let Ok((mean_beta, noise_beta)) = builder.extract_primary_betas(&fit) {
+                mean_beta_hint = Some(mean_beta);
+                noise_beta_hint = Some(noise_beta);
+            }
+        }
+    }
+
     // Macro to invoke the exact-joint spatial optimizer with shared closures.
     // The exact path evaluates the full profiled/Laplace objective over
     // theta = [rho, psi] with the real joint Hessian required by NewtonTR/ARC.
@@ -1579,6 +1656,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 mean_penalty_count,
                 noise_penalty_count,
                 extra_rho0.as_slice().unwrap_or(&[]),
+                exact_joint_rho0_hint.as_ref(),
                 kappa_options,
             );
             let mean_terms = spatial_length_scale_term_indices(builder.meanspec());
@@ -1591,6 +1669,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 &[mean_terms, noise_terms],
                 kappa_options,
                 &joint_setup,
+                builder.exact_spatial_seed_risk_profile(),
                 analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
                 |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
@@ -1703,6 +1782,10 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
 
     fn exact_spatial_joint_supported(&self) -> bool {
         true
+    }
+
+    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
+        crate::seeding::SeedRiskProfile::Gaussian
     }
 
     fn build_blocks(
@@ -1858,6 +1941,10 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
 
     fn exact_spatial_joint_supported(&self) -> bool {
         true
+    }
+
+    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
+        crate::seeding::SeedRiskProfile::Gaussian
     }
 
     fn require_exact_spatial_joint(&self) -> bool {
@@ -2806,8 +2893,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterCapability, OuterConfig,
-        OuterEval,
+        ClosureObjective, Derivative, HessianResult, OuterCapability, OuterEval,
     };
 
     let mut obj = ClosureObjective {
@@ -2897,18 +2983,17 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         >,
     };
 
-    let outer_config = OuterConfig {
-        tolerance: options.outer_tol,
-        max_iter: options.outer_max_iter,
-        fd_step: 1e-4,
-        bounds: Some((lower, upper)),
-        seed_config: crate::seeding::SeedConfig::default(),
-        rho_bound: RHO_BOUND,
-        heuristic_lambdas: None,
-        initial_rho: Some(theta0),
-        fallback_policy: FallbackPolicy::Automatic,
-        screening_cap: None,
-    };
+    let outer_config = crate::terms::smooth::exact_joint_multistart_outer_config(
+        &theta0,
+        &lower,
+        &upper,
+        rho_dim,
+        theta_dim - rho_dim,
+        crate::seeding::SeedRiskProfile::GeneralizedLinear,
+        options.outer_tol,
+        options.outer_max_iter,
+        1e-4,
+    );
 
     let outer = crate::solver::outer_strategy::run_outer(
         &mut obj,

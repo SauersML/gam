@@ -1228,7 +1228,6 @@ fn materialize_survival<'a>(
                 weights: Array1::ones(n),
                 inverse_link: survival_inverse_link,
                 derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-                time_anchor: None,
                 max_iter: 200,
                 tol: 1e-7,
                 time_block,

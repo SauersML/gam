@@ -13,7 +13,9 @@ use crate::families::bernoulli_marginal_slope::{
     signed_probit_neglog_derivatives_up_to_fourth, unary_derivatives_log,
     unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
-use crate::families::gamlss::monotone_wiggle_nonnegative_constraints;
+use crate::families::gamlss::{
+    monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta,
+};
 use crate::families::survival_location_scale::TimeBlockInput;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -1866,6 +1868,19 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             Ok(None)
         }
     }
+
+    fn post_update_block_beta(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        _: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        if block_idx == 0 {
+            return Ok(project_monotone_wiggle_beta(beta));
+        }
+        Ok(beta)
+    }
 }
 
 // ── Building block specs ──────────────────────────────────────────────
@@ -2335,6 +2350,7 @@ pub fn fit_survival_marginal_slope_terms(
         &[marginal_terms, logslope_terms],
         kappa_options,
         &setup,
+        crate::seeding::SeedRiskProfile::Survival,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {

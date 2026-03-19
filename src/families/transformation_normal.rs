@@ -2080,6 +2080,7 @@ pub fn fit_transformation_normal(
         &block_term_indices_slice,
         kappa_options,
         &joint_setup,
+        crate::seeding::SeedRiskProfile::Gaussian,
         analytic_gradient,
         analytic_hessian,
         // fit_fn

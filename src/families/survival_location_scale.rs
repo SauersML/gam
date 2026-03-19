@@ -47,7 +47,7 @@ use crate::solver::estimate::{
 };
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array1, Array2, s};
 use statrs::function::erf::erfc;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -500,32 +500,6 @@ pub struct TimeBlockInput {
     pub initial_beta: Option<Array1<f64>>,
 }
 
-pub(crate) fn time_derivative_lower_bound_constraints(
-    design_derivative_exit: &Array2<f64>,
-    derivative_offset_exit: &Array1<f64>,
-    lower_bound: f64,
-) -> Result<Option<LinearInequalityConstraints>, String> {
-    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
-        return Err(format!(
-            "time derivative constraints require matching rows/offsets: rows={}, offsets={}",
-            design_derivative_exit.nrows(),
-            derivative_offset_exit.len()
-        ));
-    }
-    if design_derivative_exit.ncols() == 0 {
-        return Ok(None);
-    }
-    if !lower_bound.is_finite() {
-        return Err(format!(
-            "time derivative lower bound must be finite, got {lower_bound}"
-        ));
-    }
-    Ok(Some(LinearInequalityConstraints {
-        a: design_derivative_exit.clone(),
-        b: derivative_offset_exit.mapv(|offset| lower_bound - offset),
-    }))
-}
-
 #[derive(Clone)]
 pub struct CovariateBlockInput {
     pub design: DesignMatrix,
@@ -600,11 +574,6 @@ struct SurvivalLocationScaleSpec {
     pub weights: Array1<f64>,
     pub inverse_link: InverseLink,
     pub derivative_guard: f64,
-    /// Optional anchor time for identifiability of h(t).
-    ///
-    /// If `None`, the model anchors at the earliest observed entry time.
-    /// If `Some(t_anchor)`, the nearest observed entry-time row is used.
-    pub time_anchor: Option<f64>,
     pub max_iter: usize,
     pub tol: f64,
     pub time_block: TimeBlockInput,
@@ -635,7 +604,6 @@ pub struct SurvivalLocationScaleTermSpec {
     /// Strict lower bound on d_eta/dt used by both the event Jacobian term
     /// and the time monotonicity constraints.
     pub derivative_guard: f64,
-    pub time_anchor: Option<f64>,
     pub max_iter: usize,
     pub tol: f64,
     pub time_block: TimeBlockInput,
@@ -3184,12 +3152,7 @@ fn prepare_survival_location_scale_model(
     validate_survival_location_scale_spec(spec)?;
     let n = spec.event_target.len();
     let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
-    let mut time_prepared = prepare_identified_time_block(
-        &spec.time_block,
-        0,
-        protected_timewiggle_cols,
-        spec.derivative_guard,
-    )?;
+    let mut time_prepared = prepare_identified_time_block(&spec.time_block)?;
 
     if time_prepared.initial_beta.is_none() {
         let deriv_offset_max = spec
@@ -3720,12 +3683,7 @@ fn project_onto_linear_constraints(
     beta
 }
 
-fn prepare_identified_time_block(
-    input: &TimeBlockInput,
-    _anchorrow: usize,
-    _protected_tail_cols: usize,
-    _derivative_guard: f64,
-) -> Result<TimeBlockPrepared, String> {
+fn prepare_identified_time_block(input: &TimeBlockInput) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
     if !input.structural_monotonicity {
         return Err(
@@ -7977,10 +7935,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         _: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        if block_idx != Self::BLOCK_LINK_WIGGLE {
-            return Ok(beta);
+        if block_idx == Self::BLOCK_TIME || block_idx == Self::BLOCK_LINK_WIGGLE {
+            return Ok(project_monotone_wiggle_beta(beta));
         }
-        Ok(project_monotone_wiggle_beta(beta))
+        Ok(beta)
     }
 }
 
@@ -8206,7 +8164,6 @@ pub(crate) fn fit_survival_location_scale_terms(
             weights: spec.weights.clone(),
             inverse_link: spec.inverse_link.clone(),
             derivative_guard: spec.derivative_guard,
-            time_anchor: spec.time_anchor,
             max_iter: spec.max_iter,
             tol: spec.tol,
             time_block: TimeBlockInput {
@@ -8237,6 +8194,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         &[threshold_terms, log_sigma_terms],
         kappa_options,
         &joint_setup,
+        crate::seeding::SeedRiskProfile::Survival,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
@@ -8518,6 +8476,32 @@ mod tests {
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, array};
 
+    fn time_derivative_lower_bound_constraints(
+        design_derivative_exit: &Array2<f64>,
+        derivative_offset_exit: &Array1<f64>,
+        lower_bound: f64,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        if design_derivative_exit.nrows() != derivative_offset_exit.len() {
+            return Err(format!(
+                "time derivative constraints require matching rows/offsets: rows={}, offsets={}",
+                design_derivative_exit.nrows(),
+                derivative_offset_exit.len()
+            ));
+        }
+        if design_derivative_exit.ncols() == 0 {
+            return Ok(None);
+        }
+        if !lower_bound.is_finite() {
+            return Err(format!(
+                "time derivative lower bound must be finite, got {lower_bound}"
+            ));
+        }
+        Ok(Some(LinearInequalityConstraints {
+            a: design_derivative_exit.clone(),
+            b: derivative_offset_exit.mapv(|offset| lower_bound - offset),
+        }))
+    }
+
     fn sparse_design_from_dense(dense: &Array2<f64>) -> DesignMatrix {
         let mut triplets = Vec::new();
         for i in 0..dense.nrows() {
@@ -8602,6 +8586,24 @@ mod tests {
             wiggle_knots: None,
             wiggle_degree: None,
         }
+    }
+
+    #[test]
+    fn time_block_post_update_projects_negative_coefficients() {
+        let family = survival_exact_newton_test_family();
+        let spec = ParameterBlockSpec {
+            name: "time_transform".to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, 2)))),
+            offset: Array1::zeros(1),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let projected = family
+            .post_update_block_beta(&[], SurvivalLocationScaleFamily::BLOCK_TIME, &spec, array![-2.0, 0.5])
+            .expect("project time beta");
+        assert_eq!(projected, array![0.0, 0.5]);
     }
 
     fn survival_exact_newton_test_familywith_inverse_link(
@@ -8819,13 +8821,13 @@ mod tests {
     }
 
     #[test]
-    fn identified_time_blockzeroes_anchorrow() {
+    fn identified_time_block_preserves_input_designs() {
         let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
         let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
         let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
-            design_entry,
-            design_exit,
+            design_entry: design_entry.clone(),
+            design_exit: design_exit.clone(),
             design_derivative_exit: design_derivative_exit.clone(),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
@@ -8836,34 +8838,10 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(
-            &time_block,
-            0,
-            0,
-            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-        )
-        .expect("prepare time block");
-        let entry_anchorrow = prepared.design_entry.row(0);
-        let entry_max_abs = entry_anchorrow
-            .iter()
-            .copied()
-            .map(f64::abs)
-            .fold(0.0, f64::max);
-        assert!(
-            entry_max_abs <= 1e-10,
-            "entry anchor row not zero after identifiability transform: max_abs={entry_max_abs}"
-        );
-
-        let exit_anchorrow = prepared.design_exit.row(0);
-        let exit_max_abs = exit_anchorrow
-            .iter()
-            .copied()
-            .map(f64::abs)
-            .fold(0.0, f64::max);
-        assert!(
-            exit_max_abs > 1e-6,
-            "test setup should keep exit anchor row distinct from zero to detect anchor mixups"
-        );
+        let prepared = prepare_identified_time_block(&time_block).expect("prepare time block");
+        assert_eq!(prepared.design_entry, design_entry);
+        assert_eq!(prepared.design_exit, design_exit);
+        assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
     }
 
     #[test]
@@ -8885,13 +8863,7 @@ mod tests {
             initial_beta: None,
         };
 
-        let prepared = prepare_identified_time_block(
-            &time_block,
-            0,
-            0,
-            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-        )
-        .expect("prepare time block");
+        let prepared = prepare_identified_time_block(&time_block).expect("prepare time block");
         let p = time_block.design_entry.ncols();
 
         assert_eq!(
@@ -8901,60 +8873,59 @@ mod tests {
         );
         assert_eq!(
             prepared.transform.z.ncols(),
-            p - 1,
-            "a single nonzero anchor row should remove exactly one time coefficient dimension"
+            p,
+            "anchored time basis should keep the full coefficient dimension"
         );
         assert_eq!(
             prepared.design_entry.ncols(),
-            p - 1,
-            "prepared entry design should keep the p-1 nullspace basis columns"
+            p,
+            "prepared entry design should keep the full anchored basis width"
         );
         assert_eq!(
             prepared.design_exit.ncols(),
-            p - 1,
-            "prepared exit design should keep the p-1 nullspace basis columns"
+            p,
+            "prepared exit design should keep the full anchored basis width"
         );
+        assert_eq!(prepared.transform.z, Array2::<f64>::eye(p));
     }
 
     #[test]
-    fn identified_time_block_constraints_match_transformed_derivative_guard() {
-        let derivative_guard = 1e-4;
-        let derivative_offset_exit = array![2.0e-5, 4.0e-5, 6.0e-5];
+    fn identified_time_block_uses_nonnegative_time_constraints() {
         let time_block = TimeBlockInput {
             design_entry: array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]],
             design_exit: array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]],
             design_derivative_exit: array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]],
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
-            derivative_offset_exit: derivative_offset_exit.clone(),
+            derivative_offset_exit: Array1::zeros(3),
             structural_monotonicity: true,
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(&time_block, 0, 0, derivative_guard)
-            .expect("prepare time block");
+        let prepared = prepare_identified_time_block(&time_block).expect("prepare time block");
         let constraints = prepared
             .linear_constraints
             .expect("time derivative constraints");
-        assert_eq!(constraints.a, prepared.design_derivative_exit);
+        assert_eq!(
+            constraints.a,
+            Array2::<f64>::eye(time_block.design_exit.ncols())
+        );
         assert_eq!(
             constraints.b,
-            derivative_offset_exit.mapv(|offset| derivative_guard - offset),
+            Array1::<f64>::zeros(time_block.design_exit.ncols())
         );
     }
 
     #[test]
-    fn identified_time_block_degenerate_entry_uses_exit_design() {
-        // When entry design row is all zeros (degenerate entry times),
-        // the identifiability constraint should fall back to the exit design.
+    fn identified_time_block_degenerate_entry_preserves_full_dimension() {
         let design_entry = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         let design_exit = array![[0.1, 0.5, 0.9], [0.2, 0.6, 1.0], [0.3, 0.7, 1.0]];
         let design_derivative_exit = array![[0.1, 0.1, 0.0], [0.1, 0.1, 0.0], [0.1, 0.1, 0.0]];
         let time_block = TimeBlockInput {
-            design_entry,
-            design_exit,
+            design_entry: design_entry.clone(),
+            design_exit: design_exit.clone(),
             design_derivative_exit: design_derivative_exit.clone(),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
@@ -8965,33 +8936,20 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(
-            &time_block,
-            0,
-            0,
-            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-        )
-        .expect("prepare time block");
-        // With a non-trivial exit design row, one dimension should be removed.
-        assert_eq!(
-            prepared.design_exit.ncols(),
-            2,
-            "degenerate entry should still remove one dimension using exit design"
-        );
-        // The exit anchor row (after transform) should be zeroed by the constraint.
-        let exit_anchor = prepared.design_exit.row(0);
-        let exit_anchor_max = exit_anchor.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        assert!(
-            exit_anchor_max < 1e-10,
-            "exit anchor row should be near zero after constraint: max_abs={exit_anchor_max}"
-        );
+        let prepared = prepare_identified_time_block(&time_block).expect("prepare time block");
+        assert_eq!(prepared.design_entry, design_entry);
+        assert_eq!(prepared.design_exit, design_exit);
+        assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
     }
 
     #[test]
-    fn select_anchorrow_defaults_to_earliest_entry() {
+    fn resolve_survival_time_anchor_defaults_to_earliest_entry() {
         let age_entry = array![5.0, 1.0, 3.0];
-        let idx = select_anchorrow(&age_entry, None).expect("select default anchor");
-        assert_eq!(idx, 1);
+        let anchor = crate::families::survival_construction::resolve_survival_time_anchor_value(
+            &age_entry, None,
+        )
+        .expect("resolve default anchor");
+        assert!((anchor - 1.0).abs() <= 1e-12);
     }
 
     #[test]
@@ -10666,7 +10624,6 @@ mod tests {
             weights,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
             derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-            time_anchor: None,
             max_iter: 400,
             tol: 1e-6,
             time_block: TimeBlockInput {
