@@ -2476,6 +2476,68 @@ impl PredictableModel for SurvivalPredictor {
     }
 }
 
+/// Predictor for transformation-normal (PIT) models.
+///
+/// The PIT-transformed values h(y|x) are precomputed in
+/// `build_predict_input_for_model` and stored in the PredictInput offset.
+/// This predictor passes them through as the prediction: eta = h, mean = h.
+pub struct TransformationNormalPredictor {
+    pub covariance: Option<Array2<f64>>,
+}
+
+impl PredictableModel for TransformationNormalPredictor {
+    fn predict_plugin_response(
+        &self,
+        input: &PredictInput,
+    ) -> Result<PredictResult, EstimationError> {
+        // h values are in the offset (computed by build_predict_input_for_model)
+        let h = input.offset.clone();
+        Ok(PredictResult {
+            eta: h.clone(),
+            mean: h,
+        })
+    }
+
+    fn predict_with_uncertainty(
+        &self,
+        input: &PredictInput,
+        _fit: &UnifiedFitResult,
+        _options: &PredictOptions,
+    ) -> Result<PredictUncertaintyResult, EstimationError> {
+        let h = input.offset.clone();
+        let n = h.len();
+        Ok(PredictUncertaintyResult {
+            eta: h.clone(),
+            eta_standard_error: Array1::zeros(n),
+            mean: h.clone(),
+            mean_lower: h.clone(),
+            mean_upper: h,
+            observation_lower: None,
+            observation_upper: None,
+        })
+    }
+
+    fn predict_posterior_mean(
+        &self,
+        input: &PredictInput,
+        _fit: &UnifiedFitResult,
+        _confidence_level: Option<f64>,
+    ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        let h = input.offset.clone();
+        let n = h.len();
+        Ok(PredictPosteriorMeanResult {
+            eta: h.clone(),
+            eta_standard_error: Array1::zeros(n),
+            mean: h.clone(),
+            mean_lower: None,
+            mean_upper: None,
+        })
+    }
+
+    fn n_blocks(&self) -> usize { 1 }
+    fn block_roles(&self) -> Vec<BlockRole> { vec![BlockRole::Mean] }
+}
+
 /// Compute eta standard errors from a design matrix and covariance/precision backend.
 fn eta_standard_errors_from_backend(
     x: &DesignMatrix,

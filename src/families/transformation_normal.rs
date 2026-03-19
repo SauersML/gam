@@ -132,6 +132,12 @@ pub struct TransformationNormalFamily {
 
     // --- Config ---
     block_name: String,
+
+    // --- Response basis metadata (for reconstruction at predict time) ---
+    response_knots: Array1<f64>,
+    response_transform: Array2<f64>,
+    response_degree: usize,
+    response_median: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +223,15 @@ impl TransformationNormalFamily {
         // ----- 6. Initial log-lambdas (one per penalty, start at 0.0) -----
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
 
+        // Compute response median for anchoring
+        let mut sorted_resp = response.to_vec();
+        sorted_resp.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let resp_median = if sorted_resp.len() % 2 == 1 {
+            sorted_resp[sorted_resp.len() / 2]
+        } else {
+            0.5 * (sorted_resp[sorted_resp.len() / 2 - 1] + sorted_resp[sorted_resp.len() / 2])
+        };
+
         Ok(Self {
             x_val_kron,
             x_deriv_kron,
@@ -228,6 +243,10 @@ impl TransformationNormalFamily {
             initial_beta,
             initial_log_lambdas,
             block_name: "transformation".to_string(),
+            response_knots: resp_knots,
+            response_transform: resp_transform,
+            response_degree: config.response_degree,
+            response_median: resp_median,
         })
     }
 
@@ -314,6 +333,15 @@ impl TransformationNormalFamily {
 
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
 
+        // Compute response median from column 1 (y values)
+        let mut sorted_resp = response_approx.to_vec();
+        sorted_resp.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let resp_median = if sorted_resp.len() % 2 == 1 {
+            sorted_resp[sorted_resp.len() / 2]
+        } else {
+            0.5 * (sorted_resp[sorted_resp.len() / 2 - 1] + sorted_resp[sorted_resp.len() / 2])
+        };
+
         Ok(Self {
             x_val_kron,
             x_deriv_kron,
@@ -325,8 +353,18 @@ impl TransformationNormalFamily {
             initial_beta,
             initial_log_lambdas,
             block_name: "transformation".to_string(),
+            response_knots: response_knots.clone(),
+            response_transform: response_transform.clone(),
+            response_degree,
+            response_median: resp_median,
         })
     }
+
+    /// Response basis metadata for serialization/prediction.
+    pub fn response_knots(&self) -> &Array1<f64> { &self.response_knots }
+    pub fn response_transform(&self) -> &Array2<f64> { &self.response_transform }
+    pub fn response_degree(&self) -> usize { self.response_degree }
+    pub fn response_median(&self) -> f64 { self.response_median }
 
     /// Return the `ParameterBlockSpec` for this family (single block).
     pub fn block_spec(&self) -> ParameterBlockSpec {
