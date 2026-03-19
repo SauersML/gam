@@ -3547,7 +3547,9 @@ impl SparseHessianAccumulator {
             // integers starting at first_row[c], so the offset is arithmetic.
             let idx = s.col_ptrs[c] + (r - s.first_row[c]);
             assert!(idx < s.col_ptrs[c + 1], "add_upper contiguous OOB");
-            unsafe { *self.values.get_unchecked_mut(idx) += val; }
+            unsafe {
+                *self.values.get_unchecked_mut(idx) += val;
+            }
         } else {
             // Fallback linear scan for non-contiguous patterns.
             let start = s.col_ptrs[c];
@@ -3555,7 +3557,9 @@ impl SparseHessianAccumulator {
             let slice = &s.row_indices[start..end];
             for (off, &ri) in slice.iter().enumerate() {
                 if ri == r {
-                    unsafe { *self.values.get_unchecked_mut(start + off) += val; }
+                    unsafe {
+                        *self.values.get_unchecked_mut(start + off) += val;
+                    }
                     return;
                 }
             }
@@ -3604,9 +3608,8 @@ impl SparseHessianAccumulator {
         // Safety: col_ptrs and row_indices were built from a valid BTreeSet
         // enumeration → sorted row indices per column, no duplicates, all
         // indices in [0, dim).
-        let symbolic = unsafe {
-            SymbolicSparseColMat::new_unchecked(dim, dim, col_ptrs, None, row_indices)
-        };
+        let symbolic =
+            unsafe { SymbolicSparseColMat::new_unchecked(dim, dim, col_ptrs, None, row_indices) };
         SparseColMat::new(symbolic, self.values)
     }
 }

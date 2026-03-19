@@ -9,12 +9,10 @@
 //! These are the building blocks a library consumer needs to construct
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
-use ndarray::{Array1, Array2, array, s};
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
     KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
-use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::families::gamlss::{
     WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
     monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
@@ -23,6 +21,8 @@ use crate::families::survival_location_scale::{
     ResidualDistribution, SurvivalCovariateTermBlockTemplate,
 };
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
+use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
+use ndarray::{Array1, Array2, array, s};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -606,19 +606,19 @@ pub fn build_survival_time_basis(
                     }
                 }
             }
-            let x_derivative_time = match faer::sparse::SparseColMat::try_new_from_triplets(
-                n, p_time, &deriv_triplets,
-            ) {
-                Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
-                Err(_) => {
-                    // Fallback: build dense
-                    let mut dense = Array2::<f64>::zeros((n, p_time));
-                    for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
-                        dense[[row, col]] = val;
+            let x_derivative_time =
+                match faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
+                {
+                    Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
+                    Err(_) => {
+                        // Fallback: build dense
+                        let mut dense = Array2::<f64>::zeros((n, p_time));
+                        for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
+                            dense[[row, col]] = val;
+                        }
+                        DesignMatrix::Dense(DenseDesignMatrix::from(dense))
                     }
-                    DesignMatrix::Dense(DenseDesignMatrix::from(dense))
-                }
-            };
+                };
 
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time: entry_basis.design,
@@ -770,18 +770,18 @@ pub fn build_survival_time_basis(
                     col + 1
                 ));
             }
-            let x_derivative_time = match faer::sparse::SparseColMat::try_new_from_triplets(
-                n, p_time, &deriv_triplets,
-            ) {
-                Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
-                Err(_) => {
-                    let mut dense = Array2::<f64>::zeros((n, p_time));
-                    for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
-                        dense[[row, col]] = val;
+            let x_derivative_time =
+                match faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
+                {
+                    Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
+                    Err(_) => {
+                        let mut dense = Array2::<f64>::zeros((n, p_time));
+                        for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
+                            dense[[row, col]] = val;
+                        }
+                        DesignMatrix::Dense(DenseDesignMatrix::from(dense))
                     }
-                    DesignMatrix::Dense(DenseDesignMatrix::from(dense))
-                }
-            };
+                };
 
             let penalty_basis = build_bspline_basis_1d(
                 log_exit.view(),

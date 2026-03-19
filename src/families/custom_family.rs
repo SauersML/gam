@@ -2772,12 +2772,9 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
                 .channels
                 .iter()
                 .map(|channel| {
-                    channel
-                        .psi_derivative
-                        .as_ref()
-                        .map(|deriv| {
-                            deriv.forward_mul(basis.slice(ndarray::s![channel.range.clone()]))
-                        })
+                    channel.psi_derivative.as_ref().map(|deriv| {
+                        deriv.forward_mul(basis.slice(ndarray::s![channel.range.clone()]))
+                    })
                 })
                 .collect();
             let mut col = Array1::<f64>::zeros(self.total_dim);
@@ -6224,7 +6221,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     t.hessian_psi_psi,
                     t.hessian_psi_psi_operator,
                 ),
-                None => (0.0, Array1::zeros(total), Array2::zeros((total, total)), None),
+                None => (
+                    0.0,
+                    Array1::zeros(total),
+                    Array2::zeros((total, total)),
+                    None,
+                ),
             };
 
             let mut a = obj_ll;

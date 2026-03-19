@@ -41,7 +41,6 @@ use gam::inference::data::{
     load_dataset_projected as load_dataset_auto_projected,
     load_datasetwith_schema as load_dataset_auto_with_schema,
 };
-use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::inference::formula_dsl::{
     LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
     effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
@@ -53,6 +52,7 @@ use gam::inference::model::{
     PredictModelClass, SavedAnchoredDeviationRuntime, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
+use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
@@ -2617,7 +2617,9 @@ fn run_predict_survival(
                 Ok(vec![jac])
             })
             .map_err(|e| {
-                format!("saved survival marginal-slope posterior covariance application failed: {e}")
+                format!(
+                    "saved survival marginal-slope posterior covariance application failed: {e}"
+                )
             })?;
             let eta_var = local_covariances
                 .into_iter()

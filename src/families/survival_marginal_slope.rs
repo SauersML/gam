@@ -7,7 +7,6 @@ use crate::custom_family::{
     custom_family_outer_capability, evaluate_custom_family_joint_hyper, first_psi_linear_map,
     fit_custom_family, second_psi_linear_map,
 };
-use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
@@ -28,6 +27,7 @@ use crate::smooth::{
     freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
+use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -116,8 +116,6 @@ fn block_slices(block_states: &[ParameterBlockState]) -> BlockSlices {
         total,
     }
 }
-
-
 
 // ── Primary-space helpers ─────────────────────────────────────────────
 
@@ -351,7 +349,12 @@ impl BlockHessianAccumulator {
         for a in 0..3 {
             for b in 0..3 {
                 time_designs[a]
-                    .row_outer_into(row, time_designs[b], primary_hessian[[a, b]], &mut self.h_tt)
+                    .row_outer_into(
+                        row,
+                        time_designs[b],
+                        primary_hessian[[a, b]],
+                        &mut self.h_tt,
+                    )
                     .expect("time block row_outer_into dimension mismatch");
             }
         }
@@ -470,14 +473,22 @@ impl BlockHessianAccumulator {
                     // psi=marginal: (time, marginal) block = h_tm
                     // right⊗left: right_time ⊗ psi_row → h_tm
                     ndarray::linalg::general_mat_mul(
-                        *alpha, &t_col, &psi_row.view().insert_axis(Axis(0)), 1.0, &mut self.h_tm,
+                        *alpha,
+                        &t_col,
+                        &psi_row.view().insert_axis(Axis(0)),
+                        1.0,
+                        &mut self.h_tm,
                     );
                     // left⊗right: psi_row ⊗ right_time → h_tm^T (handled by symmetry)
                 }
                 2 => {
                     // psi=logslope: (time, logslope) block = h_tg
                     ndarray::linalg::general_mat_mul(
-                        *alpha, &t_col, &psi_row.view().insert_axis(Axis(0)), 1.0, &mut self.h_tg,
+                        *alpha,
+                        &t_col,
+                        &psi_row.view().insert_axis(Axis(0)),
+                        1.0,
+                        &mut self.h_tg,
                     );
                 }
                 _ => {}
@@ -719,10 +730,16 @@ impl HyperOperator for BlockHessianOperator {
         let mut out = Array2::zeros((self.slices.total, self.slices.total));
         out.slice_mut(s![self.slices.time.clone(), self.slices.time.clone()])
             .assign(&self.h_tt);
-        out.slice_mut(s![self.slices.marginal.clone(), self.slices.marginal.clone()])
-            .assign(&self.h_mm);
-        out.slice_mut(s![self.slices.logslope.clone(), self.slices.logslope.clone()])
-            .assign(&self.h_gg);
+        out.slice_mut(s![
+            self.slices.marginal.clone(),
+            self.slices.marginal.clone()
+        ])
+        .assign(&self.h_mm);
+        out.slice_mut(s![
+            self.slices.logslope.clone(),
+            self.slices.logslope.clone()
+        ])
+        .assign(&self.h_gg);
         out.slice_mut(s![self.slices.time.clone(), self.slices.marginal.clone()])
             .assign(&self.h_tm);
         out.slice_mut(s![self.slices.marginal.clone(), self.slices.time.clone()])
@@ -731,10 +748,16 @@ impl HyperOperator for BlockHessianOperator {
             .assign(&self.h_tg);
         out.slice_mut(s![self.slices.logslope.clone(), self.slices.time.clone()])
             .assign(&self.h_tg.t());
-        out.slice_mut(s![self.slices.marginal.clone(), self.slices.logslope.clone()])
-            .assign(&self.h_mg);
-        out.slice_mut(s![self.slices.logslope.clone(), self.slices.marginal.clone()])
-            .assign(&self.h_mg.t());
+        out.slice_mut(s![
+            self.slices.marginal.clone(),
+            self.slices.logslope.clone()
+        ])
+        .assign(&self.h_mg);
+        out.slice_mut(s![
+            self.slices.logslope.clone(),
+            self.slices.marginal.clone()
+        ])
+        .assign(&self.h_mg.t());
         out
     }
 
@@ -927,7 +950,6 @@ struct RowPrimaryBase {
 }
 
 struct EvalCache {
-    slices: BlockSlices,
     row_bases: Vec<RowPrimaryBase>,
 }
 
@@ -1109,7 +1131,6 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     fn build_eval_cache(&self, block_states: &[ParameterBlockState]) -> Result<EvalCache, String> {
-        let slices = block_slices(block_states);
         let row_bases = (0..self.n)
             .map(|row| {
                 let (_, gradient, hessian) =
@@ -1117,7 +1138,7 @@ impl SurvivalMarginalSlopeFamily {
                 Ok(RowPrimaryBase { gradient, hessian })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(EvalCache { slices, row_bases })
+        Ok(EvalCache { row_bases })
     }
 
     fn row_primary_gradient_hessian<'a>(
@@ -1390,155 +1411,6 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// Map a psi derivative to a primary-space direction for a given row.
-    ///
-    /// Only the baseline and slope surface blocks can carry spatial parameters.
-    /// The time block (block 0) is a pure monotone time basis with no spatial terms.
-    fn row_primary_psi_direction(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-    ) -> Result<Option<Array1<f64>>, String> {
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
-        else {
-            return Ok(None);
-        };
-        let deriv = &derivative_blocks[block_idx][local_idx];
-        let mut out = Array1::<f64>::zeros(N_PRIMARY);
-        match block_idx {
-            1 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.marginal_design.ncols(),
-                    "SurvivalMarginalSlope marginal",
-                )?;
-                let value = x_row.dot(&block_states[1].beta);
-                out[0] = value;
-                out[1] = value;
-            }
-            2 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.logslope_design.ncols(),
-                    "SurvivalMarginalSlope logslope",
-                )?;
-                out[3] = x_row.dot(&block_states[2].beta);
-            }
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi: only baseline/slope spatial blocks are supported, got block {block_idx}"
-                ));
-            }
-        }
-        Ok(Some(out))
-    }
-
-    fn row_primary_psi_action_on_direction(
-        &self,
-        row: usize,
-        slices: &BlockSlices,
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array1<f64>>, String> {
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
-        else {
-            return Ok(None);
-        };
-        let deriv = &derivative_blocks[block_idx][local_idx];
-        let mut out = Array1::<f64>::zeros(N_PRIMARY);
-        match block_idx {
-            1 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.marginal_design.ncols(),
-                    "SurvivalMarginalSlope marginal",
-                )?;
-                let value = x_row.dot(&d_beta_flat.slice(s![slices.marginal.clone()]).to_owned());
-                out[0] = value;
-                out[1] = value;
-            }
-            2 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.logslope_design.ncols(),
-                    "SurvivalMarginalSlope logslope",
-                )?;
-                out[3] = x_row.dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned());
-            }
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi action: only baseline/slope spatial blocks are supported, got block {block_idx}"
-                ));
-            }
-        }
-        Ok(Some(out))
-    }
-
-    fn row_primary_psi_second_direction(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_i: usize,
-        psi_j: usize,
-    ) -> Result<Option<Array1<f64>>, String> {
-        let Some((block_i, local_i)) = self.resolve_psi_location(derivative_blocks, psi_i) else {
-            return Ok(None);
-        };
-        let Some((block_j, local_j)) = self.resolve_psi_location(derivative_blocks, psi_j) else {
-            return Ok(None);
-        };
-        if block_i != block_j {
-            return Ok(Some(Array1::<f64>::zeros(N_PRIMARY)));
-        }
-        let deriv_i = &derivative_blocks[block_i][local_i];
-        let mut out = Array1::<f64>::zeros(N_PRIMARY);
-        match block_i {
-            1 => {
-                let x_row = self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.n,
-                    self.marginal_design.ncols(),
-                    "SurvivalMarginalSlope marginal",
-                )?;
-                let value = x_row.dot(&block_states[1].beta);
-                out[0] = value;
-                out[1] = value;
-            }
-            2 => {
-                let x_row = self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.n,
-                    self.logslope_design.ncols(),
-                    "SurvivalMarginalSlope logslope",
-                )?;
-                out[3] = x_row.dot(&block_states[2].beta);
-            }
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi second: only baseline/slope spatial blocks are supported, got block {block_i}"
-                ));
-            }
-        }
-        Ok(Some(out))
-    }
-
     // ── Psi terms (first and second order) ────────────────────────────
     //
     // All three psi methods (first-order, second-order, directional derivative)
@@ -1552,8 +1424,7 @@ impl SurvivalMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<(usize, usize, usize, &'static str)>, String> {
-        let Some((block_idx, local_idx)) =
-            self.resolve_psi_location(derivative_blocks, psi_index)
+        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
         else {
             return Ok(None);
         };
@@ -1598,8 +1469,11 @@ impl SurvivalMarginalSlopeFamily {
                 .axpy_row_into(row, primary[2], &mut st)
                 .expect("time deriv axpy dim mismatch");
         }
-        self.marginal_design
-            .axpy_row_into(row, primary[0] + primary[1], &mut score_m.view_mut())?;
+        self.marginal_design.axpy_row_into(
+            row,
+            primary[0] + primary[1],
+            &mut score_m.view_mut(),
+        )?;
         self.logslope_design
             .axpy_row_into(row, primary[3], &mut score_g.view_mut())?;
         Ok(())
@@ -1651,10 +1525,8 @@ impl SurvivalMarginalSlopeFamily {
             .into_par_iter()
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 // Compute psi design row once; derive direction from it.
-                let psi_row =
-                    self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-                let dir =
-                    primary_direction_from_psi_row(block_idx, &psi_row, beta_psi);
+                let psi_row = self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+                let dir = primary_direction_from_psi_row(block_idx, &psi_row, beta_psi);
 
                 let (f_pi, f_pipi) = if let Some(c) = cache {
                     let (g, h) = self.row_primary_gradient_hessian(row, c);
@@ -1676,9 +1548,7 @@ impl SurvivalMarginalSlopeFamily {
                 }
                 // Score: pullback of f_pipi·dir into all 3 blocks
                 let pb = f_pipi.dot(&dir);
-                self.accumulate_score_blockwise(
-                    row, &pb, &mut a.1, &mut a.2, &mut a.3,
-                )?;
+                self.accumulate_score_blockwise(row, &pb, &mut a.1, &mut a.2, &mut a.3)?;
 
                 // Hessian: rank-1 from psi_row × pullback(f_pipi·loading)
                 let right_primary = f_pipi.dot(&loading);
@@ -1699,7 +1569,9 @@ impl SurvivalMarginalSlopeFamily {
 
         // Assemble score into flat vector
         let mut score_psi = Array1::zeros(slices.total);
-        score_psi.slice_mut(s![slices.time.clone()]).assign(&score_t);
+        score_psi
+            .slice_mut(s![slices.time.clone()])
+            .assign(&score_t);
         score_psi
             .slice_mut(s![slices.marginal.clone()])
             .assign(&score_m);
@@ -1761,10 +1633,21 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let same_block = block_idx_i == block_idx_j;
 
-        type Acc = (f64, Array1<f64>, Array1<f64>, Array1<f64>, BlockHessianAccumulator);
+        type Acc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            BlockHessianAccumulator,
+        );
         let make_acc = || -> Acc {
-            (0.0, Array1::zeros(p_t), Array1::zeros(p_m), Array1::zeros(p_g),
-             BlockHessianAccumulator::new(p_t, p_m, p_g))
+            (
+                0.0,
+                Array1::zeros(p_t),
+                Array1::zeros(p_m),
+                Array1::zeros(p_g),
+                BlockHessianAccumulator::new(p_t, p_m, p_g),
+            )
         };
 
         let (objective_psi_psi, score_t, score_m, score_g, acc) = (0..self.n)
@@ -1780,14 +1663,22 @@ impl SurvivalMarginalSlopeFamily {
 
                 let (psi_row_ij, dir_ij) = if same_block {
                     let r = self.psi_second_design_row_vector(
-                        row, deriv_i, deriv_j, local_idx_j, self.n, p_psi_i, label_i,
+                        row,
+                        deriv_i,
+                        deriv_j,
+                        local_idx_j,
+                        self.n,
+                        p_psi_i,
+                        label_i,
                     )?;
                     let d = primary_second_direction_from_psi_row(block_idx_i, &r, beta_i);
                     (Some(r), d)
                 } else {
                     (None, Array1::<f64>::zeros(N_PRIMARY))
                 };
-                let has_ij = psi_row_ij.as_ref().is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
+                let has_ij = psi_row_ij
+                    .as_ref()
+                    .is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
 
                 let (f_pi, f_pipi) = if let Some(c) = cache {
                     let (g, h) = self.row_primary_gradient_hessian(row, c);
@@ -1832,20 +1723,21 @@ impl SurvivalMarginalSlopeFamily {
                 if has_ij {
                     let rp_ij = f_pipi.dot(&loading_i);
                     a.4.add_rank1_psi_cross(
-                        self, row, block_idx_i, psi_row_ij.as_ref().unwrap(), &rp_ij,
+                        self,
+                        row,
+                        block_idx_i,
+                        psi_row_ij.as_ref().unwrap(),
+                        &rp_ij,
                     );
                 }
                 let scalar_ij = loading_i.dot(&f_pipi.dot(&loading_j));
-                a.4.add_psi_psi_outer(
-                    block_idx_i, &psi_row_i, block_idx_j, &psi_row_j, scalar_ij,
-                );
+                a.4.add_psi_psi_outer(block_idx_i, &psi_row_i, block_idx_j, &psi_row_j, scalar_ij);
                 let rp_i = third_j.t().dot(&loading_i);
                 a.4.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &rp_i);
                 let rp_j = third_i.t().dot(&loading_j);
                 a.4.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j);
                 a.4.add_pullback(self, row, &fourth);
-                let third_ij =
-                    self.row_primary_third_contracted(row, block_states, &dir_ij)?;
+                let third_ij = self.row_primary_third_contracted(row, block_states, &dir_ij)?;
                 a.4.add_pullback(self, row, &third_ij);
 
                 Ok(a)
@@ -1860,9 +1752,15 @@ impl SurvivalMarginalSlopeFamily {
             })?;
 
         let mut score_psi_psi = Array1::zeros(slices.total);
-        score_psi_psi.slice_mut(s![slices.time.clone()]).assign(&score_t);
-        score_psi_psi.slice_mut(s![slices.marginal.clone()]).assign(&score_m);
-        score_psi_psi.slice_mut(s![slices.logslope.clone()]).assign(&score_g);
+        score_psi_psi
+            .slice_mut(s![slices.time.clone()])
+            .assign(&score_t);
+        score_psi_psi
+            .slice_mut(s![slices.marginal.clone()])
+            .assign(&score_m);
+        score_psi_psi
+            .slice_mut(s![slices.logslope.clone()])
+            .assign(&score_g);
 
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
@@ -1917,17 +1815,14 @@ impl SurvivalMarginalSlopeFamily {
                 |mut acc, row| -> Result<BlockHessianAccumulator, String> {
                     let psi_row =
                         self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-                    let psi_dir =
-                        primary_direction_from_psi_row(block_idx, &psi_row, beta_psi);
+                    let psi_dir = primary_direction_from_psi_row(block_idx, &psi_row, beta_psi);
                     let psi_action =
                         primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block);
-                    let row_dir =
-                        self.row_primary_direction_from_flat(row, &slices, d_beta_flat);
+                    let row_dir = self.row_primary_direction_from_flat(row, &slices, d_beta_flat);
                     let third_beta =
                         self.row_primary_third_contracted(row, block_states, &row_dir)?;
-                    let fourth = self.row_primary_fourth_contracted(
-                        row, block_states, &row_dir, &psi_dir,
-                    )?;
+                    let fourth =
+                        self.row_primary_fourth_contracted(row, block_states, &row_dir, &psi_dir)?;
 
                     let right_primary = third_beta.t().dot(&loading);
                     acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
@@ -1940,7 +1835,10 @@ impl SurvivalMarginalSlopeFamily {
             )
             .try_reduce(
                 || BlockHessianAccumulator::new(p_t, p_m, p_g),
-                |mut a, b| { a.add(&b); Ok(a) },
+                |mut a, b| {
+                    a.add(&b);
+                    Ok(a)
+                },
             )?;
 
         Ok(Some(acc.to_dense(&slices)))
@@ -2024,13 +1922,21 @@ struct SurvivalMarginalSlopeRowKernel {
 impl SurvivalMarginalSlopeRowKernel {
     fn new(family: SurvivalMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
         let slices = block_slices(&block_states);
-        Self { family, block_states, slices }
+        Self {
+            family,
+            block_states,
+            slices,
+        }
     }
 }
 
 impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
-    fn n_rows(&self) -> usize { self.family.n }
-    fn n_coefficients(&self) -> usize { self.slices.total }
+    fn n_rows(&self) -> usize {
+        self.family.n
+    }
+    fn n_coefficients(&self) -> usize {
+        self.slices.total
+    }
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
         let beta_time = &self.block_states[0].beta;
@@ -2045,9 +1951,14 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
             + self.family.derivative_offset_exit[row];
         let g = self.block_states[2].eta[row];
         row_primary_closed_form(
-            q0, q1, qd1, g,
-            self.family.z[row], self.family.weights[row],
-            self.family.event[row], self.family.derivative_guard,
+            q0,
+            q1,
+            qd1,
+            g,
+            self.family.z[row],
+            self.family.weights[row],
+            self.family.event[row],
+            self.family.derivative_guard,
         )
     }
 
@@ -2069,29 +1980,44 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     fn jacobian_transpose_action(&self, row: usize, v: &[f64; 4], out: &mut [f64]) {
         {
             let mut time = ndarray::ArrayViewMut1::from(&mut out[self.slices.time.clone()]);
-            self.family.design_entry.axpy_row_into(row, v[0], &mut time)
+            self.family
+                .design_entry
+                .axpy_row_into(row, v[0], &mut time)
                 .expect("time entry axpy dim mismatch");
-            self.family.design_exit.axpy_row_into(row, v[1], &mut time)
+            self.family
+                .design_exit
+                .axpy_row_into(row, v[1], &mut time)
                 .expect("time exit axpy dim mismatch");
-            self.family.design_derivative_exit.axpy_row_into(row, v[2], &mut time)
+            self.family
+                .design_derivative_exit
+                .axpy_row_into(row, v[2], &mut time)
                 .expect("time deriv axpy dim mismatch");
         }
         {
             let mut marginal = ndarray::ArrayViewMut1::from(&mut out[self.slices.marginal.clone()]);
-            self.family.marginal_design.axpy_row_into(row, v[0] + v[1], &mut marginal)
+            self.family
+                .marginal_design
+                .axpy_row_into(row, v[0] + v[1], &mut marginal)
                 .expect("marginal axpy dim mismatch");
         }
         {
             let mut logslope = ndarray::ArrayViewMut1::from(&mut out[self.slices.logslope.clone()]);
-            self.family.logslope_design.axpy_row_into(row, v[3], &mut logslope)
+            self.family
+                .logslope_design
+                .axpy_row_into(row, v[3], &mut logslope)
                 .expect("logslope axpy dim mismatch");
         }
     }
 
     fn add_pullback_hessian(&self, row: usize, h: &[[f64; 4]; 4], target: &mut Array2<f64>) {
         let mut h_arr = Array2::<f64>::zeros((4, 4));
-        for a in 0..4 { for b in 0..4 { h_arr[[a, b]] = h[a][b]; } }
-        self.family.add_pullback_primary_hessian(target, row, &self.slices, &h_arr);
+        for a in 0..4 {
+            for b in 0..4 {
+                h_arr[[a, b]] = h[a][b];
+            }
+        }
+        self.family
+            .add_pullback_primary_hessian(target, row, &self.slices, &h_arr);
     }
 
     fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 4]; 4], diag: &mut [f64]) {
@@ -2107,7 +2033,9 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
                     .expect("time squared_axpy dim mismatch");
             }
             for &(pj, des_j) in &designs {
-                if pj <= pi { continue; }
+                if pj <= pi {
+                    continue;
+                }
                 let mut td = ndarray::ArrayViewMut1::from(&mut diag[self.slices.time.clone()]);
                 des.crossdiag_axpy_row_into(row, des_j, 2.0 * h[pi][pj], &mut td)
                     .expect("time crossdiag dim mismatch");
@@ -2116,30 +2044,51 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         {
             let alpha = h[0][0] + 2.0 * h[0][1] + h[1][1];
             let mut md = ndarray::ArrayViewMut1::from(&mut diag[self.slices.marginal.clone()]);
-            self.family.marginal_design.squared_axpy_row_into(row, alpha, &mut md)
+            self.family
+                .marginal_design
+                .squared_axpy_row_into(row, alpha, &mut md)
                 .expect("marginal squared_axpy dim mismatch");
         }
         {
             let mut gd = ndarray::ArrayViewMut1::from(&mut diag[self.slices.logslope.clone()]);
-            self.family.logslope_design.squared_axpy_row_into(row, h[3][3], &mut gd)
+            self.family
+                .logslope_design
+                .squared_axpy_row_into(row, h[3][3], &mut gd)
                 .expect("logslope squared_axpy dim mismatch");
         }
     }
 
     fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
         let dir_arr = Array1::from_vec(dir.to_vec());
-        let out = self.family.row_primary_third_contracted(row, &self.block_states, &dir_arr)?;
+        let out = self
+            .family
+            .row_primary_third_contracted(row, &self.block_states, &dir_arr)?;
         let mut r = [[0.0; 4]; 4];
-        for a in 0..4 { for b in 0..4 { r[a][b] = out[[a, b]]; } }
+        for a in 0..4 {
+            for b in 0..4 {
+                r[a][b] = out[[a, b]];
+            }
+        }
         Ok(r)
     }
 
-    fn row_fourth_contracted(&self, row: usize, dir_u: &[f64; 4], dir_v: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
+    fn row_fourth_contracted(
+        &self,
+        row: usize,
+        dir_u: &[f64; 4],
+        dir_v: &[f64; 4],
+    ) -> Result<[[f64; 4]; 4], String> {
         let u = Array1::from_vec(dir_u.to_vec());
         let v = Array1::from_vec(dir_v.to_vec());
-        let out = self.family.row_primary_fourth_contracted(row, &self.block_states, &u, &v)?;
+        let out = self
+            .family
+            .row_primary_fourth_contracted(row, &self.block_states, &u, &v)?;
         let mut r = [[0.0; 4]; 4];
-        for a in 0..4 { for b in 0..4 { r[a][b] = out[[a, b]]; } }
+        for a in 0..4 {
+            for b in 0..4 {
+                r[a][b] = out[[a, b]];
+            }
+        }
         Ok(r)
     }
 }
@@ -2382,20 +2331,15 @@ impl SurvivalMarginalSlopeFamily {
                             for a in 0..3 {
                                 for b in 0..3 {
                                     designs[a]
-                                        .row_outer_into(
-                                            row,
-                                            designs[b],
-                                            f_pipi[[a, b]],
-                                            hess_time,
-                                        )
+                                        .row_outer_into(row, designs[b], f_pipi[[a, b]], hess_time)
                                         .expect("time row_outer_into dim mismatch");
                                 }
                             }
                         }
                         BlockwiseHessianAccumulator::Sparse(hess_time) => {
-                            let (e_rp, e_ci, e_v) = e_sparse.as_ref().expect(
-                                "time sparse metadata should be present for entry design",
-                            );
+                            let (e_rp, e_ci, e_v) = e_sparse
+                                .as_ref()
+                                .expect("time sparse metadata should be present for entry design");
                             let (x_rp, x_ci, x_v) = x_sparse
                                 .as_ref()
                                 .expect("time sparse metadata should be present for exit design");
@@ -2427,8 +2371,7 @@ impl SurvivalMarginalSlopeFamily {
                         }
                     }
 
-                    let alpha_m =
-                        f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
+                    let alpha_m = f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
                     match &mut acc.5 {
                         BlockwiseHessianAccumulator::Dense(hess_marginal) => {
                             self.marginal_design
@@ -2774,8 +2717,7 @@ impl SurvivalMarginalSlopeFamily {
                     // ── marginal Hessian: symmetric rank-1 scatter ───────
                     // CSR column indices are sorted, so pj >= pi ⟹ cb >= ca,
                     // giving us the upper triangle directly.
-                    let alpha_m =
-                        f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
+                    let alpha_m = f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
                     if alpha_m != 0.0 {
                         let hm = &mut acc.5;
                         let m_start = m_rp[row];
@@ -2919,7 +2861,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         let cache = build_row_kernel_cache(&kern)?;
-        Ok(Some(crate::families::row_kernel::row_kernel_hessian_dense(&kern, &cache)))
+        Ok(Some(crate::families::row_kernel::row_kernel_hessian_dense(
+            &kern, &cache,
+        )))
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
@@ -2954,7 +2898,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
         let sv = d_beta_v_flat.as_slice().ok_or("non-contiguous d_beta_v")?;
-        crate::families::row_kernel::row_kernel_second_directional_derivative(&kern, su, sv).map(Some)
+        crate::families::row_kernel::row_kernel_second_directional_derivative(&kern, su, sv)
+            .map(Some)
     }
 
     fn exact_newton_joint_psi_terms(
@@ -3615,9 +3560,8 @@ mod tests {
                 }
             }
         }
-        let sparse =
-            SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets)
-                .expect("assemble sparse design");
+        let sparse = SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets)
+            .expect("assemble sparse design");
         DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse))
     }
 
@@ -3653,11 +3597,15 @@ mod tests {
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
             derivative_guard: 1e-4,
-            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 1)))),
-            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 1)))),
-            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones((
-                1, 1,
-            )))),
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 1)),
+            )),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 1)),
+            )),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::ones((1, 1)),
+            )),
             offset_entry: Arc::new(Array1::zeros(1)),
             offset_exit: Arc::new(Array1::zeros(1)),
             derivative_offset_exit: Arc::new(Array1::zeros(1)),
@@ -3708,14 +3656,22 @@ mod tests {
             weights: Arc::new(array![1.2]),
             z: Arc::new(array![0.3]),
             derivative_guard: 1e-6,
-            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
             design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.8]])),
-            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.4]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.4]],
+            )),
             offset_entry: Arc::new(array![0.1]),
             offset_exit: Arc::new(array![-0.2]),
             derivative_offset_exit: Arc::new(array![0.05]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
             time_linear_constraints: None,
         };
         let block_states = vec![
@@ -3770,14 +3726,22 @@ mod tests {
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
             derivative_guard: 1e-4,
-            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0]])),
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0
+            ]])),
             design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0]])),
-            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0]],
+            )),
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![0.0]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             time_linear_constraints: None,
         };
         let block_states = vec![
@@ -3820,16 +3784,24 @@ mod tests {
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
             derivative_guard: 1e-6,
-            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
-            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
-            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0, 0.0
             ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0, 0.0
+            ]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0, 0.0]],
+            )),
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![1e-6]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             time_linear_constraints: monotone_wiggle_nonnegative_constraints(2),
         };
         let spec = ParameterBlockSpec {

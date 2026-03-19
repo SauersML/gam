@@ -3669,9 +3669,7 @@ fn compute_outer_hessian(
                         if let Some(ref drift_fn) = solution.fixed_drift_deriv {
                             if let Some(result) = drift_fn(ext_idx, &v_ks[rho_idx]) {
                                 h2_trace += match result {
-                                    DriftDerivResult::Dense(ref m) => {
-                                        hop.trace_logdet_gradient(m)
-                                    }
+                                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
                                     DriftDerivResult::Operator(ref op) => {
                                         hop.trace_logdet_operator(op.as_ref())
                                     }
@@ -3783,9 +3781,7 @@ fn compute_outer_hessian(
                         if let Some(ref drift_fn) = solution.fixed_drift_deriv {
                             if let Some(result) = drift_fn(ii, &ext_v[jj]) {
                                 h2_trace += match result {
-                                    DriftDerivResult::Dense(ref m) => {
-                                        hop.trace_logdet_gradient(m)
-                                    }
+                                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
                                     DriftDerivResult::Operator(ref op) => {
                                         hop.trace_logdet_operator(op.as_ref())
                                     }
@@ -3799,9 +3795,7 @@ fn compute_outer_hessian(
                         if let Some(ref drift_fn) = solution.fixed_drift_deriv {
                             if let Some(result) = drift_fn(jj, &ext_v[ii]) {
                                 h2_trace += match result {
-                                    DriftDerivResult::Dense(ref m) => {
-                                        hop.trace_logdet_gradient(m)
-                                    }
+                                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
                                     DriftDerivResult::Operator(ref op) => {
                                         hop.trace_logdet_operator(op.as_ref())
                                     }
