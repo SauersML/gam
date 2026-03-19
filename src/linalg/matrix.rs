@@ -6,7 +6,9 @@ use crate::types::RidgePolicy;
 use faer::Accum;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ShapeBuilder, s};
+use ndarray::{
+    Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder, s,
+};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -3388,6 +3390,155 @@ fn add_sparse_symmetric_upper(
         .map_err(|_| "add_sparse_symmetric_upper failed to assemble CSC".to_string())
 }
 
+// ── Sparse Hessian accumulator ───────────────────────────────────────────────
+
+/// Pre-computed upper-triangle CSC sparsity pattern + flat values buffer for
+/// assembling `X^T diag(w) X` directly in sparse form.
+///
+/// Designed for B-spline / local-support bases where the Hessian is banded and
+/// the dense `p×p` representation wastes most of its storage.  The pattern is
+/// computed once from the design matrices; each parallel worker then owns a
+/// cheap clone of the values buffer and accumulates with `O(nnz)` memory
+/// instead of `O(p²)`.
+#[derive(Clone)]
+pub struct SparseHessianAccumulator {
+    dim: usize,
+    /// CSC column pointers, length `dim + 1`.
+    col_ptrs: Vec<usize>,
+    /// CSC row indices (upper triangle: row ≤ col), length `nnz`.
+    row_indices: Vec<usize>,
+    /// Values buffer, length `nnz`.
+    pub values: Vec<f64>,
+}
+
+impl SparseHessianAccumulator {
+    // ── pattern builders ─────────────────────────────────────────────
+
+    /// Build the symbolic upper-triangle pattern of `X^T X` from a single
+    /// sparse CSR design matrix.
+    pub fn from_single_csr(csr: &SparseRowMat<usize, f64>, dim: usize) -> Self {
+        Self::from_multi_csr(&[csr], dim)
+    }
+
+    /// Build the symbolic upper-triangle pattern of the block Hessian produced
+    /// by multiple sparse CSR designs that share the same column space.
+    ///
+    /// The result covers every `(col_a, col_b)` pair that co-occurs in *any*
+    /// row of *any* of the supplied designs.
+    pub fn from_multi_csr(csrs: &[&SparseRowMat<usize, f64>], dim: usize) -> Self {
+        use std::collections::BTreeSet;
+
+        let n = csrs[0].nrows();
+        let mut pattern = BTreeSet::<(usize, usize)>::new();
+
+        // Scratch buffer for the union of nonzero columns across all designs
+        // at a single row – reused to avoid per-row allocation.
+        let mut cols = Vec::with_capacity(32);
+
+        for i in 0..n {
+            cols.clear();
+            for csr in csrs {
+                let sym = csr.symbolic();
+                let rp = sym.row_ptr();
+                let ci = sym.col_idx();
+                for p in rp[i]..rp[i + 1] {
+                    cols.push(ci[p]);
+                }
+            }
+            cols.sort_unstable();
+            cols.dedup();
+            // Insert all upper-triangle pairs (r ≤ c).
+            for (ai, &ca) in cols.iter().enumerate() {
+                for &cb in &cols[ai..] {
+                    pattern.insert((ca, cb));
+                }
+            }
+        }
+
+        // Convert BTreeSet → CSC col_ptrs + row_indices.
+        let nnz = pattern.len();
+        let mut col_ptrs = vec![0usize; dim + 1];
+        let mut row_indices = Vec::with_capacity(nnz);
+        for &(r, c) in &pattern {
+            col_ptrs[c + 1] += 1;
+            row_indices.push(r);
+        }
+        for j in 1..=dim {
+            col_ptrs[j] += col_ptrs[j - 1];
+        }
+
+        SparseHessianAccumulator {
+            dim,
+            col_ptrs,
+            row_indices,
+            values: vec![0.0; nnz],
+        }
+    }
+
+    // ── accumulation ─────────────────────────────────────────────────
+
+    /// Add `val` to the upper-triangle entry `(row, col)`.
+    /// Caller must ensure `(min(row,col), max(row,col))` is in the pattern.
+    #[inline(always)]
+    pub fn add(&mut self, row: usize, col: usize, val: f64) {
+        let (r, c) = if row <= col { (row, col) } else { (col, row) };
+        let start = self.col_ptrs[c];
+        let end = self.col_ptrs[c + 1];
+        // Linear scan – typically ≤ 8 entries per column for banded B-splines.
+        let slice = &self.row_indices[start..end];
+        // Fast path: check last added position first for locality.
+        for (off, &ri) in slice.iter().enumerate() {
+            if ri == r {
+                unsafe { *self.values.get_unchecked_mut(start + off) += val; }
+                return;
+            }
+        }
+        // Entry not in pattern – this indicates a caller/pattern mismatch.
+        assert!(
+            false,
+            "SparseHessianAccumulator::add: ({r}, {c}) not in pattern"
+        );
+    }
+
+    /// Element-wise `self.values += other`.
+    #[inline]
+    pub fn add_values(&mut self, other: &[f64]) {
+        debug_assert_eq!(self.values.len(), other.len());
+        for (a, &b) in self.values.iter_mut().zip(other.iter()) {
+            *a += b;
+        }
+    }
+
+    /// Create a zero-valued copy sharing the same symbolic structure.
+    pub fn empty_clone(&self) -> Self {
+        SparseHessianAccumulator {
+            dim: self.dim,
+            col_ptrs: self.col_ptrs.clone(),
+            row_indices: self.row_indices.clone(),
+            values: vec![0.0; self.values.len()],
+        }
+    }
+
+    // ── finalization ─────────────────────────────────────────────────
+
+    /// Consume the accumulator and return a `SparseColMat` (upper-triangle).
+    pub fn into_sparse_col_mat(self) -> Result<SparseColMat<usize, f64>, String> {
+        // Build triplets from the CSC structure.
+        let mut triplets = Vec::with_capacity(self.values.len());
+        for c in 0..self.dim {
+            for idx in self.col_ptrs[c]..self.col_ptrs[c + 1] {
+                let r = self.row_indices[idx];
+                let v = self.values[idx];
+                if v != 0.0 {
+                    triplets.push(Triplet::new(r, c, v));
+                }
+            }
+        }
+        SparseColMat::try_new_from_triplets(self.dim, self.dim, &triplets)
+            .map_err(|_| "SparseHessianAccumulator: failed to assemble CSC".to_string())
+    }
+}
+
 /// A generic abstraction over a factorized symmetric positive-definite (or regularized) system.
 pub trait FactorizedSystem: Send + Sync {
     /// Solve $H x = b$ for a single right-hand side.
@@ -4492,12 +4643,130 @@ impl DesignMatrix {
         Ok(())
     }
 
+    /// Add `alpha * self[row, :] * other[row, :]` elementwise into `out`.
+    ///
+    /// Both matrices must have the same number of columns (== `out.len()`).
+    /// For Sparse×Sparse this runs in O(nnz_lhs + nnz_rhs) via sorted
+    /// merge-intersection on the CSR column indices — no dense expansion.
+    pub fn crossdiag_axpy_row_into(
+        &self,
+        row: usize,
+        other: &DesignMatrix,
+        alpha: f64,
+        out: &mut ArrayViewMut1<'_, f64>,
+    ) -> Result<(), String> {
+        debug_assert_eq!(self.ncols(), other.ncols());
+        debug_assert_eq!(out.len(), self.ncols());
+        if alpha == 0.0 {
+            return Ok(());
+        }
+        match (self, other) {
+            (Self::Dense(lhs), Self::Dense(rhs)) => {
+                let lhs_owned;
+                let lhs_ref: &Array2<f64> = match lhs.as_dense_ref() {
+                    Some(r) => r,
+                    None => {
+                        lhs_owned = lhs.to_dense_arc();
+                        lhs_owned.as_ref()
+                    }
+                };
+                let rhs_owned;
+                let rhs_ref: &Array2<f64> = match rhs.as_dense_ref() {
+                    Some(r) => r,
+                    None => {
+                        rhs_owned = rhs.to_dense_arc();
+                        rhs_owned.as_ref()
+                    }
+                };
+                let x = lhs_ref.row(row);
+                let y = rhs_ref.row(row);
+                for (dst, (&xi, &yi)) in out.iter_mut().zip(x.iter().zip(y.iter())) {
+                    *dst += alpha * xi * yi;
+                }
+            }
+            (Self::Sparse(lhs), Self::Sparse(rhs)) => {
+                let lhs_csr = lhs.to_csr_arc().unwrap_or_else(|| {
+                    panic!("crossdiag_axpy_row_into: failed to obtain lhs CSR view")
+                });
+                let rhs_csr = rhs.to_csr_arc().unwrap_or_else(|| {
+                    panic!("crossdiag_axpy_row_into: failed to obtain rhs CSR view")
+                });
+                let lhs_sym = lhs_csr.symbolic();
+                let rhs_sym = rhs_csr.symbolic();
+                let lhs_rp = lhs_sym.row_ptr();
+                let rhs_rp = rhs_sym.row_ptr();
+                let lhs_ci = lhs_sym.col_idx();
+                let rhs_ci = rhs_sym.col_idx();
+                let lhs_v = lhs_csr.val();
+                let rhs_v = rhs_csr.val();
+                // Merge-intersection: both col_idx slices are sorted.
+                let mut li = lhs_rp[row];
+                let mut ri = rhs_rp[row];
+                let l_end = lhs_rp[row + 1];
+                let r_end = rhs_rp[row + 1];
+                while li < l_end && ri < r_end {
+                    let lc = lhs_ci[li];
+                    let rc = rhs_ci[ri];
+                    if lc == rc {
+                        out[lc] += alpha * lhs_v[li] * rhs_v[ri];
+                        li += 1;
+                        ri += 1;
+                    } else if lc < rc {
+                        li += 1;
+                    } else {
+                        ri += 1;
+                    }
+                }
+            }
+            _ => {
+                // Mixed dense/sparse: iterate the sparse side, index into dense.
+                let (sparse_mat, dense_mat) = match (self, other) {
+                    (Self::Sparse(s), Self::Dense(d)) => (s, d),
+                    (Self::Dense(d), Self::Sparse(s)) => (s, d),
+                    _ => unreachable!(),
+                };
+                let csr = sparse_mat.to_csr_arc().unwrap_or_else(|| {
+                    panic!("crossdiag_axpy_row_into: failed to obtain CSR view")
+                });
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                let dense_owned;
+                let dense_ref: &Array2<f64> = match dense_mat.as_dense_ref() {
+                    Some(r) => r,
+                    None => {
+                        dense_owned = dense_mat.to_dense_arc();
+                        dense_owned.as_ref()
+                    }
+                };
+                let dense_row = dense_ref.row(row);
+                for ptr in row_ptr[row]..row_ptr[row + 1] {
+                    let c = col_idx[ptr];
+                    out[c] += alpha * vals[ptr] * dense_row[c];
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Symmetric rank-1 update `target += alpha * x_row x_row^T` for one row.
     pub fn syr_row_into(
         &self,
         row: usize,
         alpha: f64,
         target: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        self.syr_row_into_view(row, alpha, target.view_mut())
+    }
+
+    /// Like `syr_row_into` but accepts a mutable view, so callers can pass
+    /// a slice of a larger matrix without allocating a temporary.
+    pub fn syr_row_into_view(
+        &self,
+        row: usize,
+        alpha: f64,
+        mut target: ArrayViewMut2<'_, f64>,
     ) -> Result<(), String> {
         if target.nrows() != self.ncols() || target.ncols() != self.ncols() {
             return Err(format!(
@@ -4568,6 +4837,18 @@ impl DesignMatrix {
         other: &DesignMatrix,
         alpha: f64,
         target: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        self.row_outer_into_view(row, other, alpha, target.view_mut())
+    }
+
+    /// Like `row_outer_into` but accepts a mutable view, so callers can pass
+    /// a slice of a larger matrix without allocating a temporary.
+    pub fn row_outer_into_view(
+        &self,
+        row: usize,
+        other: &DesignMatrix,
+        alpha: f64,
+        mut target: ArrayViewMut2<'_, f64>,
     ) -> Result<(), String> {
         if target.nrows() != self.ncols() || target.ncols() != other.ncols() {
             return Err(format!(

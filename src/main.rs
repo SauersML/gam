@@ -2569,27 +2569,57 @@ fn run_predict_survival(
         let need_uncertainty = args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
         let posterior_mean = if need_uncertainty {
             let cov_mat = covariance_from_model(model, args.covariance_mode)?;
+            let p_t = beta_time.len();
+            let p_m = beta_marginal.len();
+            let p_s = beta_slope.len();
+            let p_total = p_t + p_m + p_s;
             let mut eta_var = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let c_i = c[i];
-                let q_i = q_exit[i];
-                let b_i = slope[i];
-                let slope_grad_scale = q_i * b_i / c_i + z[i];
-                let mut grad =
-                    Array1::<f64>::zeros(beta_time.len() + beta_marginal.len() + beta_slope.len());
-                let mut cursor = 0usize;
-                grad.slice_mut(s![cursor..cursor + beta_time.len()])
-                    .assign(&(&time_build.x_exit_time.row(i).to_owned() * c_i));
-                cursor += beta_time.len();
-                grad.slice_mut(s![cursor..cursor + beta_marginal.len()])
-                    .assign(&(&cov_design.design.row_chunk(i..i + 1).row(0).to_owned() * c_i));
-                cursor += beta_marginal.len();
-                grad.slice_mut(s![cursor..cursor + beta_slope.len()])
-                    .assign(
-                        &(&logslope_design.design.row_chunk(i..i + 1).row(0).to_owned()
-                            * slope_grad_scale),
-                    );
-                eta_var[i] = grad.dot(&cov_mat.dot(&grad)).max(0.0);
+            // Chunked Jacobian: build J_chunk, compute diag(J C J^T) per chunk.
+            // Memory bound: ~8 MB working set per chunk.
+            let chunk_size = (8 * 1024 * 1024 / (p_total.max(1) * 8 * 2))
+                .max(16)
+                .min(n.max(1));
+            let mut start = 0usize;
+            while start < n {
+                let end = (start + chunk_size).min(n);
+                let cs = end - start;
+                let mut jac = Array2::<f64>::zeros((cs, p_total));
+                // Time block: scale rows by c_i
+                {
+                    let x_t = time_build.x_exit_time.slice(s![start..end, ..]);
+                    let mut dst = jac.slice_mut(s![.., ..p_t]);
+                    dst.assign(&x_t);
+                    for i in 0..cs {
+                        let ci = c[start + i];
+                        dst.row_mut(i).mapv_inplace(|v| v * ci);
+                    }
+                }
+                // Marginal block: scale rows by c_i
+                {
+                    let x_m = cov_design.design.row_chunk(start..end);
+                    let mut dst = jac.slice_mut(s![.., p_t..p_t + p_m]);
+                    dst.assign(&x_m);
+                    for i in 0..cs {
+                        let ci = c[start + i];
+                        dst.row_mut(i).mapv_inplace(|v| v * ci);
+                    }
+                }
+                // Slope block: scale rows by (q*b/c + z)
+                {
+                    let x_s = logslope_design.design.row_chunk(start..end);
+                    let mut dst = jac.slice_mut(s![.., p_t + p_m..]);
+                    dst.assign(&x_s);
+                    for i in 0..cs {
+                        let gi = q_exit[start + i] * slope[start + i] / c[start + i] + z[start + i];
+                        dst.row_mut(i).mapv_inplace(|v| v * gi);
+                    }
+                }
+                // diag(J C J^T): compute JC = J @ C, then row-wise dot
+                let jc = gam::faer_ndarray::fast_ab(&jac.view(), &cov_mat.view());
+                for i in 0..cs {
+                    eta_var[start + i] = jac.row(i).dot(&jc.row(i)).max(0.0);
+                }
+                start = end;
             }
             let eta_se = eta_var.mapv(f64::sqrt);
             let posterior = Array1::from_iter(

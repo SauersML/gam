@@ -216,6 +216,17 @@ impl<'a> RemlState<'a> {
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_sparse_exact(rho, bundle, hyper_dirs)?;
             Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
+        } else if matches!(
+            bundle.pirls_result.coordinate_frame,
+            crate::pirls::PirlsCoordinateFrame::TransformedQs
+        ) && self
+            .active_constraint_free_basis(bundle.pirls_result.as_ref())
+            .is_none()
+        {
+            let ext_coords = self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs)?;
+            let (ext_pair_fn, rho_ext_pair_fn) =
+                self.build_tau_pair_callbacks_original_basis(rho, bundle, hyper_dirs)?;
+            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
         } else {
             let ext_coords = self.build_tau_hyper_coords(rho, bundle, hyper_dirs)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
@@ -518,18 +529,12 @@ impl<'a> RemlState<'a> {
     /// not a dense matrix, so the unified evaluator can compute
     /// `tr(H^{-1} B_τ)` exactly without falling back to dense spectral
     /// materialization.
-    pub(crate) fn build_tau_hyper_coords_sparse_exact(
+    pub(crate) fn build_tau_hyper_coords_original_basis(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
-        if bundle.sparse_exact.is_none() {
-            return Err(EstimationError::InvalidInput(
-                "missing sparse exact evaluation payload".to_string(),
-            ));
-        }
-
         let psi_dim = hyper_dirs.len();
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -598,6 +603,13 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
+            &self.canonical_penalties,
+            &rho.mapv(f64::exp).to_vec(),
+            bundle.ridge_passport.penalty_logdet_ridge(),
+            p_dim,
+        )
+        .map_err(EstimationError::InvalidInput)?;
 
         let mut coords = Vec::with_capacity(psi_dim);
         for dir in hyper_dirs {
@@ -635,11 +647,7 @@ impl<'a> RemlState<'a> {
                 Some(&pirls_result.solve_c_array * &x_tau_beta_j)
             };
 
-            let ld_s_j = self.fixed_subspace_penalty_trace(
-                &pirls_result.reparam_result.e_transformed,
-                &s_tau_j,
-                pirls_result.ridge_passport,
-            )?;
+            let ld_s_j = pld.tau_gradient_component(&s_tau_j);
 
             coords.push(super::unified::HyperCoord {
                 a: a_j,
@@ -664,13 +672,27 @@ impl<'a> RemlState<'a> {
         Ok(coords)
     }
 
+    pub(crate) fn build_tau_hyper_coords_sparse_exact(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+        if bundle.sparse_exact.is_none() {
+            return Err(EstimationError::InvalidInput(
+                "missing sparse exact evaluation payload".to_string(),
+            ));
+        }
+        self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs)
+    }
+
     /// Sparse-exact τ×τ and ρ×τ pair callbacks in original coordinates.
     ///
     /// This path prioritizes correctness and consistent basis alignment with the
     /// sparse Cholesky operator. It densifies the design only for second-order
     /// pair assembly, which is acceptable because pair callbacks are used only
     /// when the caller requests the full outer Hessian.
-    pub(crate) fn build_tau_pair_callbacks_sparse_exact(
+    pub(crate) fn build_tau_pair_callbacks_original_basis(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -966,6 +988,21 @@ impl<'a> RemlState<'a> {
         };
 
         Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)))
+    }
+
+    pub(crate) fn build_tau_pair_callbacks_sparse_exact(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<
+        (
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        ),
+        EstimationError,
+    > {
+        self.build_tau_pair_callbacks_original_basis(rho, bundle, hyper_dirs)
     }
 
     /// Build pair callbacks for τ×τ and ρ×τ second-order [`HyperCoordPair`]

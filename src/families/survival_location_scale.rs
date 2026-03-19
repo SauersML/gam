@@ -486,9 +486,9 @@ fn inverse_link_pdffourth_derivative(inverse_link: &InverseLink, eta: f64) -> f6
 
 #[derive(Clone)]
 pub struct TimeBlockInput {
-    pub design_entry: Array2<f64>,
-    pub design_exit: Array2<f64>,
-    pub design_derivative_exit: Array2<f64>,
+    pub design_entry: DesignMatrix,
+    pub design_exit: DesignMatrix,
+    pub design_derivative_exit: DesignMatrix,
     pub offset_entry: Array1<f64>,
     pub offset_exit: Array1<f64>,
     pub derivative_offset_exit: Array1<f64>,
@@ -3646,32 +3646,6 @@ struct TimeBlockPrepared {
     transform: TimeIdentifiabilityTransform,
 }
 
-pub(crate) fn time_derivative_lower_bound_constraints(
-    design_derivative_exit: &Array2<f64>,
-    derivative_offset_exit: &Array1<f64>,
-    lower_bound: f64,
-) -> Result<Option<LinearInequalityConstraints>, String> {
-    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
-        return Err(format!(
-            "time derivative constraints require matching rows/offsets: rows={}, offsets={}",
-            design_derivative_exit.nrows(),
-            derivative_offset_exit.len()
-        ));
-    }
-    if design_derivative_exit.ncols() == 0 {
-        return Ok(None);
-    }
-    if !lower_bound.is_finite() {
-        return Err(format!(
-            "time derivative lower bound must be finite, got {lower_bound}"
-        ));
-    }
-    Ok(Some(LinearInequalityConstraints {
-        a: design_derivative_exit.clone(),
-        b: derivative_offset_exit.mapv(|offset| lower_bound - offset),
-    }))
-}
-
 pub(crate) fn project_onto_linear_constraints(
     dim: usize,
     constraints: &LinearInequalityConstraints,
@@ -3717,9 +3691,11 @@ fn prepare_identified_time_block(input: &TimeBlockInput) -> Result<TimeBlockPrep
                 .to_string(),
         );
     }
-    let design_entry = input.design_entry.clone();
-    let design_exit = input.design_exit.clone();
-    let design_derivative_exit = input.design_derivative_exit.clone();
+    // Materialize to dense at the location-scale boundary — the hot path
+    // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense).
+    let design_entry = input.design_entry.to_dense();
+    let design_exit = input.design_exit.to_dense();
+    let design_derivative_exit = input.design_derivative_exit.to_dense();
     let penalties = input.penalties.clone();
     let linear_constraints = monotone_wiggle_nonnegative_constraints(p);
     let initial_beta = linear_constraints.as_ref().map(|constraints| {

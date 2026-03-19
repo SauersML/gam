@@ -49,6 +49,21 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    fn bundle_matrix_in_original_basis(
+        &self,
+        pirls_result: &PirlsResult,
+        matrix: &Array2<f64>,
+    ) -> Array2<f64> {
+        match pirls_result.coordinate_frame {
+            pirls::PirlsCoordinateFrame::OriginalSparseNative => matrix.clone(),
+            pirls::PirlsCoordinateFrame::TransformedQs => {
+                let qs = &pirls_result.reparam_result.qs;
+                let tmp = qs.dot(matrix);
+                tmp.dot(&qs.t())
+            }
+        }
+    }
+
     pub(crate) fn last_ridge_used(&self) -> Option<f64> {
         self.cache_manager
             .current_eval_bundle
@@ -2944,6 +2959,18 @@ impl<'a> RemlState<'a> {
                     None,
                     None,
                 )
+            } else if matches!(
+                bundle.pirls_result.coordinate_frame,
+                pirls::PirlsCoordinateFrame::TransformedQs
+            ) && self
+                .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                .is_none()
+            {
+                (
+                    self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?,
+                    None,
+                    None,
+                )
             } else {
                 (
                     self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?,
@@ -3002,6 +3029,20 @@ impl<'a> RemlState<'a> {
         };
 
         let pirls_result = bundle.pirls_result.as_ref();
+        if matches!(
+            pirls_result.coordinate_frame,
+            pirls::PirlsCoordinateFrame::TransformedQs
+        ) && self.active_constraint_free_basis(pirls_result).is_none()
+        {
+            return self.evaluate_unified_dense_original_with_ext_from_bundle(
+                rho,
+                bundle,
+                mode,
+                ext_coords,
+                ext_coord_pair_fn,
+                rho_ext_pair_fn,
+            );
+        }
         let ridge_passport = pirls_result.ridge_passport;
 
         // Constraint projection.
@@ -3098,6 +3139,106 @@ impl<'a> RemlState<'a> {
         let inner_solution = builder.build();
 
         // Prior (ρ-only; ψ coordinates are unconstrained soft-prior-free).
+        let prior = if mode == super::unified::EvalMode::ValueOnly {
+            let pc = self.compute_soft_priorcost(rho);
+            if pc.abs() > 0.0 {
+                Some((pc, Array1::zeros(rho.len()), None))
+            } else {
+                None
+            }
+        } else {
+            let pc = self.compute_soft_priorcost(rho);
+            let pg = self.compute_soft_priorgrad(rho);
+            let ph = if mode == super::unified::EvalMode::ValueGradientHessian {
+                self.compute_soft_priorhess(rho)
+            } else {
+                None
+            };
+            if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
+                Some((pc, pg, ph))
+            } else {
+                None
+            }
+        };
+
+        let result = reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), mode, prior)
+            .map_err(|e| EstimationError::InvalidInput(e))?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
+        Ok(self.apply_tk_to_result(result, rho, tk_terms))
+    }
+
+    fn evaluate_unified_dense_original_with_ext_from_bundle(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+        ext_coords: Vec<super::unified::HyperCoord>,
+        ext_coord_pair_fn: Option<
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        >,
+        rho_ext_pair_fn: Option<
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        >,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        use super::unified::{
+            DenseSpectralOperator, HessianOperator, InnerSolutionBuilder, reml_laml_evaluate,
+        };
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let ridge_passport = pirls_result.ridge_passport;
+        let h_total_original =
+            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
+        let hessian_op: Box<dyn HessianOperator> = Box::new(
+            DenseSpectralOperator::from_symmetric(&h_total_original).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "DenseSpectralOperator from original-basis PIRLS Hessian (psi-ext): {e}"
+                ))
+            })?,
+        );
+
+        let e_for_logdet = pirls_result.reparam_result.e_transformed.clone();
+        let (penalty_rank, penalty_logdet) =
+            self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
+
+        let beta = self.sparse_exact_beta_original(pirls_result);
+        let p_eff_dim = beta.len();
+        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
+
+        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
+            self.build_sparse_derivative_context(pirls_result, bundle)?;
+
+        let n_observations = self.y.len();
+        let penalty_coords: Vec<super::unified::PenaltyCoordinate> = self
+            .canonical_penalties
+            .iter()
+            .map(|cp| cp.to_penalty_coordinate())
+            .collect();
+        let mut builder = InnerSolutionBuilder::new(
+            log_likelihood,
+            pirls_result.stable_penalty_term,
+            beta,
+            n_observations,
+            hessian_op,
+            penalty_coords,
+            penalty_logdet,
+            dispersion,
+        )
+        .deriv_provider(deriv_provider)
+        .tk(0.0, None)
+        .firth(firth_op)
+        .nullspace_dim_override(nullspace_dim)
+        .barrier_config(barrier_config)
+        .ext_coords(ext_coords);
+
+        if let Some(f) = ext_coord_pair_fn {
+            builder = builder.ext_coord_pair_fn(f);
+        }
+        if let Some(f) = rho_ext_pair_fn {
+            builder = builder.rho_ext_pair_fn(f);
+        }
+
+        let inner_solution = builder.build();
+
         let prior = if mode == super::unified::EvalMode::ValueOnly {
             let pc = self.compute_soft_priorcost(rho);
             if pc.abs() > 0.0 {

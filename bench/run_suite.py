@@ -4810,13 +4810,6 @@ def run_rust_gamlss_survival_marginal_slope_cv(
                     sdv = 1.0
                 train_df[col] = (train_df[col] - mu) / sdv
                 test_df[col] = (test_df[col] - mu) / sdv
-            _apply_exact_train_fold_standardization(
-                train_df,
-                test_df,
-                train_raw,
-                test_raw,
-                z_column,
-            )
             train_df["__entry"] = 0.0
             horizon = _survival_eval_horizon(train_df, ds["time_col"])
             test_pred_df = test_df.copy()

@@ -10,11 +10,13 @@
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
 use ndarray::{Array1, Array2, array, s};
+use std::sync::Arc;
 
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
     KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
+use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::families::gamlss::{
     WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
     monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
@@ -68,11 +70,11 @@ pub enum SurvivalTimeBasisConfig {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SurvivalTimeBuildOutput {
-    pub x_entry_time: Array2<f64>,
-    pub x_exit_time: Array2<f64>,
-    pub x_derivative_time: Array2<f64>,
+    pub x_entry_time: DesignMatrix,
+    pub x_exit_time: DesignMatrix,
+    pub x_derivative_time: DesignMatrix,
     pub penalties: Vec<Array2<f64>>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
@@ -505,9 +507,9 @@ pub fn build_survival_time_basis(
 
     match cfg {
         SurvivalTimeBasisConfig::None => Ok(SurvivalTimeBuildOutput {
-            x_entry_time: Array2::zeros((n, 0)),
-            x_exit_time: Array2::zeros((n, 0)),
-            x_derivative_time: Array2::zeros((n, 0)),
+            x_entry_time: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((n, 0)))),
+            x_exit_time: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((n, 0)))),
+            x_derivative_time: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((n, 0)))),
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
             basisname: "none".to_string(),
@@ -528,9 +530,9 @@ pub fn build_survival_time_basis(
                 x_derivative_time[[i, 1]] = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
             }
             Ok(SurvivalTimeBuildOutput {
-                x_entry_time,
-                x_exit_time,
-                x_derivative_time,
+                x_entry_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_entry_time)),
+                x_exit_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_exit_time)),
+                x_derivative_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_derivative_time)),
                 penalties: Vec::new(),
                 nullspace_dims: Vec::new(),
                 basisname: "linear".to_string(),
@@ -584,7 +586,11 @@ pub fn build_survival_time_basis(
             .map_err(|e| format!("failed to build bspline exit basis: {e}"))?;
 
             let p_time = exit_basis.design.ncols();
-            let mut x_derivative_time = Array2::<f64>::zeros((n, p_time));
+            // Build derivative basis as sparse triplets — B-spline derivatives
+            // have the same local support as the basis itself (at most degree+1
+            // nonzeros per row), so building dense first wastes memory.
+            let mut deriv_triplets: Vec<faer::sparse::Triplet<usize, f64>> =
+                Vec::with_capacity(n * (degree + 1));
             let mut deriv_buf = vec![0.0_f64; p_time];
             for i in 0..n {
                 deriv_buf.fill(0.0);
@@ -597,13 +603,29 @@ pub fn build_survival_time_basis(
                 .map_err(|e| format!("failed to evaluate bspline derivative: {e}"))?;
                 let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
                 for j in 0..p_time {
-                    x_derivative_time[[i, j]] = deriv_buf[j] * chain;
+                    let v = deriv_buf[j] * chain;
+                    if v.abs() > 1e-15 {
+                        deriv_triplets.push(faer::sparse::Triplet::new(i, j, v));
+                    }
                 }
             }
+            let x_derivative_time = match faer::sparse::SparseColMat::try_new_from_triplets(
+                n, p_time, &deriv_triplets,
+            ) {
+                Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
+                Err(_) => {
+                    // Fallback: build dense
+                    let mut dense = Array2::<f64>::zeros((n, p_time));
+                    for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
+                        dense[[row, col]] = val;
+                    }
+                    DesignMatrix::Dense(DenseDesignMatrix::from(dense))
+                }
+            };
 
             Ok(SurvivalTimeBuildOutput {
-                x_entry_time: entry_basis.design.to_dense(),
-                x_exit_time: exit_basis.design.to_dense(),
+                x_entry_time: entry_basis.design,
+                x_exit_time: exit_basis.design,
                 x_derivative_time,
                 nullspace_dims: entry_basis.nullspace_dims,
                 penalties: entry_basis.penalties,
@@ -717,7 +739,13 @@ pub fn build_survival_time_basis(
             };
             let db_exit = db_exit_arc.as_ref();
 
-            let mut x_derivative_time = Array2::<f64>::zeros((n, p_time));
+            // Build I-spline derivative as sparse triplets.  The derivative
+            // is a cumulative sum of B-spline derivatives and typically has
+            // more nonzeros per row than a plain B-spline, but still much
+            // fewer than p_time for modest bases.
+            let mut deriv_triplets: Vec<faer::sparse::Triplet<usize, f64>> =
+                Vec::with_capacity(n * p_time.min(16));
+            let mut found_nonfinite: Option<(usize, usize)> = None;
             for i in 0..n {
                 let mut running = 0.0_f64;
                 let mut d_i_log_full = vec![0.0_f64; p_time_full];
@@ -730,18 +758,34 @@ pub fn build_survival_time_basis(
                 }
                 let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
                 for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                    x_derivative_time[[i, j_new]] = d_i_log_full[j_old] * chain;
+                    let v = d_i_log_full[j_old] * chain;
+                    if !v.is_finite() {
+                        found_nonfinite = Some((i, j_new));
+                    }
+                    if v.abs() > 1e-15 {
+                        deriv_triplets.push(faer::sparse::Triplet::new(i, j_new, v));
+                    }
                 }
             }
-            if let Some((row, col)) = x_derivative_time.indexed_iter().find_map(|((i, j), v)| {
-                if v.is_finite() { None } else { Some((i, j)) }
-            }) {
+            if let Some((row, col)) = found_nonfinite {
                 return Err(format!(
                     "survival ispline derivative basis produced non-finite value at row {}, column {}",
                     row + 1,
                     col + 1
                 ));
             }
+            let x_derivative_time = match faer::sparse::SparseColMat::try_new_from_triplets(
+                n, p_time, &deriv_triplets,
+            ) {
+                Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
+                Err(_) => {
+                    let mut dense = Array2::<f64>::zeros((n, p_time));
+                    for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
+                        dense[[row, col]] = val;
+                    }
+                    DesignMatrix::Dense(DenseDesignMatrix::from(dense))
+                }
+            };
 
             let penalty_basis = build_bspline_basis_1d(
                 log_exit.view(),
@@ -795,8 +839,8 @@ pub fn build_survival_time_basis(
                 })
                 .collect();
             Ok(SurvivalTimeBuildOutput {
-                x_entry_time,
-                x_exit_time,
+                x_entry_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_entry_time)),
+                x_exit_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_exit_time)),
                 x_derivative_time,
                 penalties,
                 nullspace_dims,
@@ -902,8 +946,8 @@ pub fn evaluate_survival_time_basis_row(
 }
 
 pub fn center_survival_time_designs_at_anchor(
-    design_entry: &mut Array2<f64>,
-    design_exit: &mut Array2<f64>,
+    design_entry: &mut DesignMatrix,
+    design_exit: &mut DesignMatrix,
     anchor_row: &Array1<f64>,
 ) -> Result<(), String> {
     if design_entry.ncols() != anchor_row.len() || design_exit.ncols() != anchor_row.len() {
@@ -914,12 +958,17 @@ pub fn center_survival_time_designs_at_anchor(
             anchor_row.len()
         ));
     }
-    for mut row in design_entry.rows_mut() {
-        row -= &anchor_row.view();
+    // Centering destroys sparsity (every row gets a dense offset), so
+    // materialize to dense.  This only runs once at construction time.
+    fn center_dense(dm: &mut DesignMatrix, anchor: &Array1<f64>) {
+        let mut dense = dm.to_dense();
+        for mut row in dense.rows_mut() {
+            row -= &anchor.view();
+        }
+        *dm = DesignMatrix::Dense(DenseDesignMatrix::from(dense));
     }
-    for mut row in design_exit.rows_mut() {
-        row -= &anchor_row.view();
-    }
+    center_dense(design_entry, anchor_row);
+    center_dense(design_exit, anchor_row);
     Ok(())
 }
 
@@ -1109,27 +1158,27 @@ pub fn build_survival_timewiggle_from_baseline(
 }
 
 pub fn append_zero_tail_columns(
-    x_entry: &mut Array2<f64>,
-    x_exit: &mut Array2<f64>,
-    x_derivative: &mut Array2<f64>,
+    x_entry: &mut DesignMatrix,
+    x_exit: &mut DesignMatrix,
+    x_derivative: &mut DesignMatrix,
     tail_cols: usize,
 ) {
     if tail_cols == 0 {
         return;
     }
-    let p_base = x_entry.ncols();
-    let n = x_entry.nrows();
-    let mut new_entry = Array2::<f64>::zeros((n, p_base + tail_cols));
-    let mut new_exit = Array2::<f64>::zeros((n, p_base + tail_cols));
-    let mut new_derivative = Array2::<f64>::zeros((n, p_base + tail_cols));
-    new_entry.slice_mut(s![.., 0..p_base]).assign(x_entry);
-    new_exit.slice_mut(s![.., 0..p_base]).assign(x_exit);
-    new_derivative
-        .slice_mut(s![.., 0..p_base])
-        .assign(x_derivative);
-    *x_entry = new_entry;
-    *x_exit = new_exit;
-    *x_derivative = new_derivative;
+    // Wiggle tail columns are dense, so materialize everything to dense.
+    // This only runs once at construction time when time-wiggles are active.
+    fn append_dense(dm: &mut DesignMatrix, tail: usize) {
+        let old = dm.to_dense();
+        let n = old.nrows();
+        let p_base = old.ncols();
+        let mut out = Array2::<f64>::zeros((n, p_base + tail));
+        out.slice_mut(s![.., 0..p_base]).assign(&old);
+        *dm = DesignMatrix::Dense(DenseDesignMatrix::from(out));
+    }
+    append_dense(x_entry, tail_cols);
+    append_dense(x_exit, tail_cols);
+    append_dense(x_derivative, tail_cols);
 }
 
 // ---------------------------------------------------------------------------
