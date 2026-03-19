@@ -948,6 +948,113 @@ impl Default for OuterConfig {
     }
 }
 
+// ─── OuterProblem builder ─────────────────────────────────────────────
+//
+// Declarative builder for outer optimization problems.  Derives
+// OuterCapability flags from high-level inputs (gradient/hessian
+// availability, psi dimension, EFS eligibility) so call sites never
+// hand-copy capability flags.
+
+/// Declarative outer-problem builder.  Produces both the
+/// [`OuterCapability`] (what the objective can provide) and the
+/// [`OuterConfig`] (how the runner should behave) from a small set
+/// of high-level declarations.
+pub struct OuterProblem {
+    n_params: usize,
+    gradient: Derivative,
+    hessian: Derivative,
+    psi_dim: usize,
+    efs_available: bool,
+    barrier_config: Option<BarrierConfig>,
+    tolerance: f64,
+    max_iter: usize,
+    fd_step: f64,
+    bounds: Option<(Array1<f64>, Array1<f64>)>,
+    rho_bound: f64,
+    seed_config: crate::seeding::SeedConfig,
+    heuristic_lambdas: Option<Vec<f64>>,
+    initial_rho: Option<Array1<f64>>,
+    fallback_policy: FallbackPolicy,
+    screening_cap: Option<Arc<AtomicUsize>>,
+}
+
+impl OuterProblem {
+    pub fn new(n_params: usize) -> Self {
+        Self {
+            n_params,
+            gradient: Derivative::Unavailable,
+            hessian: Derivative::Unavailable,
+            psi_dim: 0,
+            efs_available: false,
+            barrier_config: None,
+            tolerance: 1e-5,
+            max_iter: 200,
+            fd_step: 1e-4,
+            bounds: None,
+            rho_bound: 30.0,
+            seed_config: crate::seeding::SeedConfig::default(),
+            heuristic_lambdas: None,
+            initial_rho: None,
+            fallback_policy: FallbackPolicy::Automatic,
+            screening_cap: None,
+        }
+    }
+
+    pub fn with_gradient(mut self, d: Derivative) -> Self { self.gradient = d; self }
+    pub fn with_hessian(mut self, d: Derivative) -> Self { self.hessian = d; self }
+    pub fn with_psi_dim(mut self, dim: usize) -> Self { self.psi_dim = dim; self }
+    pub fn with_efs(mut self) -> Self { self.efs_available = true; self }
+    pub fn with_barrier(mut self, cfg: Option<BarrierConfig>) -> Self { self.barrier_config = cfg; self }
+    pub fn with_tolerance(mut self, tol: f64) -> Self { self.tolerance = tol; self }
+    pub fn with_max_iter(mut self, n: usize) -> Self { self.max_iter = n; self }
+    pub fn with_fd_step(mut self, h: f64) -> Self { self.fd_step = h; self }
+    pub fn with_bounds(mut self, lo: Array1<f64>, hi: Array1<f64>) -> Self { self.bounds = Some((lo, hi)); self }
+    pub fn with_rho_bound(mut self, b: f64) -> Self { self.rho_bound = b; self }
+    pub fn with_seed_config(mut self, sc: crate::seeding::SeedConfig) -> Self { self.seed_config = sc; self }
+    pub fn with_heuristic_lambdas(mut self, h: Vec<f64>) -> Self { self.heuristic_lambdas = Some(h); self }
+    pub fn with_initial_rho(mut self, rho: Array1<f64>) -> Self { self.initial_rho = Some(rho); self }
+    pub fn with_fallback_policy(mut self, p: FallbackPolicy) -> Self { self.fallback_policy = p; self }
+    pub fn with_screening_cap(mut self, cap: Arc<AtomicUsize>) -> Self { self.screening_cap = Some(cap); self }
+
+    /// Derive the capability flags from the builder state.
+    pub fn capability(&self) -> OuterCapability {
+        OuterCapability {
+            gradient: self.gradient,
+            hessian: self.hessian,
+            n_params: self.n_params,
+            all_penalty_like: self.psi_dim == 0,
+            has_psi_coords: self.psi_dim > 0,
+            fixed_point_available: self.efs_available,
+            barrier_config: self.barrier_config.clone(),
+        }
+    }
+
+    /// Derive the runner configuration from the builder state.
+    pub fn config(&self) -> OuterConfig {
+        OuterConfig {
+            tolerance: self.tolerance,
+            max_iter: self.max_iter,
+            fd_step: self.fd_step,
+            bounds: self.bounds.clone(),
+            seed_config: self.seed_config.clone(),
+            rho_bound: self.rho_bound,
+            heuristic_lambdas: self.heuristic_lambdas.clone(),
+            initial_rho: self.initial_rho.clone(),
+            fallback_policy: self.fallback_policy,
+            screening_cap: self.screening_cap.clone(),
+        }
+    }
+
+    /// Run the outer optimization with a given objective.
+    pub fn run(
+        &self,
+        obj: &mut dyn OuterObjective,
+        context: &str,
+    ) -> Result<OuterResult, EstimationError> {
+        run_outer(obj, &self.config(), context)
+    }
+}
+
 /// Result of a completed outer optimization.
 #[derive(Clone, Debug)]
 pub struct OuterResult {
