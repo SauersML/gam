@@ -3493,11 +3493,10 @@ impl SparseHessianAccumulator {
                 return;
             }
         }
-        // Entry not in pattern – this indicates a caller/pattern mismatch.
-        assert!(
-            false,
-            "SparseHessianAccumulator::add: ({r}, {c}) not in pattern"
-        );
+        // Entry not in pattern — unreachable if pattern was built from the
+        // same designs used for accumulation.
+        #[cfg(debug_assertions)]
+        unreachable!("SparseHessianAccumulator::add: ({r}, {c}) not in pattern");
     }
 
     /// Element-wise `self.values += other`.

@@ -393,6 +393,54 @@ impl BlockHessianAccumulator {
         }
     }
 
+    /// Add outer product of two psi block-local rows (possibly in different blocks).
+    /// Adds both α·(a ⊗ b) and α·(b ⊗ a) to maintain symmetry.
+    ///
+    /// The full p×p symmetric Hessian has blocks:
+    ///   (block_i, block_j) += α · psi_row_i ⊗ psi_row_j
+    ///   (block_j, block_i) += α · psi_row_j ⊗ psi_row_i   (= transpose)
+    /// Our off-diagonal storage convention (h_mg = marginal×logslope) handles
+    /// the transpose automatically in to_dense/operator assembly.
+    fn add_psi_psi_outer(
+        &mut self,
+        block_i: usize,
+        psi_row_i: &Array1<f64>,
+        block_j: usize,
+        psi_row_j: &Array1<f64>,
+        alpha: f64,
+    ) {
+        if alpha == 0.0 {
+            return;
+        }
+        let col_i = psi_row_i.view().insert_axis(Axis(1));
+        let row_j = psi_row_j.view().insert_axis(Axis(0));
+
+        if block_i == block_j {
+            // Same block: symmetric rank-2 update to the diagonal block
+            let col_j = psi_row_j.view().insert_axis(Axis(1));
+            let row_i = psi_row_i.view().insert_axis(Axis(0));
+            let target = match block_i {
+                1 => &mut self.h_mm,
+                2 => &mut self.h_gg,
+                _ => return,
+            };
+            ndarray::linalg::general_mat_mul(alpha, &col_i, &row_j, 1.0, target);
+            ndarray::linalg::general_mat_mul(alpha, &col_j, &row_i, 1.0, target);
+        } else {
+            // Different blocks: one rank-1 update to h_mg.
+            // Block (marginal, logslope) gets the psi_marginal ⊗ psi_logslope contribution;
+            // the (logslope, marginal) transpose is assembled from h_mg^T automatically.
+            let (marginal_row, logslope_row) = if block_i == 1 {
+                (psi_row_i, psi_row_j)
+            } else {
+                (psi_row_j, psi_row_i)
+            };
+            let m_col = marginal_row.view().insert_axis(Axis(1));
+            let g_row = logslope_row.view().insert_axis(Axis(0));
+            ndarray::linalg::general_mat_mul(alpha, &m_col, &g_row, 1.0, &mut self.h_mg);
+        }
+    }
+
     /// Assemble into a dense p×p matrix.
     fn to_dense(&self, slices: &BlockSlices) -> Array2<f64> {
         let mut out = Array2::zeros((slices.total, slices.total));
@@ -1521,99 +1569,71 @@ impl SurvivalMarginalSlopeFamily {
         Ok(Some(out))
     }
 
-    fn embedded_psi_vector(
+    // ── Psi terms (first and second order) ────────────────────────────
+    //
+    // All three psi methods (first-order, second-order, directional derivative)
+    // use block-local accumulation via BlockHessianAccumulator. Per-row work is
+    // O(max(p_block²)) instead of O(p²), eliminating the dense p×p bottleneck
+    // that breaks multi-axis Duchon / per-axis length scaling.
+
+    /// Resolve psi block info: (block_idx, local_idx, p_block, label).
+    fn psi_block_info(
         &self,
-        row: usize,
-        slices: &BlockSlices,
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<(usize, Array1<f64>)>, String> {
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+    ) -> Result<Option<(usize, usize, usize, &'static str)>, String> {
+        let Some((block_idx, local_idx)) =
+            self.resolve_psi_location(derivative_blocks, psi_index)
         else {
             return Ok(None);
         };
-        let deriv = &derivative_blocks[block_idx][local_idx];
-        let mut out = Array1::<f64>::zeros(slices.total);
         match block_idx {
-            1 => out
-                .slice_mut(s![slices.marginal.clone()])
-                .assign(&self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.marginal_design.ncols(),
-                    "SurvivalMarginalSlope marginal",
-                )?),
-            2 => out
-                .slice_mut(s![slices.logslope.clone()])
-                .assign(&self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.n,
-                    self.logslope_design.ncols(),
-                    "SurvivalMarginalSlope logslope",
-                )?),
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi embedding: only baseline/slope spatial blocks are supported, got block {block_idx}"
-                ));
-            }
+            1 => Ok(Some((
+                block_idx,
+                local_idx,
+                self.marginal_design.ncols(),
+                "SurvivalMarginalSlope marginal",
+            ))),
+            2 => Ok(Some((
+                block_idx,
+                local_idx,
+                self.logslope_design.ncols(),
+                "SurvivalMarginalSlope logslope",
+            ))),
+            _ => Err(format!(
+                "survival marginal-slope psi: only baseline/slope spatial blocks are supported, got block {block_idx}"
+            )),
         }
-        Ok(Some((block_idx, out)))
     }
 
-    fn embedded_psi_second_vector(
+    /// Accumulate block-local score from a primary-space vector (replaces
+    /// pullback_primary_vector + score += for score accumulation).
+    fn accumulate_score_blockwise(
         &self,
         row: usize,
-        slices: &BlockSlices,
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_i: usize,
-        psi_j: usize,
-    ) -> Result<Option<(usize, Array1<f64>)>, String> {
-        let Some((block_i, local_i)) = self.resolve_psi_location(derivative_blocks, psi_i) else {
-            return Ok(None);
-        };
-        let Some((block_j, local_j)) = self.resolve_psi_location(derivative_blocks, psi_j) else {
-            return Ok(None);
-        };
-        if block_i != block_j {
-            return Ok(Some((block_i, Array1::<f64>::zeros(slices.total))));
+        primary: &Array1<f64>,
+        score_t: &mut Array1<f64>,
+        score_m: &mut Array1<f64>,
+        score_g: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        {
+            let mut st = score_t.view_mut();
+            self.design_entry
+                .axpy_row_into(row, primary[0], &mut st)
+                .expect("time entry axpy dim mismatch");
+            self.design_exit
+                .axpy_row_into(row, primary[1], &mut st)
+                .expect("time exit axpy dim mismatch");
+            self.design_derivative_exit
+                .axpy_row_into(row, primary[2], &mut st)
+                .expect("time deriv axpy dim mismatch");
         }
-        let deriv_i = &derivative_blocks[block_i][local_i];
-        let mut out = Array1::<f64>::zeros(slices.total);
-        match block_i {
-            1 => out.slice_mut(s![slices.marginal.clone()]).assign(
-                &self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.n,
-                    self.marginal_design.ncols(),
-                    "SurvivalMarginalSlope marginal",
-                )?,
-            ),
-            2 => out.slice_mut(s![slices.logslope.clone()]).assign(
-                &self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.n,
-                    self.logslope_design.ncols(),
-                    "SurvivalMarginalSlope logslope",
-                )?,
-            ),
-            _ => {
-                return Err(format!(
-                    "survival marginal-slope psi second embedding: only baseline/slope spatial blocks are supported, got block {block_i}"
-                ));
-            }
-        }
-        Ok(Some((block_i, out)))
+        self.marginal_design
+            .axpy_row_into(row, primary[0] + primary[1], &mut score_m.view_mut())?;
+        self.logslope_design
+            .axpy_row_into(row, primary[3], &mut score_g.view_mut())?;
+        Ok(())
     }
-
-    // ── Psi terms (first and second order) ────────────────────────────
 
     fn psi_terms_inner(
         &self,
@@ -1623,15 +1643,24 @@ impl SurvivalMarginalSlopeFamily {
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let slices = block_slices(block_states);
-        let Some((block_idx, _)) =
-            self.embedded_psi_vector(0, &slices, derivative_blocks, psi_index)?
+        let Some((block_idx, local_idx, p_psi, psi_label)) =
+            self.psi_block_info(derivative_blocks, psi_index)?
         else {
             return Ok(None);
         };
+        let deriv = &derivative_blocks[block_idx][local_idx];
         let loading = spatial_block_primary_loading(block_idx)?;
+
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+
         let mut objective_psi = 0.0;
-        let mut score_psi = Array1::<f64>::zeros(slices.total);
-        let mut hessian_psi = Array2::<f64>::zeros((slices.total, slices.total));
+        let mut score_t = Array1::<f64>::zeros(p_t);
+        let mut score_m = Array1::<f64>::zeros(p_m);
+        let mut score_g = Array1::<f64>::zeros(p_g);
+        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g);
+
         for row in 0..self.n {
             let Some(dir) =
                 self.row_primary_psi_direction(row, block_states, derivative_blocks, psi_index)?
@@ -1647,29 +1676,46 @@ impl SurvivalMarginalSlopeFamily {
                 (g, h)
             };
             let third = self.row_primary_third_contracted(row, block_states, &dir)?;
-            let (_, left_vec) = self
-                .embedded_psi_vector(row, &slices, derivative_blocks, psi_index)?
-                .ok_or_else(|| "missing survival marginal-slope psi vector".to_string())?;
-            objective_psi += f_pi.dot(&dir);
-            score_psi += &(left_vec.clone() * f_pi.dot(&loading));
-            score_psi += &self.pullback_primary_vector(row, &slices, &f_pipi.dot(&dir))?;
+            let psi_row =
+                self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
 
-            let right_vec = self.pullback_primary_vector(row, &slices, &f_pipi.dot(&loading))?;
-            hessian_psi += &left_vec
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&right_vec.view().insert_axis(Axis(0)));
-            hessian_psi += &right_vec
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_vec.view().insert_axis(Axis(0)));
-            self.add_pullback_primary_hessian(&mut hessian_psi, row, &slices, &third);
+            objective_psi += f_pi.dot(&dir);
+
+            // Score: psi block gets scalar × psi_row
+            let s1 = f_pi.dot(&loading);
+            match block_idx {
+                1 => score_m.scaled_add(s1, &psi_row),
+                2 => score_g.scaled_add(s1, &psi_row),
+                _ => {}
+            }
+            // Score: pullback of f_pipi·dir into all 3 blocks
+            let pb = f_pipi.dot(&dir);
+            self.accumulate_score_blockwise(
+                row, &pb, &mut score_t, &mut score_m, &mut score_g,
+            )?;
+
+            // Hessian: rank-1 from psi_row × pullback(f_pipi·loading)
+            let right_primary = f_pipi.dot(&loading);
+            acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+            // Hessian: pullback of third derivative
+            acc.add_pullback(self, row, &third);
         }
+
+        // Assemble score into flat vector
+        let mut score_psi = Array1::zeros(slices.total);
+        score_psi.slice_mut(s![slices.time.clone()]).assign(&score_t);
+        score_psi
+            .slice_mut(s![slices.marginal.clone()])
+            .assign(&score_m);
+        score_psi
+            .slice_mut(s![slices.logslope.clone()])
+            .assign(&score_g);
+
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
-            hessian_psi,
-            hessian_psi_operator: None,
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(Box::new(acc.into_operator(slices))),
         }))
     }
 
@@ -1691,15 +1737,33 @@ impl SurvivalMarginalSlopeFamily {
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let slices = block_slices(block_states);
-        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_i)? else {
+        let Some((block_idx_i, local_idx_i, p_psi_i, label_i)) =
+            self.psi_block_info(derivative_blocks, psi_i)?
+        else {
             return Ok(None);
         };
-        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_j)? else {
+        let Some((block_idx_j, local_idx_j, p_psi_j, label_j)) =
+            self.psi_block_info(derivative_blocks, psi_j)?
+        else {
             return Ok(None);
         };
+        let deriv_i = &derivative_blocks[block_idx_i][local_idx_i];
+        let loading_i = spatial_block_primary_loading(block_idx_i)?;
+        let loading_j = spatial_block_primary_loading(block_idx_j)?;
+
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+
         let mut objective_psi_psi = 0.0;
-        let mut score_psi_psi = Array1::<f64>::zeros(slices.total);
-        let mut hessian_psi_psi = Array2::<f64>::zeros((slices.total, slices.total));
+        let mut score_t = Array1::<f64>::zeros(p_t);
+        let mut score_m = Array1::<f64>::zeros(p_m);
+        let mut score_g = Array1::<f64>::zeros(p_g);
+        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g);
+
+        // Whether psi_ij second design row is nonzero (only when same block)
+        let same_block = block_idx_i == block_idx_j;
+
         for row in 0..self.n {
             let Some(dir_i) =
                 self.row_primary_psi_direction(row, block_states, derivative_blocks, psi_i)?
@@ -1730,93 +1794,130 @@ impl SurvivalMarginalSlopeFamily {
             };
             let third_i = self.row_primary_third_contracted(row, block_states, &dir_i)?;
             let third_j = self.row_primary_third_contracted(row, block_states, &dir_j)?;
-            let fourth = self.row_primary_fourth_contracted(row, block_states, &dir_i, &dir_j)?;
-            let (_, left_i) = self
-                .embedded_psi_vector(row, &slices, derivative_blocks, psi_i)?
-                .ok_or_else(|| "missing psi_i vector".to_string())?;
-            let (_, left_j) = self
-                .embedded_psi_vector(row, &slices, derivative_blocks, psi_j)?
-                .ok_or_else(|| "missing psi_j vector".to_string())?;
-            let left_ij = self
-                .embedded_psi_second_vector(row, &slices, derivative_blocks, psi_i, psi_j)?
-                .map(|(_, v)| v)
-                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
-            let loading_i = spatial_block_primary_loading(
-                self.resolve_psi_location(derivative_blocks, psi_i)
-                    .map(|(idx, _)| idx)
-                    .ok_or_else(|| "missing psi_i block".to_string())?,
+            let fourth =
+                self.row_primary_fourth_contracted(row, block_states, &dir_i, &dir_j)?;
+
+            let psi_row_i = self.psi_design_row_vector(
+                row, deriv_i, self.n, p_psi_i, label_i,
             )?;
-            let loading_j = spatial_block_primary_loading(
-                self.resolve_psi_location(derivative_blocks, psi_j)
-                    .map(|(idx, _)| idx)
-                    .ok_or_else(|| "missing psi_j block".to_string())?,
+            let psi_row_j = self.psi_design_row_vector(
+                row,
+                &derivative_blocks[block_idx_j][local_idx_j],
+                self.n,
+                p_psi_j,
+                label_j,
             )?;
+
+            // Optional second-order psi design row (only when same block)
+            let psi_row_ij = if same_block {
+                Some(self.psi_second_design_row_vector(
+                    row,
+                    deriv_i,
+                    &derivative_blocks[block_idx_j][local_idx_j],
+                    local_idx_j,
+                    self.n,
+                    p_psi_i,
+                    label_i,
+                )?)
+            } else {
+                None
+            };
+            let has_ij = psi_row_ij
+                .as_ref()
+                .is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
 
             objective_psi_psi += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
 
-            if left_ij.iter().any(|v| v.abs() > 0.0) {
-                score_psi_psi += &(left_ij.clone() * f_pi.dot(&loading_i));
+            // ── Score ──
+            // Term: left_ij * f_pi·loading_i (only if psi_row_ij nonzero)
+            if has_ij {
+                let s_ij = f_pi.dot(&loading_i);
+                let psi_ij = psi_row_ij.as_ref().unwrap();
+                match block_idx_i {
+                    1 => score_m.scaled_add(s_ij, psi_ij),
+                    2 => score_g.scaled_add(s_ij, psi_ij),
+                    _ => {}
+                }
             }
-            score_psi_psi += &(left_i.clone() * loading_i.dot(&f_pipi.dot(&dir_j)));
-            score_psi_psi += &(left_j.clone() * loading_j.dot(&f_pipi.dot(&dir_i)));
-            score_psi_psi += &self.pullback_primary_vector(row, &slices, &f_pipi.dot(&dir_ij))?;
-            score_psi_psi += &self.pullback_primary_vector(row, &slices, &third_i.dot(&dir_j))?;
+            // Term: left_i * loading_i·f_pipi·dir_j
+            let s_i = loading_i.dot(&f_pipi.dot(&dir_j));
+            match block_idx_i {
+                1 => score_m.scaled_add(s_i, &psi_row_i),
+                2 => score_g.scaled_add(s_i, &psi_row_i),
+                _ => {}
+            }
+            // Term: left_j * loading_j·f_pipi·dir_i
+            let s_j = loading_j.dot(&f_pipi.dot(&dir_i));
+            match block_idx_j {
+                1 => score_m.scaled_add(s_j, &psi_row_j),
+                2 => score_g.scaled_add(s_j, &psi_row_j),
+                _ => {}
+            }
+            // Term: pullback(f_pipi·dir_ij) + pullback(third_i·dir_j)
+            let pb1 = f_pipi.dot(&dir_ij);
+            self.accumulate_score_blockwise(
+                row, &pb1, &mut score_t, &mut score_m, &mut score_g,
+            )?;
+            let pb2 = third_i.dot(&dir_j);
+            self.accumulate_score_blockwise(
+                row, &pb2, &mut score_t, &mut score_m, &mut score_g,
+            )?;
 
-            if left_ij.iter().any(|v| v.abs() > 0.0) {
-                let right_ij =
-                    self.pullback_primary_vector(row, &slices, &f_pipi.dot(&loading_i))?;
-                hessian_psi_psi += &left_ij
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&right_ij.view().insert_axis(Axis(0)));
-                hessian_psi_psi += &right_ij
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&left_ij.view().insert_axis(Axis(0)));
+            // ── Hessian ──
+            // Term 1: left_ij ⊗ right_ij + right_ij ⊗ left_ij (if nonzero)
+            if has_ij {
+                let right_primary_ij = f_pipi.dot(&loading_i);
+                acc.add_rank1_psi_cross(
+                    self,
+                    row,
+                    block_idx_i,
+                    psi_row_ij.as_ref().unwrap(),
+                    &right_primary_ij,
+                );
             }
 
+            // Term 2: scalar_ij * (left_i ⊗ left_j + left_j ⊗ left_i)
             let scalar_ij = loading_i.dot(&f_pipi.dot(&loading_j));
-            hessian_psi_psi += &(left_i
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_j.view().insert_axis(Axis(0)))
-                * scalar_ij);
-            hessian_psi_psi += &(left_j
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_i.view().insert_axis(Axis(0)))
-                * scalar_ij);
+            acc.add_psi_psi_outer(
+                block_idx_i,
+                &psi_row_i,
+                block_idx_j,
+                &psi_row_j,
+                scalar_ij,
+            );
 
-            let right_i =
-                self.pullback_primary_vector(row, &slices, &third_j.t().dot(&loading_i))?;
-            hessian_psi_psi += &left_i
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&right_i.view().insert_axis(Axis(0)));
-            hessian_psi_psi += &right_i
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_i.view().insert_axis(Axis(0)));
+            // Term 3: left_i ⊗ right_i + right_i ⊗ left_i
+            //   where right_i = pullback(third_j^T · loading_i)
+            let right_primary_i = third_j.t().dot(&loading_i);
+            acc.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &right_primary_i);
 
-            let right_j =
-                self.pullback_primary_vector(row, &slices, &third_i.t().dot(&loading_j))?;
-            hessian_psi_psi += &left_j
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&right_j.view().insert_axis(Axis(0)));
-            hessian_psi_psi += &right_j
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_j.view().insert_axis(Axis(0)));
+            // Term 4: left_j ⊗ right_j + right_j ⊗ left_j
+            //   where right_j = pullback(third_i^T · loading_j)
+            let right_primary_j = third_i.t().dot(&loading_j);
+            acc.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &right_primary_j);
 
-            self.add_pullback_primary_hessian(&mut hessian_psi_psi, row, &slices, &fourth);
+            // Term 5: pullback_hessian(fourth) + pullback_hessian(third_ij)
+            acc.add_pullback(self, row, &fourth);
             let third_ij = self.row_primary_third_contracted(row, block_states, &dir_ij)?;
-            self.add_pullback_primary_hessian(&mut hessian_psi_psi, row, &slices, &third_ij);
+            acc.add_pullback(self, row, &third_ij);
         }
+
+        // Assemble score and Hessian into flat structures
+        let mut score_psi_psi = Array1::zeros(slices.total);
+        score_psi_psi
+            .slice_mut(s![slices.time.clone()])
+            .assign(&score_t);
+        score_psi_psi
+            .slice_mut(s![slices.marginal.clone()])
+            .assign(&score_m);
+        score_psi_psi
+            .slice_mut(s![slices.logslope.clone()])
+            .assign(&score_g);
+
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
-            hessian_psi_psi,
+            hessian_psi_psi: acc.to_dense(&slices),
         }))
     }
 
@@ -1838,16 +1939,19 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let slices = block_slices(block_states);
-        let Some((_, _)) = self.embedded_psi_vector(0, &slices, derivative_blocks, psi_index)?
+        let Some((block_idx, local_idx, p_psi, psi_label)) =
+            self.psi_block_info(derivative_blocks, psi_index)?
         else {
             return Ok(None);
         };
-        let block_idx = self
-            .embedded_psi_vector(0, &slices, derivative_blocks, psi_index)?
-            .map(|(idx, _)| idx)
-            .ok_or_else(|| "missing psi block".to_string())?;
+        let deriv = &derivative_blocks[block_idx][local_idx];
         let loading = spatial_block_primary_loading(block_idx)?;
-        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g);
+
         for row in 0..self.n {
             let row_dir = self.row_primary_direction_from_flat(row, &slices, d_beta_flat);
             let Some(psi_dir) =
@@ -1867,24 +1971,21 @@ impl SurvivalMarginalSlopeFamily {
             let third_beta = self.row_primary_third_contracted(row, block_states, &row_dir)?;
             let fourth =
                 self.row_primary_fourth_contracted(row, block_states, &row_dir, &psi_dir)?;
-            let (_, left_vec) = self
-                .embedded_psi_vector(row, &slices, derivative_blocks, psi_index)?
-                .ok_or_else(|| "missing psi vector".to_string())?;
-            let right_vec =
-                self.pullback_primary_vector(row, &slices, &third_beta.t().dot(&loading))?;
-            out += &left_vec
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&right_vec.view().insert_axis(Axis(0)));
-            out += &right_vec
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&left_vec.view().insert_axis(Axis(0)));
-            self.add_pullback_primary_hessian(&mut out, row, &slices, &fourth);
-            let third_action = self.row_primary_third_contracted(row, block_states, &psi_action)?;
-            self.add_pullback_primary_hessian(&mut out, row, &slices, &third_action);
+
+            let psi_row =
+                self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+
+            // rank-1: psi_row × pullback(third_beta^T · loading)
+            let right_primary = third_beta.t().dot(&loading);
+            acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+            // pullback Hessian of fourth + third_action
+            acc.add_pullback(self, row, &fourth);
+            let third_action =
+                self.row_primary_third_contracted(row, block_states, &psi_action)?;
+            acc.add_pullback(self, row, &third_action);
         }
-        Ok(Some(out))
+
+        Ok(Some(acc.to_dense(&slices)))
     }
 }
 

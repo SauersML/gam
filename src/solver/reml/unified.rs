@@ -980,6 +980,8 @@ pub struct HyperCoordPair {
     pub g: Array1<f64>,
     /// ∂²_ij H|_β — fixed-β Hessian second drift (p×p matrix).
     pub b_mat: Array2<f64>,
+    /// ∂²_ij H|_β — operator-valued Hessian second drift (implicit, avoids p×p).
+    pub b_operator: Option<Box<dyn HyperOperator>>,
     /// ∂²_ij L_δ(S) — smooth penalty pseudo-logdet second derivative.
     /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
     pub ld_s: f64,
@@ -993,6 +995,7 @@ impl HyperCoordPair {
             a: 0.0,
             g: Array1::zeros(0),
             b_mat: Array2::zeros((0, 0)),
+            b_operator: None,
             ld_s: 0.0,
         }
     }
@@ -3648,7 +3651,11 @@ fn compute_outer_hessian(
                     // + C[u_re] + Q[v_rho, v_ext] via second_correction.
                     // + M_ext[v_rho] if ext coord has β-dependent B.
                     // M_rho ≡ 0 (ρ is β-independent).
-                    let mut h2_trace = hop.trace_logdet_gradient(&pair.b_mat);
+                    let mut h2_trace = if let Some(ref op) = pair.b_operator {
+                        hop.trace_logdet_operator(op.as_ref())
+                    } else {
+                        hop.trace_logdet_gradient(&pair.b_mat)
+                    };
 
                     // M_ext[v_rho] = D_β B_ext[v_rho]
                     if solution.ext_coords[ext_idx].b_depends_on_beta {
@@ -3751,7 +3758,11 @@ fn compute_outer_hessian(
                     rhs -= &pair.g;
 
                     // Ḧ_{ij}: second Hessian drift (using logdet gradient operator G_ε).
-                    let mut h2_trace = hop.trace_logdet_gradient(&pair.b_mat);
+                    let mut h2_trace = if let Some(ref op) = pair.b_operator {
+                        hop.trace_logdet_operator(op.as_ref())
+                    } else {
+                        hop.trace_logdet_gradient(&pair.b_mat)
+                    };
 
                     // M_i[v_j]: D_β B_i[v_j] if B_i depends on β
                     if coord_i.b_depends_on_beta {

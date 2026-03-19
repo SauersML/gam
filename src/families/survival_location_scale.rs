@@ -8833,9 +8833,9 @@ mod tests {
         let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
         let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
-            design_entry: design_entry.clone(),
-            design_exit: design_exit.clone(),
-            design_derivative_exit: design_derivative_exit.clone(),
+            design_entry: DesignMatrix::from(design_entry.clone()),
+            design_exit: DesignMatrix::from(design_exit.clone()),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
@@ -8857,9 +8857,9 @@ mod tests {
         let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
         let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
-            design_entry,
-            design_exit,
-            design_derivative_exit: design_derivative_exit.clone(),
+            design_entry: DesignMatrix::from(design_entry),
+            design_exit: DesignMatrix::from(design_exit),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
@@ -8899,9 +8899,9 @@ mod tests {
     #[test]
     fn identified_time_block_uses_nonnegative_time_constraints() {
         let time_block = TimeBlockInput {
-            design_entry: array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]],
-            design_exit: array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]],
-            design_derivative_exit: array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]],
+            design_entry: DesignMatrix::from(array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]]),
+            design_exit: DesignMatrix::from(array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]]),
+            design_derivative_exit: DesignMatrix::from(array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]]),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
@@ -8931,9 +8931,9 @@ mod tests {
         let design_exit = array![[0.1, 0.5, 0.9], [0.2, 0.6, 1.0], [0.3, 0.7, 1.0]];
         let design_derivative_exit = array![[0.1, 0.1, 0.0], [0.1, 0.1, 0.0], [0.1, 0.1, 0.0]];
         let time_block = TimeBlockInput {
-            design_entry: design_entry.clone(),
-            design_exit: design_exit.clone(),
-            design_derivative_exit: design_derivative_exit.clone(),
+            design_entry: DesignMatrix::from(design_entry.clone()),
+            design_exit: DesignMatrix::from(design_exit.clone()),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
@@ -10634,9 +10634,9 @@ mod tests {
             max_iter: 400,
             tol: 1e-6,
             time_block: TimeBlockInput {
-                design_entry,
-                design_exit,
-                design_derivative_exit: design_derivative_exit.clone(),
+                design_entry: DesignMatrix::from(design_entry),
+                design_exit: DesignMatrix::from(design_exit),
+                design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
                 offset_entry,
                 offset_exit,
                 derivative_offset_exit: derivative_offset_exit.clone(),
