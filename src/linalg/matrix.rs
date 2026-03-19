@@ -3420,22 +3420,13 @@ impl SparseHessianSymbolic {
         let n = csrs[0].nrows();
         let mut pattern = BTreeSet::<(usize, usize)>::new();
 
-        // Hoist symbolic accessors out of the per-row loop.
-        let sym_parts: Vec<(&[usize], &[usize])> = csrs
-            .iter()
-            .map(|csr| {
-                let sym = csr.symbolic();
-                // Safety: row_ptr/col_idx borrow from `csr` which outlives `sym_parts`.
-                let rp: &[usize] = unsafe { std::mem::transmute(sym.row_ptr()) };
-                let ci: &[usize] = unsafe { std::mem::transmute(sym.col_idx()) };
-                (rp, ci)
-            })
-            .collect();
-
         let mut cols = Vec::with_capacity(32);
         for i in 0..n {
             cols.clear();
-            for &(rp, ci) in &sym_parts {
+            for csr in csrs {
+                let sym = csr.symbolic();
+                let rp = sym.row_ptr();
+                let ci = sym.col_idx();
                 for p in rp[i]..rp[i + 1] {
                     cols.push(ci[p]);
                 }
@@ -3591,22 +3582,26 @@ impl SparseHessianAccumulator {
     /// Consume the accumulator and return a `SparseColMat` (upper-triangle).
     ///
     /// Constructs the CSC matrix directly from the symbolic structure — no
-    /// triplet roundtrip.
+    /// triplet roundtrip.  If this is the last reference to the symbolic
+    /// pattern, it is moved rather than cloned.
     pub fn into_sparse_col_mat(self) -> SparseColMat<usize, f64> {
         use faer::sparse::SymbolicSparseColMat;
 
-        let s = &*self.sym;
+        // Try to take ownership of the symbolic data (avoids clone when the
+        // parallel reduction has already discarded all other Arcs).
+        let (col_ptrs, row_indices, dim) = match Arc::try_unwrap(self.sym) {
+            Ok(owned) => (owned.col_ptrs, owned.row_indices, owned.dim),
+            Err(shared) => (
+                shared.col_ptrs.clone(),
+                shared.row_indices.clone(),
+                shared.dim,
+            ),
+        };
         // Safety: col_ptrs and row_indices were built from a valid BTreeSet
         // enumeration → sorted row indices per column, no duplicates, all
         // indices in [0, dim).
         let symbolic = unsafe {
-            SymbolicSparseColMat::new_unchecked(
-                s.dim,
-                s.dim,
-                s.col_ptrs.clone(),
-                None,
-                s.row_indices.clone(),
-            )
+            SymbolicSparseColMat::new_unchecked(dim, dim, col_ptrs, None, row_indices)
         };
         SparseColMat::new(symbolic, self.values)
     }
