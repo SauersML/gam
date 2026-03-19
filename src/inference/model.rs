@@ -155,6 +155,18 @@ pub struct FittedModelPayload {
     pub survival_distribution: Option<String>,
     #[serde(default)]
     pub training_headers: Option<Vec<String>>,
+    /// Transformation-normal: B-spline knots for the response-direction basis.
+    #[serde(default)]
+    pub transformation_response_knots: Option<Vec<f64>>,
+    /// Transformation-normal: deviation nullspace transform matrix (row-major).
+    #[serde(default)]
+    pub transformation_response_transform: Option<Vec<Vec<f64>>>,
+    /// Transformation-normal: B-spline degree for the response basis.
+    #[serde(default)]
+    pub transformation_response_degree: Option<usize>,
+    /// Transformation-normal: median of the response used for anchoring.
+    #[serde(default)]
+    pub transformation_response_median: Option<f64>,
     #[serde(default)]
     pub resolved_termspec: Option<TermCollectionSpec>,
     #[serde(default)]
@@ -963,8 +975,14 @@ impl FittedModel {
                 Some(Box::new(predictor) as Box<dyn PredictableModel>)
             }
             PredictModelClass::TransformationNormal => {
-                // Prediction for transformation-normal models is not yet wired.
-                None
+                // The h values are computed in build_predict_input_for_model
+                // and stored in the offset field. The predictor is a simple
+                // identity: eta = offset, mean = offset (h is already the
+                // PIT-transformed value on the standard normal scale).
+                let fit = self.fit_result.as_ref()?;
+                Some(Box::new(super::predict::TransformationNormalPredictor {
+                    covariance: fit.beta_covariance().cloned(),
+                }) as Box<dyn PredictableModel>)
             }
         }
     }

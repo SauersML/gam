@@ -1419,6 +1419,7 @@ fn run_fit_transformation_normal(
             ds.headers.clone(),
             frozen_covariate,
             solved.fit,
+            &solved.family,
         );
         write_model_json(out, &model)?;
         progress.advance_workflow(fit_total_steps);
@@ -1949,7 +1950,90 @@ fn build_predict_input_for_model(
             "build_predict_input_for_model should not be called for survival models".to_string(),
         ),
         PredictModelClass::TransformationNormal => {
-            Err("prediction for transformation-normal models is not yet supported".to_string())
+            // Build the tensor product design: response_basis(y_new) ⊗ covariate_design(x_new)
+            let payload = model.payload();
+            let response_knots = payload.transformation_response_knots.as_ref()
+                .ok_or("saved transformation-normal model missing response_knots")?;
+            let response_transform_vecs = payload.transformation_response_transform.as_ref()
+                .ok_or("saved transformation-normal model missing response_transform")?;
+            let response_degree = payload.transformation_response_degree
+                .ok_or("saved transformation-normal model missing response_degree")?;
+
+            // Reconstruct the transform matrix from nested vecs
+            let t_rows = response_transform_vecs.len();
+            let t_cols = if t_rows > 0 { response_transform_vecs[0].len() } else { 0 };
+            let mut resp_transform = ndarray::Array2::<f64>::zeros((t_rows, t_cols));
+            for (i, row) in response_transform_vecs.iter().enumerate() {
+                for (j, &v) in row.iter().enumerate() {
+                    resp_transform[[i, j]] = v;
+                }
+            }
+            let resp_knots = ndarray::Array1::from_vec(response_knots.clone());
+
+            // Get response column from formula LHS
+            let formula_text = &payload.formula;
+            let response_col_name = formula_text.split('~').next()
+                .map(|s| s.trim())
+                .ok_or("cannot parse response column from formula")?;
+            let response_col_idx = *col_map.get(response_col_name)
+                .ok_or_else(|| format!("response column '{}' not found in new data", response_col_name))?;
+            let response_new = data.column(response_col_idx).to_owned();
+
+            // Build response basis at new y values
+            let (raw_val_basis, _) = gam::basis::create_basis::<gam::basis::Dense>(
+                response_new.view(),
+                gam::basis::KnotSource::Provided(resp_knots.view()),
+                response_degree,
+                gam::basis::BasisOptions::value(),
+            ).map_err(|e| e.to_string())?;
+            let raw_val = raw_val_basis.as_ref().clone();
+            let dev_val = raw_val.dot(&resp_transform);
+            let dev_dim = resp_transform.ncols();
+            let p_resp = 2 + dev_dim;
+            let mut resp_val = ndarray::Array2::<f64>::zeros((n, p_resp));
+            resp_val.column_mut(0).fill(1.0);
+            resp_val.column_mut(1).assign(&response_new);
+            resp_val.slice_mut(ndarray::s![.., 2..]).assign(&dev_val);
+
+            // Build covariate design from resolved_termspec
+            let cov_design_full = design;
+
+            // Compute h = (resp_val ⊙_row cov_design) @ beta via factored multiply
+            let fit_saved = model.unified()?;
+            let beta = &fit_saved.blocks[0].beta;
+            let p_cov = cov_design_full.design.ncols();
+            if beta.len() != p_resp * p_cov {
+                return Err(format!(
+                    "beta length {} != p_resp({}) * p_cov({})",
+                    beta.len(), p_resp, p_cov
+                ));
+            }
+            // Reshape beta to p_resp × p_cov and compute h row by row
+            let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov))
+                .map_err(|e| format!("beta reshape failed: {e}"))?;
+            let cov_mat = cov_design_full.design.row_chunk(0..n);
+            let mut h = ndarray::Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let resp_row = resp_val.row(i);
+                let cov_row = cov_mat.row(i);
+                // h_i = sum_{r,c} resp_row[r] * cov_row[c] * beta[r,c]
+                let mut val = 0.0;
+                for r in 0..p_resp {
+                    if resp_row[r] == 0.0 { continue; }
+                    for c in 0..p_cov {
+                        val += resp_row[r] * cov_row[c] * beta_mat[[r, c]];
+                    }
+                }
+                h[i] = val;
+            }
+
+            Ok(PredictInput {
+                design: DesignMatrix::from_dense(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
+                offset: h,
+                design_noise: None,
+                offset_noise: None,
+                auxiliary_scalar: None,
+            })
         }
     }
 }
@@ -2192,7 +2276,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 .to_string(),
         ),
         PredictModelClass::TransformationNormal => {
-            Err("prediction for transformation-normal models is not yet supported".to_string())
+            // Transformation-normal uses the unified path via build_predict_input_for_model.
+            // If we reach here, something went wrong in the dispatch.
+            Err("transformation-normal model unexpectedly bypassed the unified prediction path".to_string())
         }
         PredictModelClass::Standard => run_predict_standard(
             &mut progress,
@@ -6806,6 +6892,7 @@ fn build_transformation_normal_saved_model(
     training_headers: Vec<String>,
     resolved_covariate_spec: TermCollectionSpec,
     fit_result: UnifiedFitResult,
+    family: &gam::families::transformation_normal::TransformationNormalFamily,
 ) -> SavedModel {
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -6821,6 +6908,13 @@ fn build_transformation_normal_saved_model(
     payload.data_schema = Some(data_schema);
     payload.training_headers = Some(training_headers);
     payload.resolved_termspec = Some(resolved_covariate_spec);
+    payload.transformation_response_knots = Some(family.response_knots().to_vec());
+    payload.transformation_response_transform = Some(
+        family.response_transform().rows().into_iter()
+            .map(|r| r.to_vec()).collect()
+    );
+    payload.transformation_response_degree = Some(family.response_degree());
+    payload.transformation_response_median = Some(family.response_median());
     SavedModel::from_payload(payload)
 }
 
