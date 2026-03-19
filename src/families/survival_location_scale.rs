@@ -2191,10 +2191,19 @@ impl SurvivalLocationScaleFamily {
         if g < guard && g >= guard - roundoff_slack {
             g = guard;
         }
-        if g < guard {
+        // `d_raw` is structurally constrained, but the full event Jacobian is
+        // `g = d_raw + qdot`. The threshold/log-sigma contribution can nudge an
+        // otherwise valid monotone state below the numeric guard while still
+        // remaining strictly positive. The row kernel only needs `log(g)` on the
+        // positive domain, so clamp positive near-boundary values to the guard
+        // and reserve hard failure for true non-monotone states.
+        if g > 0.0 && g < guard {
+            g = guard;
+        }
+        if g <= 0.0 {
             return Err(format!(
                 "survival location-scale monotonicity violated at row {row}: \
-                 d_eta/dt={g:.3e} < lower_bound={guard:.3e} \
+                 d_eta/dt={g:.3e} <= 0 (lower_bound={guard:.3e}) \
                  (operand_scale={:.3e}, roundoff_slack={roundoff_slack:.3e})",
                 state.g_operand_scale
             ));

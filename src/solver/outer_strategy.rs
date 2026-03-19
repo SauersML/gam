@@ -561,15 +561,51 @@ fn into_objective_error(context: &str, err: EstimationError) -> ObjectiveEvalErr
     ObjectiveEvalError::recoverable(format!("{context}: {err}"))
 }
 
+fn finite_cost_or_error(context: &str, cost: f64) -> Result<f64, ObjectiveEvalError> {
+    if cost.is_finite() {
+        Ok(cost)
+    } else {
+        Err(ObjectiveEvalError::recoverable(format!(
+            "{context}: objective returned a non-finite cost"
+        )))
+    }
+}
+
+fn finite_outer_eval_or_error(
+    context: &str,
+    eval: OuterEval,
+) -> Result<OuterEval, ObjectiveEvalError> {
+    if !eval.cost.is_finite() {
+        return Err(ObjectiveEvalError::recoverable(format!(
+            "{context}: objective returned a non-finite cost"
+        )));
+    }
+    if !eval.gradient.iter().all(|v| v.is_finite()) {
+        return Err(ObjectiveEvalError::recoverable(format!(
+            "{context}: objective returned a non-finite gradient"
+        )));
+    }
+    if let HessianResult::Analytic(ref hessian) = eval.hessian
+        && !hessian.iter().all(|v| v.is_finite())
+    {
+        return Err(ObjectiveEvalError::recoverable(format!(
+            "{context}: objective returned a non-finite Hessian"
+        )));
+    }
+    Ok(eval)
+}
+
 struct OuterCostBridge<'a> {
     obj: &'a mut dyn OuterObjective,
 }
 
 impl ZerothOrderObjective for OuterCostBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        self.obj
+        let cost = self
+            .obj
             .eval_cost(x)
-            .map_err(|err| into_objective_error("outer eval_cost failed", err))
+            .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
+        finite_cost_or_error("outer eval_cost failed", cost)
     }
 }
 
@@ -579,9 +615,11 @@ struct OuterFirstOrderBridge<'a> {
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        self.obj
+        let cost = self
+            .obj
             .eval_cost(x)
-            .map_err(|err| into_objective_error("outer eval_cost failed", err))
+            .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
+        finite_cost_or_error("outer eval_cost failed", cost)
     }
 }
 
@@ -591,6 +629,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             .obj
             .eval(x)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
+        let eval = finite_outer_eval_or_error("outer eval failed", eval)?;
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -605,9 +644,11 @@ struct OuterSecondOrderBridge<'a> {
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        self.obj
+        let cost = self
+            .obj
             .eval_cost(x)
-            .map_err(|err| into_objective_error("outer eval_cost failed", err))
+            .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
+        finite_cost_or_error("outer eval_cost failed", cost)
     }
 }
 
@@ -617,6 +658,7 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
             .obj
             .eval(x)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
+        let eval = finite_outer_eval_or_error("outer eval failed", eval)?;
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -630,6 +672,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             .obj
             .eval(x)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
+        let eval = finite_outer_eval_or_error("outer eval failed", eval)?;
         let hessian = match self.hessian_source {
             HessianSource::Analytic => eval.hessian.into_option(),
             HessianSource::FiniteDifference
@@ -665,6 +708,11 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             .obj
             .eval_efs(x)
             .map_err(|err| into_objective_error("outer EFS eval failed", err))?;
+        if !eval.cost.is_finite() {
+            return Err(ObjectiveEvalError::recoverable(
+                "outer EFS eval failed: objective returned a non-finite cost".to_string(),
+            ));
+        }
         let status = if let Some(ref barrier_cfg) = self.barrier_config {
             if let Some(ref beta) = eval.beta {
                 let ref_diag = 1.0;
@@ -715,7 +763,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 // Evaluate cost at the trial point.
                 let trial = x + &combined_step;
                 match self.obj.eval_cost(&trial) {
-                    Ok(trial_cost) if trial_cost < current_cost => {
+                    Ok(trial_cost) if trial_cost.is_finite() && trial_cost < current_cost => {
                         // Step accepted — the combined step decreases V(θ).
                         if bt > 0 {
                             log::debug!(
@@ -1071,8 +1119,40 @@ fn run_outer_with_plan(
             screen_start.elapsed().as_secs_f64(),
         );
         scored.sort_by(|a, b| a.1.total_cmp(&b.1));
-        scored.truncate(budget);
-        scored.iter().map(|&(i, _)| seeds[i].clone()).collect()
+        let finite_ranked: Vec<usize> = scored
+            .iter()
+            .filter_map(|&(i, cost)| cost.is_finite().then_some(i))
+            .collect();
+        if finite_ranked.is_empty() {
+            log::warn!(
+                "[OUTER] {context}: seed screening produced no finite costs; trying all {} seeds without pruning.",
+                seeds.len()
+            );
+            seeds
+        } else {
+            // Keep the best finite seeds first, then backfill with the original
+            // heuristic order so capped screening cannot prune away every
+            // recoverable start when the cheap eval path is over-pessimistic.
+            let mut selected = Vec::with_capacity(budget);
+            let mut picked = vec![false; seeds.len()];
+            for idx in finite_ranked.into_iter().take(budget) {
+                selected.push(idx);
+                picked[idx] = true;
+            }
+            if selected.len() < budget {
+                for idx in 0..seeds.len() {
+                    if picked[idx] {
+                        continue;
+                    }
+                    selected.push(idx);
+                    picked[idx] = true;
+                    if selected.len() == budget {
+                        break;
+                    }
+                }
+            }
+            selected.into_iter().map(|i| seeds[i].clone()).collect()
+        }
     };
 
     let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {
