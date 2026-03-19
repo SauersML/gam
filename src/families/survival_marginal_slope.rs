@@ -18,8 +18,11 @@ use crate::families::gamlss::{
     monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta,
     validate_monotone_wiggle_beta_nonnegative,
 };
+use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::families::survival_location_scale::TimeBlockInput;
-use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DesignMatrix, SymmetricMatrix};
+#[cfg(test)]
+use crate::matrix::DenseDesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -1826,43 +1829,52 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
         let deriv_i = &derivative_blocks[block_idx_i][local_idx_i];
+        let deriv_j = &derivative_blocks[block_idx_j][local_idx_j];
         let loading_i = spatial_block_primary_loading(block_idx_i)?;
         let loading_j = spatial_block_primary_loading(block_idx_j)?;
+        let beta_i = match block_idx_i {
+            1 => &block_states[1].beta,
+            _ => &block_states[2].beta,
+        };
+        let beta_j = match block_idx_j {
+            1 => &block_states[1].beta,
+            _ => &block_states[2].beta,
+        };
 
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
-
-        let mut objective_psi_psi = 0.0;
-        let mut score_t = Array1::<f64>::zeros(p_t);
-        let mut score_m = Array1::<f64>::zeros(p_m);
-        let mut score_g = Array1::<f64>::zeros(p_g);
-        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g);
-
-        // Whether psi_ij second design row is nonzero (only when same block)
         let same_block = block_idx_i == block_idx_j;
 
-        for row in 0..self.n {
-            let Some(dir_i) =
-                self.row_primary_psi_direction(row, block_states, derivative_blocks, psi_i)?
-            else {
-                continue;
-            };
-            let Some(dir_j) =
-                self.row_primary_psi_direction(row, block_states, derivative_blocks, psi_j)?
-            else {
-                continue;
-            };
-            let dir_ij = self
-                .row_primary_psi_second_direction(
-                    row,
-                    block_states,
-                    derivative_blocks,
-                    psi_i,
-                    psi_j,
-                )?
-                .unwrap_or_else(|| Array1::<f64>::zeros(N_PRIMARY));
-            let (f_pi, f_pipi) = if let Some(c) = cache {
+        type Acc = (f64, Array1<f64>, Array1<f64>, Array1<f64>, BlockHessianAccumulator);
+        let make_acc = || -> Acc {
+            (0.0, Array1::zeros(p_t), Array1::zeros(p_m), Array1::zeros(p_g),
+             BlockHessianAccumulator::new(p_t, p_m, p_g))
+        };
+
+        let (objective_psi_psi, score_t, score_m, score_g, acc) = (0..self.n)
+            .into_par_iter()
+            .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
+                // Compute psi design rows once; derive directions from them.
+                let psi_row_i =
+                    self.psi_design_row_vector(row, deriv_i, self.n, p_psi_i, label_i)?;
+                let psi_row_j =
+                    self.psi_design_row_vector(row, deriv_j, self.n, p_psi_j, label_j)?;
+                let dir_i = primary_direction_from_psi_row(block_idx_i, &psi_row_i, beta_i);
+                let dir_j = primary_direction_from_psi_row(block_idx_j, &psi_row_j, beta_j);
+
+                let (psi_row_ij, dir_ij) = if same_block {
+                    let r = self.psi_second_design_row_vector(
+                        row, deriv_i, deriv_j, local_idx_j, self.n, p_psi_i, label_i,
+                    )?;
+                    let d = primary_second_direction_from_psi_row(block_idx_i, &r, beta_i);
+                    (Some(r), d)
+                } else {
+                    (None, Array1::<f64>::zeros(N_PRIMARY))
+                };
+                let has_ij = psi_row_ij.as_ref().is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
+
+                let (f_pi, f_pipi) = if let Some(c) = cache {
                 let (g, h) = self.row_primary_gradient_hessian(row, c);
                 (g.clone(), h.clone())
             } else {
@@ -2528,15 +2540,15 @@ impl SurvivalMarginalSlopeFamily {
             blockworking_sets: vec![
                 BlockWorkingSet::ExactNewton {
                     gradient: grad_time,
-                    hessian: SymmetricMatrix::Sparse(acc_time.into_sparse_col_mat()?),
+                    hessian: SymmetricMatrix::Sparse(acc_time.into_sparse_col_mat()),
                 },
                 BlockWorkingSet::ExactNewton {
                     gradient: grad_marginal,
-                    hessian: SymmetricMatrix::Sparse(acc_marginal.into_sparse_col_mat()?),
+                    hessian: SymmetricMatrix::Sparse(acc_marginal.into_sparse_col_mat()),
                 },
                 BlockWorkingSet::ExactNewton {
                     gradient: grad_logslope,
-                    hessian: SymmetricMatrix::Sparse(acc_logslope.into_sparse_col_mat()?),
+                    hessian: SymmetricMatrix::Sparse(acc_logslope.into_sparse_col_mat()),
                 },
             ],
         })
@@ -3292,9 +3304,9 @@ mod tests {
 
     fn base_time_block() -> TimeBlockInput {
         TimeBlockInput {
-            design_entry: Array2::zeros((1, 1)),
-            design_exit: Array2::zeros((1, 1)),
-            design_derivative_exit: Array2::ones((1, 1)),
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
             offset_entry: Array1::zeros(1),
             offset_exit: Array1::zeros(1),
             derivative_offset_exit: Array1::zeros(1),

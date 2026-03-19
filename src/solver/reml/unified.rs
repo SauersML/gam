@@ -1010,7 +1010,14 @@ impl HyperCoordPair {
 ///
 /// When unavailable, the outer Hessian is approximate (fine for BFGS/ARC,
 /// insufficient for exact Newton quadratic convergence).
-pub type FixedDriftDerivFn = Box<dyn Fn(usize, &Array1<f64>) -> Option<Array2<f64>> + Send + Sync>;
+/// Result of a fixed-drift derivative evaluation: can be dense or operator-backed.
+pub enum DriftDerivResult {
+    Dense(Array2<f64>),
+    Operator(Box<dyn HyperOperator>),
+}
+
+pub type FixedDriftDerivFn =
+    Box<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Implicit Hessian-drift operators for scalable anisotropic REML
@@ -3660,8 +3667,15 @@ fn compute_outer_hessian(
                     // M_ext[v_rho] = D_β B_ext[v_rho]
                     if solution.ext_coords[ext_idx].b_depends_on_beta {
                         if let Some(ref drift_fn) = solution.fixed_drift_deriv {
-                            if let Some(m_ext) = drift_fn(ext_idx, &v_ks[rho_idx]) {
-                                h2_trace += hop.trace_logdet_gradient(&m_ext);
+                            if let Some(result) = drift_fn(ext_idx, &v_ks[rho_idx]) {
+                                h2_trace += match result {
+                                    DriftDerivResult::Dense(ref m) => {
+                                        hop.trace_logdet_gradient(m)
+                                    }
+                                    DriftDerivResult::Operator(ref op) => {
+                                        hop.trace_logdet_operator(op.as_ref())
+                                    }
+                                };
                             }
                         }
                     }
@@ -3767,8 +3781,15 @@ fn compute_outer_hessian(
                     // M_i[v_j]: D_β B_i[v_j] if B_i depends on β
                     if coord_i.b_depends_on_beta {
                         if let Some(ref drift_fn) = solution.fixed_drift_deriv {
-                            if let Some(m_i) = drift_fn(ii, &ext_v[jj]) {
-                                h2_trace += hop.trace_logdet_gradient(&m_i);
+                            if let Some(result) = drift_fn(ii, &ext_v[jj]) {
+                                h2_trace += match result {
+                                    DriftDerivResult::Dense(ref m) => {
+                                        hop.trace_logdet_gradient(m)
+                                    }
+                                    DriftDerivResult::Operator(ref op) => {
+                                        hop.trace_logdet_operator(op.as_ref())
+                                    }
+                                };
                             }
                         }
                     }
@@ -3776,8 +3797,15 @@ fn compute_outer_hessian(
                     // M_j[v_i]: D_β B_j[v_i] if B_j depends on β
                     if coord_j.b_depends_on_beta {
                         if let Some(ref drift_fn) = solution.fixed_drift_deriv {
-                            if let Some(m_j) = drift_fn(jj, &ext_v[ii]) {
-                                h2_trace += hop.trace_logdet_gradient(&m_j);
+                            if let Some(result) = drift_fn(jj, &ext_v[ii]) {
+                                h2_trace += match result {
+                                    DriftDerivResult::Dense(ref m) => {
+                                        hop.trace_logdet_gradient(m)
+                                    }
+                                    DriftDerivResult::Operator(ref op) => {
+                                        hop.trace_logdet_operator(op.as_ref())
+                                    }
+                                };
                             }
                         }
                     }

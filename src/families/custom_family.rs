@@ -13,7 +13,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
-    BlockCoupledOperator, DispersionHandling, EvalMode, FixedDriftDerivFn,
+    BlockCoupledOperator, DispersionHandling, DriftDerivResult, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
     InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
     compute_block_penalty_logdet_derivs, exact_intersection_nullity, penalty_matrix_root,
@@ -2602,6 +2602,9 @@ pub(crate) struct CustomFamilyJointPsiOperator {
     total_dim: usize,
     channels: Vec<CustomFamilyJointDesignChannel>,
     pair_contributions: Vec<CustomFamilyJointDesignPairContribution>,
+    /// Optional dense correction for small cross-blocks (e.g. h/w parameters)
+    /// that don't warrant their own weighted-Gram channel.
+    dense_correction: Option<Array2<f64>>,
 }
 
 impl CustomFamilyJointPsiOperator {
@@ -2614,6 +2617,21 @@ impl CustomFamilyJointPsiOperator {
             total_dim,
             channels,
             pair_contributions,
+            dense_correction: None,
+        }
+    }
+
+    pub(crate) fn with_dense_correction(
+        total_dim: usize,
+        channels: Vec<CustomFamilyJointDesignChannel>,
+        pair_contributions: Vec<CustomFamilyJointDesignPairContribution>,
+        dense_correction: Option<Array2<f64>>,
+    ) -> Self {
+        Self {
+            total_dim,
+            channels,
+            pair_contributions,
+            dense_correction,
         }
     }
 }
@@ -2641,7 +2659,11 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
             })
             .collect();
 
-        let mut out = Array1::<f64>::zeros(self.total_dim);
+        let mut out = if let Some(ref corr) = self.dense_correction {
+            corr.dot(v)
+        } else {
+            Array1::<f64>::zeros(self.total_dim)
+        };
         for pair in &self.pair_contributions {
             let left = &self.channels[pair.left_channel];
             let right_base = &base_vals[pair.right_channel];
@@ -2707,7 +2729,11 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
             })
             .collect();
 
-        let mut total = 0.0;
+        let mut total = if let Some(ref corr) = self.dense_correction {
+            v.dot(&corr.dot(u))
+        } else {
+            0.0
+        };
         for pair in &self.pair_contributions {
             let left_base_u = &base_u[pair.left_channel];
             let right_base_v = &base_v[pair.right_channel];
@@ -2725,24 +2751,66 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((self.total_dim, self.total_dim));
+        let mut out = self
+            .dense_correction
+            .clone()
+            .unwrap_or_else(|| Array2::<f64>::zeros((self.total_dim, self.total_dim)));
         let mut basis = Array1::<f64>::zeros(self.total_dim);
         for j in 0..self.total_dim {
             basis[j] = 1.0;
-            let col = self.mul_vec(&basis);
-            out.column_mut(j).assign(&col);
+            // Use mul_vec without the dense_correction part (already in `out`).
+            let base_vals: Vec<Array1<f64>> = self
+                .channels
+                .iter()
+                .map(|channel| {
+                    channel
+                        .design
+                        .dot(&basis.slice(ndarray::s![channel.range.clone()]))
+                })
+                .collect();
+            let deriv_vals: Vec<Option<Array1<f64>>> = self
+                .channels
+                .iter()
+                .map(|channel| {
+                    channel
+                        .psi_derivative
+                        .as_ref()
+                        .map(|deriv| {
+                            deriv.forward_mul(basis.slice(ndarray::s![channel.range.clone()]))
+                        })
+                })
+                .collect();
+            let mut col = Array1::<f64>::zeros(self.total_dim);
+            for pair in &self.pair_contributions {
+                let left = &self.channels[pair.left_channel];
+                let right_base = &base_vals[pair.right_channel];
+                let weighted_drift = &pair.drift_weights * right_base;
+                let mut contrib = left.design.t().dot(&weighted_drift);
+                if let Some(left_deriv) = left.psi_derivative.as_ref() {
+                    let weighted_right = &pair.weights * right_base;
+                    contrib += &left_deriv.transpose_mul(weighted_right.view());
+                }
+                if let Some(right_deriv) = deriv_vals[pair.right_channel].as_ref() {
+                    let weighted_right = &pair.weights * right_deriv;
+                    contrib += &left.design.t().dot(&weighted_right);
+                }
+                col.slice_mut(ndarray::s![left.range.clone()])
+                    .scaled_add(1.0, &contrib);
+            }
+            out.column_mut(j).scaled_add(1.0, &col);
             basis[j] = 0.0;
         }
         out
     }
 
     fn is_implicit(&self) -> bool {
-        self.channels.iter().any(|channel| {
-            channel
-                .psi_derivative
-                .as_ref()
-                .is_some_and(|d| d.is_implicit())
-        })
+        self.dense_correction.is_none()
+            && self.channels.iter().any(|channel| {
+                channel
+                    .psi_derivative
+                    .as_ref()
+                    .is_some_and(|d| d.is_implicit())
+            })
     }
 }
 
@@ -6357,10 +6425,10 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     let psi_workspace = psi_workspace;
 
     Some(Box::new(
-        move |ext_idx: usize, direction: &Array1<f64>| -> Option<Array2<f64>> {
+        move |ext_idx: usize, direction: &Array1<f64>| -> Option<DriftDerivResult> {
             // The family hook takes a psi index (0-based within ψ coordinates)
             // and a flattened coefficient direction.
-            if let Some(workspace) = psi_workspace.as_ref() {
+            let dense = if let Some(workspace) = psi_workspace.as_ref() {
                 workspace
                     .hessian_directional_derivative(ext_idx, direction)
                     .ok()
@@ -6376,7 +6444,8 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
                     )
                     .ok()
                     .flatten()
-            }
+            };
+            dense.map(DriftDerivResult::Dense)
         },
     ))
 }
