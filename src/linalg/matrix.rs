@@ -4444,6 +4444,54 @@ impl DesignMatrix {
         Ok(())
     }
 
+    /// Add `alpha * X[row, :]^2` elementwise into `out` without allocating a
+    /// standalone row buffer.
+    pub fn squared_axpy_row_into(
+        &self,
+        row: usize,
+        alpha: f64,
+        out: &mut ArrayViewMut1<'_, f64>,
+    ) -> Result<(), String> {
+        if out.len() != self.ncols() {
+            return Err(format!(
+                "DesignMatrix::squared_axpy_row_into length mismatch: out={}, ncols={}",
+                out.len(),
+                self.ncols()
+            ));
+        }
+        if alpha == 0.0 {
+            return Ok(());
+        }
+        match self {
+            Self::Dense(matrix) => {
+                if let Some(dense) = matrix.as_dense_ref() {
+                    for (dst, &value) in out.iter_mut().zip(dense.row(row).iter()) {
+                        *dst += alpha * value * value;
+                    }
+                } else {
+                    let chunk = matrix.row_chunk(row..row + 1);
+                    for (dst, &value) in out.iter_mut().zip(chunk.row(0).iter()) {
+                        *dst += alpha * value * value;
+                    }
+                }
+            }
+            Self::Sparse(matrix) => {
+                let csr = matrix.to_csr_arc().unwrap_or_else(|| {
+                    panic!("DesignMatrix::squared_axpy_row_into: failed to obtain CSR view")
+                });
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for ptr in row_ptr[row]..row_ptr[row + 1] {
+                    let value = vals[ptr];
+                    out[col_idx[ptr]] += alpha * value * value;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Symmetric rank-1 update `target += alpha * x_row x_row^T` for one row.
     pub fn syr_row_into(
         &self,
@@ -4503,6 +4551,89 @@ impl DesignMatrix {
                     for ptr_j in row_ptr[row]..row_ptr[row + 1] {
                         let j = col_idx[ptr_j];
                         target[[i, j]] += alpha * xi * vals[ptr_j];
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Asymmetric rank-1 update: `target += alpha * lhs_row * rhs_row^T`.
+    ///
+    /// `self` provides `lhs_row`, `other` provides `rhs_row`.
+    /// `target` must be `self.ncols() x other.ncols()`.
+    pub fn row_outer_into(
+        &self,
+        row: usize,
+        other: &DesignMatrix,
+        alpha: f64,
+        target: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        if target.nrows() != self.ncols() || target.ncols() != other.ncols() {
+            return Err(format!(
+                "DesignMatrix::row_outer_into shape mismatch: target={}x{}, lhs={}, rhs={}",
+                target.nrows(),
+                target.ncols(),
+                self.ncols(),
+                other.ncols()
+            ));
+        }
+        if alpha == 0.0 {
+            return Ok(());
+        }
+        match (self, other) {
+            (Self::Dense(lhs), Self::Dense(rhs)) => {
+                let lhs_dense = lhs.to_dense();
+                let rhs_dense = rhs.to_dense();
+                let x = lhs_dense.row(row);
+                let y = rhs_dense.row(row);
+                for i in 0..x.len() {
+                    let xi = x[i];
+                    if xi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..y.len() {
+                        target[[i, j]] += alpha * xi * y[j];
+                    }
+                }
+            }
+            (Self::Sparse(lhs), Self::Sparse(rhs)) => {
+                let lhs_csr = lhs.to_csr_arc().unwrap_or_else(|| {
+                    panic!("row_outer_into: failed to obtain lhs CSR view")
+                });
+                let rhs_csr = rhs.to_csr_arc().unwrap_or_else(|| {
+                    panic!("row_outer_into: failed to obtain rhs CSR view")
+                });
+                let lhs_sym = lhs_csr.symbolic();
+                let rhs_sym = rhs_csr.symbolic();
+                let lhs_rp = lhs_sym.row_ptr();
+                let rhs_rp = rhs_sym.row_ptr();
+                let lhs_ci = lhs_sym.col_idx();
+                let rhs_ci = rhs_sym.col_idx();
+                let lhs_v = lhs_csr.val();
+                let rhs_v = rhs_csr.val();
+                for pi in lhs_rp[row]..lhs_rp[row + 1] {
+                    let i = lhs_ci[pi];
+                    let xi = lhs_v[pi];
+                    for pj in rhs_rp[row]..rhs_rp[row + 1] {
+                        let j = rhs_ci[pj];
+                        target[[i, j]] += alpha * xi * rhs_v[pj];
+                    }
+                }
+            }
+            _ => {
+                // Mixed dense/sparse: materialize both rows.
+                let x = self.row_chunk(row..row + 1);
+                let x_row = x.row(0);
+                let y = other.row_chunk(row..row + 1);
+                let y_row = y.row(0);
+                for i in 0..x_row.len() {
+                    let xi = x_row[i];
+                    if xi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..y_row.len() {
+                        target[[i, j]] += alpha * xi * y_row[j];
                     }
                 }
             }
