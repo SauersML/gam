@@ -4546,6 +4546,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
     let dense_cov_design = cov_design.design.to_dense();
+    let dense_time_entry = time_design_entry.to_dense();
+    let dense_time_exit = time_design_exit.to_dense();
+    let dense_time_derivative = time_design_derivative_exit.to_dense();
     let mut model = gam::families::royston_parmar::working_model_from_time_covariateshared(
         penalties,
         monotonicity,
@@ -4556,9 +4559,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             event_target: event_target.view(),
             event_competing: event_competing.view(),
             weights: weights.view(),
-            time_entry: time_design_entry.view(),
-            time_exit: time_design_exit.view(),
-            time_derivative: time_design_derivative_exit.view(),
+            time_entry: dense_time_entry.view(),
+            time_exit: dense_time_exit.view(),
+            time_derivative: dense_time_derivative.view(),
             covariates: dense_cov_design.view(),
             monotonicity_constraint_rows: None,
             monotonicity_constraint_offsets: None,
@@ -12089,6 +12092,9 @@ mod tests {
                 let eta_offset_entry = Array1::zeros(age_entry.len());
                 let eta_offset_exit = Array1::zeros(age_entry.len());
                 let derivative_offset_exit = Array1::zeros(age_entry.len());
+                let tb_entry_d = time_build.x_entry_time.to_dense();
+                let tb_exit_d = time_build.x_exit_time.to_dense();
+                let tb_deriv_d = time_build.x_derivative_time.to_dense();
                 let mut model = gam::families::royston_parmar::working_model_from_flattened(
                     penalties,
                     gam::survival::MonotonicityPenalty { tolerance: 0.0 },
@@ -12099,9 +12105,9 @@ mod tests {
                         event_target: event_target.view(),
                         event_competing: event_competing.view(),
                         weights: weights.view(),
-                        x_entry: time_build.x_entry_time.view(),
-                        x_exit: time_build.x_exit_time.view(),
-                        x_derivative: time_build.x_derivative_time.view(),
+                        x_entry: tb_entry_d.view(),
+                        x_exit: tb_exit_d.view(),
+                        x_derivative: tb_deriv_d.view(),
                         monotonicity_constraint_rows: None,
                         monotonicity_constraint_offsets: None,
                         eta_offset_entry: Some(eta_offset_entry.view()),

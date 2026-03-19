@@ -1650,56 +1650,82 @@ impl SurvivalMarginalSlopeFamily {
         };
         let deriv = &derivative_blocks[block_idx][local_idx];
         let loading = spatial_block_primary_loading(block_idx)?;
+        let beta_psi = match block_idx {
+            1 => &block_states[1].beta,
+            _ => &block_states[2].beta,
+        };
 
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
 
-        let mut objective_psi = 0.0;
-        let mut score_t = Array1::<f64>::zeros(p_t);
-        let mut score_m = Array1::<f64>::zeros(p_m);
-        let mut score_g = Array1::<f64>::zeros(p_g);
-        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g);
+        // Parallel accumulation: each worker gets its own block-local accumulators.
+        type Acc = (
+            f64,                     // objective_psi
+            Array1<f64>,             // score_t
+            Array1<f64>,             // score_m
+            Array1<f64>,             // score_g
+            BlockHessianAccumulator, // Hessian blocks
+        );
+        let make_acc = || -> Acc {
+            (
+                0.0,
+                Array1::zeros(p_t),
+                Array1::zeros(p_m),
+                Array1::zeros(p_g),
+                BlockHessianAccumulator::new(p_t, p_m, p_g),
+            )
+        };
 
-        for row in 0..self.n {
-            let Some(dir) =
-                self.row_primary_psi_direction(row, block_states, derivative_blocks, psi_index)?
-            else {
-                continue;
-            };
-            let (f_pi, f_pipi) = if let Some(c) = cache {
-                let (g, h) = self.row_primary_gradient_hessian(row, c);
-                (g.clone(), h.clone())
-            } else {
-                let (_, g, h) =
-                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                (g, h)
-            };
-            let third = self.row_primary_third_contracted(row, block_states, &dir)?;
-            let psi_row =
-                self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+        let (objective_psi, score_t, score_m, score_g, acc) = (0..self.n)
+            .into_par_iter()
+            .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
+                // Compute psi design row once; derive direction from it.
+                let psi_row =
+                    self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+                let dir =
+                    primary_direction_from_psi_row(block_idx, &psi_row, beta_psi);
 
-            objective_psi += f_pi.dot(&dir);
+                let (f_pi, f_pipi) = if let Some(c) = cache {
+                    let (g, h) = self.row_primary_gradient_hessian(row, c);
+                    (g.clone(), h.clone())
+                } else {
+                    let (_, g, h) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    (g, h)
+                };
+                let third = self.row_primary_third_contracted(row, block_states, &dir)?;
 
-            // Score: psi block gets scalar × psi_row
-            let s1 = f_pi.dot(&loading);
-            match block_idx {
-                1 => score_m.scaled_add(s1, &psi_row),
-                2 => score_g.scaled_add(s1, &psi_row),
-                _ => {}
-            }
-            // Score: pullback of f_pipi·dir into all 3 blocks
-            let pb = f_pipi.dot(&dir);
-            self.accumulate_score_blockwise(
-                row, &pb, &mut score_t, &mut score_m, &mut score_g,
-            )?;
+                a.0 += f_pi.dot(&dir);
 
-            // Hessian: rank-1 from psi_row × pullback(f_pipi·loading)
-            let right_primary = f_pipi.dot(&loading);
-            acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
-            // Hessian: pullback of third derivative
-            acc.add_pullback(self, row, &third);
-        }
+                // Score: psi block gets scalar × psi_row
+                let s1 = f_pi.dot(&loading);
+                match block_idx {
+                    1 => a.2.scaled_add(s1, &psi_row),
+                    _ => a.3.scaled_add(s1, &psi_row),
+                }
+                // Score: pullback of f_pipi·dir into all 3 blocks
+                let pb = f_pipi.dot(&dir);
+                self.accumulate_score_blockwise(
+                    row, &pb, &mut a.1, &mut a.2, &mut a.3,
+                )?;
+
+                // Hessian: rank-1 from psi_row × pullback(f_pipi·loading)
+                let right_primary = f_pipi.dot(&loading);
+                a.4.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                // Hessian: pullback of third derivative
+                a.4.add_pullback(self, row, &third);
+
+                Ok(a)
+            })
+            .try_reduce(make_acc, |mut a, b| {
+                a.0 += b.0;
+                a.1 += &b.1;
+                a.2 += &b.2;
+                a.3 += &b.3;
+                a.4.add(&b.4);
+                Ok(a)
+            })?;
 
         // Assemble score into flat vector
         let mut score_psi = Array1::zeros(slices.total);
