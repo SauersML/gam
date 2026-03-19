@@ -885,87 +885,90 @@ impl BernoulliMarginalSlopePredictor {
         )
     }
 
-    fn link_values(
-        runtime: Option<&SavedAnchoredDeviationRuntime>,
-        beta: Option<ArrayView1<'_, f64>>,
-        eta: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        if let (Some(runtime), Some(beta)) = (runtime, beta) {
-            let design = runtime.design(eta).map_err(EstimationError::InvalidInput)?;
-            Ok(eta + &design.dot(&beta.to_owned()))
-        } else {
-            Ok(eta.clone())
-        }
-    }
-
-    fn link_derivative(
-        runtime: Option<&SavedAnchoredDeviationRuntime>,
-        beta: Option<ArrayView1<'_, f64>>,
-        eta: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        if let (Some(runtime), Some(beta)) = (runtime, beta) {
-            let design = runtime
-                .first_derivative_design(eta)
-                .map_err(EstimationError::InvalidInput)?;
-            Ok(design.dot(&beta.to_owned()) + 1.0)
-        } else {
-            Ok(Array1::ones(eta.len()))
-        }
-    }
-
+    /// Newton solve for the marginal intercept.
+    ///
+    /// All per-iteration allocations except `runtime.design()`/`first_derivative_design()`
+    /// are eliminated: `eta_nodes_buf` is a caller-owned scratch buffer, `link_dev_beta`
+    /// is a pre-owned array (not a view), and the f/df accumulators are scalar.
     fn solve_intercept_scalar_with_nodes(
         &self,
         marginal_eta: f64,
         slope: f64,
         warped_nodes: &Array1<f64>,
         quadrature_weights: &Array1<f64>,
-        link_dev_beta: Option<ArrayView1<'_, f64>>,
+        link_dev_beta: Option<&Array1<f64>>,
+        eta_nodes_buf: &mut Array1<f64>,
     ) -> Result<f64, EstimationError> {
         let target = crate::probability::normal_cdf(marginal_eta).clamp(1e-12, 1.0 - 1e-12);
+        let num_nodes = warped_nodes.len();
+        let link_dim = link_dev_beta.map_or(0, Array1::len);
         // Rigid warm start: a₀ = q·√(1+b²).  With affine link L(u) ≈ ℓ₀+ℓ₁·u,
         // exact intercept is (q·√(1+ℓ₁²b²) − ℓ₀) / ℓ₁.
         let mut intercept = marginal_eta * (1.0 + slope * slope).sqrt();
         if let (Some(runtime), Some(beta)) =
             (self.link_deviation_runtime.as_ref(), link_dev_beta)
         {
-            let v = ndarray::Array1::from_vec(vec![intercept]);
-            let linked = Self::link_values(Some(runtime), Some(beta), &v)?;
-            let linked_d1 = Self::link_derivative(Some(runtime), Some(beta), &v)?;
-            let ell1 = linked_d1[0];
+            eta_nodes_buf[0] = intercept;
+            let one_pt = eta_nodes_buf.slice(ndarray::s![0..1]).to_owned();
+            let basis = runtime.design(&one_pt).map_err(EstimationError::InvalidInput)?;
+            let d1_basis = runtime
+                .first_derivative_design(&one_pt)
+                .map_err(EstimationError::InvalidInput)?;
+            let mut dev = 0.0;
+            let mut d1_dev = 0.0;
+            for j in 0..link_dim {
+                dev += basis[[0, j]] * beta[j];
+                d1_dev += d1_basis[[0, j]] * beta[j];
+            }
+            let ell1 = d1_dev + 1.0;
             if ell1 > 1e-8 {
-                let ell0 = linked[0] - ell1 * intercept;
+                let ell0 = (intercept + dev) - ell1 * intercept;
                 intercept =
                     (marginal_eta * (1.0 + ell1 * ell1 * slope * slope).sqrt() - ell0) / ell1;
             }
         }
         for _ in 0..20 {
-            let eta_nodes = warped_nodes.mapv(|hz| intercept + slope * hz);
-            let linked = Self::link_values(
-                self.link_deviation_runtime.as_ref(),
-                link_dev_beta,
-                &eta_nodes,
-            )?;
-            let linked_d1 = Self::link_derivative(
-                self.link_deviation_runtime.as_ref(),
-                link_dev_beta,
-                &eta_nodes,
-            )?;
-            let f = quadrature_weights
-                .iter()
-                .zip(linked.iter())
-                .map(|(&w, &q)| w * crate::probability::normal_cdf(q))
-                .sum::<f64>()
-                - target;
+            for k in 0..num_nodes {
+                eta_nodes_buf[k] = intercept + slope * warped_nodes[k];
+            }
+            let (f, df) = if let (Some(runtime), Some(beta)) =
+                (self.link_deviation_runtime.as_ref(), link_dev_beta)
+            {
+                let basis = runtime
+                    .design(eta_nodes_buf)
+                    .map_err(EstimationError::InvalidInput)?;
+                let d1_basis = runtime
+                    .first_derivative_design(eta_nodes_buf)
+                    .map_err(EstimationError::InvalidInput)?;
+                let mut f_acc = 0.0;
+                let mut df_acc = 0.0;
+                for k in 0..num_nodes {
+                    let mut dev = 0.0;
+                    let mut d1_dev = 0.0;
+                    for j in 0..link_dim {
+                        dev += basis[[k, j]] * beta[j];
+                        d1_dev += d1_basis[[k, j]] * beta[j];
+                    }
+                    let linked = eta_nodes_buf[k] + dev;
+                    let d1 = d1_dev + 1.0;
+                    f_acc += quadrature_weights[k] * crate::probability::normal_cdf(linked);
+                    df_acc += quadrature_weights[k] * crate::probability::normal_pdf(linked) * d1;
+                }
+                (f_acc - target, df_acc)
+            } else {
+                let mut f_acc = 0.0;
+                let mut df_acc = 0.0;
+                for k in 0..num_nodes {
+                    let eta = eta_nodes_buf[k];
+                    f_acc += quadrature_weights[k] * crate::probability::normal_cdf(eta);
+                    df_acc += quadrature_weights[k] * crate::probability::normal_pdf(eta);
+                }
+                (f_acc - target, df_acc)
+            };
             if f.abs() < 1e-10 {
                 break;
             }
-            let df = quadrature_weights
-                .iter()
-                .zip(linked.iter().zip(linked_d1.iter()))
-                .map(|(&w, (&q, &dq))| w * crate::probability::normal_pdf(q) * dq)
-                .sum::<f64>()
-                .max(1e-10);
-            intercept -= f / df;
+            intercept -= f / df.max(1e-10);
         }
         Ok(intercept)
     }
@@ -1120,7 +1123,8 @@ impl BernoulliMarginalSlopePredictor {
                 slope,
                 &warped_nodes,
                 &quadrature_weights,
-                beta_link_dev.clone(),
+                link_dev_beta_owned.as_ref(),
+                &mut eta_nodes_buf,
             )?;
 
             if !need_gradient {
