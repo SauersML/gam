@@ -924,7 +924,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 effective_link,
                 LinkFunction::Sas | LinkFunction::BetaLogistic
             ),
-        compute_inference: false,
+        // Nonlinear families require posterior covariance for prediction.
+        // Always compute inference for non-Gaussian models so that saved
+        // models contain the covariance matrix needed by posterior-mean
+        // prediction.
+        compute_inference: !matches!(family, LikelihoodFamily::GaussianIdentity),
         max_iter: fit_max_iter,
         tol: fit_tol,
         nullspace_dims: vec![],
@@ -992,7 +996,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 optimize_mixture: true,
                 sas_link: None,
                 optimize_sas: false,
-                compute_inference: false,
+                compute_inference: !matches!(family, LikelihoodFamily::GaussianIdentity),
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
