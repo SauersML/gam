@@ -34,7 +34,7 @@ use crate::smooth::{
     AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
     TermCollectionSpec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
-use crate::solver::optimize::{CostOnlyOptimizationRequest, optimize_cost_only};
+use crate::solver::optimize::CostOnlyObjective;
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::HashMap;
@@ -486,13 +486,18 @@ fn fit_survival_location_scale_model(
                 seed_config.max_seeds = 8;
                 seed_config.screening_budget = 3;
                 seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
-                let mut outer_request = CostOnlyOptimizationRequest::new(init.clone());
-                outer_request.tolerance = 1e-4;
-                outer_request.max_iter = 30;
-                outer_request.fd_step = 1e-3;
-                outer_request.seed_config = seed_config;
+                let problem = crate::solver::outer_strategy::OuterProblem::new(dim)
+                    .with_tolerance(1e-4)
+                    .with_max_iter(30)
+                    .with_fd_step(1e-3)
+                    .with_seed_config(seed_config)
+                    .with_heuristic_lambdas(init.to_vec());
                 let context = format!("survival inverse-link optimization ({name}, dim={dim})");
-                match optimize_cost_only(outer_request, &context, |rho| objective(rho)) {
+                let mut cost_obj = crate::solver::optimize::CostOnlyObjective {
+                    n_params: dim,
+                    cost_fn: |rho: &ndarray::Array1<f64>| objective(rho),
+                };
+                match problem.run(&mut cost_obj, &context) {
                     Ok(result) => {
                         if let Some(link) = recover(&result.rho) {
                             eprintln!(

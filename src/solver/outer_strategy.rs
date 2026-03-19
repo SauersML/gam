@@ -847,21 +847,7 @@ fn solution_into_outer_result(
     }
 }
 
-impl OuterResult {
-    /// Convert to the smoothing summary type consumed by downstream estimate
-    /// code.
-    pub fn into_smoothing_result(self) -> crate::solver::smoothing::SmoothingBfgsResult {
-        crate::solver::smoothing::SmoothingBfgsResult {
-            rho: self.rho,
-            final_value: self.final_value,
-            iterations: self.iterations,
-            finalgrad_norm: self.final_grad_norm,
-            final_stationarity_residual: if self.converged { 0.0 } else { f64::NAN },
-            final_boundviolation: 0.0,
-            stationary: self.converged,
-        }
-    }
-}
+
 
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
@@ -1017,6 +1003,10 @@ impl OuterProblem {
     pub fn with_screening_cap(mut self, cap: Arc<AtomicUsize>) -> Self { self.screening_cap = Some(cap); self }
 
     /// Derive the capability flags from the builder state.
+    ///
+    /// When using [`build_objective`](Self::build_objective), prefer that method
+    /// instead — it derives `fixed_point_available` from whether an EFS closure
+    /// is actually provided, rather than relying on the manual `.with_efs()` flag.
     pub fn capability(&self) -> OuterCapability {
         OuterCapability {
             gradient: self.gradient,
@@ -1042,6 +1032,41 @@ impl OuterProblem {
             initial_rho: self.initial_rho.clone(),
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
+        }
+    }
+
+    /// Construct a [`ClosureObjective`] with capability flags derived from the
+    /// builder state **and** the closures actually provided.
+    ///
+    /// `fixed_point_available` is set to `true` when `efs_fn` is `Some`,
+    /// regardless of whether `.with_efs()` was called.  This is the canonical
+    /// way to create production objectives — it eliminates the drift risk of
+    /// manually entering capability flags.
+    pub fn build_objective<S, Fc, Fe, Fr, Fefs>(
+        &self,
+        state: S,
+        cost_fn: Fc,
+        eval_fn: Fe,
+        reset_fn: Option<Fr>,
+        efs_fn: Option<Fefs>,
+    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs>
+    where
+        Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+        Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
+        Fr: FnMut(&mut S),
+        Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+    {
+        let mut cap = self.capability();
+        // Derive fixed_point_available from whether the caller actually
+        // provided an EFS hook, rather than relying on manual flags.
+        cap.fixed_point_available = efs_fn.is_some();
+        ClosureObjective {
+            state,
+            cap,
+            cost_fn,
+            eval_fn,
+            reset_fn,
+            efs_fn,
         }
     }
 

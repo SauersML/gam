@@ -18,6 +18,7 @@ mod inner_strategy;
 pub(crate) mod penalty_logdet;
 mod runtime;
 mod trace;
+pub(crate) mod assembly;
 pub(crate) mod unified;
 
 #[cfg(test)]
