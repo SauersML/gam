@@ -561,6 +561,29 @@ pub trait CustomFamily {
         Ok(beta)
     }
 
+    /// Optional barrier-aware maximum feasible step size for a block update.
+    ///
+    /// Given the current block state and a proposed step direction `delta`,
+    /// returns `Some(alpha_max)` where `alpha_max` is the largest step size
+    /// in `(0, 1]` such that `beta + alpha_max * delta` remains strictly
+    /// feasible with respect to any implicit barrier in the likelihood.
+    ///
+    /// Families whose log-likelihood contains natural log-barrier terms
+    /// (e.g. `log(h')` in transformation-normal) should implement this to
+    /// prevent the line search from evaluating the likelihood at infeasible
+    /// points.  A fraction-to-boundary safety factor (e.g. 0.995) should be
+    /// applied internally.
+    ///
+    /// Returns `None` if no barrier constraint applies (the default).
+    fn max_feasible_step_size(
+        &self,
+        _: &[ParameterBlockState],
+        _: usize,
+        _: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        Ok(None)
+    }
+
     /// Optional linear inequality constraints for a block update:
     /// `A * beta_block >= b`.
     fn block_linear_constraints(
@@ -720,6 +743,24 @@ pub trait CustomFamily {
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
         self.exact_newton_joint_hessian(block_states)
+    }
+
+    /// Rescaled joint Hessian for logdet computation.  Returns
+    /// `(H_scaled, deriv_log_scale)` where `H_scaled ≈ exp(-L) * H_exact`,
+    /// so `logdet(H) = logdet(H_scaled) + p * L`.
+    ///
+    /// Families whose derivatives can overflow (e.g. CLogLog survival)
+    /// override this to shift `exp(u)` to `exp(u − L)`, keeping every
+    /// Hessian entry finite while preserving the logdet up to the
+    /// additive correction `p * L`.
+    ///
+    /// The default returns `None`, falling through to the standard
+    /// (non-rescaled) logdet path.
+    fn exact_newton_joint_hessian_for_logdet(
+        &self,
+        _: &[ParameterBlockState],
+    ) -> Result<Option<(Array2<f64>, f64)>, String> {
+        Ok(None)
     }
 
     /// Optional spec-aware exact first directional derivative of the joint Hessian.
@@ -4000,9 +4041,10 @@ fn solve_quadraticwith_linear_constraints(
     let tol_dual = 1e-9;
     let feas_tol = 1e-8;
 
-    if let Some(beta_unconstrained) =
-        StableSolver::new("custom-family constrained quadratic fast-path")
-            .solvevectorwithridge_retries(hessian, rhs, 0.0)
+    if warm_active_set.is_none_or(|active| active.is_empty())
+        && let Some(beta_unconstrained) =
+            StableSolver::new("custom-family constrained quadratic fast-path")
+                .solvevectorwithridge_retries(hessian, rhs, 0.0)
         && beta_unconstrained.iter().all(|v| v.is_finite())
         && check_linear_feasibility(&beta_unconstrained, constraints, feas_tol).is_ok()
     {
@@ -4255,6 +4297,13 @@ fn positive_part_cholesky_fallback(
     existing_ridge: f64,
     eigh_err: &crate::faer_ndarray::FaerLinalgError,
 ) -> Result<f64, String> {
+    if !a.iter().all(|value| value.is_finite()) {
+        log::warn!(
+            "[PositivePartFallback] eigendecomposition failed on non-finite Hessian ({eigh_err}); \
+             dropping the positive-part surrogate contribution"
+        );
+        return Ok(0.0);
+    }
     let p = a.nrows();
     let diag_scale = a
         .diag()
@@ -4967,6 +5016,39 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
+    // Try the rescaled logdet path first — it returns (H_scaled, L) where
+    // H_scaled = exp(-L) * H_exact, avoiding exp(u) overflow entirely.
+    // When L = 0 (no rescaling needed), this reduces to the normal path.
+    if let Some((h_raw, deriv_log_scale)) =
+        family.exact_newton_joint_hessian_for_logdet(states)?
+    {
+        let mut h_joint = symmetrized_square_matrix(
+            h_raw,
+            total,
+            "joint exact-newton Hessian shape mismatch in logdet terms (rescaled)",
+        )?;
+        let penalty_scale = (-deriv_log_scale).exp();
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            h_joint
+                .slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(penalty_scale, s_lambda);
+        }
+        let logdet_h_scaled = if strict_spd {
+            strict_logdet_spd_with_semidefinite_option(&h_joint, allow_semidefinite)?
+        } else {
+            stable_logdet_with_ridge_policy(
+                &h_joint,
+                options.ridge_floor * penalty_scale,
+                options.ridge_policy,
+            )?
+        };
+        let logdet_h_total = logdet_h_scaled + total as f64 * deriv_log_scale;
+        return Ok((logdet_h_total, penalty_logdet_s_total));
+    }
+    // Fallback: try the non-rescaled symmetrized path (for families that
+    // don't implement exact_newton_joint_hessian_for_logdet but do provide
+    // a plain joint Hessian).
     if let Some(mut h_joint) = exact_newton_joint_hessian_symmetrized(
         family,
         states,
@@ -5549,10 +5631,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 None
             };
             let mut accepted = false;
+            // Barrier-aware step ceiling: families with natural log-barrier
+            // terms (e.g. log(h') in transformation-normal) report the maximum
+            // feasible step fraction so the line search never evaluates the
+            // likelihood outside its domain.
+            let barrier_ceiling =
+                family.max_feasible_step_size(&states, b, &delta)?.unwrap_or(1.0);
             // Reuse trial_beta_buf to avoid allocation per backtracking trial.
             let mut trial_beta_buf = beta_old.clone();
             for bt in 0..8 {
-                let alpha = 0.5f64.powi(bt);
+                let alpha = (0.5f64.powi(bt)).min(barrier_ceiling);
                 trial_beta_buf.assign(&beta_old);
                 trial_beta_buf.scaled_add(alpha, &delta);
                 let trial_beta =
@@ -5599,8 +5687,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         } else {
                             None
                         };
+                        let descent_barrier_ceiling = family
+                            .max_feasible_step_size(&states, b, &descent_dir)?
+                            .unwrap_or(1.0);
                         for bt in 0..12 {
-                            let alpha = 0.5f64.powi(bt);
+                            let alpha = (0.5f64.powi(bt)).min(descent_barrier_ceiling);
                             trial_beta_buf.assign(&beta_old);
                             trial_beta_buf.scaled_add(alpha, &descent_dir);
                             let trial_beta = family.post_update_block_beta(

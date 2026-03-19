@@ -8,8 +8,8 @@
 //! with an arbitrary covariate design operator. The deviations are B-splines with
 //! value and first derivative projected to zero at the response median, so setting
 //! deviation coefficients to zero recovers an affine (location-scale) transformation
-//! exactly. Monotonicity is enforced via `LinearInequalityConstraints` on the
-//! derivative design matrix.
+//! exactly. Monotonicity is enforced by the natural `log(h')` barrier in the
+//! likelihood combined with a fraction-to-boundary line search.
 //!
 //! The log-likelihood per observation is the change-of-variables density for a
 //! standard normal target:
@@ -62,10 +62,6 @@ pub struct TransformationNormalConfig {
     pub response_extra_penalty_orders: Vec<usize>,
     /// Whether to add a global identity (ridge) penalty (default true).
     pub double_penalty: bool,
-    /// Number of grid points for monotonicity constraint evaluation (default 64).
-    pub derivative_grid_size: usize,
-    /// Lower bound for the Jacobian h' (default 1e-6).
-    pub monotonicity_eps: f64,
 }
 
 impl Default for TransformationNormalConfig {
@@ -76,8 +72,6 @@ impl Default for TransformationNormalConfig {
             response_penalty_order: 2,
             response_extra_penalty_orders: vec![1],
             double_penalty: true,
-            derivative_grid_size: 64,
-            monotonicity_eps: 1e-6,
         }
     }
 }
@@ -122,9 +116,6 @@ pub struct TransformationNormalFamily {
     covariate_design: DesignMatrix,
     // --- Tensor penalties ---
     tensor_penalties: Vec<PenaltyMatrix>,
-
-    // --- Monotonicity constraints ---
-    monotonicity_constraints: LinearInequalityConstraints,
 
     // --- Initial values ---
     initial_beta: Array1<f64>,
@@ -205,22 +196,11 @@ impl TransformationNormalFamily {
             config,
         )?;
 
-        // ----- 4. Monotonicity constraints -----
-        let monotonicity_constraints = build_subsampled_monotonicity_constraints(
-            &x_deriv_kron,
-            response,
-            &resp_knots,
-            config.response_degree,
-            &resp_transform,
-            &covariate_design,
-            config,
-        )?;
-
-        // ----- 5. Warm start -----
+        // ----- 4. Warm start -----
         let initial_beta =
             compute_warm_start(response, &covariate_design, p_resp, p_cov, warm_start)?;
 
-        // ----- 6. Initial log-lambdas (one per penalty, start at 0.0) -----
+        // ----- 5. Initial log-lambdas (one per penalty, start at 0.0) -----
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
 
         // Compute response median for anchoring
@@ -239,7 +219,6 @@ impl TransformationNormalFamily {
             response_deriv_basis: resp_deriv,
             covariate_design,
             tensor_penalties,
-            monotonicity_constraints,
             initial_beta,
             initial_log_lambdas,
             block_name: "transformation".to_string(),
@@ -306,20 +285,6 @@ impl TransformationNormalFamily {
             config,
         )?;
 
-        // Monotonicity constraints.
-        // Extract response values from column 1 of the value basis (which stores y)
-        // to build the boundary grid.  For biobank scale, subsample training rows.
-        let response_approx_for_grid = response_val_basis.column(1).to_owned();
-        let monotonicity_constraints = build_subsampled_monotonicity_constraints(
-            &x_deriv_kron,
-            &response_approx_for_grid,
-            &response_knots,
-            response_degree,
-            &response_transform,
-            &covariate_design,
-            config,
-        )?;
-
         // Warm start: need response values for location-scale init.
         // Extract response from column 1 of response_val_basis (which stores y).
         let response_approx = response_val_basis.column(1).to_owned();
@@ -349,7 +314,6 @@ impl TransformationNormalFamily {
             response_deriv_basis,
             covariate_design,
             tensor_penalties,
-            monotonicity_constraints,
             initial_beta,
             initial_log_lambdas,
             block_name: "transformation".to_string(),
@@ -468,7 +432,9 @@ impl CustomFamily for TransformationNormalFamily {
         let mut ll = 0.0;
         for i in 0..h.len() {
             if h_prime[i] <= 0.0 {
-                return Err("h' non-positive in log_likelihood_only".to_string());
+                // The barrier line search should prevent this, but if reached
+                // return -inf so the backtracking loop rejects the step.
+                return Ok(f64::NEG_INFINITY);
             }
             ll += -0.5 * h[i] * h[i] + h_prime[i].ln();
         }
@@ -496,16 +462,54 @@ impl CustomFamily for TransformationNormalFamily {
         }
     }
 
-    fn block_linear_constraints(
+    fn max_feasible_step_size(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_index: usize,
-        _: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
         if block_index != 0 {
             return Ok(None);
         }
-        Ok(Some(self.monotonicity_constraints.clone()))
+        let beta = &block_states[0].beta;
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let d_h_prime = self.x_deriv_kron.forward_mul(delta);
+
+        // Fraction-to-boundary rule: find the largest alpha in (0, 1] such that
+        // h'(beta + alpha * delta) > 0 at every observation.
+        //
+        // For each i where d_h'[i] < 0, the step that drives h'[i] to zero is
+        // alpha_i = h'[i] / (-d_h'[i]).  We take the minimum and apply a 0.995
+        // safety factor (standard in interior-point methods).
+        let mut alpha_max = 1.0_f64;
+        for i in 0..h_prime.len() {
+            let dh = d_h_prime[i];
+            if dh < -1e-14 {
+                let hit = h_prime[i] / (-dh);
+                if hit < alpha_max {
+                    alpha_max = hit;
+                }
+            }
+        }
+        let tau = 0.995;
+        let alpha_safe = tau * alpha_max;
+        if alpha_safe < 1.0 {
+            Ok(Some(alpha_safe))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn block_linear_constraints(
+        &self,
+        _: &[ParameterBlockState],
+        _: usize,
+        _: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        // Monotonicity is enforced by the natural log(h') barrier in the
+        // likelihood combined with the fraction-to-boundary line search
+        // (max_feasible_step_size).  No explicit constraints needed.
+        Ok(None)
     }
 
     fn exact_newton_hessian_directional_derivative(
@@ -1070,168 +1074,6 @@ fn build_tensor_penalties_kronecker(
     }
 
     Ok(penalties)
-}
-
-// ---------------------------------------------------------------------------
-// Monotonicity constraints
-// ---------------------------------------------------------------------------
-
-/// Evenly spaced grid over the response range for boundary constraint evaluation.
-fn response_derivative_grid(
-    response: &Array1<f64>,
-    config: &TransformationNormalConfig,
-) -> Result<Array1<f64>, String> {
-    let grid_size = config.derivative_grid_size;
-    if grid_size < 2 {
-        return Ok(Array1::zeros(0));
-    }
-    let min_val = response.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_val = response.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !min_val.is_finite() || !max_val.is_finite() {
-        return Err("non-finite response values for derivative grid".to_string());
-    }
-    let range = max_val - min_val;
-    if range < 1e-12 {
-        return Ok(Array1::from_vec(vec![min_val; grid_size]));
-    }
-    // Extend slightly beyond data range.
-    let margin = 0.05 * range;
-    let left = min_val - margin;
-    let right = max_val + margin;
-    Ok(Array1::from_iter((0..grid_size).map(|i| {
-        let t = i as f64 / ((grid_size - 1) as f64);
-        left + (right - left) * t
-    })))
-}
-
-/// Subsample covariate rows uniformly for boundary constraints.
-fn subsample_covariate_rows(design: &DesignMatrix, max_rows: usize) -> Array2<f64> {
-    let n = design.nrows();
-    if n <= max_rows {
-        return design.row_chunk(0..n);
-    }
-    let step = n as f64 / max_rows as f64;
-    let indices: Vec<usize> = (0..max_rows)
-        .map(|i| ((i as f64 * step) as usize).min(n - 1))
-        .collect();
-    let mut out = Array2::zeros((indices.len(), design.ncols()));
-    for (r, &idx) in indices.iter().enumerate() {
-        let row = design.row_chunk(idx..idx + 1);
-        out.row_mut(r).assign(&row.row(0));
-    }
-    out
-}
-
-/// Maximum number of training-point constraint rows for biobank-scale monotonicity.
-///
-/// When the training set is large (e.g. 400K), using all n derivative rows as
-/// hard constraints is prohibitively expensive.  This cap limits the training-point
-/// portion of the constraint matrix.  Boundary grid rows are added on top of this.
-const MAX_MONOTONICITY_TRAINING_ROWS: usize = 8192;
-
-/// Build monotonicity constraints from a KroneckerDesign, subsampling for
-/// large problems.
-///
-/// This mirrors what `build_monotonicity_constraints` does for the non-prebuilt
-/// path: it includes BOTH training-point derivative rows (subsampled if n is
-/// large) AND boundary grid rows that evaluate h'(y|x) on a fine grid of
-/// response values crossed with subsampled covariate rows.  The boundary grid
-/// is critical for preventing B-spline derivatives from going negative between
-/// observed response values, especially near domain boundaries.
-fn build_subsampled_monotonicity_constraints(
-    x_deriv_kron: &KroneckerDesign,
-    response_values: &Array1<f64>,
-    response_knots: &Array1<f64>,
-    response_degree: usize,
-    response_transform: &Array2<f64>,
-    covariate_design: &DesignMatrix,
-    config: &TransformationNormalConfig,
-) -> Result<LinearInequalityConstraints, String> {
-    let n = x_deriv_kron.nrows();
-    let p = x_deriv_kron.ncols();
-    let eps = config.monotonicity_eps;
-
-    // --- Part 1: training-point derivative rows (subsampled if large) ---
-    let mut constraint_rows: Vec<Array1<f64>> = Vec::new();
-
-    if n <= MAX_MONOTONICITY_TRAINING_ROWS {
-        // Use all training-point rows.
-        for i in 0..n {
-            let row = x_deriv_kron.row_chunk(i..i + 1).row(0).to_owned();
-            let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if norm > 1e-12 {
-                constraint_rows.push(row);
-            }
-        }
-    } else {
-        // Subsample uniformly.
-        let step = n as f64 / MAX_MONOTONICITY_TRAINING_ROWS as f64;
-        let indices: Vec<usize> = (0..MAX_MONOTONICITY_TRAINING_ROWS)
-            .map(|i| ((i as f64 * step) as usize).min(n - 1))
-            .collect();
-        for &idx in &indices {
-            let row = x_deriv_kron.row_chunk(idx..idx + 1).row(0).to_owned();
-            let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if norm > 1e-12 {
-                constraint_rows.push(row);
-            }
-        }
-    }
-
-    // --- Part 2: boundary grid rows ---
-    // Evaluate the response derivative basis on a fine grid of response values,
-    // crossed with a subsample of covariate rows.  This catches negativity
-    // between observed response values and near domain boundaries.
-    let grid = response_derivative_grid(response_values, config)?;
-    let p_cov = covariate_design.ncols();
-    if !grid.is_empty() && p_cov > 0 {
-        let (raw_d1, _) = create_basis::<Dense>(
-            grid.view(),
-            KnotSource::Provided(response_knots.view()),
-            response_degree,
-            BasisOptions::first_derivative(),
-        )
-        .map_err(|e| e.to_string())?;
-        let dev_d1 = raw_d1.as_ref().dot(response_transform);
-        let p_resp = 2 + dev_d1.ncols();
-        let g = grid.len();
-        let mut grid_resp_deriv = Array2::<f64>::zeros((g, p_resp));
-        grid_resp_deriv.column_mut(1).fill(1.0); // derivative of y is 1
-        grid_resp_deriv.slice_mut(s![.., 2..]).assign(&dev_d1);
-
-        // Use a subsample of covariate rows for the boundary constraint.
-        let cov_subsample = subsample_covariate_rows(covariate_design, 50);
-        for gi in 0..g {
-            for ci in 0..cov_subsample.nrows() {
-                let mut row = Array1::<f64>::zeros(p);
-                for j in 0..p_resp {
-                    let r = grid_resp_deriv[[gi, j]];
-                    if r == 0.0 {
-                        continue;
-                    }
-                    for k in 0..p_cov {
-                        row[j * p_cov + k] = r * cov_subsample[[ci, k]];
-                    }
-                }
-                let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
-                if norm > 1e-12 {
-                    constraint_rows.push(row);
-                }
-            }
-        }
-    }
-
-    let n_constraints = constraint_rows.len();
-    if n_constraints == 0 {
-        return Err("no valid constraint rows for monotonicity".to_string());
-    }
-    let mut a = Array2::<f64>::zeros((n_constraints, p));
-    for (i, row) in constraint_rows.into_iter().enumerate() {
-        a.row_mut(i).assign(&row);
-    }
-    let b = Array1::from_elem(n_constraints, eps);
-
-    Ok(LinearInequalityConstraints { a, b })
 }
 
 // ---------------------------------------------------------------------------

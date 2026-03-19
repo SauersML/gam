@@ -9469,6 +9469,21 @@ mod tests {
         }
     }
 
+    fn test_payload(
+        formula: impl Into<String>,
+        model_kind: ModelKind,
+        family_state: FittedFamily,
+        family: impl Into<String>,
+    ) -> FittedModelPayload {
+        FittedModelPayload::new(
+            MODEL_VERSION,
+            formula.into(),
+            model_kind,
+            family_state,
+            family.into(),
+        )
+    }
+
     fn intercept_only_gaussian_location_scale_model(
         beta_mu: f64,
         beta_log_sigma: f64,
@@ -9482,76 +9497,23 @@ mod tests {
             None,
             saved_fit_summary_stub(),
         );
-        SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "y ~ 1".to_string(),
-            model_kind: ModelKind::LocationScale,
-            family_state: FittedFamily::LocationScale {
+        let mut payload = test_payload(
+            "y ~ 1",
+            ModelKind::LocationScale,
+            FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::GaussianIdentity,
                 base_link: None,
             },
-            family: FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
-            fit_result: Some(fit_result),
-            unified: None,
-            data_schema: None,
-            link: None,
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: Some("y ~ 1".to_string()),
-            formula_logslope: None,
-            beta_noise: Some(vec![beta_log_sigma]),
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: Some(response_scale),
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: None,
-            linkwiggle_degree: None,
-            beta_link_wiggle: None,
-            baseline_timewiggle_knots: None,
-            baseline_timewiggle_degree: None,
-            baseline_timewiggle_penalty_orders: None,
-            baseline_timewiggle_double_penalty: None,
-            beta_baseline_timewiggle: None,
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: None,
-            survival_exit: None,
-            survival_event: None,
-            survivalspec: None,
-            survival_baseline_target: None,
-            survival_baseline_scale: None,
-            survival_baseline_shape: None,
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: None,
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: None,
-            survival_likelihood: None,
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: None,
-            training_headers: Some(vec![]),
-            resolved_termspec: Some(empty_termspec()),
-            resolved_termspec_noise: Some(empty_termspec()),
-            adaptive_regularization_diagnostics: None,
-        })
+            FAMILY_GAUSSIAN_LOCATION_SCALE,
+        );
+        payload.fit_result = Some(fit_result);
+        payload.formula_noise = Some("y ~ 1".to_string());
+        payload.beta_noise = Some(vec![beta_log_sigma]);
+        payload.gaussian_response_scale = Some(response_scale);
+        payload.training_headers = Some(vec![]);
+        payload.resolved_termspec = Some(empty_termspec());
+        payload.resolved_termspec_noise = Some(empty_termspec());
+        SavedModel::from_payload(payload)
     }
 
     fn intercept_only_binomial_location_scale_model(
@@ -9570,76 +9532,26 @@ mod tests {
             Some(covariance),
             saved_fit_summary_stub(),
         );
-        SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "y ~ 1".to_string(),
-            model_kind: ModelKind::LocationScale,
-            family_state: FittedFamily::LocationScale {
+        let mut payload = test_payload(
+            "y ~ 1",
+            ModelKind::LocationScale,
+            FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::BinomialProbit,
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
-            family: "binomial-location-scale".to_string(),
-            fit_result: Some(fit_result),
-            unified: None,
-            data_schema: None,
-            link: Some("probit".to_string()),
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: Some("y ~ 1".to_string()),
-            formula_logslope: None,
-            beta_noise: Some(vec![beta_ls]),
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: wiggle_knots,
-            linkwiggle_degree: wiggle_degree,
-            beta_link_wiggle,
-            baseline_timewiggle_knots: None,
-            baseline_timewiggle_degree: None,
-            baseline_timewiggle_penalty_orders: None,
-            baseline_timewiggle_double_penalty: None,
-            beta_baseline_timewiggle: None,
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: None,
-            survival_exit: None,
-            survival_event: None,
-            survivalspec: None,
-            survival_baseline_target: None,
-            survival_baseline_scale: None,
-            survival_baseline_shape: None,
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: None,
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: None,
-            survival_likelihood: None,
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: None,
-            training_headers: Some(vec![]),
-            resolved_termspec: Some(empty_termspec()),
-            resolved_termspec_noise: Some(empty_termspec()),
-            adaptive_regularization_diagnostics: None,
-        })
+            "binomial-location-scale",
+        );
+        payload.fit_result = Some(fit_result);
+        payload.link = Some("probit".to_string());
+        payload.formula_noise = Some("y ~ 1".to_string());
+        payload.beta_noise = Some(vec![beta_ls]);
+        payload.linkwiggle_knots = wiggle_knots;
+        payload.linkwiggle_degree = wiggle_degree;
+        payload.beta_link_wiggle = beta_link_wiggle;
+        payload.training_headers = Some(vec![]);
+        payload.resolved_termspec = Some(empty_termspec());
+        payload.resolved_termspec_noise = Some(empty_termspec());
+        SavedModel::from_payload(payload)
     }
 
     fn intercept_only_binomial_mean_wiggle_model(
@@ -9678,78 +9590,24 @@ mod tests {
         beta_joint[0] = beta_eta;
         beta_joint.slice_mut(s![1..]).assign(&beta_wiggle);
         fit_result.beta = beta_joint;
-        SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "y ~ 1".to_string(),
-            model_kind: ModelKind::Standard,
-            family_state: FittedFamily::Standard {
+        let mut payload = test_payload(
+            "y ~ 1",
+            ModelKind::Standard,
+            FittedFamily::Standard {
                 likelihood: family,
                 link: Some(link),
                 mixture_state: None,
                 sas_state: None,
             },
-            family: family_to_string(family).to_string(),
-            fit_result: Some(fit_result),
-            unified: None,
-            data_schema: None,
-            link: Some(linkname(link).to_string()),
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: None,
-            formula_logslope: None,
-            beta_noise: None,
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: Some(wiggle_knots),
-            linkwiggle_degree: Some(wiggle_degree),
-            beta_link_wiggle: None,
-            baseline_timewiggle_knots: None,
-            baseline_timewiggle_degree: None,
-            baseline_timewiggle_penalty_orders: None,
-            baseline_timewiggle_double_penalty: None,
-            beta_baseline_timewiggle: None,
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: None,
-            survival_exit: None,
-            survival_event: None,
-            survivalspec: None,
-            survival_baseline_target: None,
-            survival_baseline_scale: None,
-            survival_baseline_shape: None,
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: None,
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: None,
-            survival_likelihood: None,
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: None,
-            training_headers: Some(vec![]),
-            resolved_termspec: Some(empty_termspec()),
-            resolved_termspec_noise: None,
-            adaptive_regularization_diagnostics: None,
-        })
+            family_to_string(family),
+        );
+        payload.fit_result = Some(fit_result);
+        payload.link = Some(linkname(link).to_string());
+        payload.linkwiggle_knots = Some(wiggle_knots);
+        payload.linkwiggle_degree = Some(wiggle_degree);
+        payload.training_headers = Some(vec![]);
+        payload.resolved_termspec = Some(empty_termspec());
+        SavedModel::from_payload(payload)
     }
 
     fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
@@ -10979,77 +10837,24 @@ mod tests {
 
     #[test]
     fn saved_survival_model_requires_time_basis_metadata() {
-        let model = SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "Surv(start, stop, event) ~ x".to_string(),
-            model_kind: ModelKind::Survival,
-            family_state: FittedFamily::Survival {
+        let mut payload = test_payload(
+            "Surv(start, stop, event) ~ x",
+            ModelKind::Survival,
+            FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
             },
-            family: "survival".to_string(),
-            fit_result: None,
-            unified: None,
-            data_schema: None,
-            link: None,
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: None,
-            formula_logslope: None,
-            beta_noise: None,
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: None,
-            linkwiggle_degree: None,
-            beta_link_wiggle: None,
-            baseline_timewiggle_knots: None,
-            baseline_timewiggle_degree: None,
-            baseline_timewiggle_penalty_orders: None,
-            baseline_timewiggle_double_penalty: None,
-            beta_baseline_timewiggle: None,
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: Some("start".to_string()),
-            survival_exit: Some("stop".to_string()),
-            survival_event: Some("event".to_string()),
-            survivalspec: Some("net".to_string()),
-            survival_baseline_target: Some("linear".to_string()),
-            survival_baseline_scale: None,
-            survival_baseline_shape: None,
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: None,
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: None,
-            survival_likelihood: Some("transformation".to_string()),
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: Some("gaussian".to_string()),
-            training_headers: None,
-            resolved_termspec: None,
-            resolved_termspec_noise: None,
-            adaptive_regularization_diagnostics: None,
-        });
+            "survival",
+        );
+        payload.survival_entry = Some("start".to_string());
+        payload.survival_exit = Some("stop".to_string());
+        payload.survival_event = Some("event".to_string());
+        payload.survivalspec = Some("net".to_string());
+        payload.survival_baseline_target = Some("linear".to_string());
+        payload.survival_likelihood = Some("transformation".to_string());
+        payload.survival_distribution = Some("gaussian".to_string());
+        let model = SavedModel::from_payload(payload);
 
         let err = super::load_survival_time_basis_config_from_model(&model)
             .expect_err("survival model without basis metadata should fail");
@@ -11060,78 +10865,29 @@ mod tests {
     fn saved_baseline_timewiggle_components_return_none_without_metadata() {
         let eta = array![0.1, 0.2];
         let deriv = array![0.3, 0.4];
-        let model = SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=5)"
-                .to_string(),
-            model_kind: ModelKind::Survival,
-            family_state: FittedFamily::Survival {
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=5)",
+            ModelKind::Survival,
+            FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
             },
-            family: "survival".to_string(),
-            fit_result: None,
-            unified: None,
-            data_schema: None,
-            link: None,
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: None,
-            formula_logslope: None,
-            beta_noise: None,
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: None,
-            linkwiggle_degree: None,
-            beta_link_wiggle: None,
-            baseline_timewiggle_knots: None,
-            baseline_timewiggle_degree: None,
-            baseline_timewiggle_penalty_orders: None,
-            baseline_timewiggle_double_penalty: None,
-            beta_baseline_timewiggle: None,
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: Some("entry".to_string()),
-            survival_exit: Some("exit".to_string()),
-            survival_event: Some("event".to_string()),
-            survivalspec: Some("net".to_string()),
-            survival_baseline_target: Some("weibull".to_string()),
-            survival_baseline_scale: Some(10.0),
-            survival_baseline_shape: Some(1.2),
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: Some("none".to_string()),
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: None,
-            survival_likelihood: Some("transformation".to_string()),
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: Some("gaussian".to_string()),
-            training_headers: Some(vec![]),
-            resolved_termspec: Some(empty_termspec()),
-            resolved_termspec_noise: None,
-            adaptive_regularization_diagnostics: None,
-        });
+            "survival",
+        );
+        payload.survival_entry = Some("entry".to_string());
+        payload.survival_exit = Some("exit".to_string());
+        payload.survival_event = Some("event".to_string());
+        payload.survivalspec = Some("net".to_string());
+        payload.survival_baseline_target = Some("weibull".to_string());
+        payload.survival_baseline_scale = Some(10.0);
+        payload.survival_baseline_shape = Some(1.2);
+        payload.survival_time_basis = Some("none".to_string());
+        payload.survival_likelihood = Some("transformation".to_string());
+        payload.survival_distribution = Some("gaussian".to_string());
+        payload.training_headers = Some(vec![]);
+        payload.resolved_termspec = Some(empty_termspec());
+        let model = SavedModel::from_payload(payload);
         let got = super::saved_baseline_timewiggle_components(&eta, &eta, &deriv, &model)
             .expect("baseline-timewiggle metadata check");
         assert!(got.is_none());
@@ -11176,78 +10932,36 @@ mod tests {
             None,
             saved_fit_summary_stub(),
         );
-        let model = SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)"
-                .to_string(),
-            model_kind: ModelKind::Survival,
-            family_state: FittedFamily::Survival {
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
+            ModelKind::Survival,
+            FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
             },
-            family: "survival".to_string(),
-            fit_result: Some(fit_result),
-            unified: None,
-            data_schema: None,
-            link: None,
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: None,
-            formula_logslope: None,
-            beta_noise: None,
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: None,
-            linkwiggle_degree: None,
-            beta_link_wiggle: None,
-            baseline_timewiggle_knots: Some(built.knots.to_vec()),
-            baseline_timewiggle_degree: Some(built.degree),
-            baseline_timewiggle_penalty_orders: Some(wiggle_cfg.penalty_orders.clone()),
-            baseline_timewiggle_double_penalty: Some(wiggle_cfg.double_penalty),
-            beta_baseline_timewiggle: Some(Array1::<f64>::zeros(built.ncols).to_vec()),
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: Some("entry".to_string()),
-            survival_exit: Some("exit".to_string()),
-            survival_event: Some("event".to_string()),
-            survivalspec: Some("net".to_string()),
-            survival_baseline_target: Some("weibull".to_string()),
-            survival_baseline_scale: Some(15.0),
-            survival_baseline_shape: Some(1.3),
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: Some("none".to_string()),
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: Some(1e-4),
-            survival_likelihood: Some("transformation".to_string()),
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: Some("gaussian".to_string()),
-            training_headers: Some(vec!["entry".to_string(), "exit".to_string()]),
-            resolved_termspec: Some(empty_termspec()),
-            resolved_termspec_noise: None,
-            adaptive_regularization_diagnostics: None,
-        });
+            "survival",
+        );
+        payload.fit_result = Some(fit_result);
+        payload.baseline_timewiggle_knots = Some(built.knots.to_vec());
+        payload.baseline_timewiggle_degree = Some(built.degree);
+        payload.baseline_timewiggle_penalty_orders = Some(wiggle_cfg.penalty_orders.clone());
+        payload.baseline_timewiggle_double_penalty = Some(wiggle_cfg.double_penalty);
+        payload.beta_baseline_timewiggle = Some(Array1::<f64>::zeros(built.ncols).to_vec());
+        payload.survival_entry = Some("entry".to_string());
+        payload.survival_exit = Some("exit".to_string());
+        payload.survival_event = Some("event".to_string());
+        payload.survivalspec = Some("net".to_string());
+        payload.survival_baseline_target = Some("weibull".to_string());
+        payload.survival_baseline_scale = Some(15.0);
+        payload.survival_baseline_shape = Some(1.3);
+        payload.survival_time_basis = Some("none".to_string());
+        payload.survivalridge_lambda = Some(1e-4);
+        payload.survival_likelihood = Some("transformation".to_string());
+        payload.survival_distribution = Some("gaussian".to_string());
+        payload.training_headers = Some(vec!["entry".to_string(), "exit".to_string()]);
+        payload.resolved_termspec = Some(empty_termspec());
+        let model = SavedModel::from_payload(payload);
         let data = array![[10.0, 20.0], [12.0, 24.0]];
         let col_map = HashMap::from([("entry".to_string(), 0usize), ("exit".to_string(), 1usize)]);
         let out_dir = tempdir().expect("tempdir");
@@ -11304,87 +11018,44 @@ mod tests {
             "timewiggle(degree=3, internal_knots=4)",
         )
         .expect("baseline-timewiggle cfg");
-        let model = SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)"
-                .to_string(),
-            model_kind: ModelKind::Survival,
-            family_state: FittedFamily::Survival {
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
+            ModelKind::Survival,
+            FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
             },
-            family: "survival".to_string(),
-            fit_result: Some(core_saved_fit_result(
-                Array1::zeros(1),
-                Array1::zeros(0),
-                1.0,
-                None,
-                None,
-                saved_fit_summary_stub(),
-            )),
-            unified: None,
-            data_schema: None,
-            link: None,
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: None,
-            formula_logslope: None,
-            beta_noise: None,
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: None,
-            linkwiggle_degree: None,
-            beta_link_wiggle: None,
-            baseline_timewiggle_knots: Some(vec![
-                -2.0, -2.0, -2.0, -2.0, -0.5, 0.5, 2.0, 2.0, 2.0, 2.0,
-            ]),
-            baseline_timewiggle_degree: Some(3),
-            baseline_timewiggle_penalty_orders: Some(vec![1, 2, 3]),
-            baseline_timewiggle_double_penalty: Some(false),
-            beta_baseline_timewiggle: Some(vec![0.0; 6]),
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: Some("entry".to_string()),
-            survival_exit: Some("exit".to_string()),
-            survival_event: Some("event".to_string()),
-            survivalspec: Some("net".to_string()),
-            survival_baseline_target: Some("weibull".to_string()),
-            survival_baseline_scale: Some(15.0),
-            survival_baseline_shape: Some(1.3),
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: Some("none".to_string()),
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: Some(1e-4),
-            survival_likelihood: Some("transformation".to_string()),
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: Some("gaussian".to_string()),
-            training_headers: Some(vec!["entry".to_string(), "exit".to_string()]),
-            resolved_termspec: Some(empty_termspec()),
-            resolved_termspec_noise: None,
-            adaptive_regularization_diagnostics: None,
-        });
+            "survival",
+        );
+        payload.fit_result = Some(core_saved_fit_result(
+            Array1::zeros(1),
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            saved_fit_summary_stub(),
+        ));
+        payload.baseline_timewiggle_knots =
+            Some(vec![-2.0, -2.0, -2.0, -2.0, -0.5, 0.5, 2.0, 2.0, 2.0, 2.0]);
+        payload.baseline_timewiggle_degree = Some(3);
+        payload.baseline_timewiggle_penalty_orders = Some(vec![1, 2, 3]);
+        payload.baseline_timewiggle_double_penalty = Some(false);
+        payload.beta_baseline_timewiggle = Some(vec![0.0; 6]);
+        payload.survival_entry = Some("entry".to_string());
+        payload.survival_exit = Some("exit".to_string());
+        payload.survival_event = Some("event".to_string());
+        payload.survivalspec = Some("net".to_string());
+        payload.survival_baseline_target = Some("weibull".to_string());
+        payload.survival_baseline_scale = Some(15.0);
+        payload.survival_baseline_shape = Some(1.3);
+        payload.survival_time_basis = Some("none".to_string());
+        payload.survivalridge_lambda = Some(1e-4);
+        payload.survival_likelihood = Some("transformation".to_string());
+        payload.survival_distribution = Some("gaussian".to_string());
+        payload.training_headers = Some(vec!["entry".to_string(), "exit".to_string()]);
+        payload.resolved_termspec = Some(empty_termspec());
+        let model = SavedModel::from_payload(payload);
 
         let saved_cfg = super::saved_baseline_timewiggle_spec(&model)
             .expect("saved baseline-timewiggle spec")
@@ -12705,76 +12376,20 @@ mod tests {
                 _ => 0.08,
             })
             .collect::<Vec<_>>();
-        let model = SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "y ~ x".to_string(),
-            model_kind: ModelKind::LocationScale,
-            family_state: FittedFamily::LocationScale {
+        let mut payload = test_payload(
+            "y ~ x",
+            ModelKind::LocationScale,
+            FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::BinomialProbit,
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
-            family: "binomial-location-scale".to_string(),
-            fit_result: None,
-            unified: None,
-            data_schema: None,
-            link: Some("probit".to_string()),
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: None,
-            formula_logslope: None,
-            beta_noise: None,
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: Some(knots),
-            linkwiggle_degree: Some(3),
-            beta_link_wiggle: Some(beta_link_wiggle.clone()),
-            baseline_timewiggle_knots: None,
-            baseline_timewiggle_degree: None,
-            baseline_timewiggle_penalty_orders: None,
-            baseline_timewiggle_double_penalty: None,
-            beta_baseline_timewiggle: None,
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: None,
-            survival_exit: None,
-            survival_event: None,
-            survivalspec: None,
-            survival_baseline_target: None,
-            survival_baseline_scale: None,
-            survival_baseline_shape: None,
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: None,
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: None,
-            survival_likelihood: None,
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: None,
-            training_headers: None,
-            resolved_termspec: None,
-            resolved_termspec_noise: None,
-            adaptive_regularization_diagnostics: None,
-        });
+            "binomial-location-scale",
+        );
+        payload.link = Some("probit".to_string());
+        payload.linkwiggle_knots = Some(knots);
+        payload.linkwiggle_degree = Some(3);
+        payload.beta_link_wiggle = Some(beta_link_wiggle.clone());
+        let model = SavedModel::from_payload(payload);
 
         let exact = saved_linkwiggle_derivative_q0(&q0, &model).expect("exact derivative");
         let constrained_deriv = saved_linkwiggle_design(&q0, &model)
@@ -12942,76 +12557,17 @@ mod tests {
     #[test]
     fn saved_linkwiggle_design_returnsnonewhen_metadata_missing() {
         let q0 = array![-0.3, 0.2];
-        let model = SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "y ~ x".to_string(),
-            model_kind: ModelKind::LocationScale,
-            family_state: FittedFamily::LocationScale {
+        let mut payload = test_payload(
+            "y ~ x",
+            ModelKind::LocationScale,
+            FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::BinomialProbit,
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
-            family: "binomial-location-scale".to_string(),
-            fit_result: None,
-            unified: None,
-            data_schema: None,
-            link: Some("probit".to_string()),
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: None,
-            formula_logslope: None,
-            beta_noise: None,
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: None,
-            linkwiggle_degree: None,
-            beta_link_wiggle: None,
-            baseline_timewiggle_knots: None,
-            baseline_timewiggle_degree: None,
-            baseline_timewiggle_penalty_orders: None,
-            baseline_timewiggle_double_penalty: None,
-            beta_baseline_timewiggle: None,
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: None,
-            survival_exit: None,
-            survival_event: None,
-            survivalspec: None,
-            survival_baseline_target: None,
-            survival_baseline_scale: None,
-            survival_baseline_shape: None,
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: None,
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: None,
-            survival_likelihood: None,
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: None,
-            training_headers: None,
-            resolved_termspec: None,
-            resolved_termspec_noise: None,
-            adaptive_regularization_diagnostics: None,
-        });
+            "binomial-location-scale",
+        );
+        payload.link = Some("probit".to_string());
+        let model = SavedModel::from_payload(payload);
         let design = saved_linkwiggle_design(&q0, &model).expect("wiggle design");
         assert!(design.is_none());
     }
@@ -13019,76 +12575,19 @@ mod tests {
     #[test]
     fn apply_saved_linkwiggle_rejects_partial_metadata() {
         let q0 = array![-0.2, 0.1];
-        let model = SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: "y ~ x".to_string(),
-            model_kind: ModelKind::LocationScale,
-            family_state: FittedFamily::LocationScale {
+        let mut payload = test_payload(
+            "y ~ x",
+            ModelKind::LocationScale,
+            FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::BinomialProbit,
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
-            family: "binomial-location-scale".to_string(),
-            fit_result: None,
-            unified: None,
-            data_schema: None,
-            link: Some("probit".to_string()),
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
-            formula_noise: None,
-            formula_logslope: None,
-            beta_noise: None,
-            noise_projection: None,
-            noise_center: None,
-            noise_scale: None,
-            noise_non_intercept_start: None,
-            gaussian_response_scale: None,
-            transformation_response_knots: None,
-            transformation_response_transform: None,
-            transformation_response_degree: None,
-            transformation_response_median: None,
-            linkwiggle_knots: Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
-            linkwiggle_degree: Some(2),
-            beta_link_wiggle: None,
-            baseline_timewiggle_knots: None,
-            baseline_timewiggle_degree: None,
-            baseline_timewiggle_penalty_orders: None,
-            baseline_timewiggle_double_penalty: None,
-            beta_baseline_timewiggle: None,
-            z_column: None,
-            marginal_baseline: None,
-            logslope_baseline: None,
-            score_warp_runtime: None,
-            link_deviation_runtime: None,
-            survival_entry: None,
-            survival_exit: None,
-            survival_event: None,
-            survivalspec: None,
-            survival_baseline_target: None,
-            survival_baseline_scale: None,
-            survival_baseline_shape: None,
-            survival_baseline_rate: None,
-            survival_baseline_makeham: None,
-            survival_time_basis: None,
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_keep_cols: None,
-            survival_time_smooth_lambda: None,
-            survival_time_anchor: None,
-            survivalridge_lambda: None,
-            survival_likelihood: None,
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_distribution: None,
-            training_headers: None,
-            resolved_termspec: None,
-            resolved_termspec_noise: None,
-            adaptive_regularization_diagnostics: None,
-        });
+            "binomial-location-scale",
+        );
+        payload.link = Some("probit".to_string());
+        payload.linkwiggle_knots = Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]);
+        payload.linkwiggle_degree = Some(2);
+        let model = SavedModel::from_payload(payload);
         let err = apply_saved_linkwiggle(&q0, &model).expect_err("expected partial-metadata error");
         assert!(err.contains("link-wiggle"));
     }
