@@ -1,6 +1,6 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
-    create_ispline_derivative_dense,
+    BasisOptions, Dense, KnotSource, PenaltyInfo, PenaltySource, create_basis,
+    create_difference_penalty_matrix, create_ispline_derivative_dense,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -31,10 +31,10 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::normal_pdf;
 use crate::smooth::{
-    BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
-    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    BlockwisePenalty, ExactJointHyperSetup, PenaltyBlockInfo,
+    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
+    TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
@@ -1058,6 +1058,22 @@ fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectio
     design
         .penalties
         .push(BlockwisePenalty::new(0..p, identity_penalty(p)));
+    // Identity penalty penalizes the full space → nullspace dimension is 0.
+    design.nullspace_dims.push(0);
+    design.penaltyinfo.push(PenaltyBlockInfo {
+        global_index: design.penaltyinfo.len(),
+        termname: Some("log_sigma_shrinkage".to_string()),
+        penalty: PenaltyInfo {
+            source: PenaltySource::Other("shrinkage".to_string()),
+            original_index: 0,
+            active: true,
+            effective_rank: p,
+            dropped_reason: None,
+            nullspace_dim_hint: 0,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+        },
+    });
 }
 
 // Honest warm start for the binomial location-scale model: run a short fit on

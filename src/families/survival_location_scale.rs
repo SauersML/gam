@@ -1089,10 +1089,24 @@ struct SurvivalExactRowKernel {
     d3_log_g: f64,
 }
 
+/// Mix event and censored contributions, avoiding `0 * Inf = NaN` when
+/// `d ∈ {0, 1}` and one branch is non-finite.
+#[inline]
+fn event_mix(d: f64, event_val: f64, censored_val: f64) -> f64 {
+    if d == 1.0 {
+        event_val
+    } else if d == 0.0 {
+        censored_val
+    } else {
+        d * event_val + (1.0 - d) * censored_val
+    }
+}
+
 impl SurvivalExactRowKernel {
     #[inline]
     fn log_likelihood(self) -> f64 {
-        self.w * (self.d * (self.logphi1 + self.log_g) + (1.0 - self.d) * self.log_s1 - self.log_s0)
+        self.w
+            * (event_mix(self.d, self.logphi1 + self.log_g, self.log_s1) - self.log_s0)
     }
 }
 
@@ -2157,6 +2171,31 @@ impl SurvivalLocationScaleFamily {
                 format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
             })?;
 
+        // Row degeneracy guard: when any hazard/pdf derivative is non-finite
+        // (e.g. CLogLog with u > ~709 where exp(u) overflows), the row's
+        // survival probability has underflowed to 0 and the derivatives
+        // cannot be represented in f64.  Exclude the row — same principle
+        // as the w <= 0 early-return above.
+        if !(r0.is_finite()
+            && dr0.is_finite()
+            && ddr0.is_finite()
+            && dddr0.is_finite()
+            && r1.is_finite()
+            && dr1.is_finite()
+            && ddr1.is_finite()
+            && dddr1.is_finite()
+            && dlogphi1.is_finite()
+            && d2logphi1.is_finite()
+            && d3logphi1.is_finite()
+            && d4logphi1.is_finite())
+        {
+            log::debug!(
+                "skipping row {row}: survival derivatives non-finite \
+                 (u0={u0:.2e}, u1={u1:.2e})"
+            );
+            return Ok(None);
+        }
+
         let guard = self.time_derivative_lower_bound();
         let mut g = state.g;
         // Layer 4: NaN is a hard error (genuinely bad data or upstream logic
@@ -2304,14 +2343,16 @@ impl SurvivalLocationScaleFamily {
         // needed by the Arbogast chain rule for the outer REML Hessian.
         // They enter F_αβγδ = m4·u_α·u_β·u_γ·u_δ + ... in the (s,s,s,s)
         // and (ϑ,s,s,s) blocks. See response.md Section 6.
+        // Use `event_mix` for d * (event term) + (1-d) * (censored term) to
+        // avoid 0 * Inf = NaN when d ∈ {0, 1} and one branch is non-finite.
         let d1_q0 = kernel.w * kernel.r0;
         let d2_q0 = kernel.w * kernel.dr0;
         let d3_q0 = kernel.w * kernel.ddr0;
         let d4_q0 = kernel.w * kernel.dddr0;
-        let d1_q1 = kernel.w * (kernel.d * kernel.dlogphi1 + (1.0 - kernel.d) * (-kernel.r1));
-        let d2_q1 = kernel.w * (kernel.d * kernel.d2logphi1 + (1.0 - kernel.d) * (-kernel.dr1));
-        let d3_q1 = kernel.w * (kernel.d * kernel.d3logphi1 + (1.0 - kernel.d) * (-kernel.ddr1));
-        let d4_q1 = kernel.w * (kernel.d * kernel.d4logphi1 + (1.0 - kernel.d) * (-kernel.dddr1));
+        let d1_q1 = kernel.w * event_mix(kernel.d, kernel.dlogphi1, -kernel.r1);
+        let d2_q1 = kernel.w * event_mix(kernel.d, kernel.d2logphi1, -kernel.dr1);
+        let d3_q1 = kernel.w * event_mix(kernel.d, kernel.d3logphi1, -kernel.ddr1);
+        let d4_q1 = kernel.w * event_mix(kernel.d, kernel.d4logphi1, -kernel.dddr1);
         let d1_q = d1_q0 + d1_q1;
         let d2_q = d2_q0 + d2_q1;
         let d3_q = d3_q0 + d3_q1;
@@ -2331,22 +2372,20 @@ impl SurvivalLocationScaleFamily {
             d1_qdot1: kernel.w * kernel.d * kernel.d_log_g,
             d2_qdot1: kernel.w * kernel.d * kernel.d2_log_g,
             grad_time_eta_h0: kernel.w * kernel.r0,
-            grad_time_eta_h1: kernel.w
-                * (kernel.d * kernel.dlogphi1 + (1.0 - kernel.d) * (-kernel.r1)),
+            grad_time_eta_h1: kernel.w * event_mix(kernel.d, kernel.dlogphi1, -kernel.r1),
             grad_time_eta_d: kernel.w * kernel.d * kernel.d_log_g,
             h_time_h0: kernel.w * kernel.dr0,
-            h_time_h1: kernel.w * (kernel.d * kernel.d2logphi1 + (1.0 - kernel.d) * (-kernel.dr1)),
+            h_time_h1: kernel.w * event_mix(kernel.d, kernel.d2logphi1, -kernel.dr1),
             h_time_d: -kernel.w * kernel.d * kernel.d2_log_g,
             d_h_h0: kernel.w * kernel.ddr0,
-            d_h_h1: kernel.w * kernel.d * kernel.d3logphi1
-                - kernel.w * (1.0 - kernel.d) * kernel.ddr1,
+            d_h_h1: kernel.w * event_mix(kernel.d, kernel.d3logphi1, -kernel.ddr1),
             d_h_d: -kernel.w * kernel.d * kernel.d3_log_g,
             // 4th derivatives of ℓ w.r.t. the time predictors h0, h1.
             // These are the exact bilinear coefficients for D²H[u,v] in the
             // time-time block. Since u = q + h, d⁴ℓ/dh⁴ = d⁴ℓ/du⁴
             // (same sign because (+1)⁴ = 1), we have:
             d2_h_h0: kernel.w * kernel.dddr0,
-            d2_h_h1: kernel.w * (kernel.d * kernel.d4logphi1 + (1.0 - kernel.d) * (-kernel.dddr1)),
+            d2_h_h1: kernel.w * event_mix(kernel.d, kernel.d4logphi1, -kernel.dddr1),
         }))
     }
 }

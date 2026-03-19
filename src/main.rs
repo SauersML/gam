@@ -1752,12 +1752,20 @@ fn run_fitwith_predict_noise(
             .first()
             .map(|b| b.beta.clone())
             .unwrap_or_else(|| Array1::zeros(0));
+        let p_threshold = beta_threshold.len();
+        // The joint covariance covers all blocks (threshold + noise).
+        // Extract the threshold-block submatrix (top-left p_threshold × p_threshold)
+        // so that the saved fit result dimensions are consistent.
+        let covariance_threshold = fit.covariance_conditional.as_ref().map(|cov| {
+            cov.slice(ndarray::s![..p_threshold, ..p_threshold])
+                .to_owned()
+        });
         let fit_result = core_saved_fit_result(
             beta_threshold,
             fit.lambdas.clone(),
             1.0,
-            fit.covariance_conditional.clone(),
-            fit.covariance_conditional.clone(),
+            covariance_threshold.clone(),
+            covariance_threshold,
             SavedFitSummary::from_blockwise_fit(&fit)?,
         );
         let dense_binom_mean = solved.fit.mean_design.design.to_dense();
@@ -1966,7 +1974,11 @@ fn build_predict_input_for_model(
 
             // Reconstruct the transform matrix from nested vecs
             let t_rows = response_transform_vecs.len();
-            let t_cols = if t_rows > 0 { response_transform_vecs[0].len() } else { 0 };
+            let t_cols = if t_rows > 0 {
+                response_transform_vecs[0].len()
+            } else {
+                0
+            };
             let mut resp_transform = ndarray::Array2::<f64>::zeros((t_rows, t_cols));
             for (i, row) in response_transform_vecs.iter().enumerate() {
                 for (j, &v) in row.iter().enumerate() {
@@ -1982,9 +1994,12 @@ fn build_predict_input_for_model(
                 .next()
                 .map(|s: &str| s.trim())
                 .ok_or("cannot parse response column from formula")?;
-            let response_col_idx = *col_map
-                .get(response_col_name)
-                .ok_or_else(|| format!("response column '{}' not found in new data", response_col_name))?;
+            let response_col_idx = *col_map.get(response_col_name).ok_or_else(|| {
+                format!(
+                    "response column '{}' not found in new data",
+                    response_col_name
+                )
+            })?;
             let response_new = data.column(response_col_idx).to_owned();
 
             // Build response basis at new y values
@@ -1993,7 +2008,8 @@ fn build_predict_input_for_model(
                 gam::basis::KnotSource::Provided(resp_knots.view()),
                 response_degree,
                 gam::basis::BasisOptions::value(),
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
             let raw_val = raw_val_basis.as_ref().clone();
             let dev_val = raw_val.dot(&resp_transform);
             let dev_dim = resp_transform.ncols();
@@ -2015,11 +2031,15 @@ fn build_predict_input_for_model(
             if beta.len() != p_resp * p_cov {
                 return Err(format!(
                     "beta length {} != p_resp({}) * p_cov({})",
-                    beta.len(), p_resp, p_cov
+                    beta.len(),
+                    p_resp,
+                    p_cov
                 ));
             }
             // Reshape beta to p_resp × p_cov and compute h row by row
-            let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov))
+            let beta_mat = beta
+                .view()
+                .into_shape_with_order((p_resp, p_cov))
                 .map_err(|e| format!("beta reshape failed: {e}"))?;
             let cov_mat = cov_design_full.design.row_chunk(0..n);
             let mut h = ndarray::Array1::<f64>::zeros(n);
@@ -2029,7 +2049,9 @@ fn build_predict_input_for_model(
                 // h_i = sum_{r,c} resp_row[r] * cov_row[c] * beta[r,c]
                 let mut val = 0.0;
                 for r in 0..p_resp {
-                    if resp_row[r] == 0.0 { continue; }
+                    if resp_row[r] == 0.0 {
+                        continue;
+                    }
                     for c in 0..p_cov {
                         val += resp_row[r] * cov_row[c] * beta_mat[[r, c]];
                     }
@@ -2288,7 +2310,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         PredictModelClass::TransformationNormal => {
             // Transformation-normal uses the unified path via build_predict_input_for_model.
             // If we reach here, something went wrong in the dispatch.
-            Err("transformation-normal model unexpectedly bypassed the unified prediction path".to_string())
+            Err(
+                "transformation-normal model unexpectedly bypassed the unified prediction path"
+                    .to_string(),
+            )
         }
         PredictModelClass::Standard => run_predict_standard(
             &mut progress,
@@ -4322,12 +4347,23 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             if let Some(lw) = fit.fit.fit.lambdas_linkwiggle() {
                 lambdas.extend(lw.iter().copied());
             }
+            let beta_time = fit.fit.fit.beta_time();
+            let p_time = beta_time.len();
+            // The joint covariance covers all blocks (time + threshold + log_sigma + linkwiggle).
+            // Extract the time-block submatrix (top-left p_time × p_time)
+            // so that the saved fit result dimensions are consistent.
+            let covariance_time = fit
+                .fit
+                .fit
+                .covariance_conditional
+                .as_ref()
+                .map(|cov| cov.slice(ndarray::s![..p_time, ..p_time]).to_owned());
             let mut fit_result = core_saved_fit_result(
-                fit.fit.fit.beta_time(),
+                beta_time,
                 Array1::from_vec(lambdas.clone()),
                 1.0,
-                fit.fit.fit.covariance_conditional.clone(),
-                fit.fit.fit.covariance_conditional.clone(),
+                covariance_time.clone(),
+                covariance_time,
                 SavedFitSummary::from_survival_location_scale_fit(&fit.fit.fit)?,
             );
             apply_inverse_link_state_to_fit_result(&mut fit_result, &fitted_inverse_link);
@@ -6920,8 +6956,12 @@ fn build_transformation_normal_saved_model(
     payload.resolved_termspec = Some(resolved_covariate_spec);
     payload.transformation_response_knots = Some(family.response_knots().to_vec());
     payload.transformation_response_transform = Some(
-        family.response_transform().rows().into_iter()
-            .map(|r| r.to_vec()).collect()
+        family
+            .response_transform()
+            .rows()
+            .into_iter()
+            .map(|r| r.to_vec())
+            .collect(),
     );
     payload.transformation_response_degree = Some(family.response_degree());
     payload.transformation_response_median = Some(family.response_median());
@@ -9465,6 +9505,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: Some(response_scale),
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             beta_link_wiggle: None,
@@ -9549,6 +9593,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: wiggle_knots,
             linkwiggle_degree: wiggle_degree,
             beta_link_wiggle,
@@ -9655,6 +9703,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: Some(wiggle_knots),
             linkwiggle_degree: Some(wiggle_degree),
             beta_link_wiggle: None,
@@ -10951,6 +11003,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             beta_link_wiggle: None,
@@ -11029,6 +11085,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             beta_link_wiggle: None,
@@ -11141,6 +11201,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             beta_link_wiggle: None,
@@ -11272,6 +11336,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             beta_link_wiggle: None,
@@ -12631,10 +12699,10 @@ mod tests {
         let beta_link_wiggle = (0..constrained_cols)
             .map(|j| match j % 5 {
                 0 => 0.2,
-                1 => -0.15,
+                1 => 0.15,
                 2 => 0.05,
                 3 => 0.1,
-                _ => -0.08,
+                _ => 0.08,
             })
             .collect::<Vec<_>>();
         let model = SavedModel::from_payload(FittedModelPayload {
@@ -12660,6 +12728,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: Some(knots),
             linkwiggle_degree: Some(3),
             beta_link_wiggle: Some(beta_link_wiggle.clone()),
@@ -12893,6 +12965,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             beta_link_wiggle: None,
@@ -12966,6 +13042,10 @@ mod tests {
             noise_scale: None,
             noise_non_intercept_start: None,
             gaussian_response_scale: None,
+            transformation_response_knots: None,
+            transformation_response_transform: None,
+            transformation_response_degree: None,
+            transformation_response_median: None,
             linkwiggle_knots: Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
             linkwiggle_degree: Some(2),
             beta_link_wiggle: None,
