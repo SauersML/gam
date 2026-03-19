@@ -1,7 +1,7 @@
-use crate::faer_ndarray::{fast_av, FaerArrayView};
+use crate::faer_ndarray::{FaerArrayView, fast_av};
 use crate::matrix::{BlockDesignOperator, DesignBlock, DesignMatrix, ReparamDesignOperator};
 use faer::prelude::SolveLstsq;
-use ndarray::{s, Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, s};
 use std::ops::Range;
 use std::sync::Arc;
 

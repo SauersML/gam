@@ -2450,10 +2450,10 @@ impl LinearOperator for ChunkedKernelDesignOperator {
         self.total_cols
     }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let k_eff = self.constraint_transform.as_ref().map_or(
-            self.centers.nrows(),
-            |z| z.ncols(),
-        );
+        let k_eff = self
+            .constraint_transform
+            .as_ref()
+            .map_or(self.centers.nrows(), |z| z.ncols());
         let v_kernel = vector.slice(s![..k_eff]);
         let mut result = Array1::<f64>::zeros(self.n);
         // Process in chunks to limit memory.
@@ -2471,10 +2471,10 @@ impl LinearOperator for ChunkedKernelDesignOperator {
         result
     }
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let k_eff = self.constraint_transform.as_ref().map_or(
-            self.centers.nrows(),
-            |z| z.ncols(),
-        );
+        let k_eff = self
+            .constraint_transform
+            .as_ref()
+            .map_or(self.centers.nrows(), |z| z.ncols());
         let mut result = Array1::<f64>::zeros(self.total_cols);
         // Kernel part: chunked accumulation of K^T v.
         for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
@@ -2514,10 +2514,10 @@ impl ChunkedKernelDesignOperator {
     /// Combined row chunk: [kernel_chunk | poly_chunk].
     fn row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
-        let k_eff = self.constraint_transform.as_ref().map_or(
-            self.centers.nrows(),
-            |z| z.ncols(),
-        );
+        let k_eff = self
+            .constraint_transform
+            .as_ref()
+            .map_or(self.centers.nrows(), |z| z.ncols());
         let kernel = self.kernel_chunk(rows.clone());
         let poly_cols = self.poly_basis.as_ref().map_or(0, |p| p.ncols());
         let mut combined = Array2::<f64>::zeros((chunk_n, k_eff + poly_cols));
@@ -4382,9 +4382,9 @@ impl DesignMatrix {
                 }
             }
             Self::Sparse(matrix) => {
-                let csr = matrix.to_csr_arc().unwrap_or_else(|| {
-                    panic!("DesignMatrix::dot_row: failed to obtain CSR view")
-                });
+                let csr = matrix
+                    .to_csr_arc()
+                    .unwrap_or_else(|| panic!("DesignMatrix::dot_row: failed to obtain CSR view"));
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();
@@ -4598,12 +4598,12 @@ impl DesignMatrix {
                 }
             }
             (Self::Sparse(lhs), Self::Sparse(rhs)) => {
-                let lhs_csr = lhs.to_csr_arc().unwrap_or_else(|| {
-                    panic!("row_outer_into: failed to obtain lhs CSR view")
-                });
-                let rhs_csr = rhs.to_csr_arc().unwrap_or_else(|| {
-                    panic!("row_outer_into: failed to obtain rhs CSR view")
-                });
+                let lhs_csr = lhs
+                    .to_csr_arc()
+                    .unwrap_or_else(|| panic!("row_outer_into: failed to obtain lhs CSR view"));
+                let rhs_csr = rhs
+                    .to_csr_arc()
+                    .unwrap_or_else(|| panic!("row_outer_into: failed to obtain rhs CSR view"));
                 let lhs_sym = lhs_csr.symbolic();
                 let rhs_sym = rhs_csr.symbolic();
                 let lhs_rp = lhs_sym.row_ptr();

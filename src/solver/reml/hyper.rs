@@ -203,10 +203,12 @@ impl<'a> RemlState<'a> {
                 "skipping tau hyper-coordinate construction (n={n_x}, p={p_x}): \
                  dense design materialization too large; falling back to rho-only REML"
             );
-            let identity_pair: Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync> =
-                Box::new(|_, _| super::unified::HyperCoordPair::zero());
-            let identity_pair2: Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync> =
-                Box::new(|_, _| super::unified::HyperCoordPair::zero());
+            let identity_pair: Box<
+                dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync,
+            > = Box::new(|_, _| super::unified::HyperCoordPair::zero());
+            let identity_pair2: Box<
+                dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync,
+            > = Box::new(|_, _| super::unified::HyperCoordPair::zero());
             return Ok((Vec::new(), identity_pair, identity_pair2));
         }
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {

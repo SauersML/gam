@@ -68,10 +68,12 @@ use gam::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
     append_zero_tail_columns, build_survival_baseline_offsets, build_survival_time_basis,
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
+    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     build_time_varying_survival_covariate_template, evaluate_survival_baseline,
-    normalize_survival_time_pair, parse_survival_baseline_config,
-    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, survival_baseline_targetname,
+    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
+    survival_baseline_targetname,
     survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
@@ -2251,13 +2253,27 @@ fn run_predict_survival(
         age_exit[i] = t1;
     }
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
-    let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
+    let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
     let saved_likelihood_mode = parse_survival_likelihood_mode(
         model
             .survival_likelihood
             .as_deref()
             .unwrap_or("transformation"),
     )?;
+    if matches!(
+        saved_likelihood_mode,
+        SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
+    ) {
+        let time_anchor = model
+            .survival_time_anchor
+            .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
+        let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &time_cfg)?;
+        center_survival_time_designs_at_anchor(
+            &mut time_build.x_entry_time,
+            &mut time_build.x_exit_time,
+            &time_anchor_row,
+        )?;
+    }
     if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
         && !baseline_timewiggle_is_present(model)
     {
@@ -2534,7 +2550,8 @@ fn run_predict_survival(
                 let q_i = q_exit[i];
                 let b_i = slope[i];
                 let slope_grad_scale = q_i * b_i / c_i + z[i];
-                let mut grad = Array1::<f64>::zeros(beta_time.len() + beta_marginal.len() + beta_slope.len());
+                let mut grad =
+                    Array1::<f64>::zeros(beta_time.len() + beta_marginal.len() + beta_slope.len());
                 let mut cursor = 0usize;
                 grad.slice_mut(s![cursor..cursor + beta_time.len()])
                     .assign(&(&time_build.x_exit_time.row(i).to_owned() * c_i));
@@ -2542,9 +2559,11 @@ fn run_predict_survival(
                 grad.slice_mut(s![cursor..cursor + beta_marginal.len()])
                     .assign(&(&cov_design.design.row_chunk(i..i + 1).row(0).to_owned() * c_i));
                 cursor += beta_marginal.len();
-                grad.slice_mut(s![cursor..cursor + beta_slope.len()]).assign(
-                    &(&logslope_design.design.row_chunk(i..i + 1).row(0).to_owned() * slope_grad_scale),
-                );
+                grad.slice_mut(s![cursor..cursor + beta_slope.len()])
+                    .assign(
+                        &(&logslope_design.design.row_chunk(i..i + 1).row(0).to_owned()
+                            * slope_grad_scale),
+                    );
                 eta_var[i] = grad.dot(&cov_mat.dot(&grad)).max(0.0);
             }
             let eta_se = eta_var.mapv(f64::sqrt);
@@ -3519,6 +3538,39 @@ fn build_survival_feasible_initial_beta(
     beta
 }
 
+fn resolved_survival_time_basis_config_from_build(
+    basisname: &str,
+    degree: Option<usize>,
+    knots: Option<&Vec<f64>>,
+    keep_cols: Option<&Vec<usize>>,
+    smooth_lambda: Option<f64>,
+) -> Result<SurvivalTimeBasisConfig, String> {
+    match basisname {
+        "none" => Ok(SurvivalTimeBasisConfig::None),
+        "linear" => Ok(SurvivalTimeBasisConfig::Linear),
+        "bspline" => Ok(SurvivalTimeBasisConfig::BSpline {
+            degree: degree.ok_or_else(|| "survival bspline basis is missing degree".to_string())?,
+            knots: Array1::from_vec(
+                knots.cloned()
+                    .ok_or_else(|| "survival bspline basis is missing knots".to_string())?,
+            ),
+            smooth_lambda: smooth_lambda.unwrap_or(1e-2),
+        }),
+        "ispline" => Ok(SurvivalTimeBasisConfig::ISpline {
+            degree: degree.ok_or_else(|| "survival ispline basis is missing degree".to_string())?,
+            knots: Array1::from_vec(
+                knots.cloned()
+                    .ok_or_else(|| "survival ispline basis is missing knots".to_string())?,
+            ),
+            keep_cols: keep_cols
+                .cloned()
+                .ok_or_else(|| "survival ispline basis is missing keep_cols".to_string())?,
+            smooth_lambda: smooth_lambda.unwrap_or(1e-2),
+        }),
+        other => Err(format!("unsupported survival time basis '{other}'")),
+    }
+}
+
 fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
     model.has_baseline_time_wiggle()
 }
@@ -3915,6 +3967,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_args.ridge_lambda,
         )),
     )?;
+    let time_anchor = resolve_survival_time_anchor_value(&age_entry, args.survival_time_anchor)?;
+    let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &resolved_time_cfg)?;
     progress.advance_workflow(2);
     if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         require_structural_survival_time_basis(&time_build.basisname, "survival fitting")?;
@@ -3922,6 +3983,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut time_design_entry = time_build.x_entry_time.clone();
     let mut time_design_exit = time_build.x_exit_time.clone();
     let mut time_design_derivative_exit = time_build.x_derivative_time.clone();
+    center_survival_time_designs_at_anchor(
+        &mut time_design_entry,
+        &mut time_design_exit,
+        &time_anchor_row,
+    )?;
     let mut time_penalties = time_build.penalties.clone();
     let mut time_nullspace_dims = time_build.nullspace_dims.clone();
     let mut timewiggle_block = None;
@@ -4003,7 +4069,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 weights: weights.clone(),
                 inverse_link,
                 derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-                time_anchor: args.survival_time_anchor,
+                time_anchor: Some(time_anchor),
                 max_iter: 400,
                 tol: 1e-6,
                 time_block: TimeBlockInput {
@@ -4132,6 +4198,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_time_knots = time_build.knots.clone();
             payload.survival_time_keep_cols = time_build.keep_cols.clone();
             payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+            payload.survival_time_anchor = Some(time_anchor);
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
@@ -4326,6 +4393,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_time_knots = time_build.knots.clone();
             payload.survival_time_keep_cols = time_build.keep_cols.clone();
             payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+            payload.survival_time_anchor = Some(time_anchor);
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
@@ -4893,7 +4961,18 @@ fn run_sample_survival(
         event_target[i] = if data[[i, event_col]] >= 0.5 { 1 } else { 0 };
     }
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
-    let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
+    let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
+    if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        let time_anchor = model
+            .survival_time_anchor
+            .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
+        let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &time_cfg)?;
+        center_survival_time_designs_at_anchor(
+            &mut time_build.x_entry_time,
+            &mut time_build.x_exit_time,
+            &time_anchor_row,
+        )?;
+    }
     let baseline_cfg = survival_baseline_config_from_model(model)?;
     let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
@@ -8720,8 +8799,7 @@ mod tests {
         parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
         required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
-        saved_linkwiggle_design, summarizewiggle_domain,
-        validate_cli_firth_configuration,
+        saved_linkwiggle_design, summarizewiggle_domain, validate_cli_firth_configuration,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use super::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
@@ -10684,10 +10762,18 @@ mod tests {
 
     #[test]
     fn structural_survival_basis_detection_is_ispline_only() {
-        assert!(gam::survival_construction::survival_basis_supports_structural_monotonicity("ispline"));
-        assert!(gam::survival_construction::survival_basis_supports_structural_monotonicity("ISPLINE"));
-        assert!(!gam::survival_construction::survival_basis_supports_structural_monotonicity("linear"));
-        assert!(!gam::survival_construction::survival_basis_supports_structural_monotonicity("bspline"));
+        assert!(
+            gam::survival_construction::survival_basis_supports_structural_monotonicity("ispline")
+        );
+        assert!(
+            gam::survival_construction::survival_basis_supports_structural_monotonicity("ISPLINE")
+        );
+        assert!(
+            !gam::survival_construction::survival_basis_supports_structural_monotonicity("linear")
+        );
+        assert!(
+            !gam::survival_construction::survival_basis_supports_structural_monotonicity("bspline")
+        );
     }
 
     #[test]

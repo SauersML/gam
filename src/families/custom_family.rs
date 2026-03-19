@@ -5661,6 +5661,12 @@ fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static
     ))
 }
 
+fn normalize_outer_eval_error_detail(error: &str) -> &str {
+    error
+        .strip_prefix("custom-family invalid input: ")
+        .unwrap_or(error)
+}
+
 #[cfg(test)]
 fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -7419,7 +7425,12 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .state
         .last_error
         .as_ref()
-        .map(|e| format!(" last objective error: {e}"))
+        .map(|e| {
+            format!(
+                " last objective error: {}",
+                normalize_outer_eval_error_detail(e)
+            )
+        })
         .unwrap_or_default();
 
     let outer_result = outer_result.map_err(|e| {

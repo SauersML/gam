@@ -12,7 +12,7 @@ use crate::custom_family::{
     shared_dense_arc, should_materialize_custom_family_psi_dense, weighted_crossprod_psi_maps,
     wrap_spatial_implicit_psi_operator,
 };
-use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_xt_diag_x, rrqr_nullspace_basis};
+use crate::faer_ndarray::fast_xt_diag_x;
 use crate::families::bernoulli_marginal_slope::erfcx_nonnegative;
 use crate::families::gamlss::{
     SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
@@ -500,16 +500,30 @@ pub struct TimeBlockInput {
     pub initial_beta: Option<Array1<f64>>,
 }
 
-pub(crate) fn structural_nonnegative_constraints(
-    lift: &Array2<f64>,
-) -> Option<LinearInequalityConstraints> {
-    if lift.ncols() == 0 {
-        return None;
+pub(crate) fn time_derivative_lower_bound_constraints(
+    design_derivative_exit: &Array2<f64>,
+    derivative_offset_exit: &Array1<f64>,
+    lower_bound: f64,
+) -> Result<Option<LinearInequalityConstraints>, String> {
+    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
+        return Err(format!(
+            "time derivative constraints require matching rows/offsets: rows={}, offsets={}",
+            design_derivative_exit.nrows(),
+            derivative_offset_exit.len()
+        ));
     }
-    Some(LinearInequalityConstraints {
-        a: lift.clone(),
-        b: Array1::zeros(lift.nrows()),
-    })
+    if design_derivative_exit.ncols() == 0 {
+        return Ok(None);
+    }
+    if !lower_bound.is_finite() {
+        return Err(format!(
+            "time derivative lower bound must be finite, got {lower_bound}"
+        ));
+    }
+    Ok(Some(LinearInequalityConstraints {
+        a: design_derivative_exit.clone(),
+        b: derivative_offset_exit.mapv(|offset| lower_bound - offset),
+    }))
 }
 
 #[derive(Clone)]
@@ -3169,10 +3183,13 @@ fn prepare_survival_location_scale_model(
 ) -> Result<PreparedSurvivalLocationScaleModel, String> {
     validate_survival_location_scale_spec(spec)?;
     let n = spec.event_target.len();
-    let anchorrow = select_anchorrow(&spec.age_entry, spec.time_anchor)?;
     let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
-    let mut time_prepared =
-        prepare_identified_time_block(&spec.time_block, anchorrow, protected_timewiggle_cols)?;
+    let mut time_prepared = prepare_identified_time_block(
+        &spec.time_block,
+        0,
+        protected_timewiggle_cols,
+        spec.derivative_guard,
+    )?;
 
     if time_prepared.initial_beta.is_none() {
         let deriv_offset_max = spec
@@ -3705,8 +3722,9 @@ fn project_onto_linear_constraints(
 
 fn prepare_identified_time_block(
     input: &TimeBlockInput,
-    anchorrow: usize,
-    protected_tail_cols: usize,
+    _anchorrow: usize,
+    _protected_tail_cols: usize,
+    _derivative_guard: f64,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
     if !input.structural_monotonicity {
@@ -3715,79 +3733,13 @@ fn prepare_identified_time_block(
                 .to_string(),
         );
     }
-    if p < 2 {
-        return Err(format!(
-            "time_block needs at least 2 columns for identifiability, got {p}"
-        ));
-    }
-    if anchorrow >= input.design_exit.nrows() {
-        return Err(format!(
-            "time_block anchor row out of bounds: got {anchorrow}, nrows={}",
-            input.design_exit.nrows()
-        ));
-    }
-    if protected_tail_cols >= p {
-        return Err(format!(
-            "timewiggle tail columns must be smaller than full time block: tail={}, total={p}",
-            protected_tail_cols
-        ));
-    }
-    let p_base = p - protected_tail_cols;
-    if p_base < 2 {
-        return Err(format!(
-            "time_block needs at least 2 non-timewiggle columns for identifiability, got {p_base}"
-        ));
-    }
-
-    // Identifiability: enforce h(t_anchor)=0 by constraining c^T beta = 0,
-    // where c is the time basis row at anchor time. Reparameterize beta = Z theta
-    // with columns of Z spanning null(c^T), so the constraint is exact for all theta.
-    //
-    // When entry times are degenerate (no left truncation, all entry = 0),
-    // the entry design row is all zeros (I-splines = 0 at the left boundary),
-    // making the constraint trivial. Fall back to the exit design row,
-    // which always has non-trivial basis values.
-    let c_entry = input.design_entry.slice(s![anchorrow, 0..p_base]);
-    let entry_norm = c_entry.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    let c = if entry_norm > 1e-12 {
-        c_entry.to_owned()
-    } else {
-        input.design_exit.slice(s![anchorrow, 0..p_base]).to_owned()
-    };
-    let c_col = c.view().insert_axis(Axis(1)).to_owned();
-    let (z_base, rank) = rrqr_nullspace_basis(&c_col, default_rrqr_rank_alpha())
-        .map_err(|e| format!("time_block identifiability RRQR failed: {e}"))?;
-    if rank >= p_base || z_base.ncols() == 0 {
-        return Err(
-            "time_block identifiability constraint removed all columns; add richer time basis"
-                .to_string(),
-        );
-    }
-    let z = if protected_tail_cols == 0 {
-        z_base
-    } else {
-        let reduced_p = z_base.ncols() + protected_tail_cols;
-        let mut z_full = Array2::<f64>::zeros((p, reduced_p));
-        z_full
-            .slice_mut(s![0..p_base, 0..z_base.ncols()])
-            .assign(&z_base);
-        for j in 0..protected_tail_cols {
-            z_full[[p_base + j, z_base.ncols() + j]] = 1.0;
-        }
-        z_full
-    };
-    let design_entry = input.design_entry.dot(&z);
-    let design_exit = input.design_exit.dot(&z);
-    let design_derivative_exit = input.design_derivative_exit.dot(&z);
-    let penalties = input
-        .penalties
-        .iter()
-        .map(|s| z.t().dot(s).dot(&z))
-        .collect::<Vec<_>>();
-    let linear_constraints = structural_nonnegative_constraints(&z);
+    let design_entry = input.design_entry.clone();
+    let design_exit = input.design_exit.clone();
+    let design_derivative_exit = input.design_derivative_exit.clone();
+    let penalties = input.penalties.clone();
+    let linear_constraints = monotone_wiggle_nonnegative_constraints(p);
     let initial_beta = linear_constraints.as_ref().map(|constraints| {
-        let reduced = input.initial_beta.as_ref().map(|b| z.t().dot(b));
-        project_onto_linear_constraints(z.ncols(), constraints, reduced.as_ref())
+        project_onto_linear_constraints(p, constraints, input.initial_beta.as_ref())
     });
 
     Ok(TimeBlockPrepared {
@@ -3797,7 +3749,7 @@ fn prepare_identified_time_block(
         linear_constraints,
         penalties,
         initial_beta,
-        transform: TimeIdentifiabilityTransform { z },
+        transform: TimeIdentifiabilityTransform { z: Array2::eye(p) },
     })
 }
 
@@ -3814,37 +3766,6 @@ fn initial_log_lambdas<T>(
         ));
     }
     Ok(rho)
-}
-
-fn select_anchorrow(age_entry: &Array1<f64>, time_anchor: Option<f64>) -> Result<usize, String> {
-    if age_entry.is_empty() {
-        return Err("select_anchorrow: empty age_entry".to_string());
-    }
-    match time_anchor {
-        None => age_entry
-            .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i)
-            .ok_or_else(|| "select_anchorrow: failed to select earliest entry".to_string()),
-        Some(t_anchor) => {
-            if !t_anchor.is_finite() {
-                return Err(format!(
-                    "fit_survival_location_scale: non-finite time_anchor {t_anchor}"
-                ));
-            }
-            age_entry
-                .iter()
-                .enumerate()
-                .min_by(|a, b| {
-                    let da = (a.1 - t_anchor).abs();
-                    let db = (b.1 - t_anchor).abs();
-                    da.total_cmp(&db)
-                })
-                .map(|(i, _)| i)
-                .ok_or_else(|| "select_anchorrow: failed to select nearest entry".to_string())
-        }
-    }
 }
 
 fn weighted_crossprod_dense(
@@ -8657,7 +8578,12 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_linear_constraints: structural_nonnegative_constraints(&Array2::eye(1)),
+            time_linear_constraints: time_derivative_lower_bound_constraints(
+                &array![[1.0], [1.0], [1.0]],
+                &Array1::zeros(3),
+                1e-8,
+            )
+            .expect("time derivative constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
                 [1.0],
                 [0.4],
@@ -8910,7 +8836,13 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(&time_block, 0, 0).expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            0,
+            0,
+            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+        )
+        .expect("prepare time block");
         let entry_anchorrow = prepared.design_entry.row(0);
         let entry_max_abs = entry_anchorrow
             .iter()
@@ -8953,7 +8885,13 @@ mod tests {
             initial_beta: None,
         };
 
-        let prepared = prepare_identified_time_block(&time_block, 0, 0).expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            0,
+            0,
+            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+        )
+        .expect("prepare time block");
         let p = time_block.design_entry.ncols();
 
         assert_eq!(
@@ -8979,6 +8917,35 @@ mod tests {
     }
 
     #[test]
+    fn identified_time_block_constraints_match_transformed_derivative_guard() {
+        let derivative_guard = 1e-4;
+        let derivative_offset_exit = array![2.0e-5, 4.0e-5, 6.0e-5];
+        let time_block = TimeBlockInput {
+            design_entry: array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]],
+            design_exit: array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]],
+            design_derivative_exit: array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]],
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: derivative_offset_exit.clone(),
+            structural_monotonicity: true,
+            penalties: vec![Array2::eye(3)],
+            nullspace_dims: vec![],
+            initial_log_lambdas: None,
+            initial_beta: None,
+        };
+        let prepared = prepare_identified_time_block(&time_block, 0, 0, derivative_guard)
+            .expect("prepare time block");
+        let constraints = prepared
+            .linear_constraints
+            .expect("time derivative constraints");
+        assert_eq!(constraints.a, prepared.design_derivative_exit);
+        assert_eq!(
+            constraints.b,
+            derivative_offset_exit.mapv(|offset| derivative_guard - offset),
+        );
+    }
+
+    #[test]
     fn identified_time_block_degenerate_entry_uses_exit_design() {
         // When entry design row is all zeros (degenerate entry times),
         // the identifiability constraint should fall back to the exit design.
@@ -8998,7 +8965,13 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(&time_block, 0, 0).expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            0,
+            0,
+            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+        )
+        .expect("prepare time block");
         // With a non-trivial exit design row, one dimension should be removed.
         assert_eq!(
             prepared.design_exit.ncols(),
@@ -10792,7 +10765,12 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_linear_constraints: structural_nonnegative_constraints(&Array2::eye(2)),
+            time_linear_constraints: time_derivative_lower_bound_constraints(
+                &x_deriv,
+                &offset_deriv,
+                DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+            )
+            .expect("time derivative constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),
@@ -10936,7 +10914,12 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_linear_constraints: structural_nonnegative_constraints(&Array2::eye(1)),
+            time_linear_constraints: time_derivative_lower_bound_constraints(
+                &Array2::ones((n, 1)),
+                &Array1::zeros(n),
+                DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+            )
+            .expect("time derivative constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),
