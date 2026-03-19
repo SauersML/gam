@@ -2964,7 +2964,6 @@ impl BernoulliMarginalSlopeFamily {
         let has_hw = primary.h.is_some() || primary.w.is_some();
 
         if can_operatorize {
-            #[allow(clippy::type_complexity)]
             type OpAcc = (
                 f64,
                 Array1<f64>,
