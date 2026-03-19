@@ -9,22 +9,20 @@
 //! These are the building blocks a library consumer needs to construct
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2, array, s};
 
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
     KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
 use crate::families::gamlss::{
-    WiggleBlockConfig, append_selected_wiggle_penalty_orders,
-    buildwiggle_block_input_from_seed, monotone_wiggle_basis_with_derivative_order,
-    split_wiggle_penalty_orders,
+    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
+    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
 };
 use crate::families::survival_location_scale::{
     ResidualDistribution, SurvivalCovariateTermBlockTemplate,
 };
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
-
 
 // ---------------------------------------------------------------------------
 // Types
@@ -810,6 +808,117 @@ pub fn build_survival_time_basis(
             })
         }
     }
+}
+
+pub fn resolve_survival_time_anchor_value(
+    age_entry: &Array1<f64>,
+    time_anchor: Option<f64>,
+) -> Result<f64, String> {
+    if age_entry.is_empty() {
+        return Err("survival time anchor requires non-empty entry times".to_string());
+    }
+    let anchor = match time_anchor {
+        Some(t_anchor) => {
+            if !t_anchor.is_finite() || t_anchor < 0.0 {
+                return Err(format!(
+                    "survival time anchor must be finite and non-negative, got {t_anchor}"
+                ));
+            }
+            t_anchor
+        }
+        None => age_entry
+            .iter()
+            .copied()
+            .min_by(f64::total_cmp)
+            .ok_or_else(|| "failed to select survival time anchor".to_string())?,
+    };
+    Ok(anchor.max(SURVIVAL_TIME_FLOOR))
+}
+
+pub fn evaluate_survival_time_basis_row(
+    age: f64,
+    cfg: &SurvivalTimeBasisConfig,
+) -> Result<Array1<f64>, String> {
+    if !age.is_finite() || age < 0.0 {
+        return Err(format!(
+            "survival time basis row requires finite non-negative age, got {age}"
+        ));
+    }
+    let age = age.max(SURVIVAL_TIME_FLOOR);
+    let log_age = array![age.ln()];
+    match cfg {
+        SurvivalTimeBasisConfig::None => Ok(Array1::zeros(0)),
+        SurvivalTimeBasisConfig::Linear => Ok(array![1.0, age.ln()]),
+        SurvivalTimeBasisConfig::BSpline { degree, knots, .. } => {
+            if knots.is_empty() {
+                return Err(
+                    "survival BSpline anchor evaluation requires resolved knot metadata".to_string(),
+                );
+            }
+            let built = build_bspline_basis_1d(
+                log_age.view(),
+                &BSplineBasisSpec {
+                    degree: *degree,
+                    penalty_order: 2,
+                    knotspec: BSplineKnotSpec::Provided(knots.clone()),
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::None,
+                },
+            )
+            .map_err(|e| format!("failed to evaluate survival bspline anchor row: {e}"))?;
+            Ok(built.design.to_dense().row(0).to_owned())
+        }
+        SurvivalTimeBasisConfig::ISpline {
+            degree,
+            knots,
+            keep_cols,
+            ..
+        } => {
+            if knots.is_empty() {
+                return Err(
+                    "survival ISpline anchor evaluation requires resolved knot metadata".to_string(),
+                );
+            }
+            let (basis_arc, _) = create_basis::<Dense>(
+                log_age.view(),
+                KnotSource::Provided(knots.view()),
+                *degree,
+                BasisOptions::i_spline(),
+            )
+            .map_err(|e| format!("failed to evaluate survival ispline anchor row: {e}"))?;
+            let basis = basis_arc.as_ref();
+            let row = basis.row(0);
+            if keep_cols.is_empty() {
+                return Ok(row.to_owned());
+            }
+            if keep_cols.iter().any(|&j| j >= row.len()) {
+                return Err("survival ISpline anchor keep_cols exceed basis width".to_string());
+            }
+            Ok(Array1::from_iter(keep_cols.iter().map(|&j| row[j])))
+        }
+    }
+}
+
+pub fn center_survival_time_designs_at_anchor(
+    design_entry: &mut Array2<f64>,
+    design_exit: &mut Array2<f64>,
+    anchor_row: &Array1<f64>,
+) -> Result<(), String> {
+    if design_entry.ncols() != anchor_row.len() || design_exit.ncols() != anchor_row.len() {
+        return Err(format!(
+            "survival time anchoring column mismatch: entry={}, exit={}, anchor={}",
+            design_entry.ncols(),
+            design_exit.ncols(),
+            anchor_row.len()
+        ));
+    }
+    for mut row in design_entry.rows_mut() {
+        row -= &anchor_row.view();
+    }
+    for mut row in design_exit.rows_mut() {
+        row -= &anchor_row.view();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -1505,58 +1505,58 @@ impl<'a> RemlState<'a> {
                     firth_p,
                 );
             } else {
-            let x_dense = pirls_result
+                let x_dense = pirls_result
                 .x_transformed
                 .try_to_dense_arc(
                     "dense REML eval bundle requires dense transformed design for Firth operator",
                 )
                 .map_err(EstimationError::InvalidInput)?;
-            let firth_build_start = std::time::Instant::now();
-            let firth_op = Arc::new(Self::build_firth_dense_operator(
-                x_dense.as_ref(),
-                &pirls_result.final_eta,
-                self.weights,
-            )?);
-            log::info!(
-                "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
-                firth_op.x_dense.nrows(),
-                firth_op.x_dense.ncols(),
-                firth_op.k_reduced.nrows(),
-                firth_op.half_log_det,
-                firth_build_start.elapsed().as_secs_f64(),
-            );
-            // Firth-adjusted inner Jacobian for implicit differentiation:
-            //   H_total = Xᵀ W X + S - H_φ,
-            //   H_φ     = ∇²_β Φ
-            //          = 0.5 [ Xᵀ diag(w'' ⊙ h) X - Bᵀ P B ].
-            // This keeps B_k/B_{kl} solves on the same objective surface as
-            // the Firth-augmented stationarity system.
-            //
-            // Conceptually Φ is the pseudodeterminant term 0.5 log|XᵀWX|_+.
-            // The hphi block below is therefore the curvature of that
-            // identifiable-subspace Jeffreys penalty, represented in the
-            // current transformed basis.
-            let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
-            let diag_term = Self::xt_diag_x_dense_into(
-                &firth_op.x_dense,
-                &(&firth_op.w2 * &firth_op.h_diag),
-                &mut weighted_xtdx,
-            );
-            let bpb = fast_ab(&firth_op.b_base.t().to_owned(), &firth_op.p_b_base);
-            let mut hphi = 0.5 * (diag_term - bpb);
-            // Numerical symmetry guard.
-            for i in 0..hphi.nrows() {
-                for j in 0..i {
-                    let avg = 0.5 * (hphi[[i, j]] + hphi[[j, i]]);
-                    hphi[[i, j]] = avg;
-                    hphi[[j, i]] = avg;
+                let firth_build_start = std::time::Instant::now();
+                let firth_op = Arc::new(Self::build_firth_dense_operator(
+                    x_dense.as_ref(),
+                    &pirls_result.final_eta,
+                    self.weights,
+                )?);
+                log::info!(
+                    "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
+                    firth_op.x_dense.nrows(),
+                    firth_op.x_dense.ncols(),
+                    firth_op.k_reduced.nrows(),
+                    firth_op.half_log_det,
+                    firth_build_start.elapsed().as_secs_f64(),
+                );
+                // Firth-adjusted inner Jacobian for implicit differentiation:
+                //   H_total = Xᵀ W X + S - H_φ,
+                //   H_φ     = ∇²_β Φ
+                //          = 0.5 [ Xᵀ diag(w'' ⊙ h) X - Bᵀ P B ].
+                // This keeps B_k/B_{kl} solves on the same objective surface as
+                // the Firth-augmented stationarity system.
+                //
+                // Conceptually Φ is the pseudodeterminant term 0.5 log|XᵀWX|_+.
+                // The hphi block below is therefore the curvature of that
+                // identifiable-subspace Jeffreys penalty, represented in the
+                // current transformed basis.
+                let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
+                let diag_term = Self::xt_diag_x_dense_into(
+                    &firth_op.x_dense,
+                    &(&firth_op.w2 * &firth_op.h_diag),
+                    &mut weighted_xtdx,
+                );
+                let bpb = fast_ab(&firth_op.b_base.t().to_owned(), &firth_op.p_b_base);
+                let mut hphi = 0.5 * (diag_term - bpb);
+                // Numerical symmetry guard.
+                for i in 0..hphi.nrows() {
+                    for j in 0..i {
+                        let avg = 0.5 * (hphi[[i, j]] + hphi[[j, i]]);
+                        hphi[[i, j]] = avg;
+                        hphi[[j, i]] = avg;
+                    }
                 }
-            }
-            // Keep tiny numerical noise from making the solve surface less stable.
-            if hphi.iter().all(|v| v.is_finite()) {
-                h_total -= &hphi;
-            }
-            firth_dense_operator = Some(firth_op);
+                // Keep tiny numerical noise from making the solve surface less stable.
+                if hphi.iter().all(|v| v.is_finite()) {
+                    h_total -= &hphi;
+                }
+                firth_dense_operator = Some(firth_op);
             } // else (not too large for Firth)
         }
 

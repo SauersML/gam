@@ -200,7 +200,9 @@ impl DeviationRuntime {
         let (left, right) = self.support_interval()?;
         let samples_per_span = per_span.max(3);
         let mut pts = Vec::new();
-        let active_knots = &self.knots.slice(s![self.degree..=self.knots.len() - self.degree - 1]);
+        let active_knots = &self
+            .knots
+            .slice(s![self.degree..=self.knots.len() - self.degree - 1]);
         let mut span_added = false;
         for window in active_knots.windows(2) {
             let lo = window[0].max(left);
@@ -577,7 +579,6 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
             + 6.0 * lambda.powi(3));
     (weight * k1, weight * k2, weight * k3, weight * k4)
 }
-
 
 pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     let s = x.max(1e-300).sqrt();
@@ -1021,9 +1022,8 @@ impl BernoulliMarginalSlopeFamily {
         // Add a dense grid over the full support interval so the
         // derivative constraint is practically global.
         let dense = runtime.dense_constraint_grid(4)?;
-        let points = runtime.supported_unique_values_from_iter(
-            values.into_iter().chain(dense.iter().copied()),
-        )?;
+        let points = runtime
+            .supported_unique_values_from_iter(values.into_iter().chain(dense.iter().copied()))?;
         if points.is_empty() {
             return Ok(None);
         }
@@ -1900,8 +1900,16 @@ impl BernoulliMarginalSlopeFamily {
         primary: &PrimarySlices,
         primary_hessian: &Array2<f64>,
     ) {
-        let x_row = self.marginal_design.row_chunk(row..row + 1).row(0).to_owned();
-        let g_row = self.logslope_design.row_chunk(row..row + 1).row(0).to_owned();
+        let x_row = self
+            .marginal_design
+            .row_chunk(row..row + 1)
+            .row(0)
+            .to_owned();
+        let g_row = self
+            .logslope_design
+            .row_chunk(row..row + 1)
+            .row(0)
+            .to_owned();
         let xx = x_row
             .view()
             .insert_axis(Axis(1))
@@ -2319,8 +2327,12 @@ impl BernoulliMarginalSlopeFamily {
                             })?;
                         acc.0 += f_pi.dot(&dir);
                         acc.1 += &(left_vec.clone() * f_pi[idx_primary]);
-                        acc.1 += &self
-                            .pullback_primary_vector(row, slices, primary, &f_pipi.dot(&dir))?;
+                        acc.1 += &self.pullback_primary_vector(
+                            row,
+                            slices,
+                            primary,
+                            &f_pipi.dot(&dir),
+                        )?;
 
                         let right_vec = self.pullback_primary_vector(
                             row,
@@ -2400,185 +2412,203 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                    let Some(dir_i) = self.row_primary_psi_direction(
-                        row,
-                        block_states,
-                        derivative_blocks,
-                        psi_i,
-                        primary,
-                    )?
-                    else {
-                        continue;
-                    };
-                    let Some(dir_j) = self.row_primary_psi_direction(
-                        row,
-                        block_states,
-                        derivative_blocks,
-                        psi_j,
-                        primary,
-                    )?
-                    else {
-                        continue;
-                    };
-                    let dir_ij = self
-                        .row_primary_psi_second_direction(
+                        let Some(dir_i) = self.row_primary_psi_direction(
                             row,
                             block_states,
                             derivative_blocks,
                             psi_i,
+                            primary,
+                        )?
+                        else {
+                            continue;
+                        };
+                        let Some(dir_j) = self.row_primary_psi_direction(
+                            row,
+                            block_states,
+                            derivative_blocks,
                             psi_j,
                             primary,
                         )?
-                        .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
-                    let row_ctx = self.build_row_exact_context(
-                        row,
-                        block_states,
-                        &cache.h_nodes,
-                        cache.score_warp_obs.as_ref(),
-                    )?;
-                    let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
-                        row,
-                        block_states,
-                        primary,
-                        &row_ctx,
-                        &cache.h_nodes,
-                        cache.h_node_design.as_ref(),
-                        cache.score_warp_obs.as_ref(),
-                    )?;
-                    let third_i = self.row_primary_third_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &dir_i,
-                    )?;
-                    let third_j = self.row_primary_third_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &dir_j,
-                    )?;
-                    let fourth = self.row_primary_fourth_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &dir_i,
-                        &dir_j,
-                    )?;
-                    let (_, left_i) = self
-                        .embedded_psi_vector(row, slices, derivative_blocks, psi_i)?
-                        .ok_or_else(|| {
-                            "missing bernoulli marginal-slope psi_i vector".to_string()
-                        })?;
-                    let (_, left_j) = self
-                        .embedded_psi_vector(row, slices, derivative_blocks, psi_j)?
-                        .ok_or_else(|| {
-                            "missing bernoulli marginal-slope psi_j vector".to_string()
-                        })?;
-                    let left_ij = self
-                        .embedded_psi_second_vector(row, slices, derivative_blocks, psi_i, psi_j)?
-                        .map(|(_, v)| v)
-                        .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
-
-                    acc.0 += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
-                    if left_ij.iter().any(|v| v.abs() > 0.0) {
-                        let idx_ij = if left_ij
-                            .slice(s![slices.marginal.clone()])
-                            .iter()
-                            .any(|v| v.abs() > 0.0)
-                        {
-                            0
-                        } else {
-                            1
+                        else {
+                            continue;
                         };
-                        acc.1 += &(left_ij.clone() * f_pi[idx_ij]);
-                    }
-                    acc.1 += &(left_i.clone() * f_pipi.row(idx_i).dot(&dir_j));
-                    acc.1 += &(left_j.clone() * f_pipi.row(idx_j).dot(&dir_i));
-                    acc.1 += &self
-                        .pullback_primary_vector(row, slices, primary, &f_pipi.dot(&dir_ij))?;
-                    acc.1 += &self
-                        .pullback_primary_vector(row, slices, primary, &third_i.dot(&dir_j))?;
+                        let dir_ij = self
+                            .row_primary_psi_second_direction(
+                                row,
+                                block_states,
+                                derivative_blocks,
+                                psi_i,
+                                psi_j,
+                                primary,
+                            )?
+                            .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
+                        let row_ctx = self.build_row_exact_context(
+                            row,
+                            block_states,
+                            &cache.h_nodes,
+                            cache.score_warp_obs.as_ref(),
+                        )?;
+                        let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                            row,
+                            block_states,
+                            primary,
+                            &row_ctx,
+                            &cache.h_nodes,
+                            cache.h_node_design.as_ref(),
+                            cache.score_warp_obs.as_ref(),
+                        )?;
+                        let third_i = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &dir_i,
+                        )?;
+                        let third_j = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &dir_j,
+                        )?;
+                        let fourth = self.row_primary_fourth_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &dir_i,
+                            &dir_j,
+                        )?;
+                        let (_, left_i) = self
+                            .embedded_psi_vector(row, slices, derivative_blocks, psi_i)?
+                            .ok_or_else(|| {
+                                "missing bernoulli marginal-slope psi_i vector".to_string()
+                            })?;
+                        let (_, left_j) = self
+                            .embedded_psi_vector(row, slices, derivative_blocks, psi_j)?
+                            .ok_or_else(|| {
+                                "missing bernoulli marginal-slope psi_j vector".to_string()
+                            })?;
+                        let left_ij = self
+                            .embedded_psi_second_vector(
+                                row,
+                                slices,
+                                derivative_blocks,
+                                psi_i,
+                                psi_j,
+                            )?
+                            .map(|(_, v)| v)
+                            .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
 
-                    if left_ij.iter().any(|v| v.abs() > 0.0) {
-                        let idx_ij = if left_ij
-                            .slice(s![slices.marginal.clone()])
-                            .iter()
-                            .any(|v| v.abs() > 0.0)
-                        {
-                            0
-                        } else {
-                            1
-                        };
-                        let right_ij = self.pullback_primary_vector(
+                        acc.0 += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
+                        if left_ij.iter().any(|v| v.abs() > 0.0) {
+                            let idx_ij = if left_ij
+                                .slice(s![slices.marginal.clone()])
+                                .iter()
+                                .any(|v| v.abs() > 0.0)
+                            {
+                                0
+                            } else {
+                                1
+                            };
+                            acc.1 += &(left_ij.clone() * f_pi[idx_ij]);
+                        }
+                        acc.1 += &(left_i.clone() * f_pipi.row(idx_i).dot(&dir_j));
+                        acc.1 += &(left_j.clone() * f_pipi.row(idx_j).dot(&dir_i));
+                        acc.1 += &self.pullback_primary_vector(
                             row,
                             slices,
                             primary,
-                            &f_pipi.row(idx_ij).to_owned(),
+                            &f_pipi.dot(&dir_ij),
                         )?;
-                        acc.2 += &left_ij
+                        acc.1 += &self.pullback_primary_vector(
+                            row,
+                            slices,
+                            primary,
+                            &third_i.dot(&dir_j),
+                        )?;
+
+                        if left_ij.iter().any(|v| v.abs() > 0.0) {
+                            let idx_ij = if left_ij
+                                .slice(s![slices.marginal.clone()])
+                                .iter()
+                                .any(|v| v.abs() > 0.0)
+                            {
+                                0
+                            } else {
+                                1
+                            };
+                            let right_ij = self.pullback_primary_vector(
+                                row,
+                                slices,
+                                primary,
+                                &f_pipi.row(idx_ij).to_owned(),
+                            )?;
+                            acc.2 += &left_ij
+                                .view()
+                                .insert_axis(Axis(1))
+                                .dot(&right_ij.view().insert_axis(Axis(0)));
+                            acc.2 += &right_ij
+                                .view()
+                                .insert_axis(Axis(1))
+                                .dot(&left_ij.view().insert_axis(Axis(0)));
+                        }
+
+                        let scalar_ij = f_pipi[[idx_i, idx_j]];
+                        acc.2 += &(left_i
                             .view()
                             .insert_axis(Axis(1))
-                            .dot(&right_ij.view().insert_axis(Axis(0)));
-                        acc.2 += &right_ij
+                            .dot(&left_j.view().insert_axis(Axis(0)))
+                            * scalar_ij);
+                        acc.2 += &(left_j
                             .view()
                             .insert_axis(Axis(1))
-                            .dot(&left_ij.view().insert_axis(Axis(0)));
-                    }
+                            .dot(&left_i.view().insert_axis(Axis(0)))
+                            * scalar_ij);
 
-                    let scalar_ij = f_pipi[[idx_i, idx_j]];
-                    acc.2 += &(left_i
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&left_j.view().insert_axis(Axis(0)))
-                        * scalar_ij);
-                    acc.2 += &(left_j
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&left_i.view().insert_axis(Axis(0)))
-                        * scalar_ij);
+                        let right_i = self.pullback_primary_vector(
+                            row,
+                            slices,
+                            primary,
+                            &third_j.row(idx_i).to_owned(),
+                        )?;
+                        acc.2 += &left_i
+                            .view()
+                            .insert_axis(Axis(1))
+                            .dot(&right_i.view().insert_axis(Axis(0)));
+                        acc.2 += &right_i
+                            .view()
+                            .insert_axis(Axis(1))
+                            .dot(&left_i.view().insert_axis(Axis(0)));
 
-                    let right_i = self.pullback_primary_vector(
-                        row,
-                        slices,
-                        primary,
-                        &third_j.row(idx_i).to_owned(),
-                    )?;
-                    acc.2 += &left_i
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&right_i.view().insert_axis(Axis(0)));
-                    acc.2 += &right_i
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&left_i.view().insert_axis(Axis(0)));
+                        let right_j = self.pullback_primary_vector(
+                            row,
+                            slices,
+                            primary,
+                            &third_i.row(idx_j).to_owned(),
+                        )?;
+                        acc.2 += &left_j
+                            .view()
+                            .insert_axis(Axis(1))
+                            .dot(&right_j.view().insert_axis(Axis(0)));
+                        acc.2 += &right_j
+                            .view()
+                            .insert_axis(Axis(1))
+                            .dot(&left_j.view().insert_axis(Axis(0)));
 
-                    let right_j = self.pullback_primary_vector(
-                        row,
-                        slices,
-                        primary,
-                        &third_i.row(idx_j).to_owned(),
-                    )?;
-                    acc.2 += &left_j
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&right_j.view().insert_axis(Axis(0)));
-                    acc.2 += &right_j
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&left_j.view().insert_axis(Axis(0)));
-
-                    self.add_pullback_primary_hessian(&mut acc.2, row, slices, primary, &fourth);
-                    let third_ij = self.row_primary_third_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &dir_ij,
-                    )?;
-                    self.add_pullback_primary_hessian(&mut acc.2, row, slices, primary, &third_ij);
+                        self.add_pullback_primary_hessian(
+                            &mut acc.2, row, slices, primary, &fourth,
+                        );
+                        let third_ij = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &dir_ij,
+                        )?;
+                        self.add_pullback_primary_hessian(
+                            &mut acc.2, row, slices, primary, &third_ij,
+                        );
                     }
                     Ok(acc)
                 },
@@ -2630,81 +2660,87 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                    let row_dir =
-                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
-                    let Some(psi_dir) = self.row_primary_psi_direction(
-                        row,
-                        block_states,
-                        derivative_blocks,
-                        psi_index,
-                        primary,
-                    )?
-                    else {
-                        continue;
-                    };
-                    let psi_action = self
-                        .row_primary_psi_action_on_direction(
+                        let row_dir = self.row_primary_direction_from_flat(
                             row,
                             slices,
+                            primary,
+                            d_beta_flat,
+                        )?;
+                        let Some(psi_dir) = self.row_primary_psi_direction(
+                            row,
+                            block_states,
                             derivative_blocks,
                             psi_index,
-                            d_beta_flat,
                             primary,
                         )?
-                        .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
-                    let row_ctx = self.build_row_exact_context(
-                        row,
-                        block_states,
-                        &cache.h_nodes,
-                        cache.score_warp_obs.as_ref(),
-                    )?;
-                    let third_beta = self.row_primary_third_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &row_dir,
-                    )?;
-                    let fourth = self.row_primary_fourth_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &row_dir,
-                        &psi_dir,
-                    )?;
-                    let (_, left_vec) = self
-                        .embedded_psi_vector(row, slices, derivative_blocks, psi_index)?
-                        .ok_or_else(|| "missing bernoulli marginal-slope psi vector".to_string())?;
-                    let right_vec = self.pullback_primary_vector(
-                        row,
-                        slices,
-                        primary,
-                        &third_beta.row(idx_primary).to_owned(),
-                    )?;
-                    acc += &left_vec
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&right_vec.view().insert_axis(Axis(0)));
-                    acc += &right_vec
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&left_vec.view().insert_axis(Axis(0)));
-                    self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &fourth);
-                    let third_action = self.row_primary_third_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &psi_action,
-                    )?;
-                    self.add_pullback_primary_hessian(
-                        &mut acc,
-                        row,
-                        slices,
-                        primary,
-                        &third_action,
-                    );
+                        else {
+                            continue;
+                        };
+                        let psi_action = self
+                            .row_primary_psi_action_on_direction(
+                                row,
+                                slices,
+                                derivative_blocks,
+                                psi_index,
+                                d_beta_flat,
+                                primary,
+                            )?
+                            .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
+                        let row_ctx = self.build_row_exact_context(
+                            row,
+                            block_states,
+                            &cache.h_nodes,
+                            cache.score_warp_obs.as_ref(),
+                        )?;
+                        let third_beta = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &row_dir,
+                        )?;
+                        let fourth = self.row_primary_fourth_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &row_dir,
+                            &psi_dir,
+                        )?;
+                        let (_, left_vec) = self
+                            .embedded_psi_vector(row, slices, derivative_blocks, psi_index)?
+                            .ok_or_else(|| {
+                                "missing bernoulli marginal-slope psi vector".to_string()
+                            })?;
+                        let right_vec = self.pullback_primary_vector(
+                            row,
+                            slices,
+                            primary,
+                            &third_beta.row(idx_primary).to_owned(),
+                        )?;
+                        acc += &left_vec
+                            .view()
+                            .insert_axis(Axis(1))
+                            .dot(&right_vec.view().insert_axis(Axis(0)));
+                        acc += &right_vec
+                            .view()
+                            .insert_axis(Axis(1))
+                            .dot(&left_vec.view().insert_axis(Axis(0)));
+                        self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &fourth);
+                        let third_action = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &psi_action,
+                        )?;
+                        self.add_pullback_primary_hessian(
+                            &mut acc,
+                            row,
+                            slices,
+                            primary,
+                            &third_action,
+                        );
                     }
                     Ok(acc)
                 },
@@ -2736,22 +2772,26 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                    let row_dir =
-                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
-                    let row_ctx = self.build_row_exact_context(
-                        row,
-                        block_states,
-                        &cache.h_nodes,
-                        cache.score_warp_obs.as_ref(),
-                    )?;
-                    let third = self.row_primary_third_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &row_dir,
-                    )?;
-                    self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &third);
+                        let row_dir = self.row_primary_direction_from_flat(
+                            row,
+                            slices,
+                            primary,
+                            d_beta_flat,
+                        )?;
+                        let row_ctx = self.build_row_exact_context(
+                            row,
+                            block_states,
+                            &cache.h_nodes,
+                            cache.score_warp_obs.as_ref(),
+                        )?;
+                        let third = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &row_dir,
+                        )?;
+                        self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &third);
                     }
                     Ok(acc)
                 },
@@ -2784,25 +2824,33 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                    let row_u =
-                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_u_flat)?;
-                    let row_v =
-                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
-                    let row_ctx = self.build_row_exact_context(
-                        row,
-                        block_states,
-                        &cache.h_nodes,
-                        cache.score_warp_obs.as_ref(),
-                    )?;
-                    let fourth = self.row_primary_fourth_contracted_recompute(
-                        row,
-                        block_states,
-                        cache,
-                        &row_ctx,
-                        &row_u,
-                        &row_v,
-                    )?;
-                    self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &fourth);
+                        let row_u = self.row_primary_direction_from_flat(
+                            row,
+                            slices,
+                            primary,
+                            d_beta_u_flat,
+                        )?;
+                        let row_v = self.row_primary_direction_from_flat(
+                            row,
+                            slices,
+                            primary,
+                            d_beta_v_flat,
+                        )?;
+                        let row_ctx = self.build_row_exact_context(
+                            row,
+                            block_states,
+                            &cache.h_nodes,
+                            cache.score_warp_obs.as_ref(),
+                        )?;
+                        let fourth = self.row_primary_fourth_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            &row_ctx,
+                            &row_u,
+                            &row_v,
+                        )?;
+                        self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &fourth);
                     }
                     Ok(acc)
                 },
@@ -2827,7 +2875,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut ll = 0.0;
         let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
         let mut grad_logslope = Array1::<f64>::zeros(slices.logslope.len());
-        let mut hess_marginal = Array2::<f64>::zeros((slices.marginal.len(), slices.marginal.len()));
+        let mut hess_marginal =
+            Array2::<f64>::zeros((slices.marginal.len(), slices.marginal.len()));
         let mut hess_logslope =
             Array2::<f64>::zeros((slices.logslope.len(), slices.logslope.len()));
         let mut grad_h = slices.h.as_ref().map(|r| Array1::<f64>::zeros(r.len()));
@@ -2879,10 +2928,16 @@ impl BernoulliMarginalSlopeFamily {
                     self.logslope_design
                         .axpy_row_into(row, -(u1 * deta_dg), &mut logslope)?;
                 }
-                self.marginal_design
-                    .syr_row_into(row, u2 * deta_dq * deta_dq, &mut hess_marginal)?;
-                self.logslope_design
-                    .syr_row_into(row, u2 * deta_dg * deta_dg + u1 * q * c2, &mut hess_logslope)?;
+                self.marginal_design.syr_row_into(
+                    row,
+                    u2 * deta_dq * deta_dq,
+                    &mut hess_marginal,
+                )?;
+                self.logslope_design.syr_row_into(
+                    row,
+                    u2 * deta_dg * deta_dg + u1 * q * c2,
+                    &mut hess_logslope,
+                )?;
             }
 
             return Ok(FamilyEvaluation {
@@ -2948,7 +3003,10 @@ impl BernoulliMarginalSlopeFamily {
             {
                 *grad_h -= &f_pi.slice(s![primary_h.start..primary_h.end]).to_owned();
                 *hess_h += &f_pipi
-                    .slice(s![primary_h.start..primary_h.end, primary_h.start..primary_h.end])
+                    .slice(s![
+                        primary_h.start..primary_h.end,
+                        primary_h.start..primary_h.end
+                    ])
                     .to_owned();
             }
             if let (Some(primary_w), Some(grad_w), Some(hess_w)) =
@@ -2956,7 +3014,10 @@ impl BernoulliMarginalSlopeFamily {
             {
                 *grad_w -= &f_pi.slice(s![primary_w.start..primary_w.end]).to_owned();
                 *hess_w += &f_pipi
-                    .slice(s![primary_w.start..primary_w.end, primary_w.start..primary_w.end])
+                    .slice(s![
+                        primary_w.start..primary_w.end,
+                        primary_w.start..primary_w.end
+                    ])
                     .to_owned();
             }
         }
@@ -3948,12 +4009,13 @@ mod tests {
             quadrature_weights: array![0.5, 0.5],
             score_warp: Some(prepared.runtime.clone()),
             score_warp_obs_design: Some(Arc::new(prepared.block.design.to_dense())),
-            cached_score_warp_constraints: BernoulliMarginalSlopeFamily::build_score_warp_constraints(
-                &prepared.runtime,
-                &seed,
-                &array![-0.25, 0.25],
-            )
-            .expect("cached score-warp constraints"),
+            cached_score_warp_constraints:
+                BernoulliMarginalSlopeFamily::build_score_warp_constraints(
+                    &prepared.runtime,
+                    &seed,
+                    &array![-0.25, 0.25],
+                )
+                .expect("cached score-warp constraints"),
             link_dev: None,
         };
         let block_states = vec![

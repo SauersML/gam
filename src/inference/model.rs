@@ -132,6 +132,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub survival_time_smooth_lambda: Option<f64>,
     #[serde(default)]
+    pub survival_time_anchor: Option<f64>,
+    #[serde(default)]
     pub survivalridge_lambda: Option<f64>,
     #[serde(default)]
     pub survival_likelihood: Option<String>,
@@ -216,6 +218,7 @@ impl FittedModelPayload {
             survival_time_knots: None,
             survival_time_keep_cols: None,
             survival_time_smooth_lambda: None,
+            survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
             survival_beta_time: None,
@@ -1184,6 +1187,7 @@ impl FittedModel {
                 "survival_time_smooth_lambda",
                 self.survival_time_smooth_lambda,
             ),
+            ("survival_time_anchor", self.survival_time_anchor),
             ("survivalridge_lambda", self.survivalridge_lambda),
         ] {
             if let Some(v) = opt {

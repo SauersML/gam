@@ -746,8 +746,9 @@ pub struct SimplicialFactor {
     l_row_idx: Vec<usize>,
     /// Numeric values of L, length nnz(L)
     l_values: Vec<f64>,
-    /// Forward permutation: perm_fwd[original] = permuted
-    perm_fwd: Vec<usize>,
+    /// Inverse permutation returned by faer, used to map original coordinates
+    /// into the permuted simplicial factor basis.
+    perm_inv: Vec<usize>,
     /// Dimension
     n: usize,
     /// log|H| = 2 * sum(log(L_ii))
@@ -769,7 +770,7 @@ pub fn factorize_simplicial(
             l_col_ptr: vec![0],
             l_row_idx: Vec::new(),
             l_values: Vec::new(),
-            perm_fwd: Vec::new(),
+            perm_inv: Vec::new(),
             n: 0,
             logdet: 0.0,
         });
@@ -886,7 +887,7 @@ pub fn factorize_simplicial(
         l_col_ptr,
         l_row_idx,
         l_values,
-        perm_fwd,
+        perm_inv,
         n,
         logdet,
     })
@@ -904,8 +905,8 @@ pub struct TakahashiInverse {
     col_ptr: Vec<usize>,
     /// Row indices (owned copy from L)
     row_idx: Vec<usize>,
-    /// Forward permutation: perm_fwd[original] = permuted
-    perm_fwd: Vec<usize>,
+    /// Inverse permutation returned by faer.
+    perm_inv: Vec<usize>,
     /// Dimension
     n: usize,
 }
@@ -987,15 +988,15 @@ impl TakahashiInverse {
             z_values,
             col_ptr,
             row_idx,
-            perm_fwd: factor.perm_fwd.clone(),
+            perm_inv: factor.perm_inv.clone(),
             n,
         }
     }
 
     /// Get H⁻¹[i,j] in ORIGINAL (unpermuted) coordinates.
     pub fn get(&self, i: usize, j: usize) -> f64 {
-        let pi = self.perm_fwd[i];
-        let pj = self.perm_fwd[j];
+        let pi = self.perm_inv[i];
+        let pj = self.perm_inv[j];
         self.get_permuted(pi, pj)
     }
 

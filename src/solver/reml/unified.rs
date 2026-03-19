@@ -3141,9 +3141,7 @@ fn compute_adjoint_z_c(ing: &ScalarGlmIngredients<'_>, hop: &dyn HessianOperator
     // Guard: Z = H⁻¹ Xᵀ is a p × n dense matrix. Refuse at biobank scale.
     const ZC_MAX_DENSE_WORK: usize = 50_000_000;
     if n.saturating_mul(p) > ZC_MAX_DENSE_WORK {
-        log::warn!(
-            "compute_adjoint_z_c: skipping (n={n}, p={p}) — too large for dense Z = H⁻¹Xᵀ"
-        );
+        log::warn!("compute_adjoint_z_c: skipping (n={n}, p={p}) — too large for dense Z = H⁻¹Xᵀ");
         return Array1::zeros(p);
     }
 
