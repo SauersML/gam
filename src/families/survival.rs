@@ -1357,43 +1357,43 @@ impl WorkingModelSurvival {
     /// Build an [`InnerSolution`](crate::estimate::reml::unified::InnerSolution) from
     /// the survival working state, suitable for the unified REML/LAML evaluator.
     ///
-    /// Uses a [`SurvivalDerivProvider`] to supply third-derivative Hessian
-    /// corrections through the unified `HessianDerivativeProvider` trait,
-    /// rather than precomputing corrections for each penalty block.
-    pub fn build_inner_solution(
+    /// Evaluate the survival outer objective and gradient via the unified REML/LAML
+    /// evaluator, using the canonical assembly module.
+    pub fn unified_lamlobjective_and_rhogradient(
         &self,
         beta: &Array1<f64>,
         state: &WorkingState,
         rho: &Array1<f64>,
-    ) -> Result<crate::estimate::reml::unified::InnerSolution<'static>, EstimationError> {
+    ) -> Result<(f64, Array1<f64>), EstimationError> {
+        use crate::estimate::reml::assembly::{InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks};
         use crate::estimate::reml::unified::{
-            DenseSpectralOperator, DispersionHandling, InnerSolutionBuilder, PenaltyCoordinate,
-            PenaltyLogdetDerivs, compute_block_penalty_logdet_derivs, penalty_matrix_root,
+            DenseSpectralOperator, DispersionHandling, EvalMode, PenaltyLogdetDerivs,
+            compute_block_penalty_logdet_derivs,
         };
 
         let p = beta.len();
         let k_count = self.penalties.blocks.len();
 
-        // --- Hessian operator (wraps full penalized + ridge Hessian) ---
+        // --- Hessian operator ---
         let h_dense = state.hessian.to_dense();
         let hop = DenseSpectralOperator::from_symmetric(&h_dense)
             .map_err(EstimationError::InvalidInput)?;
 
-        // --- Unified penalty coordinates ---
-        let mut penalty_coords = Vec::with_capacity(k_count);
-        for block in &self.penalties.blocks {
-            let root = penalty_matrix_root(&block.matrix).map_err(EstimationError::InvalidInput)?;
-            penalty_coords.push(PenaltyCoordinate::from_block_root(
-                root,
-                block.range.start,
-                block.range.end,
-                p,
-            ));
-        }
+        // --- Penalty coordinates via shared assembler helper ---
+        let block_descs: Vec<PenaltyBlockDesc> = self
+            .penalties
+            .blocks
+            .iter()
+            .map(|b| PenaltyBlockDesc {
+                matrix: &b.matrix,
+                range_start: b.range.start,
+                range_end: b.range.end,
+            })
+            .collect();
+        let penalty_coords = penalty_coords_from_blocks(&block_descs, p)
+            .map_err(EstimationError::InvalidInput)?;
 
         // --- Penalty logdet derivatives ---
-        // Each survival PenaltyBlock occupies its own index range, so we treat
-        // each as a single-penalty block for compute_block_penalty_logdet_derivs.
         let per_block_rho: Vec<Array1<f64>> =
             rho.iter().map(|&r| Array1::from_vec(vec![r])).collect();
         let per_block_penalty_matrices: Vec<Vec<Array2<f64>>> = self
@@ -1406,8 +1406,6 @@ impl WorkingModelSurvival {
             .iter()
             .map(|v| v.as_slice())
             .collect();
-        // Each survival PenaltyBlock carries its structural nullspace_dim.
-        // Wrap each as a single-element slice for the per-block interface.
         let per_block_nullspace_vecs: Vec<Vec<usize>> = self
             .penalties
             .blocks
@@ -1434,52 +1432,40 @@ impl WorkingModelSurvival {
             }
         };
 
-        // The unified evaluator computes: -log_lik + 0.5 * penalty_quadratic.
-        // The existing code computes:     0.5 * deviance + penalty_term.
-        // Matching: penalty_quadratic = 2 * penalty_term.
-        // (penalty_term includes both lambda-weighted penalty and stabilization ridge.)
+        // penalty_quadratic = 2 * penalty_term (matching unified evaluator convention).
         let penalty_quadratic = 2.0 * state.penalty_term;
-
-        let n_observations = self.nrows();
-
-        // --- Derivative provider for third-derivative Hessian corrections ---
         let provider = SurvivalDerivProvider::new(self.clone(), beta.clone());
 
-        let builder = InnerSolutionBuilder::new(
-            state.log_likelihood,
+        let result = InnerAssembly {
+            log_likelihood: state.log_likelihood,
             penalty_quadratic,
-            beta.clone(),
-            n_observations,
-            Box::new(hop),
+            beta: beta.clone(),
+            n_observations: self.nrows(),
+            hessian_op: Box::new(hop),
             penalty_coords,
             penalty_logdet,
-            DispersionHandling::Fixed {
+            dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
                 include_logdet_s: true,
             },
-        );
-
-        let solution = builder.deriv_provider(Box::new(provider)).build();
-
-        Ok(solution)
-    }
-
-    /// Evaluate the survival outer objective and gradient via the unified REML/LAML
-    /// evaluator, using the shared `reml_laml_evaluate` infrastructure.
-    pub fn unified_lamlobjective_and_rhogradient(
-        &self,
-        beta: &Array1<f64>,
-        state: &WorkingState,
-        rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), EstimationError> {
-        use crate::estimate::reml::unified::{EvalMode, reml_laml_evaluate};
-
-        let solution = self.build_inner_solution(beta, state, rho)?;
-        let rho_slice = rho.as_slice().expect("rho must be contiguous");
-
-        let result = reml_laml_evaluate(&solution, rho_slice, EvalMode::ValueAndGradient, None)
-            .map_err(EstimationError::InvalidInput)?;
+            deriv_provider: Some(Box::new(provider)),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            nullspace_dim: None,
+            barrier_config: None,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+        }
+        .evaluate(
+            rho.as_slice().expect("rho must be contiguous"),
+            EvalMode::ValueAndGradient,
+            None,
+        )
+        .map_err(EstimationError::InvalidInput)?;
 
         let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
         Ok((result.cost, gradient))

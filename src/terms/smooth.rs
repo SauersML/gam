@@ -10393,12 +10393,23 @@ where
         Derivative, EfsEval, HessianResult, OuterEval,
     };
 
-    let outer_config = exact_joint_multistart_outer_config(
+    let problem = exact_joint_multistart_outer_problem(
         &theta0,
         &lower,
         &upper,
         rho_dim,
         psi_dim,
+        theta_dim,
+        if analytic_joint_gradient_available {
+            Derivative::Analytic
+        } else {
+            Derivative::FiniteDifference
+        },
+        if analytic_outer_hessian_available {
+            Derivative::Analytic
+        } else {
+            Derivative::Unavailable
+        },
         seed_risk_profile,
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
@@ -10414,26 +10425,9 @@ where
     }
 
     let result = {
-        let mut obj = ClosureObjective {
-            state: &mut state,
-            cap: OuterCapability {
-                gradient: if analytic_joint_gradient_available {
-                    Derivative::Analytic
-                } else {
-                    Derivative::FiniteDifference
-                },
-                hessian: if analytic_outer_hessian_available {
-                    Derivative::Analytic
-                } else {
-                    Derivative::Unavailable
-                },
-                n_params: theta_dim,
-                all_penalty_like: false,
-                has_psi_coords: true,
-                fixed_point_available: false,
-                barrier_config: None,
-            },
-            cost_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
+        let mut obj = problem.build_objective(
+            &mut state,
+            |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
                 if let Some(cost) = ctx.cache.memoized_cost(theta) {
                     ctx.track_best(theta, cost);
                     return Ok(cost);
@@ -10457,7 +10451,7 @@ where
                     Err(_) => Ok(f64::INFINITY),
                 }
             },
-            eval_fn: |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
+            |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
                 if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
                     ctx.track_best(theta, cost);
                     if !cost.is_finite() {
@@ -10526,21 +10520,18 @@ where
                     Err(_) => Ok(OuterEval::infeasible(theta.len())),
                 }
             },
-            reset_fn: None::<fn(&mut &mut NBlockExactJointState<'_>)>,
-            efs_fn: None::<
+            None::<fn(&mut &mut NBlockExactJointState<'_>)>,
+            None::<
                 fn(
                     &mut &mut NBlockExactJointState<'_>,
                     &Array1<f64>,
                 ) -> Result<EfsEval, EstimationError>,
             >,
-        };
+        );
 
-        crate::solver::outer_strategy::run_outer(
-            &mut obj,
-            &outer_config,
-            "n-block exact-joint spatial",
-        )
-        .map_err(|e| e.to_string())?
+        problem
+            .run(&mut obj, "n-block exact-joint spatial")
+            .map_err(|e| e.to_string())?
     }; // obj dropped here, releasing mutable borrow on state
 
     let theta_star = result.rho;

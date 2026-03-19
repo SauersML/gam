@@ -49,37 +49,29 @@ pub struct OuterCapability {
     pub hessian: Derivative,
     /// Number of smoothing (+ any auxiliary hyper-) parameters being optimized.
     pub n_params: usize,
-    /// Whether all hyperparameter coordinates (both rho and any extended coords)
-    /// are penalty-like. When true, the pure EFS (Extended Fellner-Schall)
-    /// fixed-point optimizer can be eligible when `fixed_point_available` is
-    /// also true. When false (e.g. psi/design-moving coordinates), the
-    /// fallback is not automatically hybrid EFS; that still requires
-    /// `fixed_point_available`.
+    /// Number of ψ (design-moving) coordinates among the extended
+    /// hyperparameter coordinates. When 0, all coords are penalty-like and
+    /// pure EFS is eligible (given `fixed_point_available`). When > 0,
+    /// hybrid EFS is eligible instead: EFS for ρ + preconditioned gradient
+    /// for ψ.
     ///
-    /// # Hybrid EFS strategy (when `has_psi_coords` is true)
+    /// # Hybrid EFS strategy (when `psi_dim > 0`)
     ///
-    /// The hybrid is enabled when `has_psi_coords = true` and `n_params > 8`.
-    /// It combines:
+    /// Enabled when `psi_dim > 0`, `n_params > 8`, and `fixed_point_available`.
+    /// Combines:
     /// - Standard EFS multiplicative fixed-point updates for ρ coordinates
     /// - Safeguarded preconditioned gradient steps for ψ coordinates:
     ///   `Δψ = -α G⁺ g_ψ` where G is the trace Gram matrix
     ///
-    /// This is mathematically necessary because no EFS-type fixed-point
-    /// iteration exists for indefinite B_ψ (see response.md Section 2 for
-    /// the counterexample proof). The structural requirement for EFS is
-    /// `H^{-1/2} B_d H^{-1/2} ≽ 0` (PSD) plus fixed nullspace — exactly
-    /// what penalty-like coords satisfy and design-moving coords do not.
-    pub all_penalty_like: bool,
-    /// Whether ψ (design-moving) coordinates are present among the extended
-    /// hyperparameter coordinates. When true together with `n_params > 8` and
-    /// `fixed_point_available`, the planner can select hybrid EFS instead of
-    /// falling back to full BFGS.
+    /// Mathematically necessary because no EFS-type fixed-point iteration
+    /// exists for indefinite B_ψ (see response.md Section 2). The structural
+    /// requirement for EFS is `H^{-1/2} B_d H^{-1/2} ≽ 0` (PSD) plus fixed
+    /// nullspace — exactly what penalty-like coords satisfy and design-moving
+    /// coords do not.
     ///
-    /// The hybrid strategy is O(1) H⁻¹ solves per iteration (same as pure
-    /// EFS), compared to O(dim(θ)) for BFGS which needs finite-difference
-    /// gradient evaluations. This makes the hybrid dramatically cheaper for
-    /// high-dimensional smoothing parameter spaces.
-    pub has_psi_coords: bool,
+    /// The hybrid is O(1) H⁻¹ solves per iteration (same as pure EFS),
+    /// compared to O(dim(θ)) for BFGS.
+    pub psi_dim: usize,
     /// Whether the objective actually implements `eval_efs()` for fixed-point
     /// plans. Structural eligibility (`all_penalty_like` / `has_psi_coords`)
     /// is not sufficient by itself: if this is false, the planner must stay on
@@ -96,6 +88,17 @@ pub struct OuterCapability {
     /// blocked EFS. The quantitative check allows EFS when constraints exist but
     /// the barrier curvature is negligible (coefficients far from their bounds).
     pub barrier_config: Option<BarrierConfig>,
+}
+
+impl OuterCapability {
+    /// True when all coordinates are penalty-like (no ψ coords).
+    pub fn all_penalty_like(&self) -> bool {
+        self.psi_dim == 0
+    }
+    /// True when ψ (design-moving) coordinates are present.
+    pub fn has_psi_coords(&self) -> bool {
+        self.psi_dim > 0
+    }
 }
 
 /// Which solver algorithm to use for the outer optimization.
@@ -217,7 +220,7 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // and bails out early if the barrier curvature becomes non-negligible
         // relative to the penalized Hessian diagonal.
         (Analytic, Unavailable)
-            if cap.fixed_point_available && cap.all_penalty_like && cap.n_params > 8 =>
+            if cap.fixed_point_available && cap.all_penalty_like() && cap.n_params > 8 =>
         {
             OuterPlan {
                 solver: S::Efs,
@@ -225,7 +228,7 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             }
         }
         (Unavailable, Unavailable)
-            if cap.fixed_point_available && cap.all_penalty_like && cap.n_params > 8 =>
+            if cap.fixed_point_available && cap.all_penalty_like() && cap.n_params > 8 =>
         {
             OuterPlan {
                 solver: S::Efs,
@@ -246,7 +249,7 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // This stays O(1) H⁻¹ solves per iteration (vs O(dim(θ)) for BFGS)
         // and uses the same trace Gram matrix that EFS already computes.
         (Analytic, Unavailable)
-            if cap.fixed_point_available && cap.has_psi_coords && cap.n_params > 8 =>
+            if cap.fixed_point_available && cap.has_psi_coords() && cap.n_params > 8 =>
         {
             OuterPlan {
                 solver: S::HybridEfs,
@@ -254,7 +257,7 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             }
         }
         (Unavailable, Unavailable)
-            if cap.fixed_point_available && cap.has_psi_coords && cap.n_params > 8 =>
+            if cap.fixed_point_available && cap.has_psi_coords() && cap.n_params > 8 =>
         {
             OuterPlan {
                 solver: S::HybridEfs,
@@ -298,7 +301,7 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         Derivative::FiniteDifference => " [FD gradient from cost-only objective]",
         _ => "",
     };
-    let barrier_note = if cap.barrier_config.is_some() && cap.all_penalty_like && cap.n_params > 8 {
+    let barrier_note = if cap.barrier_config.is_some() && cap.all_penalty_like() && cap.n_params > 8 {
         " [EFS with runtime barrier-curvature guard]"
     } else {
         ""

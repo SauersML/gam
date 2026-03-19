@@ -15,9 +15,8 @@ use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, DriftDerivResult, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    InnerSolutionBuilder, MatrixFreeSpdOperator, PenaltyCoordinate,
-    compute_block_penalty_logdet_derivs, exact_intersection_nullity, penalty_matrix_root,
-    reml_laml_evaluate,
+    MatrixFreeSpdOperator,
+    compute_block_penalty_logdet_derivs, exact_intersection_nullity,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -4867,7 +4866,7 @@ pub(crate) fn custom_family_outer_capability<F: CustomFamily + ?Sized>(
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     n_params: usize,
-    has_psi_coords: bool,
+    psi_dim: usize,
 ) -> crate::solver::outer_strategy::OuterCapability {
     use crate::solver::outer_strategy::{Derivative, OuterCapability};
 
@@ -4887,8 +4886,7 @@ pub(crate) fn custom_family_outer_capability<F: CustomFamily + ?Sized>(
         gradient,
         hessian,
         n_params,
-        all_penalty_like: false,
-        has_psi_coords,
+        psi_dim,
         barrier_config: None,
         fixed_point_available: false,
     }
@@ -5869,16 +5867,8 @@ struct ExtCoordBundle {
 
 /// Build an `InnerSolution` from joint Hessian data and call the unified evaluator.
 ///
-/// This is the bridge between the custom family's joint Hessian infrastructure
-/// and the unified REML/LAML evaluator. It:
-/// 1. Receives a unified [`HessianOperator`] backend (dense or matrix-free)
-/// 2. Builds unified penalty coordinates for the rho block
-/// 3. Computes penalty logdet derivatives
-/// 4. Assembles an `InnerSolution` and calls `reml_laml_evaluate`
-///
-/// When `ext_bundle` is provided, the extended hyperparameter coordinates (ψ)
-/// are attached to the `InnerSolution` so the unified evaluator produces
-/// gradient/Hessian over the combined (ρ + ψ) space.
+/// Bridge between the custom family's joint Hessian infrastructure and the
+/// unified REML/LAML evaluator, routed through the canonical assembly module.
 fn unified_joint_cost_gradient(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
@@ -5896,22 +5886,30 @@ fn unified_joint_cost_gradient(
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-    // Build unified penalty coordinates from the original block-local roots.
-    let mut penalty_coords = Vec::new();
-    for (b, spec) in specs.iter().enumerate() {
-        let (start, end) = ranges[b];
-        for s_k in spec.penalties.iter() {
-            let s_dense = s_k.as_dense_cow();
-            let root = penalty_matrix_root(&s_dense)?;
-            penalty_coords.push(PenaltyCoordinate::from_block_root(root, start, end, total));
-        }
-    }
+    use crate::estimate::reml::assembly::{InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks};
 
-    // Compute penalty logdet derivatives (exact pseudo-logdet on positive eigenspace).
+    // Collect dense penalty matrices so references stay valid for the assembler.
     let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = specs
         .iter()
         .map(|s| s.penalties.iter().map(|p| p.to_dense()).collect())
         .collect();
+    let block_descs: Vec<PenaltyBlockDesc> = specs
+        .iter()
+        .enumerate()
+        .flat_map(|(b, spec)| {
+            let (start, end) = ranges[b];
+            per_block_penalties_dense[b].iter().map(move |dense| {
+                PenaltyBlockDesc {
+                    matrix: dense,
+                    range_start: start,
+                    range_end: end,
+                }
+            })
+        })
+        .collect();
+    let penalty_coords = penalty_coords_from_blocks(&block_descs, total)?;
+
+    // Compute penalty logdet derivatives.
     let per_block_penalties: Vec<&[Array2<f64>]> = per_block_penalties_dense
         .iter()
         .map(|v| v.as_slice())
@@ -5930,44 +5928,43 @@ fn unified_joint_cost_gradient(
         penalty_logdet_ridge,
     )?;
 
-    // Number of observations.
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
 
-    // Build InnerSolution via builder and call unified evaluator.
-    let mut builder = InnerSolutionBuilder::new(
-        inner.log_likelihood,
-        inner.penalty_value,
-        beta_flat.clone(),
+    // Unpack optional ext-coord bundle.
+    let (ext_coords, ext_coord_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) =
+        if let Some(bundle) = ext_bundle {
+            (bundle.coords, bundle.ext_ext_fn, bundle.rho_ext_fn, bundle.drift_fn)
+        } else {
+            (Vec::new(), None, None, None)
+        };
+
+    let ext_dim = ext_coords.len();
+
+    let result = InnerAssembly {
+        log_likelihood: inner.log_likelihood,
+        penalty_quadratic: inner.penalty_value,
+        beta: beta_flat.clone(),
         n_observations,
         hessian_op,
         penalty_coords,
         penalty_logdet,
-        DispersionHandling::Fixed {
+        dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h,
             include_logdet_s,
         },
-    )
-    .deriv_provider(deriv_provider);
-
-    // Attach extended (ψ) coordinates when provided.
-    if let Some(bundle) = ext_bundle {
-        builder = builder.ext_coords(bundle.coords);
-        if let Some(f) = bundle.ext_ext_fn {
-            builder = builder.ext_coord_pair_fn(f);
-        }
-        if let Some(f) = bundle.rho_ext_fn {
-            builder = builder.rho_ext_pair_fn(f);
-        }
-        if let Some(f) = bundle.drift_fn {
-            builder = builder.fixed_drift_deriv(f);
-        }
+        deriv_provider: Some(deriv_provider),
+        tk_correction: 0.0,
+        tk_gradient: None,
+        firth: None,
+        nullspace_dim: None,
+        barrier_config: None,
+        ext_coords,
+        ext_coord_pair_fn,
+        rho_ext_pair_fn,
+        fixed_drift_deriv,
     }
-
-    let inner_solution = builder.build();
-
-    let ext_dim = inner_solution.ext_coords.len();
-    let result = reml_laml_evaluate(&inner_solution, rho.as_slice().unwrap(), eval_mode, None)?;
+    .evaluate(rho.as_slice().unwrap(), eval_mode, None)?;
 
     let cost = result.cost;
     let gradient = result
@@ -7835,9 +7832,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // based on the presence of a wiggle block.
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterConfig, OuterEval,
-    };
+    use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
     // previously behind Mutex because the old optimizer bridge used `Fn`
@@ -7849,33 +7844,29 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let n_rho = rho0.len();
     let total_joint_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let mut primary_cap = custom_family_outer_capability(family, specs, options, n_rho, false);
-    if matches!(primary_cap.hessian, Derivative::Analytic)
+    let primary_cap = custom_family_outer_capability(family, specs, options, n_rho, false);
+    let hessian = if matches!(primary_cap.hessian, Derivative::Analytic)
         && !joint_exact_analytic_outer_hessian_available(total_joint_p)
     {
-        primary_cap.hessian = Derivative::Unavailable;
-    }
-    let need_outer_hessian = matches!(primary_cap.hessian, Derivative::Analytic);
-    let outer_config = OuterConfig {
-        tolerance: options.outer_tol,
-        max_iter: options.outer_max_iter,
-        fd_step: 1e-4,
-        bounds: None,
-        seed_config: crate::seeding::SeedConfig::default(),
-        rho_bound: 30.0,
-        heuristic_lambdas: None,
-        initial_rho: Some(rho0.clone()),
-        fallback_policy: FallbackPolicy::Automatic,
-        screening_cap: None,
+        Derivative::Unavailable
+    } else {
+        primary_cap.hessian
     };
+    let need_outer_hessian = matches!(hessian, Derivative::Analytic);
+    let problem = OuterProblem::new(n_rho)
+        .with_gradient(primary_cap.gradient)
+        .with_hessian(hessian)
+        .with_tolerance(options.outer_tol)
+        .with_max_iter(options.outer_max_iter)
+        .with_fd_step(1e-4)
+        .with_initial_rho(rho0.clone());
 
-    let mut obj = ClosureObjective {
-        state: CustomOuterState {
+    let mut obj = problem.build_objective(
+        CustomOuterState {
             warm_cache: None,
             last_error: None,
         },
-        cap: primary_cap,
-        cost_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
+        |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             // Always use warm cache when available — the previous inner solution
             // gives a much better starting point. This was previously disabled for
             // exact-Hessian families, forcing every inner solve to start from
@@ -7901,7 +7892,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
             }
         },
-        eval_fn: |outer: &mut CustomOuterState, rho: &Array1<f64>| {
+        |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             // Always use warm cache — previous inner solution is an excellent
             // starting point, especially when rho hasn't moved far.
             let warm_ref = outer.warm_cache.as_ref();
@@ -7966,20 +7957,19 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 hessian,
             })
         },
-        reset_fn: Some(|outer: &mut CustomOuterState| {
+        Some(|outer: &mut CustomOuterState| {
             outer.warm_cache = None;
         }),
-        efs_fn: None::<
+        None::<
             fn(
                 &mut CustomOuterState,
                 &Array1<f64>,
             )
                 -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
         >,
-    };
+    );
 
-    let outer_result =
-        crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, "custom family");
+    let outer_result = problem.run(&mut obj, "custom family");
 
     let last_error_detail = obj
         .state

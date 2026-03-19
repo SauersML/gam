@@ -23,8 +23,7 @@ where
             gradient: Derivative::FiniteDifference,
             hessian: Derivative::Unavailable,
             n_params: self.n_params,
-            all_penalty_like: false,
-            has_psi_coords: false,
+            psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
         }
