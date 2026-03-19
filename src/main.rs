@@ -434,7 +434,7 @@ enum FamilyArg {
     TransformationNormal,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
 enum CovarianceModeArg {
     Conditional,
     Corrected,
