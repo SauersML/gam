@@ -41,6 +41,7 @@ use gam::inference::data::{
     load_dataset_projected as load_dataset_auto_projected,
     load_datasetwith_schema as load_dataset_auto_with_schema,
 };
+use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::inference::formula_dsl::{
     LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
     effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
@@ -52,7 +53,7 @@ use gam::inference::model::{
     PredictModelClass, SavedAnchoredDeviationRuntime, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
-use gam::matrix::DesignMatrix;
+use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
     state_fromspec,
@@ -2569,23 +2570,23 @@ fn run_predict_survival(
         let deterministic_mean = eta.mapv(|v| normal_cdf(-v));
         let need_uncertainty = args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
         let posterior_mean = if need_uncertainty {
-            let cov_mat = covariance_from_model(model, args.covariance_mode)?;
+            let backend = prediction_backend_from_model(model, args.covariance_mode)?;
             let p_t = beta_time.len();
             let p_m = beta_marginal.len();
             let p_s = beta_slope.len();
             let p_total = p_t + p_m + p_s;
-            let mut eta_var = Array1::<f64>::zeros(n);
-            // Chunked Jacobian: build J_chunk, compute diag(J C J^T) per chunk.
-            // Memory bound: ~8 MB working set per chunk.
-            let chunk_size = (8 * 1024 * 1024 / (p_total.max(1) * 8 * 2))
-                .max(16)
-                .min(n.max(1));
-            let mut start = 0usize;
-            while start < n {
-                let end = (start + chunk_size).min(n);
+            if backend.nrows() != p_total {
+                return Err(format!(
+                    "saved survival marginal-slope covariance/backend mismatch: got dimension {}, expected {}",
+                    backend.nrows(),
+                    p_total
+                ));
+            }
+            let eta_var = rowwise_local_covariances(&backend, n, 1, |rows| {
+                let start = rows.start;
+                let end = rows.end;
                 let cs = end - start;
                 let mut jac = Array2::<f64>::zeros((cs, p_total));
-                // Time block: scale rows by c_i
                 {
                     let x_t = time_build.x_exit_time.row_chunk(start..end);
                     let mut dst = jac.slice_mut(s![.., ..p_t]);
@@ -2595,7 +2596,6 @@ fn run_predict_survival(
                         dst.row_mut(i).mapv_inplace(|v| v * ci);
                     }
                 }
-                // Marginal block: scale rows by c_i
                 {
                     let x_m = cov_design.design.row_chunk(start..end);
                     let mut dst = jac.slice_mut(s![.., p_t..p_t + p_m]);
@@ -2605,7 +2605,6 @@ fn run_predict_survival(
                         dst.row_mut(i).mapv_inplace(|v| v * ci);
                     }
                 }
-                // Slope block: scale rows by (q*b/c + z)
                 {
                     let x_s = logslope_design.design.row_chunk(start..end);
                     let mut dst = jac.slice_mut(s![.., p_t + p_m..]);
@@ -2615,13 +2614,12 @@ fn run_predict_survival(
                         dst.row_mut(i).mapv_inplace(|v| v * gi);
                     }
                 }
-                // diag(J C J^T): compute JC = J @ C, then row-wise dot
-                let jc = gam::faer_ndarray::fast_ab(&jac.view(), &cov_mat.view());
-                for i in 0..cs {
-                    eta_var[start + i] = jac.row(i).dot(&jc.row(i)).max(0.0);
-                }
-                start = end;
-            }
+                Ok(vec![jac])
+            })
+            .map_err(|e| {
+                format!("saved survival marginal-slope posterior covariance application failed: {e}")
+            })?[0][0]
+                .mapv(|v| v.max(0.0));
             let eta_se = eta_var.mapv(f64::sqrt);
             let posterior = Array1::from_iter(
                 eta.iter()
@@ -8465,6 +8463,25 @@ fn covariance_from_model(
             .to_string()
     })?;
     Ok(cov.clone())
+}
+
+fn prediction_backend_from_model<'a>(
+    model: &'a SavedModel,
+    mode: CovarianceModeArg,
+) -> Result<PredictionCovarianceBackend<'a>, String> {
+    let fit = model.fit_result.as_ref().ok_or_else(|| {
+        "model is missing canonical fit_result payload; refit with current CLI".to_string()
+    })?;
+    if mode == CovarianceModeArg::Conditional
+        && let Some(hessian) = fit.penalized_hessian()
+    {
+        return PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(
+            hessian.clone(),
+        ))
+        .or_else(|_| Ok(PredictionCovarianceBackend::from_dense(covariance_from_model(model, mode)?.view())));
+    }
+    let cov = covariance_from_model(model, mode)?;
+    Ok(PredictionCovarianceBackend::from_dense(cov.view()))
 }
 
 fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCovarianceMode {

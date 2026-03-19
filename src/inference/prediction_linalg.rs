@@ -6,7 +6,7 @@ const PREDICTION_TARGET_WORK_BYTES: usize = 8 * 1024 * 1024;
 const PREDICTION_MIN_CHUNK_ROWS: usize = 16;
 const PREDICTION_MAX_CHUNK_ROWS: usize = 4096;
 
-pub(crate) enum PredictionCovarianceBackend<'a> {
+pub enum PredictionCovarianceBackend<'a> {
     Dense(ArrayView2<'a, f64>),
     Factorized {
         factor: Box<dyn FactorizedSystem>,
@@ -15,11 +15,11 @@ pub(crate) enum PredictionCovarianceBackend<'a> {
 }
 
 impl<'a> PredictionCovarianceBackend<'a> {
-    pub(crate) fn from_dense(covariance: ArrayView2<'a, f64>) -> Self {
+    pub fn from_dense(covariance: ArrayView2<'a, f64>) -> Self {
         Self::Dense(covariance)
     }
 
-    pub(crate) fn from_factorized_hessian(hessian: SymmetricMatrix) -> Result<Self, String> {
+    pub fn from_factorized_hessian(hessian: SymmetricMatrix) -> Result<Self, String> {
         if hessian.nrows() != hessian.ncols() {
             return Err(format!(
                 "prediction precision backend requires a square Hessian, got {}x{}",
@@ -42,14 +42,14 @@ impl<'a> PredictionCovarianceBackend<'a> {
         Ok(Self::Factorized { factor, dim })
     }
 
-    pub(crate) fn parameter_dim(&self) -> usize {
+    pub fn parameter_dim(&self) -> usize {
         match self {
             Self::Dense(covariance) => covariance.nrows(),
             Self::Factorized { dim, .. } => *dim,
         }
     }
 
-    pub(crate) fn nrows(&self) -> usize {
+    pub fn nrows(&self) -> usize {
         match self {
             Self::Dense(covariance) => covariance.nrows(),
             Self::Factorized { .. } => self.parameter_dim(),
@@ -110,7 +110,7 @@ pub(crate) fn prediction_chunk_rows(
         .min(n_rows.max(1))
 }
 
-pub(crate) fn rowwise_local_covariances<F>(
+pub fn rowwise_local_covariances<F>(
     backend: &PredictionCovarianceBackend<'_>,
     n_rows: usize,
     local_dim: usize,

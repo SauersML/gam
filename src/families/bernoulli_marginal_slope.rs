@@ -1687,6 +1687,411 @@ impl BernoulliMarginalSlopeFamily {
         Ok(f_jet.coeff(f_jet.full_mask()))
     }
 
+
+    // ── Analytic implicit-differentiation kernel ──────────────────────
+    //
+    // Replaces MultiDirJet AD in the inner (gradient+Hessian) hot path.
+    // One scalar Newton root + one analytic reduction per row.
+    //
+    // IFT:
+    //   a_u    = −M_u / M_a
+    //   a_{uv} = −(M_{uv} + M_{au} a_v + M_{av} a_u + M_{aa} a_u a_v) / M_a
+
+    /// Analytic neg-log-likelihood value at a single row (no jets).
+    fn compute_row_analytic_neglog(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+    ) -> f64 {
+        let b = block_states[1].eta[row];
+        let yi = self.y[row];
+        let wi = self.weights[row];
+        let y_sign = 2.0 * yi - 1.0;
+        let a = row_ctx.intercept;
+        let h_obs = row_ctx.h_obs_base;
+        let eta_obs = a + b * h_obs;
+
+        let s_obs = if let Some(ls) = row_ctx.obs_link.as_ref() {
+            let bw = &block_states.last().unwrap().beta;
+            eta_obs + ls.basis.row(0).dot(bw)
+        } else {
+            eta_obs
+        };
+        let m = y_sign * s_obs;
+        let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(m);
+        -wi * log_cdf
+    }
+
+    /// Analytic gradient + Hessian of neg-log-likelihood at one row,
+    /// in primary coordinates, via IFT through 2nd order.
+    /// Returns (neg_log_lik, gradient, Hessian).
+    fn compute_row_analytic_gradient_hessian(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &PrimarySlices,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        h_nodes: &Array1<f64>,
+        h_node_design: Option<&Array2<f64>>,
+        score_warp_obs: Option<&(DesignMatrix, Array1<f64>)>,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let p = primary.total;
+        let q = block_states[0].eta[row];
+        let b = block_states[1].eta[row];
+        let yi = self.y[row];
+        let wi = self.weights[row];
+        let y_sign = 2.0 * yi - 1.0;
+        let a = row_ctx.intercept;
+        let m_a = row_ctx.m_a;
+        let h_obs = row_ctx.h_obs_base;
+
+        let beta_w = if self.link_dev.is_some() {
+            block_states.last().map(|s| &s.beta)
+        } else {
+            None
+        };
+
+        let n_w = primary.w.as_ref().map_or(0, |r| r.len());
+        let n_h = primary.h.as_ref().map_or(0, |r| r.len());
+        let q_nodes = h_nodes.len();
+
+        // ── Per-node tables: s_j, φ(s_j)·wt_j, L_j, L'_j ───────────
+        let mut nd_s = Vec::with_capacity(q_nodes);
+        let mut nd_p = Vec::with_capacity(q_nodes);
+        let mut nd_l1 = Vec::with_capacity(q_nodes);
+        let mut nd_l2 = Vec::with_capacity(q_nodes);
+
+        for j in 0..q_nodes {
+            let h_j = h_nodes[j];
+            let u_j = a + b * h_j;
+            let (s_j, l1, l2) = if let Some(ls) = row_ctx.node_link.as_ref() {
+                let bw = beta_w.unwrap();
+                (
+                    u_j + ls.basis.row(j).dot(bw),
+                    1.0 + ls.d1.row(j).dot(bw),
+                    ls.d2.row(j).dot(bw),
+                )
+            } else {
+                (u_j, 1.0, 0.0)
+            };
+            nd_s.push(s_j);
+            nd_p.push(normal_pdf(s_j) * self.quadrature_weights[j]);
+            nd_l1.push(l1);
+            nd_l2.push(l2);
+        }
+
+        // ── M derivatives ─────────────────────────────────────────────
+        let phi_q = normal_pdf(q);
+
+        // M_aa = Σ_j p_j [−s_j L_j² + L'_j]
+        let m_aa: f64 = (0..q_nodes)
+            .map(|j| nd_p[j] * (-nd_s[j] * nd_l1[j] * nd_l1[j] + nd_l2[j]))
+            .sum();
+
+        // M_θ  (length p)
+        let mut m_theta = Array1::<f64>::zeros(p);
+        m_theta[0] = -phi_q;
+        m_theta[1] = (0..q_nodes).map(|j| nd_p[j] * nd_l1[j] * h_nodes[j]).sum();
+        if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
+            for k in 0..n_h {
+                m_theta[hr.start + k] = (0..q_nodes)
+                    .map(|j| nd_p[j] * nd_l1[j] * b * des[[j, k]])
+                    .sum();
+            }
+        }
+        if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
+            for l in 0..n_w {
+                m_theta[wr.start + l] =
+                    (0..q_nodes).map(|j| nd_p[j] * ls.basis[[j, l]]).sum();
+            }
+        }
+
+        // M_aθ  (length p)
+        let mut m_a_theta = Array1::<f64>::zeros(p);
+        // M_{aq} = 0
+        m_a_theta[1] = (0..q_nodes)
+            .map(|j| nd_p[j] * h_nodes[j] * (-nd_s[j] * nd_l1[j] * nd_l1[j] + nd_l2[j]))
+            .sum();
+        if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
+            for k in 0..n_h {
+                m_a_theta[hr.start + k] = (0..q_nodes)
+                    .map(|j| {
+                        nd_p[j]
+                            * b
+                            * des[[j, k]]
+                            * (-nd_s[j] * nd_l1[j] * nd_l1[j] + nd_l2[j])
+                    })
+                    .sum();
+            }
+        }
+        if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
+            for l in 0..n_w {
+                m_a_theta[wr.start + l] = (0..q_nodes)
+                    .map(|j| {
+                        nd_p[j]
+                            * (-nd_s[j] * nd_l1[j] * ls.basis[[j, l]] + ls.d1[[j, l]])
+                    })
+                    .sum();
+            }
+        }
+
+        // ── 1st-order IFT: a_θ = −M_θ / M_a ─────────────────────────
+        let a_theta = m_theta.mapv(|v| -v / m_a);
+
+        // ── η_θ at observation point ──────────────────────────────────
+        let mut eta_theta = a_theta.clone();
+        eta_theta[1] += h_obs;
+        if let (Some(hr), Some((obs_des, _))) = (primary.h.as_ref(), score_warp_obs) {
+            let obs_row = obs_des.row_chunk(row..row + 1);
+            for k in 0..n_h {
+                eta_theta[hr.start + k] += b * obs_row[[0, k]];
+            }
+        }
+
+        // ── s_obs_θ through link ──────────────────────────────────────
+        let eta_obs = a + b * h_obs;
+        let (s_obs, l_obs, l_obs2) = if let Some(ls) = row_ctx.obs_link.as_ref() {
+            let bw = beta_w.unwrap();
+            (
+                eta_obs + ls.basis.row(0).dot(bw),
+                1.0 + ls.d1.row(0).dot(bw),
+                ls.d2.row(0).dot(bw),
+            )
+        } else {
+            (eta_obs, 1.0, 0.0)
+        };
+
+        // s_θ[k] = L_obs η_θ[k] + δ(k∈w) B_l(η_obs)
+        let mut s_theta = eta_theta.mapv(|v| l_obs * v);
+        if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.obs_link.as_ref()) {
+            for l in 0..n_w {
+                s_theta[wr.start + l] += ls.basis[[0, l]];
+            }
+        }
+
+        // ── f value, gradient ─────────────────────────────────────────
+        let m = y_sign * s_obs;
+        let (log_cdf, lambda) = signed_probit_logcdf_and_mills_ratio(m);
+        let neglog = -wi * log_cdf;
+        let df_ds = -wi * y_sign * lambda;
+        let d2f_ds2 = wi * lambda * (m + lambda);
+
+        let grad = s_theta.mapv(|v| df_ds * v);
+
+        // ── M_θθ (p×p) ───────────────────────────────────────────────
+        let mut m_theta_theta = Array2::<f64>::zeros((p, p));
+        m_theta_theta[[0, 0]] = q * phi_q;
+
+        for j in 0..q_nodes {
+            let pj = nd_p[j];
+            let sj = nd_s[j];
+            let l1j = nd_l1[j];
+            let l2j = nd_l2[j];
+            let hj = h_nodes[j];
+
+            // ξ_j = ∂s_j/∂θ (not through a)
+            let mut xi = Array1::<f64>::zeros(p);
+            xi[1] = l1j * hj;
+            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
+                for k in 0..n_h {
+                    xi[hr.start + k] = l1j * b * des[[j, k]];
+                }
+            }
+            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
+                for l in 0..n_w {
+                    xi[wr.start + l] = ls.basis[[j, l]];
+                }
+            }
+
+            // −s_j p_j ξ_j ξ_j^T
+            let neg_sp = -sj * pj;
+            for k in 0..p {
+                if xi[k] == 0.0 {
+                    continue;
+                }
+                for l in k..p {
+                    if xi[l] == 0.0 {
+                        continue;
+                    }
+                    let v = neg_sp * xi[k] * xi[l];
+                    m_theta_theta[[k, l]] += v;
+                    if l != k {
+                        m_theta_theta[[l, k]] += v;
+                    }
+                }
+            }
+
+            // ∂ξ/∂θ corrections (× p_j)
+            // (g,g): L'_j h_j²
+            m_theta_theta[[1, 1]] += pj * l2j * hj * hj;
+            // (g,h_k): L'_j b D h_j + L_j D
+            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
+                for k in 0..n_h {
+                    let v = pj * (l2j * b * des[[j, k]] * hj + l1j * des[[j, k]]);
+                    m_theta_theta[[1, hr.start + k]] += v;
+                    m_theta_theta[[hr.start + k, 1]] += v;
+                }
+            }
+            // (g,w_m): B'_m h_j
+            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
+                for l in 0..n_w {
+                    let v = pj * ls.d1[[j, l]] * hj;
+                    m_theta_theta[[1, wr.start + l]] += v;
+                    m_theta_theta[[wr.start + l, 1]] += v;
+                }
+            }
+            // (h_k1,h_k2): L'_j b² D D
+            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
+                for k1 in 0..n_h {
+                    for k2 in k1..n_h {
+                        let v = pj * l2j * b * b * des[[j, k1]] * des[[j, k2]];
+                        let i1 = hr.start + k1;
+                        let i2 = hr.start + k2;
+                        m_theta_theta[[i1, i2]] += v;
+                        if i2 != i1 {
+                            m_theta_theta[[i2, i1]] += v;
+                        }
+                    }
+                }
+                // (h_k,w_m): B'_m b D
+                if let (Some(wr), Some(ls)) =
+                    (primary.w.as_ref(), row_ctx.node_link.as_ref())
+                {
+                    for k in 0..n_h {
+                        for l in 0..n_w {
+                            let v = pj * ls.d1[[j, l]] * b * des[[j, k]];
+                            m_theta_theta[[hr.start + k, wr.start + l]] += v;
+                            m_theta_theta[[wr.start + l, hr.start + k]] += v;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 2nd-order IFT: a_{kl} ────────────────────────────────────
+        let mut a_theta_theta = Array2::<f64>::zeros((p, p));
+        for k in 0..p {
+            for l in k..p {
+                let v = -(m_theta_theta[[k, l]]
+                    + m_a_theta[k] * a_theta[l]
+                    + m_a_theta[l] * a_theta[k]
+                    + m_aa * a_theta[k] * a_theta[l])
+                    / m_a;
+                a_theta_theta[[k, l]] = v;
+                a_theta_theta[[l, k]] = v;
+            }
+        }
+
+        // ── s_obs_θθ ──────────────────────────────────────────────────
+        let mut s_theta_theta = Array2::<f64>::zeros((p, p));
+        for k in 0..p {
+            for l in k..p {
+                let mut v = l_obs2 * eta_theta[k] * eta_theta[l]
+                    + l_obs * a_theta_theta[[k, l]];
+                if let (Some(wr), Some(ls)) =
+                    (primary.w.as_ref(), row_ctx.obs_link.as_ref())
+                {
+                    if l >= wr.start && l < wr.end {
+                        v += ls.d1[[0, l - wr.start]] * eta_theta[k];
+                    }
+                    if k >= wr.start && k < wr.end {
+                        v += ls.d1[[0, k - wr.start]] * eta_theta[l];
+                    }
+                }
+                s_theta_theta[[k, l]] = v;
+                s_theta_theta[[l, k]] = v;
+            }
+        }
+
+        // ── Hessian: f_{kl} = d²f/ds² s_k s_l + df/ds s_{kl} ────────
+        let mut hess = Array2::<f64>::zeros((p, p));
+        for k in 0..p {
+            for l in k..p {
+                let v = d2f_ds2 * s_theta[k] * s_theta[l]
+                    + df_ds * s_theta_theta[[k, l]];
+                hess[[k, l]] = v;
+                hess[[l, k]] = v;
+            }
+        }
+
+        Ok((neglog, grad, hess))
+    }
+
+    /// Third-derivative tensor contracted with one direction v.
+    /// out[k,l] = Σ_m f_{klm} v[m].
+    fn compute_row_analytic_third_contracted(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &PrimarySlices,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        h_nodes: &Array1<f64>,
+        h_node_design: Option<&Array2<f64>>,
+        score_warp_obs: Option<&(DesignMatrix, Array1<f64>)>,
+        dir_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let p = primary.total;
+        let mut out = Array2::<f64>::zeros((p, p));
+        for k in 0..p {
+            let dk = unit_primary_direction(primary, k);
+            for l in k..p {
+                let dl = unit_primary_direction(primary, l);
+                let value = self.row_neglog_directional_from_primary(
+                    row,
+                    block_states,
+                    primary,
+                    &[dk.clone(), dl.clone(), dir_v.clone()],
+                    row_ctx,
+                    h_nodes,
+                    h_node_design,
+                    score_warp_obs,
+                )?;
+                out[[k, l]] = value;
+                out[[l, k]] = value;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fourth-derivative tensor contracted with two directions u,v.
+    /// out[k,l] = Σ_{m,n} f_{klmn} u[m] v[n].
+    fn compute_row_analytic_fourth_contracted(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &PrimarySlices,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        h_nodes: &Array1<f64>,
+        h_node_design: Option<&Array2<f64>>,
+        score_warp_obs: Option<&(DesignMatrix, Array1<f64>)>,
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let p = primary.total;
+        let mut out = Array2::<f64>::zeros((p, p));
+        for k in 0..p {
+            let dk = unit_primary_direction(primary, k);
+            for l in k..p {
+                let dl = unit_primary_direction(primary, l);
+                let value = self.row_neglog_directional_from_primary(
+                    row,
+                    block_states,
+                    primary,
+                    &[dk.clone(), dl.clone(), dir_u.clone(), dir_v.clone()],
+                    row_ctx,
+                    h_nodes,
+                    h_node_design,
+                    score_warp_obs,
+                )?;
+                out[[k, l]] = value;
+                out[[l, k]] = value;
+            }
+        }
+        Ok(out)
+    }
+
+
     fn row_primary_direction_from_flat(
         &self,
         row: usize,
@@ -3254,42 +3659,35 @@ impl BernoulliMarginalSlopeFamily {
                             &dir_i,
                             &dir_j,
                         )?;
-                        let (_, left_i) = self
-                            .embedded_psi_vector(row, slices, derivative_blocks, psi_i)?
+                        let br_i = self
+                            .block_psi_row(row, slices, derivative_blocks, psi_i)?
                             .ok_or_else(|| {
                                 "missing bernoulli marginal-slope psi_i vector".to_string()
                             })?;
-                        let (_, left_j) = self
-                            .embedded_psi_vector(row, slices, derivative_blocks, psi_j)?
+                        let br_j = self
+                            .block_psi_row(row, slices, derivative_blocks, psi_j)?
                             .ok_or_else(|| {
                                 "missing bernoulli marginal-slope psi_j vector".to_string()
                             })?;
-                        let left_ij = self
-                            .embedded_psi_second_vector(
+                        let br_ij = self.block_psi_second_row(
                                 row,
                                 slices,
                                 derivative_blocks,
                                 psi_i,
                                 psi_j,
                             )?
-                            .map(|(_, v)| v)
-                            .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
+                        ;
 
                         acc.0 += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
-                        if left_ij.iter().any(|v| v.abs() > 0.0) {
-                            let idx_ij = if left_ij
-                                .slice(s![slices.marginal.clone()])
-                                .iter()
-                                .any(|v| v.abs() > 0.0)
-                            {
-                                0
-                            } else {
-                                1
-                            };
-                            acc.1 += &(left_ij.clone() * f_pi[idx_ij]);
+                        if let Some(ref bij) = br_ij {
+                            let idx_ij = if bij.block_idx == 0 { 0 } else { 1 };
+                            acc.1.slice_mut(s![bij.range.clone()])
+                                .scaled_add(f_pi[idx_ij], &bij.local_vec);
                         }
-                        acc.1 += &(left_i.clone() * f_pipi.row(idx_i).dot(&dir_j));
-                        acc.1 += &(left_j.clone() * f_pipi.row(idx_j).dot(&dir_i));
+                        acc.1.slice_mut(s![br_i.range.clone()])
+                            .scaled_add(f_pipi.row(idx_i).dot(&dir_j), &br_i.local_vec);
+                        acc.1.slice_mut(s![br_j.range.clone()])
+                            .scaled_add(f_pipi.row(idx_j).dot(&dir_i), &br_j.local_vec);
                         acc.1 += &self.pullback_primary_vector(
                             row,
                             slices,
@@ -3422,7 +3820,7 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let Some((block_idx, _)) =
-            self.embedded_psi_vector(0, slices, derivative_blocks, psi_index)?
+            self.resolve_psi_location(derivative_blocks, psi_index)
         else {
             return Ok(None);
         };
@@ -3478,8 +3876,8 @@ impl BernoulliMarginalSlopeFamily {
                             &row_dir,
                             &psi_dir,
                         )?;
-                        let (_, left_vec) = self
-                            .embedded_psi_vector(row, slices, derivative_blocks, psi_index)?
+                        let psi_row = self
+                            .block_psi_row(row, slices, derivative_blocks, psi_index)?
                             .ok_or_else(|| {
                                 "missing bernoulli marginal-slope psi vector".to_string()
                             })?;
@@ -3489,14 +3887,16 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                             &third_beta.row(idx_primary).to_owned(),
                         )?;
-                        acc += &left_vec
-                            .view()
-                            .insert_axis(Axis(1))
-                            .dot(&right_vec.view().insert_axis(Axis(0)));
-                        acc += &right_vec
-                            .view()
-                            .insert_axis(Axis(1))
-                            .dot(&left_vec.view().insert_axis(Axis(0)));
+                        {
+                            let mut block = acc.slice_mut(s![psi_row.range.clone(), ..]);
+                            block += &psi_row.local_vec.view().insert_axis(Axis(1))
+                                .dot(&right_vec.view().insert_axis(Axis(0)));
+                        }
+                        {
+                            let mut block = acc.slice_mut(s![.., psi_row.range.clone()]);
+                            block += &right_vec.view().insert_axis(Axis(1))
+                                .dot(&psi_row.local_vec.view().insert_axis(Axis(0)));
+                        }
                         self.add_pullback_primary_hessian(&mut acc, row, slices, primary, &fourth);
                         let third_action = self.row_primary_third_contracted_recompute(
                             row,
