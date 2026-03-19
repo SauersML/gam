@@ -970,7 +970,7 @@ fn materialize_standard<'a>(
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        compute_inference: false,
+        compute_inference: !matches!(family, crate::types::LikelihoodFamily::GaussianIdentity),
         max_iter: 200,
         tol: 1e-7,
         nullspace_dims: vec![],
