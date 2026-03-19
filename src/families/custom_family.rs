@@ -3974,32 +3974,151 @@ fn stable_logdet_with_ridge_policy(
             //   log |A + ridge I|_+ = Σ_{lambda_j > floor} log(lambda_j)
             //
             // This is a *surrogate* objective, not a valid Laplace term when
-            // the Hessian is indefinite. Unlike the historical implementation,
-            // this does not silently cascade between different approximation
-            // methods when eigendecomposition fails.
+            // the Hessian is indefinite.
+            //
+            // Primary: eigendecomposition (positive-part filtering).
+            // Fallback: escalating-ridge Cholesky when eigh fails despite
+            // internal jitter schedule.  For nearly-SPD matrices the Cholesky
+            // logdet ≈ positive-part logdet; for mildly indefinite matrices
+            // the ridge bias is a constant offset that does not affect REML
+            // gradients.  Cholesky is a direct (non-iterative) algorithm, so
+            // it cannot suffer QR-style convergence failures.
             let floor = ridge.max(1e-14);
-            let (evals, _) = crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower)
-                .map_err(|e| format!("positive-part surrogate eigendecomposition failed: {e}"))?;
-            let n_negative = evals.iter().filter(|&&ev| ev < -floor).count();
-            if n_negative > 0 {
-                log::warn!(
-                    "[RidgedSurrogateReml] Hessian has {} negative eigenvalue(s) after \
-                     ridging (ridge={:.2e}). The Laplace approximation is not valid in \
-                     these directions; the surrogate objective ignores them. Consider \
-                     using StrictPseudoLaplace if exact Laplace semantics are needed.",
-                    n_negative,
-                    ridge,
-                );
-            }
-            let mut logdet = 0.0;
-            for &ev in &evals {
-                if ev > floor {
-                    logdet += ev.ln();
+            match crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower) {
+                Ok((evals, _)) => {
+                    let n_negative = evals.iter().filter(|&&ev| ev < -floor).count();
+                    if n_negative > 0 {
+                        log::warn!(
+                            "[RidgedSurrogateReml] Hessian has {} negative eigenvalue(s) after \
+                             ridging (ridge={:.2e}). The Laplace approximation is not valid in \
+                             these directions; the surrogate objective ignores them.",
+                            n_negative,
+                            ridge,
+                        );
+                    }
+                    let mut logdet = 0.0;
+                    for &ev in &evals {
+                        if ev > floor {
+                            logdet += ev.ln();
+                        }
+                    }
+                    Ok(logdet)
                 }
+                Err(eigh_err) => positive_part_cholesky_fallback(&a, ridge, &eigh_err),
             }
-            Ok(logdet)
         }
     }
+}
+
+/// Fallback for the `PositivePart` logdet branch when eigendecomposition fails
+/// despite the internal escalating-jitter schedule in `FaerEigh::eigh`.
+///
+/// Strategy: make the matrix SPD by adding progressively larger ridge, then use
+/// Cholesky (a direct, non-iterative factorization) for the logdet.
+///
+/// Mathematical justification: the positive-part surrogate is already an
+/// approximation.  For a nearly-SPD Hessian the Cholesky logdet is close to
+/// the positive-part logdet.  For a mildly indefinite Hessian the extra ridge
+/// shifts all eigenvalues positive; the resulting bias is a smooth, slowly-
+/// varying offset in the REML objective that does not corrupt gradients.
+fn positive_part_cholesky_fallback(
+    a: &Array2<f64>,
+    existing_ridge: f64,
+    eigh_err: &crate::faer_ndarray::FaerLinalgError,
+) -> Result<f64, String> {
+    let p = a.nrows();
+    let diag_scale = a
+        .diag()
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+
+    // Geometric schedule: start from a ridge that should dominate any
+    // moderate indefiniteness, and escalate if Cholesky still fails.
+    const MAX_ATTEMPTS: usize = 6;
+    let mut boost = diag_scale * 1e-6;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut candidate = a.clone();
+        for i in 0..p {
+            candidate[[i, i]] += boost;
+        }
+        if let Ok(chol) = candidate.cholesky(Side::Lower) {
+            let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
+            if logdet.is_finite() {
+                log::warn!(
+                    "[PositivePartFallback] eigendecomposition failed ({eigh_err}); \
+                     using Cholesky with boosted ridge={:.2e} (attempt {}/{MAX_ATTEMPTS}, \
+                     existing_ridge={:.2e}, p={p})",
+                    boost + existing_ridge,
+                    attempt + 1,
+                    existing_ridge,
+                );
+                return Ok(logdet);
+            }
+        }
+        boost *= 10.0;
+    }
+
+    Err(format!(
+        "positive-part surrogate eigendecomposition failed ({eigh_err}) and \
+         Cholesky fallback also failed after {MAX_ATTEMPTS} attempts \
+         (final ridge={:.2e}, p={p})",
+        boost + existing_ridge,
+    ))
+}
+
+/// Fallback for penalty pseudo-logdet when eigendecomposition fails.
+///
+/// Penalty matrices are PSD by construction (weighted sum of PSD penalties),
+/// so the ridged matrix should be SPD.  Uses escalating-ridge Cholesky —
+/// same pattern as `positive_part_cholesky_fallback`.
+fn penalty_logdet_cholesky_fallback(
+    s_ridged: &Array2<f64>,
+    existing_ridge: f64,
+    block: usize,
+    p: usize,
+    eigh_err: &crate::faer_ndarray::FaerLinalgError,
+) -> Result<f64, String> {
+    let diag_scale = s_ridged
+        .diag()
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+
+    const MAX_ATTEMPTS: usize = 6;
+    let mut boost = diag_scale * 1e-8;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut candidate = s_ridged.clone();
+        for i in 0..p {
+            candidate[[i, i]] += boost;
+        }
+        if let Ok(chol) = candidate.cholesky(Side::Lower) {
+            let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
+            if logdet.is_finite() {
+                log::warn!(
+                    "[PenaltyLogdetFallback] eigendecomposition failed for block {block} \
+                     ({eigh_err}); using Cholesky with boosted ridge={:.2e} \
+                     (attempt {}/{MAX_ATTEMPTS}, existing_ridge={:.2e}, p={p})",
+                    boost + existing_ridge,
+                    attempt + 1,
+                    existing_ridge,
+                );
+                return Ok(logdet);
+            }
+        }
+        boost *= 10.0;
+    }
+
+    Err(format!(
+        "penalty logdet eigendecomposition failed for block {block} ({eigh_err}) and \
+         Cholesky fallback also failed after {MAX_ATTEMPTS} attempts \
+         (final ridge={:.2e}, p={p})",
+        boost + existing_ridge,
+    ))
 }
 
 const AUTO_SLQ_LOGDET_MIN_DIM: usize = 4096;
@@ -4548,33 +4667,42 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                     s_for_logdet[[i, i]] += ridge;
                 }
             }
-            let (evals, _) = s_for_logdet.eigh(faer::Side::Lower).map_err(|e| {
-                format!("penalty logdet eigendecomposition failed for block {b}: {e}")
-            })?;
-            // Structural nullity determines the split: bottom m₀ eigenvalues
-            // are structural zeros, top (p - m₀) are the positive subspace.
-            let m0 = if !spec.nullspace_dims.is_empty()
-                && spec.nullspace_dims.len() == spec.penalties.len()
-            {
-                {
-                    let penalties_dense: Vec<Array2<f64>> =
-                        spec.penalties.iter().map(|p| p.to_dense()).collect();
-                    crate::estimate::reml::unified::exact_intersection_nullity(
-                        &penalties_dense,
-                        &spec.nullspace_dims,
-                    )
+            let block_logdet = match s_for_logdet.eigh(faer::Side::Lower) {
+                Ok((evals, _)) => {
+                    // Structural nullity determines the split: bottom m₀ eigenvalues
+                    // are structural zeros, top (p - m₀) are the positive subspace.
+                    let m0 = if !spec.nullspace_dims.is_empty()
+                        && spec.nullspace_dims.len() == spec.penalties.len()
+                    {
+                        let penalties_dense: Vec<Array2<f64>> =
+                            spec.penalties.iter().map(|p| p.to_dense()).collect();
+                        crate::estimate::reml::unified::exact_intersection_nullity(
+                            &penalties_dense,
+                            &spec.nullspace_dims,
+                        )
+                    } else {
+                        let threshold =
+                            crate::estimate::reml::unified::positive_eigenvalue_threshold(
+                                evals.as_slice().unwrap(),
+                            );
+                        evals.iter().filter(|&&e| e <= threshold).count()
+                    };
+                    evals
+                        .iter()
+                        .skip(m0)
+                        .map(|&e| e.max(f64::MIN_POSITIVE).ln())
+                        .sum::<f64>()
                 }
-            } else {
-                let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(
-                    evals.as_slice().unwrap(),
-                );
-                evals.iter().filter(|&&e| e <= threshold).count()
+                Err(eigh_err) => {
+                    // Penalty matrices are PSD by construction, so eigh failure
+                    // here is purely numerical.  Fall back to Cholesky on the
+                    // ridged matrix (which should be SPD).  The Cholesky logdet
+                    // includes null-space contributions (~m₀ × ln(ridge)), making
+                    // it a slight overestimate, but this is a smooth bias that
+                    // does not corrupt REML gradients.
+                    penalty_logdet_cholesky_fallback(&s_for_logdet, ridge, b, p, &eigh_err)?
+                }
             };
-            let block_logdet: f64 = evals
-                .iter()
-                .skip(m0)
-                .map(|&e| e.max(f64::MIN_POSITIVE).ln())
-                .sum();
             penalty_logdet_s_total += block_logdet;
         }
         s_lambdas.push(s_lambda);
@@ -7615,7 +7743,7 @@ mod tests {
     use crate::matrix::DesignMatrix;
     use crate::smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
-        build_term_collection_design, freeze_spatial_length_scale_terms_from_design,
+        build_term_collection_design, freeze_term_collection_from_design,
         spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
     };
     use approx::assert_relative_eq;
@@ -7723,7 +7851,7 @@ mod tests {
         };
         let base_design =
             build_term_collection_design(data.view(), &spec).expect("build base spatial design");
-        let resolvedspec = freeze_spatial_length_scale_terms_from_design(&spec, &base_design)
+        let resolvedspec = freeze_term_collection_from_design(&spec, &base_design)
             .expect("freeze spatial term spec");
         let resolved_design = build_term_collection_design(data.view(), &resolvedspec)
             .expect("rebuild frozen spatial design");

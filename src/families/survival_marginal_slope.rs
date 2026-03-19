@@ -24,7 +24,7 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_spatial_length_scale_terms_from_design, optimize_spatial_length_scale_exact_joint,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::reml::unified::HyperOperator;
@@ -3292,12 +3292,12 @@ pub fn fit_survival_marginal_slope_terms(
     let marginal_design =
         build_term_collection_design(data, &spec.marginalspec).map_err(|e| e.to_string())?;
     let marginalspec_boot =
-        freeze_spatial_length_scale_terms_from_design(&spec.marginalspec, &marginal_design)
+        freeze_term_collection_from_design(&spec.marginalspec, &marginal_design)
             .map_err(|e| e.to_string())?;
     let logslope_design =
         build_term_collection_design(data, &spec.logslopespec).map_err(|e| e.to_string())?;
     let logslopespec_boot =
-        freeze_spatial_length_scale_terms_from_design(&spec.logslopespec, &logslope_design)
+        freeze_term_collection_from_design(&spec.logslopespec, &logslope_design)
             .map_err(|e| e.to_string())?;
 
     let time_penalties_len = spec.time_block.penalties.len();

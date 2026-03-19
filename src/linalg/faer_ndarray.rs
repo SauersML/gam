@@ -26,6 +26,8 @@ pub enum FaerLinalgError {
     FactorizationFailed,
     #[error("SVD failed to converge")]
     SvdNoConvergence,
+    #[error("Self-adjoint eigendecomposition input contains non-finite values")]
+    SelfAdjointEigenNonFiniteInput,
     #[error("Self-adjoint eigendecomposition failed: {0:?}")]
     SelfAdjointEigen(solvers::EvdError),
     #[error("Cholesky factorization failed: {0:?}")]
@@ -1252,12 +1254,16 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
         }
 
         let owned = self.to_owned();
-        if let Ok(ok) = try_eigh(&owned, side) {
-            return Ok(ok);
+        if owned.iter().any(|value| !value.is_finite()) {
+            return Err(FaerLinalgError::SelfAdjointEigenNonFiniteInput);
+        }
+        if let Ok((evals, evecs)) = try_eigh(&owned, side)
+            && evals.iter().all(|value| value.is_finite())
+            && evecs.iter().all(|value| value.is_finite())
+        {
+            return Ok((evals, evecs));
         }
 
-        // Rarely, near-singular block Hessians trigger backend EVD no-convergence.
-        // Retry on an explicitly symmetrized + lightly jittered copy.
         let mut repaired = owned.clone();
         let n = repaired.nrows();
         for i in 0..n {
@@ -1267,15 +1273,43 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
                 repaired[[j, i]] = avg;
             }
         }
-        let mut diag_scale = 0.0_f64;
-        for i in 0..n {
-            diag_scale = diag_scale.max(repaired[[i, i]].abs());
+
+        let scale = repaired
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+            .max(1.0);
+        let scaled = repaired.mapv(|value| value / scale);
+        let jitter_schedule = [0.0_f64, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4];
+        let mut last_error = FaerLinalgError::FactorizationFailed;
+
+        for &jitter in &jitter_schedule {
+            let mut candidate = scaled.clone();
+            if jitter > 0.0 {
+                for i in 0..n {
+                    candidate[[i, i]] += jitter;
+                }
+            }
+
+            match try_eigh(&candidate, side) {
+                Ok((mut evals, evecs))
+                    if evals.iter().all(|value| value.is_finite())
+                        && evecs.iter().all(|value| value.is_finite()) =>
+                {
+                    for value in &mut evals {
+                        *value = (*value - jitter) * scale;
+                    }
+                    return Ok((evals, evecs));
+                }
+                Ok(_) => {
+                    last_error = FaerLinalgError::SelfAdjointEigenNonFiniteInput;
+                }
+                Err(err) => {
+                    last_error = err;
+                }
+            }
         }
-        let base = (diag_scale.max(1.0)) * 1e-12;
-        for i in 0..n {
-            repaired[[i, i]] += base;
-        }
-        try_eigh(&repaired, side)
+
+        Err(last_error)
     }
 }
 
@@ -1525,41 +1559,26 @@ mod tests {
     //
     // Eigendecomposition NoConvergence on pathological matrices
     //
-    // These tests demonstrate that FaerEigh::eigh fails (NoConvergence) when
-    // the input matrix contains NaN or Inf entries, even after the internal
-    // symmetrize-and-jitter retry.  This is the low-level trigger for the
-    // higher-level "exact-newton eigendecomposition failed" crash in the
-    // custom-family block-update path.
+    // These tests lock down the hardened contract for FaerEigh::eigh:
+    // non-finite input must be rejected explicitly, while finite symmetric
+    // matrices still produce finite spectra.
     //
 
     #[test]
-    fn eigh_on_nan_matrix_returns_nan_eigenvalues_not_error() {
-        // On macOS (and potentially other platforms), faer's eigh does NOT
-        // return Err(NoConvergence) for NaN inputs — it returns Ok with NaN
-        // eigenvalues. This is dangerous because callers that check for Err
-        // will miss the pathology.
-        //
-        // On production CI (Linux/different SIMD), the same NaN pattern
-        // CAN trigger NoConvergence. The behavior is platform-dependent.
+    fn eigh_on_nan_matrix_rejects_non_finite_input() {
         let mat = array![
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 2.0, 0.0, 0.0],
             [0.0, 0.0, 3.0, f64::NAN],
             [0.0, 0.0, f64::NAN, 4.0]
         ];
-        let result = mat.eigh(Side::Lower);
-        match result {
-            Ok((evals, _)) => {
-                // eigh returned Ok — eigenvalues should contain NaN
-                assert!(
-                    evals.iter().any(|v| v.is_nan()),
-                    "eigh returned Ok but eigenvalues should contain NaN: {evals:?}"
-                );
-            }
-            Err(_) => {
-                // NoConvergence is also acceptable (platform-dependent)
-            }
-        }
+        let err = mat
+            .eigh(Side::Lower)
+            .expect_err("non-finite symmetric input must be rejected");
+        assert!(matches!(
+            err,
+            FaerLinalgError::SelfAdjointEigenNonFiniteInput
+        ));
     }
 
     #[test]

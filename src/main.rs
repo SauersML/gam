@@ -5,10 +5,7 @@ use csv::WriterBuilder;
 use faer::Mat as FaerMat;
 use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_fit;
-use gam::basis::{
-    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, CenterStrategy,
-    MaternIdentifiability, SpatialIdentifiability, create_difference_penalty_matrix,
-};
+use gam::basis::{BasisOptions, create_difference_penalty_matrix};
 use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
@@ -61,8 +58,9 @@ use gam::mixture_link::{
 use gam::probability::{normal_cdf, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
-    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TensorBSplineIdentifiability,
-    TermCollectionSpec, build_term_collection_design, weighted_blockwise_penalty_sum,
+    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
+    build_term_collection_design, freeze_term_collection_from_design,
+    weighted_blockwise_penalty_sum,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
@@ -1067,7 +1065,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     progress.advance_workflow(4);
     print_spatial_aniso_scales(&resolvedspec);
 
-    let frozenspec = freeze_term_collectionspec(&resolvedspec, &design)?;
+    let frozenspec =
+        freeze_term_collection_from_design(&resolvedspec, &design).map_err(|e| e.to_string())?;
     let mut saved_fit = fit.clone();
     saved_fit.fitted_link = standard_saved_link_state.clone();
     let saved_termspec = frozenspec.clone();
@@ -1287,9 +1286,11 @@ fn run_fit_bernoulli_marginal_slope(
     progress.advance_workflow(3);
 
     let frozen_marginal =
-        freeze_term_collectionspec(&solved.marginalspec_resolved, &solved.marginal_design)?;
+        freeze_term_collection_from_design(&solved.marginalspec_resolved, &solved.marginal_design)
+            .map_err(|e| e.to_string())?;
     let frozen_logslope =
-        freeze_term_collectionspec(&solved.logslopespec_resolved, &solved.logslope_design)?;
+        freeze_term_collection_from_design(&solved.logslopespec_resolved, &solved.logslope_design)
+            .map_err(|e| e.to_string())?;
     progress.advance_workflow(4);
     println!(
         "model fit complete | family={} | outer_iter={} | converged={}",
@@ -1398,8 +1399,11 @@ fn run_fit_transformation_normal(
     };
     progress.advance_workflow(3);
 
-    let frozen_covariate =
-        freeze_term_collectionspec(&solved.covariate_spec_resolved, &solved.covariate_design)?;
+    let frozen_covariate = freeze_term_collection_from_design(
+        &solved.covariate_spec_resolved,
+        &solved.covariate_design,
+    )
+    .map_err(|e| e.to_string())?;
     progress.advance_workflow(4);
     println!(
         "model fit complete | family={} | outer_iter={} | converged={}",
@@ -1534,8 +1538,11 @@ fn run_fitwith_predict_noise(
             mean_design,
             noise_design,
         } = solved.fit;
-        let frozen_meanspec = freeze_term_collectionspec(&meanspec_resolved, &mean_design)?;
-        let frozen_noisespec = freeze_term_collectionspec(&noisespec_resolved, &noise_design)?;
+        let frozen_meanspec = freeze_term_collection_from_design(&meanspec_resolved, &mean_design)
+            .map_err(|e| e.to_string())?;
+        let frozen_noisespec =
+            freeze_term_collection_from_design(&noisespec_resolved, &noise_design)
+                .map_err(|e| e.to_string())?;
         progress.advance_workflow(4);
         println!(
             "model fit complete | family={} | outer_iter={} | converged={}",
@@ -1723,9 +1730,13 @@ fn run_fitwith_predict_noise(
     };
     let fit = solved.fit.fit;
     let frozen_meanspec =
-        freeze_term_collectionspec(&solved.fit.meanspec_resolved, &solved.fit.mean_design)?;
-    let frozen_noisespec =
-        freeze_term_collectionspec(&solved.fit.noisespec_resolved, &solved.fit.noise_design)?;
+        freeze_term_collection_from_design(&solved.fit.meanspec_resolved, &solved.fit.mean_design)
+            .map_err(|e| e.to_string())?;
+    let frozen_noisespec = freeze_term_collection_from_design(
+        &solved.fit.noisespec_resolved,
+        &solved.fit.noise_design,
+    )
+    .map_err(|e| e.to_string())?;
     progress.advance_workflow(4);
     println!(
         "model fit complete | family={} | outer_iter={} | converged={}",
@@ -2000,7 +2011,7 @@ fn run_predict_unified(
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
         let pm = predictor
-            .predict_posterior_mean(pred_input, &fit_for_predict)
+            .predict_posterior_mean(pred_input, &fit_for_predict, Some(args.level))
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
         let sigma = if model_class == PredictModelClass::GaussianLocationScale {
             let with_se = predictor
@@ -2014,8 +2025,8 @@ fn run_predict_unified(
             pm.eta,
             pm.mean,
             Some(pm.eta_standard_error),
-            None,
-            None,
+            pm.mean_lower,
+            pm.mean_upper,
             sigma,
         )
     } else {
@@ -3347,7 +3358,7 @@ fn run_predict_standard(
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture
     );
-    let (eta, mean, se_opt, mut mean_lo, mut mean_hi) = if args.uncertainty {
+    let (eta, mean, se_opt, mean_lo, mean_hi) = if args.uncertainty {
         let options = gam::estimate::PredictUncertaintyOptions {
             confidence_level: args.level,
             covariance_mode: infer_covariance_mode(args.covariance_mode),
@@ -3366,9 +3377,15 @@ fn run_predict_standard(
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
         let pm = predictor
-            .predict_posterior_mean(&pred_input, &fit_saved)
+            .predict_posterior_mean(&pred_input, &fit_saved, Some(args.level))
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-        (pm.eta, pm.mean, Some(pm.eta_standard_error), None, None)
+        (
+            pm.eta,
+            pm.mean,
+            Some(pm.eta_standard_error),
+            pm.mean_lower,
+            pm.mean_upper,
+        )
     } else {
         let pred = predictor
             .predict_plugin_response(&pred_input)
@@ -3376,52 +3393,11 @@ fn run_predict_standard(
         (pred.eta, pred.mean, None, None, None)
     };
 
-    let mut eta_se = None;
-
-    if se_opt.is_some() && mean_lo.is_none() {
-        if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-            return Err(format!("--level must be in (0,1), got {}", args.level));
-        }
-        let se = se_opt.as_ref().ok_or_else(|| {
-            "internal error: eta SE unavailable for uncertainty interval".to_string()
-        })?;
-        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-        eta_se = Some(se.clone());
-        if nonlinear {
-            let response_sd = response_sd_from_eta_for_family(
-                family,
-                eta.view(),
-                se.view(),
-                saved_mixture,
-                saved_sas,
-                saved_mixture_param_cov,
-                saved_sas_param_cov,
-            )?;
-            let (lo, hi) = response_interval_from_mean_sd(
-                mean.view(),
-                response_sd.view(),
-                z,
-                1e-10,
-                1.0 - 1e-10,
-            );
-            mean_lo = Some(lo);
-            mean_hi = Some(hi);
-        } else {
-            let eta_lower = &eta - &se.mapv(|v| z * v);
-            let eta_upper = &eta + &se.mapv(|v| z * v);
-            mean_lo = Some(
-                try_inverse_link_array(family, eta_lower.view(), saved_link_kind)
-                    .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
-            );
-            mean_hi = Some(
-                try_inverse_link_array(family, eta_upper.view(), saved_link_kind)
-                    .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
-            );
-        }
-    }
-    if args.uncertainty {
-        eta_se = se_opt.clone();
-    }
+    let eta_se = if args.uncertainty || se_opt.is_some() {
+        se_opt.clone()
+    } else {
+        None
+    };
 
     progress.advance_workflow(4);
     progress.set_stage("predict", "writing predictions");
@@ -4024,7 +4000,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     };
     let cov_design = build_term_collection_design(ds.values.view(), &termspec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
-    let frozen_termspec = freeze_term_collectionspec(&termspec, &cov_design)?;
+    let frozen_termspec =
+        freeze_term_collection_from_design(&termspec, &cov_design).map_err(|e| e.to_string())?;
 
     let p_cov = cov_design.design.ncols();
     let mut age_entry = Array1::<f64>::zeros(n);
@@ -4351,8 +4328,20 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_distribution =
                 Some(inverse_link_to_saved_string(&fitted_inverse_link));
             payload.training_headers = Some(ds.headers.clone());
-            payload.resolved_termspec = Some(fit.fit.resolved_thresholdspec.clone());
-            payload.resolved_termspec_noise = Some(fit.fit.resolved_log_sigmaspec.clone());
+            payload.resolved_termspec = Some(
+                freeze_term_collection_from_design(
+                    &fit.fit.resolved_thresholdspec,
+                    &fit.fit.threshold_design,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+            payload.resolved_termspec_noise = Some(
+                freeze_term_collection_from_design(
+                    &fit.fit.resolved_log_sigmaspec,
+                    &fit.fit.log_sigma_design,
+                )
+                .map_err(|e| e.to_string())?,
+            );
             write_payload_json(&out, payload)?;
             progress.advance_workflow(survival_total_steps);
         }
@@ -4508,8 +4497,20 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
             payload.training_headers = Some(ds.headers.clone());
-            payload.resolved_termspec = Some(fit.marginalspec_resolved.clone());
-            payload.resolved_termspec_noise = Some(fit.logslopespec_resolved.clone());
+            payload.resolved_termspec = Some(
+                freeze_term_collection_from_design(
+                    &fit.marginalspec_resolved,
+                    &fit.marginal_design,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+            payload.resolved_termspec_noise = Some(
+                freeze_term_collection_from_design(
+                    &fit.logslopespec_resolved,
+                    &fit.logslope_design,
+                )
+                .map_err(|e| e.to_string())?,
+            );
             payload.z_column = args.z_column.clone();
             payload.logslope_baseline = Some(fit.baseline_slope);
             write_payload_json(&out, payload)?;
@@ -6385,180 +6386,6 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
     }
 }
 
-fn freeze_term_collectionspec(
-    spec: &TermCollectionSpec,
-    design: &gam::smooth::TermCollectionDesign,
-) -> Result<TermCollectionSpec, String> {
-    if spec.smooth_terms.len() != design.smooth.terms.len() {
-        return Err(format!(
-            "internal freeze mismatch: smooth spec count {} != fitted smooth term count {}",
-            spec.smooth_terms.len(),
-            design.smooth.terms.len()
-        ));
-    }
-    if spec.random_effect_terms.len() != design.random_effect_levels.len() {
-        return Err(format!(
-            "internal freeze mismatch: random-effect spec count {} != fitted random-effect term count {}",
-            spec.random_effect_terms.len(),
-            design.random_effect_levels.len()
-        ));
-    }
-
-    let mut frozen = spec.clone();
-    for (term, fitted) in frozen
-        .smooth_terms
-        .iter_mut()
-        .zip(design.smooth.terms.iter())
-    {
-        match (&mut term.basis, &fitted.metadata) {
-            (
-                SmoothBasisSpec::BSpline1D { spec: s, .. },
-                BasisMetadata::BSpline1D {
-                    knots,
-                    identifiability_transform,
-                },
-            ) => {
-                s.knotspec = BSplineKnotSpec::Provided(knots.clone());
-                s.identifiability = match identifiability_transform {
-                    Some(z) => BSplineIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => BSplineIdentifiability::None,
-                };
-            }
-            (
-                SmoothBasisSpec::ThinPlate {
-                    spec: s,
-                    input_scales,
-                    ..
-                },
-                BasisMetadata::ThinPlate {
-                    centers,
-                    length_scale,
-                    identifiability_transform,
-                    input_scales: meta_scales,
-                    ..
-                },
-            ) => {
-                s.center_strategy = CenterStrategy::UserProvided(centers.clone());
-                s.length_scale = *length_scale;
-                s.identifiability = match identifiability_transform {
-                    Some(z) => SpatialIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => SpatialIdentifiability::None,
-                };
-                *input_scales = meta_scales.clone();
-            }
-            (
-                SmoothBasisSpec::Matern {
-                    spec: s,
-                    input_scales,
-                    ..
-                },
-                BasisMetadata::Matern {
-                    centers,
-                    length_scale,
-                    nu,
-                    include_intercept,
-                    identifiability_transform,
-                    input_scales: meta_scales,
-                    aniso_log_scales: meta_aniso,
-                    ..
-                },
-            ) => {
-                s.center_strategy = CenterStrategy::UserProvided(centers.clone());
-                s.length_scale = *length_scale;
-                s.nu = *nu;
-                s.include_intercept = *include_intercept;
-                s.identifiability = match identifiability_transform {
-                    Some(z) => MaternIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => MaternIdentifiability::None,
-                };
-                s.aniso_log_scales = meta_aniso.clone();
-                *input_scales = meta_scales.clone();
-            }
-            (
-                SmoothBasisSpec::Duchon {
-                    spec: s,
-                    input_scales,
-                    ..
-                },
-                BasisMetadata::Duchon {
-                    centers,
-                    length_scale,
-                    power,
-                    nullspace_order,
-                    identifiability_transform,
-                    input_scales: meta_scales,
-                    aniso_log_scales: meta_aniso,
-                },
-            ) => {
-                s.center_strategy = CenterStrategy::UserProvided(centers.clone());
-                s.length_scale = *length_scale;
-                s.power = *power;
-                s.nullspace_order = *nullspace_order;
-                s.identifiability = match identifiability_transform {
-                    Some(z) => SpatialIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => SpatialIdentifiability::None,
-                };
-                s.aniso_log_scales = meta_aniso.clone();
-                *input_scales = meta_scales.clone();
-            }
-            (
-                SmoothBasisSpec::TensorBSpline {
-                    feature_cols,
-                    spec: s,
-                },
-                BasisMetadata::TensorBSpline {
-                    feature_cols: fitted_cols,
-                    knots,
-                    degrees,
-                    identifiability_transform,
-                },
-            ) => {
-                if s.marginalspecs.len() != knots.len() || s.marginalspecs.len() != degrees.len() {
-                    return Err(format!(
-                        "tensor freeze mismatch for '{}': marginalspecs={}, knots={}, degrees={}",
-                        term.name,
-                        s.marginalspecs.len(),
-                        knots.len(),
-                        degrees.len()
-                    ));
-                }
-                *feature_cols = fitted_cols.clone();
-                for i in 0..s.marginalspecs.len() {
-                    s.marginalspecs[i].degree = degrees[i];
-                    s.marginalspecs[i].knotspec = BSplineKnotSpec::Provided(knots[i].clone());
-                }
-                s.identifiability = match identifiability_transform {
-                    Some(z) => TensorBSplineIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => TensorBSplineIdentifiability::None,
-                };
-            }
-            _ => {
-                return Err(format!(
-                    "smooth metadata/spec mismatch while freezing term '{}'",
-                    term.name
-                ));
-            }
-        }
-    }
-
-    for (idx, rt) in frozen.random_effect_terms.iter_mut().enumerate() {
-        let (_, kept_levels) = &design.random_effect_levels[idx];
-        rt.frozen_levels = Some(kept_levels.clone());
-    }
-
-    Ok(frozen)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WiggleDomainDiagnostics {
     domain_min: f64,
@@ -6782,6 +6609,25 @@ fn predict_standard_linkwiggle(
         let (lo, hi) =
             response_interval_from_mean_sd(mean.view(), response_sd.view(), z, clamp_lo, clamp_hi);
         (Some(lo), Some(hi))
+    } else if args.mode == PredictModeArg::PosteriorMean {
+        let mut pm = gam::predict::PredictPosteriorMeanResult {
+            eta: eta.clone(),
+            eta_standard_error: eta_se
+                .as_ref()
+                .ok_or_else(|| "internal error: eta SE unavailable for posterior mean".to_string())?
+                .clone(),
+            mean: mean.clone(),
+            mean_lower: None,
+            mean_upper: None,
+        };
+        gam::predict::enrich_posterior_mean_bounds(
+            &mut pm,
+            args.level,
+            family,
+            Some(saved_link_kind),
+        )
+        .map_err(|e| format!("enrich_posterior_mean_bounds failed: {e}"))?;
+        (pm.mean_lower, pm.mean_upper)
     } else {
         (None, None)
     };
@@ -8851,6 +8697,15 @@ fn write_prediction_csv(
         cols.push(("effective_se", &se_v));
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
+    } else if let (Some(lo), Some(hi)) = (mean_lower, mean_upper) {
+        lo_v = lo.to_vec();
+        hi_v = hi.to_vec();
+        cols.push(("mean_lower", &lo_v));
+        cols.push(("mean_upper", &hi_v));
+    } else if mean_lower.is_some() {
+        return Err("internal error: mean_upper missing while mean_lower is present".to_string());
+    } else if mean_upper.is_some() {
+        return Err("internal error: mean_lower missing while mean_upper is present".to_string());
     }
 
     write_prediction_csv_unified(path, &cols)
@@ -9383,10 +9238,12 @@ mod tests {
 
         let pred_text = fs::read_to_string(&pred_path).expect("read prediction csv");
         let header = pred_text.lines().next().unwrap_or("");
-        assert!(
-            header.contains("mean"),
-            "prediction output missing mean column: {header}"
-        );
+        for required in ["mean", "effective_se", "mean_lower", "mean_upper"] {
+            assert!(
+                header.contains(required),
+                "posterior-mean prediction output missing {required} column: {header}"
+            );
+        }
     }
 
     #[test]
@@ -9460,10 +9317,12 @@ mod tests {
 
         let pred_text = fs::read_to_string(&pred_path).expect("read prediction csv");
         let header = pred_text.lines().next().unwrap_or("");
-        assert!(
-            header.contains("mean"),
-            "prediction output missing mean column: {header}"
-        );
+        for required in ["mean", "effective_se", "mean_lower", "mean_upper"] {
+            assert!(
+                header.contains(required),
+                "posterior-mean prediction output missing {required} column: {header}"
+            );
+        }
     }
 
     fn intercept_only_gaussian_location_scale_model(
@@ -9798,7 +9657,7 @@ mod tests {
             mode: PredictModeArg::PosteriorMean,
         };
         let design = Array2::<f64>::ones((3, 1));
-        let (eta, mean, _, _, _) = predict_standard_linkwiggle(
+        let (eta, mean, eta_se, mean_lo, mean_hi) = predict_standard_linkwiggle(
             &args,
             &model,
             LikelihoodFamily::BinomialLogit,
@@ -9812,6 +9671,21 @@ mod tests {
         )
         .expect("predict standard binomial wiggle");
         assert_eq!(eta.len(), 3);
+        assert_eq!(
+            eta_se.as_ref().map(|v| v.len()),
+            Some(3),
+            "posterior-mean wiggle path should emit effective SE"
+        );
+        assert_eq!(
+            mean_lo.as_ref().map(|v| v.len()),
+            Some(3),
+            "posterior-mean wiggle path should emit lower bounds"
+        );
+        assert_eq!(
+            mean_hi.as_ref().map(|v| v.len()),
+            Some(3),
+            "posterior-mean wiggle path should emit upper bounds"
+        );
         for &m in &mean {
             assert!(m.is_finite());
             assert!(m > 0.0 && m < 1.0);
@@ -12067,12 +11941,24 @@ mod tests {
         let deriv_scaled = built_scaled.x_derivative_time.as_dense_cow();
 
         assert_eq!(
-            (built_days.x_entry_time.nrows(), built_days.x_entry_time.ncols()),
-            (built_scaled.x_entry_time.nrows(), built_scaled.x_entry_time.ncols())
+            (
+                built_days.x_entry_time.nrows(),
+                built_days.x_entry_time.ncols()
+            ),
+            (
+                built_scaled.x_entry_time.nrows(),
+                built_scaled.x_entry_time.ncols()
+            )
         );
         assert_eq!(
-            (built_days.x_exit_time.nrows(), built_days.x_exit_time.ncols()),
-            (built_scaled.x_exit_time.nrows(), built_scaled.x_exit_time.ncols())
+            (
+                built_days.x_exit_time.nrows(),
+                built_days.x_exit_time.ncols()
+            ),
+            (
+                built_scaled.x_exit_time.nrows(),
+                built_scaled.x_exit_time.ncols()
+            )
         );
         assert_eq!(
             (
@@ -12096,8 +11982,7 @@ mod tests {
                     "exit basis mismatch at ({i},{j})"
                 );
                 assert!(
-                    (deriv_days[[i, j]] - deriv_scaled[[i, j]] / time_scale).abs()
-                        <= 1e-12,
+                    (deriv_days[[i, j]] - deriv_scaled[[i, j]] / time_scale).abs() <= 1e-12,
                     "derivative basis mismatch at ({i},{j})"
                 );
             }
@@ -12344,7 +12229,13 @@ mod tests {
         assert_eq!(built.basisname, "ispline");
         assert!(built.knots.as_ref().is_some_and(|k| !k.is_empty()));
         assert!(built.x_exit_time.ncols() > 0);
-        assert!(built.x_derivative_time.as_dense_cow().iter().all(|v| v.is_finite()));
+        assert!(
+            built
+                .x_derivative_time
+                .as_dense_cow()
+                .iter()
+                .all(|v| v.is_finite())
+        );
     }
 
     #[test]
@@ -12374,7 +12265,13 @@ mod tests {
             assert!(k < upper_boundary);
         }
         assert!(built.x_exit_time.ncols() > 0);
-        assert!(built.x_derivative_time.as_dense_cow().iter().all(|v| v.is_finite()));
+        assert!(
+            built
+                .x_derivative_time
+                .as_dense_cow()
+                .iter()
+                .all(|v| v.is_finite())
+        );
     }
 
     #[test]
@@ -12562,7 +12459,13 @@ mod tests {
         )
         .expect("build ispline time basis with zero entry times");
 
-        assert!(built.x_derivative_time.as_dense_cow().iter().all(|v| v.is_finite()));
+        assert!(
+            built
+                .x_derivative_time
+                .as_dense_cow()
+                .iter()
+                .all(|v| v.is_finite())
+        );
     }
 
     #[test]

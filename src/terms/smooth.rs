@@ -9137,97 +9137,187 @@ pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> O
         })
 }
 
-pub(crate) fn freeze_spatial_length_scale_terms_from_design(
+/// Freeze a `TermCollectionSpec` by baking in the concrete knots, centers,
+/// identifiability transforms, and random-effect levels that were resolved
+/// during design-matrix construction.  The result passes `validate_frozen`
+/// and is safe to serialize for prediction.
+///
+/// This is the single canonical freezer — every model-save path should call
+/// this rather than rolling ad-hoc freezing logic.
+pub fn freeze_term_collection_from_design(
     spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
 ) -> Result<TermCollectionSpec, EstimationError> {
     if spec.smooth_terms.len() != design.smooth.terms.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "cannot freeze spatial length-scale terms: smooth spec count {} != fitted smooth term count {}",
+            "freeze mismatch: smooth spec count {} != design smooth term count {}",
             spec.smooth_terms.len(),
             design.smooth.terms.len()
         )));
     }
+    if spec.random_effect_terms.len() != design.random_effect_levels.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "freeze mismatch: random-effect spec count {} != design random-effect term count {}",
+            spec.random_effect_terms.len(),
+            design.random_effect_levels.len()
+        )));
+    }
 
     let mut frozen = spec.clone();
+
+    // ── smooth terms ────────────────────────────────────────────────────
     for (term, fitted) in frozen
         .smooth_terms
         .iter_mut()
         .zip(design.smooth.terms.iter())
     {
-        if let (
-            SmoothBasisSpec::Matern {
-                spec: s,
-                input_scales,
-                ..
-            },
-            BasisMetadata::Matern {
-                centers,
-                identifiability_transform,
-                input_scales: meta_scales,
-                aniso_log_scales: meta_aniso,
-                ..
-            },
-        ) = (&mut term.basis, &fitted.metadata)
-        {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-            if let Some(z) = identifiability_transform {
-                s.identifiability = MaternIdentifiability::FrozenTransform {
-                    transform: z.clone(),
+        match (&mut term.basis, &fitted.metadata) {
+            (
+                SmoothBasisSpec::BSpline1D { spec: s, .. },
+                BasisMetadata::BSpline1D {
+                    knots,
+                    identifiability_transform,
+                },
+            ) => {
+                s.knotspec = BSplineKnotSpec::Provided(knots.clone());
+                s.identifiability = match identifiability_transform {
+                    Some(z) => BSplineIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => BSplineIdentifiability::None,
                 };
             }
-            s.aniso_log_scales = meta_aniso.clone();
-            *input_scales = meta_scales.clone();
-        }
-        if let (
-            SmoothBasisSpec::Duchon {
-                spec: s,
-                input_scales,
-                ..
-            },
-            BasisMetadata::Duchon {
-                centers,
-                identifiability_transform,
-                input_scales: meta_scales,
-                aniso_log_scales: meta_aniso,
-                ..
-            },
-        ) = (&mut term.basis, &fitted.metadata)
-        {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-            if let Some(z) = identifiability_transform {
-                s.identifiability = SpatialIdentifiability::FrozenTransform {
-                    transform: z.clone(),
+            (
+                SmoothBasisSpec::ThinPlate {
+                    spec: s,
+                    input_scales,
+                    ..
+                },
+                BasisMetadata::ThinPlate {
+                    centers,
+                    length_scale,
+                    identifiability_transform,
+                    input_scales: meta_scales,
+                    ..
+                },
+            ) => {
+                s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+                s.length_scale = *length_scale;
+                s.identifiability = match identifiability_transform {
+                    Some(z) => SpatialIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => SpatialIdentifiability::None,
+                };
+                *input_scales = meta_scales.clone();
+            }
+            (
+                SmoothBasisSpec::Matern {
+                    spec: s,
+                    input_scales,
+                    ..
+                },
+                BasisMetadata::Matern {
+                    centers,
+                    length_scale,
+                    nu,
+                    include_intercept,
+                    identifiability_transform,
+                    input_scales: meta_scales,
+                    aniso_log_scales: meta_aniso,
+                    ..
+                },
+            ) => {
+                s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+                s.length_scale = *length_scale;
+                s.nu = *nu;
+                s.include_intercept = *include_intercept;
+                s.identifiability = match identifiability_transform {
+                    Some(z) => MaternIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => MaternIdentifiability::None,
+                };
+                s.aniso_log_scales = meta_aniso.clone();
+                *input_scales = meta_scales.clone();
+            }
+            (
+                SmoothBasisSpec::Duchon {
+                    spec: s,
+                    input_scales,
+                    ..
+                },
+                BasisMetadata::Duchon {
+                    centers,
+                    length_scale,
+                    power,
+                    nullspace_order,
+                    identifiability_transform,
+                    input_scales: meta_scales,
+                    aniso_log_scales: meta_aniso,
+                },
+            ) => {
+                s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+                s.length_scale = *length_scale;
+                s.power = *power;
+                s.nullspace_order = *nullspace_order;
+                s.identifiability = match identifiability_transform {
+                    Some(z) => SpatialIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => SpatialIdentifiability::None,
+                };
+                s.aniso_log_scales = meta_aniso.clone();
+                *input_scales = meta_scales.clone();
+            }
+            (
+                SmoothBasisSpec::TensorBSpline {
+                    feature_cols,
+                    spec: s,
+                },
+                BasisMetadata::TensorBSpline {
+                    feature_cols: fitted_cols,
+                    knots,
+                    degrees,
+                    identifiability_transform,
+                },
+            ) => {
+                if s.marginalspecs.len() != knots.len() || s.marginalspecs.len() != degrees.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "tensor freeze mismatch for '{}': marginalspecs={}, knots={}, degrees={}",
+                        term.name,
+                        s.marginalspecs.len(),
+                        knots.len(),
+                        degrees.len()
+                    )));
+                }
+                *feature_cols = fitted_cols.clone();
+                for i in 0..s.marginalspecs.len() {
+                    s.marginalspecs[i].degree = degrees[i];
+                    s.marginalspecs[i].knotspec = BSplineKnotSpec::Provided(knots[i].clone());
+                }
+                s.identifiability = match identifiability_transform {
+                    Some(z) => TensorBSplineIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => TensorBSplineIdentifiability::None,
                 };
             }
-            s.aniso_log_scales = meta_aniso.clone();
-            *input_scales = meta_scales.clone();
-        }
-        if let (
-            SmoothBasisSpec::ThinPlate {
-                spec: s,
-                input_scales,
-                ..
-            },
-            BasisMetadata::ThinPlate {
-                centers,
-                length_scale,
-                identifiability_transform,
-                input_scales: meta_scales,
-                ..
-            },
-        ) = (&mut term.basis, &fitted.metadata)
-        {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-            s.length_scale = *length_scale;
-            if let Some(z) = identifiability_transform {
-                s.identifiability = SpatialIdentifiability::FrozenTransform {
-                    transform: z.clone(),
-                };
+            _ => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "smooth metadata/spec type mismatch while freezing term '{}'",
+                    term.name
+                )));
             }
-            *input_scales = meta_scales.clone();
         }
     }
+
+    // ── random-effect terms ─────────────────────────────────────────────
+    for (idx, rt) in frozen.random_effect_terms.iter_mut().enumerate() {
+        let (_, kept_levels) = &design.random_effect_levels[idx];
+        rt.frozen_levels = Some(kept_levels.clone());
+    }
+
     Ok(frozen)
 }
 
@@ -10236,7 +10326,7 @@ where
                     "failed to build block-{blk_idx} design during exact joint kappa optimization: {e}"
                 )
             })?;
-            let resolved = freeze_spatial_length_scale_terms_from_design(spec, &design)
+            let resolved = freeze_term_collection_from_design(spec, &design)
                 .map_err(|e| {
                     format!(
                         "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
@@ -10289,7 +10379,7 @@ where
                 "failed to build block-{blk_idx} design during exact joint kappa optimization: {e}"
             )
         })?;
-        let frozen = freeze_spatial_length_scale_terms_from_design(spec, &design).map_err(|e| {
+        let frozen = freeze_term_collection_from_design(spec, &design).map_err(|e| {
             format!(
                 "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
             )
@@ -10554,6 +10644,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             family,
             options,
         )?;
+        let resolvedspec = freeze_term_collection_from_design(&resolvedspec, &out.design)?;
         return Ok(FittedTermCollectionWithSpec {
             fit: out.fit,
             design: out.design,
@@ -10624,7 +10715,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         family,
         options,
     )?;
-    resolvedspec = freeze_spatial_length_scale_terms_from_design(&resolvedspec, &best.design)?;
+    resolvedspec = freeze_term_collection_from_design(&resolvedspec, &best.design)?;
     // Sync knot-cloud-derived aniso contrasts from the basis metadata back
     // into the spec so the optimizer starts from the geometry-informed η values
     // rather than the zero sentinel from --scale-dimensions.
@@ -11901,8 +11992,7 @@ mod tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("base design");
-        let frozen =
-            freeze_spatial_length_scale_terms_from_design(&spec, &design).expect("freeze spec");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze spec");
         let rebuilt = build_term_collection_design(data.view(), &frozen).expect("rebuilt design");
         let caches =
             extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
@@ -11944,8 +12034,7 @@ mod tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("base design");
-        let frozen =
-            freeze_spatial_length_scale_terms_from_design(&spec, &design).expect("freeze spec");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze spec");
         let rebuilt = build_term_collection_design(data.view(), &frozen).expect("rebuilt design");
         let caches =
             extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
@@ -12362,6 +12451,114 @@ mod tests {
     }
 
     #[test]
+    fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
+        let n = 24usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (i % 3) as f64;
+        }
+
+        let pspline_term = |name: &str| SmoothTermSpec {
+            name: name.to_string(),
+            basis: SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec: BSplineBasisSpec {
+                    degree: 3,
+                    penalty_order: 2,
+                    knotspec: BSplineKnotSpec::Generate {
+                        data_range: (0.0, 1.0),
+                        num_internal_knots: 3,
+                    },
+                    double_penalty: true,
+                    identifiability: BSplineIdentifiability::None,
+                },
+            },
+            shape: ShapeConstraint::None,
+        };
+        let random_effect = RandomEffectTermSpec {
+            name: "grp".to_string(),
+            feature_col: 1,
+            drop_first_level: false,
+            frozen_levels: None,
+        };
+
+        let meanspec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![random_effect.clone()],
+            smooth_terms: vec![pspline_term("mean_ps")],
+        };
+        let noisespec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![random_effect],
+            smooth_terms: vec![pspline_term("noise_ps")],
+        };
+
+        let kappa_options = SpatialLengthScaleOptimizationOptions {
+            enabled: true,
+            max_outer_iter: 1,
+            rel_tol: 1e-6,
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: 1e-3,
+            max_length_scale: 1e3,
+            pilot_subsample_threshold: 0,
+        };
+        let joint_setup =
+            isotropic_two_block_exact_joint_setup(&meanspec, &noisespec, &kappa_options);
+        let theta_dim = joint_setup.theta0().len();
+
+        let mean_terms = spatial_length_scale_term_indices(&meanspec);
+        let noise_terms = spatial_length_scale_term_indices(&noisespec);
+        assert!(mean_terms.is_empty());
+        assert!(noise_terms.is_empty());
+
+        let solved = optimize_spatial_length_scale_exact_joint(
+            data.view(),
+            &[meanspec.clone(), noisespec.clone()],
+            &[mean_terms, noise_terms],
+            &kappa_options,
+            &joint_setup,
+            crate::seeding::SeedRiskProfile::Gaussian,
+            true,
+            true,
+            |rho, specs, designs| {
+                assert!(rho.is_empty());
+                assert_eq!(specs.len(), 2);
+                assert_eq!(designs.len(), 2);
+                Ok(designs[0].design.ncols() as f64 + designs[1].design.ncols() as f64)
+            },
+            |rho, specs, designs, need_hessian| {
+                assert!(rho.is_empty());
+                assert_eq!(specs.len(), 2);
+                assert_eq!(designs.len(), 2);
+                Ok((
+                    0.0,
+                    Array1::zeros(theta_dim),
+                    need_hessian.then(|| Array2::zeros((theta_dim, theta_dim))),
+                ))
+            },
+        )
+        .expect("exact joint no-spatial fast path should succeed");
+
+        for resolved in [&solved.resolved_specs[0], &solved.resolved_specs[1]] {
+            resolved
+                .validate_frozen("resolvedspec")
+                .expect("exact joint no-spatial fast path should fully freeze specs");
+            match &resolved.smooth_terms[0].basis {
+                SmoothBasisSpec::BSpline1D { spec, .. } => {
+                    assert!(matches!(spec.knotspec, BSplineKnotSpec::Provided(_)));
+                }
+                _ => panic!("expected P-spline term"),
+            }
+            assert!(
+                resolved.random_effect_terms[0].frozen_levels.is_some(),
+                "random-effect levels should be frozen in exact joint no-spatial fast path"
+            );
+        }
+    }
+
+    #[test]
     fn incremental_frozen_realizer_matches_unified_full_rebuild() {
         let n = 24usize;
         let mut data = Array2::<f64>::zeros((n, 4));
@@ -12427,8 +12624,7 @@ mod tests {
         };
 
         let base_design = build_term_collection_design(data.view(), &spec).expect("base design");
-        let frozen =
-            freeze_spatial_length_scale_terms_from_design(&spec, &base_design).expect("freeze");
+        let frozen = freeze_term_collection_from_design(&spec, &base_design).expect("freeze");
         let frozen_design =
             build_term_collection_design(data.view(), &frozen).expect("frozen design");
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
@@ -12565,10 +12761,10 @@ mod tests {
 
         let mean_design = build_term_collection_design(data.view(), &meanspec).expect("mean");
         let noise_design = build_term_collection_design(data.view(), &noisespec).expect("noise");
-        let mean_frozen = freeze_spatial_length_scale_terms_from_design(&meanspec, &mean_design)
-            .expect("freeze mean");
-        let noise_frozen = freeze_spatial_length_scale_terms_from_design(&noisespec, &noise_design)
-            .expect("freeze noise");
+        let mean_frozen =
+            freeze_term_collection_from_design(&meanspec, &mean_design).expect("freeze mean");
+        let noise_frozen =
+            freeze_term_collection_from_design(&noisespec, &noise_design).expect("freeze noise");
 
         let mean_term_indices = spatial_length_scale_term_indices(&mean_frozen);
         let noise_term_indices = spatial_length_scale_term_indices(&noise_frozen);
@@ -12669,8 +12865,7 @@ mod tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
-        let frozen =
-            freeze_spatial_length_scale_terms_from_design(&spec, &design).expect("freeze spec");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze spec");
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         let rho_dim = design.penalties.len();
         let dims_per_term = vec![1];
@@ -12757,7 +12952,7 @@ mod tests {
 
         let design = build_term_collection_design(data.view(), &spec)
             .expect("baseline Matérn design should build");
-        let frozenspec = freeze_spatial_length_scale_terms_from_design(&spec, &design)
+        let frozenspec = freeze_term_collection_from_design(&spec, &design)
             .expect("freezing Matérn centers from design should succeed");
 
         match &frozenspec.smooth_terms[0].basis {
@@ -12820,7 +13015,7 @@ mod tests {
 
         let design = build_term_collection_design(data.view(), &spec)
             .expect("baseline ThinPlate design should build");
-        let frozenspec = freeze_spatial_length_scale_terms_from_design(&spec, &design)
+        let frozenspec = freeze_term_collection_from_design(&spec, &design)
             .expect("freezing ThinPlate centers from design should succeed");
 
         match &frozenspec.smooth_terms[0].basis {
@@ -12925,7 +13120,7 @@ mod tests {
 
         let design = build_term_collection_design(data.view(), &spec)
             .expect("baseline Duchon design should build");
-        let frozenspec = freeze_spatial_length_scale_terms_from_design(&spec, &design)
+        let frozenspec = freeze_term_collection_from_design(&spec, &design)
             .expect("freezing Duchon centers from design should succeed");
 
         match &frozenspec.smooth_terms[0].basis {
@@ -13240,7 +13435,7 @@ mod tests {
 
         let design = build_term_collection_design(data.view(), &spec)
             .expect("baseline Duchon design should build");
-        let frozenspec = freeze_spatial_length_scale_terms_from_design(&spec, &design)
+        let frozenspec = freeze_term_collection_from_design(&spec, &design)
             .expect("freezing Duchon centers from design should succeed");
         let derivative =
             try_build_spatial_term_log_kappa_derivative(data.view(), &frozenspec, &design, 0);
@@ -13281,6 +13476,91 @@ mod tests {
             }
             _ => panic!("expected Duchon term"),
         }
+    }
+
+    #[test]
+    fn single_block_no_spatial_fast_path_returns_fully_frozen_spec() {
+        let n = 48usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (i % 4) as f64;
+            y[i] = 0.5 + 1.5 * t;
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![RandomEffectTermSpec {
+                name: "grp".to_string(),
+                feature_col: 1,
+                drop_first_level: false,
+                frozen_levels: None,
+            }],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "ps".to_string(),
+                basis: SmoothBasisSpec::BSpline1D {
+                    feature_col: 0,
+                    spec: BSplineBasisSpec {
+                        degree: 3,
+                        penalty_order: 2,
+                        knotspec: BSplineKnotSpec::Generate {
+                            data_range: (0.0, 1.0),
+                            num_internal_knots: 4,
+                        },
+                        double_penalty: true,
+                        identifiability: BSplineIdentifiability::None,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: true,
+            max_iter: 40,
+            tol: 1e-6,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+
+        let fitted = fit_term_collectionwith_spatial_length_scale_optimization(
+            data.view(),
+            y,
+            Array1::ones(n),
+            Array1::zeros(n),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &fit_opts,
+            &SpatialLengthScaleOptimizationOptions::default(),
+        )
+        .expect("single-block no-spatial fit should succeed");
+
+        fitted
+            .resolvedspec
+            .validate_frozen("resolvedspec")
+            .expect("single-block no-spatial fast path should fully freeze specs");
+        match &fitted.resolvedspec.smooth_terms[0].basis {
+            SmoothBasisSpec::BSpline1D { spec, .. } => {
+                assert!(matches!(spec.knotspec, BSplineKnotSpec::Provided(_)));
+            }
+            _ => panic!("expected P-spline term"),
+        }
+        assert!(
+            fitted.resolvedspec.random_effect_terms[0]
+                .frozen_levels
+                .is_some(),
+            "random-effect levels should be frozen in single-block no-spatial fast path"
+        );
     }
 
     #[test]
