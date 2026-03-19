@@ -776,7 +776,7 @@ impl RemlConfig {
             likelihood,
             link_kind: InverseLink::Standard(likelihood.link_function()),
             convergence_tolerance: reml_tol,
-            max_iterations: 500,
+            max_iterations: 100,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
             objective_consistentfdgradient: false,
@@ -4267,8 +4267,8 @@ impl fmt::Display for ModelSummary {
 pub use crate::inference::predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod, PredictInput,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
-    PredictableModel, coefficient_uncertainty, coefficient_uncertaintywith_mode, predict_gam,
-    predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
+    PredictableModel, coefficient_uncertainty, coefficient_uncertaintywith_mode,
+    enrich_posterior_mean_bounds, predict_gam, predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 pub use crate::solver::smoothing::{
     SmoothingBfgsOptions, SmoothingBfgsResult, SmoothingOptimizerKind,

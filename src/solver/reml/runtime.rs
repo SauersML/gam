@@ -1987,10 +1987,16 @@ impl<'a> RemlState<'a> {
                 }
                 return Ok(f64::INFINITY);
             }
+            Err(EstimationError::PerfectSeparationDetected { .. })
+            | Err(EstimationError::PirlsDidNotConverge { .. }) => {
+                self.cache_manager.invalidate_eval_bundle();
+                log::warn!(
+                    "P-IRLS separation/non-convergence at current rho; returning +inf cost to retreat."
+                );
+                return Ok(f64::INFINITY);
+            }
             Err(e) => {
                 self.cache_manager.invalidate_eval_bundle();
-                // Other errors still bubble up
-                // Provide bounds diagnostics here too
                 let (at_lower, at_upper) = boundary_hit_indices(p.view(), RHO_BOUND, 1e-8);
                 if !(at_lower.is_empty() && at_upper.is_empty()) {
                     log::debug!(
