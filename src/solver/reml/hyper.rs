@@ -942,6 +942,7 @@ impl<'a> RemlState<'a> {
                 a: a_ij,
                 g: g_ij,
                 b_mat: b_ij,
+                b_operator: None,
                 ld_s: ld_s_ij,
             }
         };
@@ -985,6 +986,7 @@ impl<'a> RemlState<'a> {
                 a: a_kj,
                 g: g_kj,
                 b_mat: b_kj,
+                b_operator: None,
                 ld_s: ld_s_kj,
             }
         };
@@ -1472,6 +1474,7 @@ impl<'a> RemlState<'a> {
                 a: a_ij,
                 g: g_ij,
                 b_mat: b_ij,
+                b_operator: None,
                 ld_s: ld_s_ij,
             }
         };
@@ -1552,6 +1555,7 @@ impl<'a> RemlState<'a> {
                 a: a_kj,
                 g: g_kj,
                 b_mat: b_kj,
+                b_operator: None,
                 ld_s: ld_s_kj,
             }
         };
