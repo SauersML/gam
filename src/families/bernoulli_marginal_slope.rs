@@ -2961,17 +2961,12 @@ impl BernoulliMarginalSlopeFamily {
                                 self.add_pullback_primary_hessian(hmat, i, slices, primary, &f_pipi);
                             }
                         } else {
-                            let row_neglog = self.row_neglog_directional_from_primary(
-                                i, block_states, primary, &[], row_ctx,
-                                &cache.h_nodes, cache.h_node_design.as_ref(),
-                                cache.score_warp_obs.as_ref(),
-                            )?;
-                            acc.0 -= row_neglog;
-                            let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                            let (nll, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                                 i, block_states, primary, row_ctx,
                                 &cache.h_nodes, cache.h_node_design.as_ref(),
                                 cache.score_warp_obs.as_ref(),
                             )?;
+                            acc.0 -= nll;
                             acc.1 -= &self.pullback_primary_vector(i, slices, primary, &f_pi)?;
                             if let Some(ref mut hmat) = acc.2 {
                                 self.add_pullback_primary_hessian(hmat, i, slices, primary, &f_pipi);
