@@ -9,8 +9,9 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
-    MultiDirJet, unary_derivatives_log, unary_derivatives_log_normal_pdf,
-    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
+    MultiDirJet, signed_probit_logcdf_and_mills_ratio,
+    signed_probit_neglog_derivatives_up_to_fourth, unary_derivatives_log,
+    unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::survival_location_scale::{
     TimeBlockInput, structural_nonnegative_constraints,
@@ -24,6 +25,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut1, Axis, s};
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -68,17 +70,17 @@ pub struct SurvivalMarginalSlopeFitResult {
 #[derive(Clone)]
 struct SurvivalMarginalSlopeFamily {
     n: usize,
-    event: Array1<f64>,
-    weights: Array1<f64>,
-    z: Array1<f64>,
+    event: Arc<Array1<f64>>,
+    weights: Arc<Array1<f64>>,
+    z: Arc<Array1<f64>>,
     derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
-    design_entry: Array2<f64>,
-    design_exit: Array2<f64>,
-    design_derivative_exit: Array2<f64>,
-    offset_entry: Array1<f64>,
-    offset_exit: Array1<f64>,
-    derivative_offset_exit: Array1<f64>,
+    design_entry: Arc<Array2<f64>>,
+    design_exit: Arc<Array2<f64>>,
+    design_derivative_exit: Arc<Array2<f64>>,
+    offset_entry: Arc<Array1<f64>>,
+    offset_exit: Arc<Array1<f64>>,
+    derivative_offset_exit: Arc<Array1<f64>>,
     /// Baseline covariate block: contributes additively to q0 and q1, but not qd1.
     marginal_design: DesignMatrix,
     /// Log-slope block: standard single design.
@@ -167,11 +169,183 @@ fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String
     }
 }
 
+// ── Closed-form row kernel ─────────────────────────────────────────────
+//
+// The survival marginal-slope NLL for row i is:
+//
+//   ℓ_i = w_i [ (1-d)·neglogΦ(-η₁) − neglogΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
+//
+// with η₀ = q₀c + gz, η₁ = q₁c + gz, a'₁ = qd₁·c, c = √(1+g²).
+//
+// All derivatives w.r.t. the 4 primary scalars (q₀, q₁, qd₁, g) are
+// closed-form scalar formulas. No jets, no per-row heap allocation.
+
+/// Derivatives of c(g) = √(1+g²) up to 4th order.
+#[inline]
+fn c_derivatives(g: f64) -> (f64, f64, f64, f64, f64) {
+    let g2 = g * g;
+    let c = (1.0 + g2).sqrt();
+    let c2 = c * c; // = 1 + g²
+    let c3 = c2 * c;
+    let c5 = c3 * c2;
+    let c7 = c5 * c2;
+    let c1 = g2 / c; // g * g / c = g² / c
+    let c2d = g2 * (g2 + 2.0) / c3;
+    let c3d = g2 * (g2 * g2 + 2.0 * g2 + 4.0) / c5;
+    let c4d = g2 * (g2 * g2 * g2 + 4.0 * g2 * g2 - 4.0 * g2 + 8.0) / c7;
+    (c, c1, c2d, c3d, c4d)
+}
+
+/// Derivatives of neglog(x) = -log(x): [-1/x, 1/x², -2/x³, 6/x⁴].
+#[inline]
+fn neglog_derivatives(x: f64) -> (f64, f64, f64, f64) {
+    let x1 = x.max(1e-300);
+    let inv = 1.0 / x1;
+    let inv2 = inv * inv;
+    (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
+}
+
+/// Row-level primary gradient (4-vector) and Hessian (4×4 symmetric)
+/// computed entirely from closed-form scalar formulas.
+///
+/// Returns (nll, gradient[4], hessian[4][4]) on the stack.
+#[inline]
+fn row_primary_closed_form(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    g: f64,
+    z: f64,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
+    let (c, c1, c2, ..) = c_derivatives(g);
+
+    // Linear predictors
+    let eta0 = q0 * c + g * z;
+    let eta1 = q1 * c + g * z;
+    let ad1 = qd1 * c;
+
+    if qd1 < derivative_guard {
+        return Err(format!(
+            "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
+        ));
+    }
+
+    // ── NLL terms ──
+    // Entry survival: -neglogΦ(-η₀) = logΦ(-η₀)
+    let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
+    // Exit survival: (1-d)·neglogΦ(-η₁)
+    let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
+    // Event density: d·logφ(η₁)
+    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+    // Time derivative: d·log(ad1)
+    let log_ad1 = ad1.max(1e-300).ln();
+
+    let nll = w * ((1.0 - d) * (-logcdf_neg_eta1) - logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
+
+    // ── First and second derivatives of each NLL component ──
+    // For neglogΦ(-η): f(η) = -logΦ(-η), f'(η) = φ(-η)/Φ(-η) = λ(-η).
+    // signed_probit_neglog_derivatives gives (k1, k2, k3, k4) for -logΦ(m)
+    // where k1 = -λ(m), k2 = λ(m+λ), etc.
+    // For entry: m = -η₀, weight = -w (because we subtract this term)
+    let (e0_k1, e0_k2, _, _) =
+        signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w);
+    // For exit: m = -η₁, weight = w(1-d)
+    let (e1_k1, e1_k2, _, _) =
+        signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d));
+    // Event density: -d·logφ(η₁) = d·(η₁²/2 + const).
+    // d/dη₁ = d·w·η₁, d²/dη₁² = d·w.
+    let phi_u1 = w * d * eta1;
+    let phi_u2 = w * d;
+    // Time derivative: -d·log(ad1).
+    let (nl_u1, nl_u2, _, _) = neglog_derivatives(ad1);
+    let td_u1 = w * d * nl_u1;
+    let td_u2 = w * d * nl_u2;
+
+    // ── Chain rule to primary space ──
+    // η₀ depends on (q₀, g): ∂η₀/∂q₀ = c, ∂η₀/∂g = q₀c₁ + z
+    // η₁ depends on (q₁, g): ∂η₁/∂q₁ = c, ∂η₁/∂g = q₁c₁ + z
+    // ad1 depends on (qd1, g): ∂ad1/∂qd1 = c, ∂ad1/∂g = qd1·c₁
+    let deta0_dq0 = c;
+    let deta0_dg = q0 * c1 + z;
+    let deta1_dq1 = c;
+    let deta1_dg = q1 * c1 + z;
+    let dad1_dqd1 = c;
+    let dad1_dg = qd1 * c1;
+
+    // Combined first derivatives of total NLL:
+    // u1 for η₀ terms = e0_k1 (entry)
+    // u1 for η₁ terms = e1_k1 + phi_u1 (exit + density)
+    // u1 for ad1 term = td_u1 (time derivative)
+    let u1_eta0 = e0_k1;
+    let u1_eta1 = e1_k1 + phi_u1;
+    let u1_ad1 = td_u1;
+
+    let mut grad = [0.0_f64; N_PRIMARY];
+    grad[0] = u1_eta0 * deta0_dq0; // ∂ℓ/∂q₀
+    grad[1] = u1_eta1 * deta1_dq1; // ∂ℓ/∂q₁
+    grad[2] = u1_ad1 * dad1_dqd1; // ∂ℓ/∂qd₁
+    grad[3] = u1_eta0 * deta0_dg + u1_eta1 * deta1_dg + u1_ad1 * dad1_dg; // ∂ℓ/∂g
+
+    // Combined second derivatives:
+    let u2_eta0 = e0_k2;
+    let u2_eta1 = e1_k2 + phi_u2;
+    let u2_ad1 = td_u2;
+
+    // Second mixed derivatives of η w.r.t. primary scalars:
+    let d2eta0_dq0dg = c1;
+    let d2eta1_dq1dg = c1;
+    let d2ad1_dqd1dg = c1;
+    // d²η₀/dg² = q₀·c₂ (z is linear in g, so its second derivative is 0)
+    let d2eta0_dg2 = q0 * c2;
+    let d2eta1_dg2 = q1 * c2;
+    let d2ad1_dg2 = qd1 * c2;
+
+    let mut hess = [[0.0_f64; N_PRIMARY]; N_PRIMARY];
+
+    // (q0, q0)
+    hess[0][0] = u2_eta0 * deta0_dq0 * deta0_dq0;
+    // (q1, q1)
+    hess[1][1] = u2_eta1 * deta1_dq1 * deta1_dq1;
+    // (qd1, qd1)
+    hess[2][2] = u2_ad1 * dad1_dqd1 * dad1_dqd1;
+    // (q0, q1) = 0 (η₀ and η₁ share no primary scalars except g)
+    hess[0][1] = 0.0;
+    hess[1][0] = 0.0;
+    // (q0, qd1) = 0
+    hess[0][2] = 0.0;
+    hess[2][0] = 0.0;
+    // (q1, qd1) = 0
+    hess[1][2] = 0.0;
+    hess[2][1] = 0.0;
+    // (q0, g) = u2_η₀ · (∂η₀/∂q₀)(∂η₀/∂g) + u1_η₀ · (∂²η₀/∂q₀∂g)
+    hess[0][3] = u2_eta0 * deta0_dq0 * deta0_dg + u1_eta0 * d2eta0_dq0dg;
+    hess[3][0] = hess[0][3];
+    // (q1, g)
+    hess[1][3] = u2_eta1 * deta1_dq1 * deta1_dg + u1_eta1 * d2eta1_dq1dg;
+    hess[3][1] = hess[1][3];
+    // (qd1, g)
+    hess[2][3] = u2_ad1 * dad1_dqd1 * dad1_dg + u1_ad1 * d2ad1_dqd1dg;
+    hess[3][2] = hess[2][3];
+    // (g, g) = Σ_terms [u2·(dterm/dg)² + u1·(d²term/dg²)]
+    hess[3][3] = u2_eta0 * deta0_dg * deta0_dg + u1_eta0 * d2eta0_dg2
+        + u2_eta1 * deta1_dg * deta1_dg + u1_eta1 * d2eta1_dg2
+        + u2_ad1 * dad1_dg * dad1_dg + u1_ad1 * d2ad1_dg2;
+
+    Ok((nll, grad, hess))
+}
+
 // ── Eval cache ────────────────────────────────────────────────────────
+//
+// Third and fourth order contracted derivatives for the outer REML path
+// continue to use the MultiDirJet engine via row_neglog_directional.
+// That path is called O(n_rho²) times, not O(n × inner_iters) times,
+// so the jet overhead is acceptable there.
 
 #[derive(Clone)]
 struct RowPrimaryBase {
-    nll: f64,
     gradient: Array1<f64>,
     hessian: Array2<f64>,
 }
@@ -317,23 +491,42 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    /// Compute per-row primary gradient and Hessian using the closed-form
+    /// scalar kernel.  The hot inner computation uses stack arrays only;
+    /// conversion to Array1/Array2 happens once at the boundary for API
+    /// compatibility with outer-derivative paths.
     fn compute_row_primary_gradient_hessian_uncached(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let nll = self.row_neglog_directional(row, block_states, &[])?;
-        let mut grad = Array1::<f64>::zeros(N_PRIMARY);
-        let mut hess = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
-        for a in 0..N_PRIMARY {
-            let da = unit_primary_direction(a);
-            grad[a] = self.row_neglog_directional(row, block_states, &[da.clone()])?;
-            for b in a..N_PRIMARY {
-                let db = unit_primary_direction(b);
-                let value =
-                    self.row_neglog_directional(row, block_states, &[da.clone(), db.clone()])?;
-                hess[[a, b]] = value;
-                hess[[b, a]] = value;
+        let beta_time = &block_states[0].beta;
+        let beta_marginal = &block_states[1].beta;
+        let q0 = self.design_entry.row(row).dot(beta_time)
+            + self.offset_entry[row]
+            + self.marginal_design.dot_row(row, beta_marginal);
+        let q1 = self.design_exit.row(row).dot(beta_time)
+            + self.offset_exit[row]
+            + self.marginal_design.dot_row(row, beta_marginal);
+        let qd1 = self.design_derivative_exit.row(row).dot(beta_time)
+            + self.derivative_offset_exit[row];
+        let g = block_states[2].eta[row];
+        let (nll, grad_arr, hess_arr) = row_primary_closed_form(
+            q0,
+            q1,
+            qd1,
+            g,
+            self.z[row],
+            self.weights[row],
+            self.event[row],
+            self.derivative_guard,
+        )?;
+        // Convert stack arrays to ndarray types at the boundary.
+        let grad = Array1::from_vec(grad_arr.to_vec());
+        let mut hess = Array2::zeros((N_PRIMARY, N_PRIMARY));
+        for i in 0..N_PRIMARY {
+            for j in 0..N_PRIMARY {
+                hess[[i, j]] = hess_arr[i][j];
             }
         }
         Ok((nll, grad, hess))
@@ -343,13 +536,9 @@ impl SurvivalMarginalSlopeFamily {
         let slices = block_slices(block_states);
         let row_bases = (0..self.n)
             .map(|row| {
-                let (nll, gradient, hessian) =
+                let (_, gradient, hessian) =
                     self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                Ok(RowPrimaryBase {
-                    nll,
-                    gradient,
-                    hessian,
-                })
+                Ok(RowPrimaryBase { gradient, hessian })
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(EvalCache { slices, row_bases })
@@ -594,7 +783,7 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(N_PRIMARY);
-        let d_time = d_beta_flat.slice(s![slices.time.clone()]).to_owned();
+        let d_time = d_beta_flat.slice(s![slices.time.clone()]);
         out[0] = self.design_entry.row(row).dot(&d_time);
         out[0] += self
             .marginal_design
@@ -610,28 +799,19 @@ impl SurvivalMarginalSlopeFamily {
         out
     }
 
-    // ── Joint gradient + Hessian ──────────────────────────────────────
+    // ── Dense exact Hessian (streaming, uncached) ─────────────────────
 
-    fn joint_gradient_hessian(
+    fn joint_hessian_dense_streaming(
         &self,
         block_states: &[ParameterBlockState],
-        need_hessian: bool,
-    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-        let cache = self.build_eval_cache(block_states)?;
-        let slices = &cache.slices;
-        let mut gradient = Array1::<f64>::zeros(slices.total);
-        let mut hessian = need_hessian.then(|| Array2::<f64>::zeros((slices.total, slices.total)));
-        let mut ll = 0.0;
-        for i in 0..self.n {
-            ll -= cache.row_bases[i].nll;
-
-            let (f_pi, f_pipi) = self.row_primary_gradient_hessian(i, &cache);
-            gradient -= &self.pullback_primary_vector(i, slices, f_pi)?;
-            if let Some(ref mut hmat) = hessian {
-                self.add_pullback_primary_hessian(hmat, i, slices, f_pipi);
-            }
+    ) -> Result<Array2<f64>, String> {
+        let slices = block_slices(block_states);
+        let mut hessian = Array2::<f64>::zeros((slices.total, slices.total));
+        for row in 0..self.n {
+            let (_, _, f_pipi) = self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+            self.add_pullback_primary_hessian(&mut hessian, row, &slices, &f_pipi);
         }
-        Ok((ll, gradient, hessian))
+        Ok(hessian)
     }
 
     // ── Hessian directional derivatives ───────────────────────────────
@@ -1436,109 +1616,99 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
         let slices = block_slices(block_states);
-        let mut ll = 0.0;
-        let mut grad_time = Array1::<f64>::zeros(slices.time.len());
-        let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
-        let mut grad_logslope = Array1::<f64>::zeros(slices.logslope.len());
-        let mut hess_time = Array2::<f64>::zeros((slices.time.len(), slices.time.len()));
-        let mut hess_marginal =
-            Array2::<f64>::zeros((slices.marginal.len(), slices.marginal.len()));
-        let mut hess_logslope =
-            Array2::<f64>::zeros((slices.logslope.len(), slices.logslope.len()));
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
 
-        for row in 0..self.n {
-            let (row_nll, f_pi, f_pipi) =
-                self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-            ll -= row_nll;
+        // Parallel accumulation: each worker accumulates into its own
+        // block-local gradient + Hessian arrays, then we reduce by addition.
+        // This avoids both per-chunk Vec allocation AND serial bottlenecks.
+        type Acc = (
+            f64,           // ll
+            Array1<f64>,   // grad_time
+            Array1<f64>,   // grad_marginal
+            Array1<f64>,   // grad_logslope
+            Array2<f64>,   // hess_time
+            Array2<f64>,   // hess_marginal
+            Array2<f64>,   // hess_logslope
+        );
 
-            {
-                let mut time = grad_time.view_mut();
-                dense_row_axpy_into(&self.design_entry, row, -f_pi[0], &mut time);
-                dense_row_axpy_into(&self.design_exit, row, -f_pi[1], &mut time);
-                dense_row_axpy_into(&self.design_derivative_exit, row, -f_pi[2], &mut time);
-            }
-            {
-                let mut marginal = grad_marginal.view_mut();
-                self.marginal_design
-                    .axpy_row_into(row, -(f_pi[0] + f_pi[1]), &mut marginal)?;
-            }
-            {
-                let mut logslope = grad_logslope.view_mut();
-                self.logslope_design
-                    .axpy_row_into(row, -f_pi[3], &mut logslope)?;
-            }
+        let make_acc = || -> Acc {
+            (
+                0.0,
+                Array1::zeros(p_t),
+                Array1::zeros(p_m),
+                Array1::zeros(p_g),
+                Array2::zeros((p_t, p_t)),
+                Array2::zeros((p_m, p_m)),
+                Array2::zeros((p_g, p_g)),
+            )
+        };
+        let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope) =
+            (0..self.n)
+                .into_par_iter()
+                .fold(make_acc, |mut acc, row| {
+                    let (row_nll, f_pi, f_pipi) = match self
+                        .compute_row_primary_gradient_hessian_uncached(row, block_states)
+                    {
+                        Ok(v) => v,
+                        Err(_) => return acc,
+                    };
+                    acc.0 -= row_nll;
 
-            dense_row_outer_into(
-                &self.design_entry,
-                &self.design_entry,
-                row,
-                f_pipi[[0, 0]],
-                &mut hess_time,
-            );
-            dense_row_outer_into(
-                &self.design_entry,
-                &self.design_exit,
-                row,
-                f_pipi[[0, 1]],
-                &mut hess_time,
-            );
-            dense_row_outer_into(
-                &self.design_entry,
-                &self.design_derivative_exit,
-                row,
-                f_pipi[[0, 2]],
-                &mut hess_time,
-            );
-            dense_row_outer_into(
-                &self.design_exit,
-                &self.design_entry,
-                row,
-                f_pipi[[1, 0]],
-                &mut hess_time,
-            );
-            dense_row_outer_into(
-                &self.design_exit,
-                &self.design_exit,
-                row,
-                f_pipi[[1, 1]],
-                &mut hess_time,
-            );
-            dense_row_outer_into(
-                &self.design_exit,
-                &self.design_derivative_exit,
-                row,
-                f_pipi[[1, 2]],
-                &mut hess_time,
-            );
-            dense_row_outer_into(
-                &self.design_derivative_exit,
-                &self.design_entry,
-                row,
-                f_pipi[[2, 0]],
-                &mut hess_time,
-            );
-            dense_row_outer_into(
-                &self.design_derivative_exit,
-                &self.design_exit,
-                row,
-                f_pipi[[2, 1]],
-                &mut hess_time,
-            );
-            dense_row_outer_into(
-                &self.design_derivative_exit,
-                &self.design_derivative_exit,
-                row,
-                f_pipi[[2, 2]],
-                &mut hess_time,
-            );
-            self.marginal_design.syr_row_into(
-                row,
-                f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]],
-                &mut hess_marginal,
-            )?;
-            self.logslope_design
-                .syr_row_into(row, f_pipi[[3, 3]], &mut hess_logslope)?;
-        }
+                    {
+                        let mut time = acc.1.view_mut();
+                        dense_row_axpy_into(&self.design_entry, row, -f_pi[0], &mut time);
+                        dense_row_axpy_into(&self.design_exit, row, -f_pi[1], &mut time);
+                        dense_row_axpy_into(
+                            &self.design_derivative_exit,
+                            row,
+                            -f_pi[2],
+                            &mut time,
+                        );
+                    }
+                    self.marginal_design
+                        .axpy_row_into(row, -(f_pi[0] + f_pi[1]), &mut acc.2.view_mut())
+                        .expect("survival marginal block axpy should match block dimensions");
+                    self.logslope_design
+                        .axpy_row_into(row, -f_pi[3], &mut acc.3.view_mut())
+                        .expect("survival logslope block axpy should match block dimensions");
+
+                    let designs = [
+                        &self.design_entry,
+                        &self.design_exit,
+                        &self.design_derivative_exit,
+                    ];
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            dense_row_outer_into(
+                                designs[a], designs[b], row, f_pipi[[a, b]], &mut acc.4,
+                            );
+                        }
+                    }
+
+                    self.marginal_design
+                        .syr_row_into(
+                            row,
+                            f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]],
+                            &mut acc.5,
+                        )
+                        .expect("survival marginal block syr should match block dimensions");
+                    self.logslope_design
+                        .syr_row_into(row, f_pipi[[3, 3]], &mut acc.6)
+                        .expect("survival logslope block syr should match block dimensions");
+                    acc
+                })
+                .reduce(make_acc, |mut a, b| {
+                    a.0 += b.0;
+                    a.1 += &b.1;
+                    a.2 += &b.2;
+                    a.3 += &b.3;
+                    a.4 += &b.4;
+                    a.5 += &b.5;
+                    a.6 += &b.6;
+                    a
+                });
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
@@ -1607,8 +1777,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        self.joint_gradient_hessian(block_states, true)
-            .map(|(_, _, h)| h)
+        self.joint_hessian_dense_streaming(block_states).map(Some)
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
@@ -1711,13 +1880,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
 
 fn build_time_blockspec(
     time_block: &TimeBlockInput,
-    design_exit: &Array2<f64>,
+    design_exit: &Arc<Array2<f64>>,
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "time_surface".to_string(),
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_exit.clone())),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::Materialized(Arc::clone(
+            design_exit,
+        ))),
         offset: Array1::zeros(design_exit.nrows()),
         penalties: time_block
             .penalties
@@ -2016,34 +2187,35 @@ pub fn fit_survival_marginal_slope_terms(
     ));
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
 
-    let event = spec.event_target.clone();
-    let weights = spec.weights.clone();
-    let z = spec.z.clone();
+    let event = Arc::new(spec.event_target.clone());
+    let weights = Arc::new(spec.weights.clone());
+    let z = Arc::new(spec.z.clone());
     let derivative_guard = spec.derivative_guard;
-    let design_entry = spec.time_block.design_entry.clone();
-    let design_exit = spec.time_block.design_exit.clone();
-    let design_derivative_exit = spec.time_block.design_derivative_exit.clone();
-    let offset_entry = spec.time_block.offset_entry.clone();
-    let offset_exit = spec.time_block.offset_exit.clone();
-    let derivative_offset_exit = spec.time_block.derivative_offset_exit.clone();
+    let design_entry = Arc::new(spec.time_block.design_entry.clone());
+    let design_exit = Arc::new(spec.time_block.design_exit.clone());
+    let design_derivative_exit = Arc::new(spec.time_block.design_derivative_exit.clone());
+    let offset_entry = Arc::new(spec.time_block.offset_entry.clone());
+    let offset_exit = Arc::new(spec.time_block.offset_exit.clone());
+    let derivative_offset_exit = Arc::new(spec.time_block.derivative_offset_exit.clone());
     let time_block_ref = spec.time_block.clone();
-    let time_linear_constraints = structural_nonnegative_constraints(&Array2::eye(design_exit.ncols()));
+    let time_linear_constraints =
+        structural_nonnegative_constraints(&Array2::eye(design_exit.ncols()));
 
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign|
      -> SurvivalMarginalSlopeFamily {
         SurvivalMarginalSlopeFamily {
             n,
-            event: event.clone(),
-            weights: weights.clone(),
-            z: z.clone(),
+            event: Arc::clone(&event),
+            weights: Arc::clone(&weights),
+            z: Arc::clone(&z),
             derivative_guard,
-            design_entry: design_entry.clone(),
-            design_exit: design_exit.clone(),
-            design_derivative_exit: design_derivative_exit.clone(),
-            offset_entry: offset_entry.clone(),
-            offset_exit: offset_exit.clone(),
-            derivative_offset_exit: derivative_offset_exit.clone(),
+            design_entry: Arc::clone(&design_entry),
+            design_exit: Arc::clone(&design_exit),
+            design_derivative_exit: Arc::clone(&design_derivative_exit),
+            offset_entry: Arc::clone(&offset_entry),
+            offset_exit: Arc::clone(&offset_exit),
+            derivative_offset_exit: Arc::clone(&derivative_offset_exit),
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
             time_linear_constraints: time_linear_constraints.clone(),
@@ -2272,16 +2444,16 @@ mod tests {
     fn censored_rows_still_reject_invalid_time_derivative() {
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
-            event: array![0.0],
-            weights: array![1.0],
-            z: array![0.0],
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
             derivative_guard: 1e-4,
-            design_entry: Array2::zeros((1, 1)),
-            design_exit: Array2::zeros((1, 1)),
-            design_derivative_exit: Array2::ones((1, 1)),
-            offset_entry: Array1::zeros(1),
-            offset_exit: Array1::zeros(1),
-            derivative_offset_exit: Array1::zeros(1),
+            design_entry: Arc::new(Array2::zeros((1, 1))),
+            design_exit: Arc::new(Array2::zeros((1, 1))),
+            design_derivative_exit: Arc::new(Array2::ones((1, 1))),
+            offset_entry: Arc::new(Array1::zeros(1)),
+            offset_exit: Arc::new(Array1::zeros(1)),
+            derivative_offset_exit: Arc::new(Array1::zeros(1)),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
@@ -2293,6 +2465,10 @@ mod tests {
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
                 eta: array![0.0],
             },
             ParameterBlockState {
