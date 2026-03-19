@@ -907,9 +907,9 @@ struct BernoulliMarginalSlopeRowExactContext {
 }
 
 /// Chunk size for parallel row accumulation.  Rows within a chunk are
-/// processed sequentially and the per-row context / gradient / Hessian is
-/// computed on the fly and discarded after accumulation — no per-row state
-/// is persisted.
+/// processed sequentially; per-row gradient / Hessian vectors are computed
+/// on the fly and discarded after accumulation.  The per-row *context*
+/// (intercept, M_a, link stacks) is pre-solved once in the eval cache.
 const ROW_CHUNK_SIZE: usize = 1024;
 
 /// Lightweight cache that stores shared precomputed state.  When the model is
@@ -923,7 +923,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
     primary: PrimarySlices,
     h_nodes: Array1<f64>,
     h_node_design: Option<Array2<f64>>,
-    score_warp_obs: Option<(Arc<Array2<f64>>, Array1<f64>)>,
+    score_warp_obs: Option<(DesignMatrix, Array1<f64>)>,
     /// Pre-solved row contexts.  `None` in the rigid (non-flex) case where the
     /// intercept is closed-form and cheap to recompute.
     row_contexts: Option<Vec<BernoulliMarginalSlopeRowExactContext>>,
@@ -4105,22 +4105,24 @@ mod tests {
             .block_linear_constraints(&block_states, 2, &dummy_spec)
             .expect("constraint lookup")
             .expect("link block constraints");
-        let exact_points = family
-            .link_dev_constraint_points(&block_states)
-            .expect("exact link constraint points")
-            .expect("non-empty link constraint points");
+        // Constraints come from the static dense knot-span grid, not an O(nQ)
+        // state-dependent scan.
+        let grid_points = prepared
+            .runtime
+            .dense_constraint_grid(4)
+            .expect("dense constraint grid");
         assert_eq!(constraints.a.ncols(), link_dim);
-        assert_eq!(constraints.a.nrows(), exact_points.len());
+        assert_eq!(constraints.a.nrows(), grid_points.len());
         assert_eq!(
             constraints.a,
             prepared
                 .runtime
-                .first_derivative_design(&exact_points)
+                .first_derivative_design(&grid_points)
                 .expect("link derivative design"),
         );
         assert_eq!(
             constraints.b,
-            Array1::from_elem(exact_points.len(), prepared.runtime.monotonicity_eps - 1.0),
+            Array1::from_elem(grid_points.len(), prepared.runtime.monotonicity_eps - 1.0),
         );
         assert!(
             family
@@ -4170,6 +4172,7 @@ mod tests {
                 )
                 .expect("cached score-warp constraints"),
             link_dev: None,
+            cached_link_dev_constraints: None,
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -4377,6 +4380,7 @@ mod tests {
             score_warp_obs_design: None,
             cached_score_warp_constraints: None,
             link_dev: None,
+            cached_link_dev_constraints: None,
         };
         let states_at = |q: f64, g: f64| {
             vec![
@@ -4516,6 +4520,10 @@ mod tests {
             score_warp_obs_design: None,
             cached_score_warp_constraints: None,
             link_dev: Some(prepared.runtime.clone()),
+            cached_link_dev_constraints: BernoulliMarginalSlopeFamily::build_link_dev_constraints(
+                &prepared.runtime,
+            )
+            .expect("build link dev constraints"),
         };
 
         // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
