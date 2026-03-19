@@ -1,0 +1,4 @@
+- Autodiff is never used outside of tests as hand-derived derivatives enable performance optimizations.
+- Finite differences is never preferred and should only be used if all other methods (including BFGS) are not feasible.
+- Posterior mean must always be the default.
+- Analytic, closed-forms should be supported in general for all model types.
