@@ -3073,6 +3073,7 @@ fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> Blockwise
         inner_tol: spec.tol,
         outer_max_iter: 60,
         outer_tol: 1e-5,
+        compute_covariance: true,
         ..BlockwiseFitOptions::default()
     }
 }
