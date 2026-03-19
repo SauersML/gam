@@ -2909,8 +2909,11 @@ pub fn reml_laml_evaluate(
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let grad_idx = k + ext_idx;
 
-        // Mode response: β_i = -H⁻¹ g_i
+        // Mode response for τ/ψ coordinates: β_i = H⁻¹ g_i.
+        // The HessianDerivativeProvider convention is the NEGATED β-direction,
+        // so correction terms consume -β_i rather than β_i itself.
         let v_i = hop.solve(&coord.g);
+        let corr_dir_i = v_i.mapv(|v| -v);
 
         // Trace term: ½ tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + C[β_i]
         // Uses the logdet gradient operator G_ε.
@@ -2922,7 +2925,7 @@ pub fn reml_laml_evaluate(
         } else {
             // Exact path.
             let correction = if effective_deriv.has_corrections() {
-                effective_deriv.hessian_derivative_correction(&v_i)?
+                effective_deriv.hessian_derivative_correction(&corr_dir_i)?
             } else {
                 None
             };
@@ -3359,10 +3362,12 @@ fn compute_outer_hessian(
 
     // Precompute ext mode responses and total Hessian drifts.
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
+    let mut ext_corr_dirs: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
     let mut ext_h_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(ext_dim);
 
     for coord in solution.ext_coords.iter() {
         let v_i = hop.solve(&coord.g);
+        let corr_dir_i = v_i.mapv(|v| -v);
 
         if use_stochastic_cross_traces {
             if let Some(op) = coord
@@ -3374,6 +3379,7 @@ fn compute_outer_hessian(
                     // Skip dense materialization: stochastic cross-traces
                     // will use the implicit operator directly.
                     ext_v.push(v_i);
+                    ext_corr_dirs.push(corr_dir_i);
                     ext_h_matrices.push(None);
                     continue;
                 }
@@ -3384,12 +3390,13 @@ fn compute_outer_hessian(
         // operator-only fast path.
         let mut h_i = coord.drift.materialize();
         if effective_deriv.has_corrections() {
-            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
+            if let Some(corr) = effective_deriv.hessian_derivative_correction(&corr_dir_i)? {
                 h_i += &corr;
             }
         }
 
         ext_v.push(v_i);
+        ext_corr_dirs.push(corr_dir_i);
         ext_h_matrices.push(Some(h_i));
     }
 
@@ -3660,7 +3667,7 @@ fn compute_outer_hessian(
                                 compute_fourth_derivative_trace(
                                     ing,
                                     &v_ks[rho_idx],
-                                    &ext_v[ext_idx],
+                                    &ext_corr_dirs[ext_idx],
                                     hop,
                                 )
                             }) {
@@ -3671,7 +3678,7 @@ fn compute_outer_hessian(
                             if let Some(correction) = effective_deriv
                                 .hessian_second_derivative_correction(
                                     &v_ks[rho_idx],
-                                    &ext_v[ext_idx],
+                                    &ext_corr_dirs[ext_idx],
                                     &u_re,
                                 )?
                             {
@@ -3769,7 +3776,12 @@ fn compute_outer_hessian(
                         if let Some(ref z_c) = adjoint_z_c {
                             h2_trace += rhs.dot(z_c);
                             if let Some(d_trace) = glm_ingredients.as_ref().and_then(|ing| {
-                                compute_fourth_derivative_trace(ing, &ext_v[ii], &ext_v[jj], hop)
+                                compute_fourth_derivative_trace(
+                                    ing,
+                                    &ext_corr_dirs[ii],
+                                    &ext_corr_dirs[jj],
+                                    hop,
+                                )
                             }) {
                                 h2_trace += d_trace;
                             }
@@ -3777,7 +3789,9 @@ fn compute_outer_hessian(
                             let u_ij = hop.solve(&rhs);
                             if let Some(correction) = effective_deriv
                                 .hessian_second_derivative_correction(
-                                    &ext_v[ii], &ext_v[jj], &u_ij,
+                                    &ext_corr_dirs[ii],
+                                    &ext_corr_dirs[jj],
+                                    &u_ij,
                                 )?
                             {
                                 h2_trace += hop.trace_logdet_gradient(&correction);

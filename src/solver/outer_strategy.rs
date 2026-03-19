@@ -1084,6 +1084,7 @@ fn run_outer_with_plan(
     let bounds_template = (lower, upper);
 
     let mut best: Option<OuterResult> = None;
+    let mut last_seed_error: Option<String> = None;
 
     for seed in &screened {
         obj.reset();
@@ -1269,16 +1270,21 @@ fn run_outer_with_plan(
                 }
             }
             Err(e) => {
+                last_seed_error = Some(e.to_string());
                 log::debug!("[OUTER] {context}: seed failed: {e}");
             }
         }
     }
 
-    best.ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(format!(
+    best.ok_or_else(|| match last_seed_error {
+        Some(err) => EstimationError::RemlOptimizationFailed(format!(
+            "all {} seed candidates failed ({context}); last_error: {err}",
+            screened.len()
+        )),
+        None => EstimationError::RemlOptimizationFailed(format!(
             "all {} seed candidates failed ({context})",
             screened.len()
-        ))
+        )),
     })
 }
 

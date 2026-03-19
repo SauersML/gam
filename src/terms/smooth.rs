@@ -8712,8 +8712,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
-        OuterConfig, OuterEval,
+        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -8821,23 +8820,17 @@ fn try_exact_joint_spatial_aniso_optimization(
         .map_err(EstimationError::InvalidInput)?,
     };
 
-    let outer_config = OuterConfig {
-        tolerance: 1e-6,
-        max_iter: 50,
-        fd_step: 1e-5,
-        bounds: Some((lower.clone(), upper.clone())),
-        seed_config: crate::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            num_auxiliary_trailing: psi_dim,
-            ..Default::default()
-        },
-        rho_bound: 12.0,
-        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-        initial_rho: Some(theta0.clone()),
-        fallback_policy: FallbackPolicy::Automatic,
-        screening_cap: None,
-    };
+    let outer_config = exact_joint_multistart_outer_config(
+        theta0,
+        lower,
+        upper,
+        rho_dim,
+        psi_dim,
+        seed_risk_profile_for_likelihood_family(family),
+        1e-6,
+        50,
+        1e-5,
+    );
 
     let mut obj = ClosureObjective {
         state: &mut ctx,
@@ -8931,8 +8924,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
-        OuterConfig, OuterEval,
+        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
     };
 
     let theta_dim = theta0.len();
@@ -9038,23 +9030,17 @@ fn try_exact_joint_spatial_isotropic_optimization(
         .map_err(EstimationError::InvalidInput)?,
     };
 
-    let outer_config = OuterConfig {
-        tolerance: 1e-6,
-        max_iter: 50,
-        fd_step: 1e-5,
-        bounds: Some((lower.clone(), upper.clone())),
-        seed_config: crate::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            num_auxiliary_trailing: kappa_dim,
-            ..Default::default()
-        },
-        rho_bound: 12.0,
-        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-        initial_rho: Some(theta0.clone()),
-        fallback_policy: FallbackPolicy::Automatic,
-        screening_cap: None,
-    };
+    let outer_config = exact_joint_multistart_outer_config(
+        theta0,
+        lower,
+        upper,
+        rho_dim,
+        kappa_dim,
+        seed_risk_profile_for_likelihood_family(family),
+        1e-6,
+        50,
+        1e-5,
+    );
 
     let mut obj = ClosureObjective {
         state: &mut ctx,
@@ -10147,12 +10133,66 @@ impl<'d> ExactJointDesignCache<'d> {
     }
 }
 
+pub(crate) fn seed_risk_profile_for_likelihood_family(
+    family: LikelihoodFamily,
+) -> crate::seeding::SeedRiskProfile {
+    match family {
+        LikelihoodFamily::GaussianIdentity => crate::seeding::SeedRiskProfile::Gaussian,
+        LikelihoodFamily::RoystonParmar => crate::seeding::SeedRiskProfile::Survival,
+        LikelihoodFamily::BinomialLogit
+        | LikelihoodFamily::BinomialProbit
+        | LikelihoodFamily::BinomialCLogLog
+        | LikelihoodFamily::BinomialSas
+        | LikelihoodFamily::BinomialBetaLogistic
+        | LikelihoodFamily::BinomialMixture
+        | LikelihoodFamily::PoissonLog
+        | LikelihoodFamily::GammaLog => crate::seeding::SeedRiskProfile::GeneralizedLinear,
+    }
+}
+
+pub(crate) fn exact_joint_multistart_outer_config(
+    theta0: &Array1<f64>,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+    rho_dim: usize,
+    auxiliary_dim: usize,
+    risk_profile: crate::seeding::SeedRiskProfile,
+    tolerance: f64,
+    max_iter: usize,
+    fd_step: f64,
+) -> crate::solver::outer_strategy::OuterConfig {
+    let mut seed_heuristic = theta0.to_vec();
+    for value in &mut seed_heuristic[..rho_dim] {
+        *value = value.exp();
+    }
+
+    crate::solver::outer_strategy::OuterConfig {
+        tolerance,
+        max_iter,
+        fd_step,
+        bounds: Some((lower.clone(), upper.clone())),
+        seed_config: crate::seeding::SeedConfig {
+            max_seeds: 4,
+            screening_budget: 2,
+            risk_profile,
+            num_auxiliary_trailing: auxiliary_dim,
+            ..Default::default()
+        },
+        rho_bound: 12.0,
+        heuristic_lambdas: Some(seed_heuristic),
+        initial_rho: None,
+        fallback_policy: crate::solver::outer_strategy::FallbackPolicy::Automatic,
+        screening_cap: None,
+    }
+}
+
 pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn>(
     data: ArrayView2<'_, f64>,
     block_specs: &[TermCollectionSpec],
     block_term_indices: &[Vec<usize>],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     joint_setup: &ExactJointHyperSetup,
+    seed_risk_profile: crate::seeding::SeedRiskProfile,
     analytic_joint_gradient_available: bool,
     analytic_joint_hessian_available: bool,
     mut fit_fn: FitFn,
@@ -10293,27 +10333,20 @@ where
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
 
     use crate::solver::outer_strategy::{
-        ClosureObjective, Derivative, EfsEval, FallbackPolicy, HessianResult, OuterCapability,
-        OuterConfig, OuterEval,
+        ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
     };
 
-    let outer_config = OuterConfig {
-        tolerance: kappa_options.rel_tol.max(1e-6),
-        max_iter: kappa_options.max_outer_iter.max(1),
-        fd_step: 1e-4,
-        bounds: Some((lower.clone(), upper.clone())),
-        seed_config: crate::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            num_auxiliary_trailing: psi_dim,
-            ..Default::default()
-        },
-        rho_bound: 12.0,
-        heuristic_lambdas: Some(theta0.as_slice().unwrap().to_vec()),
-        initial_rho: Some(theta0.clone()),
-        fallback_policy: FallbackPolicy::Automatic,
-        screening_cap: None,
-    };
+    let outer_config = exact_joint_multistart_outer_config(
+        &theta0,
+        &lower,
+        &upper,
+        rho_dim,
+        psi_dim,
+        seed_risk_profile,
+        kappa_options.rel_tol.max(1e-6),
+        kappa_options.max_outer_iter.max(1),
+        1e-4,
+    );
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
     fn collect_specs(cache: &ExactJointDesignCache<'_>) -> Vec<TermCollectionSpec> {
@@ -10433,9 +10466,7 @@ where
                             hessian: hessian_result,
                         })
                     }
-                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                        "n-block exact-joint derivative evaluation failed: {e}"
-                    ))),
+                    Err(_) => Ok(OuterEval::infeasible(theta.len())),
                 }
             },
             reset_fn: None::<fn(&mut &mut NBlockExactJointState<'_>)>,
@@ -12288,6 +12319,7 @@ mod tests {
             &[mean_terms, noise_terms],
             &kappa_options,
             &joint_setup,
+            crate::seeding::SeedRiskProfile::Gaussian,
             true,
             true,
             |rho, specs, designs| {
@@ -13310,6 +13342,7 @@ mod tests {
             &[mean_terms, noise_terms],
             &kappa_options,
             &joint_setup,
+            crate::seeding::SeedRiskProfile::Gaussian,
             true,
             true,
             |rho, specs, designs| {

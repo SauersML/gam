@@ -3682,6 +3682,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &[marginal_terms, logslope_terms],
         kappa_options,
         &setup,
+        crate::seeding::SeedRiskProfile::GeneralizedLinear,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {

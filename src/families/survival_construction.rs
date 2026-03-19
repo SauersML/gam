@@ -852,7 +852,8 @@ pub fn evaluate_survival_time_basis_row(
         SurvivalTimeBasisConfig::BSpline { degree, knots, .. } => {
             if knots.is_empty() {
                 return Err(
-                    "survival BSpline anchor evaluation requires resolved knot metadata".to_string(),
+                    "survival BSpline anchor evaluation requires resolved knot metadata"
+                        .to_string(),
                 );
             }
             let built = build_bspline_basis_1d(
@@ -876,7 +877,8 @@ pub fn evaluate_survival_time_basis_row(
         } => {
             if knots.is_empty() {
                 return Err(
-                    "survival ISpline anchor evaluation requires resolved knot metadata".to_string(),
+                    "survival ISpline anchor evaluation requires resolved knot metadata"
+                        .to_string(),
                 );
             }
             let (basis_arc, _) = create_basis::<Dense>(
