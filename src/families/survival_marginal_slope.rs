@@ -1410,7 +1410,6 @@ impl SurvivalMarginalSlopeFamily {
         second_psi_linear_map(action.as_ref(), dense, total_rows, p).row_vector(row)
     }
 
-    /// Map a psi derivative to a primary-space direction for a given row.
     // ── Psi terms (first and second order) ────────────────────────────
     //
     // All three psi methods (first-order, second-order, directional derivative)
