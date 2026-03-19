@@ -922,7 +922,22 @@ impl BernoulliMarginalSlopePredictor {
         link_dev_beta: Option<ArrayView1<'_, f64>>,
     ) -> Result<f64, EstimationError> {
         let target = crate::probability::normal_cdf(marginal_eta).clamp(1e-12, 1.0 - 1e-12);
+        // Rigid warm start: a₀ = q·√(1+b²).  With affine link L(u) ≈ ℓ₀+ℓ₁·u,
+        // exact intercept is (q·√(1+ℓ₁²b²) − ℓ₀) / ℓ₁.
         let mut intercept = marginal_eta * (1.0 + slope * slope).sqrt();
+        if let (Some(runtime), Some(beta)) =
+            (self.link_deviation_runtime.as_ref(), link_dev_beta)
+        {
+            let v = ndarray::Array1::from_vec(vec![intercept]);
+            let linked = Self::link_values(Some(runtime), Some(beta), &v)?;
+            let linked_d1 = Self::link_derivative(Some(runtime), Some(beta), &v)?;
+            let ell1 = linked_d1[0];
+            if ell1 > 1e-8 {
+                let ell0 = linked[0] - ell1 * intercept;
+                intercept =
+                    (marginal_eta * (1.0 + ell1 * ell1 * slope * slope).sqrt() - ell0) / ell1;
+            }
+        }
         for _ in 0..20 {
             let eta_nodes = warped_nodes.mapv(|hz| intercept + slope * hz);
             let linked = Self::link_values(

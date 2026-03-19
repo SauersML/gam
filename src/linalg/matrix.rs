@@ -3392,23 +3392,131 @@ fn add_sparse_symmetric_upper(
 
 // ── Sparse Hessian accumulator ───────────────────────────────────────────────
 
+/// Immutable symbolic sparsity pattern for a banded upper-triangle CSC Hessian.
+///
+/// Shared via `Arc` across all parallel workers so that only the mutable values
+/// buffer needs to be cloned per worker.
+struct SparseHessianSymbolic {
+    dim: usize,
+    nnz: usize,
+    /// CSC column pointers, length `dim + 1`.
+    col_ptrs: Vec<usize>,
+    /// CSC row indices (upper triangle: row ≤ col), length `nnz`.
+    row_indices: Vec<usize>,
+    /// First row index in each column.  For banded patterns the rows within a
+    /// column are contiguous, so `offset = col_ptrs[c] + (r - first_row[c])`.
+    /// Columns with zero entries store `usize::MAX`.
+    first_row: Vec<usize>,
+    /// Whether every column has strictly contiguous row indices (true for
+    /// B-spline bases).  When true, `add` is O(1) arithmetic instead of a
+    /// linear scan.
+    contiguous: bool,
+}
+
+impl SparseHessianSymbolic {
+    fn build(csrs: &[&SparseRowMat<usize, f64>], dim: usize) -> Self {
+        use std::collections::BTreeSet;
+
+        let n = csrs[0].nrows();
+        let mut pattern = BTreeSet::<(usize, usize)>::new();
+
+        // Hoist symbolic accessors out of the per-row loop.
+        let sym_parts: Vec<(&[usize], &[usize])> = csrs
+            .iter()
+            .map(|csr| {
+                let sym = csr.symbolic();
+                // Safety: row_ptr/col_idx borrow from `csr` which outlives `sym_parts`.
+                let rp: &[usize] = unsafe { std::mem::transmute(sym.row_ptr()) };
+                let ci: &[usize] = unsafe { std::mem::transmute(sym.col_idx()) };
+                (rp, ci)
+            })
+            .collect();
+
+        let mut cols = Vec::with_capacity(32);
+        for i in 0..n {
+            cols.clear();
+            for &(rp, ci) in &sym_parts {
+                for p in rp[i]..rp[i + 1] {
+                    cols.push(ci[p]);
+                }
+            }
+            cols.sort_unstable();
+            cols.dedup();
+            for (ai, &ca) in cols.iter().enumerate() {
+                for &cb in &cols[ai..] {
+                    pattern.insert((ca, cb));
+                }
+            }
+        }
+
+        // Convert BTreeSet → CSC.
+        let nnz = pattern.len();
+        let mut col_ptrs = vec![0usize; dim + 1];
+        let mut row_indices = Vec::with_capacity(nnz);
+        for &(r, c) in &pattern {
+            col_ptrs[c + 1] += 1;
+            row_indices.push(r);
+        }
+        for j in 1..=dim {
+            col_ptrs[j] += col_ptrs[j - 1];
+        }
+
+        // Detect contiguity and record first_row per column.
+        let mut first_row = vec![usize::MAX; dim];
+        let mut contiguous = true;
+        for c in 0..dim {
+            let start = col_ptrs[c];
+            let end = col_ptrs[c + 1];
+            if start == end {
+                continue;
+            }
+            first_row[c] = row_indices[start];
+            // Check rows are first_row, first_row+1, ..., first_row+(end-start-1).
+            for (off, &ri) in row_indices[start..end].iter().enumerate() {
+                if ri != first_row[c] + off {
+                    contiguous = false;
+                    break;
+                }
+            }
+            if !contiguous {
+                break;
+            }
+        }
+
+        SparseHessianSymbolic {
+            dim,
+            nnz,
+            col_ptrs,
+            row_indices,
+            first_row,
+            contiguous,
+        }
+    }
+}
+
 /// Pre-computed upper-triangle CSC sparsity pattern + flat values buffer for
 /// assembling `X^T diag(w) X` directly in sparse form.
 ///
 /// Designed for B-spline / local-support bases where the Hessian is banded and
 /// the dense `p×p` representation wastes most of its storage.  The pattern is
 /// computed once from the design matrices; each parallel worker then owns a
-/// cheap clone of the values buffer and accumulates with `O(nnz)` memory
-/// instead of `O(p²)`.
-#[derive(Clone)]
+/// cheap values buffer (the symbolic structure is `Arc`-shared) and accumulates
+/// with `O(nnz)` memory instead of `O(p²)`.
 pub struct SparseHessianAccumulator {
-    dim: usize,
-    /// CSC column pointers, length `dim + 1`.
-    col_ptrs: Vec<usize>,
-    /// CSC row indices (upper triangle: row ≤ col), length `nnz`.
-    row_indices: Vec<usize>,
+    sym: Arc<SparseHessianSymbolic>,
     /// Values buffer, length `nnz`.
     pub values: Vec<f64>,
+}
+
+// Manual Clone: only the values buffer is duplicated; the symbolic pattern is
+// Arc-shared.
+impl Clone for SparseHessianAccumulator {
+    fn clone(&self) -> Self {
+        SparseHessianAccumulator {
+            sym: Arc::clone(&self.sym),
+            values: self.values.clone(),
+        }
+    }
 }
 
 impl SparseHessianAccumulator {
@@ -3422,55 +3530,11 @@ impl SparseHessianAccumulator {
 
     /// Build the symbolic upper-triangle pattern of the block Hessian produced
     /// by multiple sparse CSR designs that share the same column space.
-    ///
-    /// The result covers every `(col_a, col_b)` pair that co-occurs in *any*
-    /// row of *any* of the supplied designs.
     pub fn from_multi_csr(csrs: &[&SparseRowMat<usize, f64>], dim: usize) -> Self {
-        use std::collections::BTreeSet;
-
-        let n = csrs[0].nrows();
-        let mut pattern = BTreeSet::<(usize, usize)>::new();
-
-        // Scratch buffer for the union of nonzero columns across all designs
-        // at a single row – reused to avoid per-row allocation.
-        let mut cols = Vec::with_capacity(32);
-
-        for i in 0..n {
-            cols.clear();
-            for csr in csrs {
-                let sym = csr.symbolic();
-                let rp = sym.row_ptr();
-                let ci = sym.col_idx();
-                for p in rp[i]..rp[i + 1] {
-                    cols.push(ci[p]);
-                }
-            }
-            cols.sort_unstable();
-            cols.dedup();
-            // Insert all upper-triangle pairs (r ≤ c).
-            for (ai, &ca) in cols.iter().enumerate() {
-                for &cb in &cols[ai..] {
-                    pattern.insert((ca, cb));
-                }
-            }
-        }
-
-        // Convert BTreeSet → CSC col_ptrs + row_indices.
-        let nnz = pattern.len();
-        let mut col_ptrs = vec![0usize; dim + 1];
-        let mut row_indices = Vec::with_capacity(nnz);
-        for &(r, c) in &pattern {
-            col_ptrs[c + 1] += 1;
-            row_indices.push(r);
-        }
-        for j in 1..=dim {
-            col_ptrs[j] += col_ptrs[j - 1];
-        }
-
+        let sym = Arc::new(SparseHessianSymbolic::build(csrs, dim));
+        let nnz = sym.nnz;
         SparseHessianAccumulator {
-            dim,
-            col_ptrs,
-            row_indices,
+            sym,
             values: vec![0.0; nnz],
         }
     }
@@ -3482,21 +3546,27 @@ impl SparseHessianAccumulator {
     #[inline(always)]
     pub fn add(&mut self, row: usize, col: usize, val: f64) {
         let (r, c) = if row <= col { (row, col) } else { (col, row) };
-        let start = self.col_ptrs[c];
-        let end = self.col_ptrs[c + 1];
-        // Linear scan – typically ≤ 8 entries per column for banded B-splines.
-        let slice = &self.row_indices[start..end];
-        // Fast path: check last added position first for locality.
-        for (off, &ri) in slice.iter().enumerate() {
-            if ri == r {
-                unsafe { *self.values.get_unchecked_mut(start + off) += val; }
-                return;
+        let s = &*self.sym;
+        if s.contiguous {
+            // O(1) direct-index path: rows within each column are contiguous
+            // integers starting at first_row[c], so the offset is arithmetic.
+            let idx = s.col_ptrs[c] + (r - s.first_row[c]);
+            debug_assert!(idx < s.col_ptrs[c + 1], "SparseHessianAccumulator::add contiguous OOB");
+            unsafe { *self.values.get_unchecked_mut(idx) += val; }
+        } else {
+            // Fallback linear scan for non-contiguous patterns.
+            let start = s.col_ptrs[c];
+            let end = s.col_ptrs[c + 1];
+            let slice = &s.row_indices[start..end];
+            for (off, &ri) in slice.iter().enumerate() {
+                if ri == r {
+                    unsafe { *self.values.get_unchecked_mut(start + off) += val; }
+                    return;
+                }
             }
+            #[cfg(debug_assertions)]
+            unreachable!("SparseHessianAccumulator::add: ({r}, {c}) not in pattern");
         }
-        // Entry not in pattern — unreachable if pattern was built from the
-        // same designs used for accumulation.
-        #[cfg(debug_assertions)]
-        unreachable!("SparseHessianAccumulator::add: ({r}, {c}) not in pattern");
     }
 
     /// Element-wise `self.values += other`.
@@ -3511,9 +3581,7 @@ impl SparseHessianAccumulator {
     /// Create a zero-valued copy sharing the same symbolic structure.
     pub fn empty_clone(&self) -> Self {
         SparseHessianAccumulator {
-            dim: self.dim,
-            col_ptrs: self.col_ptrs.clone(),
-            row_indices: self.row_indices.clone(),
+            sym: Arc::clone(&self.sym),
             values: vec![0.0; self.values.len()],
         }
     }
@@ -3521,20 +3589,26 @@ impl SparseHessianAccumulator {
     // ── finalization ─────────────────────────────────────────────────
 
     /// Consume the accumulator and return a `SparseColMat` (upper-triangle).
-    pub fn into_sparse_col_mat(self) -> Result<SparseColMat<usize, f64>, String> {
-        // Build triplets from the CSC structure.
-        let mut triplets = Vec::with_capacity(self.values.len());
-        for c in 0..self.dim {
-            for idx in self.col_ptrs[c]..self.col_ptrs[c + 1] {
-                let r = self.row_indices[idx];
-                let v = self.values[idx];
-                if v != 0.0 {
-                    triplets.push(Triplet::new(r, c, v));
-                }
-            }
-        }
-        SparseColMat::try_new_from_triplets(self.dim, self.dim, &triplets)
-            .map_err(|_| "SparseHessianAccumulator: failed to assemble CSC".to_string())
+    ///
+    /// Constructs the CSC matrix directly from the symbolic structure — no
+    /// triplet roundtrip.
+    pub fn into_sparse_col_mat(self) -> SparseColMat<usize, f64> {
+        use faer::sparse::SymbolicSparseColMat;
+
+        let s = &*self.sym;
+        // Safety: col_ptrs and row_indices were built from a valid BTreeSet
+        // enumeration → sorted row indices per column, no duplicates, all
+        // indices in [0, dim).
+        let symbolic = unsafe {
+            SymbolicSparseColMat::new_unchecked(
+                s.dim,
+                s.dim,
+                s.col_ptrs.clone(),
+                None,
+                s.row_indices.clone(),
+            )
+        };
+        SparseColMat::new(symbolic, self.values)
     }
 }
 

@@ -1314,24 +1314,25 @@ impl BernoulliMarginalSlopeFamily {
         let primary = primary_slices(&slices);
         let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
         let score_warp_obs = self.score_warp_obs(block_states)?;
-        let row_contexts = if self.flex_active() {
-            let n = self.y.len();
-            let contexts: Result<Vec<_>, String> = (0..n)
-                .into_par_iter()
-                .map(|row| {
-                    self.build_row_exact_context(
-                        row,
-                        block_states,
-                        &h_nodes,
-                        score_warp_obs.as_ref(),
-                        LinkOrder::Full,
-                    )
-                })
-                .collect();
-            Some(contexts?)
+        let n = self.y.len();
+        let link_order = if self.link_dev.is_some() {
+            LinkOrder::Full
         } else {
-            None
+            LinkOrder::ValueD1
         };
+        let row_contexts: Result<Vec<_>, String> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                self.build_row_exact_context(
+                    row,
+                    block_states,
+                    &h_nodes,
+                    score_warp_obs.as_ref(),
+                    link_order,
+                )
+            })
+            .collect();
+        let row_contexts = row_contexts?;
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
@@ -2209,7 +2210,7 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for i in start..end {
-                        let row_ctx = self.row_context_from_cache(i, block_states, &cache)?;
+                        let row_ctx = Self::row_ctx(&cache, i);
                         let row_neglog = self.row_neglog_directional_from_primary(
                             i,
                             block_states,
@@ -2276,7 +2277,7 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                        let row_ctx = self.row_context_from_cache(row, block_states, cache)?;
+                        let row_ctx = Self::row_ctx(cache, row);
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
                         let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
@@ -2321,7 +2322,7 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                        let row_ctx = self.row_context_from_cache(row, block_states, cache)?;
+                        let row_ctx = Self::row_ctx(cache, row);
                         let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
                             row,
                             block_states,
@@ -2463,7 +2464,7 @@ impl BernoulliMarginalSlopeFamily {
                             else {
                                 continue;
                             };
-                            let row_ctx = self.row_context_full_order(row, block_states, cache)?;
+                            let row_ctx = Self::row_ctx(cache, row);
                             let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                                 row,
                                 block_states,
@@ -2611,7 +2612,7 @@ impl BernoulliMarginalSlopeFamily {
                         else {
                             continue;
                         };
-                        let row_ctx = self.row_context_full_order(row, block_states, cache)?;
+                        let row_ctx = Self::row_ctx(cache, row);
                         let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                             row,
                             block_states,
@@ -2750,7 +2751,7 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                             )?
                             .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
-                        let row_ctx = self.row_context_full_order(row, block_states, cache)?;
+                        let row_ctx = Self::row_ctx(cache, row);
                         let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                             row,
                             block_states,
@@ -2990,7 +2991,7 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                             )?
                             .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
-                        let row_ctx = self.row_context_full_order(row, block_states, cache)?;
+                        let row_ctx = Self::row_ctx(cache, row);
                         let third_beta = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
@@ -3077,7 +3078,7 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                             d_beta_flat,
                         )?;
-                        let row_ctx = self.row_context_full_order(row, block_states, cache)?;
+                        let row_ctx = Self::row_ctx(cache, row);
                         let third = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
@@ -3130,7 +3131,7 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                             d_beta_v_flat,
                         )?;
-                        let row_ctx = self.row_context_full_order(row, block_states, cache)?;
+                        let row_ctx = Self::row_ctx(cache, row);
                         let fourth = self.row_primary_fourth_contracted_recompute(
                             row,
                             block_states,
@@ -3246,7 +3247,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         for row in 0..self.y.len() {
-            let row_ctx = self.row_context_from_cache(row, block_states, &cache)?;
+            let row_ctx = Self::row_ctx(&cache, row);
             let row_neglog = self.row_neglog_directional_from_primary(
                 row,
                 block_states,
