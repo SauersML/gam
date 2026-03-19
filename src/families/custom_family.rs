@@ -368,6 +368,29 @@ impl ExactOuterDerivativeOrder {
     }
 }
 
+/// Maximum dense psi-Hessian memory (f64 elements) before downgrading to
+/// first-order: K(K+1)/2 matrices of size p×p.  200M f64 ≈ 1.6 GB.
+const DEFAULT_EXACT_OUTER_MAX_PSI_ELEMENTS: u64 = 200_000_000;
+
+/// Shared cost-aware gate for second-order exact outer derivatives.
+///
+/// Checks whether the dense psi-Hessian memory (`K(K+1)/2 × p²`) exceeds
+/// [`DEFAULT_EXACT_OUTER_MAX_PSI_ELEMENTS`].  Families that also want a
+/// row-loop cost gate should call this *and* their own row-work check.
+///
+/// Returns `Second` when affordable, `First` otherwise.
+pub fn cost_gated_outer_order(specs: &[ParameterBlockSpec]) -> ExactOuterDerivativeOrder {
+    let p: u64 = specs.iter().map(|s| s.design.ncols() as u64).sum();
+    let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
+    let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
+    let psi_elements = k_pairs.saturating_mul(p.saturating_mul(p));
+    if psi_elements > DEFAULT_EXACT_OUTER_MAX_PSI_ELEMENTS {
+        ExactOuterDerivativeOrder::First
+    } else {
+        ExactOuterDerivativeOrder::Second
+    }
+}
+
 /// Family evaluation over all parameter blocks.
 #[derive(Clone, Debug)]
 pub struct FamilyEvaluation {
@@ -432,15 +455,16 @@ pub trait CustomFamily {
     /// Declares how much exact outer calculus this family wants to expose for
     /// the current realized problem size.
     ///
-    /// Families can use this to preserve exact first-order profiled/Laplace
-    /// derivatives while downgrading the exact outer Hessian when the full
-    /// second-order path is too expensive at scale.
+    /// The default uses [`cost_gated_outer_order`] to forbid second-order when
+    /// the dense psi-Hessian memory (`K(K+1)/2 × p²`) would be prohibitive.
+    /// Families with additional per-row cost knowledge should override and
+    /// combine `cost_gated_outer_order` with their own row-work check.
     fn exact_outer_derivative_order(
         &self,
-        _: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        ExactOuterDerivativeOrder::Second
+        cost_gated_outer_order(specs)
     }
 
     /// Whether outer hyper-derivative evaluation must use a joint exact path.
