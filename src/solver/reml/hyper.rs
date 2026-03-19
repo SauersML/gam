@@ -716,12 +716,14 @@ impl<'a> RemlState<'a> {
                 a: 0.0,
                 g: Array1::zeros(p_dim),
                 b_mat: Array2::zeros((p_dim, p_dim)),
+                b_operator: None,
                 ld_s: 0.0,
             };
             let rho_tau_pair_fn = move |_: usize, _: usize| super::unified::HyperCoordPair {
                 a: 0.0,
                 g: Array1::zeros(p_dim),
                 b_mat: Array2::zeros((p_dim, p_dim)),
+                b_operator: None,
                 ld_s: 0.0,
             };
             return Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)));

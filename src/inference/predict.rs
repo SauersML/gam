@@ -1004,31 +1004,18 @@ impl BernoulliMarginalSlopePredictor {
         let score_warp_offset = logslope_offset + logslope_dim;
         let link_dev_offset = score_warp_offset + score_warp_dim;
 
-        // Precompute score warp designs and warped values.
-        let score_warp_obs_design = self
-            .score_warp_runtime
-            .as_ref()
-            .map(|runtime| runtime.design(z).map_err(EstimationError::InvalidInput))
-            .transpose()?;
-        let warped_z = if let (Some(design), Some(beta)) =
-            (score_warp_obs_design.as_ref(), beta_score_warp.clone())
-        {
-            z + &design.dot(&beta.to_owned())
-        } else {
-            z.clone()
-        };
-
         // ── Rigid closed-form path: η = q·√(1+b²) + b·z ──────────────
+        // When neither score-warp nor link-deviation is active, z passes
+        // through unwarped and the intercept has a closed-form solution.
         if !flex_active {
-            // Vectorized eta: no per-row work.
             let c_vec = logslope_eta.mapv(|b| (1.0 + b * b).sqrt());
-            let final_eta = &c_vec * &marginal_eta + &logslope_eta * &warped_z;
+            let final_eta = &c_vec * &marginal_eta + &logslope_eta * z;
 
             if !need_gradient {
                 return Ok((final_eta, None));
             }
 
-            // Chunk Jacobian: process rows in cache-friendly blocks.
+            // Chunk Jacobian: one pass per row fills both blocks.
             let chunk_size = prediction_chunk_rows(theta.len(), 1, n);
             let mut grad = Array2::<f64>::zeros((n, theta.len()));
             let mut start = 0usize;
@@ -1036,24 +1023,16 @@ impl BernoulliMarginalSlopePredictor {
                 let end = (start + chunk_size).min(n);
                 let mc = input.design.row_chunk(start..end);
                 let lc = design_logslope.row_chunk(start..end);
-                let rows = end - start;
 
-                // d_eta/d_beta_marginal = diag(c) * X_marginal
-                for li in 0..rows {
-                    let c = c_vec[start + li];
-                    let mut row = grad.row_mut(start + li);
+                for li in 0..(end - start) {
+                    let i = start + li;
+                    let c = c_vec[i];
+                    let b = logslope_eta[i];
+                    let g_scale = marginal_eta[i] * b / c + z[i];
+                    let mut row = grad.row_mut(i);
                     for j in 0..marginal_dim {
                         row[j] = c * mc[[li, j]];
                     }
-                }
-
-                // d_eta/d_beta_logslope = diag(q*b/c + z_w) * X_logslope
-                for li in 0..rows {
-                    let i = start + li;
-                    let b = logslope_eta[i];
-                    let c = c_vec[i];
-                    let g_scale = marginal_eta[i] * b / c + warped_z[i];
-                    let mut row = grad.row_mut(i);
                     for j in 0..logslope_dim {
                         row[logslope_offset + j] = g_scale * lc[[li, j]];
                     }
@@ -1066,6 +1045,11 @@ impl BernoulliMarginalSlopePredictor {
 
         // ── Flexible path: per-row intercept solve, chunked Jacobians ──
         let (nodes, quadrature_weights) = Self::normal_expectation_nodes(20);
+        let score_warp_obs_design = self
+            .score_warp_runtime
+            .as_ref()
+            .map(|runtime| runtime.design(z).map_err(EstimationError::InvalidInput))
+            .transpose()?;
         let score_warp_node_design = self
             .score_warp_runtime
             .as_ref()
@@ -1075,6 +1059,13 @@ impl BernoulliMarginalSlopePredictor {
                     .map_err(EstimationError::InvalidInput)
             })
             .transpose()?;
+        let warped_z = if let (Some(design), Some(beta)) =
+            (score_warp_obs_design.as_ref(), beta_score_warp.clone())
+        {
+            z + &design.dot(&beta.to_owned())
+        } else {
+            z.clone()
+        };
         let warped_nodes = if let (Some(design), Some(beta)) =
             (score_warp_node_design.as_ref(), beta_score_warp.clone())
         {
@@ -1085,7 +1076,6 @@ impl BernoulliMarginalSlopePredictor {
 
         // Solve intercepts and (when gradient needed) IFT scalars in one pass.
         let mut intercepts = Array1::<f64>::zeros(n);
-        // IFT scalars — only allocated when gradient is needed.
         let mut a_q_vec = need_gradient.then(|| Array1::<f64>::zeros(n));
         let mut a_b_vec = need_gradient.then(|| Array1::<f64>::zeros(n));
         let mut a_h_rows = if need_gradient && score_warp_dim > 0 {
@@ -1099,6 +1089,7 @@ impl BernoulliMarginalSlopePredictor {
             None
         };
 
+        let link_dev_beta_ref = beta_link_dev.as_ref();
         for i in 0..n {
             let slope = logslope_eta[i];
             let q = marginal_eta[i];
@@ -1107,7 +1098,7 @@ impl BernoulliMarginalSlopePredictor {
                 slope,
                 &warped_nodes,
                 &quadrature_weights,
-                beta_link_dev.clone(),
+                link_dev_beta_ref.cloned(),
             )?;
 
             if !need_gradient {
@@ -1119,12 +1110,12 @@ impl BernoulliMarginalSlopePredictor {
             let eta_nodes = warped_nodes.mapv(|hz| intercept + slope * hz);
             let linked_nodes = Self::link_values(
                 self.link_deviation_runtime.as_ref(),
-                beta_link_dev.clone(),
+                link_dev_beta_ref.cloned(),
                 &eta_nodes,
             )?;
             let linked_d1 = Self::link_derivative(
                 self.link_deviation_runtime.as_ref(),
-                beta_link_dev.clone(),
+                link_dev_beta_ref.cloned(),
                 &eta_nodes,
             )?;
             let phi_nodes = linked_nodes.mapv(crate::probability::normal_pdf);
@@ -1132,8 +1123,7 @@ impl BernoulliMarginalSlopePredictor {
             let weighted_c1 = &weighted_phi * &linked_d1;
             let m_a = weighted_c1.sum().max(1e-12);
             a_q_vec.as_mut().unwrap()[i] = crate::probability::normal_pdf(q) / m_a;
-            let m_b = weighted_c1.dot(&warped_nodes);
-            a_b_vec.as_mut().unwrap()[i] = -m_b / m_a;
+            a_b_vec.as_mut().unwrap()[i] = -weighted_c1.dot(&warped_nodes) / m_a;
 
             if let (Some(a_h_rows), Some(node_design)) =
                 (a_h_rows.as_mut(), score_warp_node_design.as_ref())

@@ -2886,11 +2886,11 @@ impl ExactNewtonJointPsiTerms {
     }
 }
 
-#[derive(Clone)]
 pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub objective_psi_psi: f64,
     pub score_psi_psi: Array1<f64>,
     pub hessian_psi_psi: Array2<f64>,
+    pub hessian_psi_psi_operator: Option<Box<dyn HyperOperator>>,
 }
 
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
@@ -6149,9 +6149,14 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     .flatten()
             };
 
-            let (obj_ll, score_ll, hess_ll) = match psi2 {
-                Some(t) => (t.objective_psi_psi, t.score_psi_psi, t.hessian_psi_psi),
-                None => (0.0, Array1::zeros(total), Array2::zeros((total, total))),
+            let (obj_ll, score_ll, hess_ll, hess_ll_op) = match psi2 {
+                Some(t) => (
+                    t.objective_psi_psi,
+                    t.score_psi_psi,
+                    t.hessian_psi_psi,
+                    t.hessian_psi_psi_operator,
+                ),
+                None => (0.0, Array1::zeros(total), Array2::zeros((total, total)), None),
             };
 
             let mut a = obj_ll;
@@ -6201,7 +6206,13 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 0.0
             };
 
-            HyperCoordPair { a, g, b_mat, ld_s }
+            HyperCoordPair {
+                a,
+                g,
+                b_mat,
+                b_operator: hess_ll_op,
+                ld_s,
+            }
         }) as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
     };
 

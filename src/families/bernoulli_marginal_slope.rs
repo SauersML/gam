@@ -7,9 +7,9 @@ use crate::custom_family::{
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    build_block_spatial_psi_derivatives, custom_family_outer_capability,
-    evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
-    second_psi_linear_map,
+    build_block_spatial_psi_derivatives, cost_gated_outer_order,
+    custom_family_outer_capability, evaluate_custom_family_joint_hyper, first_psi_linear_map,
+    fit_custom_family, second_psi_linear_map,
 };
 use crate::estimate::{FitOptions, UnifiedFitResult, fit_gam};
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
@@ -929,39 +929,28 @@ struct BernoulliMarginalSlopeExactEvalCache {
     row_contexts: Option<Vec<BernoulliMarginalSlopeRowExactContext>>,
 }
 
-/// Maximum predicted row-loop work (unitless proxy) before downgrading to
-/// first-order outer derivatives.
+/// Maximum row-loop work proxy before downgrading to first-order:
+///   n × K_pairs × primary²
 const EXACT_OUTER_MAX_ROW_WORK: u64 = 2_000_000;
 
-/// Maximum dense psi-Hessian memory (f64 elements): K(K+1)/2 × p².
-/// 200M f64 ≈ 1.6 GB.
-const EXACT_OUTER_MAX_PSI_ELEMENTS: u64 = 200_000_000;
-
-fn bernoulli_exact_outer_derivative_order(
+/// Row-loop gate for Bernoulli marginal-slope.  The memory gate is handled
+/// by [`cost_gated_outer_order`] at the call site.
+fn bernoulli_row_work_order(
     n_rows: usize,
     score_warp_dim: usize,
     link_dev_dim: usize,
-    p_total: usize,
     k_smoothing: usize,
 ) -> ExactOuterDerivativeOrder {
     let n = n_rows as u64;
-    let p = p_total as u64;
     let k = k_smoothing as u64;
     let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
     let primary_total = 2u64
         .saturating_add(score_warp_dim as u64)
         .saturating_add(link_dev_dim as u64);
-
-    // Row-loop cost: for each of K_pairs psi-psi terms we iterate n rows
-    // doing primary² work per row.
     let row_work = n
         .saturating_mul(k_pairs)
         .saturating_mul(primary_total.saturating_mul(primary_total));
-
-    // Dense memory: K_pairs dense p×p Hessians.
-    let psi_elements = k_pairs.saturating_mul(p.saturating_mul(p));
-
-    if row_work > EXACT_OUTER_MAX_ROW_WORK || psi_elements > EXACT_OUTER_MAX_PSI_ELEMENTS {
+    if row_work > EXACT_OUTER_MAX_ROW_WORK {
         ExactOuterDerivativeOrder::First
     } else {
         ExactOuterDerivativeOrder::Second
@@ -1106,7 +1095,7 @@ impl BernoulliMarginalSlopeFamily {
         // F_a(a) = ∫ φ(L(a + b·h)) · L'(a + b·h) · w(h) dh
         let eval = |a: f64| -> Result<(f64, f64), String> {
             let v = h_nodes.mapv(|h| a + slope * h);
-            let (t, t1, _) = self.link_terms(&v, beta_w)?;
+            let (t, t1) = self.link_terms_value_d1(&v, beta_w)?;
             let f_val = self
                 .quadrature_weights
                 .iter()
@@ -1233,6 +1222,7 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         h_nodes: &Array1<f64>,
         score_warp_obs: Option<&(DesignMatrix, Array1<f64>)>,
+        link_order: LinkOrder,
     ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
         let marginal_eta = block_states[0].eta[row];
         // The log-slope block now parameterizes the signed slope directly.
@@ -1254,13 +1244,13 @@ impl BernoulliMarginalSlopeFamily {
         };
         let node_link = if let Some(runtime) = &self.link_dev {
             let u_base = h_nodes.mapv(|h| intercept + slope * h);
-            Some(self.link_basis_stack(runtime, &u_base)?)
+            Some(self.link_basis_stack(runtime, &u_base, link_order)?)
         } else {
             None
         };
         let obs_link = if let Some(runtime) = &self.link_dev {
             let eta_base = Array1::from_vec(vec![intercept + slope * h_obs_base]);
-            Some(self.link_basis_stack(runtime, &eta_base)?)
+            Some(self.link_basis_stack(runtime, &eta_base, link_order)?)
         } else {
             None
         };
@@ -1455,6 +1445,7 @@ impl BernoulliMarginalSlopeFamily {
         h_nodes: &Array1<f64>,
         h_node_design: Option<&Array2<f64>>,
         score_warp_obs: Option<&(DesignMatrix, Array1<f64>)>,
+        link_order: LinkOrder,
     ) -> Result<f64, String> {
         let k = dirs.len();
         if k > 4 {
@@ -1915,6 +1906,7 @@ impl BernoulliMarginalSlopeFamily {
         h_nodes: &Array1<f64>,
         h_node_design: Option<&Array2<f64>>,
         score_warp_obs: Option<&(DesignMatrix, Array1<f64>)>,
+        link_order: LinkOrder,
     ) -> Result<(Array1<f64>, Array2<f64>), String> {
         let mut grad = Array1::<f64>::zeros(primary.total);
         let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
@@ -2060,125 +2052,111 @@ impl BernoulliMarginalSlopeFamily {
             )
             .expect("logslope syr_row_into dimension mismatch");
 
-        // h/w cross-blocks still need dense row vectors since one side is a
-        // primary_hessian slice rather than a DesignMatrix row.
-        let has_h = primary.h.is_some() && slices.h.is_some();
-        let has_w = primary.w.is_some() && slices.w.is_some();
-        let x_row_lazy = if has_h || has_w {
-            Some(self.marginal_design.row_chunk(row..row + 1).row(0).to_owned())
-        } else {
-            None
-        };
-        let g_row_lazy = if has_h || has_w {
-            Some(self.logslope_design.row_chunk(row..row + 1).row(0).to_owned())
-        } else {
-            None
-        };
-        if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
-            let x_row = x_row_lazy.as_ref().unwrap();
-            let g_row = g_row_lazy.as_ref().unwrap();
-            let h_row0 = h
-                .slice(s![0, primary_h.start..primary_h.end])
+        // h/w cross-blocks need dense row vectors since one side is a
+        // primary_hessian slice rather than a DesignMatrix row.  Extract
+        // them once, only when at least one auxiliary block exists.
+        let need_dense = (primary.h.is_some() && slices.h.is_some())
+            || (primary.w.is_some() && slices.w.is_some());
+        if need_dense {
+            let x_row = self
+                .marginal_design
+                .row_chunk(row..row + 1)
+                .row(0)
                 .to_owned();
-            let h_len = h_row0.len();
-            let h_row0_2d = h_row0.into_shape_with_order((1, h_len)).unwrap();
-            let qh = x_row.view().insert_axis(Axis(1)).dot(&h_row0_2d);
-            target
-                .slice_mut(s![slices.marginal.clone(), block_h.clone()])
-                .scaled_add(1.0, &qh);
-            target
-                .slice_mut(s![block_h.clone(), slices.marginal.clone()])
-                .scaled_add(1.0, &qh.t().to_owned());
-
-            let h_row1 = h
-                .slice(s![1, primary_h.start..primary_h.end])
+            let g_row = self
+                .logslope_design
+                .row_chunk(row..row + 1)
+                .row(0)
                 .to_owned();
-            let h_row1_2d = h_row1.into_shape_with_order((1, h_len)).unwrap();
-            let gh = g_row.view().insert_axis(Axis(1)).dot(&h_row1_2d);
-            target
-                .slice_mut(s![slices.logslope.clone(), block_h.clone()])
-                .scaled_add(1.0, &gh);
-            target
-                .slice_mut(s![block_h.clone(), slices.logslope.clone()])
-                .scaled_add(1.0, &gh.t().to_owned());
-
-            target
-                .slice_mut(s![block_h.clone(), block_h.clone()])
-                .scaled_add(
-                    1.0,
-                    &primary_hessian
-                        .slice(s![
-                            primary_h.start..primary_h.end,
-                            primary_h.start..primary_h.end
-                        ])
-                        .to_owned(),
-                );
-        }
-
-        if let (Some(primary_w), Some(block_w)) = (primary.w.as_ref(), slices.w.as_ref()) {
-            let x_row = x_row_lazy.as_ref().unwrap();
-            let g_row = g_row_lazy.as_ref().unwrap();
-            let w_row0 = primary_hessian
-                .slice(s![0, primary_w.start..primary_w.end])
-                .to_owned();
-            let w_len = w_row0.len();
-            let w_row0_2d = w_row0.into_shape_with_order((1, w_len)).unwrap();
-            let qw = x_row.view().insert_axis(Axis(1)).dot(&w_row0_2d);
-            target
-                .slice_mut(s![slices.marginal.clone(), block_w.clone()])
-                .scaled_add(1.0, &qw);
-            target
-                .slice_mut(s![block_w.clone(), slices.marginal.clone()])
-                .scaled_add(1.0, &qw.t().to_owned());
-
-            let w_row1 = primary_hessian
-                .slice(s![1, primary_w.start..primary_w.end])
-                .to_owned();
-            let w_row1_2d = w_row1.into_shape_with_order((1, w_len)).unwrap();
-            let gw = g_row.view().insert_axis(Axis(1)).dot(&w_row1_2d);
-            target
-                .slice_mut(s![slices.logslope.clone(), block_w.clone()])
-                .scaled_add(1.0, &gw);
-            target
-                .slice_mut(s![block_w.clone(), slices.logslope.clone()])
-                .scaled_add(1.0, &gw.t().to_owned());
 
             if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
+                let h_row0 = h.slice(s![0, primary_h.start..primary_h.end]).to_owned();
+                let h_len = h_row0.len();
+                let h_row0_2d = h_row0.into_shape_with_order((1, h_len)).unwrap();
+                let qh = x_row.view().insert_axis(Axis(1)).dot(&h_row0_2d);
                 target
-                    .slice_mut(s![block_h.clone(), block_w.clone()])
+                    .slice_mut(s![slices.marginal.clone(), block_h.clone()])
+                    .scaled_add(1.0, &qh);
+                target
+                    .slice_mut(s![block_h.clone(), slices.marginal.clone()])
+                    .scaled_add(1.0, &qh.t());
+
+                let h_row1 = h.slice(s![1, primary_h.start..primary_h.end]).to_owned();
+                let h_row1_2d = h_row1.into_shape_with_order((1, h_len)).unwrap();
+                let gh = g_row.view().insert_axis(Axis(1)).dot(&h_row1_2d);
+                target
+                    .slice_mut(s![slices.logslope.clone(), block_h.clone()])
+                    .scaled_add(1.0, &gh);
+                target
+                    .slice_mut(s![block_h.clone(), slices.logslope.clone()])
+                    .scaled_add(1.0, &gh.t());
+
+                target
+                    .slice_mut(s![block_h.clone(), block_h.clone()])
                     .scaled_add(
                         1.0,
-                        &primary_hessian
-                            .slice(s![
-                                primary_h.start..primary_h.end,
-                                primary_w.start..primary_w.end
-                            ])
-                            .to_owned(),
-                    );
-                target
-                    .slice_mut(s![block_w.clone(), block_h.clone()])
-                    .scaled_add(
-                        1.0,
-                        &primary_hessian
-                            .slice(s![
-                                primary_w.start..primary_w.end,
-                                primary_h.start..primary_h.end
-                            ])
-                            .to_owned(),
+                        &h.slice(s![
+                            primary_h.start..primary_h.end,
+                            primary_h.start..primary_h.end
+                        ]),
                     );
             }
 
-            target
-                .slice_mut(s![block_w.clone(), block_w.clone()])
-                .scaled_add(
-                    1.0,
-                    &primary_hessian
-                        .slice(s![
+            if let (Some(primary_w), Some(block_w)) = (primary.w.as_ref(), slices.w.as_ref()) {
+                let w_row0 = h.slice(s![0, primary_w.start..primary_w.end]).to_owned();
+                let w_len = w_row0.len();
+                let w_row0_2d = w_row0.into_shape_with_order((1, w_len)).unwrap();
+                let qw = x_row.view().insert_axis(Axis(1)).dot(&w_row0_2d);
+                target
+                    .slice_mut(s![slices.marginal.clone(), block_w.clone()])
+                    .scaled_add(1.0, &qw);
+                target
+                    .slice_mut(s![block_w.clone(), slices.marginal.clone()])
+                    .scaled_add(1.0, &qw.t());
+
+                let w_row1 = h.slice(s![1, primary_w.start..primary_w.end]).to_owned();
+                let w_row1_2d = w_row1.into_shape_with_order((1, w_len)).unwrap();
+                let gw = g_row.view().insert_axis(Axis(1)).dot(&w_row1_2d);
+                target
+                    .slice_mut(s![slices.logslope.clone(), block_w.clone()])
+                    .scaled_add(1.0, &gw);
+                target
+                    .slice_mut(s![block_w.clone(), slices.logslope.clone()])
+                    .scaled_add(1.0, &gw.t());
+
+                if let (Some(primary_h), Some(block_h)) =
+                    (primary.h.as_ref(), slices.h.as_ref())
+                {
+                    target
+                        .slice_mut(s![block_h.clone(), block_w.clone()])
+                        .scaled_add(
+                            1.0,
+                            &h.slice(s![
+                                primary_h.start..primary_h.end,
+                                primary_w.start..primary_w.end
+                            ]),
+                        );
+                    target
+                        .slice_mut(s![block_w.clone(), block_h.clone()])
+                        .scaled_add(
+                            1.0,
+                            &h.slice(s![
+                                primary_w.start..primary_w.end,
+                                primary_h.start..primary_h.end
+                            ]),
+                        );
+                }
+
+                target
+                    .slice_mut(s![block_w.clone(), block_w.clone()])
+                    .scaled_add(
+                        1.0,
+                        &h.slice(s![
                             primary_w.start..primary_w.end,
                             primary_w.start..primary_w.end
-                        ])
-                        .to_owned(),
-                );
+                        ]),
+                    );
+            }
         }
     }
 
@@ -2282,7 +2260,7 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = self.row_context_from_cache(
                             row,
                             block_states,
-                            &cache,
+                            cache,
                         )?;
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
@@ -2331,7 +2309,7 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = self.row_context_from_cache(
                             row,
                             block_states,
-                            &cache,
+                            cache,
                         )?;
                         let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
                             row,
@@ -2436,7 +2414,7 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = self.row_context_from_cache(
                             row,
                             block_states,
-                            &cache,
+                            cache,
                         )?;
                         let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                             row,
@@ -2579,7 +2557,7 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = self.row_context_from_cache(
                             row,
                             block_states,
-                            &cache,
+                            cache,
                         )?;
                         let (f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                             row,
@@ -2822,7 +2800,7 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = self.row_context_from_cache(
                             row,
                             block_states,
-                            &cache,
+                            cache,
                         )?;
                         let third_beta = self.row_primary_third_contracted_recompute(
                             row,
@@ -2913,7 +2891,7 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = self.row_context_from_cache(
                             row,
                             block_states,
-                            &cache,
+                            cache,
                         )?;
                         let third = self.row_primary_third_contracted_recompute(
                             row,
@@ -2970,7 +2948,7 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = self.row_context_from_cache(
                             row,
                             block_states,
-                            &cache,
+                            cache,
                         )?;
                         let fourth = self.row_primary_fourth_contracted_recompute(
                             row,
@@ -3087,11 +3065,11 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         for row in 0..self.y.len() {
-                        let row_ctx = self.row_context_from_cache(
-                            row,
-                            block_states,
-                            &cache,
-                        )?;
+            let row_ctx = self.row_context_from_cache(
+                row,
+                block_states,
+                &cache,
+            )?;
             let row_neglog = self.row_neglog_directional_from_primary(
                 row,
                 block_states,
@@ -3191,9 +3169,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
+        // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
+        if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
+            return ExactOuterDerivativeOrder::First;
+        }
+        // Family-specific row-loop gate.
         let k_smoothing: usize = specs.iter().map(|s| s.penalties.len()).sum();
-        bernoulli_exact_outer_derivative_order(
+        bernoulli_row_work_order(
             self.y.len(),
             self.score_warp
                 .as_ref()
@@ -3203,7 +3185,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 .as_ref()
                 .map(|runtime| runtime.transform.ncols())
                 .unwrap_or(0),
-            p_total,
             k_smoothing,
         )
     }
@@ -3701,10 +3682,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
     let score_warp_obs_design = score_warp_prepared
         .as_ref()
-        .and_then(|p| match &p.block.design {
-            DesignMatrix::Dense(x) => Some(Arc::new(x.to_dense())),
-            DesignMatrix::Sparse(_) => None,
-        });
+        .map(|p| p.block.design.clone());
     let cached_score_warp_constraints = score_warp_runtime
         .as_ref()
         .map(|runtime| {
@@ -4067,6 +4045,10 @@ mod tests {
             score_warp_obs_design: None,
             cached_score_warp_constraints: None,
             link_dev: Some(prepared.runtime.clone()),
+            cached_link_dev_constraints: BernoulliMarginalSlopeFamily::build_link_dev_constraints(
+                &prepared.runtime,
+            )
+            .expect("build link dev constraints"),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -4179,7 +4161,7 @@ mod tests {
             quadrature_nodes: array![-0.25, 0.25],
             quadrature_weights: array![0.5, 0.5],
             score_warp: Some(prepared.runtime.clone()),
-            score_warp_obs_design: Some(Arc::new(prepared.block.design.to_dense())),
+            score_warp_obs_design: Some(prepared.block.design.clone()),
             cached_score_warp_constraints:
                 BernoulliMarginalSlopeFamily::build_score_warp_constraints(
                     &prepared.runtime,
@@ -4321,35 +4303,58 @@ mod tests {
     }
 
     #[test]
-    fn exact_outer_derivative_order_keeps_small_primary_models_second_order() {
-        // Small n, no auxiliary primaries, modest p and K.
+    fn row_work_order_keeps_small_primary_models_second_order() {
+        // Small n, no auxiliary primaries, K=2.
+        // n=100_000 × k_pairs=3 × primary²=4 = 1_200_000 < 2M.
         assert_eq!(
-            bernoulli_exact_outer_derivative_order(100_000, 0, 0, 20, 2),
+            bernoulli_row_work_order(100_000, 0, 0, 2),
             ExactOuterDerivativeOrder::Second
         );
-        // Moderate n with rich primaries but small p and K.
-        // n=4000 × k_pairs=1 × primary²=256 = 1_024_000 < 2M row-work limit.
+        // Moderate n with rich primaries, K=1.
+        // n=4000 × k_pairs=1 × primary²=256 = 1_024_000 < 2M.
         assert_eq!(
-            bernoulli_exact_outer_derivative_order(4_000, 8, 6, 30, 1),
+            bernoulli_row_work_order(4_000, 8, 6, 1),
             ExactOuterDerivativeOrder::Second
         );
     }
 
     #[test]
-    fn exact_outer_derivative_order_downgrades_large_rich_models_to_first_order() {
-        // Large n × primary² triggers row-work limit.
+    fn row_work_order_downgrades_large_rich_models_to_first_order() {
+        // n=10_000 × k_pairs=6 × primary²=256 = 15_360_000 > 2M.
         assert_eq!(
-            bernoulli_exact_outer_derivative_order(10_000, 8, 6, 30, 3),
+            bernoulli_row_work_order(10_000, 8, 6, 3),
             ExactOuterDerivativeOrder::First
         );
     }
 
     #[test]
-    fn exact_outer_derivative_order_downgrades_large_p_to_first_order() {
-        // Even small n — large p with many smoothing params triggers the
-        // psi-element memory limit: K=20 → K_pairs=210, p=1000 → 210M > 200M.
+    fn cost_gated_outer_order_downgrades_large_p() {
+        use crate::custom_family::cost_gated_outer_order;
+        use crate::matrix::DesignMatrix;
+        use ndarray::Array2;
+
+        // 2 blocks × 500 cols = p=1000, each block has 10 penalties → K=20,
+        // K_pairs=210, psi_elements = 210 × 1000² = 210M > 200M limit.
+        let design = DesignMatrix::Dense(
+            crate::matrix::DenseDesignMatrix::Materialized(Array2::zeros((10, 500))),
+        );
+        let specs: Vec<ParameterBlockSpec> = (0..2)
+            .map(|i| ParameterBlockSpec {
+                name: format!("block_{i}"),
+                design: design.clone(),
+                offset: ndarray::Array1::zeros(10),
+                penalties: (0..10)
+                    .map(|_| {
+                        crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((500, 500)))
+                    })
+                    .collect(),
+                nullspace_dims: vec![0; 10],
+                initial_log_lambdas: ndarray::Array1::zeros(10),
+                initial_beta: None,
+            })
+            .collect();
         assert_eq!(
-            bernoulli_exact_outer_derivative_order(100, 0, 0, 1000, 20),
+            cost_gated_outer_order(&specs),
             ExactOuterDerivativeOrder::First
         );
     }
