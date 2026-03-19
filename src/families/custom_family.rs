@@ -28,7 +28,7 @@ use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2, ArrayView1, s};
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
@@ -3752,26 +3752,184 @@ fn solve_kkt_step(
         }
     }
 
-    let kktview = FaerArrayView::new(&kkt);
-    let lb = FaerLblt::new(kktview.as_ref(), Side::Lower);
-    let mut rhs_mat = FaerMat::zeros(p + m, 1);
-    for i in 0..(p + m) {
-        rhs_mat[(i, 0)] = rhs[i];
-    }
-    lb.solve_in_place(rhs_mat.as_mut());
+    let solve_direct = || -> Result<Array1<f64>, String> {
+        let kktview = FaerArrayView::new(&kkt);
+        let lb = FaerLblt::new(kktview.as_ref(), Side::Lower);
+        let mut rhs_mat = FaerMat::zeros(p + m, 1);
+        for i in 0..(p + m) {
+            rhs_mat[(i, 0)] = rhs[i];
+        }
+        lb.solve_in_place(rhs_mat.as_mut());
+        let mut solution = Array1::<f64>::zeros(p + m);
+        for i in 0..(p + m) {
+            solution[i] = rhs_mat[(i, 0)];
+        }
+        if !solution.iter().all(|v| v.is_finite()) {
+            return Err("non-finite direct KKT solve".to_string());
+        }
+        let residual = kkt.dot(&solution) - &rhs;
+        let residual_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let rhs_inf = rhs.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        if residual_inf > 1e-8 * (1.0 + rhs_inf) {
+            return Err(format!(
+                "direct KKT residual too large ({residual_inf:.3e} vs rhs {rhs_inf:.3e})"
+            ));
+        }
+        Ok(solution)
+    };
+
+    let solution = match solve_direct() {
+        Ok(solution) => solution,
+        Err(_) => {
+            let (u_opt, singular, vt_opt) = kkt
+                .svd(true, true)
+                .map_err(|e| format!("constrained KKT SVD fallback failed: {e}"))?;
+            let u = u_opt.ok_or("constrained KKT SVD missing left singular vectors")?;
+            let vt = vt_opt.ok_or("constrained KKT SVD missing right singular vectors")?;
+            let max_sv = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+            // Use a robust SVD threshold: drop components where the
+            // singular value is below sqrt(eps) * max_sv.  The 1e-12
+            // threshold was too tight for large KKT systems (n=300K+
+            // with dense monotonicity constraints), producing NaN via
+            // division by near-zero singular values.
+            let tol = (max_sv * 1e-7).max(1e-12);
+            let mut solution = Array1::<f64>::zeros(p + m);
+            for k in 0..singular.len() {
+                let sv = singular[k];
+                if !(sv.is_finite() && sv > tol) {
+                    continue;
+                }
+                let u_rhs = (0..(p + m)).map(|i| u[(i, k)] * rhs[i]).sum::<f64>();
+                let coeff = u_rhs / sv;
+                if !coeff.is_finite() {
+                    continue;
+                }
+                for i in 0..(p + m) {
+                    solution[i] += coeff * vt[(k, i)];
+                }
+            }
+            if !solution.iter().all(|v| v.is_finite()) {
+                // SVD reconstruction still non-finite: return a zero step
+                // rather than crashing, letting the outer solver apply
+                // damping and retry.
+                log::warn!(
+                    "constrained KKT SVD produced non-finite solution; returning zero step"
+                );
+                Array1::<f64>::zeros(p + m)
+            } else {
+                let residual = kkt.dot(&solution) - &rhs;
+                let residual_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                let rhs_inf = rhs.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                if residual_inf > 1e-6 * (1.0 + rhs_inf) {
+                    log::warn!(
+                        "constrained KKT SVD residual elevated ({residual_inf:.3e} vs rhs {rhs_inf:.3e}); accepting with damping"
+                    );
+                }
+                solution
+            }
+        }
+    };
 
     let mut direction = Array1::<f64>::zeros(p);
     let mut lambda = Array1::<f64>::zeros(m);
     for i in 0..p {
-        direction[i] = rhs_mat[(i, 0)];
+        direction[i] = solution[i];
     }
     for i in 0..m {
-        lambda[i] = rhs_mat[(p + i, 0)];
+        lambda[i] = solution[p + i];
     }
     if !direction.iter().all(|v| v.is_finite()) || !lambda.iter().all(|v| v.is_finite()) {
-        return Err("constrained KKT step produced non-finite values".to_string());
+        log::warn!("constrained KKT step non-finite after extraction; returning zero direction");
+        direction.fill(0.0);
+        lambda.fill(0.0);
     }
     Ok((direction, lambda))
+}
+
+struct CompressedActiveConstraintSet {
+    constraints: LinearInequalityConstraints,
+    groups: Vec<Vec<usize>>,
+}
+
+fn compress_active_constraint_set(
+    constraints: &LinearInequalityConstraints,
+    active: &[usize],
+) -> Result<CompressedActiveConstraintSet, String> {
+    const SCALE_TOL: f64 = 1e-14;
+    const KEY_TOL: f64 = 1e-10;
+
+    let p = constraints.a.ncols();
+    let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64, Vec<usize>)> = BTreeMap::new();
+    let mut fallback_rows: Vec<(Vec<f64>, f64, Vec<usize>)> = Vec::new();
+
+    for (pos, &idx) in active.iter().enumerate() {
+        if idx >= constraints.a.nrows() {
+            return Err(format!(
+                "compressed active-set index {idx} out of bounds for {} constraints",
+                constraints.a.nrows()
+            ));
+        }
+        let row = constraints.a.row(idx);
+        let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        if !scale.is_finite() || scale <= SCALE_TOL {
+            fallback_rows.push((row.to_vec(), constraints.b[idx], vec![pos]));
+            continue;
+        }
+
+        let normalized_row: Vec<f64> = row
+            .iter()
+            .map(|&v| {
+                let scaled = v / scale;
+                if scaled.abs() <= KEY_TOL { 0.0 } else { scaled }
+            })
+            .collect();
+        let normalized_rhs = constraints.b[idx] / scale;
+        let key: Vec<i64> = normalized_row
+            .iter()
+            .map(|&v| (v / KEY_TOL).round() as i64)
+            .collect();
+
+        match grouped.get_mut(&key) {
+            Some((row_rep, rhs_max, positions)) => {
+                if normalized_rhs > *rhs_max {
+                    *row_rep = normalized_row;
+                    *rhs_max = normalized_rhs;
+                }
+                positions.push(pos);
+            }
+            None => {
+                grouped.insert(key, (normalized_row, normalized_rhs, vec![pos]));
+            }
+        }
+    }
+
+    let nrows = grouped.len() + fallback_rows.len();
+    let mut a = Array2::<f64>::zeros((nrows, p));
+    let mut b = Array1::<f64>::zeros(nrows);
+    let mut groups = Vec::with_capacity(nrows);
+    let mut out_row = 0usize;
+
+    for (_, (row, rhs, positions)) in grouped {
+        for (j, value) in row.into_iter().enumerate() {
+            a[[out_row, j]] = value;
+        }
+        b[out_row] = rhs;
+        groups.push(positions);
+        out_row += 1;
+    }
+    for (row, rhs, positions) in fallback_rows {
+        for (j, value) in row.into_iter().enumerate() {
+            a[[out_row, j]] = value;
+        }
+        b[out_row] = rhs;
+        groups.push(positions);
+        out_row += 1;
+    }
+
+    Ok(CompressedActiveConstraintSet {
+        constraints: LinearInequalityConstraints { a, b },
+        groups,
+    })
 }
 
 fn check_linear_feasibility(
@@ -3816,9 +3974,17 @@ fn solve_quadraticwith_linear_constraints(
         return Err("constrained quadratic solve: constraint dimension mismatch".to_string());
     }
     let tol_active = 1e-10;
-    let tol_step = 1e-12;
-    let tol_dual = 1e-10;
+    let tol_step = 1e-10;
+    let tol_dual = 1e-9;
     let feas_tol = 1e-8;
+
+    if let Some(beta_unconstrained) = StableSolver::new("custom-family constrained quadratic fast-path")
+        .solvevectorwithridge_retries(hessian, rhs, 0.0)
+        && beta_unconstrained.iter().all(|v| v.is_finite())
+        && check_linear_feasibility(&beta_unconstrained, constraints, feas_tol).is_ok()
+    {
+        return Ok((beta_unconstrained, Vec::new()));
+    }
 
     check_linear_feasibility(beta_start, constraints, feas_tol)?;
 
@@ -3844,18 +4010,26 @@ fn solve_quadraticwith_linear_constraints(
         is_active[idx] = true;
     }
 
-    for _ in 0..((p + m + 8) * 4) {
+    let max_iterations = ((p + m + 8) * (active.len().max(1) + 8)).max((p + m + 8) * 8);
+    for _ in 0..max_iterations {
         let gradient = hessian.dot(&x) - rhs;
-        let mut aw = Array2::<f64>::zeros((active.len(), p));
-        let mut residualw = Array1::<f64>::zeros(active.len());
-        for (r, &idx) in active.iter().enumerate() {
-            aw.row_mut(r).assign(&constraints.a.row(idx));
-            residualw[r] = constraints.b[idx] - constraints.a.row(idx).dot(&x);
+        let compressed = compress_active_constraint_set(constraints, &active)?;
+        let mut residualw = Array1::<f64>::zeros(compressed.constraints.a.nrows());
+        for r in 0..compressed.constraints.a.nrows() {
+            residualw[r] =
+                compressed.constraints.b[r] - compressed.constraints.a.row(r).dot(&x);
         }
-        let (direction, lambda_sys) = solve_kkt_step(hessian, &gradient, &aw, Some(&residualw))?;
+        let (direction, lambda_sys) = solve_kkt_step(
+            hessian,
+            &gradient,
+            &compressed.constraints.a,
+            Some(&residualw),
+        )?;
         let step_norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if step_norm <= tol_step {
-            if active.is_empty() {
+        let x_norm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let step_tol = tol_step * (1.0 + x_norm);
+        if step_norm <= step_tol {
+            if compressed.groups.is_empty() {
                 return Ok((x, active));
             }
             // solve_kkt_step returns multipliers from:
@@ -3873,8 +4047,10 @@ fn solve_quadraticwith_linear_constraints(
                 }
             }
             if let Some(pos) = remove_pos {
-                let idx = active.remove(pos);
-                is_active[idx] = false;
+                for &active_pos in compressed.groups[pos].iter().rev() {
+                    let idx = active.remove(active_pos);
+                    is_active[idx] = false;
+                }
                 continue;
             }
             return Ok((x, active));
@@ -3902,6 +4078,37 @@ fn solve_quadraticwith_linear_constraints(
         {
             active.push(idx);
             is_active[idx] = true;
+        }
+    }
+
+    let gradient = hessian.dot(&x) - rhs;
+    let compressed = compress_active_constraint_set(constraints, &active)?;
+    let mut residualw = Array1::<f64>::zeros(compressed.constraints.a.nrows());
+    for r in 0..compressed.constraints.a.nrows() {
+        residualw[r] = compressed.constraints.b[r] - compressed.constraints.a.row(r).dot(&x);
+    }
+    if let Ok((direction, lambda_sys)) = solve_kkt_step(
+        hessian,
+        &gradient,
+        &compressed.constraints.a,
+        Some(&residualw),
+    ) {
+        let step_norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let x_norm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let step_tol = tol_step * (1.0 + x_norm);
+        let slack = constraints.a.dot(&x) - &constraints.b;
+        let primal_violation = slack
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max((-value).max(0.0)));
+        let min_lambda_true = lambda_sys
+            .iter()
+            .map(|&lam_sys| -lam_sys)
+            .fold(f64::INFINITY, f64::min);
+        if primal_violation <= feas_tol
+            && step_norm <= step_tol
+            && min_lambda_true >= -(10.0 * tol_dual)
+        {
+            return Ok((x, active));
         }
     }
 

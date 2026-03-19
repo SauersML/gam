@@ -909,6 +909,45 @@ pub(crate) struct SmoothingCorrectionComputation {
     pub hessian_rho: Option<Array2<f64>>,
 }
 
+fn invert_regularized_rho_hessian(hessian_rho: &Array2<f64>) -> Option<(Array2<f64>, bool)> {
+    if let Ok(chol) = hessian_rho.cholesky(faer::Side::Lower) {
+        let n = hessian_rho.nrows();
+        let mut inverse = Array2::<f64>::eye(n);
+        for col in 0..n {
+            let colvec = inverse.column(col).to_owned();
+            let solved = chol.solvevec(&colvec);
+            inverse.column_mut(col).assign(&solved);
+        }
+        return Some((inverse, false));
+    }
+
+    let (eigenvalues, eigenvectors) = hessian_rho.eigh(faer::Side::Lower).ok()?;
+    if eigenvalues.iter().any(|v| !v.is_finite()) || !eigenvectors.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+
+    let n = hessian_rho.nrows();
+    let spectral_scale = eigenvalues
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let floor = (spectral_scale * 1e-10).max(LAML_RIDGE);
+    let mut inverse = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        let lambda = eigenvalues[i].max(floor);
+        let inv_lambda = 1.0 / lambda;
+        let v = eigenvectors.column(i);
+        for row in 0..n {
+            for col in 0..n {
+                inverse[[row, col]] += inv_lambda * v[row] * v[col];
+            }
+        }
+    }
+    Some((inverse, true))
+}
+
 fn compute_smoothing_correction(
     reml_state: &RemlState<'_>,
     final_rho: &Array1<f64>,
@@ -1020,24 +1059,19 @@ fn compute_smoothing_correction(
     // Add a small ridge before factorization to regularize weakly identified ρ directions.
     add_relative_diag_ridge(&mut hessian_rho, LAML_RIDGE, LAML_RIDGE);
 
-    let v_rho = match hessian_rho.cholesky(faer::Side::Lower) {
-        Ok(chol) => {
-            let mut eye = Array2::<f64>::eye(n_rho);
-            for col in 0..n_rho {
-                let colvec = eye.column(col).to_owned();
-                let solved = chol.solvevec(&colvec);
-                eye.column_mut(col).assign(&solved);
-            }
-            eye
-        }
-        Err(_) => {
-            log::warn!("Failed to invert LAML Hessian for smoothing correction; skipping.");
+    let (v_rho, repaired_hessian) = match invert_regularized_rho_hessian(&hessian_rho) {
+        Some(inverse) => inverse,
+        None => {
+            log::warn!("Failed to invert LAML Hessian for smoothing correction after spectral repair; skipping.");
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: Some(hessian_rho),
             };
         }
     };
+    if repaired_hessian {
+        log::debug!("Projected indefinite LAML Hessian onto a positive spectrum before smoothing correction inversion.");
+    }
 
     // Step 4: Compute V_corr = J * V_rho * J^T in transformed space.
     //
