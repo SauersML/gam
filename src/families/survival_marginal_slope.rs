@@ -1873,140 +1873,85 @@ impl SurvivalMarginalSlopeFamily {
                 let has_ij = psi_row_ij.as_ref().is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
 
                 let (f_pi, f_pipi) = if let Some(c) = cache {
-                let (g, h) = self.row_primary_gradient_hessian(row, c);
-                (g.clone(), h.clone())
-            } else {
-                let (_, g, h) =
-                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                (g, h)
-            };
-            let third_i = self.row_primary_third_contracted(row, block_states, &dir_i)?;
-            let third_j = self.row_primary_third_contracted(row, block_states, &dir_j)?;
-            let fourth =
-                self.row_primary_fourth_contracted(row, block_states, &dir_i, &dir_j)?;
+                    let (g, h) = self.row_primary_gradient_hessian(row, c);
+                    (g.clone(), h.clone())
+                } else {
+                    let (_, g, h) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    (g, h)
+                };
+                let third_i = self.row_primary_third_contracted(row, block_states, &dir_i)?;
+                let third_j = self.row_primary_third_contracted(row, block_states, &dir_j)?;
+                let fourth =
+                    self.row_primary_fourth_contracted(row, block_states, &dir_i, &dir_j)?;
 
-            let psi_row_i = self.psi_design_row_vector(
-                row, deriv_i, self.n, p_psi_i, label_i,
-            )?;
-            let psi_row_j = self.psi_design_row_vector(
-                row,
-                &derivative_blocks[block_idx_j][local_idx_j],
-                self.n,
-                p_psi_j,
-                label_j,
-            )?;
+                a.0 += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
 
-            // Optional second-order psi design row (only when same block)
-            let psi_row_ij = if same_block {
-                Some(self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_idx_j][local_idx_j],
-                    local_idx_j,
-                    self.n,
-                    p_psi_i,
-                    label_i,
-                )?)
-            } else {
-                None
-            };
-            let has_ij = psi_row_ij
-                .as_ref()
-                .is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
-
-            objective_psi_psi += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
-
-            // ── Score ──
-            // Term: left_ij * f_pi·loading_i (only if psi_row_ij nonzero)
-            if has_ij {
-                let s_ij = f_pi.dot(&loading_i);
-                let psi_ij = psi_row_ij.as_ref().unwrap();
-                match block_idx_i {
-                    1 => score_m.scaled_add(s_ij, psi_ij),
-                    2 => score_g.scaled_add(s_ij, psi_ij),
-                    _ => {}
+                // Score
+                if has_ij {
+                    let s_ij = f_pi.dot(&loading_i);
+                    let psi_ij = psi_row_ij.as_ref().unwrap();
+                    match block_idx_i {
+                        1 => a.2.scaled_add(s_ij, psi_ij),
+                        _ => a.3.scaled_add(s_ij, psi_ij),
+                    }
                 }
-            }
-            // Term: left_i * loading_i·f_pipi·dir_j
-            let s_i = loading_i.dot(&f_pipi.dot(&dir_j));
-            match block_idx_i {
-                1 => score_m.scaled_add(s_i, &psi_row_i),
-                2 => score_g.scaled_add(s_i, &psi_row_i),
-                _ => {}
-            }
-            // Term: left_j * loading_j·f_pipi·dir_i
-            let s_j = loading_j.dot(&f_pipi.dot(&dir_i));
-            match block_idx_j {
-                1 => score_m.scaled_add(s_j, &psi_row_j),
-                2 => score_g.scaled_add(s_j, &psi_row_j),
-                _ => {}
-            }
-            // Term: pullback(f_pipi·dir_ij) + pullback(third_i·dir_j)
-            let pb1 = f_pipi.dot(&dir_ij);
-            self.accumulate_score_blockwise(
-                row, &pb1, &mut score_t, &mut score_m, &mut score_g,
-            )?;
-            let pb2 = third_i.dot(&dir_j);
-            self.accumulate_score_blockwise(
-                row, &pb2, &mut score_t, &mut score_m, &mut score_g,
-            )?;
+                let s_i = loading_i.dot(&f_pipi.dot(&dir_j));
+                match block_idx_i {
+                    1 => a.2.scaled_add(s_i, &psi_row_i),
+                    _ => a.3.scaled_add(s_i, &psi_row_i),
+                }
+                let s_j = loading_j.dot(&f_pipi.dot(&dir_i));
+                match block_idx_j {
+                    1 => a.2.scaled_add(s_j, &psi_row_j),
+                    _ => a.3.scaled_add(s_j, &psi_row_j),
+                }
+                let pb1 = f_pipi.dot(&dir_ij);
+                self.accumulate_score_blockwise(row, &pb1, &mut a.1, &mut a.2, &mut a.3)?;
+                let pb2 = third_i.dot(&dir_j);
+                self.accumulate_score_blockwise(row, &pb2, &mut a.1, &mut a.2, &mut a.3)?;
 
-            // ── Hessian ──
-            // Term 1: left_ij ⊗ right_ij + right_ij ⊗ left_ij (if nonzero)
-            if has_ij {
-                let right_primary_ij = f_pipi.dot(&loading_i);
-                acc.add_rank1_psi_cross(
-                    self,
-                    row,
-                    block_idx_i,
-                    psi_row_ij.as_ref().unwrap(),
-                    &right_primary_ij,
+                // Hessian
+                if has_ij {
+                    let rp_ij = f_pipi.dot(&loading_i);
+                    a.4.add_rank1_psi_cross(
+                        self, row, block_idx_i, psi_row_ij.as_ref().unwrap(), &rp_ij,
+                    );
+                }
+                let scalar_ij = loading_i.dot(&f_pipi.dot(&loading_j));
+                a.4.add_psi_psi_outer(
+                    block_idx_i, &psi_row_i, block_idx_j, &psi_row_j, scalar_ij,
                 );
-            }
+                let rp_i = third_j.t().dot(&loading_i);
+                a.4.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &rp_i);
+                let rp_j = third_i.t().dot(&loading_j);
+                a.4.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j);
+                a.4.add_pullback(self, row, &fourth);
+                let third_ij =
+                    self.row_primary_third_contracted(row, block_states, &dir_ij)?;
+                a.4.add_pullback(self, row, &third_ij);
 
-            // Term 2: scalar_ij * (left_i ⊗ left_j + left_j ⊗ left_i)
-            let scalar_ij = loading_i.dot(&f_pipi.dot(&loading_j));
-            acc.add_psi_psi_outer(
-                block_idx_i,
-                &psi_row_i,
-                block_idx_j,
-                &psi_row_j,
-                scalar_ij,
-            );
+                Ok(a)
+            })
+            .try_reduce(make_acc, |mut a, b| {
+                a.0 += b.0;
+                a.1 += &b.1;
+                a.2 += &b.2;
+                a.3 += &b.3;
+                a.4.add(&b.4);
+                Ok(a)
+            })?;
 
-            // Term 3: left_i ⊗ right_i + right_i ⊗ left_i
-            //   where right_i = pullback(third_j^T · loading_i)
-            let right_primary_i = third_j.t().dot(&loading_i);
-            acc.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &right_primary_i);
-
-            // Term 4: left_j ⊗ right_j + right_j ⊗ left_j
-            //   where right_j = pullback(third_i^T · loading_j)
-            let right_primary_j = third_i.t().dot(&loading_j);
-            acc.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &right_primary_j);
-
-            // Term 5: pullback_hessian(fourth) + pullback_hessian(third_ij)
-            acc.add_pullback(self, row, &fourth);
-            let third_ij = self.row_primary_third_contracted(row, block_states, &dir_ij)?;
-            acc.add_pullback(self, row, &third_ij);
-        }
-
-        // Assemble score and Hessian into flat structures
         let mut score_psi_psi = Array1::zeros(slices.total);
-        score_psi_psi
-            .slice_mut(s![slices.time.clone()])
-            .assign(&score_t);
-        score_psi_psi
-            .slice_mut(s![slices.marginal.clone()])
-            .assign(&score_m);
-        score_psi_psi
-            .slice_mut(s![slices.logslope.clone()])
-            .assign(&score_g);
+        score_psi_psi.slice_mut(s![slices.time.clone()]).assign(&score_t);
+        score_psi_psi.slice_mut(s![slices.marginal.clone()]).assign(&score_m);
+        score_psi_psi.slice_mut(s![slices.logslope.clone()]).assign(&score_g);
 
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
-            hessian_psi_psi: acc.to_dense(&slices),
-            hessian_psi_psi_operator: None,
+            hessian_psi_psi: Array2::zeros((0, 0)),
+            hessian_psi_psi_operator: Some(Box::new(acc.into_operator(slices))),
         }))
     }
 
@@ -2035,44 +1980,51 @@ impl SurvivalMarginalSlopeFamily {
         };
         let deriv = &derivative_blocks[block_idx][local_idx];
         let loading = spatial_block_primary_loading(block_idx)?;
+        let beta_psi = match block_idx {
+            1 => &block_states[1].beta,
+            _ => &block_states[2].beta,
+        };
+        let d_beta_block = match block_idx {
+            1 => d_beta_flat.slice(s![slices.marginal.clone()]),
+            _ => d_beta_flat.slice(s![slices.logslope.clone()]),
+        };
 
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
-        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g);
 
-        for row in 0..self.n {
-            let row_dir = self.row_primary_direction_from_flat(row, &slices, d_beta_flat);
-            let Some(psi_dir) =
-                self.row_primary_psi_direction(row, block_states, derivative_blocks, psi_index)?
-            else {
-                continue;
-            };
-            let psi_action = self
-                .row_primary_psi_action_on_direction(
-                    row,
-                    &slices,
-                    derivative_blocks,
-                    psi_index,
-                    d_beta_flat,
-                )?
-                .unwrap_or_else(|| Array1::<f64>::zeros(N_PRIMARY));
-            let third_beta = self.row_primary_third_contracted(row, block_states, &row_dir)?;
-            let fourth =
-                self.row_primary_fourth_contracted(row, block_states, &row_dir, &psi_dir)?;
+        let acc = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g),
+                |mut acc, row| -> Result<BlockHessianAccumulator, String> {
+                    let psi_row =
+                        self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+                    let psi_dir =
+                        primary_direction_from_psi_row(block_idx, &psi_row, beta_psi);
+                    let psi_action =
+                        primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block);
+                    let row_dir =
+                        self.row_primary_direction_from_flat(row, &slices, d_beta_flat);
+                    let third_beta =
+                        self.row_primary_third_contracted(row, block_states, &row_dir)?;
+                    let fourth = self.row_primary_fourth_contracted(
+                        row, block_states, &row_dir, &psi_dir,
+                    )?;
 
-            let psi_row =
-                self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-
-            // rank-1: psi_row × pullback(third_beta^T · loading)
-            let right_primary = third_beta.t().dot(&loading);
-            acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
-            // pullback Hessian of fourth + third_action
-            acc.add_pullback(self, row, &fourth);
-            let third_action =
-                self.row_primary_third_contracted(row, block_states, &psi_action)?;
-            acc.add_pullback(self, row, &third_action);
-        }
+                    let right_primary = third_beta.t().dot(&loading);
+                    acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                    acc.add_pullback(self, row, &fourth);
+                    let third_action =
+                        self.row_primary_third_contracted(row, block_states, &psi_action)?;
+                    acc.add_pullback(self, row, &third_action);
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g),
+                |mut a, b| { a.add(&b); Ok(a) },
+            )?;
 
         Ok(Some(acc.to_dense(&slices)))
     }
@@ -2357,16 +2309,342 @@ impl SurvivalMarginalSlopeFamily {
             .as_sparse()
             .and_then(|s| s.to_csr_arc());
 
-        if time_csrs.is_some() && marginal_csr.is_some() && logslope_csr.is_some() {
+        let time_sparse = time_csrs.is_some();
+        let marginal_sparse = marginal_csr.is_some();
+        let logslope_sparse = logslope_csr.is_some();
+
+        if time_sparse && marginal_sparse && logslope_sparse {
             self.evaluate_blockwise_exact_newton_sparse(
                 block_states,
                 &time_csrs.unwrap(),
                 &marginal_csr.unwrap(),
                 &logslope_csr.unwrap(),
             )
-        } else {
+        } else if !time_sparse && !marginal_sparse && !logslope_sparse {
             self.evaluate_blockwise_exact_newton_dense(block_states)
+        } else {
+            self.evaluate_blockwise_exact_newton_mixed(
+                block_states,
+                time_csrs.as_ref(),
+                marginal_csr.as_ref(),
+                logslope_csr.as_ref(),
+            )
         }
+    }
+
+    fn evaluate_blockwise_exact_newton_mixed(
+        &self,
+        block_states: &[ParameterBlockState],
+        time_csrs: Option<&(
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+        )>,
+        marginal_csr: Option<&Arc<faer::sparse::SparseRowMat<usize, f64>>>,
+        logslope_csr: Option<&Arc<faer::sparse::SparseRowMat<usize, f64>>>,
+    ) -> Result<FamilyEvaluation, String> {
+        use crate::matrix::SparseHessianAccumulator;
+
+        enum BlockwiseHessianAccumulator {
+            Dense(Array2<f64>),
+            Sparse(SparseHessianAccumulator),
+        }
+
+        impl BlockwiseHessianAccumulator {
+            fn add_assign(&mut self, other: &Self) {
+                match (self, other) {
+                    (Self::Dense(lhs), Self::Dense(rhs)) => *lhs += rhs,
+                    (Self::Sparse(lhs), Self::Sparse(rhs)) => lhs.add_values(&rhs.values),
+                    _ => panic!("blockwise Hessian accumulator kind mismatch"),
+                }
+            }
+
+            fn into_symmetric(self) -> SymmetricMatrix {
+                match self {
+                    Self::Dense(mat) => SymmetricMatrix::Dense(mat),
+                    Self::Sparse(acc) => SymmetricMatrix::Sparse(acc.into_sparse_col_mat()),
+                }
+            }
+        }
+
+        let slices = block_slices(block_states);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+
+        let time_pattern = time_csrs.map(|(entry, exit, deriv)| {
+            SparseHessianAccumulator::from_multi_csr(
+                &[entry.as_ref(), exit.as_ref(), deriv.as_ref()],
+                p_t,
+            )
+        });
+        let marginal_pattern =
+            marginal_csr.map(|csr| SparseHessianAccumulator::from_single_csr(csr.as_ref(), p_m));
+        let logslope_pattern =
+            logslope_csr.map(|csr| SparseHessianAccumulator::from_single_csr(csr.as_ref(), p_g));
+
+        let e_sparse = time_csrs.map(|(entry, _, _)| {
+            let sym = entry.symbolic();
+            (sym.row_ptr(), sym.col_idx(), entry.val())
+        });
+        let x_sparse = time_csrs.map(|(_, exit, _)| {
+            let sym = exit.symbolic();
+            (sym.row_ptr(), sym.col_idx(), exit.val())
+        });
+        let d_sparse = time_csrs.map(|(_, _, deriv)| {
+            let sym = deriv.symbolic();
+            (sym.row_ptr(), sym.col_idx(), deriv.val())
+        });
+        let m_sparse = marginal_csr.map(|csr| {
+            let sym = csr.symbolic();
+            (sym.row_ptr(), sym.col_idx(), csr.val())
+        });
+        let g_sparse = logslope_csr.map(|csr| {
+            let sym = csr.symbolic();
+            (sym.row_ptr(), sym.col_idx(), csr.val())
+        });
+
+        type MixedAcc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            BlockwiseHessianAccumulator,
+            BlockwiseHessianAccumulator,
+            BlockwiseHessianAccumulator,
+        );
+
+        let make_acc = || -> MixedAcc {
+            (
+                0.0,
+                Array1::zeros(p_t),
+                Array1::zeros(p_m),
+                Array1::zeros(p_g),
+                time_pattern.as_ref().map_or_else(
+                    || BlockwiseHessianAccumulator::Dense(Array2::zeros((p_t, p_t))),
+                    |pattern| BlockwiseHessianAccumulator::Sparse(pattern.empty_clone()),
+                ),
+                marginal_pattern.as_ref().map_or_else(
+                    || BlockwiseHessianAccumulator::Dense(Array2::zeros((p_m, p_m))),
+                    |pattern| BlockwiseHessianAccumulator::Sparse(pattern.empty_clone()),
+                ),
+                logslope_pattern.as_ref().map_or_else(
+                    || BlockwiseHessianAccumulator::Dense(Array2::zeros((p_g, p_g))),
+                    |pattern| BlockwiseHessianAccumulator::Sparse(pattern.empty_clone()),
+                ),
+            )
+        };
+
+        let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope) =
+            (0..self.n)
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                    let (row_nll, f_pi, f_pipi) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    acc.0 -= row_nll;
+
+                    match &e_sparse {
+                        Some((e_rp, e_ci, e_v)) => {
+                            let gt = &mut acc.1;
+                            for p in e_rp[row]..e_rp[row + 1] {
+                                gt[e_ci[p]] -= f_pi[0] * e_v[p];
+                            }
+                            let (x_rp, x_ci, x_v) = x_sparse
+                                .as_ref()
+                                .expect("time sparse metadata should be present for exit design");
+                            for p in x_rp[row]..x_rp[row + 1] {
+                                gt[x_ci[p]] -= f_pi[1] * x_v[p];
+                            }
+                            let (d_rp, d_ci, d_v) = d_sparse.as_ref().expect(
+                                "time sparse metadata should be present for derivative design",
+                            );
+                            for p in d_rp[row]..d_rp[row + 1] {
+                                gt[d_ci[p]] -= f_pi[2] * d_v[p];
+                            }
+                        }
+                        None => {
+                            let mut time = acc.1.view_mut();
+                            self.design_entry
+                                .axpy_row_into(row, -f_pi[0], &mut time)
+                                .expect("time entry axpy dim mismatch");
+                            self.design_exit
+                                .axpy_row_into(row, -f_pi[1], &mut time)
+                                .expect("time exit axpy dim mismatch");
+                            self.design_derivative_exit
+                                .axpy_row_into(row, -f_pi[2], &mut time)
+                                .expect("time deriv axpy dim mismatch");
+                        }
+                    }
+
+                    match &m_sparse {
+                        Some((m_rp, m_ci, m_v)) => {
+                            let gm = &mut acc.2;
+                            let alpha_m = -(f_pi[0] + f_pi[1]);
+                            for p in m_rp[row]..m_rp[row + 1] {
+                                gm[m_ci[p]] += alpha_m * m_v[p];
+                            }
+                        }
+                        None => {
+                            self.marginal_design
+                                .axpy_row_into(row, -(f_pi[0] + f_pi[1]), &mut acc.2.view_mut())
+                                .expect(
+                                    "survival marginal block axpy should match block dimensions",
+                                );
+                        }
+                    }
+
+                    match &g_sparse {
+                        Some((g_rp, g_ci, g_v)) => {
+                            let gg = &mut acc.3;
+                            for p in g_rp[row]..g_rp[row + 1] {
+                                gg[g_ci[p]] -= f_pi[3] * g_v[p];
+                            }
+                        }
+                        None => {
+                            self.logslope_design
+                                .axpy_row_into(row, -f_pi[3], &mut acc.3.view_mut())
+                                .expect(
+                                    "survival logslope block axpy should match block dimensions",
+                                );
+                        }
+                    }
+
+                    match &mut acc.4 {
+                        BlockwiseHessianAccumulator::Dense(hess_time) => {
+                            let designs = [
+                                &self.design_entry,
+                                &self.design_exit,
+                                &self.design_derivative_exit,
+                            ];
+                            for a in 0..3 {
+                                for b in 0..3 {
+                                    designs[a]
+                                        .row_outer_into(
+                                            row,
+                                            designs[b],
+                                            f_pipi[[a, b]],
+                                            hess_time,
+                                        )
+                                        .expect("time row_outer_into dim mismatch");
+                                }
+                            }
+                        }
+                        BlockwiseHessianAccumulator::Sparse(hess_time) => {
+                            let (e_rp, e_ci, e_v) = e_sparse.as_ref().expect(
+                                "time sparse metadata should be present for entry design",
+                            );
+                            let (x_rp, x_ci, x_v) = x_sparse
+                                .as_ref()
+                                .expect("time sparse metadata should be present for exit design");
+                            let (d_rp, d_ci, d_v) = d_sparse.as_ref().expect(
+                                "time sparse metadata should be present for derivative design",
+                            );
+                            let row_slices: [(std::ops::Range<usize>, &[usize], &[f64]); 3] = [
+                                (e_rp[row]..e_rp[row + 1], e_ci, e_v),
+                                (x_rp[row]..x_rp[row + 1], x_ci, x_v),
+                                (d_rp[row]..d_rp[row + 1], d_ci, d_v),
+                            ];
+                            for a in 0..3 {
+                                for b in 0..3 {
+                                    let alpha = f_pipi[[a, b]];
+                                    if alpha == 0.0 {
+                                        continue;
+                                    }
+                                    let (ref ra, cia, va) = row_slices[a];
+                                    let (ref rb, cib, vb) = row_slices[b];
+                                    for pi in ra.clone() {
+                                        let ca = cia[pi];
+                                        let xia = va[pi] * alpha;
+                                        for pj in rb.clone() {
+                                            hess_time.add(ca, cib[pj], xia * vb[pj]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let alpha_m =
+                        f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
+                    match &mut acc.5 {
+                        BlockwiseHessianAccumulator::Dense(hess_marginal) => {
+                            self.marginal_design
+                                .syr_row_into(row, alpha_m, hess_marginal)
+                                .expect(
+                                    "survival marginal block syr should match block dimensions",
+                                );
+                        }
+                        BlockwiseHessianAccumulator::Sparse(hess_marginal) => {
+                            if alpha_m != 0.0 {
+                                let (m_rp, m_ci, m_v) = m_sparse.as_ref().expect(
+                                    "marginal sparse metadata should be present for sparse block",
+                                );
+                                for pi in m_rp[row]..m_rp[row + 1] {
+                                    let ca = m_ci[pi];
+                                    let xia = m_v[pi] * alpha_m;
+                                    for pj in m_rp[row]..m_rp[row + 1] {
+                                        hess_marginal.add(ca, m_ci[pj], xia * m_v[pj]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let alpha_g = f_pipi[[3, 3]];
+                    match &mut acc.6 {
+                        BlockwiseHessianAccumulator::Dense(hess_logslope) => {
+                            self.logslope_design
+                                .syr_row_into(row, alpha_g, hess_logslope)
+                                .expect(
+                                    "survival logslope block syr should match block dimensions",
+                                );
+                        }
+                        BlockwiseHessianAccumulator::Sparse(hess_logslope) => {
+                            if alpha_g != 0.0 {
+                                let (g_rp, g_ci, g_v) = g_sparse.as_ref().expect(
+                                    "logslope sparse metadata should be present for sparse block",
+                                );
+                                for pi in g_rp[row]..g_rp[row + 1] {
+                                    let ca = g_ci[pi];
+                                    let xia = g_v[pi] * alpha_g;
+                                    for pj in g_rp[row]..g_rp[row + 1] {
+                                        hess_logslope.add(ca, g_ci[pj], xia * g_v[pj]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
+                    a.0 += b.0;
+                    a.1 += &b.1;
+                    a.2 += &b.2;
+                    a.3 += &b.3;
+                    a.4.add_assign(&b.4);
+                    a.5.add_assign(&b.5);
+                    a.6.add_assign(&b.6);
+                    Ok(a)
+                })?;
+
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_time,
+                    hessian: hess_time.into_symmetric(),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_marginal,
+                    hessian: hess_marginal.into_symmetric(),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_logslope,
+                    hessian: hess_logslope.into_symmetric(),
+                },
+            ],
+        })
     }
 
     // ── Dense path (original) ────────────────────────────────────────
@@ -2773,12 +3051,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         let slices = block_slices(block_states);
-        // For large p the dense p×p Hessian is prohibitively expensive
-        // (e.g. p=50k → 20 GB).  Force the workspace/operator path instead.
         if slices.total >= 512 {
             return Ok(None);
         }
-        self.joint_hessian_dense_streaming(block_states).map(Some)
+        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+        let cache = build_row_kernel_cache(&kern)?;
+        Ok(Some(crate::families::row_kernel::row_kernel_hessian_dense(&kern, &cache)))
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
@@ -2790,10 +3068,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        Ok(Some(Arc::new(SurvivalMarginalSlopeHessianWorkspace::new(
-            self.clone(),
-            block_states.to_vec(),
-        )?)))
+        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+        Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -2801,7 +3077,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.joint_hessian_directional_derivative(block_states, d_beta_flat)
+        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+        let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
+        crate::families::row_kernel::row_kernel_directional_derivative(&kern, sl).map(Some)
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
@@ -2810,7 +3088,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.joint_hessian_second_directional_derivative(block_states, d_beta_u_flat, d_beta_v_flat)
+        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+        let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
+        let sv = d_beta_v_flat.as_slice().ok_or("non-contiguous d_beta_v")?;
+        crate::families::row_kernel::row_kernel_second_directional_derivative(&kern, su, sv).map(Some)
     }
 
     fn exact_newton_joint_psi_terms(
@@ -3433,6 +3714,8 @@ pub fn fit_survival_marginal_slope_terms(
 mod tests {
     use super::*;
     use crate::custom_family::CustomFamily;
+    use crate::matrix::SymmetricMatrix;
+    use faer::sparse::{SparseColMat, Triplet};
     use ndarray::array;
 
     fn empty_termspec() -> TermCollectionSpec {
@@ -3457,6 +3740,22 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: Some(Array1::zeros(1)),
         }
+    }
+
+    fn sparse_design(dense: &Array2<f64>) -> DesignMatrix {
+        let mut triplets = Vec::<Triplet<usize, usize, f64>>::new();
+        for i in 0..dense.nrows() {
+            for j in 0..dense.ncols() {
+                let value = dense[[i, j]];
+                if value != 0.0 {
+                    triplets.push(Triplet::new(i, j, value));
+                }
+            }
+        }
+        let sparse =
+            SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets)
+                .expect("assemble sparse design");
+        DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse))
     }
 
     #[test]
@@ -3683,5 +3982,68 @@ mod tests {
             .post_update_block_beta(&[], 0, &spec, array![-0.3, 0.2])
             .expect("project time beta");
         assert_eq!(beta, array![0.0, 0.2]);
+    }
+
+    #[test]
+    fn mixed_blockwise_exact_newton_preserves_sparse_block_hessians() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 2,
+            event: Arc::new(array![1.0, 0.0]),
+            weights: Arc::new(array![1.0, 0.8]),
+            z: Arc::new(array![0.1, -0.2]),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.6]])),
+            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.9], [0.5]])),
+            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0]
+            ])),
+            offset_entry: Arc::new(array![0.0, 0.0]),
+            offset_exit: Arc::new(array![0.0, 0.0]),
+            derivative_offset_exit: Arc::new(array![0.05, 0.05]),
+            marginal_design: sparse_design(&array![[1.0, 0.0], [0.0, 1.0]]),
+            logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.5]])),
+            time_linear_constraints: None,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.4],
+                eta: array![0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.2, -0.1],
+                eta: array![0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.3],
+                eta: array![0.3, 0.3],
+            },
+        ];
+
+        let eval = family
+            .evaluate_blockwise_exact_newton(&block_states)
+            .expect("mixed exact-newton evaluation");
+
+        assert!(matches!(
+            &eval.blockworking_sets[0],
+            BlockWorkingSet::ExactNewton {
+                hessian: SymmetricMatrix::Dense(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &eval.blockworking_sets[1],
+            BlockWorkingSet::ExactNewton {
+                hessian: SymmetricMatrix::Sparse(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &eval.blockworking_sets[2],
+            BlockWorkingSet::ExactNewton {
+                hessian: SymmetricMatrix::Dense(_),
+                ..
+            }
+        ));
     }
 }

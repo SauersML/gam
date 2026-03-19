@@ -3546,7 +3546,7 @@ impl SparseHessianAccumulator {
             // O(1) direct-index path: rows within each column are contiguous
             // integers starting at first_row[c], so the offset is arithmetic.
             let idx = s.col_ptrs[c] + (r - s.first_row[c]);
-            debug_assert!(idx < s.col_ptrs[c + 1], "add_upper contiguous OOB");
+            assert!(idx < s.col_ptrs[c + 1], "add_upper contiguous OOB");
             unsafe { *self.values.get_unchecked_mut(idx) += val; }
         } else {
             // Fallback linear scan for non-contiguous patterns.
