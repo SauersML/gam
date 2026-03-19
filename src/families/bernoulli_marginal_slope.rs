@@ -12,6 +12,7 @@ use crate::custom_family::{
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
 };
+use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::estimate::{fit_gam, FitOptions, UnifiedFitResult};
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
 use crate::families::gamlss::{initializewiggle_knots_from_seed, ParameterBlockInput};
@@ -1104,6 +1105,122 @@ fn bernoulli_row_work_order(
         ExactOuterDerivativeOrder::First
     } else {
         ExactOuterDerivativeOrder::Second
+    }
+}
+
+// ── RowKernel<2> implementation (rigid path only) ────────────────────
+
+struct BernoulliRigidRowKernel {
+    family: BernoulliMarginalSlopeFamily,
+    block_states: Vec<ParameterBlockState>,
+    slices: BlockSlices,
+}
+
+impl BernoulliRigidRowKernel {
+    fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
+        let slices = block_slices(
+            &block_states,
+            family.score_warp.is_some(),
+            family.link_dev.is_some(),
+        );
+        Self { family, block_states, slices }
+    }
+}
+
+impl RowKernel<2> for BernoulliRigidRowKernel {
+    fn n_rows(&self) -> usize { self.family.y.len() }
+    fn n_coefficients(&self) -> usize { self.slices.total }
+
+    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
+        let q = self.family.marginal_design.dot_row(row, &self.block_states[0].beta)
+            + self.block_states[0].offset[row];
+        let g = self.block_states[1].eta[row];
+        let k = RigidProbitKernel::new(
+            q, g, self.family.z[row], self.family.y[row], self.family.weights[row],
+        );
+        let nll = -self.family.weights[row] * k.logcdf;
+        let grad = [-k.u1 * k.eta_q, -k.u1 * k.eta_g];
+        let h = k.primary_hessian(q);
+        Ok((nll, grad, h))
+    }
+
+    fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 2] {
+        let d_beta = ndarray::ArrayView1::from(d_beta);
+        [
+            self.family.marginal_design.dot_row_view(
+                row, d_beta.slice(s![self.slices.marginal.clone()]),
+            ),
+            self.family.logslope_design.dot_row_view(
+                row, d_beta.slice(s![self.slices.logslope.clone()]),
+            ),
+        ]
+    }
+
+    fn jacobian_transpose_action(&self, row: usize, v: &[f64; 2], out: &mut [f64]) {
+        {
+            let mut m = ndarray::ArrayViewMut1::from(&mut out[self.slices.marginal.clone()]);
+            self.family.marginal_design.axpy_row_into(row, v[0], &mut m)
+                .expect("marginal axpy dim mismatch");
+        }
+        {
+            let mut g = ndarray::ArrayViewMut1::from(&mut out[self.slices.logslope.clone()]);
+            self.family.logslope_design.axpy_row_into(row, v[1], &mut g)
+                .expect("logslope axpy dim mismatch");
+        }
+    }
+
+    fn add_pullback_hessian(&self, row: usize, h: &[[f64; 2]; 2], target: &mut Array2<f64>) {
+        self.family.marginal_design.syr_row_into_view(
+            row, h[0][0],
+            target.slice_mut(s![self.slices.marginal.clone(), self.slices.marginal.clone()]),
+        ).expect("marginal syr dim mismatch");
+        if h[0][1] != 0.0 {
+            self.family.marginal_design.row_outer_into_view(
+                row, &self.family.logslope_design, h[0][1],
+                target.slice_mut(s![self.slices.marginal.clone(), self.slices.logslope.clone()]),
+            ).expect("marginal-logslope outer dim mismatch");
+            self.family.logslope_design.row_outer_into_view(
+                row, &self.family.marginal_design, h[0][1],
+                target.slice_mut(s![self.slices.logslope.clone(), self.slices.marginal.clone()]),
+            ).expect("logslope-marginal outer dim mismatch");
+        }
+        self.family.logslope_design.syr_row_into_view(
+            row, h[1][1],
+            target.slice_mut(s![self.slices.logslope.clone(), self.slices.logslope.clone()]),
+        ).expect("logslope syr dim mismatch");
+    }
+
+    fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 2]; 2], diag: &mut [f64]) {
+        {
+            let mut md = ndarray::ArrayViewMut1::from(&mut diag[self.slices.marginal.clone()]);
+            self.family.marginal_design.squared_axpy_row_into(row, h[0][0], &mut md)
+                .expect("marginal squared_axpy dim mismatch");
+        }
+        {
+            let mut gd = ndarray::ArrayViewMut1::from(&mut diag[self.slices.logslope.clone()]);
+            self.family.logslope_design.squared_axpy_row_into(row, h[1][1], &mut gd)
+                .expect("logslope squared_axpy dim mismatch");
+        }
+    }
+
+    fn row_third_contracted(&self, row: usize, dir: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
+        let q = self.family.marginal_design.dot_row(row, &self.block_states[0].beta)
+            + self.block_states[0].offset[row];
+        let g = self.block_states[1].eta[row];
+        let k = RigidProbitKernel::new(
+            q, g, self.family.z[row], self.family.y[row], self.family.weights[row],
+        );
+        Ok(k.third_contracted(q, dir[0], dir[1]))
+    }
+
+    fn row_fourth_contracted(&self, row: usize, dir_u: &[f64; 2], dir_v: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
+        let q = self.family.marginal_design.dot_row(row, &self.block_states[0].beta)
+            + self.block_states[0].offset[row];
+        let g = self.block_states[1].eta[row];
+        let k = RigidProbitKernel::new(
+            q, g, self.family.z[row], self.family.y[row], self.family.weights[row],
+        );
+        Ok(k.fourth_contracted(q, dir_u[0], dir_u[1], dir_v[0], dir_v[1]))
     }
 }
 
@@ -4094,14 +4211,19 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        let cache = self.build_exact_eval_cache(block_states)?;
-        // For large p the dense p×p Hessian is prohibitively expensive
-        // (e.g. p=50k → 20 GB, times threads).  Force the workspace/operator path instead.
-        if cache.slices.total >= 512 {
+        let slices = block_slices(
+            block_states, self.score_warp.is_some(), self.link_dev.is_some(),
+        );
+        if slices.total >= 512 {
             return Ok(None);
         }
-        self.joint_gradient_hessian(block_states, true)
-            .map(|(_, _, h)| h)
+        if !self.flex_active() {
+            let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+            let cache = build_row_kernel_cache(&kern)?;
+            Ok(Some(crate::families::row_kernel::row_kernel_hessian_dense(&kern, &cache)))
+        } else {
+            self.joint_gradient_hessian(block_states, true).map(|(_, _, h)| h)
+        }
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
@@ -4113,12 +4235,19 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        Ok(Some(Arc::new(
-            BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::new(
-                self.clone(),
-                block_states.to_vec(),
-            )?,
-        )))
+        if !self.flex_active() {
+            // Rigid path: use generic RowKernel<2> operator
+            let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+            Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)))
+        } else {
+            // Flex path: keep existing workspace for variable-K primary space
+            Ok(Some(Arc::new(
+                BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::new(
+                    self.clone(),
+                    block_states.to_vec(),
+                )?,
+            )))
+        }
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -4126,12 +4255,16 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let cache = self.build_exact_eval_cache(block_states)?;
-        self.exact_newton_joint_hessian_directional_derivative_from_cache(
-            block_states,
-            d_beta_flat,
-            &cache,
-        )
+        if !self.flex_active() {
+            let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+            let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
+            crate::families::row_kernel::row_kernel_directional_derivative(&kern, sl).map(Some)
+        } else {
+            let cache = self.build_exact_eval_cache(block_states)?;
+            self.exact_newton_joint_hessian_directional_derivative_from_cache(
+                block_states, d_beta_flat, &cache,
+            )
+        }
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
@@ -4140,12 +4273,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let cache = self.build_exact_eval_cache(block_states)?;
-        self.exact_newton_joint_hessiansecond_directional_derivative_from_cache(
-            block_states,
-            d_beta_u_flat,
-            d_beta_v_flat,
-            &cache,
+        if !self.flex_active() {
+            let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+            let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
+            let sv = d_beta_v_flat.as_slice().ok_or("non-contiguous d_beta_v")?;
+            crate::families::row_kernel::row_kernel_second_directional_derivative(&kern, su, sv).map(Some)
+        } else {
+            let cache = self.build_exact_eval_cache(block_states)?;
+            self.exact_newton_joint_hessiansecond_directional_derivative_from_cache(
+                block_states, d_beta_u_flat, d_beta_v_flat, &cache,
         )
     }
 
