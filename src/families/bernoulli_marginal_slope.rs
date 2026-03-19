@@ -872,7 +872,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
     primary: PrimarySlices,
     h_nodes: Array1<f64>,
     h_node_design: Option<Array2<f64>>,
-    score_warp_obs: Option<(Array2<f64>, Array1<f64>)>,
+    score_warp_obs: Option<(Arc<Array2<f64>>, Array1<f64>)>,
 }
 
 const EXACT_OUTER_HESSIAN_MAX_ROW_PAIR_WORK: usize = 2_000_000;
@@ -949,7 +949,7 @@ impl BernoulliMarginalSlopeFamily {
     fn score_warp_obs(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<Option<(Array2<f64>, Array1<f64>)>, String> {
+    ) -> Result<Option<(Arc<Array2<f64>>, Array1<f64>)>, String> {
         let Some(obs_design) = self.score_warp_obs_design.as_ref() else {
             return Ok(None);
         };
@@ -957,7 +957,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         }
         let beta_h = &block_states[2].beta;
-        Ok(Some((obs_design.as_ref().clone(), obs_design.dot(beta_h))))
+        Ok(Some((Arc::clone(obs_design), obs_design.dot(beta_h))))
     }
 
     fn deviation_constraints_from_points(
@@ -1150,7 +1150,7 @@ impl BernoulliMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
         h_nodes: &Array1<f64>,
-        score_warp_obs: Option<&(Array2<f64>, Array1<f64>)>,
+        score_warp_obs: Option<&(Arc<Array2<f64>>, Array1<f64>)>,
     ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
         let marginal_eta = block_states[0].eta[row];
         // The log-slope block now parameterizes the signed slope directly.
@@ -1333,7 +1333,7 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         h_nodes: &Array1<f64>,
         h_node_design: Option<&Array2<f64>>,
-        score_warp_obs: Option<&(Array2<f64>, Array1<f64>)>,
+        score_warp_obs: Option<&(Arc<Array2<f64>>, Array1<f64>)>,
     ) -> Result<f64, String> {
         let k = dirs.len();
         if k > 4 {
@@ -1794,7 +1794,7 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         h_nodes: &Array1<f64>,
         h_node_design: Option<&Array2<f64>>,
-        score_warp_obs: Option<&(Array2<f64>, Array1<f64>)>,
+        score_warp_obs: Option<&(Arc<Array2<f64>>, Array1<f64>)>,
     ) -> Result<(Array1<f64>, Array2<f64>), String> {
         let mut grad = Array1::<f64>::zeros(primary.total);
         let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
@@ -2126,41 +2126,45 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let chunk_results: Vec<Result<Array1<f64>, String>> = (0..((n + ROW_CHUNK_SIZE - 1)
-            / ROW_CHUNK_SIZE))
+        let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * ROW_CHUNK_SIZE;
-                let end = (start + ROW_CHUNK_SIZE).min(n);
-                let mut chunk_out = Array1::<f64>::zeros(slices.total);
-                for row in start..end {
-                    let row_ctx = self.build_row_exact_context(
-                        row,
-                        block_states,
-                        &cache.h_nodes,
-                        cache.score_warp_obs.as_ref(),
-                    )?;
-                    let row_dir =
-                        self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                    let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
-                        row,
-                        block_states,
-                        primary,
-                        &row_ctx,
-                        &cache.h_nodes,
-                        cache.h_node_design.as_ref(),
-                        cache.score_warp_obs.as_ref(),
-                    )?;
-                    let row_action = row_hessian.dot(&row_dir);
-                    chunk_out += &self.pullback_primary_vector(row, slices, primary, &row_action)?;
-                }
-                Ok(chunk_out)
-            })
-            .collect();
-        let mut out = Array1::<f64>::zeros(slices.total);
-        for result in chunk_results {
-            out += &result?;
-        }
+            .try_fold(
+                || Array1::<f64>::zeros(slices.total),
+                |mut chunk_out, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let row_ctx = self.build_row_exact_context(
+                            row,
+                            block_states,
+                            &cache.h_nodes,
+                            cache.score_warp_obs.as_ref(),
+                        )?;
+                        let row_dir =
+                            self.row_primary_direction_from_flat(row, slices, primary, direction)?;
+                        let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
+                            row,
+                            block_states,
+                            primary,
+                            &row_ctx,
+                            &cache.h_nodes,
+                            cache.h_node_design.as_ref(),
+                            cache.score_warp_obs.as_ref(),
+                        )?;
+                        let row_action = row_hessian.dot(&row_dir);
+                        chunk_out +=
+                            &self.pullback_primary_vector(row, slices, primary, &row_action)?;
+                    }
+                    Ok(chunk_out)
+                },
+            )
+            .try_reduce(
+                || Array1::<f64>::zeros(slices.total),
+                |mut left, right| -> Result<_, String> {
+                    left += &right;
+                    Ok(left)
+                },
+            )?;
         Ok(out)
     }
 
@@ -2172,67 +2176,76 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let chunk_results: Vec<Result<Array1<f64>, String>> = (0..((n + ROW_CHUNK_SIZE - 1)
-            / ROW_CHUNK_SIZE))
+        let diagonal = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * ROW_CHUNK_SIZE;
-                let end = (start + ROW_CHUNK_SIZE).min(n);
-                let mut chunk_diag = Array1::<f64>::zeros(slices.total);
-                for row in start..end {
-                    let row_ctx = self.build_row_exact_context(
-                        row,
-                        block_states,
-                        &cache.h_nodes,
-                        cache.score_warp_obs.as_ref(),
-                    )?;
-                    let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
-                        row,
-                        block_states,
-                        primary,
-                        &row_ctx,
-                        &cache.h_nodes,
-                        cache.h_node_design.as_ref(),
-                        cache.score_warp_obs.as_ref(),
-                    )?;
+            .try_fold(
+                || Array1::<f64>::zeros(slices.total),
+                |mut chunk_diag, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let row_ctx = self.build_row_exact_context(
+                            row,
+                            block_states,
+                            &cache.h_nodes,
+                            cache.score_warp_obs.as_ref(),
+                        )?;
+                        let (_, row_hessian) = self.compute_row_primary_gradient_hessian(
+                            row,
+                            block_states,
+                            primary,
+                            &row_ctx,
+                            &cache.h_nodes,
+                            cache.h_node_design.as_ref(),
+                            cache.score_warp_obs.as_ref(),
+                        )?;
 
-                    let marginal_row = self.marginal_design.row_chunk(row..row + 1);
-                    let marginal_row = marginal_row.row(0);
-                    for (local_idx, value) in marginal_row.iter().enumerate() {
-                        chunk_diag[slices.marginal.start + local_idx] +=
-                            value * value * row_hessian[[0, 0]];
-                    }
-                    let logslope_row = self.logslope_design.row_chunk(row..row + 1);
-                    let logslope_row = logslope_row.row(0);
-                    for (local_idx, value) in logslope_row.iter().enumerate() {
-                        chunk_diag[slices.logslope.start + local_idx] +=
-                            value * value * row_hessian[[1, 1]];
-                    }
+                        {
+                            let mut marginal_diag =
+                                chunk_diag.slice_mut(s![slices.marginal.clone()]);
+                            self.marginal_design.squared_axpy_row_into(
+                                row,
+                                row_hessian[[0, 0]],
+                                &mut marginal_diag,
+                            )?;
+                        }
+                        {
+                            let mut logslope_diag =
+                                chunk_diag.slice_mut(s![slices.logslope.clone()]);
+                            self.logslope_design.squared_axpy_row_into(
+                                row,
+                                row_hessian[[1, 1]],
+                                &mut logslope_diag,
+                            )?;
+                        }
 
-                    if let (Some(primary_h), Some(block_h)) =
-                        (primary.h.as_ref(), slices.h.as_ref())
-                    {
-                        for (local_idx, global_idx) in block_h.clone().enumerate() {
-                            chunk_diag[global_idx] += row_hessian
-                                [[primary_h.start + local_idx, primary_h.start + local_idx]];
+                        if let (Some(primary_h), Some(block_h)) =
+                            (primary.h.as_ref(), slices.h.as_ref())
+                        {
+                            for (local_idx, global_idx) in block_h.clone().enumerate() {
+                                chunk_diag[global_idx] += row_hessian
+                                    [[primary_h.start + local_idx, primary_h.start + local_idx]];
+                            }
+                        }
+                        if let (Some(primary_w), Some(block_w)) =
+                            (primary.w.as_ref(), slices.w.as_ref())
+                        {
+                            for (local_idx, global_idx) in block_w.clone().enumerate() {
+                                chunk_diag[global_idx] += row_hessian
+                                    [[primary_w.start + local_idx, primary_w.start + local_idx]];
+                            }
                         }
                     }
-                    if let (Some(primary_w), Some(block_w)) =
-                        (primary.w.as_ref(), slices.w.as_ref())
-                    {
-                        for (local_idx, global_idx) in block_w.clone().enumerate() {
-                            chunk_diag[global_idx] += row_hessian
-                                [[primary_w.start + local_idx, primary_w.start + local_idx]];
-                        }
-                    }
-                }
-                Ok(chunk_diag)
-            })
-            .collect();
-        let mut diagonal = Array1::<f64>::zeros(slices.total);
-        for result in chunk_results {
-            diagonal += &result?;
-        }
+                    Ok(chunk_diag)
+                },
+            )
+            .try_reduce(
+                || Array1::<f64>::zeros(slices.total),
+                |mut left, right| -> Result<_, String> {
+                    left += &right;
+                    Ok(left)
+                },
+            )?;
         Ok(diagonal)
     }
 
