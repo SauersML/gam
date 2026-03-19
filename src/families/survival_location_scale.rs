@@ -1498,6 +1498,19 @@ impl SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<SurvivalJointQuantities, String> {
+        self.collect_joint_quantities_rescaled(block_states, 0.0)
+    }
+
+    /// Collect per-row derivative quantities with a log-scale shift applied
+    /// to the derivative magnitudes.  When `deriv_log_scale > 0`, all
+    /// derivative arrays are uniformly scaled by `exp(-deriv_log_scale)`.
+    /// The caller must account for this in the logdet:
+    ///   `logdet(H) = logdet(H_scaled) + p * deriv_log_scale`.
+    fn collect_joint_quantities_rescaled(
+        &self,
+        block_states: &[ParameterBlockState],
+        deriv_log_scale: f64,
+    ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let mut d1_q = Array1::<f64>::zeros(n);
@@ -1531,7 +1544,7 @@ impl SurvivalLocationScaleFamily {
                 dynamic.q_exit[i],
                 dynamic.qdot_exit[i],
             );
-            let Some(row) = self.row_derivatives(i, state)? else {
+            let Some(row) = self.row_derivatives_rescaled(i, state, deriv_log_scale)? else {
                 continue;
             };
             d1_q[i] = row.d1_q;
@@ -1976,6 +1989,18 @@ impl SurvivalLocationScaleFamily {
         inverse_link: &InverseLink,
         eta: f64,
     ) -> Result<(f64, f64, f64, f64, f64), String> {
+        Self::exact_log_pdf_derivatives_rescaled(inverse_link, eta, 0.0)
+    }
+
+    /// Like [`Self::exact_log_pdf_derivatives`] but with a log-scale shift
+    /// on the derivative magnitudes.  For CLogLog the `exp(eta)` terms in
+    /// the derivatives become `exp(eta - deriv_log_scale)`.  The function
+    /// value is returned unshifted.
+    fn exact_log_pdf_derivatives_rescaled(
+        inverse_link: &InverseLink,
+        eta: f64,
+        deriv_log_scale: f64,
+    ) -> Result<(f64, f64, f64, f64, f64), String> {
         match inverse_link {
             InverseLink::Standard(LinkFunction::Probit) => Ok((
                 -0.5 * eta * eta - 0.5 * (2.0 * std::f64::consts::PI).ln(),
@@ -2000,8 +2025,9 @@ impl SurvivalLocationScaleFamily {
                 ))
             }
             InverseLink::Standard(LinkFunction::CLogLog) => {
-                let t = eta.exp();
-                Ok((eta - t, 1.0 - t, -t, -t, -t))
+                let t_val = eta.exp(); // for function value (may be Inf)
+                let t_deriv = (eta - deriv_log_scale).exp(); // for derivatives
+                Ok((eta - t_val, 1.0 - t_deriv, -t_deriv, -t_deriv, -t_deriv))
             }
             InverseLink::Standard(LinkFunction::Identity) => Ok((0.0, 0.0, 0.0, 0.0, 0.0)),
             _ => {
@@ -2036,6 +2062,20 @@ impl SurvivalLocationScaleFamily {
         inverse_link: &InverseLink,
         eta: f64,
     ) -> Result<(f64, f64, f64, f64, f64), String> {
+        Self::exact_survival_neglog_derivatives_fourth_rescaled(inverse_link, eta, 0.0)
+    }
+
+    /// Like [`Self::exact_survival_neglog_derivatives_fourth`] but with a
+    /// log-scale shift applied to the **derivative** magnitudes (not the
+    /// function value).  For CLogLog the derivatives are `exp(eta)`, so
+    /// shifting gives `exp(eta - deriv_log_scale)` — always finite when
+    /// the shift equals the maximum `eta` across rows.  The function
+    /// value (`-exp(eta)` = `log S`) is returned unshifted.
+    fn exact_survival_neglog_derivatives_fourth_rescaled(
+        inverse_link: &InverseLink,
+        eta: f64,
+        deriv_log_scale: f64,
+    ) -> Result<(f64, f64, f64, f64, f64), String> {
         match inverse_link {
             InverseLink::Standard(LinkFunction::Probit) => {
                 let (log_s, r, dr, ddr, dddr) = probit_log_survival_and_ratio_derivatives(eta);
@@ -2057,8 +2097,9 @@ impl SurvivalLocationScaleFamily {
                 ))
             }
             InverseLink::Standard(LinkFunction::CLogLog) => {
-                let t = eta.exp();
-                Ok((-t, t, t, t, t))
+                let t_val = eta.exp(); // for the function value (may be Inf)
+                let t_deriv = (eta - deriv_log_scale).exp(); // for derivatives (finite when shifted)
+                Ok((-t_val, t_deriv, t_deriv, t_deriv, t_deriv))
             }
             InverseLink::Standard(LinkFunction::Identity) => {
                 let s = 1.0 - eta;
@@ -2148,6 +2189,18 @@ impl SurvivalLocationScaleFamily {
         row: usize,
         state: SurvivalPredictorState,
     ) -> Result<Option<SurvivalExactRowKernel>, String> {
+        self.exact_row_kernel_rescaled(row, state, 0.0)
+    }
+
+    /// Like [`Self::exact_row_kernel`] but with a log-scale shift on the
+    /// derivative magnitudes, propagated to the survival/pdf derivative
+    /// functions.  Used by the logdet Hessian path to avoid overflow.
+    fn exact_row_kernel_rescaled(
+        &self,
+        row: usize,
+        state: SurvivalPredictorState,
+        deriv_log_scale: f64,
+    ) -> Result<Option<SurvivalExactRowKernel>, String> {
         let w = self.w[row];
         if w <= 0.0 {
             return Ok(None);
@@ -2157,17 +2210,23 @@ impl SurvivalLocationScaleFamily {
         let u1 = state.h1 + state.q1;
 
         let (log_s0, r0, dr0, ddr0, dddr0) =
-            Self::exact_survival_neglog_derivatives_fourth(&self.inverse_link, u0).map_err(
+            Self::exact_survival_neglog_derivatives_fourth_rescaled(
+                &self.inverse_link, u0, deriv_log_scale,
+            ).map_err(
                 |e| format!("inverse-link survival evaluation failed at row {row} entry: {e}"),
             )?;
 
         let (log_s1, r1, dr1, ddr1, dddr1) =
-            Self::exact_survival_neglog_derivatives_fourth(&self.inverse_link, u1).map_err(
+            Self::exact_survival_neglog_derivatives_fourth_rescaled(
+                &self.inverse_link, u1, deriv_log_scale,
+            ).map_err(
                 |e| format!("inverse-link survival evaluation failed at row {row} exit: {e}"),
             )?;
 
         let (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1) =
-            Self::exact_log_pdf_derivatives(&self.inverse_link, u1).map_err(|e| {
+            Self::exact_log_pdf_derivatives_rescaled(
+                &self.inverse_link, u1, deriv_log_scale,
+            ).map_err(|e| {
                 format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
             })?;
 
@@ -2279,7 +2338,16 @@ impl SurvivalLocationScaleFamily {
         row: usize,
         state: SurvivalPredictorState,
     ) -> Result<Option<SurvivalRowDerivatives>, String> {
-        let Some(kernel) = self.exact_row_kernel(row, state)? else {
+        self.row_derivatives_rescaled(row, state, 0.0)
+    }
+
+    fn row_derivatives_rescaled(
+        &self,
+        row: usize,
+        state: SurvivalPredictorState,
+        deriv_log_scale: f64,
+    ) -> Result<Option<SurvivalRowDerivatives>, String> {
+        let Some(kernel) = self.exact_row_kernel_rescaled(row, state, deriv_log_scale)? else {
             return Ok(None);
         };
         // The row likelihood is written in terms of the survival values
@@ -6109,6 +6177,25 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities(block_states)?;
+        self.assemble_joint_hessian_from_quantities(&q, block_states)
+    }
+
+    fn exact_newton_joint_hessian_for_logdet(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<(Array2<f64>, f64)>, String> {
+        self.exact_newton_joint_hessian_rescaled(block_states)
+    }
+
+    /// Assemble the joint Hessian matrix from pre-computed per-row
+    /// quantities.  Factored out of `exact_newton_joint_hessian` so
+    /// that the rescaled logdet path can reuse the assembly code with
+    /// shifted quantities.
+    fn assemble_joint_hessian_from_quantities(
+        &self,
+        q: &SurvivalJointQuantities,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let joint_states = self.validate_joint_states(block_states)?;
         let eta_t_exit = joint_states.3;
@@ -6408,6 +6495,55 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         }
 
         Ok(Some(joint))
+    }
+
+    /// Compute the log-scale shift needed to keep CLogLog survival
+    /// derivatives finite.  Returns `L ≥ 0` such that `exp(u - L) ≤ exp(500)`
+    /// for all row linear predictors `u`.  For non-CLogLog links, returns 0.
+    fn hessian_deriv_log_rescale(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> f64 {
+        if !matches!(
+            self.inverse_link,
+            InverseLink::Standard(LinkFunction::CLogLog)
+        ) {
+            return 0.0;
+        }
+        let dynamic = match self.build_dynamic_geometry(block_states) {
+            Ok(d) => d,
+            Err(_) => return 0.0,
+        };
+        let mut max_u = f64::NEG_INFINITY;
+        for i in 0..self.n {
+            if self.w[i] <= 0.0 {
+                continue;
+            }
+            let u0 = dynamic.h_entry[i] + dynamic.q_entry[i];
+            let u1 = dynamic.h_exit[i] + dynamic.q_exit[i];
+            max_u = max_u.max(u0).max(u1);
+        }
+        // Shift so the largest exp(u - L) ≈ exp(500), well within f64 range.
+        (max_u - 500.0).max(0.0)
+    }
+
+    /// Rescaled joint Hessian for logdet computation.  Returns
+    /// `(H_scaled, L)` where `H_scaled = exp(-L) * H_exact` and
+    /// `logdet(H_exact) = logdet(H_scaled) + p * L`.
+    fn exact_newton_joint_hessian_rescaled(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<(Array2<f64>, f64)>, String> {
+        let log_scale = self.hessian_deriv_log_rescale(block_states);
+        if log_scale == 0.0 {
+            return Ok(self
+                .exact_newton_joint_hessian(block_states)?
+                .map(|h| (h, 0.0)));
+        }
+        let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
+        Ok(self
+            .assemble_joint_hessian_from_quantities(&q, block_states)?
+            .map(|h| (h, log_scale)))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
