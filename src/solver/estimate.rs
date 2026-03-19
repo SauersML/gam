@@ -1627,36 +1627,31 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::outer_strategy::{
-            ClosureObjective, Derivative, FallbackPolicy, HessianResult, OuterCapability,
-            OuterConfig, OuterEval,
+            ClosureObjective, Derivative, HessianResult, OuterEval, OuterProblem,
         };
 
-        let outer_config = OuterConfig {
-            tolerance: smoothing_options.tol,
-            max_iter: smoothing_options.max_iter,
-            fd_step: smoothing_options.finite_diff_step,
-            bounds: None,
-            seed_config: smoothing_options.seed_config.clone(),
-            rho_bound: crate::estimate::RHO_BOUND,
-            heuristic_lambdas: heuristic_lambdas.map(|s| s.to_vec()),
-            initial_rho: None,
-            fallback_policy: FallbackPolicy::Automatic,
-            screening_cap: Some(reml_state.screening_max_inner_iterations.clone()),
+        let problem = OuterProblem::new(k)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_efs()
+            .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
+                fit_linear_constraints.as_ref(),
+            ))
+            .with_tolerance(smoothing_options.tol)
+            .with_max_iter(smoothing_options.max_iter)
+            .with_fd_step(smoothing_options.finite_diff_step)
+            .with_seed_config(smoothing_options.seed_config.clone())
+            .with_rho_bound(crate::estimate::RHO_BOUND)
+            .with_screening_cap(reml_state.screening_max_inner_iterations.clone());
+        let problem = if let Some(ref h) = heuristic_lambdas {
+            problem.with_heuristic_lambdas(h.to_vec())
+        } else {
+            problem
         };
 
         let mut obj = ClosureObjective {
             state: &mut reml_state,
-            cap: OuterCapability {
-                gradient: Derivative::Analytic,
-                hessian: Derivative::Analytic,
-                n_params: k,
-                all_penalty_like: true,
-                has_psi_coords: false,
-                fixed_point_available: true,
-                barrier_config: self::reml::unified::BarrierConfig::from_constraints(
-                    fit_linear_constraints.as_ref(),
-                ),
-            },
+            cap: problem.capability(),
             cost_fn: |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_cost(rho)
             },
@@ -1682,16 +1677,14 @@ where
             ),
         };
 
-        let strategy_result =
-            crate::solver::outer_strategy::run_outer(&mut obj, &outer_config, "standard REML")?;
-        let outer_result = strategy_result.into_smoothing_result();
+        let strategy_result = problem.run(&mut obj, "standard REML")?;
         (
-            outer_result.rho.clone(),
+            strategy_result.rho.clone(),
             cfg.link_kind.mixture_state().cloned(),
             cfg.link_kind.sas_state().copied(),
             None,
             None,
-            outer_result,
+            strategy_result,
         )
     } else {
         let use_mixture = mixture_dim > 0;
