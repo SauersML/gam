@@ -1282,7 +1282,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
 
 /// Maximum row-loop work proxy before downgrading to first-order:
 ///   n × K_pairs × primary²
-const EXACT_OUTER_MAX_ROW_WORK: u64 = 2_000_000;
+const EXACT_OUTER_MAX_ROW_WORK: u64 = 50_000_000;
 
 /// Row-loop gate for Bernoulli marginal-slope.  The memory gate is handled
 /// by [`cost_gated_outer_order`] at the call site.
@@ -1298,9 +1298,17 @@ fn bernoulli_row_work_order(
     let primary_total = 2u64
         .saturating_add(score_warp_dim as u64)
         .saturating_add(link_dev_dim as u64);
+    // Rigid models (primary=2) use RigidProbitKernel for 3rd/4th
+    // derivatives: O(1) closed-form scalars per row, not O(primary^2 Q).
+    // Use a much higher threshold for this case.
+    let effective_primary_cost = if score_warp_dim == 0 && link_dev_dim == 0 {
+        1u64 // rigid: negligible per-row cost
+    } else {
+        primary_total.saturating_mul(primary_total)
+    };
     let row_work = n
         .saturating_mul(k_pairs)
-        .saturating_mul(primary_total.saturating_mul(primary_total));
+        .saturating_mul(effective_primary_cost);
     if row_work > EXACT_OUTER_MAX_ROW_WORK {
         ExactOuterDerivativeOrder::First
     } else {
