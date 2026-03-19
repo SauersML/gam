@@ -2920,7 +2920,123 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn joint_gradient_hessian(
+    /// Like `add_pullback_primary_hessian` but only accumulates the h/w
+    /// cross-block contributions. The marginal-marginal, marginal-logslope,
+    /// and logslope-logslope blocks are handled by the weighted-Gram operator.
+    fn add_pullback_primary_hessian_hw_only(
+        &self,
+        target: &mut Array2<f64>,
+        row: usize,
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        primary_hessian: &Array2<f64>,
+    ) {
+        let h = primary_hessian;
+        let need_dense = (primary.h.is_some() && slices.h.is_some())
+            || (primary.w.is_some() && slices.w.is_some());
+        if !need_dense {
+            return;
+        }
+        let x_row = self
+            .marginal_design
+            .row_chunk(row..row + 1)
+            .row(0)
+            .to_owned();
+        let g_row = self
+            .logslope_design
+            .row_chunk(row..row + 1)
+            .row(0)
+            .to_owned();
+
+        if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
+            let h_row0 = h.slice(s![0, primary_h.start..primary_h.end]).to_owned();
+            let h_len = h_row0.len();
+            let h_row0_2d = h_row0.into_shape_with_order((1, h_len)).unwrap();
+            let qh = x_row.view().insert_axis(Axis(1)).dot(&h_row0_2d);
+            target
+                .slice_mut(s![slices.marginal.clone(), block_h.clone()])
+                .scaled_add(1.0, &qh);
+            target
+                .slice_mut(s![block_h.clone(), slices.marginal.clone()])
+                .scaled_add(1.0, &qh.t());
+
+            let h_row1 = h.slice(s![1, primary_h.start..primary_h.end]).to_owned();
+            let h_row1_2d = h_row1.into_shape_with_order((1, h_len)).unwrap();
+            let gh = g_row.view().insert_axis(Axis(1)).dot(&h_row1_2d);
+            target
+                .slice_mut(s![slices.logslope.clone(), block_h.clone()])
+                .scaled_add(1.0, &gh);
+            target
+                .slice_mut(s![block_h.clone(), slices.logslope.clone()])
+                .scaled_add(1.0, &gh.t());
+
+            target
+                .slice_mut(s![block_h.clone(), block_h.clone()])
+                .scaled_add(
+                    1.0,
+                    &h.slice(s![
+                        primary_h.start..primary_h.end,
+                        primary_h.start..primary_h.end
+                    ]),
+                );
+        }
+
+        if let (Some(primary_w), Some(block_w)) = (primary.w.as_ref(), slices.w.as_ref()) {
+            let w_row0 = h.slice(s![0, primary_w.start..primary_w.end]).to_owned();
+            let w_len = w_row0.len();
+            let w_row0_2d = w_row0.into_shape_with_order((1, w_len)).unwrap();
+            let qw = x_row.view().insert_axis(Axis(1)).dot(&w_row0_2d);
+            target
+                .slice_mut(s![slices.marginal.clone(), block_w.clone()])
+                .scaled_add(1.0, &qw);
+            target
+                .slice_mut(s![block_w.clone(), slices.marginal.clone()])
+                .scaled_add(1.0, &qw.t());
+
+            let w_row1 = h.slice(s![1, primary_w.start..primary_w.end]).to_owned();
+            let w_row1_2d = w_row1.into_shape_with_order((1, w_len)).unwrap();
+            let gw = g_row.view().insert_axis(Axis(1)).dot(&w_row1_2d);
+            target
+                .slice_mut(s![slices.logslope.clone(), block_w.clone()])
+                .scaled_add(1.0, &gw);
+            target
+                .slice_mut(s![block_w.clone(), slices.logslope.clone()])
+                .scaled_add(1.0, &gw.t());
+
+            if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
+                target
+                    .slice_mut(s![block_h.clone(), block_w.clone()])
+                    .scaled_add(
+                        1.0,
+                        &h.slice(s![
+                            primary_h.start..primary_h.end,
+                            primary_w.start..primary_w.end
+                        ]),
+                    );
+                target
+                    .slice_mut(s![block_w.clone(), block_h.clone()])
+                    .scaled_add(
+                        1.0,
+                        &h.slice(s![
+                            primary_w.start..primary_w.end,
+                            primary_h.start..primary_h.end
+                        ]),
+                    );
+            }
+
+            target
+                .slice_mut(s![block_w.clone(), block_w.clone()])
+                .scaled_add(
+                    1.0,
+                    &h.slice(s![
+                        primary_w.start..primary_w.end,
+                        primary_w.start..primary_w.end
+                    ]),
+                );
+        }
+    }
+
+        fn joint_gradient_hessian(
         &self,
         block_states: &[ParameterBlockState],
         need_hessian: bool,
@@ -3352,6 +3468,43 @@ impl BernoulliMarginalSlopeFamily {
                             acc.6[row] = third[[0, 0]];
                             acc.7[row] = third[[0, 1]];
                             acc.8[row] = third[[1, 1]];
+
+                            // h/w cross-block contributions -> dense correction
+                            if has_hw {
+                                let right_primary = f_pipi.row(idx_primary).to_owned();
+                                let psi_range = if block_idx == 0 {
+                                    slices.marginal.clone()
+                                } else {
+                                    slices.logslope.clone()
+                                };
+                                if let (Some(ph), Some(bh)) =
+                                    (primary.h.as_ref(), slices.h.as_ref())
+                                {
+                                    let h_part = right_primary.slice(s![ph.start..ph.end]);
+                                    for (li, gi) in psi_range.clone().enumerate() {
+                                        for (lj, gj) in bh.clone().enumerate() {
+                                            let val = psi_row[li] * h_part[lj];
+                                            acc.9[[gi, gj]] += val;
+                                            acc.9[[gj, gi]] += val;
+                                        }
+                                    }
+                                }
+                                if let (Some(pw), Some(bw)) =
+                                    (primary.w.as_ref(), slices.w.as_ref())
+                                {
+                                    let w_part = right_primary.slice(s![pw.start..pw.end]);
+                                    for (li, gi) in psi_range.enumerate() {
+                                        for (lj, gj) in bw.clone().enumerate() {
+                                            let val = psi_row[li] * w_part[lj];
+                                            acc.9[[gi, gj]] += val;
+                                            acc.9[[gj, gi]] += val;
+                                        }
+                                    }
+                                }
+                                self.add_pullback_primary_hessian_hw_only(
+                                    &mut acc.9, row, slices, primary, &third,
+                                );
+                            }
                         }
                         Ok(acc)
                     },
@@ -3368,6 +3521,7 @@ impl BernoulliMarginalSlopeFamily {
                             Array1::<f64>::zeros(n),
                             Array1::<f64>::zeros(n),
                             Array1::<f64>::zeros(n),
+                            Array2::<f64>::zeros((slices.total, slices.total)),
                         )
                     },
                     |mut left, right| -> Result<_, String> {
@@ -3380,6 +3534,7 @@ impl BernoulliMarginalSlopeFamily {
                         left.6 += &right.6;
                         left.7 += &right.7;
                         left.8 += &right.8;
+                        left.9 += &right.9;
                         Ok(left)
                     },
                 )?;
@@ -3407,15 +3562,20 @@ impl BernoulliMarginalSlopeFamily {
                 CustomFamilyJointDesignPairContribution::new(1, 1, w_gg, d_gg),
             ];
 
+            let dense_correction = if has_hw { Some(dense_corr) } else { None };
+
             return Ok(Some(ExactNewtonJointPsiTerms {
                 objective_psi,
                 score_psi,
                 hessian_psi: Array2::zeros((0, 0)),
-                hessian_psi_operator: Some(Box::new(CustomFamilyJointPsiOperator::new(
-                    slices.total,
-                    channels,
-                    pair_contributions,
-                ))),
+                hessian_psi_operator: Some(Box::new(
+                    CustomFamilyJointPsiOperator::with_dense_correction(
+                        slices.total,
+                        channels,
+                        pair_contributions,
+                        dense_correction,
+                    ),
+                )),
             }));
         }
 
