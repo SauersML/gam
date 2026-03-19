@@ -1053,17 +1053,10 @@ impl BernoulliBlockHessianAccumulator {
 
         // marginal x logslope: H[0,1] * x_row outer g_row
         if h[[0, 1]] != 0.0 {
-            let m_chunk = family.marginal_design.row_chunk(row..row + 1);
-            let m_row = m_chunk.row(0);
-            let g_chunk = family.logslope_design.row_chunk(row..row + 1);
-            let g_row = g_chunk.row(0);
-            ndarray::linalg::general_mat_mul(
-                h[[0, 1]],
-                &m_row.view().insert_axis(Axis(1)),
-                &g_row.view().insert_axis(Axis(0)),
-                1.0,
-                &mut self.h_mg,
-            );
+            family
+                .marginal_design
+                .row_outer_into_view(row, &family.logslope_design, h[[0, 1]], self.h_mg.view_mut())
+                .expect("marginal-logslope row_outer_into dimension mismatch");
         }
 
         // h/w cross-blocks -> dense_correction
@@ -1092,35 +1085,42 @@ impl BernoulliBlockHessianAccumulator {
 
         // Marginal component of right_primary
         if right_primary[0] != 0.0 {
-            let m_chunk = family.marginal_design.row_chunk(row..row + 1);
-            let m_row = m_chunk.row(0);
             match psi_block_idx {
                 0 => {
                     // psi=marginal, right=marginal -> h_mm, symmetric rank-2
-                    ndarray::linalg::general_mat_mul(
-                        right_primary[0],
-                        &psi_col,
-                        &m_row.view().insert_axis(Axis(0)),
-                        1.0,
-                        &mut self.h_mm,
-                    );
-                    ndarray::linalg::general_mat_mul(
-                        right_primary[0],
-                        &m_row.view().insert_axis(Axis(1)),
-                        &psi_row.view().insert_axis(Axis(0)),
-                        1.0,
-                        &mut self.h_mm,
-                    );
+                    for (idx, &value) in psi_row.iter().enumerate() {
+                        if value == 0.0 {
+                            continue;
+                        }
+                        let scale = right_primary[0] * value;
+                        {
+                            let mut col = self.h_mm.column_mut(idx);
+                            family
+                                .marginal_design
+                                .axpy_row_into(row, scale, &mut col)
+                                .expect("marginal axpy column mismatch");
+                        }
+                        {
+                            let mut row_view = self.h_mm.row_mut(idx);
+                            family
+                                .marginal_design
+                                .axpy_row_into(row, scale, &mut row_view)
+                                .expect("marginal axpy row mismatch");
+                        }
+                    }
                 }
                 1 => {
                     // psi=logslope, right=marginal -> h_mg (marginal x logslope)
-                    ndarray::linalg::general_mat_mul(
-                        right_primary[0],
-                        &m_row.view().insert_axis(Axis(1)),
-                        &psi_row.view().insert_axis(Axis(0)),
-                        1.0,
-                        &mut self.h_mg,
-                    );
+                    for (idx, &value) in psi_row.iter().enumerate() {
+                        if value == 0.0 {
+                            continue;
+                        }
+                        let mut col = self.h_mg.column_mut(idx);
+                        family
+                            .marginal_design
+                            .axpy_row_into(row, right_primary[0] * value, &mut col)
+                            .expect("marginal axpy column mismatch");
+                    }
                 }
                 _ => {}
             }
@@ -1128,35 +1128,42 @@ impl BernoulliBlockHessianAccumulator {
 
         // Logslope component of right_primary
         if right_primary[1] != 0.0 {
-            let g_chunk = family.logslope_design.row_chunk(row..row + 1);
-            let g_row = g_chunk.row(0);
             match psi_block_idx {
                 0 => {
                     // psi=marginal, right=logslope -> h_mg
-                    ndarray::linalg::general_mat_mul(
-                        right_primary[1],
-                        &psi_col,
-                        &g_row.view().insert_axis(Axis(0)),
-                        1.0,
-                        &mut self.h_mg,
-                    );
+                    for (idx, &value) in psi_row.iter().enumerate() {
+                        if value == 0.0 {
+                            continue;
+                        }
+                        let mut row_view = self.h_mg.row_mut(idx);
+                        family
+                            .logslope_design
+                            .axpy_row_into(row, right_primary[1] * value, &mut row_view)
+                            .expect("logslope axpy row mismatch");
+                    }
                 }
                 1 => {
                     // psi=logslope, right=logslope -> h_gg, symmetric rank-2
-                    ndarray::linalg::general_mat_mul(
-                        right_primary[1],
-                        &psi_col,
-                        &g_row.view().insert_axis(Axis(0)),
-                        1.0,
-                        &mut self.h_gg,
-                    );
-                    ndarray::linalg::general_mat_mul(
-                        right_primary[1],
-                        &g_row.view().insert_axis(Axis(1)),
-                        &psi_row.view().insert_axis(Axis(0)),
-                        1.0,
-                        &mut self.h_gg,
-                    );
+                    for (idx, &value) in psi_row.iter().enumerate() {
+                        if value == 0.0 {
+                            continue;
+                        }
+                        let scale = right_primary[1] * value;
+                        {
+                            let mut col = self.h_gg.column_mut(idx);
+                            family
+                                .logslope_design
+                                .axpy_row_into(row, scale, &mut col)
+                                .expect("logslope axpy column mismatch");
+                        }
+                        {
+                            let mut row_view = self.h_gg.row_mut(idx);
+                            family
+                                .logslope_design
+                                .axpy_row_into(row, scale, &mut row_view)
+                                .expect("logslope axpy row mismatch");
+                        }
+                    }
                 }
                 _ => {}
             }
