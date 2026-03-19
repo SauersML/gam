@@ -391,9 +391,13 @@ fn validate_spec(
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
         return Err("bernoulli-marginal-slope requires finite z values".to_string());
     }
-    // Enforce z is pre-standardized: weighted mean ≈ 0, weighted sd ≈ 1.
+    // Enforce z is approximately standard normal.
     // The Gaussian decoupling identity E[Φ(a + β Z)] = Φ(a / √(1+β²))
-    // holds only when Z ~ N(0, 1).
+    // holds only when Z ~ N(0, 1).  Checking mean ≈ 0, sd ≈ 1 is necessary
+    // but NOT sufficient: a standardized non-normal distribution would pass
+    // those checks but invalidate the closed form.  We additionally check
+    // weighted skewness ≈ 0 and excess kurtosis ≈ 0 to catch the most
+    // common violations (e.g. heavy tails, asymmetry, discrete scores).
     let weight_sum = spec.weights.iter().copied().sum::<f64>();
     if weight_sum.is_finite() && weight_sum > 0.0 {
         let mean = spec
@@ -413,9 +417,39 @@ fn validate_spec(
         let sd = var.sqrt();
         if mean.abs() > 1e-6 || (sd - 1.0).abs() > 1e-6 {
             return Err(format!(
-                "bernoulli-marginal-slope requires z to be pre-standardized to weighted mean 0 \
-                 and weighted sd 1; got mean={mean:.6e}, sd={sd:.6e}"
+                "bernoulli-marginal-slope requires z to already represent a latent N(0,1) score; \
+                 weighted mean 0 and weighted sd 1 are necessary sanity checks. got mean={mean:.6e}, sd={sd:.6e}"
             ));
+        }
+        // Weighted skewness and excess kurtosis as normality gates.
+        // For Z ~ N(0,1): skewness = 0, excess kurtosis = 0.
+        if sd > 1e-12 {
+            let skew = spec
+                .z
+                .iter()
+                .zip(spec.weights.iter())
+                .map(|(&zi, &wi)| wi * ((zi - mean) / sd).powi(3))
+                .sum::<f64>()
+                / weight_sum;
+            let kurt = spec
+                .z
+                .iter()
+                .zip(spec.weights.iter())
+                .map(|(&zi, &wi)| wi * ((zi - mean) / sd).powi(4))
+                .sum::<f64>()
+                / weight_sum
+                - 3.0;
+            // Tolerances are generous for finite-sample noise but catch
+            // obviously non-Gaussian shapes (e.g. uniform: kurt ≈ -1.2).
+            if skew.abs() > 0.5 || kurt.abs() > 1.5 {
+                log::warn!(
+                    "bernoulli-marginal-slope: z has skewness={skew:.3} and \
+                     excess kurtosis={kurt:.3}; the Gaussian marginalization \
+                     identity E[Φ(a+βZ)]=Φ(a/√(1+β²)) is only exact for \
+                     Z~N(0,1). Results may be biased if z is not approximately \
+                     normal."
+                );
+            }
         }
     }
     Ok(())
@@ -2904,8 +2938,9 @@ impl BernoulliMarginalSlopeFamily {
 
                 let g2 = g * g;
                 let c = (1.0 + g2).sqrt();
-                let c1 = g2 / c;
-                let c2 = g2 * (g2 + 2.0) / (c * c * c);
+                // c(g) = sqrt(1+g²), c'(g) = g/c, c''(g) = 1/c³
+                let c1 = g / c;
+                let c2 = 1.0 / (c * c * c);
                 let eta = q * c + g * zi;
                 let m = s * eta;
 
@@ -4167,6 +4202,119 @@ mod tests {
         assert_eq!(
             bernoulli_exact_outer_derivative_order(10_000, 8, 6),
             ExactOuterDerivativeOrder::First
+        );
+    }
+
+    #[test]
+    fn rigid_fast_path_matches_loglik_finite_differences() {
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.2]),
+            z: Arc::new(array![0.3]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
+            quadrature_nodes: array![0.0],
+            quadrature_weights: array![1.0],
+            score_warp: None,
+            score_warp_obs_design: None,
+            cached_score_warp_constraints: None,
+            link_dev: None,
+        };
+        let states_at = |q: f64, g: f64| {
+            vec![
+                ParameterBlockState {
+                    beta: array![q],
+                    eta: array![q],
+                },
+                ParameterBlockState {
+                    beta: array![g],
+                    eta: array![g],
+                },
+            ]
+        };
+        let q = 0.4;
+        let g = 0.7;
+        let block_states = states_at(q, g);
+        let eval = family
+            .evaluate(&block_states)
+            .expect("rigid family evaluation");
+        let grad_q = match &eval.blockworking_sets[0] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            BlockWorkingSet::Diagonal { .. } => {
+                panic!("expected exact-newton marginal block")
+            }
+        };
+        let grad_g = match &eval.blockworking_sets[1] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            BlockWorkingSet::Diagonal { .. } => {
+                panic!("expected exact-newton log-slope block")
+            }
+        };
+        let hess_qq = match &eval.blockworking_sets[0] {
+            BlockWorkingSet::ExactNewton { hessian, .. } => match hessian {
+                SymmetricMatrix::Dense(h) => h[[0, 0]],
+                _ => panic!("expected dense marginal Hessian"),
+            },
+            BlockWorkingSet::Diagonal { .. } => {
+                panic!("expected exact-newton marginal block")
+            }
+        };
+        let hess_gg = match &eval.blockworking_sets[1] {
+            BlockWorkingSet::ExactNewton { hessian, .. } => match hessian {
+                SymmetricMatrix::Dense(h) => h[[0, 0]],
+                _ => panic!("expected dense log-slope Hessian"),
+            },
+            BlockWorkingSet::Diagonal { .. } => {
+                panic!("expected exact-newton log-slope block")
+            }
+        };
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("rigid exact eval cache");
+        let row_ctx = family
+            .build_row_exact_context(
+                0,
+                &block_states,
+                &cache.h_nodes,
+                cache.score_warp_obs.as_ref(),
+            )
+            .expect("rigid row context");
+        let (primary_grad, primary_hess) = family
+            .compute_row_primary_gradient_hessian(
+                0,
+                &block_states,
+                &cache.primary,
+                &row_ctx,
+                &cache.h_nodes,
+                cache.h_node_design.as_ref(),
+                cache.score_warp_obs.as_ref(),
+            )
+            .expect("rigid exact row derivatives");
+
+        assert!(
+            (grad_q + primary_grad[0]).abs() < 1e-10,
+            "marginal gradient mismatch: fast={grad_q:.12e}, exact={:.12e}",
+            -primary_grad[0]
+        );
+        assert!(
+            (grad_g + primary_grad[1]).abs() < 1e-10,
+            "logslope gradient mismatch: fast={grad_g:.12e}, exact={:.12e}",
+            -primary_grad[1]
+        );
+        assert!(
+            (hess_qq - primary_hess[[0, 0]]).abs() < 1e-10,
+            "marginal Hessian mismatch: fast={hess_qq:.12e}, exact={:.12e}",
+            primary_hess[[0, 0]]
+        );
+        assert!(
+            (hess_gg - primary_hess[[1, 1]]).abs() < 1e-10,
+            "logslope Hessian mismatch: fast={hess_gg:.12e}, exact={:.12e}",
+            primary_hess[[1, 1]]
         );
     }
 

@@ -98,6 +98,8 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     # but occasional fit/predict failures should not fail the whole CI shard.
     "r_gamlss",
     "rust_gamlss",
+    "rust_gamlss_marginal_slope",
+    "rust_gamlss_survival_marginal_slope",
     "r_gamboostlss",
     "r_bamlss",
     "r_brms",
@@ -3170,10 +3172,78 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
                     f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
                 )
 
-    if not terms:
-        raise RuntimeError(f"empty Rust term list for scenario '{scenario_name}'")
-    formula = f"{target} ~ " + " + ".join(terms)
+    formula = f"{target} ~ " + _formula_rhs_from_terms(terms)
     return cfg["family"], formula
+
+
+def _cfg_with_excluded_columns(cfg: dict, excluded_cols) -> dict:
+    excluded = {str(col) for col in (excluded_cols or [])}
+    if not excluded:
+        return dict(cfg)
+    trimmed = dict(cfg)
+    trimmed["linear_cols"] = [str(c) for c in cfg.get("linear_cols", []) if str(c) not in excluded]
+    if cfg.get("smooth_cols") is not None:
+        trimmed["smooth_cols"] = [str(c) for c in cfg.get("smooth_cols", []) if str(c) not in excluded]
+        trimmed.pop("smooth_col", None)
+    else:
+        smooth_col = cfg.get("smooth_col")
+        if smooth_col is not None and str(smooth_col) in excluded:
+            trimmed.pop("smooth_col", None)
+    return trimmed
+
+
+def _formula_rhs_from_terms(terms: list[str]) -> str:
+    return " + ".join(str(term) for term in terms) if terms else "1"
+
+
+def _select_marginal_slope_z_column(scenario_name: str, ds: dict) -> str:
+    cfg = _scenario_fit_mapping(scenario_name)
+    if cfg is None:
+        raise RuntimeError(f"No marginal-slope mapping configured for scenario '{scenario_name}'")
+    smooth_cols = list(cfg.get("smooth_cols") or ([cfg["smooth_col"]] if cfg.get("smooth_col") else []))
+    linear_cols = list(cfg.get("linear_cols", []))
+    candidates = smooth_cols + [c for c in linear_cols if c not in smooth_cols] + list(ds.get("features", []))
+    seen = set()
+    for col in candidates:
+        name = str(col)
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in ds.get("features", []):
+            return name
+    raise RuntimeError(f"could not choose a marginal-slope z column for scenario '{scenario_name}'")
+
+
+def _apply_exact_train_fold_standardization(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    train_raw: pd.DataFrame,
+    test_raw: pd.DataFrame,
+    column: str,
+) -> None:
+    train_vals = train_raw[column].to_numpy(dtype=float)
+    mu = float(np.mean(train_vals))
+    var = float(np.mean((train_vals - mu) ** 2))
+    sd = math.sqrt(var) if np.isfinite(var) and var >= 1e-16 else 1.0
+    train_df[column] = (train_raw[column].to_numpy(dtype=float) - mu) / sd
+    test_df[column] = (test_raw[column].to_numpy(dtype=float) - mu) / sd
+
+
+def _rust_marginal_slope_formulas_for_scenario(scenario_name: str, ds: dict) -> tuple[str, str, str]:
+    base_cfg = _effective_scenario_fit_mapping(scenario_name) or {}
+    z_column = _select_marginal_slope_z_column(scenario_name, ds)
+    marginal_cfg = _cfg_with_excluded_columns(base_cfg, [z_column])
+    _, marginal_formula = _rust_formula_for_scenario(
+        scenario_name,
+        ds,
+        cfg_override=marginal_cfg,
+    )
+    _, logslope_formula = _rust_formula_for_scenario(
+        scenario_name,
+        ds,
+        cfg_override=marginal_cfg,
+    )
+    return z_column, marginal_formula, logslope_formula
 
 
 def _mgcv_formula_for_scenario(scenario_name, ds):
@@ -3265,11 +3335,20 @@ def _survival_formula_mapping(scenario_name: str) -> dict:
     }
 
 
-def _rust_survival_formula_for_scenario(scenario_name: str) -> str:
-    cfg = _survival_formula_mapping(scenario_name)
+def _rust_survival_formula_for_scenario(scenario_name: str, *, exclude_cols=None) -> str:
+    cfg = _cfg_with_excluded_columns(_survival_formula_mapping(scenario_name), exclude_cols or [])
     terms = [f"linear({c})" for c in cfg["linear_cols"]]
     terms.extend(f"s({c}, type=ps, knots={cfg['knots']})" for c in cfg["smooth_cols"])
-    return " + ".join(terms)
+    return _formula_rhs_from_terms(terms)
+
+
+def _rust_survival_marginal_slope_formulas_for_scenario(
+    scenario_name: str,
+    ds: dict,
+) -> tuple[str, str, str]:
+    z_column = _select_marginal_slope_z_column(scenario_name, ds)
+    rhs = _rust_survival_formula_for_scenario(scenario_name, exclude_cols=[z_column])
+    return z_column, rhs, rhs
 
 
 def _coxph_survival_formula_for_scenario(scenario_name: str, ds: dict) -> str:
@@ -4335,6 +4414,164 @@ def run_rust_gamlss_scenario_cv(
     )
 
 
+def run_rust_gamlss_marginal_slope_cv(
+    scenario,
+    *,
+    contender_name: str = "rust_gamlss_marginal_slope",
+    ds: dict | None = None,
+    folds: list[Fold] | None = None,
+):
+    scenario_name = scenario["name"]
+    if _scenario_fit_mapping(scenario_name) is None:
+        return None
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
+    if ds["family"] != "binomial":
+        return None
+    if folds is None:
+        folds = folds_for_dataset(ds)
+
+    try:
+        rust_bin = _ensure_rust_binary()
+    except _EXPECTED_EXTERNAL_FAILURES as e:
+        return {
+            "contender": contender_name,
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": str(e),
+        }
+
+    z_column, mean_formula, logslope_formula = _rust_marginal_slope_formulas_for_scenario(
+        scenario_name,
+        ds,
+    )
+    base_df = pd.DataFrame(ds["rows"])
+    cv_rows = []
+    plot_payload = _init_plot_payload(ds)
+    eval_suffix = _evaluation_suffix(folds)
+
+    with _workspace_tempdir(prefix="gam_bench_rust_gamlss_ms_cv_") as td:
+        td_path = Path(td)
+        for fold_id, fold in enumerate(folds):
+            train_raw = base_df.iloc[fold.train_idx].copy()
+            test_raw = base_df.iloc[fold.test_idx].copy()
+            train_df = train_raw.copy()
+            test_df = test_raw.copy()
+            train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
+            _apply_exact_train_fold_standardization(
+                train_df,
+                test_df,
+                train_raw,
+                test_raw,
+                z_column,
+            )
+            train_path = td_path / f"train_{fold_id}.csv"
+            test_path = td_path / f"test_{fold_id}.csv"
+            train_df.to_csv(train_path, index=False)
+            test_df.to_csv(test_path, index=False)
+            model_path = td_path / f"model_{fold_id}.json"
+            pred_path = td_path / f"pred_{fold_id}.csv"
+
+            fit_cmd = [
+                str(rust_bin),
+                "fit",
+                "--logslope-formula",
+                logslope_formula,
+                "--z-column",
+                z_column,
+                "--out",
+                str(model_path),
+                str(train_path),
+                mean_formula,
+            ]
+            t0 = perf_counter()
+            code, out, err = run_cmd(fit_cmd, cwd=ROOT)
+            fit_sec = perf_counter() - t0
+            if code != 0:
+                return {
+                    "contender": contender_name,
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
+                    "error": (err.strip() or out.strip() or "rust gamlss marginal-slope fit failed"),
+                }
+
+            pred_cmd = [
+                str(rust_bin),
+                "predict",
+                str(model_path),
+                str(test_path),
+                "--out",
+                str(pred_path),
+            ]
+            t1 = perf_counter()
+            code, out, err = run_cmd(pred_cmd, cwd=ROOT)
+            pred_sec = perf_counter() - t1
+            if code != 0:
+                return {
+                    "contender": contender_name,
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
+                    "error": (err.strip() or out.strip() or "rust gamlss marginal-slope predict failed"),
+                }
+            pred_df = pd.read_csv(pred_path)
+            if "mean" not in pred_df.columns:
+                return {
+                    "contender": contender_name,
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
+                    "error": "rust gamlss marginal-slope prediction output missing 'mean' column",
+                }
+            pred = pred_df["mean"].to_numpy(dtype=float)
+            y_test = test_df[ds["target"]].to_numpy(dtype=float)
+            y_train = train_df[ds["target"]].to_numpy(dtype=float)
+            _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
+            cv_rows.append(
+                {
+                    "fit_sec": float(fit_sec),
+                    "predict_sec": float(pred_sec),
+                    "auc": auc_score(y_test, pred),
+                    "brier": brier_score(y_test, pred),
+                    "logloss": log_loss_score(y_test, pred),
+                    "nagelkerke_r2": nagelkerke_r2_score(y_test, pred, null_mean=float(np.mean(y_train))),
+                    "n_test": int(len(fold.test_idx)),
+                    "model_spec": (
+                        f"marginal: {mean_formula}; logslope: {logslope_formula}; "
+                        f"z: {z_column} via release binary {eval_suffix}"
+                    ),
+                }
+            )
+
+    if not cv_rows:
+        return {
+            "contender": contender_name,
+            "family": ds["family"],
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": "no cross-validation folds generated for scenario",
+        }
+
+    return _finalize_cv_result(
+        contender=contender_name,
+        scenario_name=scenario_name,
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=cv_rows[0]["model_spec"],
+    )
+
+
 def run_rust_gamlss_survival_cv(
     scenario,
     *,
@@ -4369,9 +4606,11 @@ def run_rust_gamlss_survival_cv(
     with _workspace_tempdir(prefix="gam_bench_rust_gamlss_surv_cv_") as td:
         td_path = Path(td)
         for fold_id, fold in enumerate(folds):
-            train_df = base_df.iloc[fold.train_idx].copy()
-            test_df = base_df.iloc[fold.test_idx].copy()
-            test_eval_df = test_df.copy()
+            train_raw = base_df.iloc[fold.train_idx].copy()
+            test_raw = base_df.iloc[fold.test_idx].copy()
+            train_df = train_raw.copy()
+            test_df = test_raw.copy()
+            test_eval_df = test_raw.copy()
             train_path = td_path / f"train_{fold_id}.csv"
             test_path = td_path / f"test_{fold_id}.csv"
             model_path = td_path / f"model_{fold_id}.json"
@@ -4494,6 +4733,210 @@ def run_rust_gamlss_survival_cv(
                     "model_spec": (
                         f"{fit_formula} [survival-likelihood=location-scale; "
                         f"risk_score={score_src}; native survival curve scoring] {_evaluation_suffix(folds)}"
+                    ),
+                }
+            )
+
+    if not cv_rows:
+        return {
+            "contender": contender_name,
+            "family": ds["family"],
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": "no cross-validation folds generated for scenario",
+        }
+
+    return _finalize_cv_result(
+        contender=contender_name,
+        scenario_name=scenario_name,
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=cv_rows[0]["model_spec"],
+    )
+
+
+def run_rust_gamlss_survival_marginal_slope_cv(
+    scenario,
+    *,
+    contender_name: str = "rust_gamlss_survival_marginal_slope",
+    ds: dict | None = None,
+    folds: list[Fold] | None = None,
+):
+    scenario_name = scenario["name"]
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
+    if ds["family"] != "survival":
+        return None
+    if folds is None:
+        folds = folds_for_dataset(ds)
+
+    try:
+        rust_bin = _ensure_rust_binary()
+    except _EXPECTED_EXTERNAL_FAILURES as e:
+        return {
+            "contender": contender_name,
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": str(e),
+        }
+
+    z_column, rhs_formula, rhs_logslope = _rust_survival_marginal_slope_formulas_for_scenario(
+        scenario_name,
+        ds,
+    )
+    base_df = pd.DataFrame(ds["rows"])
+    cv_rows = []
+    plot_payload = _init_plot_payload(ds)
+    eval_suffix = _evaluation_suffix(folds)
+
+    with _workspace_tempdir(prefix="gam_bench_rust_gamlss_surv_ms_cv_") as td:
+        td_path = Path(td)
+        for fold_id, fold in enumerate(folds):
+            train_raw = base_df.iloc[fold.train_idx].copy()
+            test_raw = base_df.iloc[fold.test_idx].copy()
+            train_df = train_raw.copy()
+            test_df = test_raw.copy()
+            test_eval_df = test_raw.copy()
+            train_path = td_path / f"train_{fold_id}.csv"
+            test_path = td_path / f"test_{fold_id}.csv"
+            model_path = td_path / f"model_{fold_id}.json"
+            pred_path = td_path / f"pred_{fold_id}.csv"
+
+            for col in ds["features"]:
+                mu = float(train_df[col].mean())
+                sdv = float(train_df[col].std())
+                if (not np.isfinite(sdv)) or sdv < 1e-8:
+                    sdv = 1.0
+                train_df[col] = (train_df[col] - mu) / sdv
+                test_df[col] = (test_df[col] - mu) / sdv
+            _apply_exact_train_fold_standardization(
+                train_df,
+                test_df,
+                train_raw,
+                test_raw,
+                z_column,
+            )
+            train_df["__entry"] = 0.0
+            horizon = _survival_eval_horizon(train_df, ds["time_col"])
+            test_pred_df = test_df.copy()
+            test_pred_df["__entry"] = 0.0
+            test_pred_df[ds["time_col"]] = horizon
+            train_df.to_csv(train_path, index=False)
+            test_pred_df.to_csv(test_path, index=False)
+
+            fit_formula = f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_formula}"
+            logslope_formula = (
+                f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_logslope}"
+            )
+            fit_cmd = [
+                str(rust_bin),
+                "fit",
+                "--survival-likelihood",
+                "marginal-slope",
+                "--logslope-formula",
+                logslope_formula,
+                "--z-column",
+                z_column,
+                "--out",
+                str(model_path),
+            ]
+            fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
+            fit_cmd.extend([str(train_path), fit_formula])
+
+            t0 = perf_counter()
+            code, out, err = run_cmd(fit_cmd, cwd=ROOT)
+            fit_sec = perf_counter() - t0
+            if code != 0:
+                return {
+                    "contender": contender_name,
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "error": (
+                        err.strip() or out.strip() or "rust gamlss survival marginal-slope fit failed"
+                    ),
+                }
+
+            pred_cmd = [
+                str(rust_bin),
+                "predict",
+                str(model_path),
+                str(test_path),
+                "--out",
+                str(pred_path),
+            ]
+            t1 = perf_counter()
+            code, out, err = run_cmd(pred_cmd, cwd=ROOT)
+            pred_sec = perf_counter() - t1
+            if code != 0:
+                return {
+                    "contender": contender_name,
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "error": (
+                        err.strip()
+                        or out.strip()
+                        or "rust gamlss survival marginal-slope predict failed"
+                    ),
+                }
+            pred_df = pd.read_csv(pred_path)
+            try:
+                risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
+            except RuntimeError as e:
+                return {
+                    "contender": contender_name,
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": str(e),
+                }
+            try:
+                survival_grid = _survival_score_grid(train_df, ds["time_col"])
+                survival_matrix = _rust_native_survival_matrix_from_model(
+                    rust_bin=rust_bin,
+                    model_path=model_path,
+                    predict_df=test_df.assign(__entry=0.0),
+                    time_col=ds["time_col"],
+                    grid=survival_grid,
+                    fold_dir=td_path,
+                )
+            except RuntimeError as e:
+                return {
+                    "contender": contender_name,
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": str(e),
+                }
+            surv_metrics = score_survival_fold(
+                train_df,
+                test_eval_df,
+                time_col=ds["time_col"],
+                event_col=ds["event_col"],
+                risk_score=risk_score,
+                survival_grid=survival_grid,
+                survival_matrix=survival_matrix,
+            )
+            _append_survival_plot_fold(
+                plot_payload,
+                test_eval_df,
+                time_col=ds["time_col"],
+                event_col=ds["event_col"],
+                risk_score=risk_score,
+            )
+            cv_rows.append(
+                {
+                    "fit_sec": float(fit_sec),
+                    "predict_sec": float(pred_sec),
+                    "auc": surv_metrics["auc"],
+                    "brier": surv_metrics["brier"],
+                    "logloss": surv_metrics["logloss"],
+                    "nagelkerke_r2": surv_metrics["nagelkerke_r2"],
+                    "n_test": int(len(fold.test_idx)),
+                    "model_spec": (
+                        f"{fit_formula} [survival-likelihood=marginal-slope; "
+                        f"logslope={logslope_formula}; z={z_column}; risk_score={score_src}; "
+                        f"native survival curve scoring] {eval_suffix}"
                     ),
                 }
             )
@@ -7603,6 +8046,16 @@ def main():
                             shared_fold_artifacts=shared_fold_artifacts,
                         )
                     )
+                if ds["family"] == "binomial" and _is_contender_enabled(
+                    s_cfg, "rust_gamlss_marginal_slope"
+                ):
+                    results.append(
+                        run_rust_gamlss_marginal_slope_cv(
+                            s_cfg,
+                            ds=ds,
+                            folds=folds,
+                        )
+                    )
             rust_gamlss_surv_row = (
                 run_rust_gamlss_survival_cv(s_cfg, ds=ds, folds=folds)
                 if _is_contender_enabled(s_cfg, "rust_gamlss_survival")
@@ -7610,6 +8063,13 @@ def main():
             )
             if rust_gamlss_surv_row is not None:
                 results.append(rust_gamlss_surv_row)
+            rust_gamlss_surv_ms_row = (
+                run_rust_gamlss_survival_marginal_slope_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "rust_gamlss_survival_marginal_slope")
+                else None
+            )
+            if rust_gamlss_surv_ms_row is not None:
+                results.append(rust_gamlss_surv_ms_row)
             r_gamlss_row = (
                 run_external_r_gamlss_cv(s_cfg, ds=ds, folds=folds)
                 if _is_contender_enabled(s_cfg, "r_gamlss")

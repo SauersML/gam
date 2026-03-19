@@ -15,6 +15,7 @@ use crate::families::bernoulli_marginal_slope::{
 };
 use crate::families::gamlss::{
     monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta,
+    validate_monotone_wiggle_beta_nonnegative,
 };
 use crate::families::survival_location_scale::TimeBlockInput;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
@@ -158,7 +159,7 @@ fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String
 //
 // The survival marginal-slope NLL for row i is:
 //
-//   ℓ_i = w_i [ (1-d)·neglogΦ(-η₁) − neglogΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
+//   ℓ_i = w_i [ (1-d)·neglogΦ(-η₁) + logΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
 //
 // with η₀ = q₀c + gz, η₁ = q₁c + gz, a'₁ = qd₁·c, c = √(1+g²).
 //
@@ -170,14 +171,14 @@ fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String
 fn c_derivatives(g: f64) -> (f64, f64, f64, f64, f64) {
     let g2 = g * g;
     let c = (1.0 + g2).sqrt();
-    let c2 = c * c; // = 1 + g²
+    let c2 = c * c;
     let c3 = c2 * c;
     let c5 = c3 * c2;
     let c7 = c5 * c2;
-    let c1 = g2 / c; // g * g / c = g² / c
-    let c2d = g2 * (g2 + 2.0) / c3;
-    let c3d = g2 * (g2 * g2 + 2.0 * g2 + 4.0) / c5;
-    let c4d = g2 * (g2 * g2 * g2 + 4.0 * g2 * g2 - 4.0 * g2 + 8.0) / c7;
+    let c1 = g / c;
+    let c2d = 1.0 / c3;
+    let c3d = -3.0 * g / c5;
+    let c4d = (12.0 * g2 - 3.0) / c7;
     (c, c1, c2d, c3d, c4d)
 }
 
@@ -229,13 +230,13 @@ fn row_primary_closed_form(
     let log_ad1 = ad1.max(1e-300).ln();
 
     let nll =
-        w * ((1.0 - d) * (-logcdf_neg_eta1) - logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
+        w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
 
     // ── First and second derivatives of each NLL component ──
-    // For neglogΦ(-η): f(η) = -logΦ(-η), f'(η) = φ(-η)/Φ(-η) = λ(-η).
-    // signed_probit_neglog_derivatives gives (k1, k2, k3, k4) for -logΦ(m)
-    // where k1 = -λ(m), k2 = λ(m+λ), etc.
-    // For entry: m = -η₀, weight = -w (because we subtract this term)
+    // signed_probit_neglog_derivatives gives derivatives with respect to m for
+    // -weight * logΦ(m). Here m = -η, so odd derivatives flip sign when mapped
+    // back to derivatives with respect to η.
+    // For entry: m = -η₀, weight = -w because the NLL contains +w logΦ(-η₀)
     let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w);
     // For exit: m = -η₁, weight = w(1-d)
     let (e1_k1, e1_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d));
@@ -260,11 +261,11 @@ fn row_primary_closed_form(
     let dad1_dg = qd1 * c1;
 
     // Combined first derivatives of total NLL:
-    // u1 for η₀ terms = e0_k1 (entry)
-    // u1 for η₁ terms = e1_k1 + phi_u1 (exit + density)
+    // u1 for η₀ terms = -e0_k1 (chain rule through m = -η₀)
+    // u1 for η₁ terms = -e1_k1 + phi_u1 (chain rule through m = -η₁)
     // u1 for ad1 term = td_u1 (time derivative)
-    let u1_eta0 = e0_k1;
-    let u1_eta1 = e1_k1 + phi_u1;
+    let u1_eta0 = -e0_k1;
+    let u1_eta1 = -e1_k1 + phi_u1;
     let u1_ad1 = td_u1;
 
     let mut grad = [0.0_f64; N_PRIMARY];
@@ -352,7 +353,7 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Per-row NLL and its directional derivatives through 4 primary scalars.
     ///
-    /// NLL_i = w_i * [ (1-d)·neglogΦ(-η₁) − neglogΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
+    /// NLL_i = w_i * [ (1-d)·neglogΦ(-η₁) + logΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
     ///
     /// where η = a(t) + β·z, a(t) = q(t)·√(1+β²), β = g.
     ///
@@ -419,12 +420,12 @@ impl SurvivalMarginalSlopeFamily {
 
         // NLL_i = w_i * {
         //   (1-d_i) * neglogphi(-eta1)  [exit survival for censored]
-        //   - neglogphi(-eta0)           [entry survival, subtracted]
+        //   + log Phi(-eta0)            [entry survival from left truncation]
         //   - d_i * log_phi(eta1)        [event log-density of normal]
         //   - d_i * log(ad1)             [event log time-derivative]
         // }
 
-        // Entry survival term: -neglogphi(-eta0) = log Phi(-eta0) = log S(t0|z)
+        // Entry survival term: +log Phi(-eta0) = log S(t0|z)
         let neg_eta0 = eta0_jet.scale(-1.0);
         let entry_term = neg_eta0
             .compose_unary(unary_derivatives_neglog_phi(neg_eta0.coeff(0), wi))
@@ -1640,13 +1641,9 @@ impl SurvivalMarginalSlopeFamily {
         let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope) =
             (0..self.n)
                 .into_par_iter()
-                .fold(make_acc, |mut acc, row| {
-                    let (row_nll, f_pi, f_pipi) = match self
-                        .compute_row_primary_gradient_hessian_uncached(row, block_states)
-                    {
-                        Ok(v) => v,
-                        Err(_) => return acc,
-                    };
+                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                    let (row_nll, f_pi, f_pipi) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                     acc.0 -= row_nll;
 
                     {
@@ -1691,9 +1688,9 @@ impl SurvivalMarginalSlopeFamily {
                     self.logslope_design
                         .syr_row_into(row, f_pipi[[3, 3]], &mut acc.6)
                         .expect("survival logslope block syr should match block dimensions");
-                    acc
+                    Ok(acc)
                 })
-                .reduce(make_acc, |mut a, b| {
+                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
                     a.0 += b.0;
                     a.1 += &b.1;
                     a.2 += &b.2;
@@ -1701,8 +1698,8 @@ impl SurvivalMarginalSlopeFamily {
                     a.4 += &b.4;
                     a.5 += &b.5;
                     a.6 += &b.6;
-                    a
-                });
+                    Ok(a)
+                })?;
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
@@ -2018,8 +2015,28 @@ fn validate_standardized_z(
     let sd = var.sqrt();
     if mean.abs() > 1e-6 || (sd - 1.0).abs() > 1e-6 {
         return Err(format!(
-            "{context} requires z to be pre-standardized to weighted mean 0 and weighted sd 1; got mean={mean:.6e}, sd={sd:.6e}"
+            "{context} requires z to already represent a latent N(0,1) score; weighted mean 0 and weighted sd 1 are necessary sanity checks. got mean={mean:.6e}, sd={sd:.6e}"
         ));
+    }
+    if sd > 1e-12 {
+        let skew = z
+            .iter()
+            .zip(weights.iter())
+            .map(|(&zi, &wi)| wi * ((zi - mean) / sd).powi(3))
+            .sum::<f64>()
+            / weight_sum;
+        let kurt = z
+            .iter()
+            .zip(weights.iter())
+            .map(|(&zi, &wi)| wi * ((zi - mean) / sd).powi(4))
+            .sum::<f64>()
+            / weight_sum
+            - 3.0;
+        if skew.abs() > 0.5 || kurt.abs() > 1.5 {
+            log::warn!(
+                "{context}: z has skewness={skew:.3} and excess kurtosis={kurt:.3}; the Gaussian marginalization identity is only exact for Z~N(0,1). Results may be biased if z is not approximately normal."
+            );
+        }
     }
     Ok(())
 }
@@ -2082,6 +2099,20 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         return Err(format!(
             "survival-marginal-slope time block design column mismatch: entry={p_entry}, exit={p_exit}, deriv={p_deriv}"
         ));
+    }
+    if let Some(beta0) = &spec.time_block.initial_beta {
+        if let Some(beta0_slice) = beta0.as_slice() {
+            validate_monotone_wiggle_beta_nonnegative(
+                beta0_slice,
+                "survival-marginal-slope time_block initial_beta",
+            )?;
+        } else {
+            let beta0_values = beta0.iter().copied().collect::<Vec<_>>();
+            validate_monotone_wiggle_beta_nonnegative(
+                &beta0_values,
+                "survival-marginal-slope time_block initial_beta",
+            )?;
+        }
     }
     if !spec.time_block.structural_monotonicity {
         return Err(
@@ -2228,8 +2259,7 @@ pub fn fit_survival_marginal_slope_terms(
     let offset_exit = Arc::new(spec.time_block.offset_exit.clone());
     let derivative_offset_exit = Arc::new(spec.time_block.derivative_offset_exit.clone());
     let time_block_ref = spec.time_block.clone();
-    let time_linear_constraints =
-        monotone_wiggle_nonnegative_constraints(spec.time_block.design_exit.ncols());
+    let time_linear_constraints = monotone_wiggle_nonnegative_constraints(design_exit.ncols());
 
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign|
@@ -2269,8 +2299,11 @@ pub fn fit_survival_marginal_slope_terms(
         let rho_logslope = rho
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
+        let time_beta_hint = hints.0.as_ref().map(|beta| {
+            project_monotone_wiggle_beta(beta.clone())
+        });
         Ok(vec![
-            build_time_blockspec(&time_block_ref, &design_exit, rho_time, hints.0.clone()),
+            build_time_blockspec(&time_block_ref, &design_exit, rho_time, time_beta_hint),
             build_marginal_blockspec(marginal_design, rho_marginal, hints.1.clone()),
             build_logslope_blockspec(
                 logslope_design,
@@ -2415,6 +2448,7 @@ pub fn fit_survival_marginal_slope_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_family::CustomFamily;
     use ndarray::array;
 
     fn empty_termspec() -> TermCollectionSpec {
@@ -2511,5 +2545,157 @@ mod tests {
             err.contains("monotonicity violated at row 0"),
             "unexpected error: {err}"
         );
+    }
+
+    fn assert_close(lhs: f64, rhs: f64, tol: f64, label: &str) {
+        assert!(
+            (lhs - rhs).abs() <= tol,
+            "{label} mismatch: lhs={lhs:.12e}, rhs={rhs:.12e}, tol={tol:.3e}"
+        );
+    }
+
+    #[test]
+    fn closed_form_row_matches_exact_directional_derivatives() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.2]),
+            z: Arc::new(array![0.3]),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
+            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.8]])),
+            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.4]])),
+            offset_entry: Arc::new(array![0.1]),
+            offset_exit: Arc::new(array![-0.2]),
+            derivative_offset_exit: Arc::new(array![0.05]),
+            marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
+            logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
+            time_linear_constraints: None,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.4],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: array![-0.1],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.7],
+                eta: array![0.7],
+            },
+        ];
+
+        let (nll_closed, grad_closed, hess_closed) = family
+            .compute_row_primary_gradient_hessian_uncached(0, &block_states)
+            .expect("closed-form row derivatives");
+        let nll_exact = family
+            .row_neglog_directional(0, &block_states, &[])
+            .expect("exact row objective");
+        assert_close(nll_closed, nll_exact, 1e-12, "nll");
+
+        for a in 0..N_PRIMARY {
+            let dir_a = unit_primary_direction(a);
+            let grad_exact = family
+                .row_neglog_directional(0, &block_states, &[dir_a.clone()])
+                .expect("exact row gradient");
+            assert_close(grad_closed[a], grad_exact, 1e-10, &format!("grad[{a}]"));
+            for b in 0..N_PRIMARY {
+                let dir_b = unit_primary_direction(b);
+                let hess_exact = family
+                    .row_neglog_directional(0, &block_states, &[dir_a.clone(), dir_b])
+                    .expect("exact row hessian");
+                assert_close(
+                    hess_closed[[a, b]],
+                    hess_exact,
+                    1e-9,
+                    &format!("hess[{a},{b}]"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_newton_evaluation_propagates_invalid_rows() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            derivative_guard: 1e-4,
+            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.0]])),
+            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.0]])),
+            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![0.0]),
+            marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            time_linear_constraints: None,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.0],
+            },
+        ];
+
+        let err = family
+            .evaluate(&block_states)
+            .expect_err("invalid rows must abort exact-newton evaluation");
+        assert!(
+            err.contains("monotonicity violated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn structural_time_constraints_use_nonnegative_coefficient_cone() {
+        let constraints =
+            monotone_wiggle_nonnegative_constraints(2).expect("non-empty nonnegative cone");
+        assert_eq!(constraints.a, array![[1.0, 0.0], [0.0, 1.0]]);
+        assert_eq!(constraints.b, array![0.0, 0.0]);
+    }
+
+    #[test]
+    fn time_block_post_update_projects_negative_coefficients() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![1e-6]),
+            marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            time_linear_constraints: monotone_wiggle_nonnegative_constraints(2),
+        };
+        let spec = ParameterBlockSpec {
+            name: "time_surface".to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            offset: Array1::zeros(1),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let beta = family
+            .post_update_block_beta(&[], 0, &spec, array![-0.3, 0.2])
+            .expect("project time beta");
+        assert_eq!(beta, array![0.0, 0.2]);
     }
 }

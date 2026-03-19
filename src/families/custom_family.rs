@@ -315,7 +315,7 @@ pub struct BlockGeometryDirectionalDerivative {
 ///   links may provide Fisher weights; this is acceptable when the link is close to
 ///   canonical (small residual correction) but introduces a PQL-type approximation
 ///   for strongly non-canonical links.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum BlockWorkingSet {
     /// Standard IRLS/GLM-style diagonal working set for eta-space updates.
     Diagonal {
@@ -369,7 +369,7 @@ impl ExactOuterDerivativeOrder {
 }
 
 /// Family evaluation over all parameter blocks.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FamilyEvaluation {
     pub log_likelihood: f64,
     pub blockworking_sets: Vec<BlockWorkingSet>,

@@ -238,8 +238,9 @@ struct FitArgs {
     /// Bernoulli marginal-slope family.
     #[arg(long = "logslope-formula")]
     logslope_formula: Option<String>,
-    /// Column containing the already-standardized score z for the Bernoulli
-    /// marginal-slope family.
+    /// Column containing the latent-N(0,1) score z for the Bernoulli
+    /// marginal-slope family. Standardization alone does not justify the
+    /// closed form.
     #[arg(long = "z-column")]
     z_column: Option<String>,
     #[arg(long = "disable-score-warp", default_value_t = false)]
