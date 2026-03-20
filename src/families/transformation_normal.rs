@@ -26,7 +26,7 @@ use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_capability,
+    PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::families::gamlss::initializewiggle_knots_from_seed;
@@ -1886,23 +1886,12 @@ pub fn fit_transformation_normal(
         warm_start,
     )?;
     let probe_blocks = vec![probe_family.block_spec()];
-    let joint_cap = custom_family_outer_capability(
-        &probe_family,
-        &probe_blocks,
-        options,
-        joint_setup.rho_dim() + joint_setup.log_kappa_dim(),
-        joint_setup.log_kappa_dim(),
-    );
+    let (cap_gradient, cap_hessian) =
+        custom_family_outer_derivatives(&probe_family, &probe_blocks, options);
     let analytic_gradient = analytic_psi_available
-        && matches!(
-            joint_cap.gradient,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+        && matches!(cap_gradient, crate::solver::outer_strategy::Derivative::Analytic);
     let analytic_hessian = analytic_psi_available
-        && matches!(
-            joint_cap.hessian,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+        && matches!(cap_hessian, crate::solver::outer_strategy::Derivative::Analytic);
 
     // Shared mutable state for warm-starting across optimizer iterations.
     let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(None);

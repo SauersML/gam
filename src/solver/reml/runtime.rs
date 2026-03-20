@@ -2585,71 +2585,61 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    /// Build the soft prior tuple for the given mode.
-    fn build_prior(
-        &self,
-        rho: &Array1<f64>,
-        mode: super::unified::EvalMode,
-    ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
-        if mode == super::unified::EvalMode::ValueOnly {
-            let pc = self.compute_soft_priorcost(rho);
-            if pc.abs() > 0.0 {
-                Some((pc, Array1::zeros(rho.len()), None))
-            } else {
-                None
-            }
-        } else {
-            let pc = self.compute_soft_priorcost(rho);
-            let pg = self.compute_soft_priorgrad(rho);
-            let ph = if mode == super::unified::EvalMode::ValueGradientHessian {
-                self.compute_soft_priorhess(rho)
-            } else {
-                None
-            };
-            if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
-                Some((pc, pg, ph))
-            } else {
-                None
-            }
-        }
-    }
-
-    /// Single assembly point: build `InnerSolution`, compute prior, call
-    /// `reml_laml_evaluate`, and apply TK correction.
+    /// Build an `InnerAssembly` using the dense-transformed backend.
     ///
-    /// All `evaluate_unified*` methods funnel through here. The only variations
-    /// are the pre-computed ingredients (dense vs sparse Hessian operator,
-    /// transformed vs original-basis beta, etc.) and optional ext_coords.
-    fn assemble_and_evaluate(
+    /// Shared ingredient builder for all dense-spectral evaluation paths
+    /// (normal, ext-coord, and EFS). Callers may set `ext_coords` and pair
+    /// functions on the returned assembly before passing it to
+    /// `assemble_and_evaluate` or `assemble_and_evaluate_efs`.
+    fn build_dense_assembly(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
-        hessian_op: Box<dyn super::unified::HessianOperator>,
-        beta: Array1<f64>,
-        penalty_logdet: super::unified::PenaltyLogdetDerivs,
-        deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
-        tk_correction: f64,
-        tk_gradient: Option<Array1<f64>>,
-        firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
-        nullspace_dim: f64,
-        dispersion: super::unified::DispersionHandling,
-        log_likelihood: f64,
-        penalty_quadratic: f64,
-        barrier_config: Option<super::unified::BarrierConfig>,
-        ext_coords: Vec<super::unified::HyperCoord>,
-        ext_coord_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-        rho_ext_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        let prior = self.build_prior(rho, mode);
+    ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
+        use super::unified::DenseSpectralOperator;
 
-        let result = super::assembly::InnerAssembly {
+        let pirls_result = bundle.pirls_result.as_ref();
+        let ridge_passport = pirls_result.ridge_passport;
+
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
+            (
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+                pirls_result.reparam_result.e_transformed.dot(z),
+            )
+        } else {
+            (
+                bundle.h_total.as_ref().clone(),
+                pirls_result.reparam_result.e_transformed.clone(),
+            )
+        };
+
+        let hessian_op = Box::new(
+            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "DenseSpectralOperator from PIRLS Hessian: {e}"
+                ))
+            })?,
+        );
+
+        let (penalty_rank, penalty_logdet) =
+            self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
+
+        let beta = if let Some(z) = free_basis_opt.as_ref() {
+            z.t().dot(&pirls_result.beta_transformed.as_ref().to_owned())
+        } else {
+            pirls_result.beta_transformed.as_ref().clone()
+        };
+
+        let nullspace_dim = h_for_operator.ncols().saturating_sub(penalty_rank) as f64;
+
+        let (deriv_provider, dispersion, tk_correction, tk_gradient, log_likelihood, firth_op, barrier_config) =
+            self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
+
+        Ok(super::assembly::InnerAssembly {
             log_likelihood,
-            penalty_quadratic,
+            penalty_quadratic: pirls_result.stable_penalty_term,
             beta,
             n_observations: self.y.len(),
             hessian_op,
@@ -2662,55 +2652,134 @@ impl<'a> RemlState<'a> {
             firth: firth_op,
             nullspace_dim: Some(nullspace_dim),
             barrier_config,
-            ext_coords,
-            ext_coord_pair_fn,
-            rho_ext_pair_fn,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
-        }
-        .evaluate(rho.as_slice().unwrap(), mode, prior)
-        .map_err(EstimationError::InvalidInput)?;
+        })
+    }
 
+    /// Build an `InnerAssembly` using the sparse-exact backend.
+    ///
+    /// Shared ingredient builder for all sparse Cholesky evaluation paths.
+    fn build_sparse_assembly(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+    ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
+        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
+
+        let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
+        })?;
+        let pirls_result = bundle.pirls_result.as_ref();
+
+        let beta = self.sparse_exact_beta_original(pirls_result);
+        let p_dim = beta.len();
+        let hessian_op: Box<dyn HessianOperator> = {
+            let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
+            if let Some(ref taka) = sparse.takahashi {
+                op = op.with_takahashi(taka.clone());
+            }
+            Box::new(op)
+        };
+
+        log::trace!(
+            "SparseCholeskyOperator: dim={}, active_rank={}",
+            hessian_op.dim(),
+            hessian_op.active_rank()
+        );
+
+        let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
+        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
+            let lambdas = rho.mapv(f64::exp);
+            let (_, det2) = self.structural_penalty_logdet_derivatives_block_local(
+                &lambdas,
+                bundle.ridge_passport.penalty_logdet_ridge(),
+            )?;
+            Some(det2)
+        } else {
+            None
+        };
+        let penalty_logdet = PenaltyLogdetDerivs {
+            value: sparse.logdet_s_pos,
+            first: sparse.det1_values.as_ref().clone(),
+            second: det2,
+        };
+
+        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
+            self.build_sparse_derivative_context(pirls_result, bundle)?;
+
+        Ok(super::assembly::InnerAssembly {
+            log_likelihood,
+            penalty_quadratic: pirls_result.stable_penalty_term,
+            beta,
+            n_observations: self.y.len(),
+            hessian_op,
+            penalty_coords: self.build_penalty_coords(),
+            penalty_logdet,
+            dispersion,
+            deriv_provider: Some(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: firth_op,
+            nullspace_dim: Some(mp),
+            barrier_config,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+        })
+    }
+
+    /// Build the soft prior tuple for the given mode.
+    fn build_prior(
+        &self,
+        rho: &Array1<f64>,
+        mode: super::unified::EvalMode,
+    ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
+        super::assembly::soft_prior_for_mode(
+            rho,
+            mode,
+            |r| self.compute_soft_priorcost(r),
+            |r| self.compute_soft_priorgrad(r),
+            |r| self.compute_soft_priorhess(r),
+        )
+    }
+
+    /// Single assembly point: evaluate an `InnerAssembly`, compute prior, and
+    /// apply TK correction.
+    ///
+    /// All `evaluate_unified*` methods funnel through here.
+    fn assemble_and_evaluate(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+        assembly: super::assembly::InnerAssembly<'static>,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        let prior = self.build_prior(rho, mode);
+        let result = assembly
+            .evaluate(rho.as_slice().unwrap(), mode, prior)
+            .map_err(EstimationError::InvalidInput)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
         Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
 
-    /// Single assembly point for EFS: build `InnerSolution`, compute cost
-    /// (and gradient when ψ coords are present), return EFS step vector.
+    /// Single assembly point for EFS: build `InnerSolution` from an assembly,
+    /// compute cost (and gradient when ψ coords are present), return EFS step
+    /// vector with TK cost correction applied.
     fn assemble_and_evaluate_efs(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        hessian_op: Box<dyn super::unified::HessianOperator>,
-        beta: Array1<f64>,
-        penalty_logdet: super::unified::PenaltyLogdetDerivs,
-        deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
-        tk_correction: f64,
-        firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
-        nullspace_dim: f64,
-        dispersion: super::unified::DispersionHandling,
-        log_likelihood: f64,
-        penalty_quadratic: f64,
-        barrier_config: Option<super::unified::BarrierConfig>,
+        assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        use super::unified::{
-            InnerSolutionBuilder, compute_efs_update,
-            compute_hybrid_efs_update, reml_laml_evaluate,
-        };
+        use super::unified::{compute_efs_update, compute_hybrid_efs_update};
 
-        let n_observations = self.y.len();
-        let beta_for_barrier = beta.clone();
-        let penalty_coords = self.build_penalty_coords();
-
-        let inner_solution = InnerSolutionBuilder::new(
-            log_likelihood, penalty_quadratic, beta, n_observations,
-            hessian_op, penalty_coords, penalty_logdet, dispersion,
-        )
-        .deriv_provider(deriv_provider)
-        .tk(tk_correction, None)
-        .firth(firth_op)
-        .nullspace_dim_override(nullspace_dim)
-        .barrier_config(barrier_config)
-        .build();
+        let beta_for_barrier = assembly.beta.clone();
+        let inner_solution = assembly.build();
 
         let has_psi = inner_solution.ext_coords.iter().any(|c| !c.is_penalty_like);
         let eval_mode = if has_psi {
@@ -2719,22 +2788,10 @@ impl<'a> RemlState<'a> {
             super::unified::EvalMode::ValueOnly
         };
 
-        let prior = {
-            let pc = self.compute_soft_priorcost(rho);
-            if pc.abs() > 0.0 {
-                let prior_grad = if has_psi {
-                    self.compute_soft_priorgrad(rho)
-                } else {
-                    Array1::zeros(rho.len())
-                };
-                Some((pc, prior_grad, None))
-            } else {
-                None
-            }
-        };
-        let cost_result = reml_laml_evaluate(
+        let prior = self.build_prior(rho, eval_mode);
+        let cost_result = super::assembly::evaluate_solution(
             &inner_solution, rho.as_slice().unwrap(), eval_mode, prior,
-        ).map_err(|e| EstimationError::InvalidInput(e))?;
+        ).map_err(EstimationError::InvalidInput)?;
 
         let efs_eval = if has_psi {
             let gradient = cost_result.gradient.as_ref().expect(
@@ -2791,123 +2848,34 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        self.evaluate_unified_with_ext_from_bundle(
-            rho, bundle, mode, Vec::new(), None, None,
-        )
+        self.assemble_and_evaluate(rho, bundle, mode,
+            self.build_dense_assembly(rho, bundle, mode)?)
     }
 
-    /// Sparse-exact bridge: builds a `SparseCholeskyOperator` from the pre-computed
-    /// sparse Cholesky factor and delegates to the unified evaluator.
+    /// Sparse-exact bridge: delegates to `build_sparse_assembly` + `assemble_and_evaluate`.
     pub fn evaluate_unified_sparse(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
-
-        let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
-        })?;
-        let pirls_result = bundle.pirls_result.as_ref();
-
-        // Beta in original coordinates (sparse native).
-        let beta = self.sparse_exact_beta_original(pirls_result);
-        let p_dim = beta.len();
-
-        // Build HessianOperator from the sparse Cholesky factor, with Takahashi
-        // selected inverse for O(nnz) trace computations when available.
-        let hessian_op: Box<dyn HessianOperator> = {
-            let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
-            if let Some(ref taka) = sparse.takahashi {
-                op = op.with_takahashi(taka.clone());
-            }
-            Box::new(op)
-        };
-
-        log::trace!(
-            "SparseCholeskyOperator: dim={}, active_rank={}",
-            hessian_op.dim(),
-            hessian_op.active_rank()
-        );
-
-        // Nullspace dimension.
-        let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
-
-        // Penalty logdet second derivatives (for outer Hessian).
-        // Use block-local path to avoid O(p³) eigendecomposition.
-        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
-            let lambdas = rho.mapv(f64::exp);
-            let (_, det2) = self.structural_penalty_logdet_derivatives_block_local(
-                &lambdas,
-                bundle.ridge_passport.penalty_logdet_ridge(),
-            )?;
-            Some(det2)
-        } else {
-            None
-        };
-
-        // Penalty log-determinant derivatives from sparse data.
-        let penalty_logdet = PenaltyLogdetDerivs {
-            value: sparse.logdet_s_pos,
-            first: sparse.det1_values.as_ref().clone(),
-            second: det2,
-        };
-
-        // Build the family-dependent context (dispersion, deriv provider,
-        // Firth, barrier) via the shared sparse helper.
-        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
-            self.build_sparse_derivative_context(pirls_result, bundle)?;
-
-        self.assemble_and_evaluate(
-            rho, bundle, mode, hessian_op, beta, penalty_logdet,
-            deriv_provider, 0.0, None, firth_op, mp, dispersion,
-            log_likelihood, pirls_result.stable_penalty_term,
-            barrier_config, Vec::new(), None, None,
-        )
+        let assembly = self.build_sparse_assembly(rho, bundle, mode)?;
+        self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
-    /// Builds the InnerSolution from a sparse eval bundle and returns EFS steps.
-    /// Sparse-exact EFS bridge: builds sparse Hessian operator and delegates
-    /// to `assemble_and_evaluate_efs`.
+    /// Sparse-exact EFS bridge: delegates to `build_sparse_assembly` +
+    /// `assemble_and_evaluate_efs`.
     fn evaluate_unified_sparse_for_efs(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
-
-        let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
-        })?;
-        let pirls_result = bundle.pirls_result.as_ref();
-
-        let beta = self.sparse_exact_beta_original(pirls_result);
-        let p_dim = beta.len();
-        let hessian_op: Box<dyn HessianOperator> = {
-            let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
-            if let Some(ref taka) = sparse.takahashi {
-                op = op.with_takahashi(taka.clone());
-            }
-            Box::new(op)
-        };
-
-        let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
-        let penalty_logdet = PenaltyLogdetDerivs {
-            value: sparse.logdet_s_pos,
-            first: sparse.det1_values.as_ref().clone(),
-            second: None,
-        };
-
-        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
-            self.build_sparse_derivative_context(pirls_result, bundle)?;
-
-        self.assemble_and_evaluate_efs(
-            rho, bundle, hessian_op, beta, penalty_logdet, deriv_provider,
-            0.0, firth_op, mp, dispersion, log_likelihood,
-            pirls_result.stable_penalty_term, barrier_config,
-            Vec::new(), None, None,
-        )
+        let mut assembly = self.build_sparse_assembly(
+            rho, bundle, super::unified::EvalMode::ValueOnly,
+        )?;
+        // EFS doesn't use TK gradient.
+        assembly.tk_gradient = None;
+        self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
 
     /// Evaluate the unified REML/LAML objective with anisotropic ψ ext_coords
@@ -2990,33 +2958,20 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Dense-transformed bridge with optional ext_coords. Dispatches to the
-    /// original-basis path when QS-transformed but unconstrained.
-    fn evaluate_unified_with_ext_from_bundle(
+    /// Prepare ingredients for the dense-reparam evaluation path.
+    ///
+    /// Shared between the normal, ext-coord, and EFS dense paths.
+    /// Returns an `InnerAssembly` without ext_coords — the caller injects
+    /// those before evaluating.
+    fn prepare_dense_reparam_assembly(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        ext_coords: Vec<super::unified::HyperCoord>,
-        ext_coord_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-        rho_ext_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        penalty_logdet_mode: super::unified::EvalMode,
+    ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::unified::DenseSpectralOperator;
 
         let pirls_result = bundle.pirls_result.as_ref();
-        if matches!(
-            pirls_result.coordinate_frame,
-            pirls::PirlsCoordinateFrame::TransformedQs
-        ) && self.active_constraint_free_basis(pirls_result).is_none()
-        {
-            return self.evaluate_unified_dense_original_with_ext_from_bundle(
-                rho, bundle, mode, ext_coords, ext_coord_pair_fn, rho_ext_pair_fn,
-            );
-        }
         let ridge_passport = pirls_result.ridge_passport;
 
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
@@ -3035,13 +2990,13 @@ impl<'a> RemlState<'a> {
         let hessian_op = Box::new(
             DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
                 EstimationError::InvalidInput(format!(
-                    "DenseSpectralOperator from PIRLS Hessian (psi-ext): {e}"
+                    "DenseSpectralOperator from PIRLS Hessian: {e}"
                 ))
             })?,
         );
 
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
-            rho, &e_for_logdet, &[], ridge_passport, mode,
+            rho, &e_for_logdet, &[], ridge_passport, penalty_logdet_mode,
         )?;
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
@@ -3056,13 +3011,59 @@ impl<'a> RemlState<'a> {
         let (deriv_provider, dispersion, tk_correction, tk_gradient, log_likelihood, firth_op, barrier_config) =
             self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
 
-        self.assemble_and_evaluate(
-            rho, bundle, mode, hessian_op, beta, penalty_logdet,
-            deriv_provider, tk_correction, tk_gradient, firth_op,
-            nullspace_dim, dispersion, log_likelihood,
-            pirls_result.stable_penalty_term, barrier_config,
-            ext_coords, ext_coord_pair_fn, rho_ext_pair_fn,
-        )
+        Ok(super::assembly::InnerAssembly {
+            log_likelihood,
+            penalty_quadratic: pirls_result.stable_penalty_term,
+            beta,
+            n_observations: self.y.len(),
+            hessian_op,
+            penalty_coords: self.build_penalty_coords(),
+            penalty_logdet,
+            dispersion,
+            deriv_provider: Some(deriv_provider),
+            tk_correction,
+            tk_gradient,
+            firth: firth_op,
+            nullspace_dim: Some(nullspace_dim),
+            barrier_config,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+        })
+    }
+
+    /// Dense-transformed bridge with optional ext_coords. Dispatches to the
+    /// original-basis path when QS-transformed but unconstrained.
+    fn evaluate_unified_with_ext_from_bundle(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+        ext_coords: Vec<super::unified::HyperCoord>,
+        ext_coord_pair_fn: Option<
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        >,
+        rho_ext_pair_fn: Option<
+            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+        >,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        let pirls_result = bundle.pirls_result.as_ref();
+        if matches!(
+            pirls_result.coordinate_frame,
+            pirls::PirlsCoordinateFrame::TransformedQs
+        ) && self.active_constraint_free_basis(pirls_result).is_none()
+        {
+            return self.evaluate_unified_dense_original_with_ext_from_bundle(
+                rho, bundle, mode, ext_coords, ext_coord_pair_fn, rho_ext_pair_fn,
+            );
+        }
+
+        let mut assembly = self.build_dense_assembly(rho, bundle, mode)?;
+        assembly.ext_coords = ext_coords;
+        assembly.ext_coord_pair_fn = ext_coord_pair_fn;
+        assembly.rho_ext_pair_fn = rho_ext_pair_fn;
+        self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
     /// Dense original-basis bridge with ext_coords.
@@ -3079,37 +3080,11 @@ impl<'a> RemlState<'a> {
             Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
         >,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        use super::unified::DenseSpectralOperator;
-
-        let pirls_result = bundle.pirls_result.as_ref();
-        let ridge_passport = pirls_result.ridge_passport;
-        let h_total_original =
-            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
-        let hessian_op = Box::new(
-            DenseSpectralOperator::from_symmetric(&h_total_original).map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "DenseSpectralOperator from original-basis PIRLS Hessian (psi-ext): {e}"
-                ))
-            })?,
-        );
-
-        let e_for_logdet = pirls_result.reparam_result.e_transformed.clone();
-        let (penalty_rank, penalty_logdet) =
-            self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
-
-        let beta = self.sparse_exact_beta_original(pirls_result);
-        let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
-
-        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
-            self.build_sparse_derivative_context(pirls_result, bundle)?;
-
-        self.assemble_and_evaluate(
-            rho, bundle, mode, hessian_op, beta, penalty_logdet,
-            deriv_provider, 0.0, None, firth_op,
-            nullspace_dim, dispersion, log_likelihood,
-            pirls_result.stable_penalty_term, barrier_config,
-            ext_coords, ext_coord_pair_fn, rho_ext_pair_fn,
-        )
+        let mut assembly = self.build_dense_original_assembly(rho, bundle, mode)?;
+        assembly.ext_coords = ext_coords;
+        assembly.ext_coord_pair_fn = ext_coord_pair_fn;
+        assembly.rho_ext_pair_fn = rho_ext_pair_fn;
+        self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
     /// Sparse-exact bridge for unified evaluation with extended τ/ψ coordinates.
@@ -3130,50 +3105,11 @@ impl<'a> RemlState<'a> {
             Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
         >,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
-
-        let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
-        })?;
-        let pirls_result = bundle.pirls_result.as_ref();
-
-        let beta = self.sparse_exact_beta_original(pirls_result);
-        let p_dim = beta.len();
-        let hessian_op: Box<dyn HessianOperator> = {
-            let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
-            if let Some(ref taka) = sparse.takahashi {
-                op = op.with_takahashi(taka.clone());
-            }
-            Box::new(op)
-        };
-
-        let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
-        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
-            let lambdas = rho.mapv(f64::exp);
-            let (_, det2) = self.structural_penalty_logdet_derivatives_block_local(
-                &lambdas,
-                bundle.ridge_passport.penalty_logdet_ridge(),
-            )?;
-            Some(det2)
-        } else {
-            None
-        };
-        let penalty_logdet = PenaltyLogdetDerivs {
-            value: sparse.logdet_s_pos,
-            first: sparse.det1_values.as_ref().clone(),
-            second: det2,
-        };
-
-        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
-            self.build_sparse_derivative_context(pirls_result, bundle)?;
-
-        self.assemble_and_evaluate(
-            rho, bundle, mode, hessian_op, beta, penalty_logdet,
-            deriv_provider, 0.0, None, firth_op,
-            mp, dispersion, log_likelihood,
-            pirls_result.stable_penalty_term, barrier_config,
-            ext_coords, ext_coord_pair_fn, rho_ext_pair_fn,
-        )
+        let mut assembly = self.build_sparse_assembly(rho, bundle, mode)?;
+        assembly.ext_coords = ext_coords;
+        assembly.ext_coord_pair_fn = ext_coord_pair_fn;
+        assembly.rho_ext_pair_fn = rho_ext_pair_fn;
+        self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
     /// Compute EFS (Extended Fellner-Schall) evaluation: runs the inner solve
@@ -3210,81 +3146,16 @@ impl<'a> RemlState<'a> {
     }
 
     /// Builds the InnerSolution from an eval bundle and returns EFS steps.
-    /// Dense EFS bridge: mirrors `evaluate_unified` but delegates to `assemble_and_evaluate_efs`.
+    /// Dense EFS bridge: reuses `prepare_dense_reparam_assembly`.
     fn evaluate_unified_for_efs(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        use super::unified::DenseSpectralOperator;
-
-        let pirls_result = bundle.pirls_result.as_ref();
-        let ridge_passport = pirls_result.ridge_passport;
-
-        // Constraint projection (same as evaluate_unified).
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
-            (
-                Self::projectwith_basis(bundle.h_total.as_ref(), z),
-                pirls_result.reparam_result.e_transformed.dot(z),
-            )
-        } else {
-            (
-                bundle.h_total.as_ref().clone(),
-                pirls_result.reparam_result.e_transformed.clone(),
-            )
-        };
-
-        let hessian_op = Box::new(
-            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "DenseSpectralOperator from PIRLS Hessian (EFS): {e}"
-                ))
-            })?,
-        );
-
-        let (penalty_rank, ..) =
-            self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
-
-        let (_, penalty_logdet) = self.dense_penalty_logdet_derivs(
-            rho,
-            &e_for_logdet,
-            &[], // Block-local path via canonical_penalties handles logdet
-            ridge_passport,
-            super::unified::EvalMode::ValueOnly,
+        let assembly = self.prepare_dense_reparam_assembly(
+            rho, bundle, super::unified::EvalMode::ValueOnly,
         )?;
-
-        let beta = if let Some(z) = free_basis_opt.as_ref() {
-            z.t()
-                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
-        } else {
-            pirls_result.beta_transformed.as_ref().clone()
-        };
-
-        let p_eff_dim = h_for_operator.ncols();
-        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
-
-        // Build derivative context via the shared helper. Even though pure EFS
-        // is usually value-only, the hybrid EFS path requests gradients for ψ
-        // coordinates, so the Hessian-derivative provider must stay Firth-aware
-        // when the exact Jeffreys term is active.
-        let (
-            deriv_provider,
-            dispersion,
-            tk_correction,
-            _,
-            log_likelihood,
-            firth_op,
-            barrier_config,
-        ) = self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
-
-        self.assemble_and_evaluate_efs(
-            rho, bundle, hessian_op, beta, penalty_logdet,
-            deriv_provider, tk_correction, firth_op,
-            nullspace_dim, dispersion, log_likelihood,
-            pirls_result.stable_penalty_term, barrier_config,
-            Vec::new(), None, None,
-        )
+        self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
 
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -3381,5 +3252,140 @@ impl<'a> RemlState<'a> {
         // coords is left to BFGS (HessianResult::Unavailable). This matches
         // the current behavior where link parameters have gradient-only.
         self.evaluate_unified_with_ext_from_bundle(rho, &bundle, mode, ext_coords, None, None)
+    }
+
+    /// EFS evaluation with link-parameter ext_coords injected.
+    ///
+    /// This is the hybrid EFS counterpart of [`evaluate_unified_with_link_ext`].
+    /// The ρ coordinates receive standard EFS multiplicative updates while the
+    /// link parameters (ψ) receive preconditioned gradient steps via the Gram
+    /// matrix `G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)`.
+    ///
+    /// The returned `EfsEval` has `steps` of length `k + aux_dim` where
+    /// `k` is the number of ρ coordinates and `aux_dim` is the number of link
+    /// parameters. The caller is responsible for applying SAS reparameterization
+    /// chain rules to the ψ gradient/steps as needed.
+    pub fn compute_efs_steps_with_link_ext(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+        if self.config.firth_bias_reduction {
+            return Err(EstimationError::InvalidInput(
+                "link-parameter ext_coord optimization is incompatible with \
+                 Firth-adjusted outer gradients"
+                    .to_string(),
+            ));
+        }
+
+        let bundle = self.obtain_eval_bundle(rho)?;
+
+        // Build link ext_coords from the current runtime link state.
+        let ext_coords = if let Some(sas_state) = &self.runtime_sas_link_state {
+            let is_beta_logistic = matches!(
+                self.config.link_function(),
+                crate::types::LinkFunction::BetaLogistic
+            );
+            self.build_sas_link_ext_coords(&bundle, sas_state, is_beta_logistic)?
+        } else if let Some(mix_state) = &self.runtime_mixture_link_state {
+            self.build_mixture_link_ext_coords(&bundle, mix_state)?
+        } else {
+            Vec::new()
+        };
+
+        if ext_coords.is_empty() {
+            // No link parameters — fall back to standard EFS.
+            return self.compute_efs_steps(rho);
+        }
+
+        // Dense EFS with link ext_coords injected.
+        self.evaluate_unified_for_efs_with_ext(rho, &bundle, ext_coords)
+    }
+
+    /// Dense EFS bridge with ext_coords: mirrors `evaluate_unified_for_efs` but
+    /// injects ext_coords into the `InnerAssembly`.
+    fn evaluate_unified_for_efs_with_ext(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        ext_coords: Vec<super::unified::HyperCoord>,
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+        use super::unified::DenseSpectralOperator;
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let ridge_passport = pirls_result.ridge_passport;
+
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
+            (
+                Self::projectwith_basis(bundle.h_total.as_ref(), z),
+                pirls_result.reparam_result.e_transformed.dot(z),
+            )
+        } else {
+            (
+                bundle.h_total.as_ref().clone(),
+                pirls_result.reparam_result.e_transformed.clone(),
+            )
+        };
+
+        let hessian_op = Box::new(
+            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "DenseSpectralOperator from PIRLS Hessian (hybrid EFS link): {e}"
+                ))
+            })?,
+        );
+
+        let (penalty_rank, ..) =
+            self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
+
+        let (_, penalty_logdet) = self.dense_penalty_logdet_derivs(
+            rho,
+            &e_for_logdet,
+            &[],
+            ridge_passport,
+            super::unified::EvalMode::ValueOnly,
+        )?;
+
+        let beta = if let Some(z) = free_basis_opt.as_ref() {
+            z.t()
+                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
+        } else {
+            pirls_result.beta_transformed.as_ref().clone()
+        };
+
+        let p_eff_dim = h_for_operator.ncols();
+        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
+
+        let (
+            deriv_provider,
+            dispersion,
+            tk_correction,
+            _,
+            log_likelihood,
+            firth_op,
+            barrier_config,
+        ) = self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
+
+        let assembly = super::assembly::InnerAssembly {
+            log_likelihood,
+            penalty_quadratic: pirls_result.stable_penalty_term,
+            beta,
+            n_observations: self.y.len(),
+            hessian_op,
+            penalty_coords: self.build_penalty_coords(),
+            penalty_logdet,
+            dispersion,
+            deriv_provider: Some(deriv_provider),
+            tk_correction,
+            tk_gradient: None,
+            firth: firth_op,
+            nullspace_dim: Some(nullspace_dim),
+            barrier_config,
+            ext_coords,
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+        };
+        self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
 }

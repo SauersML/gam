@@ -4,7 +4,7 @@ use crate::custom_family::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, build_block_spatial_psi_derivatives, cost_gated_outer_order,
-    custom_family_outer_capability, evaluate_custom_family_joint_hyper, first_psi_linear_map,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper, first_psi_linear_map,
     fit_custom_family, second_psi_linear_map,
 };
 use crate::estimate::UnifiedFitResult;
@@ -3428,21 +3428,16 @@ pub fn fit_survival_marginal_slope_terms(
     let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
     let initial_family = make_family(&marginal_design, &logslope_design);
-    let joint_cap = custom_family_outer_capability(
-        &initial_family,
-        &initial_blocks,
-        options,
-        setup.theta0().len(),
-        setup.log_kappa_dim(),
-    );
+    let (joint_gradient, joint_hessian) =
+        custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
         && matches!(
-            joint_cap.gradient,
+            joint_gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
         && matches!(
-            joint_cap.hessian,
+            joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
         );
 
