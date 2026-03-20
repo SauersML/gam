@@ -7,13 +7,13 @@
 //! All families and runtime paths provide ingredients and call
 //! [`InnerAssembly::evaluate`] or [`InnerAssembly::build`].
 
+use super::FirthDenseOperator;
 use super::unified::{
     BarrierConfig, DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
     HessianOperator, HyperCoord, HyperCoordPair, InnerSolution, InnerSolutionBuilder,
     PenaltyCoordinate, PenaltyLogdetDerivs, RemlLamlResult, penalty_matrix_root,
     reml_laml_evaluate,
 };
-use super::FirthDenseOperator;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
@@ -47,10 +47,8 @@ pub struct InnerAssembly<'dp> {
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,
-    pub ext_coord_pair_fn:
-        Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
-    pub rho_ext_pair_fn:
-        Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     pub fixed_drift_deriv: Option<FixedDriftDerivFn>,
 }
 

@@ -15,8 +15,7 @@ use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, DriftDerivResult, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    MatrixFreeSpdOperator,
-    compute_block_penalty_logdet_derivs, exact_intersection_nullity,
+    MatrixFreeSpdOperator, compute_block_penalty_logdet_derivs, exact_intersection_nullity,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -4029,12 +4028,8 @@ fn rank_reduce_constraint_rows(
     }
 
     // Row norms for tolerance scaling.
-    let row_norms: Vec<f64> = (0..k)
-        .map(|i| a.row(i).dot(&a.row(i)).sqrt())
-        .collect();
-    let max_norm = row_norms
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v));
+    let row_norms: Vec<f64> = (0..k).map(|i| a.row(i).dot(&a.row(i)).sqrt()).collect();
+    let max_norm = row_norms.iter().fold(0.0_f64, |acc, &v| acc.max(v));
     // Rank tolerance: rows whose orthogonal residual (relative to the
     // accepted basis) falls below this are considered dependent.  The
     // eps^{2/3} · max_norm heuristic is standard for numerical rank
@@ -5143,9 +5138,7 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
     // Try the rescaled logdet path first — it returns (H_scaled, L) where
     // H_scaled = exp(-L) * H_exact, avoiding exp(u) overflow entirely.
     // When L = 0 (no rescaling needed), this reduces to the normal path.
-    if let Some((h_raw, deriv_log_scale)) =
-        family.exact_newton_joint_hessian_for_logdet(states)?
-    {
+    if let Some((h_raw, deriv_log_scale)) = family.exact_newton_joint_hessian_for_logdet(states)? {
         let mut h_joint = symmetrized_square_matrix(
             h_raw,
             total,
@@ -5328,15 +5321,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     } else {
         family.exact_newton_joint_hessian(&states)?.is_some()
     };
-    let inner_tol = if has_joint_exacthessian {
+    let has_constraints = specs.iter().enumerate().any(|(b, s)| {
+        family
+            .block_linear_constraints(&states, b, s)
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    let use_joint_newton = has_joint_exacthessian && !has_constraints && specs.len() >= 2;
+    // Tighten tolerance and raise cycle cap only when the joint Newton
+    // path will actually be used.  Joint Newton converges quadratically
+    // (5-10 steps), so 1e-10 tolerance and 4000 cap are safe.  The
+    // blockwise fallback converges linearly and would waste thousands of
+    // cycles trying to reach 1e-10.
+    let inner_tol = if use_joint_newton {
         options.inner_tol.min(1e-10)
     } else {
         options.inner_tol
     };
-    // Allow many cycles for exact Newton — convergence checks will exit
-    // early when the stationarity residual is small. The high cap is a
-    // safety net for ill-conditioned problems, not a target.
-    let inner_max_cycles = if has_joint_exacthessian {
+    let inner_max_cycles = if use_joint_newton {
         options.inner_max_cycles.max(4000)
     } else {
         options.inner_max_cycles
@@ -5385,14 +5388,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     //
     // Falls back to blockwise iteration if the joint Hessian is unavailable,
     // the joint solve fails, or constraints are present.
-    let has_constraints = specs.iter().enumerate().any(|(b, s)| {
-        family
-            .block_linear_constraints(&states, b, s)
-            .ok()
-            .flatten()
-            .is_some()
-    });
-    let use_joint_newton = has_joint_exacthessian && !has_constraints && specs.len() >= 2;
+    // (has_constraints and use_joint_newton already computed above for tol/cap gating.)
 
     if use_joint_newton {
         // Build block ranges for the joint system.
@@ -5759,8 +5755,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // terms (e.g. log(h') in transformation-normal) report the maximum
             // feasible step fraction so the line search never evaluates the
             // likelihood outside its domain.
-            let barrier_ceiling =
-                family.max_feasible_step_size(&states, b, &delta)?.unwrap_or(1.0);
+            let barrier_ceiling = family
+                .max_feasible_step_size(&states, b, &delta)?
+                .unwrap_or(1.0);
             // Reuse trial_beta_buf to avoid allocation per backtracking trial.
             let mut trial_beta_buf = beta_old.clone();
             for bt in 0..8 {
@@ -6012,7 +6009,9 @@ fn unified_joint_cost_gradient(
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-    use crate::estimate::reml::assembly::{InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks};
+    use crate::estimate::reml::assembly::{
+        InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
+    };
 
     // Collect dense penalty matrices so references stay valid for the assembler.
     let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = specs
@@ -6022,13 +6021,13 @@ fn unified_joint_cost_gradient(
     let block_descs: Vec<PenaltyBlockDesc> = (0..specs.len())
         .flat_map(|b| {
             let (start, end) = ranges[b];
-            per_block_penalties_dense[b].iter().map(move |dense| {
-                PenaltyBlockDesc {
+            per_block_penalties_dense[b]
+                .iter()
+                .map(move |dense| PenaltyBlockDesc {
                     matrix: dense,
                     range_start: start,
                     range_end: end,
-                }
-            })
+                })
         })
         .collect();
     let penalty_coords = penalty_coords_from_blocks(&block_descs, total)?;
@@ -6057,7 +6056,12 @@ fn unified_joint_cost_gradient(
     // Unpack optional ext-coord bundle.
     let (ext_coords, ext_coord_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) =
         if let Some(bundle) = ext_bundle {
-            (bundle.coords, bundle.ext_ext_fn, bundle.rho_ext_fn, bundle.drift_fn)
+            (
+                bundle.coords,
+                bundle.ext_ext_fn,
+                bundle.rho_ext_fn,
+                bundle.drift_fn,
+            )
         } else {
             (Vec::new(), None, None, None)
         };
@@ -10262,28 +10266,28 @@ mod tests {
     #[test]
     fn rank_reduce_drops_exactly_dependent_row() {
         // Row 3 = Row 1 + Row 2 exactly. Rank reduction should drop it.
-        let a = array![
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [1.0, 1.0, 0.0],
-        ];
+        let a = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],];
         let b = array![0.0, 0.0, 0.0];
         let groups = vec![vec![0], vec![1], vec![2]];
         let (a_out, b_out, groups_out) = rank_reduce_constraint_rows(a, b, groups);
-        assert_eq!(a_out.nrows(), 2, "should keep 2 independent rows, got {}", a_out.nrows());
+        assert_eq!(
+            a_out.nrows(),
+            2,
+            "should keep 2 independent rows, got {}",
+            a_out.nrows()
+        );
         assert_eq!(b_out.len(), 2);
         // The third group should have been merged into one of the first two.
         let total_positions: usize = groups_out.iter().map(|g| g.len()).sum();
-        assert_eq!(total_positions, 3, "all original positions must be preserved");
+        assert_eq!(
+            total_positions, 3,
+            "all original positions must be preserved"
+        );
     }
 
     #[test]
     fn rank_reduce_preserves_full_rank_matrix() {
-        let a = array![
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-        ];
+        let a = array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0],];
         let b = array![0.0, 0.0, 0.0];
         let groups = vec![vec![0], vec![1], vec![2]];
         let (a_out, b_out, groups_out) = rank_reduce_constraint_rows(a, b, groups);

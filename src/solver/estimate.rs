@@ -1062,7 +1062,9 @@ fn compute_smoothing_correction(
     let (v_rho, repaired_hessian) = match invert_regularized_rho_hessian(&hessian_rho) {
         Some(inverse) => inverse,
         None => {
-            log::warn!("Failed to invert LAML Hessian for smoothing correction after spectral repair; skipping.");
+            log::warn!(
+                "Failed to invert LAML Hessian for smoothing correction after spectral repair; skipping."
+            );
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: Some(hessian_rho),
@@ -1070,7 +1072,9 @@ fn compute_smoothing_correction(
         }
     };
     if repaired_hessian {
-        log::debug!("Projected indefinite LAML Hessian onto a positive spectrum before smoothing correction inversion.");
+        log::debug!(
+            "Projected indefinite LAML Hessian onto a positive spectrum before smoothing correction inversion."
+        );
     }
 
     // Step 4: Compute V_corr = J * V_rho * J^T in transformed space.
@@ -1565,7 +1569,13 @@ where
 
     let reml_seed_config = SeedConfig {
         bounds: (-12.0, 12.0),
-        max_seeds: if k <= 4 { 8 } else if k <= 12 { 10 } else { 12 },
+        max_seeds: if k <= 4 {
+            8
+        } else if k <= 12 {
+            10
+        } else {
+            12
+        },
         screening_budget: if k <= 6 { 2 } else { 3 },
         screen_max_inner_iterations: if matches!(cfg.link_function(), LinkFunction::Identity) {
             3
@@ -1614,9 +1624,7 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
-        use crate::solver::outer_strategy::{
-            Derivative, HessianResult, OuterEval, OuterProblem,
-        };
+        use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
 
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
@@ -1638,9 +1646,7 @@ where
 
         let mut obj = problem.build_objective(
             &mut reml_state,
-            |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
-                state.compute_cost(rho)
-            },
+            |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
             |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 outer_eval_idx.fetch_add(1, Ordering::Relaxed);
                 let cost = state.compute_cost(rho)?;
@@ -1714,9 +1720,7 @@ where
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
         let mut reml_seed_config_mix = reml_seed_config.clone();
         reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
-        use crate::solver::outer_strategy::{
-            Derivative, HessianResult, OuterEval, OuterProblem,
-        };
+        use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
         let initial_link_kind = cfg.link_kind.clone();
         let problem = OuterProblem::new(theta_dim)
             .with_gradient(Derivative::Analytic)
@@ -1750,9 +1754,7 @@ where
                         initial_rho: mix_rho,
                     })
                     .map_err(|e| {
-                        EstimationError::InvalidInput(format!(
-                            "invalid blended inverse link: {e}"
-                        ))
+                        EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
                     })?,
                 );
             }
@@ -4229,7 +4231,8 @@ pub use crate::inference::predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod, PredictInput,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
     PredictableModel, coefficient_uncertainty, coefficient_uncertaintywith_mode,
-    enrich_posterior_mean_bounds, predict_gam, predict_gam_posterior_mean, predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
+    enrich_posterior_mean_bounds, predict_gam, predict_gam_posterior_mean,
+    predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
 
 /// Canonical engine entrypoint for external designs on supported GLM-style

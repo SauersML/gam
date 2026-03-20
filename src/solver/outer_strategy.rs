@@ -301,7 +301,8 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         Derivative::FiniteDifference => " [FD gradient from cost-only objective]",
         _ => "",
     };
-    let barrier_note = if cap.barrier_config.is_some() && cap.all_penalty_like() && cap.n_params > 8 {
+    let barrier_note = if cap.barrier_config.is_some() && cap.all_penalty_like() && cap.n_params > 8
+    {
         " [EFS with runtime barrier-curvature guard]"
     } else {
         ""
@@ -850,8 +851,6 @@ fn solution_into_outer_result(
     }
 }
 
-
-
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 struct OuterConfig {
@@ -973,19 +972,58 @@ impl OuterProblem {
         }
     }
 
-    pub fn with_gradient(mut self, d: Derivative) -> Self { self.gradient = d; self }
-    pub fn with_hessian(mut self, d: Derivative) -> Self { self.hessian = d; self }
-    pub fn with_psi_dim(mut self, dim: usize) -> Self { self.psi_dim = dim; self }
-    pub fn with_barrier(mut self, cfg: Option<BarrierConfig>) -> Self { self.barrier_config = cfg; self }
-    pub fn with_tolerance(mut self, tol: f64) -> Self { self.tolerance = tol; self }
-    pub fn with_max_iter(mut self, n: usize) -> Self { self.max_iter = n; self }
-    pub fn with_fd_step(mut self, h: f64) -> Self { self.fd_step = h; self }
-    pub fn with_bounds(mut self, lo: Array1<f64>, hi: Array1<f64>) -> Self { self.bounds = Some((lo, hi)); self }
-    pub fn with_rho_bound(mut self, b: f64) -> Self { self.rho_bound = b; self }
-    pub fn with_seed_config(mut self, sc: crate::seeding::SeedConfig) -> Self { self.seed_config = sc; self }
-    pub fn with_heuristic_lambdas(mut self, h: Vec<f64>) -> Self { self.heuristic_lambdas = Some(h); self }
-    pub fn with_initial_rho(mut self, rho: Array1<f64>) -> Self { self.initial_rho = Some(rho); self }
-    pub fn with_screening_cap(mut self, cap: Arc<AtomicUsize>) -> Self { self.screening_cap = Some(cap); self }
+    pub fn with_gradient(mut self, d: Derivative) -> Self {
+        self.gradient = d;
+        self
+    }
+    pub fn with_hessian(mut self, d: Derivative) -> Self {
+        self.hessian = d;
+        self
+    }
+    pub fn with_psi_dim(mut self, dim: usize) -> Self {
+        self.psi_dim = dim;
+        self
+    }
+    pub fn with_barrier(mut self, cfg: Option<BarrierConfig>) -> Self {
+        self.barrier_config = cfg;
+        self
+    }
+    pub fn with_tolerance(mut self, tol: f64) -> Self {
+        self.tolerance = tol;
+        self
+    }
+    pub fn with_max_iter(mut self, n: usize) -> Self {
+        self.max_iter = n;
+        self
+    }
+    pub fn with_fd_step(mut self, h: f64) -> Self {
+        self.fd_step = h;
+        self
+    }
+    pub fn with_bounds(mut self, lo: Array1<f64>, hi: Array1<f64>) -> Self {
+        self.bounds = Some((lo, hi));
+        self
+    }
+    pub fn with_rho_bound(mut self, b: f64) -> Self {
+        self.rho_bound = b;
+        self
+    }
+    pub fn with_seed_config(mut self, sc: crate::seeding::SeedConfig) -> Self {
+        self.seed_config = sc;
+        self
+    }
+    pub fn with_heuristic_lambdas(mut self, h: Vec<f64>) -> Self {
+        self.heuristic_lambdas = Some(h);
+        self
+    }
+    pub fn with_initial_rho(mut self, rho: Array1<f64>) -> Self {
+        self.initial_rho = Some(rho);
+        self
+    }
+    pub fn with_screening_cap(mut self, cap: Arc<AtomicUsize>) -> Self {
+        self.screening_cap = Some(cap);
+        self
+    }
 
     /// Derive the capability flags from the builder state.
     /// `fixed_point_available` is set to `false` here; `build_objective`

@@ -1365,7 +1365,9 @@ impl WorkingModelSurvival {
         state: &WorkingState,
         rho: &Array1<f64>,
     ) -> Result<(f64, Array1<f64>), EstimationError> {
-        use crate::estimate::reml::assembly::{InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks};
+        use crate::estimate::reml::assembly::{
+            InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
+        };
         use crate::estimate::reml::unified::{
             DenseSpectralOperator, DispersionHandling, EvalMode, PenaltyLogdetDerivs,
             compute_block_penalty_logdet_derivs,
@@ -1390,8 +1392,8 @@ impl WorkingModelSurvival {
                 range_end: b.range.end,
             })
             .collect();
-        let penalty_coords = penalty_coords_from_blocks(&block_descs, p)
-            .map_err(EstimationError::InvalidInput)?;
+        let penalty_coords =
+            penalty_coords_from_blocks(&block_descs, p).map_err(EstimationError::InvalidInput)?;
 
         // --- Penalty logdet derivatives ---
         let per_block_rho: Vec<Array1<f64>> =

@@ -513,10 +513,7 @@ fn fit_survival_location_scale_model(
                         &mut F,
                         &ndarray::Array1<f64>,
                     )
-                        -> Result<
-                            crate::solver::outer_strategy::EfsEval,
-                            EstimationError,
-                        >,
+                        -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
                 >,
             );
             match problem.run(&mut obj, &context) {
