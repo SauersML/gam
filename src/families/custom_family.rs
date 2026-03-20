@@ -5879,7 +5879,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         cycles_done = cycle + 1;
 
         let objective_tol = inner_tol * (1.0 + objective.abs());
-        let exact_joint_stationarity_ok = if has_joint_exacthessian {
+        // For single-block models the blockwise iteration IS the joint
+        // iteration, so block-conditional convergence implies joint
+        // convergence.  The exact_newton_joint_stationarity check can
+        // stall at ~10x the tolerance due to numerical differences
+        // between the block-conditional and joint gradient formulations,
+        // causing 100s of wasted cycles on an already-converged solution.
+        let exact_joint_stationarity_ok = if has_joint_exacthessian && specs.len() >= 2 {
             exact_newton_joint_stationarity_inf_norm(
                 &cached_eval,
                 &states,
