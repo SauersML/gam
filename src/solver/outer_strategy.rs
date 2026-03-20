@@ -509,7 +509,7 @@ pub trait OuterObjective {
 /// This allows any call site to construct an `OuterObjective` from closures
 /// without needing to define a wrapper struct or modify the state type.
 /// Each call site wraps its existing methods into closures and passes them here.
-pub(crate) struct ClosureObjective<
+pub struct ClosureObjective<
     S,
     Fc,
     Fe,
@@ -1024,7 +1024,7 @@ impl OuterProblem {
     /// regardless of whether `.with_efs()` was called.  This is the canonical
     /// way to create production objectives — it eliminates the drift risk of
     /// manually entering capability flags.
-    pub fn build_objective<S, Fc, Fe, Fr, Fefs>(
+    pub(crate) fn build_objective<S, Fc, Fe, Fr, Fefs>(
         &self,
         state: S,
         cost_fn: Fc,
