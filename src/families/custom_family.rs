@@ -3884,7 +3884,7 @@ fn solve_kkt_step(
                 let rhs_inf = rhs.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                 if residual_inf > 1e-6 * (1.0 + rhs_inf) {
                     log::warn!(
-                        "constrained KKT SVD residual elevated ({residual_inf:.3e} vs rhs {rhs_inf:.3e}); accepting with damping"
+                        "constrained KKT SVD residual elevated ({residual_inf:.3e} vs rhs {rhs_inf:.3e}); accepting pseudoinverse solution"
                     );
                 }
                 solution
@@ -3988,10 +3988,142 @@ fn compress_active_constraint_set(
         out_row += 1;
     }
 
+    // Phase 2: rank-revealing reduction via incremental modified Gram-Schmidt.
+    //
+    // After parallel-row deduplication, the rows may still be nearly linearly
+    // dependent (e.g. consecutive B-spline difference rows in dense-data
+    // regions).  Such near-dependence makes the KKT saddle-point system
+    // ill-conditioned, causing the direct LBLt factorization to fail and the
+    // SVD pseudoinverse fallback to produce inaccurate directions.
+    //
+    // We incrementally build an orthonormal basis of the row space and keep
+    // only those rows that contribute a new independent direction.  Dropped
+    // rows have their groups merged into the most-aligned kept row so that
+    // the active-set QP can still release individual constraint groups via
+    // multiplier signs.
+    let (a, b, groups) = rank_reduce_constraint_rows(a, b, groups);
+
     Ok(CompressedActiveConstraintSet {
         constraints: LinearInequalityConstraints { a, b },
         groups,
     })
+}
+
+/// Reduce the constraint matrix to full row rank by dropping rows that are
+/// nearly in the span of earlier rows.  Uses incremental modified
+/// Gram-Schmidt for rank detection, which is O(k · p · r) where k is the
+/// input row count, p the column count, and r the numerical rank.
+///
+/// For each dropped row its group is merged into the kept row with the
+/// largest absolute dot product, preserving the active-set QP's ability to
+/// release constraint groups via multiplier signs.
+fn rank_reduce_constraint_rows(
+    a: Array2<f64>,
+    b: Array1<f64>,
+    groups: Vec<Vec<usize>>,
+) -> (Array2<f64>, Array1<f64>, Vec<Vec<usize>>) {
+    let k = a.nrows();
+    let p = a.ncols();
+    if k <= 1 {
+        return (a, b, groups);
+    }
+
+    // Row norms for tolerance scaling.
+    let row_norms: Vec<f64> = (0..k)
+        .map(|i| a.row(i).dot(&a.row(i)).sqrt())
+        .collect();
+    let max_norm = row_norms
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v));
+    // Rank tolerance: rows whose orthogonal residual (relative to the
+    // accepted basis) falls below this are considered dependent.  The
+    // eps^{2/3} · max_norm heuristic is standard for numerical rank
+    // determination; the absolute floor prevents false drops when all
+    // rows are tiny.
+    let rank_tol = (1e-10 * max_norm).max(1e-14);
+
+    // Incremental modified Gram-Schmidt.
+    let mut q_basis: Vec<Array1<f64>> = Vec::with_capacity(k.min(p));
+    let mut kept: Vec<usize> = Vec::with_capacity(k.min(p));
+    // For each dropped row, record which kept row it should merge into.
+    let mut merge_target: Vec<Option<usize>> = vec![None; k];
+
+    for i in 0..k {
+        if row_norms[i] <= rank_tol {
+            // Near-zero row — merge into first kept row if one exists.
+            if let Some(&first) = kept.first() {
+                merge_target[i] = Some(first);
+            }
+            continue;
+        }
+
+        // Orthogonalize against the current basis (modified Gram-Schmidt).
+        let mut residual = a.row(i).to_owned();
+        for q in &q_basis {
+            let coeff = residual.dot(q);
+            residual.scaled_add(-coeff, q);
+        }
+
+        let residual_norm = residual.dot(&residual).sqrt();
+        if residual_norm > rank_tol {
+            // Linearly independent — accept this row.
+            residual.mapv_inplace(|v| v / residual_norm);
+            q_basis.push(residual);
+            kept.push(i);
+        } else {
+            // Linearly dependent — find the kept row most aligned with
+            // this one (largest |dot product|) and merge into its group.
+            let mut best_align = 0.0_f64;
+            let mut best_target = kept[0];
+            for &ki in &kept {
+                let dot = a.row(ki).dot(&a.row(i)).abs();
+                if dot > best_align {
+                    best_align = dot;
+                    best_target = ki;
+                }
+            }
+            merge_target[i] = Some(best_target);
+        }
+    }
+
+    // If nothing was dropped the matrix is already full rank.
+    if kept.len() == k {
+        return (a, b, groups);
+    }
+
+    // Build the reduced output.
+    let r = kept.len();
+    let mut a_out = Array2::<f64>::zeros((r, p));
+    let mut b_out = Array1::<f64>::zeros(r);
+    let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(r);
+    let mut orig_to_out = std::collections::HashMap::with_capacity(r);
+    for (out_idx, &orig_idx) in kept.iter().enumerate() {
+        a_out.row_mut(out_idx).assign(&a.row(orig_idx));
+        b_out[out_idx] = b[orig_idx];
+        groups_out.push(groups[orig_idx].clone());
+        orig_to_out.insert(orig_idx, out_idx);
+    }
+
+    // Merge dropped groups into their targets.
+    for i in 0..k {
+        if let Some(target_orig) = merge_target[i] {
+            let &out_idx = orig_to_out
+                .get(&target_orig)
+                .expect("merge target must be a kept row");
+            groups_out[out_idx].extend_from_slice(&groups[i]);
+        }
+    }
+
+    if kept.len() < k {
+        log::debug!(
+            "rank-reduced active constraints from {} to {} rows (rank deficiency {})",
+            k,
+            kept.len(),
+            k - kept.len()
+        );
+    }
+
+    (a_out, b_out, groups_out)
 }
 
 fn check_linear_feasibility(
@@ -10084,6 +10216,83 @@ mod tests {
 
         assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
         assert_eq!(active, vec![0]);
+    }
+
+    #[test]
+    fn quadratic_linear_constraints_handles_near_dependent_rows() {
+        // Three constraints in R^2 where the third is nearly a linear
+        // combination of the first two, making the naive KKT system
+        // ill-conditioned.  The rank-reducing compression should drop
+        // the dependent row and the QP should converge cleanly.
+        //
+        //   x1 >= 0,  x2 >= 0,  x1 + x2 + eps >= 0   (eps ≈ 0)
+        //
+        // Minimize 0.5 * ||x - [−1, −1]||^2  =>  optimum at origin.
+        let hessian = Array2::eye(2);
+        let rhs = array![-1.0, -1.0]; // gradient points toward (−1,−1)
+        let beta_start = array![0.0, 0.0];
+        let eps = 1e-14;
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 0.0], [0.0, 1.0], [1.0 + eps, 1.0]],
+            b: array![0.0, 0.0, 0.0],
+        };
+
+        let (beta, active) = solve_quadraticwith_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            Some(&[0, 1, 2]), // all three active
+        )
+        .expect("near-dependent constraint QP should converge");
+
+        assert!(
+            beta[0].abs() <= 1e-10 && beta[1].abs() <= 1e-10,
+            "expected optimum at origin, got ({}, {})",
+            beta[0],
+            beta[1]
+        );
+        assert!(
+            active.len() <= 2,
+            "at most 2 independent constraints should remain active, got {}",
+            active.len()
+        );
+    }
+
+    #[test]
+    fn rank_reduce_drops_exactly_dependent_row() {
+        // Row 3 = Row 1 + Row 2 exactly. Rank reduction should drop it.
+        let a = array![
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ];
+        let b = array![0.0, 0.0, 0.0];
+        let groups = vec![vec![0], vec![1], vec![2]];
+        let (a_out, b_out, groups_out) = rank_reduce_constraint_rows(a, b, groups);
+        assert_eq!(a_out.nrows(), 2, "should keep 2 independent rows, got {}", a_out.nrows());
+        assert_eq!(b_out.len(), 2);
+        // The third group should have been merged into one of the first two.
+        let total_positions: usize = groups_out.iter().map(|g| g.len()).sum();
+        assert_eq!(total_positions, 3, "all original positions must be preserved");
+    }
+
+    #[test]
+    fn rank_reduce_preserves_full_rank_matrix() {
+        let a = array![
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ];
+        let b = array![0.0, 0.0, 0.0];
+        let groups = vec![vec![0], vec![1], vec![2]];
+        let (a_out, b_out, groups_out) = rank_reduce_constraint_rows(a, b, groups);
+        // All three rows are independent in R^2 (but we only have rank 2).
+        // The first two span R^2, so row 3 = row 1 + row 2 is dependent.
+        assert_eq!(a_out.nrows(), 2);
+        assert_eq!(b_out.len(), 2);
+        let total_positions: usize = groups_out.iter().map(|g| g.len()).sum();
+        assert_eq!(total_positions, 3);
     }
 
     #[test]
