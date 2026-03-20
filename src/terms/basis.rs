@@ -2,7 +2,7 @@ use crate::faer_ndarray::{
     FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
     rrqr_nullspace_basis,
 };
-use crate::matrix::DesignMatrix;
+use crate::matrix::{ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix};
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
@@ -1716,6 +1716,10 @@ pub struct AnisoBasisPsiDerivatives {
 /// only the compact (n * n_knots) radial jets plus (n * n_knots * D) axis
 /// fractions, which is O(n * k * D) instead of O(n * p * D).
 const IMPLICIT_OPERATOR_MEMORY_THRESHOLD: usize = 1_000_000_000; // 1 GB
+/// Memory threshold (in bytes) above which spatial kernel designs switch to a
+/// lazy chunked operator instead of dense n×p materialization.
+const SPATIAL_LAZY_DESIGN_MEMORY_THRESHOLD: usize = 256 * 1024 * 1024; // 256 MiB
+const DESIGN_CROSS_CHUNK_SIZE: usize = 1024;
 
 /// Determine whether implicit operators should be used based on problem size.
 ///
@@ -1727,6 +1731,144 @@ pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
     // the cross-t matrix and s_components. Conservative estimate: 3*D matrices.
     let dense_bytes = 3 * n * p * d * 8;
     dense_bytes > IMPLICIT_OPERATOR_MEMORY_THRESHOLD
+}
+
+fn dense_design_bytes(n: usize, p: usize) -> usize {
+    n.saturating_mul(p)
+        .saturating_mul(std::mem::size_of::<f64>())
+}
+
+fn should_use_lazy_spatial_design(n: usize, p: usize) -> bool {
+    dense_design_bytes(n, p) > SPATIAL_LAZY_DESIGN_MEMORY_THRESHOLD
+}
+
+fn wrap_dense_design_with_transform(
+    design: DesignMatrix,
+    transform: &Array2<f64>,
+    label: &str,
+) -> Result<DesignMatrix, BasisError> {
+    match design {
+        DesignMatrix::Dense(inner) => {
+            let op = CoefficientTransformOperator::new(inner, transform.clone()).map_err(|e| {
+                BasisError::InvalidInput(format!("{label} coefficient transform failed: {e}"))
+            })?;
+            Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Arc::new(op),
+            )))
+        }
+        DesignMatrix::Sparse(_) => Err(BasisError::InvalidInput(format!(
+            "{label} coefficient transform requires a dense/operator-backed design"
+        ))),
+    }
+}
+
+fn design_constraint_cross(
+    design: &DesignMatrix,
+    constraint_matrix: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Array2<f64>, BasisError> {
+    let n = design.nrows();
+    let k = design.ncols();
+    if constraint_matrix.nrows() != n {
+        return Err(BasisError::ConstraintMatrixRowMismatch {
+            basisrows: n,
+            constraintrows: constraint_matrix.nrows(),
+        });
+    }
+    if let Some(w) = weights
+        && w.len() != n
+    {
+        return Err(BasisError::WeightsDimensionMismatch {
+            expected: n,
+            found: w.len(),
+        });
+    }
+    let q = constraint_matrix.ncols();
+    let mut cross = Array2::<f64>::zeros((k, q));
+    for start in (0..n).step_by(DESIGN_CROSS_CHUNK_SIZE) {
+        let end = (start + DESIGN_CROSS_CHUNK_SIZE).min(n);
+        let basis_chunk = design.row_chunk(start..end);
+        let mut constraint_chunk = constraint_matrix.slice(s![start..end, ..]).to_owned();
+        if let Some(w) = weights {
+            for (mut row, &weight) in constraint_chunk
+                .axis_iter_mut(Axis(0))
+                .zip(w.slice(s![start..end]).iter())
+            {
+                row *= weight;
+            }
+        }
+        cross += &basis_chunk.t().dot(&constraint_chunk);
+    }
+    Ok(cross)
+}
+
+fn design_gram_matrix(design: &DesignMatrix) -> Array2<f64> {
+    let n = design.nrows();
+    let p = design.ncols();
+    let mut gram = Array2::<f64>::zeros((p, p));
+    for start in (0..n).step_by(DESIGN_CROSS_CHUNK_SIZE) {
+        let end = (start + DESIGN_CROSS_CHUNK_SIZE).min(n);
+        let chunk = design.row_chunk(start..end);
+        gram += &chunk.t().dot(&chunk);
+    }
+    gram
+}
+
+fn stabilized_orthogonality_transform_from_gram(
+    gram: &Array2<f64>,
+    transform: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let constrained_gram = {
+        let gt = fast_ab(gram, transform);
+        fast_atb(transform, &gt)
+    };
+    let (eigenvalues, eigenvectors) = constrained_gram
+        .eigh(Side::Lower)
+        .map_err(BasisError::LinalgError)?;
+    let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+    let tol = default_rrqr_rank_alpha()
+        * f64::EPSILON
+        * (constrained_gram
+            .nrows()
+            .max(constrained_gram.ncols())
+            .max(1) as f64)
+        * max_eval.max(1.0);
+    let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
+    if keep == 0 {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+
+    let eig_start = eigenvalues.len() - keep;
+    let kept_vectors = eigenvectors.slice(s![.., eig_start..]).to_owned();
+    let mut inv_sqrt = Array2::<f64>::zeros((keep, keep));
+    for (out_i, eig_i) in (eig_start..eigenvalues.len()).enumerate() {
+        inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].max(tol).sqrt();
+    }
+    let whitening = fast_ab(&kept_vectors, &inv_sqrt);
+    Ok(fast_ab(transform, &whitening))
+}
+
+pub(crate) fn orthogonality_transform_for_design(
+    design: &DesignMatrix,
+    constraint_matrix: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Array2<f64>, BasisError> {
+    let k = design.ncols();
+    if k == 0 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: 0 });
+    }
+    let q = constraint_matrix.ncols();
+    if q == 0 {
+        return Ok(Array2::eye(k));
+    }
+    let constraint_cross = design_constraint_cross(design, constraint_matrix, weights)?;
+    let (transform, rank) = rrqr_nullspace_basis(&constraint_cross, default_rrqr_rank_alpha())
+        .map_err(BasisError::LinalgError)?;
+    if rank >= k || transform.ncols() == 0 {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+    let gram = design_gram_matrix(design);
+    stabilized_orthogonality_transform_from_gram(&gram, &transform)
 }
 
 /// Which radial kernel family is being used. Stored in the streaming operator
@@ -3071,6 +3213,17 @@ fn select_kmeans_centers(
             "kmeans requested {num_centers} centers but data has {n} rows"
         )));
     }
+    const KMEANS_PILOT_MAX_ROWS: usize = 20_000;
+    if n > KMEANS_PILOT_MAX_ROWS {
+        let pilot_n = KMEANS_PILOT_MAX_ROWS.max(num_centers);
+        log::warn!(
+            "kmeans center selection using {}-row pilot subsample instead of full {} rows",
+            pilot_n,
+            n
+        );
+        let pilot = select_equal_mass_covar_representative_centers(data, pilot_n)?;
+        return select_kmeans_centers(pilot.view(), num_centers, max_iter);
+    }
     let mut centers = select_thin_plate_knots(data, num_centers)?;
     let mut assign = vec![0usize; n];
     let iters = max_iter.max(1);
@@ -3764,50 +3917,117 @@ pub fn build_thin_plate_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let dense_work = data.nrows().saturating_mul(centers.nrows());
-    const SPATIAL_DENSE_WARN: usize = 10_000_000;
-    if dense_work > SPATIAL_DENSE_WARN {
+    let internal_kernel_transform = kernel_constraint_nullspace(
+        centers.view(),
+        DuchonNullspaceOrder::Linear,
+        &mut workspace.cache,
+    )?;
+    let poly_cols = centers.ncols() + 1;
+    let base_cols = internal_kernel_transform.ncols() + poly_cols;
+    let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
+    let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols);
+    if use_lazy {
         log::warn!(
-            "thin-plate basis: n={} × k={} = {:.1} MiB dense design. \
-             Future: use ChunkedKernelDesignOperator for biobank scale.",
+            "thin-plate basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
-            centers.nrows(),
-            (dense_work * 8) as f64 / (1024.0 * 1024.0),
+            base_cols,
+            dense_bytes as f64 / (1024.0 * 1024.0),
         );
     }
-    let tps = create_thin_plate_spline_basis_scaledwithworkspace(
-        data,
-        centers.view(),
-        spec.length_scale,
-        workspace,
-    )?;
-    let identifiability_transform = spatial_identifiability_transform_from_design(
-        data,
-        tps.basis.view(),
-        &spec.identifiability,
-        "ThinPlate",
-    )?;
-    let design = if let Some(z) = identifiability_transform.as_ref() {
-        fast_ab(&tps.basis, z)
-    } else {
-        tps.basis.clone()
-    };
-    let mut candidates = vec![PenaltyCandidate {
-        matrix: tps.penalty_bending.clone(),
-        nullspace_dim_hint: tps.num_polynomial_basis,
-        source: PenaltySource::Primary,
-        normalization_scale: 1.0,
-        kronecker_factors: None,
-    }];
-    if spec.double_penalty {
-        candidates.push(PenaltyCandidate {
-            matrix: tps.penalty_ridge.clone(),
-            nullspace_dim_hint: 0,
-            source: PenaltySource::DoublePenaltyNullspace,
+    let (design, identifiability_transform, mut candidates) = if use_lazy {
+        let poly_block = polynomial_block_from_order(data, DuchonNullspaceOrder::Linear);
+        let d = data.ncols();
+        let length_scale_sq = spec.length_scale * spec.length_scale;
+        let kernel_fn = Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+            let mut dist2 = 0.0;
+            for axis in 0..d {
+                let delta = data_row[axis] - center_row[axis];
+                dist2 += delta * delta;
+            }
+            thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
+                .expect("validated thin-plate inputs should not fail")
+        });
+        let base_op = ChunkedKernelDesignOperator::new(
+            Arc::new(data.to_owned()),
+            Arc::new(centers.clone()),
+            kernel_fn,
+            Some(Arc::new(internal_kernel_transform.clone())),
+            Some(Arc::new(poly_block)),
+        )
+        .map_err(BasisError::InvalidInput)?;
+        let base_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(base_op)));
+        let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
+            data,
+            &base_design,
+            &spec.identifiability,
+            "ThinPlate",
+        )?;
+        let design = if let Some(transform) = identifiability_transform.as_ref() {
+            wrap_dense_design_with_transform(base_design, transform, "ThinPlate")?
+        } else {
+            base_design
+        };
+        let (penalty_bending, penalty_ridge) = build_thin_plate_penalty_matrices(
+            centers.view(),
+            spec.length_scale,
+            &internal_kernel_transform,
+        )?;
+        let mut candidates = vec![PenaltyCandidate {
+            matrix: penalty_bending,
+            nullspace_dim_hint: poly_cols,
+            source: PenaltySource::Primary,
             normalization_scale: 1.0,
             kronecker_factors: None,
-        });
-    }
+        }];
+        if spec.double_penalty {
+            candidates.push(PenaltyCandidate {
+                matrix: penalty_ridge,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+            });
+        }
+        (design, identifiability_transform, candidates)
+    } else {
+        let tps = create_thin_plate_spline_basis_scaledwithworkspace(
+            data,
+            centers.view(),
+            spec.length_scale,
+            workspace,
+        )?;
+        let identifiability_transform = spatial_identifiability_transform_from_design(
+            data,
+            tps.basis.view(),
+            &spec.identifiability,
+            "ThinPlate",
+        )?;
+        let design = if let Some(z) = identifiability_transform.as_ref() {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(fast_ab(
+                &tps.basis, z,
+            )))
+        } else {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(tps.basis.clone()))
+        };
+        let mut candidates = vec![PenaltyCandidate {
+            matrix: tps.penalty_bending.clone(),
+            nullspace_dim_hint: tps.num_polynomial_basis,
+            source: PenaltySource::Primary,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+        }];
+        if spec.double_penalty {
+            candidates.push(PenaltyCandidate {
+                matrix: tps.penalty_ridge.clone(),
+                nullspace_dim_hint: 0,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+            });
+        }
+        (design, identifiability_transform, candidates)
+    };
     if let Some(z) = identifiability_transform.as_ref() {
         candidates = candidates
             .into_iter()
@@ -3826,7 +4046,7 @@ pub fn build_thin_plate_basiswithworkspace(
     }
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        design,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -5644,6 +5864,86 @@ fn spatial_parametric_constraint_block(data: ArrayView2<'_, f64>) -> Array2<f64>
     c
 }
 
+fn build_thin_plate_penalty_matrices(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    kernel_transform: &Array2<f64>,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let kernel_cols = kernel_transform.ncols();
+    let poly_cols = d + 1;
+    let total_cols = kernel_cols + poly_cols;
+    let mut omega = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in i..k {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = centers[[i, c]] - centers[[j, c]];
+                dist2 += delta * delta;
+            }
+            let kij = thin_plate_kernel_from_dist2(dist2 / (length_scale * length_scale), d)?;
+            omega[[i, j]] = kij;
+            omega[[j, i]] = kij;
+        }
+    }
+    let omega_constrained = {
+        let zt_o = fast_atb(kernel_transform, &omega);
+        fast_ab(&zt_o, kernel_transform)
+    };
+    validate_psd_penalty(
+        &omega_constrained,
+        &format!("thin_plate bending penalty (dimension={d})"),
+        "thin-plate kernel and side-constraint assembly must yield a PSD penalty on the constrained subspace",
+    )?;
+    let mut penalty_bending = Array2::<f64>::zeros((total_cols, total_cols));
+    penalty_bending
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&omega_constrained);
+    let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_bending)?
+        .map(|block| block.sym_penalty)
+        .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
+    Ok((penalty_bending, penalty_ridge))
+}
+
+fn build_matern_kernel_penalty(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+    aniso_log_scales: Option<&[f64]>,
+) -> Result<Array2<f64>, BasisError> {
+    let k = centers.nrows();
+    let total_cols = k + usize::from(include_intercept);
+    let mut center_kernel = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in i..k {
+            let r = if let Some(eta) = aniso_log_scales {
+                aniso_distance(
+                    centers.row(i).as_slice().unwrap(),
+                    centers.row(j).as_slice().unwrap(),
+                    eta,
+                )
+            } else {
+                let mut dist2 = 0.0;
+                for axis in 0..centers.ncols() {
+                    let delta = centers[[i, axis]] - centers[[j, axis]];
+                    dist2 += delta * delta;
+                }
+                dist2.sqrt()
+            };
+            let kij = matern_kernel_from_distance(r, length_scale, nu)?;
+            center_kernel[[i, j]] = kij;
+            center_kernel[[j, i]] = kij;
+        }
+    }
+    let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
+    penalty_kernel
+        .slice_mut(s![0..k, 0..k])
+        .assign(&center_kernel);
+    Ok(penalty_kernel)
+}
+
 fn spatial_identifiability_transform_from_design(
     data: ArrayView2<'_, f64>,
     design: ArrayView2<'_, f64>,
@@ -5655,6 +5955,25 @@ fn spatial_identifiability_transform_from_design(
         SpatialIdentifiability::OrthogonalToParametric => {
             let c = spatial_parametric_constraint_block(data);
             let (_, z) = applyweighted_orthogonality_constraint(design, c.view(), None)?;
+            Ok(Some(z))
+        }
+        SpatialIdentifiability::FrozenTransform { .. } => {
+            frozen_spatial_identifiability_transform(identifiability, design.ncols(), label)
+        }
+    }
+}
+
+fn spatial_identifiability_transform_from_design_matrix(
+    data: ArrayView2<'_, f64>,
+    design: &DesignMatrix,
+    identifiability: &SpatialIdentifiability,
+    label: &str,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    match identifiability {
+        SpatialIdentifiability::None => Ok(None),
+        SpatialIdentifiability::OrthogonalToParametric => {
+            let c = spatial_parametric_constraint_block(data);
+            let z = orthogonality_transform_for_design(design, c.view(), None)?;
             Ok(Some(z))
         }
         SpatialIdentifiability::FrozenTransform { .. } => {
@@ -6192,6 +6511,7 @@ fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Result<f64, Bas
 /// Precomputed coefficient for `polyharmonic_kernel` that depends only on
 /// `m` and `k_dim`, not on `r`.  Avoids repeated gamma_lanczos calls in the
 /// hot kernel evaluation loop (called n × k times per basis build).
+#[derive(Clone, Copy)]
 struct PolyharmonicBlockCoeff {
     c: f64,
     power: f64,
@@ -7171,30 +7491,10 @@ pub fn build_matern_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let dense_work = data.nrows().saturating_mul(centers.nrows());
-    const SPATIAL_DENSE_WARN: usize = 10_000_000;
-    if dense_work > SPATIAL_DENSE_WARN {
-        log::warn!(
-            "Matérn basis: n={} × k={} = {:.1} MiB dense design. \
-             Future: use ChunkedKernelDesignOperator for biobank scale.",
-            data.nrows(),
-            centers.nrows(),
-            (dense_work * 8) as f64 / (1024.0 * 1024.0),
-        );
-    }
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-    let m = create_matern_spline_basiswithworkspace(
-        data,
-        centers.view(),
-        spec.length_scale,
-        spec.nu,
-        spec.include_intercept,
-        aniso.as_deref(),
-        workspace,
-    )?;
     let identifiability_transform = z_opt.clone();
     let full_transform = z_opt.as_ref().map(|z| {
         if spec.include_intercept {
@@ -7203,26 +7503,120 @@ pub fn build_matern_basiswithworkspace(
             z.clone()
         }
     });
-    let design = if let Some(transform) = full_transform.as_ref() {
-        fast_ab(&m.basis, transform)
+    let design_cols =
+        z_opt.as_ref().map_or(centers.nrows(), Array2::ncols) + usize::from(spec.include_intercept);
+    let dense_bytes = dense_design_bytes(data.nrows(), design_cols);
+    let use_lazy = should_use_lazy_spatial_design(data.nrows(), design_cols);
+    let (design, candidates) = if use_lazy {
+        log::warn!(
+            "Matérn basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
+            data.nrows(),
+            design_cols,
+            dense_bytes as f64 / (1024.0 * 1024.0),
+        );
+        let d = data.ncols();
+        let length_scale = spec.length_scale;
+        let nu = spec.nu;
+        let kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync> =
+            if let Some(eta) = aniso.as_ref() {
+                let eta = eta.clone();
+                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                    let r = aniso_distance(data_row, center_row, &eta);
+                    matern_kernel_from_distance(r, length_scale, nu)
+                        .expect("validated Matérn inputs should not fail")
+                })
+            } else {
+                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                    let mut dist2 = 0.0;
+                    for axis in 0..d {
+                        let delta = data_row[axis] - center_row[axis];
+                        dist2 += delta * delta;
+                    }
+                    matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)
+                        .expect("validated Matérn inputs should not fail")
+                })
+            };
+        let poly_basis = if spec.include_intercept {
+            Some(Arc::new(Array2::<f64>::ones((data.nrows(), 1))))
+        } else {
+            None
+        };
+        let op = ChunkedKernelDesignOperator::new(
+            Arc::new(data.to_owned()),
+            Arc::new(centers.clone()),
+            kernel_fn,
+            z_opt.as_ref().map(|z| Arc::new(z.clone())),
+            poly_basis,
+        )
+        .map_err(BasisError::InvalidInput)?;
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)));
+        let candidates = if spec.double_penalty {
+            let penalty_kernel = build_matern_kernel_penalty(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                aniso.as_deref(),
+            )?;
+            let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
+            let mut candidates = vec![normalize_penalty_candidate(
+                primary.clone(),
+                0,
+                PenaltySource::Primary,
+            )];
+            if let Some(shrinkage) = build_nullspace_shrinkage_penalty(&primary)? {
+                candidates.push(normalize_penalty_candidate(
+                    shrinkage.sym_penalty,
+                    0,
+                    PenaltySource::DoublePenaltyNullspace,
+                ));
+            }
+            candidates
+        } else {
+            build_matern_operator_penalty_candidates(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                z_opt.as_ref(),
+                aniso.as_deref(),
+            )?
+        };
+        (design, candidates)
     } else {
-        m.basis.clone()
-    };
-    let candidates = if spec.double_penalty {
-        build_matern_double_penalty_candidates(&m, full_transform.as_ref())?
-    } else {
-        build_matern_operator_penalty_candidates(
+        let m = create_matern_spline_basiswithworkspace(
+            data,
             centers.view(),
             spec.length_scale,
             spec.nu,
             spec.include_intercept,
-            z_opt.as_ref(),
             aniso.as_deref(),
-        )?
+            workspace,
+        )?;
+        let design = if let Some(transform) = full_transform.as_ref() {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(fast_ab(
+                &m.basis, transform,
+            )))
+        } else {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(m.basis.clone()))
+        };
+        let candidates = if spec.double_penalty {
+            build_matern_double_penalty_candidates(&m, full_transform.as_ref())?
+        } else {
+            build_matern_operator_penalty_candidates(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                z_opt.as_ref(),
+                aniso.as_deref(),
+            )?
+        };
+        (design, candidates)
     };
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        design,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -10223,40 +10617,134 @@ pub fn build_duchon_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let dense_work = data.nrows().saturating_mul(centers.nrows());
-    const SPATIAL_DENSE_WARN: usize = 10_000_000;
-    if dense_work > SPATIAL_DENSE_WARN {
-        log::warn!(
-            "Duchon basis: n={} × k={} = {:.1} MiB dense design. \
-             Future: use ChunkedKernelDesignOperator for biobank scale.",
-            data.nrows(),
-            centers.nrows(),
-            (dense_work * 8) as f64 / (1024.0 * 1024.0),
-        );
-    }
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
-    let d = build_duchon_basis_designwithworkspace(
-        data,
-        centers.view(),
-        spec.length_scale,
-        spec.power,
-        spec.nullspace_order,
-        aniso.as_deref(),
-        workspace,
-    )?;
-    let basis = d.basis;
-    let identifiability_transform = spatial_identifiability_transform_from_design(
-        data,
-        basis.view(),
-        &spec.identifiability,
-        "Duchon",
-    )?;
-    let design = if let Some(z) = identifiability_transform.as_ref() {
-        fast_ab(&basis, z)
+    let kernel_transform =
+        kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
+    let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+    let base_cols = kernel_transform.ncols() + poly_cols;
+    let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
+    let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols);
+    let (design, identifiability_transform) = if use_lazy {
+        log::warn!(
+            "Duchon basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
+            data.nrows(),
+            base_cols,
+            dense_bytes as f64 / (1024.0 * 1024.0),
+        );
+        let d = data.ncols();
+        let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+        let s_order = spec.power;
+        let length_scale = spec.length_scale;
+        let coeffs = length_scale
+            .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
+        let pure_poly_coeff = if length_scale.is_none() {
+            Some(PolyharmonicBlockCoeff::new(
+                pure_duchon_block_order(p_order, s_order),
+                d,
+            ))
+        } else {
+            None
+        };
+        let kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync> =
+            if let Some(eta) = aniso.as_ref() {
+                let eta = eta.clone();
+                let coeffs = coeffs.clone();
+                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                    let r = aniso_distance(data_row, center_row, &eta);
+                    if let Some(ppc) = pure_poly_coeff {
+                        if r == 0.0 && p_order > 0 {
+                            0.0
+                        } else {
+                            ppc.eval(r)
+                        }
+                    } else {
+                        duchon_matern_kernel_general_from_distance(
+                            r,
+                            length_scale,
+                            p_order,
+                            s_order,
+                            d,
+                            coeffs.as_ref(),
+                        )
+                        .expect("validated Duchon inputs should not fail")
+                    }
+                })
+            } else {
+                let coeffs = coeffs.clone();
+                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                    let mut dist2 = 0.0;
+                    for axis in 0..d {
+                        let delta = data_row[axis] - center_row[axis];
+                        dist2 += delta * delta;
+                    }
+                    let r = dist2.sqrt();
+                    if let Some(ppc) = pure_poly_coeff {
+                        if r == 0.0 && p_order > 0 {
+                            0.0
+                        } else {
+                            ppc.eval(r)
+                        }
+                    } else {
+                        duchon_matern_kernel_general_from_distance(
+                            r,
+                            length_scale,
+                            p_order,
+                            s_order,
+                            d,
+                            coeffs.as_ref(),
+                        )
+                        .expect("validated Duchon inputs should not fail")
+                    }
+                })
+            };
+        let poly_block = polynomial_block_from_order(data, spec.nullspace_order);
+        let base_op = ChunkedKernelDesignOperator::new(
+            Arc::new(data.to_owned()),
+            Arc::new(centers.clone()),
+            kernel_fn,
+            Some(Arc::new(kernel_transform.clone())),
+            Some(Arc::new(poly_block)),
+        )
+        .map_err(BasisError::InvalidInput)?;
+        let base_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(base_op)));
+        let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
+            data,
+            &base_design,
+            &spec.identifiability,
+            "Duchon",
+        )?;
+        let design = if let Some(transform) = identifiability_transform.as_ref() {
+            wrap_dense_design_with_transform(base_design, transform, "Duchon")?
+        } else {
+            base_design
+        };
+        (design, identifiability_transform)
     } else {
-        basis
+        let d = build_duchon_basis_designwithworkspace(
+            data,
+            centers.view(),
+            spec.length_scale,
+            spec.power,
+            spec.nullspace_order,
+            aniso.as_deref(),
+            workspace,
+        )?;
+        let basis = d.basis;
+        let identifiability_transform = spatial_identifiability_transform_from_design(
+            data,
+            basis.view(),
+            &spec.identifiability,
+            "Duchon",
+        )?;
+        let design = if let Some(z) = identifiability_transform.as_ref() {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(fast_ab(&basis, z)))
+        } else {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(basis))
+        };
+        (design, identifiability_transform)
     };
     let ops = build_duchon_collocation_operator_matriceswithworkspace(
         centers.view(),
@@ -10271,7 +10759,7 @@ pub fn build_duchon_basiswithworkspace(
     let candidates = operator_penalty_candidates_from_collocation(&ops.d0, &ops.d1, &ops.d2);
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        design,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -11132,31 +11620,9 @@ fn stabilize_orthogonality_transform(
     basis_matrix: ArrayView2<'_, f64>,
     transform: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let constrained_basis = fast_ab(&basis_matrix, transform);
-    let gram = fast_ata(&constrained_basis);
-    let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
-    let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    let tol = default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * (constrained_basis
-            .nrows()
-            .max(constrained_basis.ncols())
-            .max(1) as f64)
-        * max_eval.max(1.0);
-    let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
-    if keep == 0 {
-        return Err(BasisError::ConstraintNullspaceNotFound);
-    }
-
-    let eig_start = eigenvalues.len() - keep;
-    let kept_vectors = eigenvectors.slice(s![.., eig_start..]).to_owned();
-    let mut inv_sqrt = Array2::<f64>::zeros((keep, keep));
-    for (out_i, eig_i) in (eig_start..eigenvalues.len()).enumerate() {
-        inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].max(tol).sqrt();
-    }
-    let whitening = fast_ab(&kept_vectors, &inv_sqrt);
-    let basis_orthonormal = fast_ab(&constrained_basis, &whitening);
-    let stabilized_transform = fast_ab(transform, &whitening);
+    let gram = fast_ata(&basis_matrix.to_owned());
+    let stabilized_transform = stabilized_orthogonality_transform_from_gram(&gram, transform)?;
+    let basis_orthonormal = fast_ab(&basis_matrix, &stabilized_transform);
     Ok((basis_orthonormal, stabilized_transform))
 }
 
@@ -12706,9 +13172,19 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smooth::orthogonality_relative_residual;
     use ndarray::{Array1, array};
     use num_dual::{DualNum, second_derivative};
+
+    fn dense_orthogonality_relative_residual(
+        basis_matrix: ArrayView2<'_, f64>,
+        constraint_matrix: ArrayView2<'_, f64>,
+    ) -> f64 {
+        let cross = basis_matrix.t().dot(&constraint_matrix);
+        let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let b_norm = basis_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let c_norm = constraint_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+        num / (b_norm * c_norm).max(1e-300)
+    }
 
     fn scaling_test_profile<D: DualNum<f64> + Copy>(t: D) -> D {
         D::one() + t * t + t.powi(4)
@@ -13124,6 +13600,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
+        let n = 17_000usize;
+        let k = 2_000usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut centers = Array2::<f64>::zeros((k, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n - 1) as f64;
+        }
+        for j in 0..k {
+            centers[[j, 0]] = j as f64 / (k - 1) as f64;
+        }
+        let spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 1.0,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::None,
+        };
+        let result = build_thin_plate_basis(data.view(), &spec).expect("large thin-plate basis");
+        assert!(matches!(
+            result.design,
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::Lazy(_))
+        ));
+    }
+
+    #[test]
     fn test_build_thin_plate_basis_default_identifiability_is_orthogonal_to_parametric_block() {
         let data = array![
             [0.0, 0.0],
@@ -13145,7 +13646,7 @@ mod tests {
         let mut c = Array2::<f64>::ones((data.nrows(), data.ncols() + 1));
         c.slice_mut(s![.., 1..]).assign(&data);
         let cross = result_design.t().dot(&c);
-        let rel = orthogonality_relative_residual(result_design.view(), c.view());
+        let rel = dense_orthogonality_relative_residual(result_design.view(), c.view());
 
         assert!(
             rel < 1e-10,
@@ -15069,7 +15570,7 @@ mod tests {
         let mut c = Array2::<f64>::ones((data.nrows(), data.ncols() + 1));
         c.slice_mut(s![.., 1..]).assign(&data);
         let cross = out_design.t().dot(&c);
-        let rel = orthogonality_relative_residual(out_design.view(), c.view());
+        let rel = dense_orthogonality_relative_residual(out_design.view(), c.view());
 
         assert!(
             rel < 1e-10,

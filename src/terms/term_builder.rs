@@ -390,10 +390,7 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
 
 pub fn spatial_center_strategy_for_dimension(num_centers: usize, d: usize) -> CenterStrategy {
     if d >= 4 {
-        CenterStrategy::KMeans {
-            num_centers,
-            max_iter: 25,
-        }
+        CenterStrategy::EqualMassCovarRepresentative { num_centers }
     } else {
         CenterStrategy::EqualMass { num_centers }
     }
