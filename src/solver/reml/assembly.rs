@@ -1,11 +1,11 @@
 //! Canonical `InnerSolution` assembler.
 //!
-//! **Hard rule**: no production code outside this module may construct
+//! No production code outside this module may construct
 //! `InnerSolutionBuilder::new(...)` or call `reml_laml_evaluate(...)`.
 //! Tests are exempt.
 //!
-//! All families and runtime paths provide *ingredients* and call
-//! [`InnerAssembly::evaluate`] or [`InnerAssembly::evaluate_with_solution`].
+//! All families and runtime paths provide ingredients and call
+//! [`InnerAssembly::evaluate`] or [`InnerAssembly::build`].
 
 use super::unified::{
     BarrierConfig, DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
@@ -103,21 +103,6 @@ impl<'dp> InnerAssembly<'dp> {
     ) -> Result<RemlLamlResult, String> {
         let solution = self.build();
         reml_laml_evaluate(&solution, rho, mode, prior)
-    }
-
-    /// Build and evaluate, returning both the solution and the result.
-    ///
-    /// Use this when the caller needs the `InnerSolution` after evaluation
-    /// (e.g., for EFS step computation).
-    pub fn evaluate_with_solution(
-        self,
-        rho: &[f64],
-        mode: EvalMode,
-        prior: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
-    ) -> Result<(InnerSolution<'dp>, RemlLamlResult), String> {
-        let solution = self.build();
-        let result = reml_laml_evaluate(&solution, rho, mode, prior)?;
-        Ok((solution, result))
     }
 }
 

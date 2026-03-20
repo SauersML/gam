@@ -992,7 +992,6 @@ impl OuterProblem {
     pub fn with_gradient(mut self, d: Derivative) -> Self { self.gradient = d; self }
     pub fn with_hessian(mut self, d: Derivative) -> Self { self.hessian = d; self }
     pub fn with_psi_dim(mut self, dim: usize) -> Self { self.psi_dim = dim; self }
-    pub fn with_efs(mut self) -> Self { self.efs_available = true; self }
     pub fn with_barrier(mut self, cfg: Option<BarrierConfig>) -> Self { self.barrier_config = cfg; self }
     pub fn with_tolerance(mut self, tol: f64) -> Self { self.tolerance = tol; self }
     pub fn with_max_iter(mut self, n: usize) -> Self { self.max_iter = n; self }
@@ -1002,7 +1001,6 @@ impl OuterProblem {
     pub fn with_seed_config(mut self, sc: crate::seeding::SeedConfig) -> Self { self.seed_config = sc; self }
     pub fn with_heuristic_lambdas(mut self, h: Vec<f64>) -> Self { self.heuristic_lambdas = Some(h); self }
     pub fn with_initial_rho(mut self, rho: Array1<f64>) -> Self { self.initial_rho = Some(rho); self }
-    pub fn with_fallback_policy(mut self, p: FallbackPolicy) -> Self { self.fallback_policy = p; self }
     pub fn with_screening_cap(mut self, cap: Arc<AtomicUsize>) -> Self { self.screening_cap = Some(cap); self }
 
     /// Derive the capability flags from the builder state.

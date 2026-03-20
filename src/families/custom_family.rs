@@ -4861,14 +4861,15 @@ fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(
         )
 }
 
-pub(crate) fn custom_family_outer_capability<F: CustomFamily + ?Sized>(
+pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-    n_params: usize,
-    psi_dim: usize,
-) -> crate::solver::outer_strategy::OuterCapability {
-    use crate::solver::outer_strategy::{Derivative, OuterCapability};
+) -> (
+    crate::solver::outer_strategy::Derivative,
+    crate::solver::outer_strategy::Derivative,
+) {
+    use crate::solver::outer_strategy::Derivative;
 
     let order = family.exact_outer_derivative_order(specs, options);
     let gradient = if order.has_gradient() {
@@ -4882,14 +4883,7 @@ pub(crate) fn custom_family_outer_capability<F: CustomFamily + ?Sized>(
         Derivative::Unavailable
     };
 
-    OuterCapability {
-        gradient,
-        hessian,
-        n_params,
-        psi_dim,
-        barrier_config: None,
-        fixed_point_available: false,
-    }
+    (gradient, hessian)
 }
 
 fn include_exact_newton_logdet_s<F: CustomFamily + ?Sized>(
@@ -7844,17 +7838,17 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let n_rho = rho0.len();
     let total_joint_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let primary_cap = custom_family_outer_capability(family, specs, options, n_rho, 0);
-    let hessian = if matches!(primary_cap.hessian, Derivative::Analytic)
+    let (cap_gradient, cap_hessian) = custom_family_outer_derivatives(family, specs, options);
+    let hessian = if matches!(cap_hessian, Derivative::Analytic)
         && !joint_exact_analytic_outer_hessian_available(total_joint_p)
     {
         Derivative::Unavailable
     } else {
-        primary_cap.hessian
+        cap_hessian
     };
     let need_outer_hessian = matches!(hessian, Derivative::Analytic);
     let problem = OuterProblem::new(n_rho)
-        .with_gradient(primary_cap.gradient)
+        .with_gradient(cap_gradient)
         .with_hessian(hessian)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
@@ -8073,7 +8067,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_family_outer_capability_respects_first_order_downgrade() {
+    fn custom_family_outer_derivatives_respects_first_order_downgrade() {
         #[derive(Clone)]
         struct OneBlockFirstOrderOnlyFamily;
 
@@ -8110,19 +8104,17 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: None,
         }];
-        let cap = custom_family_outer_capability(
+        let (gradient, hessian) = custom_family_outer_derivatives(
             &OneBlockFirstOrderOnlyFamily,
             &specs,
             &BlockwiseFitOptions::default(),
-            1,
-            0,
         );
         assert_eq!(
-            cap.gradient,
+            gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
         assert_eq!(
-            cap.hessian,
+            hessian,
             crate::solver::outer_strategy::Derivative::Unavailable
         );
     }
