@@ -2733,6 +2733,65 @@ impl<'a> RemlState<'a> {
         })
     }
 
+    /// Build an `InnerAssembly` using the dense original-basis backend.
+    ///
+    /// Used when QS-transformed coordinates have no active constraints,
+    /// allowing us to work in the original basis for better numerical
+    /// stability with extended ψ coordinates. TK correction is zeroed
+    /// in the assembly and applied post-hoc by `assemble_and_evaluate`.
+    fn build_dense_original_assembly(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+    ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
+        use super::unified::DenseSpectralOperator;
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        let ridge_passport = pirls_result.ridge_passport;
+
+        let h_total_original =
+            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
+        let hessian_op = Box::new(
+            DenseSpectralOperator::from_symmetric(&h_total_original).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "DenseSpectralOperator from original-basis PIRLS Hessian: {e}"
+                ))
+            })?,
+        );
+
+        let e_for_logdet = pirls_result.reparam_result.e_transformed.clone();
+        let (penalty_rank, penalty_logdet) =
+            self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
+
+        let beta = self.sparse_exact_beta_original(pirls_result);
+        let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
+
+        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
+            self.build_sparse_derivative_context(pirls_result, bundle)?;
+
+        Ok(super::assembly::InnerAssembly {
+            log_likelihood,
+            penalty_quadratic: pirls_result.stable_penalty_term,
+            beta,
+            n_observations: self.y.len(),
+            hessian_op,
+            penalty_coords: self.build_penalty_coords(),
+            penalty_logdet,
+            dispersion,
+            deriv_provider: Some(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: firth_op,
+            nullspace_dim: Some(nullspace_dim),
+            barrier_config,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+        })
+    }
+
     /// Build the soft prior tuple for the given mode.
     fn build_prior(
         &self,
@@ -2958,81 +3017,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Prepare ingredients for the dense-reparam evaluation path.
-    ///
-    /// Shared between the normal, ext-coord, and EFS dense paths.
-    /// Returns an `InnerAssembly` without ext_coords — the caller injects
-    /// those before evaluating.
-    fn prepare_dense_reparam_assembly(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-        penalty_logdet_mode: super::unified::EvalMode,
-    ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use super::unified::DenseSpectralOperator;
-
-        let pirls_result = bundle.pirls_result.as_ref();
-        let ridge_passport = pirls_result.ridge_passport;
-
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
-            (
-                Self::projectwith_basis(bundle.h_total.as_ref(), z),
-                pirls_result.reparam_result.e_transformed.dot(z),
-            )
-        } else {
-            (
-                bundle.h_total.as_ref().clone(),
-                pirls_result.reparam_result.e_transformed.clone(),
-            )
-        };
-
-        let hessian_op = Box::new(
-            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "DenseSpectralOperator from PIRLS Hessian: {e}"
-                ))
-            })?,
-        );
-
-        let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
-            rho, &e_for_logdet, &[], ridge_passport, penalty_logdet_mode,
-        )?;
-
-        let beta = if let Some(z) = free_basis_opt.as_ref() {
-            z.t().dot(&pirls_result.beta_transformed.as_ref().to_owned())
-        } else {
-            pirls_result.beta_transformed.as_ref().clone()
-        };
-
-        let p_eff_dim = h_for_operator.ncols();
-        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
-
-        let (deriv_provider, dispersion, tk_correction, tk_gradient, log_likelihood, firth_op, barrier_config) =
-            self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
-
-        Ok(super::assembly::InnerAssembly {
-            log_likelihood,
-            penalty_quadratic: pirls_result.stable_penalty_term,
-            beta,
-            n_observations: self.y.len(),
-            hessian_op,
-            penalty_coords: self.build_penalty_coords(),
-            penalty_logdet,
-            dispersion,
-            deriv_provider: Some(deriv_provider),
-            tk_correction,
-            tk_gradient,
-            firth: firth_op,
-            nullspace_dim: Some(nullspace_dim),
-            barrier_config,
-            ext_coords: Vec::new(),
-            ext_coord_pair_fn: None,
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-        })
-    }
-
     /// Dense-transformed bridge with optional ext_coords. Dispatches to the
     /// original-basis path when QS-transformed but unconstrained.
     fn evaluate_unified_with_ext_from_bundle(
@@ -3145,14 +3129,14 @@ impl<'a> RemlState<'a> {
         self.evaluate_unified_for_efs(p, &bundle)
     }
 
-    /// Builds the InnerSolution from an eval bundle and returns EFS steps.
-    /// Dense EFS bridge: reuses `prepare_dense_reparam_assembly`.
+    /// Dense EFS bridge: delegates to `build_dense_assembly` +
+    /// `assemble_and_evaluate_efs`.
     fn evaluate_unified_for_efs(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        let assembly = self.prepare_dense_reparam_assembly(
+        let assembly = self.build_dense_assembly(
             rho, bundle, super::unified::EvalMode::ValueOnly,
         )?;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
@@ -3301,91 +3285,21 @@ impl<'a> RemlState<'a> {
         self.evaluate_unified_for_efs_with_ext(rho, &bundle, ext_coords)
     }
 
-    /// Dense EFS bridge with ext_coords: mirrors `evaluate_unified_for_efs` but
-    /// injects ext_coords into the `InnerAssembly`.
+    /// Dense EFS bridge with ext_coords: reuses `build_dense_assembly` and
+    /// injects the provided ext_coords before EFS evaluation.
     fn evaluate_unified_for_efs_with_ext(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         ext_coords: Vec<super::unified::HyperCoord>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        use super::unified::DenseSpectralOperator;
-
-        let pirls_result = bundle.pirls_result.as_ref();
-        let ridge_passport = pirls_result.ridge_passport;
-
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
-            (
-                Self::projectwith_basis(bundle.h_total.as_ref(), z),
-                pirls_result.reparam_result.e_transformed.dot(z),
-            )
-        } else {
-            (
-                bundle.h_total.as_ref().clone(),
-                pirls_result.reparam_result.e_transformed.clone(),
-            )
-        };
-
-        let hessian_op = Box::new(
-            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "DenseSpectralOperator from PIRLS Hessian (hybrid EFS link): {e}"
-                ))
-            })?,
-        );
-
-        let (penalty_rank, ..) =
-            self.fixed_subspace_penalty_rank_and_logdet(&e_for_logdet, ridge_passport)?;
-
-        let (_, penalty_logdet) = self.dense_penalty_logdet_derivs(
-            rho,
-            &e_for_logdet,
-            &[],
-            ridge_passport,
-            super::unified::EvalMode::ValueOnly,
+        let mut assembly = self.build_dense_assembly(
+            rho, bundle, super::unified::EvalMode::ValueOnly,
         )?;
-
-        let beta = if let Some(z) = free_basis_opt.as_ref() {
-            z.t()
-                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
-        } else {
-            pirls_result.beta_transformed.as_ref().clone()
-        };
-
-        let p_eff_dim = h_for_operator.ncols();
-        let nullspace_dim = p_eff_dim.saturating_sub(penalty_rank) as f64;
-
-        let (
-            deriv_provider,
-            dispersion,
-            tk_correction,
-            _,
-            log_likelihood,
-            firth_op,
-            barrier_config,
-        ) = self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
-
-        let assembly = super::assembly::InnerAssembly {
-            log_likelihood,
-            penalty_quadratic: pirls_result.stable_penalty_term,
-            beta,
-            n_observations: self.y.len(),
-            hessian_op,
-            penalty_coords: self.build_penalty_coords(),
-            penalty_logdet,
-            dispersion,
-            deriv_provider: Some(deriv_provider),
-            tk_correction,
-            tk_gradient: None,
-            firth: firth_op,
-            nullspace_dim: Some(nullspace_dim),
-            barrier_config,
-            ext_coords,
-            ext_coord_pair_fn: None,
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-        };
+        // EFS doesn't use TK gradient.
+        assembly.tk_gradient = None;
+        // Inject link ext_coords for hybrid EFS.
+        assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
 }

@@ -1,6 +1,5 @@
 pub mod estimate;
 pub mod mixture_link;
-pub(crate) mod optimize;
 pub mod outer_strategy;
 pub mod pirls;
 pub mod seeding;
