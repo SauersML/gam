@@ -6187,10 +6187,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         self.exact_newton_joint_hessian_rescaled(block_states)
     }
 
-    /// Assemble the joint Hessian matrix from pre-computed per-row
-    /// quantities.  Factored out of `exact_newton_joint_hessian` so
-    /// that the rescaled logdet path can reuse the assembly code with
-    /// shifted quantities.
     fn assemble_joint_hessian_from_quantities(
         &self,
         q: &SurvivalJointQuantities,
@@ -6545,7 +6541,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             .assemble_joint_hessian_from_quantities(&q, block_states)?
             .map(|h| (h, log_scale)))
     }
+}
 
+// Continue the CustomFamily trait impl — the inherent helper block above
+// (`assemble_joint_hessian_from_quantities`, `hessian_deriv_log_rescale`,
+// `exact_newton_joint_hessian_rescaled`) must live in an inherent impl
+// because they are not trait methods.
+impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],

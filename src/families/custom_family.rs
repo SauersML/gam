@@ -5887,10 +5887,8 @@ fn unified_joint_cost_gradient(
         .iter()
         .map(|s| s.penalties.iter().map(|p| p.to_dense()).collect())
         .collect();
-    let block_descs: Vec<PenaltyBlockDesc> = specs
-        .iter()
-        .enumerate()
-        .flat_map(|(b, _spec)| {
+    let block_descs: Vec<PenaltyBlockDesc> = (0..specs.len())
+        .flat_map(|b| {
             let (start, end) = ranges[b];
             per_block_penalties_dense[b].iter().map(move |dense| {
                 PenaltyBlockDesc {
