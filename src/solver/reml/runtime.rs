@@ -2434,7 +2434,7 @@ impl<'a> RemlState<'a> {
     /// Build the dispersion handling, derivative provider, log-likelihood,
     /// exact Firth operator, and barrier config that are common
     /// to both sparse evaluation paths (`evaluate_unified_sparse` and
-    /// `evaluate_unified_sparse_for_efs`).
+    /// `evaluate_efs` when sparse-dispatched).
     ///
     /// TK correction is NOT included here because the sparse paths compute
     /// it via sparse Cholesky solves with completely different logic.
@@ -2755,6 +2755,38 @@ impl<'a> RemlState<'a> {
         Ok(self.finish_assembly(pirls_result, ctx, hessian_op, beta, penalty_logdet, nullspace_dim))
     }
 
+    /// Build an `InnerAssembly` by auto-detecting the backend.
+    ///
+    /// - Sparse-exact SPD  → `build_sparse_assembly`
+    /// - QS-transformed + unconstrained + ext_coords being injected → `build_dense_original_assembly`
+    /// - Otherwise → `build_dense_assembly`
+    ///
+    /// The QS-original dispatch only fires when `has_ext` is true,
+    /// because ext_coord derivatives (ψ) are computed in original coordinates.
+    fn build_auto_assembly(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+        has_ext: bool,
+    ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
+        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            self.build_sparse_assembly(rho, bundle, mode)
+        } else if has_ext
+            && matches!(
+                bundle.pirls_result.coordinate_frame,
+                pirls::PirlsCoordinateFrame::TransformedQs
+            )
+            && self
+                .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                .is_none()
+        {
+            self.build_dense_original_assembly(rho, bundle, mode)
+        } else {
+            self.build_dense_assembly(rho, bundle, mode)
+        }
+    }
+
     /// Build the soft prior tuple for the given mode.
     fn build_prior(
         &self,
@@ -2885,19 +2917,6 @@ impl<'a> RemlState<'a> {
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
-    /// Sparse-exact EFS bridge: delegates to `build_sparse_assembly` +
-    /// `assemble_and_evaluate_efs`.
-    fn evaluate_unified_sparse_for_efs(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        let assembly = self.build_sparse_assembly(
-            rho, bundle, super::unified::EvalMode::ValueOnly,
-        )?;
-        self.assemble_and_evaluate_efs(rho, bundle, assembly)
-    }
-
     /// Evaluate the unified REML/LAML objective with anisotropic ψ ext_coords
     /// injected into the `InnerSolution`.
     ///
@@ -2957,104 +2976,11 @@ impl<'a> RemlState<'a> {
             (Vec::new(), None, None)
         };
 
-        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-            self.evaluate_unified_sparse_with_ext_from_bundle(
-                rho,
-                &bundle,
-                mode,
-                ext_coords,
-                ext_pair_fn,
-                rho_ext_pair_fn,
-            )
-        } else {
-            self.evaluate_unified_with_ext_from_bundle(
-                rho,
-                &bundle,
-                mode,
-                ext_coords,
-                ext_pair_fn,
-                rho_ext_pair_fn,
-            )
-        }
-    }
-
-    /// Dense-transformed bridge with optional ext_coords. Dispatches to the
-    /// original-basis path when QS-transformed but unconstrained.
-    fn evaluate_unified_with_ext_from_bundle(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        ext_coords: Vec<super::unified::HyperCoord>,
-        ext_coord_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-        rho_ext_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        let pirls_result = bundle.pirls_result.as_ref();
-        if matches!(
-            pirls_result.coordinate_frame,
-            pirls::PirlsCoordinateFrame::TransformedQs
-        ) && self.active_constraint_free_basis(pirls_result).is_none()
-        {
-            return self.evaluate_unified_dense_original_with_ext_from_bundle(
-                rho, bundle, mode, ext_coords, ext_coord_pair_fn, rho_ext_pair_fn,
-            );
-        }
-
-        let mut assembly = self.build_dense_assembly(rho, bundle, mode)?;
+        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
         assembly.ext_coords = ext_coords;
-        assembly.ext_coord_pair_fn = ext_coord_pair_fn;
+        assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
-        self.assemble_and_evaluate(rho, bundle, mode, assembly)
-    }
-
-    /// Dense original-basis bridge with ext_coords.
-    fn evaluate_unified_dense_original_with_ext_from_bundle(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        ext_coords: Vec<super::unified::HyperCoord>,
-        ext_coord_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-        rho_ext_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        let mut assembly = self.build_dense_original_assembly(rho, bundle, mode)?;
-        assembly.ext_coords = ext_coords;
-        assembly.ext_coord_pair_fn = ext_coord_pair_fn;
-        assembly.rho_ext_pair_fn = rho_ext_pair_fn;
-        self.assemble_and_evaluate(rho, bundle, mode, assembly)
-    }
-
-    /// Sparse-exact bridge for unified evaluation with extended τ/ψ coordinates.
-    ///
-    /// This mirrors `evaluate_unified_sparse` but injects ext-coordinates into
-    /// the `InnerSolution` so the unified evaluator can compute joint [ρ, τ/ψ]
-    /// value/gradient/Hessian while still using the sparse Cholesky operator.
-    fn evaluate_unified_sparse_with_ext_from_bundle(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        ext_coords: Vec<super::unified::HyperCoord>,
-        ext_coord_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-        rho_ext_pair_fn: Option<
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-        >,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        let mut assembly = self.build_sparse_assembly(rho, bundle, mode)?;
-        assembly.ext_coords = ext_coords;
-        assembly.ext_coord_pair_fn = ext_coord_pair_fn;
-        assembly.rho_ext_pair_fn = rho_ext_pair_fn;
-        self.assemble_and_evaluate(rho, bundle, mode, assembly)
+        self.assemble_and_evaluate(rho, &bundle, mode, assembly)
     }
 
     /// Compute EFS (Extended Fellner-Schall) evaluation: runs the inner solve
@@ -3081,26 +3007,7 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        // Dispatch to the appropriate backend.
-        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-            return self.evaluate_unified_sparse_for_efs(p, &bundle);
-        }
-
-        // Reuse the same setup as evaluate_unified but call the EFS tail.
-        self.evaluate_unified_for_efs(p, &bundle)
-    }
-
-    /// Dense EFS bridge: delegates to `build_dense_assembly` +
-    /// `assemble_and_evaluate_efs`.
-    fn evaluate_unified_for_efs(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        let assembly = self.build_dense_assembly(
-            rho, bundle, super::unified::EvalMode::ValueOnly,
-        )?;
-        self.assemble_and_evaluate_efs(rho, bundle, assembly)
+        self.evaluate_efs(p, &bundle, Vec::new())
     }
 
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -3200,7 +3107,9 @@ impl<'a> RemlState<'a> {
             return self.evaluate_unified(rho, &bundle, mode);
         }
 
-        self.evaluate_unified_with_ext_from_bundle(rho, &bundle, mode, ext_coords, None, None)
+        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, true)?;
+        assembly.ext_coords = ext_coords;
+        self.assemble_and_evaluate(rho, &bundle, mode, assembly)
     }
 
     /// EFS evaluation with link-parameter ext_coords injected.
@@ -3216,20 +3125,21 @@ impl<'a> RemlState<'a> {
             return self.compute_efs_steps(rho);
         }
 
-        self.evaluate_unified_for_efs_with_ext(rho, &bundle, ext_coords)
+        self.evaluate_efs(rho, &bundle, ext_coords)
     }
 
-    /// Dense EFS bridge with ext_coords: reuses `build_dense_assembly` and
-    /// injects the provided ext_coords before EFS evaluation.
-    fn evaluate_unified_for_efs_with_ext(
+    /// Unified EFS bridge: auto-dispatches backend, injects ext_coords,
+    /// and evaluates via `assemble_and_evaluate_efs`.
+    fn evaluate_efs(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         ext_coords: Vec<super::unified::HyperCoord>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        let mut assembly = self.build_dense_assembly(
-            rho, bundle, super::unified::EvalMode::ValueOnly,
+        let mut assembly = self.build_auto_assembly(
+            rho, bundle, super::unified::EvalMode::ValueOnly, !ext_coords.is_empty(),
         )?;
+        assembly.tk_gradient = None;
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
