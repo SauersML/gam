@@ -16,7 +16,7 @@ pub use data::{
 };
 pub use inference::{alo, data, diagnostics, generative, hmc, predict, probability, quadrature};
 pub use linalg::{faer_ndarray, matrix, utils};
-pub use solver::{estimate, mixture_link, pirls, seeding, smoothing, visualizer};
+pub use solver::{estimate, mixture_link, pirls, seeding, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
 
 pub use families::bernoulli_marginal_slope;

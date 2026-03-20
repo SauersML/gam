@@ -1024,7 +1024,7 @@ impl OuterProblem {
     /// regardless of whether `.with_efs()` was called.  This is the canonical
     /// way to create production objectives — it eliminates the drift risk of
     /// manually entering capability flags.
-    pub(crate) fn build_objective<S, Fc, Fe, Fr, Fefs>(
+    pub fn build_objective<S, Fc, Fe, Fr, Fefs>(
         &self,
         state: S,
         cost_fn: Fc,
