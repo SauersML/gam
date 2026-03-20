@@ -1984,15 +1984,7 @@ impl SurvivalLocationScaleFamily {
             + 2.0 * fp * f * f / s3
     }
 
-    /// Exact log-pdf and its first four derivatives.
-    fn exact_log_pdf_derivatives(
-        inverse_link: &InverseLink,
-        eta: f64,
-    ) -> Result<(f64, f64, f64, f64, f64), String> {
-        Self::exact_log_pdf_derivatives_rescaled(inverse_link, eta, 0.0)
-    }
-
-    /// Like [`Self::exact_log_pdf_derivatives`] but with a log-scale shift
+    /// Like [`Self::exact_log_pdf_derivatives_rescaled`] but with a log-scale shift
     /// on the derivative magnitudes.  For CLogLog the `exp(eta)` terms in
     /// the derivatives become `exp(eta - deriv_log_scale)`.  The function
     /// value is returned unshifted.
@@ -2057,15 +2049,7 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
-    /// Exact log-survival value and the derivatives of `-log S` through 4th order.
-    fn exact_survival_neglog_derivatives_fourth(
-        inverse_link: &InverseLink,
-        eta: f64,
-    ) -> Result<(f64, f64, f64, f64, f64), String> {
-        Self::exact_survival_neglog_derivatives_fourth_rescaled(inverse_link, eta, 0.0)
-    }
-
-    /// Like [`Self::exact_survival_neglog_derivatives_fourth`] but with a
+    /// Like [`Self::exact_survival_neglog_derivatives_fourth_rescaled`] but with a
     /// log-scale shift applied to the **derivative** magnitudes (not the
     /// function value).  For CLogLog the derivatives are `exp(eta)`, so
     /// shifting gives `exp(eta - deriv_log_scale)` — always finite when
@@ -9372,9 +9356,10 @@ mod tests {
     #[test]
     fn exact_log_pdf_derivatives_match_probit_closed_form() {
         let eta = 3.25;
-        let (logf, d1, d2, d3, d4) = SurvivalLocationScaleFamily::exact_log_pdf_derivatives(
+        let (logf, d1, d2, d3, d4) = SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
             &InverseLink::Standard(LinkFunction::Probit),
             eta,
+            0.0,
         )
         .expect("exact probit log-pdf derivatives");
         let expected_logf = -0.5 * eta * eta - 0.5 * (2.0 * std::f64::consts::PI).ln();
@@ -9391,9 +9376,10 @@ mod tests {
         let s = 1.0 - eta;
         let inv = 1.0 / s;
         let (log_s, r, dr, ddr, dddr) =
-            SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth(
+            SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
                 &InverseLink::Standard(LinkFunction::Identity),
                 eta,
+                0.0,
             )
             .expect("exact identity survival derivatives");
         assert!((log_s - s.ln()).abs() <= 1e-15);
