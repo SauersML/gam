@@ -34,7 +34,6 @@ use crate::smooth::{
     AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
     TermCollectionSpec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
-use crate::solver::optimize::CostOnlyObjective;
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::HashMap;
@@ -493,11 +492,27 @@ fn fit_survival_location_scale_model(
                     .with_seed_config(seed_config)
                     .with_heuristic_lambdas(init.to_vec());
                 let context = format!("survival inverse-link optimization ({name}, dim={dim})");
-                let mut cost_obj = crate::solver::optimize::CostOnlyObjective {
-                    n_params: dim,
-                    cost_fn: |rho: &ndarray::Array1<f64>| objective(rho),
-                };
-                match problem.run(&mut cost_obj, &context) {
+                let mut obj = problem.build_objective(
+                    (),
+                    |_: &mut (), rho: &ndarray::Array1<f64>| objective(rho),
+                    |_: &mut (), _: &ndarray::Array1<f64>| {
+                        Err(crate::estimate::EstimationError::InvalidInput(
+                            "cost-only objective has no eval".to_string(),
+                        ))
+                    },
+                    None::<fn(&mut ())>,
+                    None::<
+                        fn(
+                            &mut (),
+                            &ndarray::Array1<f64>,
+                        )
+                            -> Result<
+                                crate::solver::outer_strategy::EfsEval,
+                                crate::estimate::EstimationError,
+                            >,
+                    >,
+                );
+                match problem.run(&mut obj, &context) {
                     Ok(result) => {
                         if let Some(link) = recover(&result.rho) {
                             eprintln!(
