@@ -1715,7 +1715,7 @@ where
         let mut reml_seed_config_mix = reml_seed_config.clone();
         reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
         use crate::solver::outer_strategy::{
-            Derivative, EfsEval, HessianResult, OuterEval, OuterProblem,
+            Derivative, HessianResult, OuterEval, OuterProblem,
         };
         let initial_link_kind = cfg.link_kind.clone();
         let problem = OuterProblem::new(theta_dim)
@@ -2465,7 +2465,7 @@ where
     let finalgrad_norm = if finalgrad_norm_rho.is_finite() {
         finalgrad_norm_rho
     } else {
-        outer_result.finalgrad_norm
+        outer_result.final_grad_norm
     };
 
     if opts.compute_inference {

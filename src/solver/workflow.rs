@@ -473,86 +473,95 @@ fn fit_survival_location_scale_model(
         wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
     ) -> Result<SurvivalLocationScaleProfile, String> {
-        let optimize_link_parameters =
-            |init: Array1<f64>,
-             name: &str,
-             final_wiggle: Option<LinkWiggleConfig>,
-             mut objective: Box<dyn FnMut(&Array1<f64>) -> Result<f64, EstimationError>>,
-             recover: Box<dyn Fn(&Array1<f64>) -> Option<InverseLink>>|
-             -> Result<Option<SurvivalLocationScaleProfile>, String> {
-                let dim = init.len();
-                let mut seed_config = crate::seeding::SeedConfig::default();
-                seed_config.max_seeds = 8;
-                seed_config.screening_budget = 3;
-                seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
-                let problem = crate::solver::outer_strategy::OuterProblem::new(dim)
-                    .with_tolerance(1e-4)
-                    .with_max_iter(30)
-                    .with_fd_step(1e-3)
-                    .with_seed_config(seed_config)
-                    .with_heuristic_lambdas(init.to_vec());
-                let context = format!("survival inverse-link optimization ({name}, dim={dim})");
-                type CostFn = Box<dyn FnMut(&ndarray::Array1<f64>) -> Result<f64, EstimationError>>;
-                let mut obj = problem.build_objective(
-                    objective,
-                    |f: &mut CostFn, rho: &ndarray::Array1<f64>| f(rho),
-                    |_: &mut CostFn, _: &ndarray::Array1<f64>| {
-                        Err(EstimationError::InvalidInput(
-                            "cost-only objective has no eval".to_string(),
-                        ))
-                    },
-                    None::<fn(&mut CostFn)>,
-                    None::<
-                        fn(
-                            &mut CostFn,
-                            &ndarray::Array1<f64>,
-                        )
-                            -> Result<
-                                crate::solver::outer_strategy::EfsEval,
-                                EstimationError,
-                            >,
-                    >,
-                );
-                match problem.run(&mut obj, &context) {
-                    Ok(result) => {
-                        if let Some(link) = recover(&result.rho) {
-                            eprintln!(
-                                "[survival link opt] optimized {name} params: dim={} iters={} converged={} finalobj={:.6e}",
-                                result.rho.len(),
-                                result.iterations,
-                                result.converged,
-                                result.final_value
-                            );
-                            profile_survival_location_scale_with_inverse_link(
-                                data,
-                                spec,
-                                link,
-                                final_wiggle.clone(),
-                                kappa_options,
-                            )
-                            .map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    Err(err) => {
+        fn optimize_link_parameters<F, R>(
+            data: ArrayView2<'_, f64>,
+            spec: &SurvivalLocationScaleTermSpec,
+            kappa_options: &SpatialLengthScaleOptimizationOptions,
+            init: Array1<f64>,
+            name: &str,
+            final_wiggle: Option<LinkWiggleConfig>,
+            objective: F,
+            recover: R,
+        ) -> Result<Option<SurvivalLocationScaleProfile>, String>
+        where
+            F: FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
+            R: Fn(&Array1<f64>) -> Option<InverseLink>,
+        {
+            let dim = init.len();
+            let mut seed_config = crate::seeding::SeedConfig::default();
+            seed_config.max_seeds = 8;
+            seed_config.screening_budget = 3;
+            seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
+            let problem = crate::solver::outer_strategy::OuterProblem::new(dim)
+                .with_tolerance(1e-4)
+                .with_max_iter(30)
+                .with_fd_step(1e-3)
+                .with_seed_config(seed_config)
+                .with_heuristic_lambdas(init.to_vec());
+            let context = format!("survival inverse-link optimization ({name}, dim={dim})");
+            let mut obj = problem.build_objective(
+                objective,
+                |f: &mut F, rho: &ndarray::Array1<f64>| f(rho),
+                |_: &mut F, _: &ndarray::Array1<f64>| {
+                    Err(EstimationError::InvalidInput(
+                        "cost-only objective has no eval".to_string(),
+                    ))
+                },
+                None::<fn(&mut F)>,
+                None::<
+                    fn(
+                        &mut F,
+                        &ndarray::Array1<f64>,
+                    )
+                        -> Result<
+                            crate::solver::outer_strategy::EfsEval,
+                            EstimationError,
+                        >,
+                >,
+            );
+            match problem.run(&mut obj, &context) {
+                Ok(result) => {
+                    if let Some(link) = recover(&result.rho) {
                         eprintln!(
-                            "[survival link opt] {name} optimization failed; using initial params: {err}"
+                            "[survival link opt] optimized {name} params: dim={} iters={} converged={} finalobj={:.6e}",
+                            result.rho.len(),
+                            result.iterations,
+                            result.converged,
+                            result.final_value
                         );
+                        profile_survival_location_scale_with_inverse_link(
+                            data,
+                            spec,
+                            link,
+                            final_wiggle.clone(),
+                            kappa_options,
+                        )
+                        .map(Some)
+                    } else {
                         Ok(None)
                     }
                 }
-            };
+                Err(err) => {
+                    eprintln!(
+                        "[survival link opt] {name} optimization failed; using initial params: {err}"
+                    );
+                    Ok(None)
+                }
+            }
+        }
 
         match spec.inverse_link.clone() {
             InverseLink::Sas(state0) => {
                 let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
                 let wiggle_cfg = wiggle.clone();
                 let optimized = optimize_link_parameters(
+                    data,
+                    spec,
+                    kappa_options,
                     init,
                     "SAS",
                     wiggle.clone(),
-                    Box::new(|theta: &Array1<f64>| {
+                    |theta: &Array1<f64>| {
                         let state = state_from_sasspec(SasLinkSpec {
                             initial_epsilon: theta[0],
                             initial_log_delta: theta[1],
@@ -567,15 +576,15 @@ fn fit_survival_location_scale_model(
                         )
                         .map_err(EstimationError::InvalidInput)?
                         .objective())
-                    }),
-                    Box::new(|rho| {
+                    },
+                    |rho| {
                         state_from_sasspec(SasLinkSpec {
                             initial_epsilon: rho[0],
                             initial_log_delta: rho[1],
                         })
                         .ok()
                         .map(InverseLink::Sas)
-                    }),
+                    },
                 )?;
                 if let Some(profile) = optimized {
                     Ok(profile)
@@ -587,10 +596,13 @@ fn fit_survival_location_scale_model(
                 let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
                 let wiggle_cfg = wiggle.clone();
                 let optimized = optimize_link_parameters(
+                    data,
+                    spec,
+                    kappa_options,
                     init,
                     "BetaLogistic",
                     wiggle.clone(),
-                    Box::new(|theta: &Array1<f64>| {
+                    |theta: &Array1<f64>| {
                         let state = state_from_beta_logisticspec(SasLinkSpec {
                             initial_epsilon: theta[0],
                             initial_log_delta: theta[1],
@@ -605,15 +617,15 @@ fn fit_survival_location_scale_model(
                         )
                         .map_err(EstimationError::InvalidInput)?
                         .objective())
-                    }),
-                    Box::new(|rho| {
+                    },
+                    |rho| {
                         state_from_beta_logisticspec(SasLinkSpec {
                             initial_epsilon: rho[0],
                             initial_log_delta: rho[1],
                         })
                         .ok()
                         .map(InverseLink::BetaLogistic)
-                    }),
+                    },
                 )?;
                 if let Some(profile) = optimized {
                     Ok(profile)
@@ -626,10 +638,13 @@ fn fit_survival_location_scale_model(
                 let components_recover = components.clone();
                 let wiggle_cfg = wiggle.clone();
                 let optimized = optimize_link_parameters(
+                    data,
+                    spec,
+                    kappa_options,
                     state0.rho.clone(),
                     "mixture",
                     wiggle.clone(),
-                    Box::new(move |rho: &Array1<f64>| {
+                    move |rho: &Array1<f64>| {
                         let state = state_fromspec(&MixtureLinkSpec {
                             components: components.clone(),
                             initial_rho: rho.clone(),
@@ -644,15 +659,15 @@ fn fit_survival_location_scale_model(
                         )
                         .map_err(EstimationError::InvalidInput)?
                         .objective())
-                    }),
-                    Box::new(move |rho| {
+                    },
+                    move |rho| {
                         state_fromspec(&MixtureLinkSpec {
                             components: components_recover.clone(),
                             initial_rho: rho.to_owned(),
                         })
                         .ok()
                         .map(InverseLink::Mixture)
-                    }),
+                    },
                 )?;
                 if let Some(profile) = optimized {
                     Ok(profile)
