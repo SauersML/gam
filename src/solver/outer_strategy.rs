@@ -509,22 +509,22 @@ pub trait OuterObjective {
 /// This allows any call site to construct an `OuterObjective` from closures
 /// without needing to define a wrapper struct or modify the state type.
 /// Each call site wraps its existing methods into closures and passes them here.
-pub struct ClosureObjective<
+pub(crate) struct ClosureObjective<
     S,
     Fc,
     Fe,
     Fr = fn(&mut S),
     Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
 > {
-    pub state: S,
-    pub cap: OuterCapability,
-    pub cost_fn: Fc,
-    pub eval_fn: Fe,
+    pub(crate) state: S,
+    pub(crate) cap: OuterCapability,
+    pub(crate) cost_fn: Fc,
+    pub(crate) eval_fn: Fe,
     /// Optional reset closure. When `None`, `reset()` is a no-op.
-    pub reset_fn: Option<Fr>,
+    pub(crate) reset_fn: Option<Fr>,
     /// Optional EFS evaluation closure. When `None`, the default
     /// `OuterObjective::eval_efs` returns an error.
-    pub efs_fn: Option<Fefs>,
+    pub(crate) efs_fn: Option<Fefs>,
 }
 
 impl<S, Fc, Fe, Fr, Fefs> OuterObjective for ClosureObjective<S, Fc, Fe, Fr, Fefs>
@@ -854,31 +854,17 @@ fn solution_into_outer_result(
 
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
-pub struct OuterConfig {
-    /// Optimizer convergence tolerance.
-    pub tolerance: f64,
-    /// Maximum outer iterations per seed candidate.
-    pub max_iter: usize,
-    /// Finite-difference step size for FD Hessian construction.
-    pub fd_step: f64,
-    /// Optional per-coordinate lower/upper bounds for the outer coordinates.
-    /// When absent, the runner uses symmetric `[-rho_bound, +rho_bound]`.
-    pub bounds: Option<(Array1<f64>, Array1<f64>)>,
-    /// Seed generation and screening configuration.
-    pub seed_config: crate::seeding::SeedConfig,
-    /// Bounds on rho coordinates (applied symmetrically as [-bound, +bound]).
-    pub rho_bound: f64,
-    /// Heuristic initial lambdas for seed generation (optional).
-    pub heuristic_lambdas: Option<Vec<f64>>,
-    /// If provided, use this as the sole starting point (skip seed generation
-    /// and screening). Useful when the caller already has a good initial rho.
-    pub initial_rho: Option<Array1<f64>>,
-    /// Centralized retry policy for degraded outer plans.
-    pub fallback_policy: FallbackPolicy,
-    /// Shared atomic for screening iteration cap. When present, the screening
-    /// loop sets this to `screen_max_inner_iterations` before eval_cost calls
-    /// and resets to 0 afterward. The inner solver reads it atomically.
-    pub screening_cap: Option<Arc<AtomicUsize>>,
+struct OuterConfig {
+    tolerance: f64,
+    max_iter: usize,
+    fd_step: f64,
+    bounds: Option<(Array1<f64>, Array1<f64>)>,
+    seed_config: crate::seeding::SeedConfig,
+    rho_bound: f64,
+    heuristic_lambdas: Option<Vec<f64>>,
+    initial_rho: Option<Array1<f64>>,
+    fallback_policy: FallbackPolicy,
+    screening_cap: Option<Arc<AtomicUsize>>,
 }
 
 struct ScreeningCapGuard<'a> {
@@ -953,7 +939,6 @@ pub struct OuterProblem {
     gradient: Derivative,
     hessian: Derivative,
     psi_dim: usize,
-    efs_available: bool,
     barrier_config: Option<BarrierConfig>,
     tolerance: f64,
     max_iter: usize,
@@ -974,7 +959,6 @@ impl OuterProblem {
             gradient: Derivative::Unavailable,
             hessian: Derivative::Unavailable,
             psi_dim: 0,
-            efs_available: false,
             barrier_config: None,
             tolerance: 1e-5,
             max_iter: 200,
@@ -1004,23 +988,21 @@ impl OuterProblem {
     pub fn with_screening_cap(mut self, cap: Arc<AtomicUsize>) -> Self { self.screening_cap = Some(cap); self }
 
     /// Derive the capability flags from the builder state.
-    ///
-    /// When using [`build_objective`](Self::build_objective), prefer that method
-    /// instead — it derives `fixed_point_available` from whether an EFS closure
-    /// is actually provided, rather than relying on the manual `.with_efs()` flag.
-    pub fn capability(&self) -> OuterCapability {
+    /// `fixed_point_available` is set to `false` here; `build_objective`
+    /// overrides it based on whether an EFS closure is actually provided.
+    fn capability(&self) -> OuterCapability {
         OuterCapability {
             gradient: self.gradient,
             hessian: self.hessian,
             n_params: self.n_params,
             psi_dim: self.psi_dim,
-            fixed_point_available: self.efs_available,
+            fixed_point_available: false,
             barrier_config: self.barrier_config.clone(),
         }
     }
 
     /// Derive the runner configuration from the builder state.
-    pub fn config(&self) -> OuterConfig {
+    fn config(&self) -> OuterConfig {
         OuterConfig {
             tolerance: self.tolerance,
             max_iter: self.max_iter,
@@ -1118,7 +1100,7 @@ pub struct OuterResult {
 /// Do not wrap `run_outer` calls in try/catch with ad-hoc solver recovery.
 /// Callers should declare only the primary capability and, at most, whether
 /// automatic fallback is enabled at all.
-pub fn run_outer(
+fn run_outer(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,

@@ -1,7 +1,7 @@
 use ndarray::Array1;
 
 use gam::solver::outer_strategy::{
-    ClosureObjective, Derivative, EfsEval, HessianResult, OuterCapability, OuterConfig, OuterEval,
+    Derivative, EfsEval, HessianResult, OuterEval, OuterProblem,
 };
 
 /// Verify that `run_outer` propagates the error when the objective only
@@ -9,17 +9,22 @@ use gam::solver::outer_strategy::{
 /// pathological case that triggers a line-search failure inside BFGS.
 #[test]
 fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
-    let mut obj = ClosureObjective {
-        state: 0i32,
-        cap: OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
-            n_params: 3,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-        },
-        cost_fn: |ctx: &mut i32, x: &Array1<f64>| {
+    let problem = OuterProblem::new(3)
+        .with_gradient(Derivative::Analytic)
+        .with_tolerance(1e-5)
+        .with_max_iter(60)
+        .with_fd_step(1e-5)
+        .with_seed_config(gam::solver::seeding::SeedConfig {
+            max_seeds: 1,
+            screening_budget: 1,
+            ..Default::default()
+        })
+        .with_rho_bound(30.0)
+        .with_initial_rho(Array1::zeros(3));
+
+    let mut obj = problem.build_objective(
+        0i32,
+        |ctx: &mut i32, x: &Array1<f64>| {
             *ctx += 1;
             let r2 = x.dot(x);
             if r2 <= 1e-24 {
@@ -28,7 +33,7 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
                 Ok(f64::INFINITY)
             }
         },
-        eval_fn: |ctx: &mut i32, x: &Array1<f64>| {
+        |ctx: &mut i32, x: &Array1<f64>| {
             *ctx += 1;
             let r2 = x.dot(x);
             if r2 <= 1e-24 {
@@ -45,30 +50,13 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
                 })
             }
         },
-        reset_fn: None::<fn(&mut i32)>,
-        efs_fn: None::<
+        None::<fn(&mut i32)>,
+        None::<
             fn(&mut i32, &Array1<f64>) -> Result<EfsEval, gam::solver::estimate::EstimationError>,
         >,
-    };
+    );
 
-    let config = OuterConfig {
-        tolerance: 1e-5,
-        max_iter: 60,
-        fd_step: 1e-5,
-        bounds: None,
-        seed_config: gam::solver::seeding::SeedConfig {
-            max_seeds: 1,
-            screening_budget: 1,
-            ..Default::default()
-        },
-        rho_bound: 30.0,
-        heuristic_lambdas: None,
-        initial_rho: Some(Array1::zeros(3)),
-        fallback_policy: gam::solver::outer_strategy::FallbackPolicy::Automatic,
-        screening_cap: None,
-    };
-
-    let result = gam::solver::outer_strategy::run_outer(&mut obj, &config, "repro-linesearch");
+    let result = problem.run(&mut obj, "repro-linesearch");
 
     // The objective only has a finite value at the origin with a nonzero
     // gradient — any step away returns INFINITY. The solver must either

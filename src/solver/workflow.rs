@@ -492,23 +492,24 @@ fn fit_survival_location_scale_model(
                     .with_seed_config(seed_config)
                     .with_heuristic_lambdas(init.to_vec());
                 let context = format!("survival inverse-link optimization ({name}, dim={dim})");
+                type CostFn = Box<dyn FnMut(&ndarray::Array1<f64>) -> Result<f64, EstimationError>>;
                 let mut obj = problem.build_objective(
-                    (),
-                    |_: &mut (), rho: &ndarray::Array1<f64>| objective(rho),
-                    |_: &mut (), _: &ndarray::Array1<f64>| {
-                        Err(crate::estimate::EstimationError::InvalidInput(
+                    objective,
+                    |f: &mut CostFn, rho: &ndarray::Array1<f64>| f(rho),
+                    |_: &mut CostFn, _: &ndarray::Array1<f64>| {
+                        Err(EstimationError::InvalidInput(
                             "cost-only objective has no eval".to_string(),
                         ))
                     },
-                    None::<fn(&mut ())>,
+                    None::<fn(&mut CostFn)>,
                     None::<
                         fn(
-                            &mut (),
+                            &mut CostFn,
                             &ndarray::Array1<f64>,
                         )
                             -> Result<
                                 crate::solver::outer_strategy::EfsEval,
-                                crate::estimate::EstimationError,
+                                EstimationError,
                             >,
                     >,
                 );

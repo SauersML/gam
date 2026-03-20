@@ -1736,132 +1736,96 @@ where
         } else {
             problem
         };
-        let mut obj = problem.build_objective(
-            &mut reml_state,
-            |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
-                let rho = theta.slice(s![..k]).to_owned();
-                let mut cfg_eval = cfg.clone();
-                if use_mixture {
-                    let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
-                    cfg_eval.link_kind = InverseLink::Mixture(
-                        state_fromspec(&MixtureLinkSpec {
-                            components: mixspec.components.clone(),
-                            initial_rho: mix_rho,
+        // Shared helper: parse theta into rho + link params, update link state.
+        let apply_link_theta = |state: &mut &mut self::reml::RemlState<'_>,
+                                theta: &Array1<f64>|
+         -> Result<Array1<f64>, EstimationError> {
+            let rho = theta.slice(s![..k]).to_owned();
+            let mut cfg_eval = cfg.clone();
+            if use_mixture {
+                let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
+                cfg_eval.link_kind = InverseLink::Mixture(
+                    state_fromspec(&MixtureLinkSpec {
+                        components: mixspec.components.clone(),
+                        initial_rho: mix_rho,
+                    })
+                    .map_err(|e| {
+                        EstimationError::InvalidInput(format!(
+                            "invalid blended inverse link: {e}"
+                        ))
+                    })?,
+                );
+            }
+            if use_sas {
+                let epsilon = if use_beta_logistic {
+                    theta[k]
+                } else {
+                    let (v, _) = sas_effective_epsilon(theta[k]);
+                    v
+                };
+                let delta_like = theta[k + 1];
+                cfg_eval.link_kind = if use_beta_logistic {
+                    InverseLink::BetaLogistic(
+                        state_from_beta_logisticspec(SasLinkSpec {
+                            initial_epsilon: epsilon,
+                            initial_log_delta: delta_like,
                         })
                         .map_err(|e| {
                             EstimationError::InvalidInput(format!(
-                                "invalid blended inverse link: {e}"
+                                "invalid Beta-Logistic link: {e}"
                             ))
                         })?,
-                    );
-                }
-                if use_sas {
-                    let epsilon = if use_beta_logistic {
-                        theta[k]
-                    } else {
-                        let (v, _) = sas_effective_epsilon(theta[k]);
-                        v
-                    };
-                    let delta_like = theta[k + 1];
-                    cfg_eval.link_kind = if use_beta_logistic {
-                        InverseLink::BetaLogistic(
-                            state_from_beta_logisticspec(SasLinkSpec {
-                                initial_epsilon: epsilon,
-                                initial_log_delta: delta_like,
-                            })
-                            .map_err(|e| {
-                                EstimationError::InvalidInput(format!(
-                                    "invalid Beta-Logistic link: {e}"
-                                ))
-                            })?,
-                        )
-                    } else {
-                        InverseLink::Sas(
-                            state_from_sasspec(SasLinkSpec {
-                                initial_epsilon: epsilon,
-                                initial_log_delta: delta_like,
-                            })
-                            .map_err(|e| {
-                                EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
-                            })?,
-                        )
-                    };
-                }
-                state.set_link_states(
-                    cfg_eval.link_kind.mixture_state().cloned(),
-                    cfg_eval.link_kind.sas_state().copied(),
-                );
-                let mut cost = state.compute_cost(&rho)?;
-                let sasridge = if use_sas && !use_beta_logistic {
-                    sasridgeweight
+                    )
                 } else {
-                    0.0
+                    InverseLink::Sas(
+                        state_from_sasspec(SasLinkSpec {
+                            initial_epsilon: epsilon,
+                            initial_log_delta: delta_like,
+                        })
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
+                        })?,
+                    )
                 };
-                if use_sas && sasridge > 0.0 {
-                    let log_delta = theta[k + 1];
-                    cost += 0.5 * sasridge * log_delta * log_delta;
-                    if !use_beta_logistic {
-                        let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
-                        cost += barriercost;
-                    }
+            }
+            state.set_link_states(
+                cfg_eval.link_kind.mixture_state().cloned(),
+                cfg_eval.link_kind.sas_state().copied(),
+            );
+            Ok(rho)
+        };
+
+        // SAS ridge/barrier cost correction (shared between cost_fn, eval_fn, efs_fn).
+        let sas_ridge_cost = |theta: &Array1<f64>| -> f64 {
+            let sasridge = if use_sas && !use_beta_logistic {
+                sasridgeweight
+            } else {
+                0.0
+            };
+            if use_sas && sasridge > 0.0 {
+                let log_delta = theta[k + 1];
+                let mut extra = 0.5 * sasridge * log_delta * log_delta;
+                if !use_beta_logistic {
+                    let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
+                    extra += barriercost;
                 }
+                extra
+            } else {
+                0.0
+            }
+        };
+
+        let mut obj = problem.build_objective(
+            &mut reml_state,
+            |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
+                let rho = apply_link_theta(state, theta)?;
+                let cost = state.compute_cost(&rho)? + sas_ridge_cost(theta);
                 Ok(cost)
             },
             |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
                 let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
-                let rho = theta.slice(s![..k]).to_owned();
-                let mut cfg_eval = cfg.clone();
-                if use_mixture {
-                    let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
-                    cfg_eval.link_kind = InverseLink::Mixture(
-                        state_fromspec(&MixtureLinkSpec {
-                            components: mixspec.components.clone(),
-                            initial_rho: mix_rho,
-                        })
-                        .map_err(|e| {
-                            EstimationError::InvalidInput(format!(
-                                "invalid blended inverse link: {e}"
-                            ))
-                        })?,
-                    );
-                }
-                if use_sas {
-                    let epsilon = if use_beta_logistic {
-                        theta[k]
-                    } else {
-                        let (v, _) = sas_effective_epsilon(theta[k]);
-                        v
-                    };
-                    let delta_like = theta[k + 1];
-                    cfg_eval.link_kind = if use_beta_logistic {
-                        InverseLink::BetaLogistic(
-                            state_from_beta_logisticspec(SasLinkSpec {
-                                initial_epsilon: epsilon,
-                                initial_log_delta: delta_like,
-                            })
-                            .map_err(|e| {
-                                EstimationError::InvalidInput(format!(
-                                    "invalid Beta-Logistic link: {e}"
-                                ))
-                            })?,
-                        )
-                    } else {
-                        InverseLink::Sas(
-                            state_from_sasspec(SasLinkSpec {
-                                initial_epsilon: epsilon,
-                                initial_log_delta: delta_like,
-                            })
-                            .map_err(|e| {
-                                EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
-                            })?,
-                        )
-                    };
-                }
+                let rho = apply_link_theta(state, theta)?;
                 let tcost = Instant::now();
-                state.set_link_states(
-                    cfg_eval.link_kind.mixture_state().cloned(),
-                    cfg_eval.link_kind.sas_state().copied(),
-                );
 
                 // Use the unified REML evaluator with link ext_coords.
                 // This computes ρ gradient AND link parameter gradient jointly
@@ -1869,7 +1833,7 @@ where
                 let eval_mode = self::reml::unified::EvalMode::ValueAndGradient;
                 let result = state.evaluate_unified_with_link_ext(&rho, eval_mode)?;
 
-                let mut cost = result.cost;
+                let cost = result.cost + sas_ridge_cost(theta);
                 let mut grad = result.gradient.ok_or_else(|| {
                     EstimationError::InvalidInput(
                         "unified evaluator returned no gradient in ValueAndGradient mode"
@@ -1877,8 +1841,6 @@ where
                     )
                 })?;
 
-                // The unified evaluator returns gradient of length k + aux_dim.
-                // Pad to theta_dim if needed (should already match).
                 debug_assert_eq!(
                     grad.len(),
                     theta_dim,
@@ -1887,34 +1849,17 @@ where
                     theta_dim
                 );
 
-                // SAS ridge/barrier cost and gradient corrections.
-                let sasridge = if use_sas && !use_beta_logistic {
-                    sasridgeweight
-                } else {
-                    0.0
-                };
-                if use_sas && sasridge > 0.0 {
-                    let log_delta = theta[k + 1];
-                    cost += 0.5 * sasridge * log_delta * log_delta;
-                    if !use_beta_logistic {
-                        let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
-                        cost += barriercost;
-                    }
-                }
-
                 // SAS epsilon reparameterization chain rule.
                 if use_sas && !use_beta_logistic {
                     let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
                     grad[k] *= d_eps_d_raw;
                 }
                 // SAS log_delta ridge + barrier gradient.
-                if use_sas && sasridge > 0.0 {
+                if use_sas && !use_beta_logistic && sasridgeweight > 0.0 {
                     let log_delta = theta[k + 1];
-                    grad[k + 1] += sasridge * log_delta;
-                    if !use_beta_logistic {
-                        let (_, barriergrad) = sas_log_delta_edge_barriercostgrad(log_delta);
-                        grad[k + 1] += barriergrad;
-                    }
+                    grad[k + 1] += sasridgeweight * log_delta;
+                    let (_, barriergrad) = sas_log_delta_edge_barriercostgrad(log_delta);
+                    grad[k + 1] += barriergrad;
                 }
 
                 let cost_sec = tcost.elapsed().as_secs_f64();
@@ -1939,101 +1884,23 @@ where
             }),
             Some(
                 |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
-                    let rho = theta.slice(s![..k]).to_owned();
-                    // Set up link state (same as cost_fn / eval_fn).
-                    let mut cfg_eval = cfg.clone();
-                    if use_mixture {
-                        let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
-                        cfg_eval.link_kind = InverseLink::Mixture(
-                            state_fromspec(&MixtureLinkSpec {
-                                components: mixspec.components.clone(),
-                                initial_rho: mix_rho,
-                            })
-                            .map_err(|e| {
-                                EstimationError::InvalidInput(format!(
-                                    "invalid blended inverse link: {e}"
-                                ))
-                            })?,
-                        );
-                    }
-                    if use_sas {
-                        let epsilon = if use_beta_logistic {
-                            theta[k]
-                        } else {
-                            let (v, _) = sas_effective_epsilon(theta[k]);
-                            v
-                        };
-                        let delta_like = theta[k + 1];
-                        cfg_eval.link_kind = if use_beta_logistic {
-                            InverseLink::BetaLogistic(
-                                state_from_beta_logisticspec(SasLinkSpec {
-                                    initial_epsilon: epsilon,
-                                    initial_log_delta: delta_like,
-                                })
-                                .map_err(|e| {
-                                    EstimationError::InvalidInput(format!(
-                                        "invalid Beta-Logistic link: {e}"
-                                    ))
-                                })?,
-                            )
-                        } else {
-                            InverseLink::Sas(
-                                state_from_sasspec(SasLinkSpec {
-                                    initial_epsilon: epsilon,
-                                    initial_log_delta: delta_like,
-                                })
-                                .map_err(|e| {
-                                    EstimationError::InvalidInput(format!(
-                                        "invalid SAS link: {e}"
-                                    ))
-                                })?,
-                            )
-                        };
-                    }
-                    state.set_link_states(
-                        cfg_eval.link_kind.mixture_state().cloned(),
-                        cfg_eval.link_kind.sas_state().copied(),
-                    );
-
+                    let rho = apply_link_theta(state, theta)?;
                     let mut efs_eval = state.compute_efs_steps_with_link_ext(&rho)?;
 
-                    // SAS reparameterization chain rule on ψ steps:
-                    // The EFS/hybrid steps are in the internal parameterization,
-                    // but the outer optimizer works in the raw parameterization.
+                    // SAS reparameterization chain rule on ψ steps.
                     if use_sas && !use_beta_logistic {
                         let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
-                        // Scale epsilon step by chain-rule factor.
-                        if let Some(ref mut steps) = Some(&mut efs_eval.steps) {
-                            if steps.len() > k {
-                                steps[k] *= d_eps_d_raw;
-                            }
+                        if efs_eval.steps.len() > k {
+                            efs_eval.steps[k] *= d_eps_d_raw;
                         }
-                        // Also scale the psi_gradient if present.
                         if let Some(ref mut pg) = efs_eval.psi_gradient {
-                            // The psi_gradient is indexed by local ψ offset,
-                            // epsilon is the first ψ coordinate.
                             if !pg.is_empty() {
                                 pg[0] *= d_eps_d_raw;
                             }
                         }
                     }
 
-                    // SAS ridge/barrier cost correction.
-                    let sasridge = if use_sas && !use_beta_logistic {
-                        sasridgeweight
-                    } else {
-                        0.0
-                    };
-                    if use_sas && sasridge > 0.0 {
-                        let log_delta = theta[k + 1];
-                        efs_eval.cost += 0.5 * sasridge * log_delta * log_delta;
-                        if !use_beta_logistic {
-                            let (barriercost, _) =
-                                sas_log_delta_edge_barriercostgrad(log_delta);
-                            efs_eval.cost += barriercost;
-                        }
-                    }
-
+                    efs_eval.cost += sas_ridge_cost(theta);
                     Ok(efs_eval)
                 },
             ),

@@ -20,6 +20,19 @@ struct TkCorrectionTerms {
     hessian: Option<Array2<f64>>,
 }
 
+/// Family-dependent derivative context shared by all assembly builders.
+///
+/// Both `build_dense_derivative_context` and `build_sparse_derivative_context`
+/// return this, eliminating the tuple-order mismatch that previously existed
+/// between the two paths.
+struct DerivativeContext {
+    deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
+    dispersion: super::unified::DispersionHandling,
+    log_likelihood: f64,
+    firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+    barrier_config: Option<super::unified::BarrierConfig>,
+}
+
 impl<'a> RemlState<'a> {
     fn tk_disabled_terms(rho: &Array1<f64>, mode: super::unified::EvalMode) -> TkCorrectionTerms {
         TkCorrectionTerms {
@@ -2336,18 +2349,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         free_basis_opt: &Option<Array2<f64>>,
         include_firth_derivs: bool,
-    ) -> Result<
-        (
-            Box<dyn super::unified::HessianDerivativeProvider>,
-            super::unified::DispersionHandling,
-            f64,                                               // tk_correction
-            Option<Array1<f64>>,                               // tk_gradient
-            f64,                                               // log_likelihood
-            Option<std::sync::Arc<super::FirthDenseOperator>>, // firth_op
-            Option<super::unified::BarrierConfig>,
-        ),
-        EstimationError,
-    > {
+    ) -> Result<DerivativeContext, EstimationError> {
         use super::unified::{
             DispersionHandling, GaussianDerivatives, SinglePredictorGlmDerivatives,
         };
@@ -2401,8 +2403,6 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        let (tk_correction, tk_gradient) = (0.0, None);
-
         let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
             self.y,
             &pirls_result.finalmu,
@@ -2422,15 +2422,13 @@ impl<'a> RemlState<'a> {
             None
         };
 
-        Ok((
+        Ok(DerivativeContext {
             deriv_provider,
             dispersion,
-            tk_correction,
-            tk_gradient,
             log_likelihood,
             firth_op,
             barrier_config,
-        ))
+        })
     }
 
     /// Build the dispersion handling, derivative provider, log-likelihood,
@@ -2444,16 +2442,7 @@ impl<'a> RemlState<'a> {
         &self,
         pirls_result: &PirlsResult,
         bundle: &EvalShared,
-    ) -> Result<
-        (
-            super::unified::DispersionHandling,
-            Box<dyn super::unified::HessianDerivativeProvider>,
-            f64,                                               // log_likelihood
-            Option<std::sync::Arc<super::FirthDenseOperator>>, // firth_op
-            Option<super::unified::BarrierConfig>,
-        ),
-        EstimationError,
-    > {
+    ) -> Result<DerivativeContext, EstimationError> {
         use super::unified::{
             DispersionHandling, FirthAwareGlmDerivatives, GaussianDerivatives,
             SinglePredictorGlmDerivatives,
@@ -2536,13 +2525,13 @@ impl<'a> RemlState<'a> {
             .as_ref()
             .and_then(Self::barrier_config_from_constraints);
 
-        Ok((
-            dispersion,
+        Ok(DerivativeContext {
             deriv_provider,
+            dispersion,
             log_likelihood,
             firth_op,
             barrier_config,
-        ))
+        })
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2583,6 +2572,41 @@ impl<'a> RemlState<'a> {
             .iter()
             .map(|cp| cp.to_penalty_coordinate())
             .collect()
+    }
+
+    /// Pack a `DerivativeContext` plus backend-specific pieces into an
+    /// `InnerAssembly`. All three assembly builders (`build_dense_assembly`,
+    /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
+    /// here to avoid repeating the 18-field struct literal.
+    fn finish_assembly(
+        &self,
+        pirls_result: &PirlsResult,
+        ctx: DerivativeContext,
+        hessian_op: Box<dyn super::unified::HessianOperator>,
+        beta: Array1<f64>,
+        penalty_logdet: super::unified::PenaltyLogdetDerivs,
+        nullspace_dim: f64,
+    ) -> super::assembly::InnerAssembly<'static> {
+        super::assembly::InnerAssembly {
+            log_likelihood: ctx.log_likelihood,
+            penalty_quadratic: pirls_result.stable_penalty_term,
+            beta,
+            n_observations: self.y.len(),
+            hessian_op,
+            penalty_coords: self.build_penalty_coords(),
+            penalty_logdet,
+            dispersion: ctx.dispersion,
+            deriv_provider: Some(ctx.deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: ctx.firth_op,
+            nullspace_dim: Some(nullspace_dim),
+            barrier_config: ctx.barrier_config,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+        }
     }
 
     /// Build an `InnerAssembly` using the dense-transformed backend.
@@ -2634,29 +2658,10 @@ impl<'a> RemlState<'a> {
 
         let nullspace_dim = h_for_operator.ncols().saturating_sub(penalty_rank) as f64;
 
-        let (deriv_provider, dispersion, tk_correction, tk_gradient, log_likelihood, firth_op, barrier_config) =
-            self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
-
-        Ok(super::assembly::InnerAssembly {
-            log_likelihood,
-            penalty_quadratic: pirls_result.stable_penalty_term,
-            beta,
-            n_observations: self.y.len(),
-            hessian_op,
-            penalty_coords: self.build_penalty_coords(),
-            penalty_logdet,
-            dispersion,
-            deriv_provider: Some(deriv_provider),
-            tk_correction,
-            tk_gradient,
-            firth: firth_op,
-            nullspace_dim: Some(nullspace_dim),
-            barrier_config,
-            ext_coords: Vec::new(),
-            ext_coord_pair_fn: None,
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-        })
+        let ctx = self.build_dense_derivative_context(
+            pirls_result, bundle, &free_basis_opt, true,
+        )?;
+        Ok(self.finish_assembly(pirls_result, ctx, hessian_op, beta, penalty_logdet, nullspace_dim))
     }
 
     /// Build an `InnerAssembly` using the sparse-exact backend.
@@ -2708,29 +2713,8 @@ impl<'a> RemlState<'a> {
             second: det2,
         };
 
-        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
-            self.build_sparse_derivative_context(pirls_result, bundle)?;
-
-        Ok(super::assembly::InnerAssembly {
-            log_likelihood,
-            penalty_quadratic: pirls_result.stable_penalty_term,
-            beta,
-            n_observations: self.y.len(),
-            hessian_op,
-            penalty_coords: self.build_penalty_coords(),
-            penalty_logdet,
-            dispersion,
-            deriv_provider: Some(deriv_provider),
-            tk_correction: 0.0,
-            tk_gradient: None,
-            firth: firth_op,
-            nullspace_dim: Some(mp),
-            barrier_config,
-            ext_coords: Vec::new(),
-            ext_coord_pair_fn: None,
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-        })
+        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        Ok(self.finish_assembly(pirls_result, ctx, hessian_op, beta, penalty_logdet, mp))
     }
 
     /// Build an `InnerAssembly` using the dense original-basis backend.
@@ -2767,29 +2751,8 @@ impl<'a> RemlState<'a> {
         let beta = self.sparse_exact_beta_original(pirls_result);
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
 
-        let (dispersion, deriv_provider, log_likelihood, firth_op, barrier_config) =
-            self.build_sparse_derivative_context(pirls_result, bundle)?;
-
-        Ok(super::assembly::InnerAssembly {
-            log_likelihood,
-            penalty_quadratic: pirls_result.stable_penalty_term,
-            beta,
-            n_observations: self.y.len(),
-            hessian_op,
-            penalty_coords: self.build_penalty_coords(),
-            penalty_logdet,
-            dispersion,
-            deriv_provider: Some(deriv_provider),
-            tk_correction: 0.0,
-            tk_gradient: None,
-            firth: firth_op,
-            nullspace_dim: Some(nullspace_dim),
-            barrier_config,
-            ext_coords: Vec::new(),
-            ext_coord_pair_fn: None,
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-        })
+        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        Ok(self.finish_assembly(pirls_result, ctx, hessian_op, beta, penalty_logdet, nullspace_dim))
     }
 
     /// Build the soft prior tuple for the given mode.
@@ -2929,11 +2892,9 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        let mut assembly = self.build_sparse_assembly(
+        let assembly = self.build_sparse_assembly(
             rho, bundle, super::unified::EvalMode::ValueOnly,
         )?;
-        // EFS doesn't use TK gradient.
-        assembly.tk_gradient = None;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
 
@@ -3196,92 +3157,65 @@ impl<'a> RemlState<'a> {
     /// - Applying SAS epsilon reparameterization chain rule (`grad[k] *= d_eps/d_raw`)
     /// - Adding SAS ridge/barrier gradient contributions to `grad[k+1]`
     /// - Adding SAS ridge/barrier cost contributions to `result.cost`
+    /// Build link ext_coords from the current runtime link state.
+    fn build_link_ext_coords(
+        &self,
+        bundle: &EvalShared,
+    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+        if let Some(sas_state) = &self.runtime_sas_link_state {
+            let is_beta_logistic = matches!(
+                self.config.link_function(),
+                crate::types::LinkFunction::BetaLogistic
+            );
+            self.build_sas_link_ext_coords(bundle, sas_state, is_beta_logistic)
+        } else if let Some(mix_state) = &self.runtime_mixture_link_state {
+            self.build_mixture_link_ext_coords(bundle, mix_state)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Check that Firth is not active (incompatible with link ext_coords).
+    fn reject_firth_link_ext(&self) -> Result<(), EstimationError> {
+        if self.config.firth_bias_reduction {
+            return Err(EstimationError::InvalidInput(
+                "link-parameter ext_coord optimization is incompatible with \
+                 Firth-adjusted outer gradients"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn evaluate_unified_with_link_ext(
         &self,
         rho: &Array1<f64>,
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        // Firth bias reduction modifies the score equations in ways that the
-        // link ext_coord construction does not yet account for. Reject early.
-        if self.config.firth_bias_reduction {
-            return Err(EstimationError::InvalidInput(
-                "link-parameter ext_coord optimization is incompatible with \
-                 Firth-adjusted outer gradients"
-                    .to_string(),
-            ));
-        }
-
+        self.reject_firth_link_ext()?;
         let bundle = self.obtain_eval_bundle(rho)?;
-
-        // Build link ext_coords from the current runtime link state.
-        let ext_coords = if let Some(sas_state) = &self.runtime_sas_link_state {
-            let is_beta_logistic = matches!(
-                self.config.link_function(),
-                crate::types::LinkFunction::BetaLogistic
-            );
-            self.build_sas_link_ext_coords(&bundle, sas_state, is_beta_logistic)?
-        } else if let Some(mix_state) = &self.runtime_mixture_link_state {
-            self.build_mixture_link_ext_coords(&bundle, mix_state)?
-        } else {
-            Vec::new()
-        };
+        let ext_coords = self.build_link_ext_coords(&bundle)?;
 
         if ext_coords.is_empty() {
-            // No link parameters to optimize — fall back to standard path.
             return self.evaluate_unified(rho, &bundle, mode);
         }
 
-        // Delegate to the existing ext_coords injection path.
-        // No pair callbacks for link parameters: the outer Hessian for link
-        // coords is left to BFGS (HessianResult::Unavailable). This matches
-        // the current behavior where link parameters have gradient-only.
         self.evaluate_unified_with_ext_from_bundle(rho, &bundle, mode, ext_coords, None, None)
     }
 
     /// EFS evaluation with link-parameter ext_coords injected.
-    ///
-    /// This is the hybrid EFS counterpart of [`evaluate_unified_with_link_ext`].
-    /// The ρ coordinates receive standard EFS multiplicative updates while the
-    /// link parameters (ψ) receive preconditioned gradient steps via the Gram
-    /// matrix `G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)`.
-    ///
-    /// The returned `EfsEval` has `steps` of length `k + aux_dim` where
-    /// `k` is the number of ρ coordinates and `aux_dim` is the number of link
-    /// parameters. The caller is responsible for applying SAS reparameterization
-    /// chain rules to the ψ gradient/steps as needed.
     pub fn compute_efs_steps_with_link_ext(
         &self,
         rho: &Array1<f64>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        if self.config.firth_bias_reduction {
-            return Err(EstimationError::InvalidInput(
-                "link-parameter ext_coord optimization is incompatible with \
-                 Firth-adjusted outer gradients"
-                    .to_string(),
-            ));
-        }
-
+        self.reject_firth_link_ext()?;
         let bundle = self.obtain_eval_bundle(rho)?;
-
-        // Build link ext_coords from the current runtime link state.
-        let ext_coords = if let Some(sas_state) = &self.runtime_sas_link_state {
-            let is_beta_logistic = matches!(
-                self.config.link_function(),
-                crate::types::LinkFunction::BetaLogistic
-            );
-            self.build_sas_link_ext_coords(&bundle, sas_state, is_beta_logistic)?
-        } else if let Some(mix_state) = &self.runtime_mixture_link_state {
-            self.build_mixture_link_ext_coords(&bundle, mix_state)?
-        } else {
-            Vec::new()
-        };
+        let ext_coords = self.build_link_ext_coords(&bundle)?;
 
         if ext_coords.is_empty() {
-            // No link parameters — fall back to standard EFS.
             return self.compute_efs_steps(rho);
         }
 
-        // Dense EFS with link ext_coords injected.
         self.evaluate_unified_for_efs_with_ext(rho, &bundle, ext_coords)
     }
 
@@ -3296,9 +3230,6 @@ impl<'a> RemlState<'a> {
         let mut assembly = self.build_dense_assembly(
             rho, bundle, super::unified::EvalMode::ValueOnly,
         )?;
-        // EFS doesn't use TK gradient.
-        assembly.tk_gradient = None;
-        // Inject link ext_coords for hybrid EFS.
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
