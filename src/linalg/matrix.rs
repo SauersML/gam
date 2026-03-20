@@ -5400,7 +5400,7 @@ mod tests {
             .expect("chunked kernel operator");
 
         assert_eq!(operator.ncols(), 3);
-        let chunk = operator.row_chunk(0..2);
+        let chunk = operator.row_chunk_combined(0..2);
         assert_eq!(chunk.dim(), (2, 3));
     }
 
