@@ -3,15 +3,15 @@ use crate::basis::{
     BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
     DuchonBasisSpec, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
     PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint, applyweighted_orthogonality_constraint, build_bspline_basis_1d,
-    build_duchon_basis, build_duchon_basis_log_kappa_aniso_derivatives,
-    build_duchon_basis_log_kappa_derivative, build_duchon_basis_log_kappasecond_derivative,
-    build_duchon_basiswithworkspace, build_matern_basis,
-    build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivative,
-    build_matern_basis_log_kappasecond_derivative, build_matern_basiswithworkspace,
-    build_matern_collocation_operator_matrices, build_thin_plate_basis,
-    build_thin_plate_basis_log_kappa_derivative, build_thin_plate_basis_log_kappasecond_derivative,
-    estimate_penalty_nullity, filter_active_penalty_candidates,
+    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
+    build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivative,
+    build_duchon_basis_log_kappasecond_derivative, build_duchon_basiswithworkspace,
+    build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
+    build_matern_basis_log_kappa_derivative, build_matern_basis_log_kappasecond_derivative,
+    build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
+    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
+    build_thin_plate_basis_log_kappasecond_derivative, estimate_penalty_nullity,
+    filter_active_penalty_candidates, orthogonality_transform_for_design,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -30,8 +30,8 @@ use crate::estimate::{
 use crate::faer_ndarray::fast_atv;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
-    BlockDesignOperator, DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix,
-    TensorProductDesignOperator,
+    BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
+    RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
 };
 use crate::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
@@ -3110,7 +3110,7 @@ fn apply_spatial_orthogonality_to_parametric(
 
     for (idx, term) in smooth.terms.iter().enumerate() {
         let termspec = &smoothspecs[idx];
-        let design_local = smooth.term_designs[idx].to_dense();
+        let design_local = smooth.term_designs[idx].clone();
         let use_frozen_transform = matches!(
             spatial_identifiability_policy(termspec),
             Some(SpatialIdentifiability::FrozenTransform { .. })
@@ -3128,11 +3128,16 @@ fn apply_spatial_orthogonality_to_parametric(
         } else {
             None
         };
-        let (design_constrained, z_opt) = maybe_spatial_identifiability_transform(
+        let z_opt = maybe_spatial_identifiability_transform(
             termspec,
-            design_local.view(),
+            &design_local,
             c_local.as_ref().map(|mat| mat.view()),
         )?;
+        let design_constrained = if let Some(z) = z_opt.as_ref() {
+            apply_spatial_transform_to_design(design_local, z, &term.name)?
+        } else {
+            design_local
+        };
 
         // Mathematical acceptance criterion:
         //   ||B_con^T C||_F / (||B_con||_F ||C||_F) <= tol.
@@ -3143,7 +3148,8 @@ fn apply_spatial_orthogonality_to_parametric(
             let c_ref = c_local
                 .as_ref()
                 .expect("parametric constraint block must exist for orthogonal policy");
-            let rel = orthogonality_relative_residual(design_constrained.view(), c_ref.view());
+            let rel =
+                orthogonality_relative_residual_for_design(&design_constrained, c_ref.view())?;
             let tol = 1e-8;
             if rel > tol {
                 return Err(BasisError::InvalidInput(format!(
@@ -3209,9 +3215,7 @@ fn apply_spatial_orthogonality_to_parametric(
             };
 
         local_dims.push(design_constrained.ncols());
-        local_designs.push(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            design_constrained,
-        )));
+        local_designs.push(design_constrained);
         local_penalties.push(penalties_constrained);
         local_nullspaces.push(nullspace_constrained);
         local_penaltyinfo.push(penaltyinfo_constrained);
@@ -3394,18 +3398,74 @@ fn build_parametric_constraint_block_for_term(
     Ok(c)
 }
 
+fn apply_spatial_transform_to_design(
+    design_local: DesignMatrix,
+    transform: &Array2<f64>,
+    termname: &str,
+) -> Result<DesignMatrix, BasisError> {
+    match design_local {
+        DesignMatrix::Dense(inner) => {
+            let op = CoefficientTransformOperator::new(inner, transform.clone()).map_err(|e| {
+                BasisError::InvalidInput(format!(
+                    "spatial identifiability transform failed for term '{termname}': {e}"
+                ))
+            })?;
+            Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Arc::new(op),
+            )))
+        }
+        DesignMatrix::Sparse(_) => Err(BasisError::InvalidInput(format!(
+            "spatial identifiability transform requires a dense/operator-backed term for '{termname}'"
+        ))),
+    }
+}
+
+fn design_constraint_cross(
+    design: &DesignMatrix,
+    constraint_matrix: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let n = design.nrows();
+    if constraint_matrix.nrows() != n {
+        return Err(BasisError::ConstraintMatrixRowMismatch {
+            basisrows: n,
+            constraintrows: constraint_matrix.nrows(),
+        });
+    }
+    let mut cross = Array2::<f64>::zeros((design.ncols(), constraint_matrix.ncols()));
+    const CHUNK: usize = 1024;
+    for start in (0..n).step_by(CHUNK) {
+        let end = (start + CHUNK).min(n);
+        let design_chunk = design.row_chunk(start..end);
+        let constraint_chunk = constraint_matrix.slice(s![start..end, ..]).to_owned();
+        cross += &design_chunk.t().dot(&constraint_chunk);
+    }
+    Ok(cross)
+}
+
+fn design_frobenius_norm(design: &DesignMatrix) -> f64 {
+    let n = design.nrows();
+    const CHUNK: usize = 1024;
+    let mut sumsq = 0.0;
+    for start in (0..n).step_by(CHUNK) {
+        let end = (start + CHUNK).min(n);
+        let chunk = design.row_chunk(start..end);
+        sumsq += chunk.iter().map(|v| v * v).sum::<f64>();
+    }
+    sumsq.sqrt()
+}
+
 fn maybe_spatial_identifiability_transform(
     termspec: &SmoothTermSpec,
-    design_local: ArrayView2<'_, f64>,
+    design_local: &DesignMatrix,
     parametric_block: Option<ArrayView2<'_, f64>>,
-) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
+) -> Result<Option<Array2<f64>>, BasisError> {
     let maybe_policy = spatial_identifiability_policy(termspec);
     let Some(policy) = maybe_policy else {
-        return Ok((design_local.to_owned(), None));
+        return Ok(None);
     };
 
     match policy {
-        SpatialIdentifiability::None => Ok((design_local.to_owned(), None)),
+        SpatialIdentifiability::None => Ok(None),
         SpatialIdentifiability::OrthogonalToParametric => {
             let c = parametric_block.ok_or_else(|| {
                 BasisError::InvalidInput(
@@ -3413,12 +3473,12 @@ fn maybe_spatial_identifiability_transform(
                         .to_string(),
                 )
             })?;
-            let (b_c, z) = applyweighted_orthogonality_constraint(
+            let z = orthogonality_transform_for_design(
                 design_local,
                 c,
                 None, // fixed subspace: do not use iteration-varying PIRLS weights
             )?;
-            Ok((b_c, Some(z)))
+            Ok(Some(z))
         }
         SpatialIdentifiability::FrozenTransform { transform } => {
             if design_local.ncols() != transform.nrows() {
@@ -3428,8 +3488,7 @@ fn maybe_spatial_identifiability_transform(
                     transform.nrows()
                 )));
             }
-            let z = transform.clone();
-            Ok((design_local.dot(&z), Some(z)))
+            Ok(Some(transform.clone()))
         }
     }
 }
@@ -3442,16 +3501,16 @@ fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialI
     }
 }
 
-pub(crate) fn orthogonality_relative_residual(
-    basis_matrix: ArrayView2<'_, f64>,
+fn orthogonality_relative_residual_for_design(
+    design: &DesignMatrix,
     constraint_matrix: ArrayView2<'_, f64>,
-) -> f64 {
-    let cross = basis_matrix.t().dot(&constraint_matrix);
+) -> Result<f64, BasisError> {
+    let cross = design_constraint_cross(design, constraint_matrix)?;
     let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let b_norm = basis_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let b_norm = design_frobenius_norm(design);
     let c_norm = constraint_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
     let denom = (b_norm * c_norm).max(1e-300);
-    num / denom
+    Ok(num / denom)
 }
 
 fn with_spatial_identifiability_transform(
@@ -11491,7 +11550,11 @@ mod tests {
                 smooth_start..(smooth_start + design.smooth.total_smooth_cols())
             ])
             .to_owned();
-        let rel = orthogonality_relative_residual(b.view(), c.view());
+        let cross = b.t().dot(&c);
+        let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let b_norm = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let c_norm = c.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let rel = num / (b_norm * c_norm).max(1e-300);
         assert!(
             rel <= 1e-10,
             "Option 5 orthogonality residual too large: {rel}"
@@ -11561,6 +11624,60 @@ mod tests {
             "term-local Option 5 should not over-constrain non-overlapping smooth/linear terms: {:?}",
             out.err()
         );
+    }
+
+    #[test]
+    fn spatial_option5_preserves_lazy_thin_plate_terms_at_large_scale() {
+        let n = 17_000usize;
+        let k = 2_000usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut centers = Array2::<f64>::zeros((k, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n - 1) as f64;
+        }
+        for j in 0..k {
+            centers[[j, 0]] = j as f64 / (k - 1) as f64;
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "x".to_string(),
+                feature_col: 0,
+                double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None,
+                coefficient_max: None,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "tps_x".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::UserProvided(centers),
+                        length_scale: 1.0,
+                        double_penalty: false,
+                        identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design =
+            build_term_collection_design(data.view(), &spec).expect("large option-5 design");
+        assert!(matches!(
+            &design.smooth.term_designs[0],
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::Lazy(_))
+        ));
+        let mut c = Array2::<f64>::zeros((n, 2));
+        c.column_mut(0).fill(1.0);
+        c.column_mut(1).assign(&data.column(0));
+        let rel =
+            orthogonality_relative_residual_for_design(&design.smooth.term_designs[0], c.view())
+                .expect("orthogonality residual");
+        assert!(rel <= 1e-8, "lazy option-5 residual too large: {rel}");
     }
 
     #[test]
