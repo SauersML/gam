@@ -1867,10 +1867,8 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    /// Look up the pre-solved row context from the cache.  All row contexts
-    /// are built at `LinkOrder::Full` during cache construction, so this is
-    /// valid for every call path (ll/grad/Hessian, third/fourth derivatives,
-    /// psi terms, directional derivatives).
+    /// Look up the pre-solved row context from the cache. Callers must build
+    /// the cache at a derivative order sufficient for the downstream path.
     #[inline]
     fn row_ctx(
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -1879,9 +1877,10 @@ impl BernoulliMarginalSlopeFamily {
         &cache.row_contexts[row]
     }
 
-    fn build_exact_eval_cache(
+    fn build_exact_eval_cache_with_order(
         &self,
         block_states: &[ParameterBlockState],
+        link_order: LinkOrder,
     ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
         let slices = block_slices(
             block_states,
@@ -1892,11 +1891,6 @@ impl BernoulliMarginalSlopeFamily {
         let (h_nodes, h_node_design) = self.quadrature_h(block_states)?;
         let score_warp_obs = self.score_warp_obs(block_states)?;
         let n = self.y.len();
-        let link_order = if self.link_dev.is_some() {
-            LinkOrder::Full
-        } else {
-            LinkOrder::ValueD1
-        };
         let row_contexts: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
             .map(|row| {
@@ -1918,6 +1912,18 @@ impl BernoulliMarginalSlopeFamily {
             score_warp_obs,
             row_contexts,
         })
+    }
+
+    fn build_exact_eval_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
+        let link_order = if self.link_dev.is_some() {
+            LinkOrder::Full
+        } else {
+            LinkOrder::ValueD1
+        };
+        self.build_exact_eval_cache_with_order(block_states, link_order)
     }
     fn row_primary_direction_from_flat(
         &self,
@@ -5404,7 +5410,12 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
-        let cache = self.build_exact_eval_cache(block_states)?;
+        let link_order = if self.link_dev.is_some() {
+            LinkOrder::Hessian
+        } else {
+            LinkOrder::ValueD1
+        };
+        let cache = self.build_exact_eval_cache_with_order(block_states, link_order)?;
         let slices = cache.slices.clone();
         let primary = cache.primary.clone();
         let mut ll = 0.0;
@@ -5627,10 +5638,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             }
             return Ok(ll);
         }
-        // Flexible path: per-row intercept solve + link value evaluation.
-        // No MultiDirJet, no d2/d3/d4 derivative stacks.
-        let (h_nodes, _) = self.quadrature_h(block_states)?;
-        let score_warp_obs = self.score_warp_obs(block_states)?;
+        let cache = self.build_exact_eval_cache_with_order(block_states, LinkOrder::ValueD1)?;
         let beta_w = if self.link_dev.is_some() {
             block_states.last().map(|state| &state.beta)
         } else {
@@ -5639,22 +5647,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let mut ll = 0.0;
         for row in 0..n {
-            let q_i = block_states[0].eta[row];
-            let b_i = block_states[1].eta[row];
-            // Solve intercept (reuses link_terms which needs basis + d1 only).
-            let (a_i, _) = self.solve_row_intercept_base(q_i, b_i, &h_nodes, beta_w)?;
-            // Observation heterogeneity offset.
-            let h_obs = if let Some((_, ref dev_obs)) = score_warp_obs {
-                self.z[row] + dev_obs[row]
-            } else {
-                self.z[row]
-            };
-            // Apply link at the observation point (basis only, no derivatives).
-            let eta_obs = a_i + b_i * h_obs;
-            let s_i = if let (Some(runtime), Some(beta)) = (&self.link_dev, beta_w) {
-                let v = Array1::from_vec(vec![eta_obs]);
-                let basis = runtime.design(&v)?;
-                eta_obs + basis.row(0).dot(beta)
+            let row_ctx = Self::row_ctx(&cache, row);
+            let slope = block_states[1].eta[row];
+            let eta_obs = row_ctx.intercept + slope * row_ctx.h_obs_base;
+            let s_i = if let (Some(ls), Some(beta)) = (row_ctx.obs_link.as_ref(), beta_w) {
+                eta_obs + ls.basis.row(0).dot(beta)
             } else {
                 eta_obs
             };
@@ -5685,7 +5682,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             )));
         }
 
-        let cache = self.build_exact_eval_cache(block_states)?;
+        let link_order = if self.link_dev.is_some() {
+            LinkOrder::Hessian
+        } else {
+            LinkOrder::ValueD1
+        };
+        let cache = self.build_exact_eval_cache_with_order(block_states, link_order)?;
         let mut dense = Array2::<f64>::zeros((slices.total, slices.total));
         let mut basis = Array1::<f64>::zeros(slices.total);
         for col in 0..slices.total {

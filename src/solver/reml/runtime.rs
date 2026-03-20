@@ -2651,17 +2651,24 @@ impl<'a> RemlState<'a> {
             self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
-            z.t().dot(&pirls_result.beta_transformed.as_ref().to_owned())
+            z.t()
+                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
 
         let nullspace_dim = h_for_operator.ncols().saturating_sub(penalty_rank) as f64;
 
-        let ctx = self.build_dense_derivative_context(
-            pirls_result, bundle, &free_basis_opt, true,
-        )?;
-        Ok(self.finish_assembly(pirls_result, ctx, hessian_op, beta, penalty_logdet, nullspace_dim))
+        let ctx =
+            self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
+        Ok(self.finish_assembly(
+            pirls_result,
+            ctx,
+            hessian_op,
+            beta,
+            penalty_logdet,
+            nullspace_dim,
+        ))
     }
 
     /// Build an `InnerAssembly` using the sparse-exact backend.
@@ -2752,7 +2759,14 @@ impl<'a> RemlState<'a> {
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
 
         let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
-        Ok(self.finish_assembly(pirls_result, ctx, hessian_op, beta, penalty_logdet, nullspace_dim))
+        Ok(self.finish_assembly(
+            pirls_result,
+            ctx,
+            hessian_op,
+            beta,
+            penalty_logdet,
+            nullspace_dim,
+        ))
     }
 
     /// Build an `InnerAssembly` by auto-detecting the backend.
@@ -2844,8 +2858,12 @@ impl<'a> RemlState<'a> {
 
         let prior = self.build_prior(rho, eval_mode);
         let cost_result = super::assembly::evaluate_solution(
-            &inner_solution, rho.as_slice().unwrap(), eval_mode, prior,
-        ).map_err(EstimationError::InvalidInput)?;
+            &inner_solution,
+            rho.as_slice().unwrap(),
+            eval_mode,
+            prior,
+        )
+        .map_err(EstimationError::InvalidInput)?;
 
         let efs_eval = if has_psi {
             let gradient = cost_result.gradient.as_ref().expect(
@@ -2902,8 +2920,12 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        self.assemble_and_evaluate(rho, bundle, mode,
-            self.build_dense_assembly(rho, bundle, mode)?)
+        self.assemble_and_evaluate(
+            rho,
+            bundle,
+            mode,
+            self.build_dense_assembly(rho, bundle, mode)?,
+        )
     }
 
     /// Sparse-exact bridge: delegates to `build_sparse_assembly` + `assemble_and_evaluate`.
@@ -3137,7 +3159,10 @@ impl<'a> RemlState<'a> {
         ext_coords: Vec<super::unified::HyperCoord>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         let mut assembly = self.build_auto_assembly(
-            rho, bundle, super::unified::EvalMode::ValueOnly, !ext_coords.is_empty(),
+            rho,
+            bundle,
+            super::unified::EvalMode::ValueOnly,
+            !ext_coords.is_empty(),
         )?;
         assembly.tk_gradient = None;
         assembly.ext_coords = ext_coords;

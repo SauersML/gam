@@ -1105,8 +1105,7 @@ fn event_mix(d: f64, event_val: f64, censored_val: f64) -> f64 {
 impl SurvivalExactRowKernel {
     #[inline]
     fn log_likelihood(self) -> f64 {
-        self.w
-            * (event_mix(self.d, self.logphi1 + self.log_g, self.log_s1) - self.log_s0)
+        self.w * (event_mix(self.d, self.logphi1 + self.log_g, self.log_s1) - self.log_s0)
     }
 }
 
@@ -2195,24 +2194,29 @@ impl SurvivalLocationScaleFamily {
 
         let (log_s0, r0, dr0, ddr0, dddr0) =
             Self::exact_survival_neglog_derivatives_fourth_rescaled(
-                &self.inverse_link, u0, deriv_log_scale,
-            ).map_err(
-                |e| format!("inverse-link survival evaluation failed at row {row} entry: {e}"),
-            )?;
+                &self.inverse_link,
+                u0,
+                deriv_log_scale,
+            )
+            .map_err(|e| {
+                format!("inverse-link survival evaluation failed at row {row} entry: {e}")
+            })?;
 
         let (log_s1, r1, dr1, ddr1, dddr1) =
             Self::exact_survival_neglog_derivatives_fourth_rescaled(
-                &self.inverse_link, u1, deriv_log_scale,
-            ).map_err(
-                |e| format!("inverse-link survival evaluation failed at row {row} exit: {e}"),
-            )?;
+                &self.inverse_link,
+                u1,
+                deriv_log_scale,
+            )
+            .map_err(|e| {
+                format!("inverse-link survival evaluation failed at row {row} exit: {e}")
+            })?;
 
         let (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1) =
-            Self::exact_log_pdf_derivatives_rescaled(
-                &self.inverse_link, u1, deriv_log_scale,
-            ).map_err(|e| {
-                format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
-            })?;
+            Self::exact_log_pdf_derivatives_rescaled(&self.inverse_link, u1, deriv_log_scale)
+                .map_err(|e| {
+                    format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
+                })?;
 
         // Row degeneracy guard: when any hazard/pdf derivative is non-finite
         // (e.g. CLogLog with u > ~709 where exp(u) overflows), the row's
@@ -5031,10 +5035,7 @@ impl SurvivalLocationScaleFamily {
     /// Compute the log-scale shift needed to keep CLogLog survival
     /// derivatives finite.  Returns `L >= 0` such that `exp(u - L) <= exp(500)`
     /// for all row linear predictors `u`.  For non-CLogLog links, returns 0.
-    fn hessian_deriv_log_rescale(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> f64 {
+    fn hessian_deriv_log_rescale(&self, block_states: &[ParameterBlockState]) -> f64 {
         if !matches!(
             self.inverse_link,
             InverseLink::Standard(LinkFunction::CLogLog)
@@ -9356,12 +9357,13 @@ mod tests {
     #[test]
     fn exact_log_pdf_derivatives_match_probit_closed_form() {
         let eta = 3.25;
-        let (logf, d1, d2, d3, d4) = SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-            &InverseLink::Standard(LinkFunction::Probit),
-            eta,
-            0.0,
-        )
-        .expect("exact probit log-pdf derivatives");
+        let (logf, d1, d2, d3, d4) =
+            SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
+                &InverseLink::Standard(LinkFunction::Probit),
+                eta,
+                0.0,
+            )
+            .expect("exact probit log-pdf derivatives");
         let expected_logf = -0.5 * eta * eta - 0.5 * (2.0 * std::f64::consts::PI).ln();
         assert!((logf - expected_logf).abs() <= 1e-15);
         assert!((d1 + eta).abs() <= 1e-15);

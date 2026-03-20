@@ -104,6 +104,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
     #[serde(default)]
+    pub quadrature_points: Option<usize>,
+    #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
     pub survival_exit: Option<String>,
@@ -216,6 +218,7 @@ impl FittedModelPayload {
             logslope_baseline: None,
             score_warp_runtime: None,
             link_deviation_runtime: None,
+            quadrature_points: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -972,6 +975,7 @@ impl FittedModel {
                     z_column,
                     payload.marginal_baseline?,
                     payload.logslope_baseline?,
+                    payload.quadrature_points?,
                     runtime.score_warp,
                     runtime.link_deviation,
                 )
@@ -1076,6 +1080,18 @@ impl FittedModel {
             if self.marginal_baseline.is_none() || self.logslope_baseline.is_none() {
                 return Err(
                     "marginal-slope model is missing baseline offsets; refit with current CLI"
+                        .to_string(),
+                );
+            }
+            if self.quadrature_points.is_none() {
+                return Err(
+                    "marginal-slope model is missing quadrature_points; refit with current CLI"
+                        .to_string(),
+                );
+            }
+            if self.quadrature_points == Some(0) {
+                return Err(
+                    "marginal-slope model has quadrature_points=0; refit with current CLI"
                         .to_string(),
                 );
             }

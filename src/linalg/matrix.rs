@@ -2402,7 +2402,7 @@ impl ChunkedKernelDesignOperator {
         poly_basis: Option<Arc<Array2<f64>>>,
     ) -> Result<Self, String> {
         let n = data.nrows();
-        let k = centers.ncols();
+        let k = centers.nrows();
         if data.ncols() != centers.ncols() {
             return Err(format!(
                 "ChunkedKernelDesignOperator: data dim {} != centers dim {}",
@@ -5297,8 +5297,8 @@ impl From<&DesignMatrix> for DesignMatrix {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesignMatrix, SparseDesignMatrix, dense_matvec, dense_transpose_matvec,
-        dense_transpose_weighted_response,
+        ChunkedKernelDesignOperator, DesignMatrix, SparseDesignMatrix, dense_matvec,
+        dense_transpose_matvec, dense_transpose_weighted_response,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
@@ -5387,6 +5387,21 @@ mod tests {
             .try_to_dense_arc("matrix test")
             .expect_err("huge sparse densification should be rejected");
         assert!(err.contains("refusing to densify sparse design"));
+    }
+
+    #[test]
+    fn chunked_kernel_operator_uses_center_rows_for_column_count() {
+        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
+        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
+        let kernel = Arc::new(|x: &[f64], c: &[f64]| {
+            x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>()
+        });
+        let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
+            .expect("chunked kernel operator");
+
+        assert_eq!(operator.ncols(), 3);
+        let chunk = operator.row_chunk(0..2);
+        assert_eq!(chunk.dim(), (2, 3));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+pub(crate) mod assembly;
 mod cache;
 mod eval;
 mod firth;
@@ -18,7 +19,6 @@ mod inner_strategy;
 pub(crate) mod penalty_logdet;
 mod runtime;
 mod trace;
-pub(crate) mod assembly;
 pub(crate) mod unified;
 
 #[cfg(test)]

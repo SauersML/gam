@@ -246,6 +246,10 @@ struct FitArgs {
     disable_score_warp: bool,
     #[arg(long = "disable-link-dev", default_value_t = false)]
     disable_link_dev: bool,
+    /// Gauss-Hermite node count for flexible bernoulli marginal-slope
+    /// score-warp/link-deviation integration.
+    #[arg(long = "quadrature-points", default_value_t = 20)]
+    quadrature_points: usize,
     /// Fit a conditional transformation-normal model: h(Y|x) ~ N(0,1).
     /// Uses the main formula for the covariate-side smooth terms and
     /// automatically builds the response-direction monotone basis.
@@ -1165,9 +1169,9 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
-    if parsed.linkwiggle.is_some() {
+    if parsed.linkwiggle.is_some() && args.disable_link_dev {
         return Err(
-            "linkwiggle(...) is not supported in the bernoulli marginal-slope family; use the built-in link-deviation block instead"
+            "linkwiggle(...) routes into the bernoulli marginal-slope link-deviation block; remove --disable-link-dev or drop linkwiggle(...)"
                 .to_string(),
         );
     }
@@ -1175,6 +1179,9 @@ fn run_fit_bernoulli_marginal_slope(
         return Err(
             "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
         );
+    }
+    if args.quadrature_points == 0 {
+        return Err("--quadrature-points must be at least 1".to_string());
     }
     let logslope_formula_raw = args
         .logslope_formula
@@ -1238,6 +1245,30 @@ fn run_fit_bernoulli_marginal_slope(
         .get(z_column)
         .ok_or_else(|| format!("z column '{z_column}' not found"))?;
     let z = ds.values.column(z_col).to_owned();
+    let routed_link_dev = match parsed.linkwiggle.as_ref() {
+        Some(wiggle) => Some(deviation_block_config_from_formula_linkwiggle(wiggle)),
+        None if args.disable_link_dev => None,
+        None => Some(DeviationBlockConfig::default()),
+    };
+    inference_notes.push(
+        "bernoulli marginal-slope expects z to already be PIT-probit standardized to latent N(0,1) upstream".to_string(),
+    );
+    if parsed.linkwiggle.is_some() {
+        inference_notes.push(
+            "bernoulli marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the fixed probit base link"
+                .to_string(),
+        );
+    }
+    if args.disable_score_warp && routed_link_dev.is_none() {
+        inference_notes.push(
+            "bernoulli marginal-slope rigid probit mode is algebraic closed-form exact".to_string(),
+        );
+    } else {
+        inference_notes.push(format!(
+            "bernoulli marginal-slope flexible score/link mode uses exact analytic derivatives of a {}-point Gauss-Hermite quadrature approximation",
+            args.quadrature_points
+        ));
+    }
     let options = blockwise_options_from_fit_args(args)?;
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
@@ -1259,12 +1290,8 @@ fn run_fit_bernoulli_marginal_slope(
                 } else {
                     Some(DeviationBlockConfig::default())
                 },
-                link_dev: if args.disable_link_dev {
-                    None
-                } else {
-                    Some(DeviationBlockConfig::default())
-                },
-                quadrature_points: 20,
+                link_dev: routed_link_dev,
+                quadrature_points: args.quadrature_points,
             },
             options,
             kappa_options: kappa_options.clone(),
@@ -1312,6 +1339,7 @@ fn run_fit_bernoulli_marginal_slope(
             solved.fit,
             solved.baseline_marginal,
             solved.baseline_logslope,
+            args.quadrature_points,
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
         );
@@ -6894,6 +6922,20 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
     }
 }
 
+fn deviation_block_config_from_formula_linkwiggle(
+    wiggle: &LinkWiggleFormulaSpec,
+) -> DeviationBlockConfig {
+    let (penalty_order, penalty_orders) = split_wiggle_penalty_orders(2, &wiggle.penalty_orders);
+    DeviationBlockConfig {
+        degree: wiggle.degree,
+        num_internal_knots: wiggle.num_internal_knots,
+        penalty_order,
+        penalty_orders,
+        double_penalty: wiggle.double_penalty,
+        monotonicity_eps: DeviationBlockConfig::default().monotonicity_eps,
+    }
+}
+
 fn build_bernoulli_marginal_slope_saved_model(
     formula: String,
     data_schema: DataSchema,
@@ -6905,6 +6947,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     fit_result: UnifiedFitResult,
     baseline_marginal: f64,
     baseline_logslope: f64,
+    quadrature_points: usize,
     score_warp_runtime: Option<&DeviationRuntime>,
     link_dev_runtime: Option<&DeviationRuntime>,
 ) -> SavedModel {
@@ -6924,6 +6967,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.z_column = Some(z_column);
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
+    payload.quadrature_points = Some(quadrature_points);
     payload.training_headers = Some(training_headers);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_noise = Some(resolved_logslopespec);
@@ -9060,6 +9104,7 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
+            quadrature_points: 20,
             transformation_normal: false,
             firth: false,
             survival_likelihood: "transformation".to_string(),
@@ -9244,6 +9289,7 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
+            quadrature_points: 20,
             transformation_normal: false,
             firth: false,
             survival_likelihood: "transformation".to_string(),
@@ -9333,6 +9379,7 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
+            quadrature_points: 20,
             transformation_normal: false,
             firth: false,
             survival_likelihood: "transformation".to_string(),
@@ -9411,6 +9458,7 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
+            quadrature_points: 20,
             transformation_normal: false,
             firth: true,
             survival_likelihood: "transformation".to_string(),
@@ -10388,6 +10436,26 @@ mod tests {
     }
 
     #[test]
+    fn marginal_slope_linkwiggle_routes_into_anchored_deviation_config() {
+        let parsed = parse_formula(
+            "y ~ x + linkwiggle(degree=4, internal_knots=9, penalty_order=\"1,3\", double_penalty=false)",
+        )
+        .expect("formula");
+        let routed = super::deviation_block_config_from_formula_linkwiggle(
+            parsed.linkwiggle.as_ref().expect("linkwiggle config"),
+        );
+        assert_eq!(routed.degree, 4);
+        assert_eq!(routed.num_internal_knots, 9);
+        assert_eq!(routed.penalty_order, 1);
+        assert_eq!(routed.penalty_orders, vec![3]);
+        assert!(!routed.double_penalty);
+        assert_eq!(
+            routed.monotonicity_eps,
+            super::DeviationBlockConfig::default().monotonicity_eps
+        );
+    }
+
+    #[test]
     fn parse_timewiggle_defaults_to_all_penalty_orders() {
         let parsed =
             parse_formula("Surv(entry, exit, event) ~ timewiggle(degree=4, internal_knots=9)")
@@ -10397,6 +10465,33 @@ mod tests {
         assert_eq!(tw.num_internal_knots, 9);
         assert_eq!(tw.penalty_orders, vec![1, 2, 3]);
         assert!(tw.double_penalty);
+    }
+
+    #[test]
+    fn bernoulli_marginal_slope_saved_model_persists_quadrature_points() {
+        let model = super::build_bernoulli_marginal_slope_saved_model(
+            "y ~ 1".to_string(),
+            DataSchema { columns: vec![] },
+            "y ~ 1".to_string(),
+            "z".to_string(),
+            vec![],
+            empty_termspec(),
+            empty_termspec(),
+            core_saved_fit_result(
+                array![0.0],
+                Array1::zeros(0),
+                1.0,
+                None,
+                None,
+                saved_fit_summary_stub(),
+            ),
+            0.0,
+            0.0,
+            37,
+            None,
+            None,
+        );
+        assert_eq!(model.payload().quadrature_points, Some(37));
     }
 
     #[test]

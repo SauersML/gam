@@ -325,10 +325,18 @@ impl TransformationNormalFamily {
     }
 
     /// Response basis metadata for serialization/prediction.
-    pub fn response_knots(&self) -> &Array1<f64> { &self.response_knots }
-    pub fn response_transform(&self) -> &Array2<f64> { &self.response_transform }
-    pub fn response_degree(&self) -> usize { self.response_degree }
-    pub fn response_median(&self) -> f64 { self.response_median }
+    pub fn response_knots(&self) -> &Array1<f64> {
+        &self.response_knots
+    }
+    pub fn response_transform(&self) -> &Array2<f64> {
+        &self.response_transform
+    }
+    pub fn response_degree(&self) -> usize {
+        self.response_degree
+    }
+    pub fn response_median(&self) -> f64 {
+        self.response_median
+    }
 
     /// Return the `ParameterBlockSpec` for this family (single block).
     pub fn block_spec(&self) -> ParameterBlockSpec {
@@ -1889,9 +1897,15 @@ pub fn fit_transformation_normal(
     let (cap_gradient, cap_hessian) =
         custom_family_outer_derivatives(&probe_family, &probe_blocks, options);
     let analytic_gradient = analytic_psi_available
-        && matches!(cap_gradient, crate::solver::outer_strategy::Derivative::Analytic);
+        && matches!(
+            cap_gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
     let analytic_hessian = analytic_psi_available
-        && matches!(cap_hessian, crate::solver::outer_strategy::Derivative::Analytic);
+        && matches!(
+            cap_hessian,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
 
     // Shared mutable state for warm-starting across optimizer iterations.
     let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(None);

@@ -5084,12 +5084,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         >,
     );
 
-    let outer_result = problem.run(&mut obj, "exact spatial adaptive regularization")
-    .map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "exact spatial adaptive outer optimization failed: {e}"
-        ))
-    })?;
+    let outer_result = problem
+        .run(&mut obj, "exact spatial adaptive regularization")
+        .map_err(|e| {
+            EstimationError::InvalidInput(format!(
+                "exact spatial adaptive outer optimization failed: {e}"
+            ))
+        })?;
     let outer_iterations = outer_result.iterations;
     let outer_grad_norm = outer_result.final_grad_norm;
     let theta_star = outer_result.rho;
@@ -8699,9 +8700,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     // Use bounds and design metadata for validation.
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{
-        Derivative, EfsEval, HessianResult, OuterEval,
-    };
+    use crate::solver::outer_strategy::{Derivative, EfsEval, HessianResult, OuterEval};
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -8823,37 +8822,39 @@ fn try_exact_joint_spatial_aniso_optimization(
         1e-5,
     );
 
-    let mut obj = problem.build_objective(
-        &mut ctx,
-        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
-            let cost = ctx.eval_cost(theta);
-            ctx.track_best(theta, cost);
-            Ok(cost)
-        },
-        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx.eval_full(theta) {
-            Ok((cost, grad, hess)) => {
+    let mut obj =
+        problem.build_objective(
+            &mut ctx,
+            |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
+                let cost = ctx.eval_cost(theta);
                 ctx.track_best(theta, cost);
-                Ok(OuterEval {
-                    cost,
-                    gradient: grad,
-                    hessian: HessianResult::Analytic(hess),
-                })
-            }
-            Err(_) => Ok(OuterEval::infeasible(theta.len())),
-        },
-        None::<fn(&mut &mut AnisoJointContext<'_>)>,
-        None::<
-            fn(&mut &mut AnisoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
-        >,
-    );
+                Ok(cost)
+            },
+            |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx.eval_full(theta) {
+                Ok((cost, grad, hess)) => {
+                    ctx.track_best(theta, cost);
+                    Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: HessianResult::Analytic(hess),
+                    })
+                }
+                Err(_) => Ok(OuterEval::infeasible(theta.len())),
+            },
+            None::<fn(&mut &mut AnisoJointContext<'_>)>,
+            None::<
+                fn(
+                    &mut &mut AnisoJointContext<'_>,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
+            >,
+        );
 
-    let result = problem
-        .run(&mut obj, "aniso-psi joint REML")
-        .map_err(|e| {
-            EstimationError::InvalidInput(format!(
-                "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
-            ))
-        })?;
+    let result = problem.run(&mut obj, "aniso-psi joint REML").map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+        ))
+    })?;
     log::trace!(
         "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
         result.iterations,
@@ -8898,9 +8899,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{
-        Derivative, EfsEval, HessianResult, OuterEval,
-    };
+    use crate::solver::outer_strategy::{Derivative, EfsEval, HessianResult, OuterEval};
 
     let theta_dim = theta0.len();
     let kappa_dim = theta_dim - rho_dim;
@@ -9039,18 +9038,14 @@ fn try_exact_joint_spatial_isotropic_optimization(
             Err(_) => Ok(OuterEval::infeasible(theta.len())),
         },
         None::<fn(&mut &mut IsoJointContext<'_>)>,
-        None::<
-            fn(&mut &mut IsoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
-        >,
+        None::<fn(&mut &mut IsoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let result = problem
-        .run(&mut obj, "iso-kappa joint REML")
-        .map_err(|e| {
-            EstimationError::InvalidInput(format!(
-                "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
-            ))
-        })?;
+    let result = problem.run(&mut obj, "iso-kappa joint REML").map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+        ))
+    })?;
     log::trace!(
         "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
         result.iterations,
@@ -10389,9 +10384,7 @@ where
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
 
-    use crate::solver::outer_strategy::{
-        Derivative, EfsEval, HessianResult, OuterEval,
-    };
+    use crate::solver::outer_strategy::{Derivative, EfsEval, HessianResult, OuterEval};
 
     let problem = exact_joint_multistart_outer_problem(
         &theta0,
