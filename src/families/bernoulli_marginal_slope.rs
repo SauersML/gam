@@ -80,7 +80,6 @@ pub struct BernoulliMarginalSlopeTermSpec {
     pub logslopespec: TermCollectionSpec,
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
-    pub quadrature_points: usize,
 }
 
 pub struct BernoulliMarginalSlopeFitResult {
@@ -91,6 +90,7 @@ pub struct BernoulliMarginalSlopeFitResult {
     pub logslope_design: TermCollectionDesign,
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
+    pub quadrature_points: usize,
     pub score_warp_runtime: Option<DeviationRuntime>,
     pub link_dev_runtime: Option<DeviationRuntime>,
 }
@@ -265,6 +265,27 @@ impl DeviationRuntime {
         }
         Ok(raw.dot(&self.transform))
     }
+}
+
+pub fn bernoulli_marginal_slope_quadrature_points(
+    score_warp_basis_dim: usize,
+    link_dev_basis_dim: usize,
+) -> usize {
+    let total_basis_dim = score_warp_basis_dim + link_dev_basis_dim;
+    if total_basis_dim == 0 {
+        return 7;
+    }
+    let mut points = match (score_warp_basis_dim > 0, link_dev_basis_dim > 0) {
+        (true, true) => 31,
+        (true, false) | (false, true) => 21,
+        (false, false) => 7,
+    };
+    if total_basis_dim > 16 {
+        points = 41;
+    } else if total_basis_dim > 8 {
+        points += 4;
+    }
+    points
 }
 
 fn deviation_transform(
@@ -6220,7 +6241,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         freeze_term_collection_from_design(&spec.logslopespec, &logslope_design)
             .map_err(|e| e.to_string())?;
 
-    let (quad_nodes, quad_weights) = normal_expectation_nodes(spec.quadrature_points);
     let y = Arc::new(spec.y.clone());
     let weights = Arc::new(spec.weights.clone());
     let z = Arc::new(spec.z.clone());
@@ -6269,6 +6289,17 @@ pub fn fit_bernoulli_marginal_slope_terms(
             build_deviation_block_from_seed(&link_dev_seed, cfg)
         })
         .transpose()?;
+    let quadrature_points = bernoulli_marginal_slope_quadrature_points(
+        score_warp_prepared
+            .as_ref()
+            .map(|prepared| prepared.runtime.transform.ncols())
+            .unwrap_or(0),
+        link_dev_prepared
+            .as_ref()
+            .map(|prepared| prepared.runtime.transform.ncols())
+            .unwrap_or(0),
+    );
+    let (quad_nodes, quad_weights) = normal_expectation_nodes(quadrature_points);
 
     let extra_rho0 = {
         let mut out = Vec::new();
@@ -6528,6 +6559,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         logslope_design: designs.remove(0),
         baseline_marginal: baseline.0,
         baseline_logslope: baseline.1,
+        quadrature_points,
         score_warp_runtime,
         link_dev_runtime,
     })
@@ -6581,7 +6613,6 @@ mod tests {
             logslopespec: empty_termspec(),
             score_warp: None,
             link_dev: None,
-            quadrature_points: 7,
         }
     }
 

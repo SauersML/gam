@@ -1,4 +1,5 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
+use crate::families::bernoulli_marginal_slope::bernoulli_marginal_slope_quadrature_points;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::inference::model::{SavedAnchoredDeviationRuntime, SavedLinkWiggleRuntime};
 use crate::inference::prediction_linalg::{
@@ -768,7 +769,6 @@ pub struct BernoulliMarginalSlopePredictor {
     pub z_column: String,
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
-    pub quadrature_points: usize,
     pub covariance: Option<Array2<f64>>,
     pub score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
     pub link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
@@ -780,7 +780,6 @@ impl BernoulliMarginalSlopePredictor {
         z_column: String,
         baseline_marginal: f64,
         baseline_logslope: f64,
-        quadrature_points: usize,
         score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
         link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
     ) -> Result<Self, String> {
@@ -822,11 +821,23 @@ impl BernoulliMarginalSlopePredictor {
             z_column,
             baseline_marginal,
             baseline_logslope,
-            quadrature_points,
             covariance: unified.beta_covariance().cloned(),
             score_warp_runtime,
             link_deviation_runtime,
         })
+    }
+
+    fn quadrature_points(&self) -> usize {
+        bernoulli_marginal_slope_quadrature_points(
+            self.score_warp_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.transform.first().map(Vec::len))
+                .unwrap_or(0),
+            self.link_deviation_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.transform.first().map(Vec::len))
+                .unwrap_or(0),
+        )
     }
 
     fn theta(&self) -> Array1<f64> {
@@ -1082,7 +1093,7 @@ impl BernoulliMarginalSlopePredictor {
         }
 
         // ── Flexible path: per-row intercept solve, chunked Jacobians ──
-        let (nodes, quadrature_weights) = Self::normal_expectation_nodes(self.quadrature_points);
+        let (nodes, quadrature_weights) = Self::normal_expectation_nodes(self.quadrature_points());
         let score_warp_obs_design = self
             .score_warp_runtime
             .as_ref()
@@ -3402,22 +3413,8 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_marginal_slope_predictor_uses_saved_quadrature_points() {
-        let runtime = SavedAnchoredDeviationRuntime {
-            knots: vec![-10.0, -10.0, 10.0, 10.0],
-            degree: 1,
-            transform: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
-        };
-        let input = PredictInput {
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            design_noise: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0]],
-            ))),
-            offset_noise: Some(array![0.0]),
-            auxiliary_scalar: Some(array![0.35]),
-        };
-        let base_predictor = BernoulliMarginalSlopePredictor {
+    fn bernoulli_marginal_slope_predictor_automatically_selects_quadrature_points() {
+        let score_only = BernoulliMarginalSlopePredictor {
             beta_marginal: array![0.8],
             beta_logslope: array![1.6],
             beta_score_warp: Some(array![0.7, -0.4]),
@@ -3425,36 +3422,37 @@ mod tests {
             z_column: "z".to_string(),
             baseline_marginal: 0.0,
             baseline_logslope: 0.0,
-            quadrature_points: 3,
             covariance: None,
-            score_warp_runtime: Some(runtime.clone()),
+            score_warp_runtime: Some(SavedAnchoredDeviationRuntime {
+                knots: vec![-10.0, -10.0, 10.0, 10.0],
+                degree: 1,
+                transform: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            }),
             link_deviation_runtime: None,
         };
-        let fine_predictor = BernoulliMarginalSlopePredictor {
+        let score_and_link = BernoulliMarginalSlopePredictor {
             beta_marginal: array![0.8],
             beta_logslope: array![1.6],
             beta_score_warp: Some(array![0.7, -0.4]),
-            beta_link_dev: None,
+            beta_link_dev: Some(array![0.1, -0.2, 0.3]),
             z_column: "z".to_string(),
             baseline_marginal: 0.0,
             baseline_logslope: 0.0,
-            quadrature_points: 25,
             covariance: None,
-            score_warp_runtime: Some(runtime),
-            link_deviation_runtime: None,
+            score_warp_runtime: score_only.score_warp_runtime.clone(),
+            link_deviation_runtime: Some(SavedAnchoredDeviationRuntime {
+                knots: vec![-10.0, -10.0, 10.0, 10.0],
+                degree: 1,
+                transform: vec![
+                    vec![1.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0],
+                    vec![0.0, 0.0, 1.0],
+                ],
+            }),
         };
 
-        let coarse = base_predictor
-            .predict_plugin_response(&input)
-            .expect("coarse prediction");
-        let fine = fine_predictor
-            .predict_plugin_response(&input)
-            .expect("fine prediction");
-
-        assert!(
-            (coarse.eta[0] - fine.eta[0]).abs() > 1e-8,
-            "saved quadrature_points should change flexible marginal-slope prediction"
-        );
+        assert_eq!(score_only.quadrature_points(), 21);
+        assert_eq!(score_and_link.quadrature_points(), 31);
     }
 
     #[test]
