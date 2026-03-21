@@ -13,8 +13,7 @@ use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{
     ParameterBlockInput, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
-    monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta,
-    select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative,
+    select_wiggle_basis_from_seed,
 };
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
@@ -40,6 +39,7 @@ pub struct DeviationBlockConfig {
     pub penalty_order: usize,
     pub penalty_orders: Vec<usize>,
     pub double_penalty: bool,
+    pub monotonicity_eps: f64,
 }
 
 impl Default for DeviationBlockConfig {
@@ -50,6 +50,7 @@ impl Default for DeviationBlockConfig {
             penalty_order: 2,
             penalty_orders: vec![1, 2],
             double_penalty: true,
+            monotonicity_eps: 1e-4,
         }
     }
 }
@@ -59,6 +60,15 @@ pub struct DeviationRuntime {
     pub knots: Array1<f64>,
     pub degree: usize,
     pub basis_dim: usize,
+    pub monotonicity_eps: f64,
+    endpoint_points: Array1<f64>,
+    endpoint_d1_design: Array2<f64>,
+    span_left_points: Array1<f64>,
+    span_right_points: Array1<f64>,
+    span_left_d1_design: Array2<f64>,
+    span_right_d1_design: Array2<f64>,
+    span_left_d2_design: Array2<f64>,
+    span_mid_d3_design: Array2<f64>,
 }
 
 #[derive(Clone)]
@@ -149,50 +159,135 @@ impl DeviationRuntime {
         monotone_wiggle_basis_with_derivative_order(values.view(), &self.knots, self.degree, 4)
     }
 
-    fn validate_monotone_beta(&self, beta: &Array1<f64>, context: &str) -> Result<(), String> {
+    fn endpoint_constraint_points(&self) -> &Array1<f64> {
+        &self.endpoint_points
+    }
+
+    fn support_interval(&self) -> Result<(f64, f64), String> {
+        match (self.endpoint_points.first(), self.endpoint_points.last()) {
+            (Some(&left), Some(&right)) => Ok((left, right)),
+            _ => Err("deviation runtime is missing monotonicity support points".to_string()),
+        }
+    }
+
+    fn exact_monotonicity_min_slack(&self, beta: &Array1<f64>) -> Result<f64, String> {
         if beta.len() != self.basis_dim {
             return Err(format!(
-                "{context} length mismatch: got {}, expected {}",
+                "deviation monotonicity length mismatch: got {}, expected {}",
                 beta.len(),
                 self.basis_dim
             ));
         }
-        if let Some(beta_slice) = beta.as_slice() {
-            validate_monotone_wiggle_beta_nonnegative(beta_slice, context)
+        if beta.iter().any(|value| !value.is_finite()) {
+            let bad = beta
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+                .map(|(idx, value)| format!("deviation coefficient {idx} is non-finite ({value})"))
+                .unwrap_or_else(|| "deviation coefficient is non-finite".to_string());
+            return Err(bad);
+        }
+
+        let d1_left = self.span_left_d1_design.dot(beta);
+        let d1_right = self.span_right_d1_design.dot(beta);
+        let d2_left = self.span_left_d2_design.dot(beta);
+        let d3_mid = self.span_mid_d3_design.dot(beta);
+
+        let mut min_slack = f64::INFINITY;
+        for span_idx in 0..self.span_left_points.len() {
+            let left = self.span_left_points[span_idx];
+            let right = self.span_right_points[span_idx];
+            let width = right - left;
+            if !width.is_finite() || width <= 0.0 {
+                continue;
+            }
+            let left_slack = 1.0 + d1_left[span_idx] - self.monotonicity_eps;
+            let right_slack = 1.0 + d1_right[span_idx] - self.monotonicity_eps;
+            min_slack = min_slack.min(left_slack.min(right_slack));
+
+            let curvature = d3_mid[span_idx];
+            if curvature > 0.0 {
+                let t_star = -d2_left[span_idx] / curvature;
+                if t_star > 0.0 && t_star < width {
+                    let interior = 1.0
+                        + d1_left[span_idx]
+                        + d2_left[span_idx] * t_star
+                        + 0.5 * curvature * t_star * t_star
+                        - self.monotonicity_eps;
+                    min_slack = min_slack.min(interior);
+                }
+            }
+        }
+        if min_slack.is_finite() {
+            Ok(min_slack)
         } else {
-            let beta_values = beta.iter().copied().collect::<Vec<_>>();
-            validate_monotone_wiggle_beta_nonnegative(&beta_values, context)
+            Err("deviation monotonicity slack computation produced no active spans".to_string())
         }
     }
 
-    fn max_feasible_nonnegative_step(
+    fn monotonicity_feasible(&self, beta: &Array1<f64>, context: &str) -> Result<(), String> {
+        let slack = self.exact_monotonicity_min_slack(beta)?;
+        if slack >= -1e-10 {
+            Ok(())
+        } else {
+            let (left, right) = self.support_interval()?;
+            Err(format!(
+                "{context} violates exact monotonicity on [{left:.6}, {right:.6}] (minimum derivative slack {slack:.3e}, eps={:.3e})",
+                self.monotonicity_eps
+            ))
+        }
+    }
+
+    fn max_feasible_monotone_step(
         &self,
         beta: &Array1<f64>,
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
         if beta.len() != self.basis_dim || delta.len() != self.basis_dim {
             return Err(format!(
-                "deviation nonnegative step length mismatch: beta={}, delta={}, expected {}",
+                "deviation monotone step length mismatch: beta={}, delta={}, expected {}",
                 beta.len(),
                 delta.len(),
                 self.basis_dim
             ));
         }
-        self.validate_monotone_beta(beta, "deviation monotone coefficients")?;
-        let mut alpha = 1.0f64;
-        for idx in 0..delta.len() {
-            let step = delta[idx];
+        for (idx, step) in delta.iter().enumerate() {
             if !step.is_finite() {
                 return Err(format!("deviation step direction {idx} is non-finite"));
             }
-            if step < 0.0 {
-                alpha = alpha.min((-beta[idx] / step).clamp(0.0, 1.0));
-            }
         }
-        if alpha >= 1.0 {
+        self.monotonicity_feasible(beta, "deviation monotone coefficients")?;
+
+        let mut trial = beta.clone();
+        for idx in 0..trial.len() {
+            trial[idx] += delta[idx];
+        }
+        if self.exact_monotonicity_min_slack(&trial)? >= 0.0 {
             return Ok(Some(1.0));
         }
-        Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
+
+        let mut alpha_lo = 0.0f64;
+        let mut alpha_hi = 1.0f64;
+        for _ in 0..48 {
+            let alpha_mid = 0.5 * (alpha_lo + alpha_hi);
+            for idx in 0..trial.len() {
+                trial[idx] = beta[idx] + alpha_mid * delta[idx];
+            }
+            if self.exact_monotonicity_min_slack(&trial)? >= 0.0 {
+                alpha_lo = alpha_mid;
+            } else {
+                alpha_hi = alpha_mid;
+            }
+        }
+        if alpha_lo >= 1.0 {
+            return Ok(Some(1.0));
+        }
+        let conservative = if alpha_lo <= 0.0 {
+            0.0
+        } else {
+            (alpha_lo * 0.999_999).clamp(0.0, 1.0)
+        };
+        Ok(Some(conservative))
     }
 }
 
@@ -221,6 +316,12 @@ fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
+    if cfg.degree != 3 {
+        return Err(format!(
+            "exact monotonicity for bernoulli marginal-slope deviation blocks requires cubic splines (degree=3), got degree={}",
+            cfg.degree
+        ));
+    }
     let selected = select_wiggle_basis_from_seed(
         seed.view(),
         &WiggleBlockConfig {
@@ -233,10 +334,79 @@ fn build_deviation_block_from_seed(
     )?;
     let block = selected.block;
     let dim = block.design.ncols();
+    let knots = selected.knots;
+    let degree = selected.degree;
+    let mut endpoint_points = Vec::new();
+    for &knot in knots.iter() {
+        if endpoint_points
+            .last()
+            .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
+        {
+            endpoint_points.push(knot);
+        }
+    }
+    if endpoint_points.len() < 2 {
+        return Err(
+            "deviation runtime requires at least two distinct knot breakpoints".to_string(),
+        );
+    }
+    let mut span_left = Vec::new();
+    let mut span_right = Vec::new();
+    let mut span_mid = Vec::new();
+    for window in endpoint_points.windows(2) {
+        let left = window[0];
+        let right = window[1];
+        if right - left > 1e-12 {
+            span_left.push(left);
+            span_right.push(right);
+            span_mid.push(0.5 * (left + right));
+        }
+    }
+    if span_left.is_empty() {
+        return Err("deviation runtime requires at least one active knot span".to_string());
+    }
+    let endpoint_points = Array1::from_vec(endpoint_points);
+    let span_left_points = Array1::from_vec(span_left);
+    let span_right_points = Array1::from_vec(span_right);
+    let span_mid_points = Array1::from_vec(span_mid);
     let runtime = DeviationRuntime {
-        knots: selected.knots,
-        degree: selected.degree,
+        knots: knots.clone(),
+        degree,
         basis_dim: dim,
+        monotonicity_eps: cfg.monotonicity_eps,
+        endpoint_d1_design: monotone_wiggle_basis_with_derivative_order(
+            endpoint_points.view(),
+            &knots,
+            degree,
+            1,
+        )?,
+        span_left_d1_design: monotone_wiggle_basis_with_derivative_order(
+            span_left_points.view(),
+            &knots,
+            degree,
+            1,
+        )?,
+        span_right_d1_design: monotone_wiggle_basis_with_derivative_order(
+            span_right_points.view(),
+            &knots,
+            degree,
+            1,
+        )?,
+        span_left_d2_design: monotone_wiggle_basis_with_derivative_order(
+            span_left_points.view(),
+            &knots,
+            degree,
+            2,
+        )?,
+        span_mid_d3_design: monotone_wiggle_basis_with_derivative_order(
+            span_mid_points.view(),
+            &knots,
+            degree,
+            3,
+        )?,
+        endpoint_points,
+        span_left_points,
+        span_right_points,
     };
     Ok(DeviationPrepared { block, runtime })
 }
@@ -1602,14 +1772,14 @@ impl BernoulliMarginalSlopeFamily {
         self.score_warp.is_some() || self.link_dev.is_some()
     }
 
-    fn validate_monotone_coefficients(
+    fn validate_exact_monotonicity(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(), String> {
         if let Some(runtime) = &self.score_warp {
-            runtime.validate_monotone_beta(
+            runtime.monotonicity_feasible(
                 &block_states[2].beta,
-                "bernoulli marginal-slope score-warp coefficients",
+                "bernoulli marginal-slope score-warp deviation",
             )?;
         }
         if let Some(runtime) = &self.link_dev {
@@ -1617,10 +1787,7 @@ impl BernoulliMarginalSlopeFamily {
                 .last()
                 .map(|state| &state.beta)
                 .ok_or_else(|| "missing link deviation block state".to_string())?;
-            runtime.validate_monotone_beta(
-                beta_w,
-                "bernoulli marginal-slope link deviation coefficients",
-            )?;
+            runtime.monotonicity_feasible(beta_w, "bernoulli marginal-slope link deviation")?;
         }
         Ok(())
     }
@@ -5803,12 +5970,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        self.validate_monotone_coefficients(block_states)?;
+        self.validate_exact_monotonicity(block_states)?;
         self.evaluate_blockwise_exact_newton(block_states)
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        self.validate_monotone_coefficients(block_states)?;
+        self.validate_exact_monotonicity(block_states)?;
         if !self.flex_active() {
             // Rigid probit: vectorized closed-form.
             // η_i = q_i·c_i + b_i·z_i  where c_i = √(1+b_i²)
@@ -5888,7 +6055,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         );
         if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
             if let Some(runtime) = &self.score_warp {
-                return runtime.max_feasible_nonnegative_step(&block_states[2].beta, delta);
+                return runtime.max_feasible_monotone_step(&block_states[2].beta, delta);
             }
         }
         let link_block_idx = if slices.h.is_some() { 3 } else { 2 };
@@ -5902,7 +6069,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     .last()
                     .map(|state| &state.beta)
                     .ok_or_else(|| "missing link deviation block state".to_string())?;
-                return runtime.max_feasible_nonnegative_step(beta_w, delta);
+                return runtime.max_feasible_monotone_step(beta_w, delta);
             }
         }
         Ok(None)
@@ -6091,7 +6258,22 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             self.link_dev.is_some(),
         );
         if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
-            return Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()));
+            if let Some(runtime) = &self.score_warp {
+                if spec.design.ncols() != runtime.basis_dim {
+                    return Err(format!(
+                        "score-warp constraint dimension mismatch: block has {}, runtime has {}",
+                        spec.design.ncols(),
+                        runtime.basis_dim
+                    ));
+                }
+                return Ok(Some(LinearInequalityConstraints {
+                    a: runtime.endpoint_d1_design.clone(),
+                    b: Array1::from_elem(
+                        runtime.endpoint_constraint_points().len(),
+                        runtime.monotonicity_eps - 1.0,
+                    ),
+                }));
+            }
         }
         let link_block_idx = if slices.h.is_some() { 3 } else { 2 };
         if slices
@@ -6099,7 +6281,22 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .as_ref()
             .is_some_and(|_| block_idx == link_block_idx)
         {
-            return Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()));
+            if let Some(runtime) = &self.link_dev {
+                if spec.design.ncols() != runtime.basis_dim {
+                    return Err(format!(
+                        "link-deviation constraint dimension mismatch: block has {}, runtime has {}",
+                        spec.design.ncols(),
+                        runtime.basis_dim
+                    ));
+                }
+                return Ok(Some(LinearInequalityConstraints {
+                    a: runtime.endpoint_d1_design.clone(),
+                    b: Array1::from_elem(
+                        runtime.endpoint_constraint_points().len(),
+                        runtime.monotonicity_eps - 1.0,
+                    ),
+                }));
+            }
         }
         Ok(None)
     }
@@ -6111,21 +6308,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         _: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        let slices = block_slices(
-            block_states,
-            self.score_warp.is_some(),
-            self.link_dev.is_some(),
-        );
-        if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
-            return Ok(project_monotone_wiggle_beta(beta));
-        }
-        let link_block_idx = if slices.h.is_some() { 3 } else { 2 };
-        if slices
-            .w
-            .as_ref()
-            .is_some_and(|_| block_idx == link_block_idx)
-        {
-            return Ok(project_monotone_wiggle_beta(beta));
+        if block_idx >= block_states.len() {
+            return Err(format!(
+                "post-update block index {} out of range for {} blocks",
+                block_idx,
+                block_states.len()
+            ));
         }
         Ok(beta)
     }
@@ -6275,9 +6463,7 @@ fn build_aux_blockspec(
 ) -> Result<ParameterBlockSpec, String> {
     let mut block = prepared.block.clone();
     block.initial_log_lambdas = Some(rho);
-    block.initial_beta = beta_hint
-        .map(project_monotone_wiggle_beta)
-        .or_else(|| block.initial_beta.clone().map(project_monotone_wiggle_beta));
+    block.initial_beta = beta_hint.or_else(|| block.initial_beta.clone());
     block.intospec(name)
 }
 
@@ -6786,10 +6972,16 @@ mod tests {
             .block_linear_constraints(&block_states, 2, &dummy_spec)
             .expect("constraint lookup")
             .expect("link block constraints");
-        let expected =
-            monotone_wiggle_nonnegative_constraints(link_dim).expect("non-empty nonnegative cone");
-        assert_eq!(constraints.a, expected.a);
-        assert_eq!(constraints.b, expected.b);
+        let expected_a = prepared
+            .runtime
+            .first_derivative_design(prepared.runtime.endpoint_constraint_points())
+            .expect("endpoint derivative design");
+        let expected_b = Array1::from_elem(
+            prepared.runtime.endpoint_constraint_points().len(),
+            prepared.runtime.monotonicity_eps - 1.0,
+        );
+        assert_eq!(constraints.a, expected_a);
+        assert_eq!(constraints.b, expected_b);
         assert!(
             family
                 .block_linear_constraints(&block_states, 1, &dummy_spec)
@@ -6843,14 +7035,20 @@ mod tests {
             .block_linear_constraints(&block_states, 2, &dummy_spec)
             .expect("constraint lookup")
             .expect("score-warp constraints");
-        let expected =
-            monotone_wiggle_nonnegative_constraints(score_dim).expect("non-empty nonnegative cone");
-        assert_eq!(constraints.a, expected.a);
-        assert_eq!(constraints.b, expected.b);
+        let expected_a = prepared
+            .runtime
+            .first_derivative_design(prepared.runtime.endpoint_constraint_points())
+            .expect("endpoint derivative design");
+        let expected_b = Array1::from_elem(
+            prepared.runtime.endpoint_constraint_points().len(),
+            prepared.runtime.monotonicity_eps - 1.0,
+        );
+        assert_eq!(constraints.a, expected_a);
+        assert_eq!(constraints.b, expected_b);
     }
 
     #[test]
-    fn nonnegative_step_limit_keeps_deviation_feasible() {
+    fn exact_monotonicity_step_limit_keeps_deviation_feasible() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
         let prepared = build_deviation_block_from_seed(
             &seed,
@@ -6864,14 +7062,14 @@ mod tests {
         let beta0 = Array1::<f64>::zeros(dim);
         let mut found = None;
         'search: for idx in 0..dim {
-            for &step in &[-4.0, -2.0, -1.0, 1.0, 2.0, 4.0] {
+            for &step in &[-64.0, -32.0, -16.0, -8.0, -4.0, 4.0, 8.0, 16.0, 32.0, 64.0] {
                 let mut direction = Array1::<f64>::zeros(dim);
                 direction[idx] = step;
                 let mut trial = beta0.clone();
                 trial += &direction;
                 if prepared
                     .runtime
-                    .validate_monotone_beta(&trial, "trial monotonicity")
+                    .monotonicity_feasible(&trial, "trial monotonicity")
                     .is_err()
                 {
                     found = Some(direction);
@@ -6882,7 +7080,7 @@ mod tests {
         let direction = found.expect("expected an infeasible full step");
         let alpha = prepared
             .runtime
-            .max_feasible_nonnegative_step(&beta0, &direction)
+            .max_feasible_monotone_step(&beta0, &direction)
             .expect("max feasible step")
             .expect("step ceiling");
         assert!(
@@ -6894,17 +7092,33 @@ mod tests {
         feasible.scaled_add(alpha, &direction);
         prepared
             .runtime
-            .validate_monotone_beta(&feasible, "feasible monotonicity")
+            .monotonicity_feasible(&feasible, "feasible monotonicity")
             .expect("ceiling step should stay feasible");
         let mut infeasible = beta0.clone();
         infeasible += &direction;
         assert!(
             prepared
                 .runtime
-                .validate_monotone_beta(&infeasible, "infeasible monotonicity")
+                .monotonicity_feasible(&infeasible, "infeasible monotonicity")
                 .is_err(),
-            "full step should violate coefficient nonnegativity"
+            "full step should violate exact cubic monotonicity"
         );
+    }
+
+    #[test]
+    fn exact_monotonicity_requires_cubic_deviation_basis() {
+        let seed = array![-1.0, 0.0, 1.0];
+        let err = match build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                degree: 2,
+                ..DeviationBlockConfig::default()
+            },
+        ) {
+            Ok(_) => panic!("non-cubic deviation basis should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("requires cubic splines"));
     }
 
     #[test]
