@@ -246,10 +246,6 @@ struct FitArgs {
     disable_score_warp: bool,
     #[arg(long = "disable-link-dev", default_value_t = false)]
     disable_link_dev: bool,
-    /// Gauss-Hermite node count for flexible bernoulli marginal-slope
-    /// score-warp/link-deviation integration.
-    #[arg(long = "quadrature-points", default_value_t = 20)]
-    quadrature_points: usize,
     /// Fit a conditional transformation-normal model: h(Y|x) ~ N(0,1).
     /// Uses the main formula for the covariate-side smooth terms and
     /// automatically builds the response-direction monotone basis.
@@ -1180,9 +1176,6 @@ fn run_fit_bernoulli_marginal_slope(
             "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
         );
     }
-    if args.quadrature_points == 0 {
-        return Err("--quadrature-points must be at least 1".to_string());
-    }
     let logslope_formula_raw = args
         .logslope_formula
         .as_deref()
@@ -1264,10 +1257,10 @@ fn run_fit_bernoulli_marginal_slope(
             "bernoulli marginal-slope rigid probit mode is algebraic closed-form exact".to_string(),
         );
     } else {
-        inference_notes.push(format!(
-            "bernoulli marginal-slope flexible score/link mode uses exact analytic derivatives of a {}-point Gauss-Hermite quadrature approximation",
-            args.quadrature_points
-        ));
+        inference_notes.push(
+            "bernoulli marginal-slope flexible score/link mode uses exact analytic derivatives of an automatically selected Gauss-Hermite quadrature approximation"
+                .to_string(),
+        );
     }
     let options = blockwise_options_from_fit_args(args)?;
     let kappa_options = {
@@ -1291,7 +1284,6 @@ fn run_fit_bernoulli_marginal_slope(
                     Some(DeviationBlockConfig::default())
                 },
                 link_dev: routed_link_dev,
-                quadrature_points: args.quadrature_points,
             },
             options,
             kappa_options: kappa_options.clone(),
@@ -1339,7 +1331,6 @@ fn run_fit_bernoulli_marginal_slope(
             solved.fit,
             solved.baseline_marginal,
             solved.baseline_logslope,
-            args.quadrature_points,
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
         );
@@ -6947,7 +6938,6 @@ fn build_bernoulli_marginal_slope_saved_model(
     fit_result: UnifiedFitResult,
     baseline_marginal: f64,
     baseline_logslope: f64,
-    quadrature_points: usize,
     score_warp_runtime: Option<&DeviationRuntime>,
     link_dev_runtime: Option<&DeviationRuntime>,
 ) -> SavedModel {
@@ -6967,7 +6957,6 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.z_column = Some(z_column);
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
-    payload.quadrature_points = Some(quadrature_points);
     payload.training_headers = Some(training_headers);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_noise = Some(resolved_logslopespec);
@@ -9104,7 +9093,6 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
-            quadrature_points: 20,
             transformation_normal: false,
             firth: false,
             survival_likelihood: "transformation".to_string(),
@@ -9289,7 +9277,6 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
-            quadrature_points: 20,
             transformation_normal: false,
             firth: false,
             survival_likelihood: "transformation".to_string(),
@@ -9379,7 +9366,6 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
-            quadrature_points: 20,
             transformation_normal: false,
             firth: false,
             survival_likelihood: "transformation".to_string(),
@@ -9458,7 +9444,6 @@ mod tests {
             z_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
-            quadrature_points: 20,
             transformation_normal: false,
             firth: true,
             survival_likelihood: "transformation".to_string(),
@@ -10468,7 +10453,7 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_marginal_slope_saved_model_persists_quadrature_points() {
+    fn bernoulli_marginal_slope_saved_model_does_not_require_quadrature_metadata() {
         let model = super::build_bernoulli_marginal_slope_saved_model(
             "y ~ 1".to_string(),
             DataSchema { columns: vec![] },
@@ -10487,11 +10472,11 @@ mod tests {
             ),
             0.0,
             0.0,
-            37,
             None,
             None,
         );
-        assert_eq!(model.payload().quadrature_points, Some(37));
+        assert_eq!(model.payload().marginal_baseline, Some(0.0));
+        assert_eq!(model.payload().logslope_baseline, Some(0.0));
     }
 
     #[test]
