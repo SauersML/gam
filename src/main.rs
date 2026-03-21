@@ -6918,6 +6918,7 @@ fn deviation_block_config_from_formula_linkwiggle(
         penalty_order,
         penalty_orders,
         double_penalty: wiggle.double_penalty,
+        monotonicity_eps: 1e-4,
     }
 }
 
