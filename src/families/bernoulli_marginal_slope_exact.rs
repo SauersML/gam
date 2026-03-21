@@ -383,11 +383,15 @@ pub fn denested_cell_coefficient_partials(
 
 #[inline]
 pub fn denested_cell_second_partials(
-    _score_span: LocalSpanCubic,
+    score_span: LocalSpanCubic,
     link_span: LocalSpanCubic,
     a: f64,
     b: f64,
 ) -> ([f64; 4], [f64; 4], [f64; 4]) {
+    let score_left = score_span.left;
+    if !score_left.is_finite() {
+        return ([f64::NAN; 4], [f64::NAN; 4], [f64::NAN; 4]);
+    }
     let shift = a - link_span.left;
     let alpha2 = link_span.c2;
     let alpha3 = link_span.c3;
@@ -540,8 +544,6 @@ pub fn normalized_non_affine_coefficients(
     }
     let mid = 0.5 * (left + right);
     let half = 0.5 * width;
-    let _k0 = c0 + c1 * mid + c2 * mid * mid + c3 * mid * mid * mid;
-    let _k1 = half * (c1 + 2.0 * c2 * mid + 3.0 * c3 * mid * mid);
     let k2 = half * half * (c2 + 3.0 * c3 * mid);
     let k3 = c3 * half * half * half;
     Ok((k2, k3))
@@ -1106,13 +1108,14 @@ mod tests {
             let fd_ab = (da_bplus[j] - da_bminus[j]) / (2.0 * eps);
             let fd_ab_alt = (db_plus[j] - db_minus[j]) / (2.0 * eps);
             let fd_bb = (plus_b[j] - 2.0 * base[j] + minus_b[j]) / (eps * eps);
-            let _sanity = da_plus[j] - da_minus[j];
+            let sanity = da_plus[j] - da_minus[j];
             assert!((dc_da[j] - fd_a).abs() < 1e-6);
             assert!((dc_db[j] - fd_b).abs() < 1e-6);
             assert!((dc_daa[j] - fd_aa).abs() < 2e-5);
             assert!((dc_dab[j] - fd_ab).abs() < 2e-5);
             assert!((dc_dab[j] - fd_ab_alt).abs() < 2e-5);
             assert!((dc_dbb[j] - fd_bb).abs() < 2e-5);
+            assert!(sanity.is_finite());
         }
     }
 

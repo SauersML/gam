@@ -1258,7 +1258,7 @@ fn run_fit_bernoulli_marginal_slope(
         );
     } else {
         inference_notes.push(
-            "bernoulli marginal-slope flexible score/link mode uses exact analytic derivatives through a calibrated 1D Gaussian marginalization; the value path is not literal closed-form"
+            "bernoulli marginal-slope flexible score/link mode uses the calibrated de-nested cubic cell-partition kernel: exact affine cells with analytic Hessians, plus non-affine cubic cells evaluated through the current transported-kernel reference path"
                 .to_string(),
         );
     }

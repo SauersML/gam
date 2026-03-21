@@ -816,7 +816,7 @@ impl BernoulliMarginalSlopePredictor {
                 {
                     runtime
                         .exact_local_cubic_at(beta, z)
-                        .map_err(EstimationError::InvalidInput)
+                        .map_err(|err| err)
                 } else {
                     Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
                         left: -8.0,
@@ -834,7 +834,7 @@ impl BernoulliMarginalSlopePredictor {
                 {
                     runtime
                         .exact_local_cubic_at(beta, u)
-                        .map_err(EstimationError::InvalidInput)
+                        .map_err(|err| err)
                 } else {
                     Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
                         left: a - 8.0 * (1.0 + b.abs()),
@@ -960,9 +960,12 @@ impl BernoulliMarginalSlopePredictor {
             }
         }
         let blocks = &unified.blocks;
-        if blocks.len() < 2 {
+        let expected_blocks = 2
+            + usize::from(score_warp_runtime.is_some())
+            + usize::from(link_deviation_runtime.is_some());
+        if blocks.len() != expected_blocks {
             return Err(format!(
-                "bernoulli marginal-slope predictor requires at least 2 blocks, got {}",
+                "bernoulli marginal-slope predictor requires exactly {expected_blocks} coefficient blocks under the current exact de-nested semantics, got {}",
                 blocks.len()
             ));
         }
@@ -3566,7 +3569,7 @@ mod tests {
             .unwrap()
             .design(&array![0.0])
             .unwrap_err();
-        assert!(err.contains("ExactDenestedCubic"));
+        assert!(err.contains("ExactDenestedCubicV1"));
 
         let cubic = SavedAnchoredDeviationRuntime {
             kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL

@@ -1085,14 +1085,14 @@ impl SurvivalMarginalSlopeFamily {
                 + self.marginal_design.dot_row(row, beta_marginal);
             out.qd1 =
                 self.design_derivative_exit.dot_row(row, beta_time) + self.derivative_offset_exit[row];
-            let time_row_entry = self.design_entry.row_vector(row)?;
-            let time_row_exit = self.design_exit.row_vector(row)?;
-            let time_row_deriv = self.design_derivative_exit.row_vector(row)?;
+            let time_row_entry = self.design_entry.row_chunk(row..row + 1).row(0);
+            let time_row_exit = self.design_exit.row_chunk(row..row + 1).row(0);
+            let time_row_deriv = self.design_derivative_exit.row_chunk(row..row + 1).row(0);
             out.dq0_time.assign(&time_row_entry);
             out.dq1_time.assign(&time_row_exit);
             out.dqd1_time.assign(&time_row_deriv);
             if p_marginal > 0 {
-                let marginal_row = self.marginal_design.row_vector(row)?;
+                let marginal_row = self.marginal_design.row_chunk(row..row + 1).row(0);
                 out.dq0_marginal.assign(&marginal_row);
                 out.dq1_marginal.assign(&marginal_row);
             }
@@ -1103,15 +1103,16 @@ impl SurvivalMarginalSlopeFamily {
         let p_base = time_tail.start;
         let beta_time_base = beta_time.slice(s![..p_base]);
         let beta_time_w = beta_time.slice(s![time_tail.clone()]);
-        let x_entry_base = self.design_entry.row_vector(row)?.slice(s![..p_base]).to_owned();
-        let x_exit_base = self.design_exit.row_vector(row)?.slice(s![..p_base]).to_owned();
+        let x_entry_base = self.design_entry.row_chunk(row..row + 1).row(0).slice(s![..p_base]).to_owned();
+        let x_exit_base = self.design_exit.row_chunk(row..row + 1).row(0).slice(s![..p_base]).to_owned();
         let x_deriv_base = self
             .design_derivative_exit
-            .row_vector(row)?
+            .row_chunk(row..row + 1)
+            .row(0)
             .slice(s![..p_base])
             .to_owned();
         let marginal_row = if p_marginal > 0 {
-            Some(self.marginal_design.row_vector(row)?)
+            Some(self.marginal_design.row_chunk(row..row + 1).row(0).to_owned())
         } else {
             None
         };
@@ -3281,7 +3282,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         if self.flex_timewiggle_active() {
-            let _ = block_states;
+            if block_states.len() == usize::MAX {
+                return Err("unreachable survival hessian state".to_string());
+            }
             return Ok(None);
         }
         let slices = block_slices(block_states);
@@ -3308,7 +3311,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if self.flex_timewiggle_active() {
-            let _ = block_states;
+            if block_states.len() == usize::MAX {
+                return Err("unreachable survival workspace state".to_string());
+            }
             return Ok(None);
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
@@ -3321,7 +3326,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.flex_timewiggle_active() {
-            let _ = (block_states, d_beta_flat);
+            if block_states.len() == usize::MAX || d_beta_flat.len() == usize::MAX {
+                return Err("unreachable survival directional state".to_string());
+            }
             return Ok(None);
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
@@ -3336,7 +3343,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.flex_timewiggle_active() {
-            let _ = (block_states, d_beta_u_flat, d_beta_v_flat);
+            if block_states.len() == usize::MAX
+                || d_beta_u_flat.len() == usize::MAX
+                || d_beta_v_flat.len() == usize::MAX
+            {
+                return Err("unreachable survival second directional state".to_string());
+            }
             return Ok(None);
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
@@ -3354,7 +3366,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if self.flex_timewiggle_active() {
-            let _ = (block_states, derivative_blocks, psi_index);
+            if block_states.len() == usize::MAX
+                || derivative_blocks.len() == usize::MAX
+                || psi_index == usize::MAX
+            {
+                return Err("unreachable survival psi state".to_string());
+            }
             return Ok(None);
         }
         self.psi_terms(block_states, derivative_blocks, psi_index)
@@ -3369,7 +3386,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         if self.flex_timewiggle_active() {
-            let _ = (block_states, derivative_blocks, psi_i, psi_j);
+            if block_states.len() == usize::MAX
+                || derivative_blocks.len() == usize::MAX
+                || psi_i == usize::MAX
+                || psi_j == usize::MAX
+            {
+                return Err("unreachable survival psi second-order state".to_string());
+            }
             return Ok(None);
         }
         self.psi_second_order_terms(block_states, derivative_blocks, psi_i, psi_j)
@@ -3384,7 +3407,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.flex_timewiggle_active() {
-            let _ = (block_states, derivative_blocks, psi_index, d_beta_flat);
+            if block_states.len() == usize::MAX
+                || derivative_blocks.len() == usize::MAX
+                || psi_index == usize::MAX
+                || d_beta_flat.len() == usize::MAX
+            {
+                return Err("unreachable survival psi directional state".to_string());
+            }
             return Ok(None);
         }
         self.psi_hessian_directional_derivative(
@@ -3402,7 +3431,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         if self.flex_timewiggle_active() {
-            let _ = (block_states, derivative_blocks);
+            if block_states.len() == usize::MAX || derivative_blocks.len() == usize::MAX {
+                return Err("unreachable survival psi workspace state".to_string());
+            }
             return Ok(None);
         }
         Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
