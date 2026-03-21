@@ -1,5 +1,5 @@
 use crate::basis::BasisOptions;
-use crate::types::BasisFamily;
+use crate::basis::BasisFamily;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
