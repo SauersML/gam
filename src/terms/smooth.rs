@@ -1,17 +1,19 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
     BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
-    DuchonBasisSpec, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
-    PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
+    CenterStrategyKind, DuchonBasisSpec, KroneckerFactoredBasis, MaternBasisSpec,
+    MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
+    ThinPlateBasisSpec, apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
     build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivative,
     build_duchon_basis_log_kappasecond_derivative, build_duchon_basiswithworkspace,
     build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
     build_matern_basis_log_kappa_derivative, build_matern_basis_log_kappasecond_derivative,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
-    build_thin_plate_basis_log_kappasecond_derivative, estimate_penalty_nullity,
-    filter_active_penalty_candidates, orthogonality_transform_for_design,
+    build_thin_plate_basis_log_kappasecond_derivative, center_strategy_is_auto,
+    center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
+    default_num_centers, estimate_penalty_nullity, filter_active_penalty_candidates,
+    orthogonality_transform_for_design, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -40,13 +42,14 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f64;
 use std::ops::Range;
 use std::sync::Arc;
 
 fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
     match strategy {
+        CenterStrategy::Auto(inner) => describe_thin_plate_center_request(inner),
         CenterStrategy::UserProvided(centers) => format!("{} centers", centers.nrows()),
         CenterStrategy::EqualMass { num_centers }
         | CenterStrategy::EqualMassCovarRepresentative { num_centers }
@@ -1301,6 +1304,219 @@ fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f6
     Ok(out)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct JointSpatialCenterGroupKey {
+    feature_cols: Vec<usize>,
+    strategy_kind: CenterStrategyKind,
+    strategy_aux: usize,
+    input_scale_bits: Option<Vec<u64>>,
+}
+
+fn spatial_term_min_center_count(term: &SmoothTermSpec) -> usize {
+    match &term.basis {
+        SmoothBasisSpec::ThinPlate { feature_cols, .. } => feature_cols.len() + 1,
+        SmoothBasisSpec::Duchon {
+            feature_cols, spec, ..
+        } => match spec.nullspace_order {
+            crate::basis::DuchonNullspaceOrder::Zero => 1,
+            crate::basis::DuchonNullspaceOrder::Linear => feature_cols.len() + 1,
+        },
+        SmoothBasisSpec::Matern { .. } => 1,
+        _ => 1,
+    }
+}
+
+fn spatial_term_group_key(term: &SmoothTermSpec) -> Option<JointSpatialCenterGroupKey> {
+    let (feature_cols, strategy, input_scales) = match &term.basis {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols,
+            spec,
+            input_scales,
+        } => (feature_cols, &spec.center_strategy, input_scales.as_ref()),
+        SmoothBasisSpec::Matern {
+            feature_cols,
+            spec,
+            input_scales,
+        } => (feature_cols, &spec.center_strategy, input_scales.as_ref()),
+        SmoothBasisSpec::Duchon {
+            feature_cols,
+            spec,
+            input_scales,
+        } => (feature_cols, &spec.center_strategy, input_scales.as_ref()),
+        _ => return None,
+    };
+    let strategy_kind = center_strategy_kind(strategy);
+    let strategy_aux = match strategy {
+        CenterStrategy::Auto(inner) => match inner.as_ref() {
+            CenterStrategy::KMeans { max_iter, .. } => *max_iter,
+            CenterStrategy::UniformGrid { points_per_dim } => *points_per_dim,
+            _ => 0,
+        },
+        CenterStrategy::KMeans { max_iter, .. } => *max_iter,
+        CenterStrategy::UniformGrid { points_per_dim } => *points_per_dim,
+        _ => 0,
+    };
+    Some(JointSpatialCenterGroupKey {
+        feature_cols: feature_cols.clone(),
+        strategy_kind,
+        strategy_aux,
+        input_scale_bits: input_scales
+            .map(|values| values.iter().map(|value| value.to_bits()).collect()),
+    })
+}
+
+fn spatial_term_center_strategy(term: &SmoothTermSpec) -> Option<&CenterStrategy> {
+    match &term.basis {
+        SmoothBasisSpec::ThinPlate { spec, .. } => Some(&spec.center_strategy),
+        SmoothBasisSpec::Matern { spec, .. } => Some(&spec.center_strategy),
+        SmoothBasisSpec::Duchon { spec, .. } => Some(&spec.center_strategy),
+        _ => None,
+    }
+}
+
+fn set_spatial_term_centers(
+    term: &mut SmoothTermSpec,
+    centers: Array2<f64>,
+) -> Result<(), BasisError> {
+    match &mut term.basis {
+        SmoothBasisSpec::ThinPlate { spec, .. } => {
+            spec.center_strategy = CenterStrategy::UserProvided(centers);
+            Ok(())
+        }
+        SmoothBasisSpec::Matern { spec, .. } => {
+            spec.center_strategy = CenterStrategy::UserProvided(centers);
+            Ok(())
+        }
+        SmoothBasisSpec::Duchon { spec, .. } => {
+            spec.center_strategy = CenterStrategy::UserProvided(centers);
+            Ok(())
+        }
+        _ => Err(BasisError::InvalidInput(format!(
+            "term '{}' does not support spatial center planning",
+            term.name
+        ))),
+    }
+}
+
+fn standardized_spatial_term_data(
+    data: ArrayView2<'_, f64>,
+    term: &SmoothTermSpec,
+) -> Result<Array2<f64>, BasisError> {
+    let (feature_cols, input_scales) = match &term.basis {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols,
+            input_scales,
+            ..
+        }
+        | SmoothBasisSpec::Matern {
+            feature_cols,
+            input_scales,
+            ..
+        }
+        | SmoothBasisSpec::Duchon {
+            feature_cols,
+            input_scales,
+            ..
+        } => (feature_cols, input_scales.as_ref()),
+        _ => {
+            return Err(BasisError::InvalidInput(format!(
+                "term '{}' is not a spatial smooth",
+                term.name
+            )));
+        }
+    };
+    let mut x = select_columns(data, feature_cols)?;
+    if let Some(scales) = input_scales {
+        apply_input_standardization(&mut x, scales);
+    } else if let Some(scales) = compute_spatial_input_scales(x.view()) {
+        apply_input_standardization(&mut x, &scales);
+    }
+    Ok(x)
+}
+
+fn plan_joint_spatial_centers_for_term_blocks(
+    data: ArrayView2<'_, f64>,
+    term_blocks: &[Vec<SmoothTermSpec>],
+) -> Result<Vec<Vec<SmoothTermSpec>>, BasisError> {
+    let mut planned_blocks = term_blocks.to_vec();
+    let n = data.nrows();
+    let mut groups: BTreeMap<JointSpatialCenterGroupKey, Vec<(usize, usize)>> = BTreeMap::new();
+
+    for (block_idx, terms) in planned_blocks.iter().enumerate() {
+        for (term_idx, term) in terms.iter().enumerate() {
+            let Some(strategy) = spatial_term_center_strategy(term) else {
+                continue;
+            };
+            if !center_strategy_is_auto(strategy) {
+                continue;
+            }
+            let Some(group_key) = spatial_term_group_key(term) else {
+                continue;
+            };
+            if !matches!(
+                group_key.strategy_kind,
+                CenterStrategyKind::EqualMass
+                    | CenterStrategyKind::EqualMassCovarRepresentative
+                    | CenterStrategyKind::FarthestPoint
+                    | CenterStrategyKind::KMeans
+            ) {
+                continue;
+            }
+            if center_strategy_num_centers(strategy).is_none() {
+                continue;
+            }
+            groups
+                .entry(group_key)
+                .or_default()
+                .push((block_idx, term_idx));
+        }
+    }
+
+    for (group_key, members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let budget = default_num_centers(n, group_key.feature_cols.len());
+        let min_required = members
+            .iter()
+            .map(|&(block_idx, term_idx)| {
+                spatial_term_min_center_count(&planned_blocks[block_idx][term_idx])
+            })
+            .max()
+            .unwrap_or(1);
+        let joint_centers = budget
+            .div_ceil(members.len())
+            .max(min_required)
+            .min(n.max(1));
+        let (first_block_idx, first_term_idx) = members[0];
+        let prototype = &planned_blocks[first_block_idx][first_term_idx];
+        let standardized = standardized_spatial_term_data(data, prototype)?;
+        let strategy = spatial_term_center_strategy(prototype).ok_or_else(|| {
+            BasisError::InvalidInput(format!(
+                "term '{}' lost its spatial center strategy during joint planning",
+                prototype.name
+            ))
+        })?;
+        let joint_strategy = center_strategy_with_num_centers(strategy, joint_centers)?;
+        let shared_centers = select_centers_by_strategy(standardized.view(), &joint_strategy)?;
+        log::info!(
+            "sharing {} spatial centers across {} smooth terms over columns {:?} (joint budget from {} centers)",
+            shared_centers.nrows(),
+            members.len(),
+            group_key.feature_cols,
+            budget,
+        );
+        for (block_idx, term_idx) in members {
+            set_spatial_term_centers(
+                &mut planned_blocks[block_idx][term_idx],
+                shared_centers.clone(),
+            )?;
+        }
+    }
+
+    Ok(planned_blocks)
+}
+
 impl LinearFitConditioning {
     fn from_columns(design: &TermCollectionDesign, selected_cols: &[usize]) -> Self {
         const SCALE_EPS: f64 = 1e-12;
@@ -2322,6 +2538,12 @@ pub fn build_smooth_design_withworkspace(
     terms: &[SmoothTermSpec],
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<RawSmoothDesign, BasisError> {
+    let mut planned_blocks = plan_joint_spatial_centers_for_term_blocks(data, &[terms.to_vec()])?;
+    let planned_terms = planned_blocks.pop().ok_or_else(|| {
+        BasisError::InvalidInput(
+            "joint spatial center planner returned no smooth blocks".to_string(),
+        )
+    })?;
     let mut local_designs = Vec::<DesignMatrix>::with_capacity(terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(terms.len());
@@ -2335,7 +2557,7 @@ pub fn build_smooth_design_withworkspace(
     let mut local_kronecker_factored =
         Vec::<Option<KroneckerFactoredBasis>>::with_capacity(terms.len());
 
-    for term in terms {
+    for term in &planned_terms {
         if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
             return Err(BasisError::InvalidInput(format!(
                 "ShapeConstraint::{:?} is unsupported for term '{}'",
@@ -2740,7 +2962,7 @@ pub fn build_smooth_design_withworkspace(
     })
 }
 
-pub fn build_term_collection_design(
+fn build_term_collection_design_inner(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
 ) -> Result<TermCollectionDesign, BasisError> {
@@ -3053,6 +3275,41 @@ pub fn build_term_collection_design(
         random_effect_levels,
         smooth,
     })
+}
+
+pub fn build_term_collection_design(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+) -> Result<TermCollectionDesign, BasisError> {
+    let mut planned_specs =
+        plan_joint_spatial_centers_for_term_blocks(data, &[spec.smooth_terms.clone()])?;
+    let planned_smooth_terms = planned_specs.pop().ok_or_else(|| {
+        BasisError::InvalidInput(
+            "joint spatial center planner returned no smooth terms for single-spec build"
+                .to_string(),
+        )
+    })?;
+    let mut planned_spec = spec.clone();
+    planned_spec.smooth_terms = planned_smooth_terms;
+    build_term_collection_design_inner(data, &planned_spec)
+}
+
+pub fn build_term_collection_designs_joint(
+    data: ArrayView2<'_, f64>,
+    specs: &[TermCollectionSpec],
+) -> Result<Vec<TermCollectionDesign>, BasisError> {
+    let smooth_blocks = specs
+        .iter()
+        .map(|spec| spec.smooth_terms.clone())
+        .collect::<Vec<_>>();
+    let planned_blocks = plan_joint_spatial_centers_for_term_blocks(data, &smooth_blocks)?;
+    let mut out = Vec::with_capacity(specs.len());
+    for (spec, planned_terms) in specs.iter().zip(planned_blocks.into_iter()) {
+        let mut planned_spec = spec.clone();
+        planned_spec.smooth_terms = planned_terms;
+        out.push(build_term_collection_design_inner(data, &planned_spec)?);
+    }
+    Ok(out)
 }
 
 fn apply_spatial_orthogonality_to_parametric(
@@ -10339,21 +10596,18 @@ where
     // -----------------------------------------------------------------------
     if !kappa_options.enabled || log_kappa_dim == 0 {
         let mut resolved_specs = Vec::with_capacity(n_blocks);
-        let mut designs = Vec::with_capacity(n_blocks);
-        for (blk_idx, spec) in block_specs.iter().enumerate() {
-            let design = build_term_collection_design(data, spec).map_err(|e| {
+        let designs = build_term_collection_designs_joint(data, block_specs).map_err(|e| {
+            format!(
+                "failed to build joint block designs during exact joint kappa optimization: {e}"
+            )
+        })?;
+        for (blk_idx, (spec, design)) in block_specs.iter().zip(designs.iter()).enumerate() {
+            let resolved = freeze_term_collection_from_design(spec, design).map_err(|e| {
                 format!(
-                    "failed to build block-{blk_idx} design during exact joint kappa optimization: {e}"
+                    "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
                 )
             })?;
-            let resolved = freeze_term_collection_from_design(spec, &design)
-                .map_err(|e| {
-                    format!(
-                        "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
-                    )
-                })?;
             resolved_specs.push(resolved);
-            designs.push(design);
         }
         let rho_only = joint_setup
             .theta0()
@@ -10390,23 +10644,19 @@ where
     let all_dims = joint_setup.log_kappa_dims_per_term();
 
     // Build bootstrap designs and frozen specs for each block.
-    let mut boot_designs = Vec::with_capacity(n_blocks);
+    let boot_designs = build_term_collection_designs_joint(data, block_specs).map_err(|e| {
+        format!("failed to build joint block designs during exact joint kappa bootstrap: {e}")
+    })?;
     let mut best_specs = Vec::with_capacity(n_blocks);
     let mut total_design_cols = 0usize;
-    for (blk_idx, spec) in block_specs.iter().enumerate() {
-        let design = build_term_collection_design(data, spec).map_err(|e| {
-            format!(
-                "failed to build block-{blk_idx} design during exact joint kappa optimization: {e}"
-            )
-        })?;
-        let frozen = freeze_term_collection_from_design(spec, &design).map_err(|e| {
+    for (blk_idx, (spec, design)) in block_specs.iter().zip(boot_designs.iter()).enumerate() {
+        let frozen = freeze_term_collection_from_design(spec, design).map_err(|e| {
             format!(
                 "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
             )
         })?;
         total_design_cols += design.design.ncols();
         best_specs.push(frozen);
-        boot_designs.push(design);
     }
 
     let analytic_outer_hessian_available = analytic_joint_hessian_available

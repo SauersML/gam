@@ -11,7 +11,8 @@ use ndarray::ArrayView1;
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability,
-    ThinPlateBasisSpec, default_num_centers,
+    ThinPlateBasisSpec, auto_spatial_center_strategy, default_num_centers,
+    default_spatial_center_strategy,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
@@ -280,10 +281,15 @@ pub fn build_smooth_basis(
                 "centers",
                 heuristic_centers(ds.values.nrows(), cols.len()),
             )?;
+            let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
+                spatial_center_strategy_for_dimension(centers, cols.len())
+            } else {
+                auto_spatial_center_strategy(centers, cols.len())
+            };
             Ok(SmoothBasisSpec::ThinPlate {
                 feature_cols: cols.to_vec(),
                 spec: ThinPlateBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(centers, cols.len()),
+                    center_strategy,
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
@@ -297,6 +303,11 @@ pub fn build_smooth_basis(
                 "centers",
                 heuristic_centers(ds.values.nrows(), cols.len()),
             )?;
+            let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
+                spatial_center_strategy_for_dimension(centers, cols.len())
+            } else {
+                auto_spatial_center_strategy(centers, cols.len())
+            };
             let nu = parse_matern_nu(options.get("nu").map(String::as_str).unwrap_or("5/2"))?;
             let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
                 Some(vec![0.0; cols.len()])
@@ -306,7 +317,7 @@ pub fn build_smooth_basis(
             Ok(SmoothBasisSpec::Matern {
                 feature_cols: cols.to_vec(),
                 spec: MaternBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(centers, cols.len()),
+                    center_strategy,
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
@@ -329,6 +340,11 @@ pub fn build_smooth_basis(
                 "centers",
                 heuristic_centers(ds.values.nrows(), cols.len()),
             )?;
+            let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
+                spatial_center_strategy_for_dimension(centers, cols.len())
+            } else {
+                auto_spatial_center_strategy(centers, cols.len())
+            };
             let power = parse_duchon_power(options)?;
             let nullspace_order = parse_duchon_order(options)?;
             let length_scale = option_f64(options, "length_scale");
@@ -341,7 +357,7 @@ pub fn build_smooth_basis(
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(centers, cols.len()),
+                    center_strategy,
                     length_scale,
                     power,
                     nullspace_order,
@@ -389,11 +405,7 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
 // ---------------------------------------------------------------------------
 
 pub fn spatial_center_strategy_for_dimension(num_centers: usize, d: usize) -> CenterStrategy {
-    if d >= 4 {
-        CenterStrategy::EqualMassCovarRepresentative { num_centers }
-    } else {
-        CenterStrategy::EqualMass { num_centers }
-    }
+    default_spatial_center_strategy(num_centers, d)
 }
 
 pub fn col_minmax(col: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {
@@ -480,6 +492,16 @@ pub fn parse_countwith_basis_alias(
         ));
     }
     Ok(primary.or(basis_dim).unwrap_or(default_count))
+}
+
+fn has_explicit_countwith_basis_alias(
+    options: &BTreeMap<String, String>,
+    primarykey: &str,
+) -> bool {
+    options.contains_key(primarykey)
+        || ["k", "basis_dim", "basis-dim", "basisdim"]
+            .iter()
+            .any(|alias| options.contains_key(*alias))
 }
 
 pub fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {

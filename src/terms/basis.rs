@@ -1343,6 +1343,7 @@ impl Default for BSplineIdentifiability {
 /// Thin-plate center selection strategy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CenterStrategy {
+    Auto(Box<CenterStrategy>),
     UserProvided(Array2<f64>),
     /// Joint multidimensional equal-mass partitioning in the full smooth space.
     EqualMass {
@@ -1362,6 +1363,16 @@ pub enum CenterStrategy {
     UniformGrid {
         points_per_dim: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CenterStrategyKind {
+    UserProvided,
+    EqualMass,
+    EqualMassCovarRepresentative,
+    FarthestPoint,
+    KMeans,
+    UniformGrid,
 }
 
 /// Adaptive default center count for spatial smooths (TPS, Duchon, Matérn).
@@ -1396,6 +1407,81 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
     // penalty matrices well-conditioned relative to data.
     let small_data_cap = if n < 800 { n / 4 } else { n };
     k.min(n).min(small_data_cap)
+}
+
+pub fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
+    if d >= 4 {
+        CenterStrategy::EqualMassCovarRepresentative { num_centers }
+    } else {
+        CenterStrategy::EqualMass { num_centers }
+    }
+}
+
+pub fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
+    CenterStrategy::Auto(Box::new(default_spatial_center_strategy(num_centers, d)))
+}
+
+pub fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {
+    matches!(strategy, CenterStrategy::Auto(_))
+}
+
+fn realized_center_strategy(strategy: &CenterStrategy) -> &CenterStrategy {
+    match strategy {
+        CenterStrategy::Auto(inner) => inner.as_ref(),
+        other => other,
+    }
+}
+
+pub fn center_strategy_kind(strategy: &CenterStrategy) -> CenterStrategyKind {
+    match realized_center_strategy(strategy) {
+        CenterStrategy::UserProvided(_) => CenterStrategyKind::UserProvided,
+        CenterStrategy::EqualMass { .. } => CenterStrategyKind::EqualMass,
+        CenterStrategy::EqualMassCovarRepresentative { .. } => {
+            CenterStrategyKind::EqualMassCovarRepresentative
+        }
+        CenterStrategy::FarthestPoint { .. } => CenterStrategyKind::FarthestPoint,
+        CenterStrategy::KMeans { .. } => CenterStrategyKind::KMeans,
+        CenterStrategy::UniformGrid { .. } => CenterStrategyKind::UniformGrid,
+        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
+    }
+}
+
+pub fn center_strategy_num_centers(strategy: &CenterStrategy) -> Option<usize> {
+    match realized_center_strategy(strategy) {
+        CenterStrategy::UserProvided(centers) => Some(centers.nrows()),
+        CenterStrategy::EqualMass { num_centers }
+        | CenterStrategy::EqualMassCovarRepresentative { num_centers }
+        | CenterStrategy::FarthestPoint { num_centers }
+        | CenterStrategy::KMeans { num_centers, .. } => Some(*num_centers),
+        CenterStrategy::UniformGrid { .. } => None,
+        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
+    }
+}
+
+pub fn center_strategy_with_num_centers(
+    strategy: &CenterStrategy,
+    num_centers: usize,
+) -> Result<CenterStrategy, BasisError> {
+    validate_center_count(num_centers)?;
+    let rebuilt = match realized_center_strategy(strategy) {
+        CenterStrategy::EqualMass { .. } => CenterStrategy::EqualMass { num_centers },
+        CenterStrategy::EqualMassCovarRepresentative { .. } => {
+            CenterStrategy::EqualMassCovarRepresentative { num_centers }
+        }
+        CenterStrategy::FarthestPoint { .. } => CenterStrategy::FarthestPoint { num_centers },
+        CenterStrategy::KMeans { max_iter, .. } => CenterStrategy::KMeans {
+            num_centers,
+            max_iter: *max_iter,
+        },
+        CenterStrategy::UserProvided(_) | CenterStrategy::UniformGrid { .. } => {
+            Err(BasisError::InvalidInput(format!(
+                "cannot replace center count for {:?} strategy",
+                center_strategy_kind(strategy)
+            )))?
+        }
+        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
+    };
+    Ok(rebuilt)
 }
 
 /// Thin-plate basis configuration.
@@ -3349,11 +3435,11 @@ fn select_uniform_grid_centers(
     cartesian_grid_axes(&axes)
 }
 
-fn select_centers_by_strategy(
+pub fn select_centers_by_strategy(
     data: ArrayView2<'_, f64>,
     strategy: &CenterStrategy,
 ) -> Result<Array2<f64>, BasisError> {
-    match strategy {
+    match realized_center_strategy(strategy) {
         CenterStrategy::UserProvided(centers) => {
             if centers.ncols() != data.ncols() {
                 return Err(BasisError::DimensionMismatch(format!(
@@ -3383,6 +3469,7 @@ fn select_centers_by_strategy(
         CenterStrategy::UniformGrid { points_per_dim } => {
             select_uniform_grid_centers(data, *points_per_dim)
         }
+        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
     }
 }
 

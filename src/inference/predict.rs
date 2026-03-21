@@ -13,6 +13,7 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::InverseLink;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 /// Compute standard errors from a covariance matrix (sqrt of diagonal).
 pub fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
@@ -1039,6 +1040,8 @@ impl BernoulliMarginalSlopePredictor {
         let logslope_offset = marginal_dim;
         let score_warp_offset = logslope_offset + logslope_dim;
         let link_dev_offset = score_warp_offset + score_warp_dim;
+        let chunk_size = prediction_chunk_rows(theta.len(), 1, n);
+        let num_chunks = (n + chunk_size - 1) / chunk_size;
 
         // ── Rigid closed-form path: η = q·√(1+b²) + b·z ──────────────
         // When neither score-warp nor link-deviation is active, z passes
@@ -1052,7 +1055,6 @@ impl BernoulliMarginalSlopePredictor {
             }
 
             // Chunk Jacobian: one pass per row fills both blocks.
-            let chunk_size = prediction_chunk_rows(theta.len(), 1, n);
             let mut grad = Array2::<f64>::zeros((n, theta.len()));
             let mut start = 0usize;
             while start < n {
@@ -1110,7 +1112,126 @@ impl BernoulliMarginalSlopePredictor {
             nodes.clone()
         };
 
-        // Solve intercepts and (when gradient needed) IFT scalars in one pass.
+        // Solve intercepts and (when gradient needed) IFT scalars in chunk-parallel passes.
+        let link_dev_beta_owned = beta_link_dev.as_ref().map(|v| v.to_owned());
+        let num_nodes = warped_nodes.len();
+        struct FlexSolveChunk {
+            start: usize,
+            end: usize,
+            intercepts: Array1<f64>,
+            a_q: Option<Array1<f64>>,
+            a_b: Option<Array1<f64>>,
+            a_h: Option<Array2<f64>>,
+            a_w: Option<Array2<f64>>,
+        }
+        let solve_chunks = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| -> Result<FlexSolveChunk, EstimationError> {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(n);
+                let rows = end - start;
+                let mut intercepts = Array1::<f64>::zeros(rows);
+                let mut a_q = need_gradient.then(|| Array1::<f64>::zeros(rows));
+                let mut a_b = need_gradient.then(|| Array1::<f64>::zeros(rows));
+                let mut a_h = if need_gradient && score_warp_dim > 0 {
+                    Some(Array2::<f64>::zeros((rows, score_warp_dim)))
+                } else {
+                    None
+                };
+                let mut a_w = if need_gradient && link_dev_dim > 0 {
+                    Some(Array2::<f64>::zeros((rows, link_dev_dim)))
+                } else {
+                    None
+                };
+                let mut eta_nodes_buf = Array1::<f64>::zeros(num_nodes);
+                let mut wphi_buf = Array1::<f64>::zeros(num_nodes);
+                let mut wc1_buf = Array1::<f64>::zeros(num_nodes);
+
+                for local_row in 0..rows {
+                    let i = start + local_row;
+                    let slope = logslope_eta[i];
+                    let q = marginal_eta[i];
+                    intercepts[local_row] = self.solve_intercept_scalar_with_nodes(
+                        q,
+                        slope,
+                        &warped_nodes,
+                        &quadrature_weights,
+                        link_dev_beta_owned.as_ref(),
+                        &mut eta_nodes_buf,
+                    )?;
+
+                    if !need_gradient {
+                        continue;
+                    }
+
+                    let intercept = intercepts[local_row];
+                    for k in 0..num_nodes {
+                        eta_nodes_buf[k] = intercept + slope * warped_nodes[k];
+                    }
+
+                    let basis_for_aw = if let (Some(runtime), Some(beta_owned)) = (
+                        self.link_deviation_runtime.as_ref(),
+                        link_dev_beta_owned.as_ref(),
+                    ) {
+                        let basis = runtime
+                            .design(&eta_nodes_buf)
+                            .map_err(EstimationError::InvalidInput)?;
+                        let d1_basis = runtime
+                            .first_derivative_design(&eta_nodes_buf)
+                            .map_err(EstimationError::InvalidInput)?;
+                        for k in 0..num_nodes {
+                            let mut dev = 0.0;
+                            let mut d1_dev = 0.0;
+                            for j in 0..link_dev_dim {
+                                dev += basis[[k, j]] * beta_owned[j];
+                                d1_dev += d1_basis[[k, j]] * beta_owned[j];
+                            }
+                            let phi = crate::probability::normal_pdf(eta_nodes_buf[k] + dev);
+                            wphi_buf[k] = quadrature_weights[k] * phi;
+                            wc1_buf[k] = wphi_buf[k] * (d1_dev + 1.0);
+                        }
+                        if a_w.is_some() { Some(basis) } else { None }
+                    } else {
+                        for k in 0..num_nodes {
+                            let phi = crate::probability::normal_pdf(eta_nodes_buf[k]);
+                            wphi_buf[k] = quadrature_weights[k] * phi;
+                            wc1_buf[k] = wphi_buf[k];
+                        }
+                        None
+                    };
+
+                    let m_a = wc1_buf.sum().max(1e-12);
+                    a_q.as_mut().unwrap()[local_row] = crate::probability::normal_pdf(q) / m_a;
+                    a_b.as_mut().unwrap()[local_row] = -wc1_buf.dot(&warped_nodes) / m_a;
+
+                    if let (Some(a_h), Some(node_design)) =
+                        (a_h.as_mut(), score_warp_node_design.as_ref())
+                    {
+                        let mut a_h_row = node_design.t().dot(&wc1_buf);
+                        let factor = -slope / m_a;
+                        a_h_row.mapv_inplace(|v| v * factor);
+                        a_h.row_mut(local_row).assign(&a_h_row);
+                    }
+
+                    if let (Some(a_w), Some(basis)) = (a_w.as_mut(), basis_for_aw.as_ref()) {
+                        let mut a_w_row = basis.t().dot(&wphi_buf);
+                        a_w_row.mapv_inplace(|v| -v / m_a);
+                        a_w.row_mut(local_row).assign(&a_w_row);
+                    }
+                }
+
+                Ok(FlexSolveChunk {
+                    start,
+                    end,
+                    intercepts,
+                    a_q,
+                    a_b,
+                    a_h,
+                    a_w,
+                })
+            })
+            .collect::<Vec<_>>();
+
         let mut intercepts = Array1::<f64>::zeros(n);
         let mut a_q_vec = need_gradient.then(|| Array1::<f64>::zeros(n));
         let mut a_b_vec = need_gradient.then(|| Array1::<f64>::zeros(n));
@@ -1125,91 +1246,30 @@ impl BernoulliMarginalSlopePredictor {
             None
         };
 
-        // Pre-compute owned beta_w once so the IFT body never clones per row.
-        let link_dev_beta_owned = beta_link_dev.as_ref().map(|v| v.to_owned());
-        // Scratch buffers reused across rows (num_nodes ≈ 20).
-        let num_nodes = warped_nodes.len();
-        let mut eta_nodes_buf = Array1::<f64>::zeros(num_nodes);
-        let mut wphi_buf = Array1::<f64>::zeros(num_nodes);
-        let mut wc1_buf = Array1::<f64>::zeros(num_nodes);
-
-        for i in 0..n {
-            let slope = logslope_eta[i];
-            let q = marginal_eta[i];
-            intercepts[i] = self.solve_intercept_scalar_with_nodes(
-                q,
-                slope,
-                &warped_nodes,
-                &quadrature_weights,
-                link_dev_beta_owned.as_ref(),
-                &mut eta_nodes_buf,
-            )?;
-
-            if !need_gradient {
-                continue;
+        for solve_chunk in solve_chunks {
+            let chunk = solve_chunk?;
+            intercepts
+                .slice_mut(ndarray::s![chunk.start..chunk.end])
+                .assign(&chunk.intercepts);
+            if let (Some(target), Some(source)) = (a_q_vec.as_mut(), chunk.a_q.as_ref()) {
+                target
+                    .slice_mut(ndarray::s![chunk.start..chunk.end])
+                    .assign(source);
             }
-
-            // Fill eta_nodes scratch from converged intercept (no allocation).
-            let intercept = intercepts[i];
-            for k in 0..num_nodes {
-                eta_nodes_buf[k] = intercept + slope * warped_nodes[k];
+            if let (Some(target), Some(source)) = (a_b_vec.as_mut(), chunk.a_b.as_ref()) {
+                target
+                    .slice_mut(ndarray::s![chunk.start..chunk.end])
+                    .assign(source);
             }
-
-            // Inline link_values + link_derivative to compute wphi/wc1 in-place,
-            // and keep the basis matrix for a_w without a redundant design() call.
-            let basis_for_aw = if let (Some(runtime), Some(beta_owned)) = (
-                self.link_deviation_runtime.as_ref(),
-                link_dev_beta_owned.as_ref(),
-            ) {
-                let basis = runtime
-                    .design(&eta_nodes_buf)
-                    .map_err(EstimationError::InvalidInput)?;
-                let d1_basis = runtime
-                    .first_derivative_design(&eta_nodes_buf)
-                    .map_err(EstimationError::InvalidInput)?;
-                for k in 0..num_nodes {
-                    let mut dev = 0.0;
-                    let mut d1_dev = 0.0;
-                    for j in 0..link_dev_dim {
-                        dev += basis[[k, j]] * beta_owned[j];
-                        d1_dev += d1_basis[[k, j]] * beta_owned[j];
-                    }
-                    let phi = crate::probability::normal_pdf(eta_nodes_buf[k] + dev);
-                    wphi_buf[k] = quadrature_weights[k] * phi;
-                    wc1_buf[k] = wphi_buf[k] * (d1_dev + 1.0);
-                }
-                if a_w_rows.is_some() {
-                    Some(basis)
-                } else {
-                    None
-                }
-            } else {
-                // Identity link: linked = eta, c'= 1.
-                for k in 0..num_nodes {
-                    let phi = crate::probability::normal_pdf(eta_nodes_buf[k]);
-                    wphi_buf[k] = quadrature_weights[k] * phi;
-                    wc1_buf[k] = wphi_buf[k];
-                }
-                None
-            };
-
-            let m_a = wc1_buf.sum().max(1e-12);
-            a_q_vec.as_mut().unwrap()[i] = crate::probability::normal_pdf(q) / m_a;
-            a_b_vec.as_mut().unwrap()[i] = -wc1_buf.dot(&warped_nodes) / m_a;
-
-            if let (Some(a_h_rows), Some(node_design)) =
-                (a_h_rows.as_mut(), score_warp_node_design.as_ref())
-            {
-                let mut a_h = node_design.t().dot(&wc1_buf);
-                let factor = -slope / m_a;
-                a_h.mapv_inplace(|v| v * factor);
-                a_h_rows.row_mut(i).assign(&a_h);
+            if let (Some(target), Some(source)) = (a_h_rows.as_mut(), chunk.a_h.as_ref()) {
+                target
+                    .slice_mut(ndarray::s![chunk.start..chunk.end, ..])
+                    .assign(source);
             }
-
-            if let (Some(a_w_rows), Some(basis)) = (a_w_rows.as_mut(), basis_for_aw.as_ref()) {
-                let mut a_w = basis.t().dot(&wphi_buf);
-                a_w.mapv_inplace(|v| -v / m_a);
-                a_w_rows.row_mut(i).assign(&a_w);
+            if let (Some(target), Some(source)) = (a_w_rows.as_mut(), chunk.a_w.as_ref()) {
+                target
+                    .slice_mut(ndarray::s![chunk.start..chunk.end, ..])
+                    .assign(source);
             }
         }
 
@@ -1250,64 +1310,72 @@ impl BernoulliMarginalSlopePredictor {
         let a_b_vec = a_b_vec.unwrap();
 
         // Emit chunk Jacobians using precomputed scalars.
-        let chunk_size = prediction_chunk_rows(theta.len(), 1, n);
+        struct FlexGradientChunk {
+            start: usize,
+            end: usize,
+            grad: Array2<f64>,
+        }
+        let grad_chunks = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(n);
+                let mc = input.design.row_chunk(start..end);
+                let lc = design_logslope.row_chunk(start..end);
+                let rows = end - start;
+                let mut grad = Array2::<f64>::zeros((rows, theta.len()));
+
+                for li in 0..rows {
+                    let i = start + li;
+                    let mut row = grad.row_mut(li);
+
+                    let a_q = a_q_vec[i];
+                    for j in 0..marginal_dim {
+                        row[j] = a_q * mc[[li, j]];
+                    }
+
+                    let g_scale = a_b_vec[i] + warped_z[i];
+                    for j in 0..logslope_dim {
+                        row[logslope_offset + j] = g_scale * lc[[li, j]];
+                    }
+
+                    if let (Some(a_h_rows), Some(obs_design)) =
+                        (a_h_rows.as_ref(), score_warp_obs_design.as_ref())
+                    {
+                        let slope = logslope_eta[i];
+                        for j in 0..score_warp_dim {
+                            row[score_warp_offset + j] =
+                                a_h_rows[[i, j]] + slope * obs_design[[i, j]];
+                        }
+                    }
+
+                    if let Some(a_w_rows) = a_w_rows.as_ref() {
+                        for j in 0..link_dev_dim {
+                            row[link_dev_offset + j] = a_w_rows[[i, j]];
+                        }
+                    }
+
+                    if let (Some(link_c), Some(link_basis)) =
+                        (link_c_obs.as_ref(), link_basis_obs.as_ref())
+                    {
+                        let c = link_c[i];
+                        for j in 0..link_dev_offset {
+                            row[j] *= c;
+                        }
+                        for j in 0..link_dev_dim {
+                            row[link_dev_offset + j] =
+                                c * row[link_dev_offset + j] + link_basis[[i, j]];
+                        }
+                    }
+                }
+
+                FlexGradientChunk { start, end, grad }
+            })
+            .collect::<Vec<_>>();
         let mut grad = Array2::<f64>::zeros((n, theta.len()));
-        let mut start = 0usize;
-        while start < n {
-            let end = (start + chunk_size).min(n);
-            let mc = input.design.row_chunk(start..end);
-            let lc = design_logslope.row_chunk(start..end);
-            let rows = end - start;
-
-            for li in 0..rows {
-                let i = start + li;
-                let mut row = grad.row_mut(i);
-
-                // Marginal block: a_q * X_marginal_row.
-                let a_q = a_q_vec[i];
-                for j in 0..marginal_dim {
-                    row[j] = a_q * mc[[li, j]];
-                }
-
-                // Logslope block: (a_b + z_w) * X_logslope_row.
-                let g_scale = a_b_vec[i] + warped_z[i];
-                for j in 0..logslope_dim {
-                    row[logslope_offset + j] = g_scale * lc[[li, j]];
-                }
-
-                // Score-warp block.
-                if let (Some(a_h_rows), Some(obs_design)) =
-                    (a_h_rows.as_ref(), score_warp_obs_design.as_ref())
-                {
-                    let slope = logslope_eta[i];
-                    for j in 0..score_warp_dim {
-                        row[score_warp_offset + j] = a_h_rows[[i, j]] + slope * obs_design[[i, j]];
-                    }
-                }
-
-                // Link-deviation block.
-                if let Some(a_w_rows) = a_w_rows.as_ref() {
-                    for j in 0..link_dev_dim {
-                        row[link_dev_offset + j] = a_w_rows[[i, j]];
-                    }
-                }
-
-                // Apply link deviation chain rule to entire row.
-                if let (Some(link_c), Some(link_basis)) =
-                    (link_c_obs.as_ref(), link_basis_obs.as_ref())
-                {
-                    let c = link_c[i];
-                    for j in 0..link_dev_offset {
-                        row[j] *= c;
-                    }
-                    for j in 0..link_dev_dim {
-                        row[link_dev_offset + j] =
-                            c * row[link_dev_offset + j] + link_basis[[i, j]];
-                    }
-                }
-            }
-
-            start = end;
+        for chunk in grad_chunks {
+            grad.slice_mut(ndarray::s![chunk.start..chunk.end, ..])
+                .assign(&chunk.grad);
         }
         Ok((final_eta, Some(grad)))
     }
