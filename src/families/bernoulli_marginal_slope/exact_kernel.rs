@@ -1,3 +1,9 @@
+use crate::probability::normal_cdf;
+
+// Internal exact de-nested cubic cell kernel for Bernoulli marginal-slope.
+// This is shared by fit-time family code and saved-model prediction, but it is
+// not a standalone family surface and should not be part of the public crate API.
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LocalSpanCubic {
     pub left: f64,
@@ -70,23 +76,6 @@ pub struct DenestedPartitionCell {
 }
 
 impl DenestedPartitionCell {
-    #[inline]
-    pub fn eta(self, z: f64) -> f64 {
-        self.cell.eta(z)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AffineAnchorMoments {
-    pub alpha: f64,
-    pub beta: f64,
-    pub left: f64,
-    pub right: f64,
-    pub m0: f64,
-    pub m1: f64,
-    pub m2: f64,
-    pub m3: f64,
-    pub m4: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,6 +234,7 @@ pub fn reduce_sextic_moments(
     Ok(moments)
 }
 
+#[cfg(test)]
 #[inline]
 pub fn polynomial_value(coefficients: &[f64], z: f64) -> f64 {
     coefficients
@@ -448,6 +438,7 @@ pub fn link_basis_cell_coefficient_partials(
     (dc_da, dc_db)
 }
 
+#[cfg(test)]
 #[inline]
 pub fn link_basis_cell_second_partials(
     link_basis_span: LocalSpanCubic,
@@ -542,6 +533,12 @@ pub fn normalized_non_affine_coefficients(
             "normalized cubic coefficients require a positive finite cell width, got left={left}, right={right}"
         ));
     }
+    let anchor_scale = c0.abs() + c1.abs();
+    if !anchor_scale.is_finite() {
+        return Err(format!(
+            "normalized cubic coefficients require finite affine coefficients, got c0={c0}, c1={c1}"
+        ));
+    }
     let mid = 0.5 * (left + right);
     let half = 0.5 * width;
     let k2 = half * half * (c2 + 3.0 * c3 * mid);
@@ -609,79 +606,6 @@ fn exp_neg_half_square(x: f64) -> f64 {
     } else {
         (-0.5 * x * x).exp()
     }
-}
-
-fn adaptive_simpson<F>(f: &F, left: f64, right: f64, abs_tol: f64, rel_tol: f64) -> f64
-where
-    F: Fn(f64) -> f64,
-{
-    fn simpson<F>(f: &F, a: f64, b: f64) -> (f64, f64, f64, f64, f64)
-    where
-        F: Fn(f64) -> f64,
-    {
-        let m = 0.5 * (a + b);
-        let fa = f(a);
-        let fm = f(m);
-        let fb = f(b);
-        let s = (b - a) * (fa + 4.0 * fm + fb) / 6.0;
-        (s, fa, fm, fb, m)
-    }
-
-    fn recurse<F>(
-        f: &F,
-        a: f64,
-        b: f64,
-        abs_tol: f64,
-        rel_tol: f64,
-        whole: f64,
-        fa: f64,
-        fm: f64,
-        fb: f64,
-        depth: usize,
-    ) -> f64
-    where
-        F: Fn(f64) -> f64,
-    {
-        let m = 0.5 * (a + b);
-        let lm = 0.5 * (a + m);
-        let rm = 0.5 * (m + b);
-        let flm = f(lm);
-        let frm = f(rm);
-        let left = (m - a) * (fa + 4.0 * flm + fm) / 6.0;
-        let right = (b - m) * (fm + 4.0 * frm + fb) / 6.0;
-        let refined = left + right;
-        let err = (refined - whole).abs();
-        let tol = abs_tol.max(rel_tol * refined.abs());
-        if depth >= 20 || err <= 15.0 * tol {
-            return refined + (refined - whole) / 15.0;
-        }
-        recurse(
-            f,
-            a,
-            m,
-            0.5 * abs_tol,
-            rel_tol,
-            left,
-            fa,
-            flm,
-            fm,
-            depth + 1,
-        ) + recurse(
-            f,
-            m,
-            b,
-            0.5 * abs_tol,
-            rel_tol,
-            right,
-            fm,
-            frm,
-            fb,
-            depth + 1,
-        )
-    }
-
-    let (whole, fa, fm, fb, _) = simpson(f, left, right);
-    recurse(f, left, right, abs_tol, rel_tol, whole, fa, fm, fb, 0)
 }
 
 fn truncated_gaussian_moment_raw(a: f64, b: f64, order: usize) -> f64 {
@@ -756,21 +680,6 @@ pub fn affine_anchor_moment_vector(
     out
 }
 
-pub fn affine_anchor_moments(alpha: f64, beta: f64, left: f64, right: f64) -> AffineAnchorMoments {
-    let m = affine_anchor_moment_vector(alpha, beta, left, right, 4);
-    AffineAnchorMoments {
-        alpha,
-        beta,
-        left,
-        right,
-        m0: m[0],
-        m1: m[1],
-        m2: m[2],
-        m3: m[3],
-        m4: m[4],
-    }
-}
-
 pub fn evaluate_affine_cell_state(
     cell: DenestedCubicCell,
     max_degree: usize,
@@ -791,11 +700,309 @@ pub fn evaluate_affine_cell_state(
     })
 }
 
-/// Transitional cell evaluator.
+#[derive(Clone, Debug)]
+struct TransportCellState {
+    lambda: f64,
+    cell: DenestedCubicCell,
+    value: f64,
+    basis_moments: Vec<f64>,
+}
+
+#[inline]
+fn factorial(n: usize) -> f64 {
+    (1..=n).fold(1.0, |acc, k| acc * k as f64)
+}
+
+fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0; lhs.len() + rhs.len() - 1];
+    for (i, &lv) in lhs.iter().enumerate() {
+        for (j, &rv) in rhs.iter().enumerate() {
+            out[i + j] += lv * rv;
+        }
+    }
+    out
+}
+
+fn build_transport_series_polynomials(
+    current: DenestedCubicCell,
+    delta_c2: f64,
+    delta_c3: f64,
+    order: usize,
+) -> Vec<Vec<f64>> {
+    let eta = [current.c0, current.c1, current.c2, current.c3];
+    let delta = [0.0, 0.0, delta_c2, delta_c3];
+    let a_poly = poly_mul(&eta, &delta);
+    let b_poly = poly_mul(&delta, &delta);
+
+    let mut a_powers = Vec::with_capacity(order + 1);
+    a_powers.push(vec![1.0]);
+    for p in 1..=order {
+        a_powers.push(poly_mul(&a_powers[p - 1], &a_poly));
+    }
+
+    let max_q = order / 2;
+    let mut b_powers = Vec::with_capacity(max_q + 1);
+    b_powers.push(vec![1.0]);
+    for q in 1..=max_q {
+        b_powers.push(poly_mul(&b_powers[q - 1], &b_poly));
+    }
+
+    let mut coeffs = Vec::with_capacity(order + 1);
+    coeffs.push(vec![1.0]);
+    for m in 1..=order {
+        let mut poly = vec![0.0; 6 * m + 1];
+        for q in 0..=m / 2 {
+            let p = m - 2 * q;
+            let term = poly_mul(&a_powers[p], &b_powers[q]);
+            let sign = if (p + q) % 2 == 0 { 1.0 } else { -1.0 };
+            let scale = sign / (factorial(p) * factorial(q) * 2.0_f64.powi(q as i32));
+            for (idx, value) in term.iter().enumerate() {
+                poly[idx] += scale * value;
+            }
+        }
+        coeffs.push(poly);
+    }
+    coeffs
+}
+
+fn non_affine_required_degree(branch: ExactCellBranch, order: usize) -> usize {
+    let basis_max = match branch {
+        ExactCellBranch::Quartic => 2,
+        ExactCellBranch::Sextic => 4,
+        ExactCellBranch::Affine => 4,
+    };
+    basis_max.max(3) + 6 * order
+}
+
+fn reduced_moments_from_basis(
+    cell: DenestedCubicCell,
+    branch: ExactCellBranch,
+    basis_moments: &[f64],
+    max_degree: usize,
+) -> Result<Vec<f64>, String> {
+    match branch {
+        ExactCellBranch::Affine => Ok(affine_anchor_moment_vector(
+            cell.c0, cell.c1, cell.left, cell.right, max_degree,
+        )),
+        ExactCellBranch::Quartic => {
+            if basis_moments.len() < 3 {
+                return Err("quartic transported state is missing M0..M2".to_string());
+            }
+            reduce_quartic_moments(
+                cell,
+                [basis_moments[0], basis_moments[1], basis_moments[2]],
+                max_degree,
+            )
+        }
+        ExactCellBranch::Sextic => {
+            if basis_moments.len() < 5 {
+                return Err("sextic transported state is missing M0..M4".to_string());
+            }
+            reduce_sextic_moments(
+                cell,
+                [
+                    basis_moments[0],
+                    basis_moments[1],
+                    basis_moments[2],
+                    basis_moments[3],
+                    basis_moments[4],
+                ],
+                max_degree,
+            )
+        }
+    }
+}
+
+fn evaluate_non_affine_transport_step(
+    state: &TransportCellState,
+    target_branch: ExactCellBranch,
+    delta_c2: f64,
+    delta_c3: f64,
+    step: f64,
+    order: usize,
+    abs_tol: f64,
+    rel_tol: f64,
+) -> Result<Option<TransportCellState>, String> {
+    let required_degree = non_affine_required_degree(target_branch, order);
+    let current_full = if state.lambda == 0.0 {
+        affine_anchor_moment_vector(
+            state.cell.c0,
+            state.cell.c1,
+            state.cell.left,
+            state.cell.right,
+            required_degree,
+        )
+    } else {
+        reduced_moments_from_basis(state.cell, target_branch, &state.basis_moments, required_degree)?
+    };
+    let basis_len = match target_branch {
+        ExactCellBranch::Quartic => 3,
+        ExactCellBranch::Sextic => 5,
+        ExactCellBranch::Affine => 5,
+    };
+    let n_eval = basis_len.max(4);
+    let transport_polys =
+        build_transport_series_polynomials(state.cell, delta_c2, delta_c3, order);
+    let mut moment_series = vec![vec![0.0; order + 1]; n_eval];
+    for n in 0..n_eval {
+        for m in 0..=order {
+            let poly = &transport_polys[m];
+            let mut coeff = 0.0;
+            for (deg, poly_coeff) in poly.iter().enumerate() {
+                coeff += poly_coeff * current_full[n + deg];
+            }
+            moment_series[n][m] = coeff;
+        }
+    }
+
+    let mut value_series = vec![0.0; order + 1];
+    value_series[0] = state.value;
+    for m in 0..order {
+        value_series[m + 1] =
+            (delta_c2 * moment_series[2][m] + delta_c3 * moment_series[3][m])
+                / (2.0 * std::f64::consts::PI * (m as f64 + 1.0));
+    }
+
+    let mut next_value = 0.0;
+    let mut step_pow = 1.0;
+    for coeff in &value_series {
+        next_value += coeff * step_pow;
+        step_pow *= step;
+    }
+
+    let mut next_basis = vec![0.0; basis_len];
+    for n in 0..basis_len {
+        let mut acc = 0.0;
+        let mut pow = 1.0;
+        for coeff in &moment_series[n] {
+            acc += coeff * pow;
+            pow *= step;
+        }
+        next_basis[n] = acc;
+    }
+
+    let mut err_est = 0.0_f64;
+    let mut scale = next_value.abs().max(1.0);
+    let last_pow = step.powi(order as i32);
+    let prev_pow = if order > 0 {
+        step.powi((order - 1) as i32)
+    } else {
+        1.0
+    };
+    err_est = err_est.max(value_series[order].abs() * last_pow);
+    if order > 0 {
+        err_est = err_est.max(value_series[order - 1].abs() * prev_pow);
+    }
+    for n in 0..basis_len {
+        scale = scale.max(next_basis[n].abs());
+        err_est = err_est.max(moment_series[n][order].abs() * last_pow);
+        if order > 0 {
+            err_est = err_est.max(moment_series[n][order - 1].abs() * prev_pow);
+        }
+    }
+    let tol = abs_tol.max(rel_tol * scale);
+    if err_est > tol {
+        return Ok(None);
+    }
+
+    Ok(Some(TransportCellState {
+        lambda: state.lambda + step,
+        cell: DenestedCubicCell {
+            left: state.cell.left,
+            right: state.cell.right,
+            c0: state.cell.c0,
+            c1: state.cell.c1,
+            c2: state.cell.c2 + step * delta_c2,
+            c3: state.cell.c3 + step * delta_c3,
+        },
+        value: next_value,
+        basis_moments: next_basis,
+    }))
+}
+
+fn evaluate_non_affine_cell_state(
+    cell: DenestedCubicCell,
+    branch: ExactCellBranch,
+    max_degree: usize,
+) -> Result<CellMomentState, String> {
+    let order = 10usize;
+    let abs_tol = 1e-14;
+    let rel_tol = 1e-12;
+    let affine_cell = DenestedCubicCell {
+        left: cell.left,
+        right: cell.right,
+        c0: cell.c0,
+        c1: cell.c1,
+        c2: 0.0,
+        c3: 0.0,
+    };
+    let affine_state = evaluate_affine_cell_state(
+        affine_cell,
+        match branch {
+            ExactCellBranch::Quartic => 2,
+            ExactCellBranch::Sextic => 4,
+            ExactCellBranch::Affine => max_degree,
+        },
+    )?;
+    let basis_len = match branch {
+        ExactCellBranch::Quartic => 3,
+        ExactCellBranch::Sextic => 5,
+        ExactCellBranch::Affine => affine_state.moments.len(),
+    };
+    let mut state = TransportCellState {
+        lambda: 0.0,
+        cell: affine_cell,
+        value: affine_state.value,
+        basis_moments: affine_state.moments[..basis_len].to_vec(),
+    };
+
+    let delta_c2 = cell.c2;
+    let delta_c3 = cell.c3;
+    let mut step = 1.0f64;
+    while state.lambda < 1.0 - 1e-15 {
+        let remaining = 1.0 - state.lambda;
+        let trial = step.min(remaining);
+        match evaluate_non_affine_transport_step(
+            &state,
+            branch,
+            delta_c2,
+            delta_c3,
+            trial,
+            order,
+            abs_tol,
+            rel_tol,
+        )? {
+            Some(next_state) => {
+                state = next_state;
+                if state.lambda < 1.0 - 1e-15 {
+                    step = (trial * 2.0).min(1.0 - state.lambda);
+                }
+            }
+            None => {
+                if trial <= 2.0_f64.powi(-24) {
+                    return Err(format!(
+                        "non-affine transported cell failed to satisfy Taylor tolerance on [{:.6}, {:.6}] with c2={:.6e}, c3={:.6e}",
+                        cell.left, cell.right, cell.c2, cell.c3
+                    ));
+                }
+                step = trial * 0.5;
+            }
+        }
+    }
+
+    let moments = reduced_moments_from_basis(cell, branch, &state.basis_moments, max_degree)?;
+    Ok(CellMomentState {
+        branch,
+        value: state.value,
+        moments,
+    })
+}
+
+/// Exact de-nested cubic cell evaluator.
 ///
-/// Affine cells are evaluated from the closed-form affine anchor. Quartic and
-/// sextic cells still use the numeric reference path until the transported
-/// moment kernel replaces them.
+/// Affine cells use the closed-form affine anchor. Quartic and sextic cells
+/// are transported from that anchor in the non-affine coefficients `(c2,c3)`
+/// with an adaptive Taylor integrator over the homotopy parameter.
 pub fn evaluate_cell_moments(
     cell: DenestedCubicCell,
     max_degree: usize,
@@ -810,94 +1017,13 @@ pub fn evaluate_cell_moments(
     if branch == ExactCellBranch::Affine {
         return evaluate_affine_cell_state(cell, max_degree);
     }
-    let abs_tol = 1e-14;
-    let rel_tol = 1e-12;
-    let value = adaptive_simpson(
-        &|z| normal_cdf(cell.eta(z)) * normal_pdf(z),
-        cell.left,
-        cell.right,
-        abs_tol,
-        rel_tol,
-    );
-    let moments = match branch {
-        ExactCellBranch::Quartic => {
-            let base = [
-                adaptive_simpson(
-                    &|z| (-cell.q(z)).exp(),
-                    cell.left,
-                    cell.right,
-                    abs_tol,
-                    rel_tol,
-                ),
-                adaptive_simpson(
-                    &|z| z * (-cell.q(z)).exp(),
-                    cell.left,
-                    cell.right,
-                    abs_tol,
-                    rel_tol,
-                ),
-                adaptive_simpson(
-                    &|z| z * z * (-cell.q(z)).exp(),
-                    cell.left,
-                    cell.right,
-                    abs_tol,
-                    rel_tol,
-                ),
-            ];
-            reduce_quartic_moments(cell, base, max_degree)?
-        }
-        ExactCellBranch::Sextic => {
-            let base = [
-                adaptive_simpson(
-                    &|z| (-cell.q(z)).exp(),
-                    cell.left,
-                    cell.right,
-                    abs_tol,
-                    rel_tol,
-                ),
-                adaptive_simpson(
-                    &|z| z * (-cell.q(z)).exp(),
-                    cell.left,
-                    cell.right,
-                    abs_tol,
-                    rel_tol,
-                ),
-                adaptive_simpson(
-                    &|z| z * z * (-cell.q(z)).exp(),
-                    cell.left,
-                    cell.right,
-                    abs_tol,
-                    rel_tol,
-                ),
-                adaptive_simpson(
-                    &|z| z.powi(3) * (-cell.q(z)).exp(),
-                    cell.left,
-                    cell.right,
-                    abs_tol,
-                    rel_tol,
-                ),
-                adaptive_simpson(
-                    &|z| z.powi(4) * (-cell.q(z)).exp(),
-                    cell.left,
-                    cell.right,
-                    abs_tol,
-                    rel_tol,
-                ),
-            ];
-            reduce_sextic_moments(cell, base, max_degree)?
-        }
-        ExactCellBranch::Affine => unreachable!("affine branch returns early"),
-    };
-    Ok(CellMomentState {
-        branch,
-        value,
-        moments,
-    })
+    evaluate_non_affine_cell_state(cell, branch, max_degree)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probability::normal_pdf;
 
     fn simpson_integral<F>(left: f64, right: f64, steps: usize, f: F) -> f64
     where
@@ -952,9 +1078,8 @@ mod tests {
             c3: 0.0,
         };
         let state = evaluate_affine_cell_state(cell, 6).expect("affine cell");
-        let value_numeric = simpson_integral(cell.left, cell.right, 4000, |z| {
-            super::normal_cdf(cell.eta(z)) * super::normal_pdf(z)
-        });
+        let value_numeric =
+            simpson_integral(cell.left, cell.right, 4000, |z| super::normal_cdf(cell.eta(z)) * normal_pdf(z));
         assert_eq!(state.branch, ExactCellBranch::Affine);
         assert!((state.value - value_numeric).abs() < 1e-9);
         for degree in 0..=6 {
@@ -1146,25 +1271,25 @@ mod tests {
 
     #[test]
     fn affine_anchor_moments_match_whole_line_closed_forms() {
-        let out = affine_anchor_moments(0.0, 0.0, f64::NEG_INFINITY, f64::INFINITY);
+        let out = affine_anchor_moment_vector(0.0, 0.0, f64::NEG_INFINITY, f64::INFINITY, 4);
         let sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt();
-        assert!((out.m0 - sqrt_2pi).abs() < 1e-12);
-        assert!(out.m1.abs() < 1e-12);
-        assert!((out.m2 - sqrt_2pi).abs() < 1e-12);
+        assert!((out[0] - sqrt_2pi).abs() < 1e-12);
+        assert!(out[1].abs() < 1e-12);
+        assert!((out[2] - sqrt_2pi).abs() < 1e-12);
     }
 
     #[test]
     fn affine_anchor_moments_match_shifted_gaussian_whole_line() {
         let alpha = 0.7;
         let beta = -0.4;
-        let out = affine_anchor_moments(alpha, beta, f64::NEG_INFINITY, f64::INFINITY);
+        let out = affine_anchor_moment_vector(alpha, beta, f64::NEG_INFINITY, f64::INFINITY, 4);
         let s = (1.0 + beta * beta).sqrt();
         let mu = -alpha * beta / (1.0 + beta * beta);
         let scale = (-alpha * alpha / (2.0 * s * s)).exp() / s;
         let sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt();
-        assert!((out.m0 - scale * sqrt_2pi).abs() < 1e-12);
-        assert!((out.m1 - scale * sqrt_2pi * mu).abs() < 1e-12);
-        assert!((out.m2 - scale * sqrt_2pi * (mu * mu + 1.0 / (s * s))).abs() < 1e-10);
+        assert!((out[0] - scale * sqrt_2pi).abs() < 1e-12);
+        assert!((out[1] - scale * sqrt_2pi * mu).abs() < 1e-12);
+        assert!((out[2] - scale * sqrt_2pi * (mu * mu + 1.0 / (s * s))).abs() < 1e-10);
     }
 
     #[test]
@@ -1278,9 +1403,8 @@ mod tests {
             c3: -0.07,
         };
         let state = evaluate_cell_moments(cell, 6).expect("cell moments");
-        let value_numeric = simpson_integral(cell.left, cell.right, 4000, |z| {
-            super::normal_cdf(cell.eta(z)) * super::normal_pdf(z)
-        });
+        let value_numeric =
+            simpson_integral(cell.left, cell.right, 4000, |z| super::normal_cdf(cell.eta(z)) * normal_pdf(z));
         assert!((state.value - value_numeric).abs() < 1e-9);
         for degree in 0..=6 {
             let target = simpson_integral(cell.left, cell.right, 4000, |z| {
@@ -1362,4 +1486,3 @@ mod tests {
         );
     }
 }
-use crate::probability::{normal_cdf, normal_pdf};

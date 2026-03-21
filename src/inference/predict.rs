@@ -780,7 +780,7 @@ impl BernoulliMarginalSlopePredictor {
         b: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
-    ) -> Result<Vec<crate::families::bernoulli_marginal_slope_exact::DenestedPartitionCell>, EstimationError>
+    ) -> Result<Vec<crate::families::bernoulli_marginal_slope::exact_kernel::DenestedPartitionCell>, EstimationError>
     {
         let score_tail = 8.0;
         let mut score_breaks = if let Some(runtime) = self.score_warp_runtime.as_ref() {
@@ -806,7 +806,7 @@ impl BernoulliMarginalSlopePredictor {
         if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
             link_breaks.push(a + link_tail);
         }
-        crate::families::bernoulli_marginal_slope_exact::build_denested_partition_cells(
+        crate::families::bernoulli_marginal_slope::exact_kernel::build_denested_partition_cells(
             a,
             b,
             &score_breaks,
@@ -815,10 +815,10 @@ impl BernoulliMarginalSlopePredictor {
                 if let (Some(runtime), Some(beta)) = (self.score_warp_runtime.as_ref(), beta_score_warp)
                 {
                     runtime
-                        .exact_local_cubic_at(beta, z)
+                        .local_cubic_at(beta, z)
                         .map_err(|err| err)
                 } else {
-                    Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                    Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
                         left: -8.0,
                         right: 8.0,
                         c0: 0.0,
@@ -833,10 +833,10 @@ impl BernoulliMarginalSlopePredictor {
                     (self.link_deviation_runtime.as_ref(), beta_link_dev)
                 {
                     runtime
-                        .exact_local_cubic_at(beta, u)
+                        .local_cubic_at(beta, u)
                         .map_err(|err| err)
                 } else {
-                    Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                    Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
                         left: a - 8.0 * (1.0 + b.abs()),
                         right: a + 8.0 * (1.0 + b.abs()),
                         c0: 0.0,
@@ -864,12 +864,12 @@ impl BernoulliMarginalSlopePredictor {
         let mut f_aa = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
-            let state = crate::families::bernoulli_marginal_slope_exact::evaluate_cell_moments(
+            let state = crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
                 cell, 7,
             )
             .map_err(EstimationError::InvalidInput)?;
             f += state.value;
-            let (dc_da, _) = crate::families::bernoulli_marginal_slope_exact::denested_cell_coefficient_partials(
+            let (dc_da, _) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
@@ -882,12 +882,12 @@ impl BernoulliMarginalSlopePredictor {
                 0.0,
                 0.0,
             ];
-            f_a += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+            f_a += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
             )
             .map_err(EstimationError::InvalidInput)?;
-            f_aa += crate::families::bernoulli_marginal_slope_exact::cell_second_derivative_from_moments(
+            f_aa += crate::families::bernoulli_marginal_slope::exact_kernel::cell_second_derivative_from_moments(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -910,7 +910,7 @@ impl BernoulliMarginalSlopePredictor {
         if let Some(runtime) = score_warp_runtime.as_ref() {
             if runtime.kernel.is_empty()
                 || runtime.kernel
-                    == crate::families::bernoulli_marginal_slope_exact::LEGACY_ANCHORED_DEVIATION_KERNEL
+                    == crate::families::bernoulli_marginal_slope::exact_kernel::LEGACY_ANCHORED_DEVIATION_KERNEL
             {
                 return Err(
                     "bernoulli marginal-slope score-warp runtime is missing the ExactDenestedCubicV1 marker or uses legacy flexible semantics; refit the model"
@@ -918,12 +918,12 @@ impl BernoulliMarginalSlopePredictor {
                 );
             }
             if runtime.kernel
-                != crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                != crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
             {
                 return Err(format!(
                     "bernoulli marginal-slope score-warp runtime uses unsupported kernel '{}'; expected {}",
                     runtime.kernel,
-                    crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                    crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 ));
             }
             if runtime.degree != 3 {
@@ -936,7 +936,7 @@ impl BernoulliMarginalSlopePredictor {
         if let Some(runtime) = link_deviation_runtime.as_ref() {
             if runtime.kernel.is_empty()
                 || runtime.kernel
-                    == crate::families::bernoulli_marginal_slope_exact::LEGACY_ANCHORED_DEVIATION_KERNEL
+                    == crate::families::bernoulli_marginal_slope::exact_kernel::LEGACY_ANCHORED_DEVIATION_KERNEL
             {
                 return Err(
                     "bernoulli marginal-slope link-deviation runtime is missing the ExactDenestedCubicV1 marker or uses legacy flexible semantics; refit the model"
@@ -944,12 +944,12 @@ impl BernoulliMarginalSlopePredictor {
                 );
             }
             if runtime.kernel
-                != crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                != crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
             {
                 return Err(format!(
                     "bernoulli marginal-slope link-deviation runtime uses unsupported kernel '{}'; expected {}",
                     runtime.kernel,
-                    crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                    crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 ));
             }
             if runtime.degree != 3 {
@@ -1297,17 +1297,17 @@ impl BernoulliMarginalSlopePredictor {
                     for partition_cell in cells {
                         let cell = partition_cell.cell;
                         let state =
-                            crate::families::bernoulli_marginal_slope_exact::evaluate_cell_moments(
+                            crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
                                 cell, 9,
                             )
                             .map_err(EstimationError::InvalidInput)?;
-                        let (_, dc_db) = crate::families::bernoulli_marginal_slope_exact::denested_cell_coefficient_partials(
+                        let (_, dc_db) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
                             partition_cell.score_span,
                             partition_cell.link_span,
                             intercept,
                             slope,
                         );
-                        f_b += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+                        f_b += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                             &dc_db,
                             &state.moments,
                         )
@@ -1319,12 +1319,12 @@ impl BernoulliMarginalSlopePredictor {
                         {
                             for j in 0..score_warp_dim {
                                 let basis_span = runtime
-                                    .exact_basis_cubic_at(j, mid)
+                                    .basis_cubic_at(j, mid)
                                     .map_err(EstimationError::InvalidInput)?;
-                                let coeffs = crate::families::bernoulli_marginal_slope_exact::score_basis_cell_coefficients(
+                                let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
                                     basis_span, slope,
                                 );
-                                f_h_row[j] += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+                                f_h_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                                     &coeffs,
                                     &state.moments,
                                 )
@@ -1341,14 +1341,14 @@ impl BernoulliMarginalSlopePredictor {
                         {
                             for j in 0..link_dev_dim {
                                 let basis_span = runtime
-                                    .exact_basis_cubic_at(j, intercept + slope * mid)
+                                    .basis_cubic_at(j, intercept + slope * mid)
                                     .map_err(EstimationError::InvalidInput)?;
-                                let coeffs = crate::families::bernoulli_marginal_slope_exact::link_basis_cell_coefficients(
+                                let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::link_basis_cell_coefficients(
                                     basis_span,
                                     intercept,
                                     slope,
                                 );
-                                f_w_row[j] += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+                                f_w_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                                     &coeffs,
                                     &state.moments,
                                 )
@@ -3569,10 +3569,10 @@ mod tests {
             .unwrap()
             .design(&array![0.0])
             .unwrap_err();
-        assert!(err.contains("ExactDenestedCubicV1"));
+        assert!(err.contains("ExactDenestedCubic"));
 
         let cubic = SavedAnchoredDeviationRuntime {
-            kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+            kernel: crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 .to_string(),
             knots: vec![-10.0, -10.0, -10.0, -10.0, 10.0, 10.0, 10.0, 10.0],
             degree: 3,
@@ -3584,7 +3584,7 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
         let runtime = SavedAnchoredDeviationRuntime {
-            kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+            kernel: crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 .to_string(),
             knots: vec![-2.0, -2.0, -2.0, -2.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0],
             degree: 3,
@@ -3597,9 +3597,6 @@ mod tests {
             let cubic = runtime
                 .local_cubic_on_span(&beta, span_idx)
                 .expect("local cubic");
-            let exact = runtime
-                .exact_local_cubic_on_span(&beta, span_idx)
-                .expect("exact local cubic");
             let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
             let expected = runtime.design(&x_eval).expect("design").dot(&beta);
             let expected_d1 = runtime
@@ -3613,7 +3610,6 @@ mod tests {
                 let selected = runtime.local_cubic_at(&beta, x).expect("local cubic at x");
                 assert_eq!(selected.left, cubic.left);
                 assert_eq!(selected.right, cubic.right);
-                assert!((exact.evaluate(x) - expected[i]).abs() < 1e-10);
             }
         }
     }
@@ -3621,16 +3617,13 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
         let runtime = SavedAnchoredDeviationRuntime {
-            kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+            kernel: crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 .to_string(),
             knots: vec![-2.0, -2.0, -2.0, -2.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0],
             degree: 3,
             basis_dim: 3,
         };
         let cubic = runtime.basis_span_cubic(0, 1).expect("basis span cubic");
-        let exact = runtime
-            .exact_basis_span_cubic(0, 1)
-            .expect("exact basis span cubic");
         let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
         let design = runtime.design(&x_eval).expect("basis design");
         let d1 = runtime
@@ -3643,12 +3636,6 @@ mod tests {
             let selected = runtime.basis_cubic_at(1, x).expect("basis cubic at x");
             assert_eq!(selected.left, cubic.left);
             assert_eq!(selected.right, cubic.right);
-            let selected_exact = runtime
-                .exact_basis_cubic_at(1, x)
-                .expect("exact basis cubic at x");
-            assert!((exact.evaluate(x) - design[[i, 1]]).abs() < 1e-10);
-            assert_eq!(selected_exact.left, exact.left);
-            assert_eq!(selected_exact.right, exact.right);
         }
     }
 

@@ -20,7 +20,6 @@ pub use solver::{estimate, mixture_link, pirls, seeding, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
 
 pub use families::bernoulli_marginal_slope;
-pub use families::bernoulli_marginal_slope_exact;
 pub use families::custom_family;
 pub use families::gamlss;
 pub use families::survival;
