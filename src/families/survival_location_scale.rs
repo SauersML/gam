@@ -16,8 +16,8 @@ use crate::faer_ndarray::fast_xt_diag_x;
 use crate::families::bernoulli_marginal_slope::erfcx_nonnegative;
 use crate::families::gamlss::{
     SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
-    monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta,
-    select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative,
+    monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
+    validate_monotone_wiggle_beta_nonnegative,
 };
 use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
@@ -498,6 +498,32 @@ pub struct TimeBlockInput {
     pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,
     pub initial_beta: Option<Array1<f64>>,
+}
+
+pub(crate) fn time_derivative_lower_bound_constraints(
+    design_derivative_exit: &Array2<f64>,
+    derivative_offset_exit: &Array1<f64>,
+    lower_bound: f64,
+) -> Result<Option<LinearInequalityConstraints>, String> {
+    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
+        return Err(format!(
+            "time derivative constraints require matching rows/offsets: rows={}, offsets={}",
+            design_derivative_exit.nrows(),
+            derivative_offset_exit.len()
+        ));
+    }
+    if design_derivative_exit.ncols() == 0 {
+        return Ok(None);
+    }
+    if !lower_bound.is_finite() {
+        return Err(format!(
+            "time derivative lower bound must be finite, got {lower_bound}"
+        ));
+    }
+    Ok(Some(LinearInequalityConstraints {
+        a: design_derivative_exit.clone(),
+        b: derivative_offset_exit.mapv(|offset| lower_bound - offset),
+    }))
 }
 
 #[derive(Clone)]
@@ -1257,6 +1283,75 @@ impl SurvivalLocationScaleFamily {
     fn time_derivative_lower_bound(&self) -> f64 {
         assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
         self.derivative_guard
+    }
+
+    fn max_feasible_time_step(
+        &self,
+        beta: &Array1<f64>,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        let Some(constraints) = self.time_linear_constraints.as_ref() else {
+            return Ok(None);
+        };
+        if beta.len() != constraints.a.ncols() || delta.len() != constraints.a.ncols() {
+            return Err(format!(
+                "survival location-scale time-step dimension mismatch: beta={}, delta={}, expected {}",
+                beta.len(),
+                delta.len(),
+                constraints.a.ncols()
+            ));
+        }
+        let mut alpha = 1.0f64;
+        for row in 0..constraints.a.nrows() {
+            let a_row = constraints.a.row(row);
+            let slack = a_row.dot(beta) - constraints.b[row];
+            if slack < -1e-10 {
+                return Err(format!(
+                    "survival location-scale current time block violates derivative guard at row {row}: slack={slack:.3e}"
+                ));
+            }
+            let drift = a_row.dot(delta);
+            if drift < 0.0 {
+                alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
+            }
+        }
+        if alpha >= 1.0 {
+            Ok(Some(1.0))
+        } else {
+            Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
+        }
+    }
+
+    fn max_feasible_link_wiggle_step(
+        &self,
+        beta: &Array1<f64>,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        if beta.len() != delta.len() {
+            return Err(format!(
+                "survival location-scale linkwiggle-step dimension mismatch: beta={}, delta={}",
+                beta.len(),
+                delta.len()
+            ));
+        }
+        let mut alpha = 1.0f64;
+        for j in 0..beta.len() {
+            let slack = beta[j];
+            if slack < -1e-10 {
+                return Err(format!(
+                    "survival location-scale current linkwiggle block violates nonnegativity at coefficient {j}: beta={slack:.3e}"
+                ));
+            }
+            let drift = delta[j];
+            if drift < 0.0 {
+                alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
+            }
+        }
+        if alpha >= 1.0 {
+            Ok(Some(1.0))
+        } else {
+            Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
+        }
     }
 
     #[inline]
@@ -3257,7 +3352,7 @@ fn prepare_survival_location_scale_model(
     validate_survival_location_scale_spec(spec)?;
     let n = spec.event_target.len();
     let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
-    let mut time_prepared = prepare_identified_time_block(&spec.time_block)?;
+    let mut time_prepared = prepare_identified_time_block(&spec.time_block, spec.derivative_guard)?;
 
     if time_prepared.initial_beta.is_none() {
         let deriv_offset_max = spec
@@ -3788,7 +3883,10 @@ pub(crate) fn project_onto_linear_constraints(
     beta
 }
 
-fn prepare_identified_time_block(input: &TimeBlockInput) -> Result<TimeBlockPrepared, String> {
+fn prepare_identified_time_block(
+    input: &TimeBlockInput,
+    derivative_guard: f64,
+) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
     if !input.structural_monotonicity {
         return Err(
@@ -3802,7 +3900,11 @@ fn prepare_identified_time_block(input: &TimeBlockInput) -> Result<TimeBlockPrep
     let design_exit = input.design_exit.to_dense();
     let design_derivative_exit = input.design_derivative_exit.to_dense();
     let penalties = input.penalties.clone();
-    let linear_constraints = monotone_wiggle_nonnegative_constraints(p);
+    let linear_constraints = time_derivative_lower_bound_constraints(
+        &design_derivative_exit,
+        &input.derivative_offset_exit,
+        derivative_guard,
+    )?;
     let initial_beta = linear_constraints.as_ref().map(|constraints| {
         project_onto_linear_constraints(p, constraints, input.initial_beta.as_ref())
     });
@@ -8097,16 +8199,29 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         Ok(self.time_linear_constraints.clone())
     }
 
+    fn max_feasible_step_size(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        if block_idx == Self::BLOCK_TIME {
+            return self.max_feasible_time_step(&block_states[Self::BLOCK_TIME].beta, delta);
+        }
+        if block_idx == Self::BLOCK_LINK_WIGGLE {
+            return self
+                .max_feasible_link_wiggle_step(&block_states[Self::BLOCK_LINK_WIGGLE].beta, delta);
+        }
+        Ok(None)
+    }
+
     fn post_update_block_beta(
         &self,
         _: &[ParameterBlockState],
-        block_idx: usize,
+        _: usize,
         _: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        if block_idx == Self::BLOCK_TIME || block_idx == Self::BLOCK_LINK_WIGGLE {
-            return Ok(project_monotone_wiggle_beta(beta));
-        }
         Ok(beta)
     }
 }
@@ -8645,32 +8760,6 @@ mod tests {
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, array};
 
-    fn time_derivative_lower_bound_constraints(
-        design_derivative_exit: &Array2<f64>,
-        derivative_offset_exit: &Array1<f64>,
-        lower_bound: f64,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
-        if design_derivative_exit.nrows() != derivative_offset_exit.len() {
-            return Err(format!(
-                "time derivative constraints require matching rows/offsets: rows={}, offsets={}",
-                design_derivative_exit.nrows(),
-                derivative_offset_exit.len()
-            ));
-        }
-        if design_derivative_exit.ncols() == 0 {
-            return Ok(None);
-        }
-        if !lower_bound.is_finite() {
-            return Err(format!(
-                "time derivative lower bound must be finite, got {lower_bound}"
-            ));
-        }
-        Ok(Some(LinearInequalityConstraints {
-            a: design_derivative_exit.clone(),
-            b: derivative_offset_exit.mapv(|offset| lower_bound - offset),
-        }))
-    }
-
     fn sparse_design_from_dense(dense: &Array2<f64>) -> DesignMatrix {
         let mut triplets = Vec::new();
         for i in 0..dense.nrows() {
@@ -8758,7 +8847,7 @@ mod tests {
     }
 
     #[test]
-    fn time_block_post_update_projects_negative_coefficients() {
+    fn time_block_post_update_leaves_beta_unchanged() {
         let family = survival_exact_newton_test_family();
         let spec = ParameterBlockSpec {
             name: "time_transform".to_string(),
@@ -8769,15 +8858,135 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
         };
-        let projected = family
+        let returned = family
             .post_update_block_beta(
-                &[],
+                &[ParameterBlockState {
+                    beta: array![0.0, 0.0],
+                    eta: array![0.0, 0.0, 0.0],
+                }],
                 SurvivalLocationScaleFamily::BLOCK_TIME,
                 &spec,
                 array![-2.0, 0.5],
             )
-            .expect("project time beta");
-        assert_eq!(projected, array![0.0, 0.5]);
+            .expect("return time beta");
+        assert_eq!(returned, array![-2.0, 0.5]);
+    }
+
+    #[test]
+    fn time_block_feasible_step_stays_inside_derivative_guard() {
+        let family = survival_exact_newton_test_family();
+        let states = vec![
+            ParameterBlockState {
+                beta: array![0.1],
+                eta: array![0.0, 0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0, 0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0, 0.0, 0.0],
+            },
+        ];
+        let alpha = family
+            .max_feasible_step_size(&states, SurvivalLocationScaleFamily::BLOCK_TIME, &array![-2.0])
+            .expect("time step ceiling")
+            .expect("time step should be bounded");
+        assert!(alpha > 0.0 && alpha < 1.0);
+        let feasible = states[0].beta[0] + alpha * -2.0;
+        let constraints = family.time_linear_constraints.as_ref().expect("constraints");
+        let slack = constraints.a[[0, 0]] * feasible - constraints.b[0];
+        assert!(slack >= 0.0);
+    }
+
+    #[test]
+    fn linkwiggle_block_post_update_leaves_beta_unchanged() {
+        let mut family = survival_exact_newton_test_family();
+        family.x_link_wiggle = Some(DesignMatrix::Dense(DenseDesignMatrix::from(array![
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0]
+        ])));
+        family.wiggle_knots = Some(array![-2.0, -2.0, -2.0, -2.0, 2.0, 2.0, 2.0, 2.0]);
+        family.wiggle_degree = Some(3);
+        let spec = ParameterBlockSpec {
+            name: "linkwiggle".to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, 2)))),
+            offset: Array1::zeros(1),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let returned = family
+            .post_update_block_beta(
+                &[
+                    ParameterBlockState {
+                        beta: array![0.0],
+                        eta: array![0.0, 0.0, 0.0],
+                    },
+                    ParameterBlockState {
+                        beta: array![0.0],
+                        eta: array![0.0, 0.0, 0.0],
+                    },
+                    ParameterBlockState {
+                        beta: array![0.0],
+                        eta: array![0.0, 0.0, 0.0],
+                    },
+                    ParameterBlockState {
+                        beta: array![0.1, 0.2],
+                        eta: array![0.0, 0.0, 0.0],
+                    },
+                ],
+                SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE,
+                &spec,
+                array![0.3, 0.0],
+            )
+            .expect("return linkwiggle beta");
+        assert_eq!(returned, array![0.3, 0.0]);
+    }
+
+    #[test]
+    fn linkwiggle_block_feasible_step_stays_nonnegative() {
+        let mut family = survival_exact_newton_test_family();
+        family.x_link_wiggle = Some(DesignMatrix::Dense(DenseDesignMatrix::from(array![
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0]
+        ])));
+        family.wiggle_knots = Some(array![-2.0, -2.0, -2.0, -2.0, 2.0, 2.0, 2.0, 2.0]);
+        family.wiggle_degree = Some(3);
+        let states = vec![
+            ParameterBlockState {
+                beta: array![0.1],
+                eta: array![0.0, 0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0, 0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0, 0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.2, 0.4],
+                eta: array![0.0, 0.0, 0.0],
+            },
+        ];
+        let alpha = family
+            .max_feasible_step_size(
+                &states,
+                SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE,
+                &array![-1.0, -0.1],
+            )
+            .expect("linkwiggle step ceiling")
+            .expect("linkwiggle step should be bounded");
+        assert!(alpha > 0.0 && alpha < 1.0);
+        let feasible = &states[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE].beta
+            + &(array![-1.0, -0.1] * alpha);
+        assert!(feasible.iter().all(|&value| value >= 0.0));
     }
 
     fn survival_exact_newton_test_familywith_inverse_link(
@@ -9012,7 +9221,8 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(&time_block).expect("prepare time block");
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
@@ -9037,7 +9247,8 @@ mod tests {
             initial_beta: None,
         };
 
-        let prepared = prepare_identified_time_block(&time_block).expect("prepare time block");
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
         let p = time_block.design_entry.ncols();
 
         assert_eq!(
@@ -9064,7 +9275,8 @@ mod tests {
     }
 
     #[test]
-    fn identified_time_block_uses_nonnegative_time_constraints() {
+    fn identified_time_block_uses_derivative_lower_bound_constraints() {
+        let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
             design_entry: DesignMatrix::from(array![
                 [1.0, 0.0, 0.2],
@@ -9076,11 +9288,7 @@ mod tests {
                 [1.0, 1.5, 0.8],
                 [1.0, 2.5, 1.4]
             ]),
-            design_derivative_exit: DesignMatrix::from(array![
-                [0.0, 1.0, 0.2],
-                [0.0, 1.0, 0.3],
-                [0.0, 1.0, 0.4]
-            ]),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
             derivative_offset_exit: Array1::zeros(3),
@@ -9090,18 +9298,13 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(&time_block).expect("prepare time block");
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
         let constraints = prepared
             .linear_constraints
             .expect("time derivative constraints");
-        assert_eq!(
-            constraints.a,
-            Array2::<f64>::eye(time_block.design_exit.ncols())
-        );
-        assert_eq!(
-            constraints.b,
-            Array1::<f64>::zeros(time_block.design_exit.ncols())
-        );
+        assert_eq!(constraints.a, design_derivative_exit);
+        assert_eq!(constraints.b, Array1::<f64>::from_elem(3, 1e-6));
     }
 
     #[test]
@@ -9122,7 +9325,8 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared = prepare_identified_time_block(&time_block).expect("prepare time block");
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);

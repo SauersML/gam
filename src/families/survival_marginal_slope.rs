@@ -8,17 +8,17 @@ use crate::custom_family::{
     fit_custom_family, second_psi_linear_map,
 };
 use crate::estimate::UnifiedFitResult;
+use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::bernoulli_marginal_slope::{
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
     unary_derivatives_sqrt,
 };
-use crate::families::gamlss::{
-    monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta,
-    validate_monotone_wiggle_beta_nonnegative,
+use crate::families::survival_location_scale::{
+    TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
+    time_derivative_lower_bound_constraints,
 };
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
-use crate::families::survival_location_scale::TimeBlockInput;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
@@ -47,6 +47,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
     /// the monotonicity constraints.
     pub derivative_guard: f64,
     pub time_block: TimeBlockInput,
+    pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub logslopespec: TermCollectionSpec,
 }
 
@@ -92,6 +93,9 @@ struct SurvivalMarginalSlopeFamily {
     /// Log-slope block: standard single design.
     logslope_design: DesignMatrix,
     time_linear_constraints: Option<LinearInequalityConstraints>,
+    time_wiggle_knots: Option<Array1<f64>>,
+    time_wiggle_degree: Option<usize>,
+    time_wiggle_ncols: usize,
 }
 
 // ── Block layout ──────────────────────────────────────────────────────
@@ -121,6 +125,39 @@ fn block_slices(block_states: &[ParameterBlockState]) -> BlockSlices {
 
 // Primary scalar indices: 0=q0, 1=q1, 2=qd1, 3=g
 const N_PRIMARY: usize = 4;
+
+#[derive(Clone)]
+struct SurvivalTimeWiggleGeometry {
+    basis: Array2<f64>,
+    basis_d1: Array2<f64>,
+    basis_d2: Array2<f64>,
+    basis_d3: Array2<f64>,
+    dq_dq0: Array1<f64>,
+    d2q_dq02: Array1<f64>,
+    d3q_dq03: Array1<f64>,
+}
+
+#[derive(Clone)]
+struct SurvivalMarginalSlopeDynamicRow {
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    dq0_time: Array1<f64>,
+    dq1_time: Array1<f64>,
+    dqd1_time: Array1<f64>,
+    dq0_marginal: Array1<f64>,
+    dq1_marginal: Array1<f64>,
+    dqd1_marginal: Array1<f64>,
+    d2q0_time_time: Array2<f64>,
+    d2q1_time_time: Array2<f64>,
+    d2qd1_time_time: Array2<f64>,
+    d2q0_time_marginal: Array2<f64>,
+    d2q1_time_marginal: Array2<f64>,
+    d2qd1_time_marginal: Array2<f64>,
+    d2q0_marginal_marginal: Array2<f64>,
+    d2q1_marginal_marginal: Array2<f64>,
+    d2qd1_marginal_marginal: Array2<f64>,
+}
 
 fn unit_primary_direction(idx: usize) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(N_PRIMARY);
@@ -956,9 +993,270 @@ struct EvalCache {
 // ── Row-level NLL computation ─────────────────────────────────────────
 
 impl SurvivalMarginalSlopeFamily {
+    fn flex_timewiggle_active(&self) -> bool {
+        self.time_wiggle_ncols > 0
+    }
+
+    fn time_wiggle_range(&self) -> std::ops::Range<usize> {
+        let p_total = self.design_exit.ncols();
+        let p_w = self.time_wiggle_ncols.min(p_total);
+        (p_total - p_w)..p_total
+    }
+
+    fn time_wiggle_geometry(
+        &self,
+        h0: ndarray::ArrayView1<'_, f64>,
+        beta_w: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Option<SurvivalTimeWiggleGeometry>, String> {
+        let (Some(knots), Some(degree)) =
+            (self.time_wiggle_knots.as_ref(), self.time_wiggle_degree)
+        else {
+            return Ok(None);
+        };
+        let basis = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 0)?;
+        let basis_d1 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 1)?;
+        let basis_d2 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 2)?;
+        let basis_d3 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 3)?;
+        if basis.ncols() != beta_w.len()
+            || basis_d1.ncols() != beta_w.len()
+            || basis_d2.ncols() != beta_w.len()
+            || basis_d3.ncols() != beta_w.len()
+        {
+            return Err(format!(
+                "survival marginal-slope timewiggle basis/beta mismatch: B={} B'={} B''={} B'''={} betaw={}",
+                basis.ncols(),
+                basis_d1.ncols(),
+                basis_d2.ncols(),
+                basis_d3.ncols(),
+                beta_w.len()
+            ));
+        }
+        let dq_dq0 = basis_d1.dot(&beta_w) + 1.0;
+        let d2q_dq02 = basis_d2.dot(&beta_w);
+        let d3q_dq03 = basis_d3.dot(&beta_w);
+        Ok(Some(SurvivalTimeWiggleGeometry {
+            basis,
+            basis_d1,
+            basis_d2,
+            basis_d3,
+            dq_dq0,
+            d2q_dq02,
+            d3q_dq03,
+        }))
+    }
+
+    fn row_dynamic_q_geometry(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+    ) -> Result<SurvivalMarginalSlopeDynamicRow, String> {
+        let beta_time = &block_states[0].beta;
+        let beta_marginal = &block_states[1].beta;
+        let p_time = beta_time.len();
+        let p_marginal = beta_marginal.len();
+
+        let mut out = SurvivalMarginalSlopeDynamicRow {
+            q0: 0.0,
+            q1: 0.0,
+            qd1: 0.0,
+            dq0_time: Array1::zeros(p_time),
+            dq1_time: Array1::zeros(p_time),
+            dqd1_time: Array1::zeros(p_time),
+            dq0_marginal: Array1::zeros(p_marginal),
+            dq1_marginal: Array1::zeros(p_marginal),
+            dqd1_marginal: Array1::zeros(p_marginal),
+            d2q0_time_time: Array2::zeros((p_time, p_time)),
+            d2q1_time_time: Array2::zeros((p_time, p_time)),
+            d2qd1_time_time: Array2::zeros((p_time, p_time)),
+            d2q0_time_marginal: Array2::zeros((p_time, p_marginal)),
+            d2q1_time_marginal: Array2::zeros((p_time, p_marginal)),
+            d2qd1_time_marginal: Array2::zeros((p_time, p_marginal)),
+            d2q0_marginal_marginal: Array2::zeros((p_marginal, p_marginal)),
+            d2q1_marginal_marginal: Array2::zeros((p_marginal, p_marginal)),
+            d2qd1_marginal_marginal: Array2::zeros((p_marginal, p_marginal)),
+        };
+
+        if !self.flex_timewiggle_active() {
+            out.q0 = self.design_entry.dot_row(row, beta_time)
+                + self.offset_entry[row]
+                + self.marginal_design.dot_row(row, beta_marginal);
+            out.q1 = self.design_exit.dot_row(row, beta_time)
+                + self.offset_exit[row]
+                + self.marginal_design.dot_row(row, beta_marginal);
+            out.qd1 =
+                self.design_derivative_exit.dot_row(row, beta_time) + self.derivative_offset_exit[row];
+            let time_row_entry = self.design_entry.row_vector(row)?;
+            let time_row_exit = self.design_exit.row_vector(row)?;
+            let time_row_deriv = self.design_derivative_exit.row_vector(row)?;
+            out.dq0_time.assign(&time_row_entry);
+            out.dq1_time.assign(&time_row_exit);
+            out.dqd1_time.assign(&time_row_deriv);
+            if p_marginal > 0 {
+                let marginal_row = self.marginal_design.row_vector(row)?;
+                out.dq0_marginal.assign(&marginal_row);
+                out.dq1_marginal.assign(&marginal_row);
+            }
+            return Ok(out);
+        }
+
+        let time_tail = self.time_wiggle_range();
+        let p_base = time_tail.start;
+        let beta_time_base = beta_time.slice(s![..p_base]);
+        let beta_time_w = beta_time.slice(s![time_tail.clone()]);
+        let x_entry_base = self.design_entry.row_vector(row)?.slice(s![..p_base]).to_owned();
+        let x_exit_base = self.design_exit.row_vector(row)?.slice(s![..p_base]).to_owned();
+        let x_deriv_base = self
+            .design_derivative_exit
+            .row_vector(row)?
+            .slice(s![..p_base])
+            .to_owned();
+        let marginal_row = if p_marginal > 0 {
+            Some(self.marginal_design.row_vector(row)?)
+        } else {
+            None
+        };
+
+        let base_marginal = marginal_row
+            .as_ref()
+            .map(|row_vec| row_vec.dot(beta_marginal))
+            .unwrap_or(0.0);
+        let h0 = x_entry_base.dot(&beta_time_base) + self.offset_entry[row] + base_marginal;
+        let h1 = x_exit_base.dot(&beta_time_base) + self.offset_exit[row] + base_marginal;
+        let d_raw = x_deriv_base.dot(&beta_time_base) + self.derivative_offset_exit[row];
+
+        let entry_geom = self
+            .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
+            .ok_or_else(|| {
+                "survival marginal-slope timewiggle metadata is present but geometry could not be built at entry"
+                    .to_string()
+            })?;
+        let exit_geom = self
+            .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
+            .ok_or_else(|| {
+                "survival marginal-slope timewiggle metadata is present but geometry could not be built at exit"
+                    .to_string()
+            })?;
+
+        out.q0 = h0 + entry_geom.basis.row(0).dot(&beta_time_w);
+        out.q1 = h1 + exit_geom.basis.row(0).dot(&beta_time_w);
+        out.qd1 = exit_geom.dq_dq0[0] * d_raw;
+
+        for j in 0..p_base {
+            out.dq0_time[j] = entry_geom.dq_dq0[0] * x_entry_base[j];
+            out.dq1_time[j] = exit_geom.dq_dq0[0] * x_exit_base[j];
+            out.dqd1_time[j] =
+                exit_geom.d2q_dq02[0] * d_raw * x_exit_base[j] + exit_geom.dq_dq0[0] * x_deriv_base[j];
+            for k in 0..p_base {
+                out.d2q0_time_time[[j, k]] =
+                    entry_geom.d2q_dq02[0] * x_entry_base[j] * x_entry_base[k];
+                out.d2q1_time_time[[j, k]] =
+                    exit_geom.d2q_dq02[0] * x_exit_base[j] * x_exit_base[k];
+                out.d2qd1_time_time[[j, k]] = exit_geom.d3q_dq03[0]
+                    * d_raw
+                    * x_exit_base[j]
+                    * x_exit_base[k]
+                    + exit_geom.d2q_dq02[0]
+                        * (x_exit_base[j] * x_deriv_base[k] + x_deriv_base[j] * x_exit_base[k]);
+            }
+        }
+        for local_idx in 0..time_tail.len() {
+            let coeff_idx = time_tail.start + local_idx;
+            out.dq0_time[coeff_idx] = entry_geom.basis[[0, local_idx]];
+            out.dq1_time[coeff_idx] = exit_geom.basis[[0, local_idx]];
+            out.dqd1_time[coeff_idx] = exit_geom.basis_d1[[0, local_idx]] * d_raw;
+            for j in 0..p_base {
+                let q0_tw = entry_geom.basis_d1[[0, local_idx]] * x_entry_base[j];
+                let q1_tw = exit_geom.basis_d1[[0, local_idx]] * x_exit_base[j];
+                out.d2q0_time_time[[j, coeff_idx]] = q0_tw;
+                out.d2q0_time_time[[coeff_idx, j]] = q0_tw;
+                out.d2q1_time_time[[j, coeff_idx]] = q1_tw;
+                out.d2q1_time_time[[coeff_idx, j]] = q1_tw;
+                let qd1_cross = exit_geom.basis_d2[[0, local_idx]] * d_raw * x_exit_base[j]
+                    + exit_geom.basis_d1[[0, local_idx]] * x_deriv_base[j];
+                out.d2qd1_time_time[[j, coeff_idx]] = qd1_cross;
+                out.d2qd1_time_time[[coeff_idx, j]] = qd1_cross;
+            }
+        }
+
+        if let Some(marginal_row) = marginal_row.as_ref() {
+            for j in 0..p_marginal {
+                out.dq0_marginal[j] = entry_geom.dq_dq0[0] * marginal_row[j];
+                out.dq1_marginal[j] = exit_geom.dq_dq0[0] * marginal_row[j];
+                out.dqd1_marginal[j] = exit_geom.d2q_dq02[0] * d_raw * marginal_row[j];
+                for k in 0..p_marginal {
+                    out.d2q0_marginal_marginal[[j, k]] =
+                        entry_geom.d2q_dq02[0] * marginal_row[j] * marginal_row[k];
+                    out.d2q1_marginal_marginal[[j, k]] =
+                        exit_geom.d2q_dq02[0] * marginal_row[j] * marginal_row[k];
+                    out.d2qd1_marginal_marginal[[j, k]] =
+                        exit_geom.d3q_dq03[0] * d_raw * marginal_row[j] * marginal_row[k];
+                }
+                for k in 0..p_base {
+                    out.d2q0_time_marginal[[k, j]] =
+                        entry_geom.d2q_dq02[0] * x_entry_base[k] * marginal_row[j];
+                    out.d2q1_time_marginal[[k, j]] =
+                        exit_geom.d2q_dq02[0] * x_exit_base[k] * marginal_row[j];
+                    out.d2qd1_time_marginal[[k, j]] = exit_geom.d3q_dq03[0]
+                        * d_raw
+                        * x_exit_base[k]
+                        * marginal_row[j]
+                        + exit_geom.d2q_dq02[0] * x_deriv_base[k] * marginal_row[j];
+                }
+                for local_idx in 0..time_tail.len() {
+                    let coeff_idx = time_tail.start + local_idx;
+                    out.d2q0_time_marginal[[coeff_idx, j]] =
+                        entry_geom.basis_d1[[0, local_idx]] * marginal_row[j];
+                    out.d2q1_time_marginal[[coeff_idx, j]] =
+                        exit_geom.basis_d1[[0, local_idx]] * marginal_row[j];
+                    out.d2qd1_time_marginal[[coeff_idx, j]] =
+                        exit_geom.basis_d2[[0, local_idx]] * d_raw * marginal_row[j];
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     fn time_derivative_lower_bound(&self) -> f64 {
         assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
         self.derivative_guard
+    }
+
+    fn max_feasible_time_step(
+        &self,
+        beta: &Array1<f64>,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        let Some(constraints) = self.time_linear_constraints.as_ref() else {
+            return Ok(None);
+        };
+        if beta.len() != constraints.a.ncols() || delta.len() != constraints.a.ncols() {
+            return Err(format!(
+                "survival marginal-slope time-step dimension mismatch: beta={}, delta={}, expected {}",
+                beta.len(),
+                delta.len(),
+                constraints.a.ncols()
+            ));
+        }
+        let mut alpha = 1.0f64;
+        for row in 0..constraints.a.nrows() {
+            let a_row = constraints.a.row(row);
+            let slack = a_row.dot(beta) - constraints.b[row];
+            if slack < -1e-10 {
+                return Err(format!(
+                    "survival marginal-slope current time block violates derivative guard at row {row}: slack={slack:.3e}"
+                ));
+            }
+            let drift = a_row.dot(delta);
+            if drift < 0.0 {
+                alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
+            }
+        }
+        if alpha >= 1.0 {
+            Ok(Some(1.0))
+        } else {
+            Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
+        }
     }
 
     /// Per-row NLL and its directional derivatives through 4 primary scalars.
@@ -1098,21 +1396,12 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let beta_time = &block_states[0].beta;
-        let beta_marginal = &block_states[1].beta;
-        let q0 = self.design_entry.dot_row(row, beta_time)
-            + self.offset_entry[row]
-            + self.marginal_design.dot_row(row, beta_marginal);
-        let q1 = self.design_exit.dot_row(row, beta_time)
-            + self.offset_exit[row]
-            + self.marginal_design.dot_row(row, beta_marginal);
-        let qd1 =
-            self.design_derivative_exit.dot_row(row, beta_time) + self.derivative_offset_exit[row];
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
         let g = block_states[2].eta[row];
         let (nll, grad_arr, hess_arr) = row_primary_closed_form(
-            q0,
-            q1,
-            qd1,
+            q_geom.q0,
+            q_geom.q1,
+            q_geom.qd1,
             g,
             self.z[row],
             self.weights[row],
@@ -2097,6 +2386,9 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
+        if self.flex_timewiggle_active() {
+            return self.evaluate_blockwise_exact_newton_timewiggle_dense(block_states);
+        }
         // Detect sparse designs → sparse Hessian path (O(nnz) memory per
         // worker instead of O(p²), sparse Cholesky downstream).
         let time_csrs = match (
@@ -2141,6 +2433,146 @@ impl SurvivalMarginalSlopeFamily {
                 logslope_csr.as_ref(),
             )
         }
+    }
+
+    fn evaluate_blockwise_exact_newton_timewiggle_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<FamilyEvaluation, String> {
+        let slices = block_slices(block_states);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+
+        type Acc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array2<f64>,
+            Array2<f64>,
+            Array2<f64>,
+        );
+
+        let make_acc = || -> Acc {
+            (
+                0.0,
+                Array1::zeros(p_t),
+                Array1::zeros(p_m),
+                Array1::zeros(p_g),
+                Array2::zeros((p_t, p_t)),
+                Array2::zeros((p_m, p_m)),
+                Array2::zeros((p_g, p_g)),
+            )
+        };
+
+        let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope) =
+            (0..self.n)
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let (row_nll, f_pi, f_pipi) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    acc.0 -= row_nll;
+
+                    acc.1 -= &(f_pi[0] * &q_geom.dq0_time
+                        + f_pi[1] * &q_geom.dq1_time
+                        + f_pi[2] * &q_geom.dqd1_time);
+                    if p_m > 0 {
+                        acc.2 -= &(f_pi[0] * &q_geom.dq0_marginal
+                            + f_pi[1] * &q_geom.dq1_marginal
+                            + f_pi[2] * &q_geom.dqd1_marginal);
+                    }
+                    self.logslope_design
+                        .axpy_row_into(row, -f_pi[3], &mut acc.3.view_mut())
+                        .expect("survival logslope block axpy should match block dimensions");
+
+                    for a in 0..p_t {
+                        for b in 0..p_t {
+                            acc.4[[a, b]] += f_pipi[[0, 0]]
+                                * q_geom.dq0_time[a]
+                                * q_geom.dq0_time[b]
+                                + f_pipi[[0, 1]] * q_geom.dq0_time[a] * q_geom.dq1_time[b]
+                                + f_pipi[[0, 2]] * q_geom.dq0_time[a] * q_geom.dqd1_time[b]
+                                + f_pipi[[1, 0]] * q_geom.dq1_time[a] * q_geom.dq0_time[b]
+                                + f_pipi[[1, 1]] * q_geom.dq1_time[a] * q_geom.dq1_time[b]
+                                + f_pipi[[1, 2]] * q_geom.dq1_time[a] * q_geom.dqd1_time[b]
+                                + f_pipi[[2, 0]] * q_geom.dqd1_time[a] * q_geom.dq0_time[b]
+                                + f_pipi[[2, 1]] * q_geom.dqd1_time[a] * q_geom.dq1_time[b]
+                                + f_pipi[[2, 2]] * q_geom.dqd1_time[a] * q_geom.dqd1_time[b]
+                                + f_pi[0] * q_geom.d2q0_time_time[[a, b]]
+                                + f_pi[1] * q_geom.d2q1_time_time[[a, b]]
+                                + f_pi[2] * q_geom.d2qd1_time_time[[a, b]];
+                        }
+                    }
+                    for a in 0..p_m {
+                        for b in 0..p_m {
+                            acc.5[[a, b]] += f_pipi[[0, 0]]
+                                * q_geom.dq0_marginal[a]
+                                * q_geom.dq0_marginal[b]
+                                + f_pipi[[0, 1]]
+                                    * q_geom.dq0_marginal[a]
+                                    * q_geom.dq1_marginal[b]
+                                + f_pipi[[0, 2]]
+                                    * q_geom.dq0_marginal[a]
+                                    * q_geom.dqd1_marginal[b]
+                                + f_pipi[[1, 0]]
+                                    * q_geom.dq1_marginal[a]
+                                    * q_geom.dq0_marginal[b]
+                                + f_pipi[[1, 1]]
+                                    * q_geom.dq1_marginal[a]
+                                    * q_geom.dq1_marginal[b]
+                                + f_pipi[[1, 2]]
+                                    * q_geom.dq1_marginal[a]
+                                    * q_geom.dqd1_marginal[b]
+                                + f_pipi[[2, 0]]
+                                    * q_geom.dqd1_marginal[a]
+                                    * q_geom.dq0_marginal[b]
+                                + f_pipi[[2, 1]]
+                                    * q_geom.dqd1_marginal[a]
+                                    * q_geom.dq1_marginal[b]
+                                + f_pipi[[2, 2]]
+                                    * q_geom.dqd1_marginal[a]
+                                    * q_geom.dqd1_marginal[b]
+                                + f_pi[0] * q_geom.d2q0_marginal_marginal[[a, b]]
+                                + f_pi[1] * q_geom.d2q1_marginal_marginal[[a, b]]
+                                + f_pi[2] * q_geom.d2qd1_marginal_marginal[[a, b]];
+                        }
+                    }
+                    self.logslope_design
+                        .syr_row_into(row, f_pipi[[3, 3]], &mut acc.6)
+                        .expect("survival logslope block syr should match block dimensions");
+
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
+                    a.0 += b.0;
+                    a.1 += &b.1;
+                    a.2 += &b.2;
+                    a.3 += &b.3;
+                    a.4 += &b.4;
+                    a.5 += &b.5;
+                    a.6 += &b.6;
+                    Ok(a)
+                })?;
+
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_time,
+                    hessian: SymmetricMatrix::Dense(hess_time),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_marginal,
+                    hessian: SymmetricMatrix::Dense(hess_marginal),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_logslope,
+                    hessian: SymmetricMatrix::Dense(hess_logslope),
+                },
+            ],
+        })
     }
 
     fn evaluate_blockwise_exact_newton_mixed(
@@ -2794,6 +3226,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
+        if self.flex_timewiggle_active() {
+            return ExactOuterDerivativeOrder::Zeroth;
+        }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
@@ -2821,24 +3256,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         // True fast path: closed-form scalar NLL, no jets, no Vecs, no gradients.
-        let beta_time = &block_states[0].beta;
-        let beta_marginal = &block_states[1].beta;
         let guard = self.derivative_guard;
         let mut ll = 0.0;
         for i in 0..self.n {
-            let q0 = self.design_entry.dot_row(i, beta_time)
-                + self.offset_entry[i]
-                + self.marginal_design.dot_row(i, beta_marginal);
-            let q1 = self.design_exit.dot_row(i, beta_time)
-                + self.offset_exit[i]
-                + self.marginal_design.dot_row(i, beta_marginal);
-            let qd1 =
-                self.design_derivative_exit.dot_row(i, beta_time) + self.derivative_offset_exit[i];
+            let q_geom = self.row_dynamic_q_geometry(i, block_states)?;
             let g = block_states[2].eta[i];
             let (nll, _, _) = row_primary_closed_form(
-                q0,
-                q1,
-                qd1,
+                q_geom.q0,
+                q_geom.q1,
+                q_geom.qd1,
                 g,
                 self.z[i],
                 self.weights[i],
@@ -2854,6 +3280,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.flex_timewiggle_active() {
+            let _ = block_states;
+            return Ok(None);
+        }
         let slices = block_slices(block_states);
         if slices.total >= 512 {
             return Ok(None);
@@ -2866,6 +3296,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
+        if self.flex_timewiggle_active() {
+            return false;
+        }
         true
     }
 
@@ -2874,6 +3307,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        if self.flex_timewiggle_active() {
+            let _ = block_states;
+            return Ok(None);
+        }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)))
     }
@@ -2883,6 +3320,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.flex_timewiggle_active() {
+            let _ = (block_states, d_beta_flat);
+            return Ok(None);
+        }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
         crate::families::row_kernel::row_kernel_directional_derivative(&kern, sl).map(Some)
@@ -2894,6 +3335,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.flex_timewiggle_active() {
+            let _ = (block_states, d_beta_u_flat, d_beta_v_flat);
+            return Ok(None);
+        }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
         let sv = d_beta_v_flat.as_slice().ok_or("non-contiguous d_beta_v")?;
@@ -2908,6 +3353,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        if self.flex_timewiggle_active() {
+            let _ = (block_states, derivative_blocks, psi_index);
+            return Ok(None);
+        }
         self.psi_terms(block_states, derivative_blocks, psi_index)
     }
 
@@ -2919,6 +3368,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if self.flex_timewiggle_active() {
+            let _ = (block_states, derivative_blocks, psi_i, psi_j);
+            return Ok(None);
+        }
         self.psi_second_order_terms(block_states, derivative_blocks, psi_i, psi_j)
     }
 
@@ -2930,6 +3383,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.flex_timewiggle_active() {
+            let _ = (block_states, derivative_blocks, psi_index, d_beta_flat);
+            return Ok(None);
+        }
         self.psi_hessian_directional_derivative(
             block_states,
             derivative_blocks,
@@ -2944,6 +3401,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if self.flex_timewiggle_active() {
+            let _ = (block_states, derivative_blocks);
+            return Ok(None);
+        }
         Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -2964,15 +3425,31 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         }
     }
 
+    fn max_feasible_step_size(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        if block_idx == 0 {
+            return self.max_feasible_time_step(&block_states[0].beta, delta);
+        }
+        Ok(None)
+    }
+
     fn post_update_block_beta(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
         _: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        if block_idx == 0 {
-            return Ok(project_monotone_wiggle_beta(beta));
+        if block_idx >= block_states.len() {
+            return Err(format!(
+                "post-update block index {} out of range for {} blocks",
+                block_idx,
+                block_states.len()
+            ));
         }
         Ok(beta)
     }
@@ -3198,31 +3675,62 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             "survival-marginal-slope time block design column mismatch: entry={p_entry}, exit={p_exit}, deriv={p_deriv}"
         ));
     }
-    if let Some(beta0) = &spec.time_block.initial_beta {
-        if let Some(beta0_slice) = beta0.as_slice() {
-            validate_monotone_wiggle_beta_nonnegative(
-                beta0_slice,
-                "survival-marginal-slope time_block initial_beta",
-            )?;
-        } else {
-            let beta0_values = beta0.iter().copied().collect::<Vec<_>>();
-            validate_monotone_wiggle_beta_nonnegative(
-                &beta0_values,
-                "survival-marginal-slope time_block initial_beta",
-            )?;
-        }
-    }
     if !spec.time_block.structural_monotonicity {
         return Err(
             "survival-marginal-slope requires structural time monotonicity by construction; non-structural time transforms are no longer supported"
                 .to_string(),
         );
     }
+    if let Some(beta0) = &spec.time_block.initial_beta {
+        let derivative_constraints = time_derivative_lower_bound_constraints(
+            &spec.time_block.design_derivative_exit.to_dense(),
+            &spec.time_block.derivative_offset_exit,
+            spec.derivative_guard,
+        )?;
+        if let Some(constraints) = derivative_constraints.as_ref() {
+            if beta0.len() != constraints.a.ncols() {
+                return Err(format!(
+                    "survival-marginal-slope time_block initial_beta length mismatch: got {}, expected {}",
+                    beta0.len(),
+                    constraints.a.ncols()
+                ));
+            }
+            for row in 0..constraints.a.nrows() {
+                let slack = constraints.a.row(row).dot(beta0) - constraints.b[row];
+                if slack < -1e-10 {
+                    return Err(format!(
+                        "survival-marginal-slope time_block initial_beta violates derivative guard at row {row}: slack={slack:.3e}"
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
+        if timewiggle.degree != 3 {
+            return Err(format!(
+                "survival-marginal-slope timewiggle requires cubic degree=3, got {}",
+                timewiggle.degree
+            ));
+        }
+        if timewiggle.ncols == 0 {
+            return Err("survival-marginal-slope timewiggle requires at least one wiggle coefficient".to_string());
+        }
+        if spec.time_block.design_exit.ncols() < timewiggle.ncols {
+            return Err(format!(
+                "survival-marginal-slope timewiggle requests {} tail columns but time block only has {} columns",
+                timewiggle.ncols,
+                spec.time_block.design_exit.ncols()
+            ));
+        }
+    }
     Ok(())
 }
 
-/// Compute a simple baseline slope from the actual survival marginal-slope likelihood,
+/// Compute a baseline slope from the actual survival marginal-slope likelihood,
 /// using the baseline offsets alone as a time-only pilot q(t).
+///
+/// This is a safeguarded 1D Newton solve on the true row objective. It does not
+/// use a coarse fixed grid scan.
 fn pooled_survival_baseline(
     event: &Array1<f64>,
     weights: &Array1<f64>,
@@ -3235,39 +3743,120 @@ fn pooled_survival_baseline(
     if n == 0 {
         return 0.0;
     }
-    let objective = |slope: f64| -> f64 {
-        let mut total = 0.0;
+    let objective_grad_hess = |slope: f64| -> Option<(f64, f64, f64)> {
+        let mut obj = 0.0;
+        let mut grad = 0.0;
+        let mut hess = 0.0;
         for i in 0..n {
-            let wi = weights[i];
-            let di = event[i];
-            let zi = z[i];
-            let c = (1.0 + slope * slope).sqrt();
-            let eta0 = q0[i] * c + slope * zi;
-            let eta1 = q1[i] * c + slope * zi;
-            let ad1 = qd1[i] * c;
-            if !eta0.is_finite() || !eta1.is_finite() || !ad1.is_finite() || ad1 <= 0.0 {
-                return f64::INFINITY;
-            }
-            total += wi * (1.0 - di) * unary_derivatives_neglog_phi(-eta1, 1.0)[0];
-            total -= wi * unary_derivatives_neglog_phi(-eta0, 1.0)[0];
-            if di > 0.0 {
-                total -= wi * unary_derivatives_log_normal_pdf(eta1)[0];
-                total -= wi * ad1.ln();
-            }
+            let (row_obj, row_grad, row_hess) =
+                row_primary_closed_form(q0[i], q1[i], qd1[i], slope, z[i], weights[i], event[i], 0.0)
+                    .ok()?;
+            obj += row_obj;
+            grad += row_grad[3];
+            hess += row_hess[3][3];
         }
-        total
+        Some((obj, grad, hess))
     };
-    let mut best_slope = 0.0;
-    let mut best_obj = f64::INFINITY;
-    for step in -160..=160 {
-        let slope = step as f64 * 0.05;
-        let obj = objective(slope);
-        if obj.is_finite() && obj < best_obj {
-            best_obj = obj;
-            best_slope = slope;
-        }
+
+    let Some(state0) = objective_grad_hess(0.0) else {
+        return 0.0;
+    };
+    if !state0.0.is_finite() {
+        return 0.0;
     }
-    best_slope
+    if state0.1.abs() < 1e-8 {
+        return 0.0;
+    }
+
+    let mut best_slope = 0.0;
+    let mut best = state0;
+
+    let mut bracket_lo = if state0.1 <= 0.0 { Some((0.0, state0)) } else { None };
+    let mut bracket_hi = if state0.1 >= 0.0 { Some((0.0, state0)) } else { None };
+    let mut step = 0.5f64;
+    for _ in 0..48 {
+        for &candidate in &[-step, step] {
+            if let Some(state) = objective_grad_hess(candidate) {
+                if state.0 < best.0 {
+                    best_slope = candidate;
+                    best = state;
+                }
+                if state.1 <= 0.0 {
+                    bracket_lo = Some((candidate, state));
+                }
+                if state.1 >= 0.0 {
+                    bracket_hi = Some((candidate, state));
+                }
+                if let (Some((lo, lo_state)), Some((hi, hi_state))) = (bracket_lo, bracket_hi)
+                    && lo < hi
+                    && lo_state.1 <= 0.0
+                    && hi_state.1 >= 0.0
+                {
+                    let mut slope = best_slope.clamp(lo, hi);
+                    let mut state = if (slope - lo).abs() < f64::EPSILON {
+                        lo_state
+                    } else if (slope - hi).abs() < f64::EPSILON {
+                        hi_state
+                    } else {
+                        match objective_grad_hess(slope) {
+                            Some(s) => s,
+                            None => {
+                                slope = 0.5 * (lo + hi);
+                                objective_grad_hess(slope).unwrap_or(best)
+                            }
+                        }
+                    };
+
+                    let mut bracket_lo = (lo, lo_state);
+                    let mut bracket_hi = (hi, hi_state);
+                    for _ in 0..60 {
+                        if state.1.abs() < 1e-8 || (bracket_hi.0 - bracket_lo.0).abs() < 1e-8 {
+                            break;
+                        }
+                        let mut candidate = 0.5 * (bracket_lo.0 + bracket_hi.0);
+                        if state.2.is_finite() && state.2 > 0.0 {
+                            let newton = slope - state.1 / state.2;
+                            if newton > bracket_lo.0 && newton < bracket_hi.0 {
+                                candidate = newton;
+                            }
+                        }
+                        let Some(candidate_state) = objective_grad_hess(candidate) else {
+                            candidate = 0.5 * (bracket_lo.0 + bracket_hi.0);
+                            let Some(mid_state) = objective_grad_hess(candidate) else {
+                                break;
+                            };
+                            if mid_state.0 < best.0 {
+                                best_slope = candidate;
+                                best = mid_state;
+                            }
+                            if mid_state.1 <= 0.0 {
+                                bracket_lo = (candidate, mid_state);
+                            } else {
+                                bracket_hi = (candidate, mid_state);
+                            }
+                            slope = candidate;
+                            state = mid_state;
+                            continue;
+                        };
+                        if candidate_state.0 < best.0 {
+                            best_slope = candidate;
+                            best = candidate_state;
+                        }
+                        if candidate_state.1 <= 0.0 {
+                            bracket_lo = (candidate, candidate_state);
+                        } else {
+                            bracket_hi = (candidate, candidate_state);
+                        }
+                        slope = candidate;
+                        state = candidate_state;
+                    }
+                    return if best.0.is_finite() { best_slope } else { 0.0 };
+                }
+            }
+        }
+        step *= 2.0;
+    }
+    if best.0.is_finite() { best_slope } else { 0.0 }
 }
 
 // ── Public fitting function ───────────────────────────────────────────
@@ -3330,7 +3919,11 @@ pub fn fit_survival_marginal_slope_terms(
     let offset_exit = Arc::new(spec.time_block.offset_exit.clone());
     let derivative_offset_exit = Arc::new(spec.time_block.derivative_offset_exit.clone());
     let time_block_ref = spec.time_block.clone();
-    let time_linear_constraints = monotone_wiggle_nonnegative_constraints(design_exit.ncols());
+    let time_linear_constraints = time_derivative_lower_bound_constraints(
+        &design_derivative_exit.to_dense(),
+        derivative_offset_exit.as_ref(),
+        derivative_guard,
+    )?;
 
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign|
@@ -3350,6 +3943,9 @@ pub fn fit_survival_marginal_slope_terms(
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
             time_linear_constraints: time_linear_constraints.clone(),
+            time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
+            time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
+            time_wiggle_ncols: spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols),
         }
     };
 
@@ -3370,10 +3966,21 @@ pub fn fit_survival_marginal_slope_terms(
         let rho_logslope = rho
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
-        let time_beta_hint = hints
-            .0
-            .as_ref()
-            .map(|beta| project_monotone_wiggle_beta(beta.clone()));
+        let time_beta_hint = if let Some(constraints) = time_linear_constraints.as_ref() {
+            Some(project_onto_linear_constraints(
+                design_exit.ncols(),
+                constraints,
+                hints
+                    .0
+                    .as_ref()
+                    .or(time_block_ref.initial_beta.as_ref()),
+            ))
+        } else {
+            hints
+                .0
+                .clone()
+                .or_else(|| time_block_ref.initial_beta.clone())
+        };
         Ok(vec![
             build_time_blockspec(&time_block_ref, &design_exit, rho_time, time_beta_hint),
             build_marginal_blockspec(marginal_design, rho_marginal, hints.1.clone()),
@@ -3562,17 +4169,24 @@ mod tests {
     #[test]
     fn validate_spec_rejects_nonstructural_time_block() {
         let spec = SurvivalMarginalSlopeTermSpec {
-            age_entry: array![0.0],
-            age_exit: array![1.0],
-            event_target: array![0.0],
-            weights: array![1.0],
-            z: array![0.0],
+            age_entry: array![0.0, 0.0],
+            age_exit: array![1.0, 1.0],
+            event_target: array![0.0, 1.0],
+            weights: array![1.0, 1.0],
+            z: array![-1.0, 1.0],
             marginalspec: empty_termspec(),
             derivative_guard: 1e-4,
             time_block: TimeBlockInput {
+                design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
+                design_exit: DesignMatrix::from(Array2::zeros((2, 1))),
+                design_derivative_exit: DesignMatrix::from(Array2::ones((2, 1))),
+                offset_entry: Array1::zeros(2),
+                offset_exit: Array1::zeros(2),
+                derivative_offset_exit: Array1::zeros(2),
                 structural_monotonicity: false,
                 ..base_time_block()
             },
+            timewiggle_block: None,
             logslopespec: empty_termspec(),
         };
 
@@ -3610,6 +4224,9 @@ mod tests {
                 Array2::zeros((1, 0)),
             )),
             time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -3667,6 +4284,9 @@ mod tests {
                 1.0
             ]])),
             time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -3737,6 +4357,9 @@ mod tests {
                 Array2::zeros((1, 0)),
             )),
             time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -3763,15 +4386,50 @@ mod tests {
     }
 
     #[test]
-    fn structural_time_constraints_use_nonnegative_coefficient_cone() {
-        let constraints =
-            monotone_wiggle_nonnegative_constraints(2).expect("non-empty nonnegative cone");
-        assert_eq!(constraints.a, array![[1.0, 0.0], [0.0, 1.0]]);
-        assert_eq!(constraints.b, array![0.0, 0.0]);
+    fn structural_time_constraints_use_derivative_lower_bound_rows() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 2,
+            event: Arc::new(array![0.0, 1.0]),
+            weights: Arc::new(array![1.0, 1.0]),
+            z: Arc::new(array![0.0, 0.0]),
+            derivative_guard: 1e-4,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((2, 2)))),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((2, 2)))),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 2.0], [3.0, 4.0]])),
+            offset_entry: Arc::new(Array1::zeros(2)),
+            offset_exit: Arc::new(Array1::zeros(2)),
+            derivative_offset_exit: Arc::new(array![0.25, 0.5]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((2, 0)))),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((2, 0)))),
+            time_linear_constraints: time_derivative_lower_bound_constraints(
+                &array![[1.0, 2.0], [3.0, 4.0]],
+                &array![0.25, 0.5],
+                1e-4,
+            )
+            .expect("time derivative constraints"),
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let spec = ParameterBlockSpec {
+            name: "time_surface".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0, 0.0], [0.0, 0.0]])),
+            offset: Array1::zeros(2),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let constraints = family
+            .block_linear_constraints(&[], 0, &spec)
+            .expect("constraint lookup")
+            .expect("time constraints");
+        assert_eq!(constraints.a, array![[1.0, 2.0], [3.0, 4.0]]);
+        assert_eq!(constraints.b, array![-0.2499, -0.4999]);
     }
 
     #[test]
-    fn time_block_post_update_projects_negative_coefficients() {
+    fn time_block_post_update_leaves_beta_unchanged() {
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![0.0]),
@@ -3796,7 +4454,15 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
-            time_linear_constraints: monotone_wiggle_nonnegative_constraints(2),
+            time_linear_constraints: time_derivative_lower_bound_constraints(
+                &array![[1.0, 0.0]],
+                &array![1e-6],
+                1e-6,
+            )
+            .expect("time derivative constraints"),
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
         };
         let spec = ParameterBlockSpec {
             name: "time_surface".to_string(),
@@ -3808,9 +4474,78 @@ mod tests {
             initial_beta: None,
         };
         let beta = family
-            .post_update_block_beta(&[], 0, &spec, array![-0.3, 0.2])
-            .expect("project time beta");
-        assert_eq!(beta, array![0.0, 0.2]);
+            .post_update_block_beta(
+                &[ParameterBlockState {
+                    beta: array![0.0, 0.0],
+                    eta: array![0.0],
+                }],
+                0,
+                &spec,
+                array![-0.3, 0.2],
+            )
+            .expect("return time beta");
+        assert_eq!(beta, array![-0.3, 0.2]);
+    }
+
+    #[test]
+    fn time_block_feasible_step_stays_inside_derivative_guard() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            derivative_guard: 1e-4,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0, 0.0]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0, 0.0]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![0.2]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            time_linear_constraints: time_derivative_lower_bound_constraints(
+                &array![[1.0, 0.0]],
+                &array![0.2],
+                1e-4,
+            )
+            .expect("time derivative constraints"),
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.0],
+            },
+        ];
+        let alpha = family
+            .max_feasible_step_size(&states, 0, &array![-1.0, 0.0])
+            .expect("time step ceiling")
+            .expect("time step should be bounded");
+        assert!(alpha > 0.0 && alpha < 1.0);
+        let feasible = &states[0].beta + &(array![-1.0, 0.0] * alpha);
+        let slack = family
+            .time_linear_constraints
+            .as_ref()
+            .expect("constraints")
+            .a
+            .row(0)
+            .dot(&feasible)
+            - family
+                .time_linear_constraints
+                .as_ref()
+                .expect("constraints")
+                .b[0];
+        assert!(slack >= 0.0);
     }
 
     #[test]
@@ -3833,6 +4568,9 @@ mod tests {
             marginal_design: sparse_design(&array![[1.0, 0.0], [0.0, 1.0]]),
             logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.5]])),
             time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
         };
         let block_states = vec![
             ParameterBlockState {

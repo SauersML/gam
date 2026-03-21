@@ -62,7 +62,7 @@ pub struct DeviationRuntime {
     pub basis_dim: usize,
     pub monotonicity_eps: f64,
     endpoint_points: Array1<f64>,
-    endpoint_d1_design: Array2<f64>,
+    span_left_value_design: Array2<f64>,
     span_left_points: Array1<f64>,
     span_right_points: Array1<f64>,
     span_left_d1_design: Array2<f64>,
@@ -71,10 +71,40 @@ pub struct DeviationRuntime {
     span_mid_d3_design: Array2<f64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviationSpanCubic {
+    pub left: f64,
+    pub right: f64,
+    pub c0: f64,
+    pub c1: f64,
+    pub c2: f64,
+    pub c3: f64,
+}
+
+impl DeviationSpanCubic {
+    #[inline]
+    fn evaluate(self, x: f64) -> f64 {
+        let t = x - self.left;
+        self.c0 + self.c1 * t + self.c2 * t * t + self.c3 * t * t * t
+    }
+
+    #[inline]
+    fn first_derivative(self, x: f64) -> f64 {
+        let t = x - self.left;
+        self.c1 + 2.0 * self.c2 * t + 3.0 * self.c3 * t * t
+    }
+
+    #[inline]
+    fn second_derivative(self, x: f64) -> f64 {
+        let t = x - self.left;
+        2.0 * self.c2 + 6.0 * self.c3 * t
+    }
+}
+
 #[derive(Clone)]
-struct DeviationPrepared {
-    block: ParameterBlockInput,
-    runtime: DeviationRuntime,
+pub(crate) struct DeviationPrepared {
+    pub(crate) block: ParameterBlockInput,
+    pub(crate) runtime: DeviationRuntime,
 }
 
 #[derive(Clone)]
@@ -96,7 +126,6 @@ pub struct BernoulliMarginalSlopeFitResult {
     pub logslope_design: TermCollectionDesign,
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
-    pub quadrature_points: usize,
     pub score_warp_runtime: Option<DeviationRuntime>,
     pub link_dev_runtime: Option<DeviationRuntime>,
 }
@@ -124,6 +153,17 @@ struct ThetaHints {
 }
 
 impl DeviationRuntime {
+    fn validate_beta_shape(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {
+        if beta.len() != self.basis_dim {
+            return Err(format!(
+                "{label} length mismatch: got {}, expected {}",
+                beta.len(),
+                self.basis_dim
+            ));
+        }
+        Ok(())
+    }
+
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
         monotone_wiggle_basis_with_derivative_order(
             values.view(),
@@ -159,8 +199,182 @@ impl DeviationRuntime {
         monotone_wiggle_basis_with_derivative_order(values.view(), &self.knots, self.degree, 4)
     }
 
-    fn endpoint_constraint_points(&self) -> &Array1<f64> {
+    fn span_count(&self) -> usize {
+        self.span_left_points.len()
+    }
+
+    fn breakpoints(&self) -> &Array1<f64> {
         &self.endpoint_points
+    }
+
+    fn span_interval(&self, span_idx: usize) -> Result<(f64, f64), String> {
+        if span_idx >= self.span_count() {
+            return Err(format!(
+                "deviation span index {} out of range for {} spans",
+                span_idx,
+                self.span_count()
+            ));
+        }
+        Ok((self.span_left_points[span_idx], self.span_right_points[span_idx]))
+    }
+
+    fn span_index_for(&self, value: f64) -> Result<usize, String> {
+        if !value.is_finite() {
+            return Err(format!(
+                "deviation span lookup requires finite value, got {value}"
+            ));
+        }
+        let n = self.span_count();
+        if n == 0 {
+            return Err("deviation runtime has no active spans".to_string());
+        }
+        if value <= self.span_left_points[0] {
+            return Ok(0);
+        }
+        if value >= self.span_right_points[n - 1] {
+            return Ok(n - 1);
+        }
+        for span_idx in 0..n {
+            let left = self.span_left_points[span_idx];
+            let right = self.span_right_points[span_idx];
+            if value >= left && value <= right {
+                return Ok(span_idx);
+            }
+        }
+        Err(format!(
+            "deviation span lookup failed for value {value}; support is [{:.6}, {:.6}]",
+            self.span_left_points[0],
+            self.span_right_points[n - 1]
+        ))
+    }
+
+    fn local_cubic_on_span(
+        &self,
+        beta: &Array1<f64>,
+        span_idx: usize,
+    ) -> Result<DeviationSpanCubic, String> {
+        self.validate_beta_shape(beta, "deviation local cubic coefficients")?;
+        let (left, right) = self.span_interval(span_idx)?;
+        let value_design = self.span_left_value_design.row(span_idx);
+        let d1_design = self.span_left_d1_design.row(span_idx);
+        let d2_design = self.span_left_d2_design.row(span_idx);
+        let d3 = self.span_mid_d3_design.row(span_idx).dot(beta);
+        Ok(DeviationSpanCubic {
+            left,
+            right,
+            c0: value_design.dot(beta),
+            c1: d1_design.dot(beta),
+            c2: 0.5 * d2_design.dot(beta),
+            c3: d3 / 6.0,
+        })
+    }
+
+    pub fn basis_span_cubic(
+        &self,
+        span_idx: usize,
+        basis_idx: usize,
+    ) -> Result<DeviationSpanCubic, String> {
+        if basis_idx >= self.basis_dim {
+            return Err(format!(
+                "deviation basis index {} out of range for {} coefficients",
+                basis_idx, self.basis_dim
+            ));
+        }
+        let (left, right) = self.span_interval(span_idx)?;
+        Ok(DeviationSpanCubic {
+            left,
+            right,
+            c0: self.span_left_value_design[[span_idx, basis_idx]],
+            c1: self.span_left_d1_design[[span_idx, basis_idx]],
+            c2: 0.5 * self.span_left_d2_design[[span_idx, basis_idx]],
+            c3: self.span_mid_d3_design[[span_idx, basis_idx]] / 6.0,
+        })
+    }
+
+    pub fn basis_cubic_at(
+        &self,
+        basis_idx: usize,
+        value: f64,
+    ) -> Result<DeviationSpanCubic, String> {
+        let span_idx = self.span_index_for(value)?;
+        self.basis_span_cubic(span_idx, basis_idx)
+    }
+
+    pub fn exact_local_cubic_on_span(
+        &self,
+        beta: &Array1<f64>,
+        span_idx: usize,
+    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
+        self.local_cubic_on_span(beta, span_idx).map(|span| {
+            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                left: span.left,
+                right: span.right,
+                c0: span.c0,
+                c1: span.c1,
+                c2: span.c2,
+                c3: span.c3,
+            }
+        })
+    }
+
+    pub fn exact_local_cubic_at(
+        &self,
+        beta: &Array1<f64>,
+        value: f64,
+    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
+        self.local_cubic_at(beta, value).map(|span| {
+            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                left: span.left,
+                right: span.right,
+                c0: span.c0,
+                c1: span.c1,
+                c2: span.c2,
+                c3: span.c3,
+            }
+        })
+    }
+
+    pub fn exact_basis_span_cubic(
+        &self,
+        span_idx: usize,
+        basis_idx: usize,
+    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
+        self.basis_span_cubic(span_idx, basis_idx).map(|span| {
+            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                left: span.left,
+                right: span.right,
+                c0: span.c0,
+                c1: span.c1,
+                c2: span.c2,
+                c3: span.c3,
+            }
+        })
+    }
+
+    pub fn exact_basis_cubic_at(
+        &self,
+        basis_idx: usize,
+        value: f64,
+    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
+        self.basis_cubic_at(basis_idx, value).map(|span| {
+            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                left: span.left,
+                right: span.right,
+                c0: span.c0,
+                c1: span.c1,
+                c2: span.c2,
+                c3: span.c3,
+            }
+        })
+    }
+
+    fn local_cubic_at(
+        &self,
+        beta: &Array1<f64>,
+        value: f64,
+    ) -> Result<DeviationSpanCubic, String> {
+        let span_idx = self.span_index_for(value)?;
+        self.local_cubic_on_span(beta, span_idx)
     }
 
     fn support_interval(&self) -> Result<(f64, f64), String> {
@@ -170,7 +384,10 @@ impl DeviationRuntime {
         }
     }
 
-    fn exact_monotonicity_min_slack(&self, beta: &Array1<f64>) -> Result<f64, String> {
+    pub(crate) fn exact_monotonicity_min_slack(
+        &self,
+        beta: &Array1<f64>,
+    ) -> Result<f64, String> {
         if beta.len() != self.basis_dim {
             return Err(format!(
                 "deviation monotonicity length mismatch: got {}, expected {}",
@@ -225,7 +442,11 @@ impl DeviationRuntime {
         }
     }
 
-    fn monotonicity_feasible(&self, beta: &Array1<f64>, context: &str) -> Result<(), String> {
+    pub(crate) fn monotonicity_feasible(
+        &self,
+        beta: &Array1<f64>,
+        context: &str,
+    ) -> Result<(), String> {
         let slack = self.exact_monotonicity_min_slack(beta)?;
         if slack >= -1e-10 {
             Ok(())
@@ -238,7 +459,7 @@ impl DeviationRuntime {
         }
     }
 
-    fn max_feasible_monotone_step(
+    pub(crate) fn max_feasible_monotone_step(
         &self,
         beta: &Array1<f64>,
         delta: &Array1<f64>,
@@ -312,13 +533,13 @@ pub fn bernoulli_marginal_slope_quadrature_points(
     points
 }
 
-fn build_deviation_block_from_seed(
+pub(crate) fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
     if cfg.degree != 3 {
         return Err(format!(
-            "exact monotonicity for bernoulli marginal-slope deviation blocks requires cubic splines (degree=3), got degree={}",
+            "exact de-nested cubic bernoulli marginal-slope requires cubic deviation blocks (degree=3), got degree={}",
             cfg.degree
         ));
     }
@@ -374,11 +595,11 @@ fn build_deviation_block_from_seed(
         degree,
         basis_dim: dim,
         monotonicity_eps: cfg.monotonicity_eps,
-        endpoint_d1_design: monotone_wiggle_basis_with_derivative_order(
-            endpoint_points.view(),
+        span_left_value_design: monotone_wiggle_basis_with_derivative_order(
+            span_left_points.view(),
             &knots,
             degree,
-            1,
+            0,
         )?,
         span_left_d1_design: monotone_wiggle_basis_with_derivative_order(
             span_left_points.view(),
@@ -693,7 +914,7 @@ fn joint_setup(
     )
 }
 
-fn normal_expectation_nodes(n: usize) -> (Array1<f64>, Array1<f64>) {
+pub(crate) fn normal_expectation_nodes(n: usize) -> (Array1<f64>, Array1<f64>) {
     let gh = compute_gauss_hermite_n(n);
     let scale = 2.0_f64.sqrt();
     let norm = std::f64::consts::PI.sqrt();
@@ -1768,6 +1989,132 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
 }
 
 impl BernoulliMarginalSlopeFamily {
+    fn flex_score_beta<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<Option<&'a Array1<f64>>, String> {
+        if self.score_warp.is_none() {
+            return Ok(None);
+        }
+        block_states
+            .get(2)
+            .map(|state| Some(&state.beta))
+            .ok_or_else(|| "missing score-warp block state".to_string())
+    }
+
+    fn denested_partition_cells(
+        &self,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<Vec<crate::families::bernoulli_marginal_slope_exact::DenestedPartitionCell>, String>
+    {
+        let score_tail = 8.0;
+        let mut score_breaks = if let Some(runtime) = self.score_warp.as_ref() {
+            runtime.breakpoints().to_vec()
+        } else {
+            vec![-8.0, 8.0]
+        };
+        if score_breaks.first().copied().unwrap_or(score_tail) > -score_tail {
+            score_breaks.insert(0, -score_tail);
+        }
+        if score_breaks.last().copied().unwrap_or(-score_tail) < score_tail {
+            score_breaks.push(score_tail);
+        }
+        let link_tail = 8.0 * (1.0 + b.abs());
+        let mut link_breaks = if let Some(runtime) = self.link_dev.as_ref() {
+            runtime.breakpoints().to_vec()
+        } else {
+            vec![a - link_tail, a + link_tail]
+        };
+        if link_breaks.first().copied().unwrap_or(a + link_tail) > a - link_tail {
+            link_breaks.insert(0, a - link_tail);
+        }
+        if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
+            link_breaks.push(a + link_tail);
+        }
+        crate::families::bernoulli_marginal_slope_exact::build_denested_partition_cells(
+            a,
+            b,
+            &score_breaks,
+            &link_breaks,
+            |z| {
+                if let (Some(runtime), Some(beta)) = (self.score_warp.as_ref(), beta_h) {
+                    runtime.exact_local_cubic_at(beta, z)
+                } else {
+                    Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                        left: -8.0,
+                        right: 8.0,
+                        c0: 0.0,
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    })
+                }
+            },
+            |u| {
+                if let (Some(runtime), Some(beta)) = (self.link_dev.as_ref(), beta_w) {
+                    runtime.exact_local_cubic_at(beta, u)
+                } else {
+                    Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                        left: a - 8.0 * (1.0 + b.abs()),
+                        right: a + 8.0 * (1.0 + b.abs()),
+                        c0: 0.0,
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    })
+                }
+            },
+        )
+    }
+
+    fn evaluate_denested_calibration(
+        &self,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64, f64), String> {
+        let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
+        let mut f = -normal_cdf(marginal_eta);
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        for partition_cell in cells {
+            let cell = partition_cell.cell;
+            let state =
+                crate::families::bernoulli_marginal_slope_exact::evaluate_cell_moments(cell, 9)?;
+            f += state.value;
+            let (dc_da, _) = crate::families::bernoulli_marginal_slope_exact::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
+            let shift = a - partition_cell.link_span.left;
+            let d2c_da2 = [
+                2.0 * partition_cell.link_span.c2 + 6.0 * partition_cell.link_span.c3 * shift,
+                6.0 * partition_cell.link_span.c3 * slope,
+                0.0,
+                0.0,
+            ];
+            f_a += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+                &dc_da,
+                &state.moments,
+            )?;
+            f_aa += crate::families::bernoulli_marginal_slope_exact::cell_second_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &d2c_da2,
+                &state.moments,
+            )?;
+        }
+        Ok((f, f_a, f_aa))
+    }
+
     fn flex_active(&self) -> bool {
         self.score_warp.is_some() || self.link_dev.is_some()
     }
@@ -1814,9 +2161,9 @@ impl BernoulliMarginalSlopeFamily {
         if let Some(runtime) = &self.score_warp {
             let beta_h = &block_states[2].beta;
             let design = runtime.design(&self.quadrature_nodes)?;
-            Ok((&self.quadrature_nodes + &design.dot(beta_h), Some(design)))
+            Ok((design.dot(beta_h), Some(design)))
         } else {
-            Ok((self.quadrature_nodes.clone(), None))
+            Ok((Array1::zeros(self.quadrature_nodes.len()), None))
         }
     }
 
@@ -1838,31 +2185,17 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         marginal_eta: f64,
         slope: f64,
-        h_nodes: &Array1<f64>,
+        beta_h: Option<&Array1<f64>>,
+        _h_nodes: &Array1<f64>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64), String> {
-        let target = normal_cdf(marginal_eta);
-
-        // Evaluate the constraint function F(a) and its derivative F_a at a given intercept.
-        // F(a) = ∫ Φ(L(a + b·h)) w(h) dh − Φ(q)
-        // F_a(a) = ∫ φ(L(a + b·h)) · L'(a + b·h) · w(h) dh
-        let eval = |a: f64| -> Result<(f64, f64), String> {
-            let v = h_nodes.mapv(|h| a + slope * h);
-            let (t, t1) = self.link_terms_value_d1(&v, beta_w)?;
-            let f_val = self
-                .quadrature_weights
-                .iter()
-                .zip(t.iter())
-                .map(|(&w, &tt)| w * normal_cdf(tt))
-                .sum::<f64>()
-                - target;
-            let f_deriv = self
-                .quadrature_weights
-                .iter()
-                .zip(t.iter().zip(t1.iter()))
-                .map(|(&w, (&tt, &tt1))| w * normal_pdf(tt) * tt1)
-                .sum::<f64>();
-            Ok((f_val, f_deriv))
+        // Evaluate the de-nested calibration equation through the current
+        // hybrid cell-partition kernel: exact on affine cells, numeric
+        // reference on quartic/sextic cells.
+        //   F(a) = E[ Φ(a + b z + b Δ_h(z) + Δ_w(a + b z)) ] - Φ(q)
+        // and its derivative with respect to a.
+        let eval = |a: f64| -> Result<(f64, f64, f64), String> {
+            self.evaluate_denested_calibration(a, marginal_eta, slope, beta_h, beta_w)
         };
 
         // Initial guess: closed-form for rigid probit: a₀ = q·√(1+b²).
@@ -1887,7 +2220,7 @@ impl BernoulliMarginalSlopeFamily {
         // took unconstrained Newton steps before a sign bracket existed, which
         // is unstable in the extreme probit tail because F(a) saturates while
         // F'(a) is tiny, producing huge oscillatory jumps.
-        let (f_init, f_deriv_init) = eval(a)?;
+        let (f_init, f_deriv_init, _) = eval(a)?;
         if f_init == 0.0 {
             return Ok((a, f_deriv_init));
         }
@@ -1902,7 +2235,7 @@ impl BernoulliMarginalSlopeFamily {
             let mut found = None;
             for _ in 0..64 {
                 let hi_try = a + bracket_step;
-                let (f_try, _) = eval(hi_try)?;
+                let (f_try, _, _) = eval(hi_try)?;
                 if f_try >= 0.0 {
                     found = Some((hi_try, f_try));
                     break;
@@ -1914,11 +2247,11 @@ impl BernoulliMarginalSlopeFamily {
                 // Failed to bracket from below after 64 doublings.
                 // Return the last point as best-effort; the residual
                 // check at the end will decide if it's acceptable.
-                let (_, f_deriv_lo) = eval(lo)?;
+                let (_, f_deriv_lo, _) = eval(lo)?;
                 return Ok((lo, f_deriv_lo.max(1e-30)));
             };
             hi = hi_found;
-            let (f_lo_val, _) = eval(lo)?;
+            let (f_lo_val, _, _) = eval(lo)?;
             f_lo = f_lo_val;
             f_hi = f_hi_found;
         } else {
@@ -1926,7 +2259,7 @@ impl BernoulliMarginalSlopeFamily {
             let mut found = None;
             for _ in 0..64 {
                 let lo_try = a - bracket_step;
-                let (f_try, _) = eval(lo_try)?;
+                let (f_try, _, _) = eval(lo_try)?;
                 if f_try <= 0.0 {
                     found = Some((lo_try, f_try));
                     break;
@@ -1935,11 +2268,11 @@ impl BernoulliMarginalSlopeFamily {
                 bracket_step *= 2.0;
             }
             let Some((lo_found, f_lo_found)) = found else {
-                let (_, f_deriv_hi) = eval(hi)?;
+                let (_, f_deriv_hi, _) = eval(hi)?;
                 return Ok((hi, f_deriv_hi.max(1e-30)));
             };
             lo = lo_found;
-            let (f_hi_val, _) = eval(hi)?;
+            let (f_hi_val, _, _) = eval(hi)?;
             f_hi = f_hi_val;
             f_lo = f_lo_found;
         }
@@ -1948,16 +2281,16 @@ impl BernoulliMarginalSlopeFamily {
         {
             (a, f_init, f_deriv_init)
         } else if f_lo.abs() <= f_hi.abs() {
-            let (_, d_lo) = eval(lo)?;
+            let (_, d_lo, _) = eval(lo)?;
             (lo, f_lo, d_lo)
         } else {
-            let (_, d_hi) = eval(hi)?;
+            let (_, d_hi, _) = eval(hi)?;
             (hi, f_hi, d_hi)
         };
 
         a = a.clamp(lo, hi);
         for _ in 0..48 {
-            let (f_val, f_deriv) = eval(a)?;
+            let (f_val, f_deriv, _) = eval(a)?;
             if f_val.abs() < best_f.abs() {
                 best_a = a;
                 best_f = f_val;
@@ -1978,7 +2311,7 @@ impl BernoulliMarginalSlopeFamily {
 
             if (hi - lo) <= 1e-12 * (1.0 + a.abs()) {
                 let mid = 0.5 * (lo + hi);
-                let (f_mid, f_mid_deriv) = eval(mid)?;
+                let (f_mid, f_mid_deriv, _) = eval(mid)?;
                 if f_mid.abs() < best_f.abs() {
                     best_a = mid;
                     best_f = f_mid;
@@ -2218,23 +2551,29 @@ impl BernoulliMarginalSlopeFamily {
             None
         };
         let h_obs_base = if let Some((_, dev_obs)) = score_warp_obs {
-            self.z[row] + dev_obs[row]
+            dev_obs[row]
         } else {
-            self.z[row]
+            0.0
         };
         let (intercept, m_a) = if self.flex_active() {
-            self.solve_row_intercept_base(marginal_eta, slope, h_nodes, beta_w)?
+            self.solve_row_intercept_base(
+                marginal_eta,
+                slope,
+                self.flex_score_beta(block_states)?,
+                h_nodes,
+                beta_w,
+            )?
         } else {
             (marginal_eta * (1.0 + slope * slope).sqrt(), f64::NAN)
         };
         let node_link = if let Some(runtime) = &self.link_dev {
-            let u_base = h_nodes.mapv(|h| intercept + slope * h);
+            let u_base = self.quadrature_nodes.mapv(|z| intercept + slope * z);
             Some(self.link_basis_stack(runtime, &u_base, link_order)?)
         } else {
             None
         };
         let obs_link = if let Some(runtime) = &self.link_dev {
-            let eta_base = Array1::from_vec(vec![intercept + slope * h_obs_base]);
+            let eta_base = Array1::from_vec(vec![intercept + slope * self.z[row]]);
             Some(self.link_basis_stack(runtime, &eta_base, link_order)?)
         } else {
             None
@@ -2782,6 +3121,8 @@ impl BernoulliMarginalSlopeFamily {
         };
         let phi_q = normal_pdf(q);
         let inv_ma = 1.0 / m_a;
+        let h_range = primary.h.as_ref();
+        let w_range = primary.w.as_ref();
 
         // ── Phase 1: intercept-equation derivatives over quadrature nodes ──
         let mut m_aa = 0.0f64;
@@ -2791,24 +3132,37 @@ impl BernoulliMarginalSlopeFamily {
         let nq = h_nodes.len();
         let rho = &mut scratch.rho;
         let tau = &mut scratch.tau;
-        let du = &mut scratch.du;
         for j in 0..nq {
+            let z_j = self.quadrature_nodes[j];
             let h_j = h_nodes[j];
             let omega_j = self.quadrature_weights[j];
             let h_row = h_node_design.as_ref().map(|design| design.row(j));
-            let (s_j, c_j, d_j, _) = self.fill_fixed_a_jets(
-                primary,
-                b,
-                h_j,
-                a + b * h_j,
-                h_row,
-                row_ctx.node_link.as_ref(),
-                j,
-                beta_w,
-                rho,
-                tau,
-                du,
-            )?;
+            rho.fill(0.0);
+            tau.fill(0.0);
+            let (link_dev, c_j, d_j) = if let Some(link) = row_ctx.node_link.as_ref() {
+                let bw = beta_w.ok_or_else(|| "missing link deviation coefficients".to_string())?;
+                (
+                    link.basis.row(j).dot(bw),
+                    1.0 + link.d1.row(j).dot(bw),
+                    link.d2.row(j).dot(bw),
+                )
+            } else {
+                (0.0, 1.0, 0.0)
+            };
+            let s_j = a + b * z_j + b * h_j + link_dev;
+            rho[1] = z_j + h_j + (c_j - 1.0) * z_j;
+            tau[1] = d_j * z_j;
+            if let (Some(h_range), Some(h_row)) = (h_range, h_row) {
+                for (local_idx, &basis_val) in h_row.iter().enumerate() {
+                    rho[h_range.start + local_idx] = b * basis_val;
+                }
+            }
+            if let (Some(w_range), Some(link)) = (w_range, row_ctx.node_link.as_ref()) {
+                for local_idx in 0..w_range.len() {
+                    rho[w_range.start + local_idx] = link.basis[[j, local_idx]];
+                    tau[w_range.start + local_idx] = link.d1[[j, local_idx]];
+                }
+            }
             let r_j = omega_j * normal_pdf(s_j);
             let t_j = -s_j * r_j;
             for u in 0..r {
@@ -2826,18 +3180,23 @@ impl BernoulliMarginalSlopeFamily {
                         }
                     }
                 }
-                self.add_fixed_a_second_derivative(
-                    primary,
-                    b,
-                    h_j,
-                    h_row,
-                    row_ctx.node_link.as_ref(),
-                    j,
-                    c_j,
-                    d_j,
-                    r_j,
-                    m_uv,
-                );
+                m_uv[[1, 1]] += r_j * d_j * z_j * z_j;
+                if let (Some(h_range), Some(h_row)) = (h_range, h_row) {
+                    for (k, &basis_k) in h_row.iter().enumerate() {
+                        let idx_k = h_range.start + k;
+                        let bh_val = r_j * basis_k;
+                        m_uv[[1, idx_k]] += bh_val;
+                        m_uv[[idx_k, 1]] += bh_val;
+                    }
+                }
+                if let (Some(w_range), Some(link)) = (w_range, row_ctx.node_link.as_ref()) {
+                    for ell in 0..w_range.len() {
+                        let idx_l = w_range.start + ell;
+                        let bw_val = r_j * z_j * link.d1[[j, ell]];
+                        m_uv[[1, idx_l]] += bw_val;
+                        m_uv[[idx_l, 1]] += bw_val;
+                    }
+                }
             }
         }
         m_u[0] -= phi_q;
@@ -2867,20 +3226,34 @@ impl BernoulliMarginalSlopeFamily {
 
         // ── Phase 3: observed predictor ──
         let h_obs = row_ctx.h_obs_base;
+        let z_obs = self.z[row];
         let obs_basis_row = obs_row.as_ref().copied();
-        let (eta_val, c_o, d_o, _) = self.fill_fixed_a_jets(
-            primary,
-            b,
-            h_obs,
-            a + b * h_obs,
-            obs_basis_row,
-            row_ctx.obs_link.as_ref(),
-            0,
-            beta_w,
-            rho,
-            tau,
-            du,
-        )?;
+        rho.fill(0.0);
+        tau.fill(0.0);
+        let (link_dev_obs, c_o, d_o) = if let Some(link) = row_ctx.obs_link.as_ref() {
+            let bw = beta_w.ok_or_else(|| "missing link deviation coefficients".to_string())?;
+            (
+                link.basis.row(0).dot(bw),
+                1.0 + link.d1.row(0).dot(bw),
+                link.d2.row(0).dot(bw),
+            )
+        } else {
+            (0.0, 1.0, 0.0)
+        };
+        let eta_val = a + b * z_obs + b * h_obs + link_dev_obs;
+        rho[1] = z_obs + h_obs + (c_o - 1.0) * z_obs;
+        tau[1] = d_o * z_obs;
+        if let (Some(h_range), Some(obs_basis_row)) = (h_range, obs_basis_row) {
+            for (local_idx, &basis_val) in obs_basis_row.iter().enumerate() {
+                rho[h_range.start + local_idx] = b * basis_val;
+            }
+        }
+        if let (Some(w_range), Some(link)) = (w_range, row_ctx.obs_link.as_ref()) {
+            for local_idx in 0..w_range.len() {
+                rho[w_range.start + local_idx] = link.basis[[0, local_idx]];
+                tau[w_range.start + local_idx] = link.d1[[0, local_idx]];
+            }
+        }
         let eta_u = &mut scratch.grad;
         for u in 0..r {
             eta_u[u] = c_o * a_u[u] + rho[u];
@@ -2893,18 +3266,22 @@ impl BernoulliMarginalSlopeFamily {
         let hess = &mut scratch.hess;
         if need_hessian {
             hess.fill(0.0);
-            self.add_fixed_a_second_derivative(
-                primary,
-                b,
-                h_obs,
-                obs_basis_row,
-                row_ctx.obs_link.as_ref(),
-                0,
-                c_o,
-                d_o,
-                1.0,
-                hess,
-            );
+            hess[[1, 1]] += d_o * z_obs * z_obs;
+            if let (Some(h_range), Some(obs_basis_row)) = (h_range, obs_basis_row) {
+                for (k, &basis_k) in obs_basis_row.iter().enumerate() {
+                    let idx_k = h_range.start + k;
+                    hess[[1, idx_k]] += basis_k;
+                    hess[[idx_k, 1]] += basis_k;
+                }
+            }
+            if let (Some(w_range), Some(link)) = (w_range, row_ctx.obs_link.as_ref()) {
+                for ell in 0..w_range.len() {
+                    let idx_l = w_range.start + ell;
+                    let bw_val = z_obs * link.d1[[0, ell]];
+                    hess[[1, idx_l]] += bw_val;
+                    hess[[idx_l, 1]] += bw_val;
+                }
+            }
             for u in 0..r {
                 for v in u..r {
                     let eta_uv = c_o * a_uv[[u, v]]
@@ -2947,6 +3324,10 @@ impl BernoulliMarginalSlopeFamily {
             out[[1, 1]] = t[1][1];
             return Ok(out);
         }
+        return Err(
+            "bernoulli marginal-slope flexible third-order directional derivatives are not available for the exact de-nested cubic kernel"
+                .to_string(),
+        );
         // Flex: analytic IFT 3rd order
         let r = primary.total;
         let q = block_states[0].eta[row];
@@ -3409,6 +3790,10 @@ impl BernoulliMarginalSlopeFamily {
             out[[1, 1]] = f[1][1];
             return Ok(out);
         }
+        return Err(
+            "bernoulli marginal-slope flexible fourth-order directional derivatives are not available for the exact de-nested cubic kernel"
+                .to_string(),
+        );
         // Flex: analytic IFT through 4th order.
         // Compute a_{klv}, a_{klu} (3rd IFT), then a_{kluv} (4th IFT),
         // push through observation-point chain rule and Faa di Bruno.
@@ -5945,6 +6330,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
+        if self.flex_active() {
+            return ExactOuterDerivativeOrder::First;
+        }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
@@ -6005,12 +6393,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     |left, right| -> Result<_, String> { Ok(left + right) },
                 );
         }
-        let cache = self.build_exact_eval_cache_with_order(block_states, LinkOrder::ValueD1)?;
+        let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = if self.link_dev.is_some() {
             block_states.last().map(|state| &state.beta)
         } else {
             None
         };
+        let score_warp_obs = self.score_warp_obs(block_states)?;
+        let empty_nodes = Array1::<f64>::zeros(0);
         let n = self.y.len();
         (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
@@ -6020,15 +6410,29 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                        let row_ctx = Self::row_ctx(&cache, row);
+                        let intercept = self
+                            .solve_row_intercept_base(
+                                block_states[0].eta[row],
+                                block_states[1].eta[row],
+                                beta_h,
+                                &empty_nodes,
+                                beta_w,
+                            )?
+                            .0;
                         let slope = block_states[1].eta[row];
-                        let eta_obs = row_ctx.intercept + slope * row_ctx.h_obs_base;
-                        let s_i =
-                            if let (Some(ls), Some(beta)) = (row_ctx.obs_link.as_ref(), beta_w) {
-                                eta_obs + ls.basis.row(0).dot(beta)
-                            } else {
-                                eta_obs
-                            };
+                        let h_obs = score_warp_obs
+                            .as_ref()
+                            .map(|(_, dev_obs)| dev_obs[row])
+                            .unwrap_or(0.0);
+                        let eta_obs = intercept
+                            + slope * self.z[row]
+                            + slope * h_obs;
+                        let s_i = if beta_w.is_some() {
+                            self.link_terms_value_d1(&Array1::from_vec(vec![eta_obs]), beta_w)?
+                                .0[0]
+                        } else {
+                            eta_obs
+                        };
                         let signed = (2.0 * self.y[row] - 1.0) * s_i;
                         let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
                         ll += self.weights[row] * log_cdf;
@@ -6147,12 +6551,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
             crate::families::row_kernel::row_kernel_directional_derivative(&kern, sl).map(Some)
         } else {
-            let cache = self.build_exact_eval_cache(block_states)?;
-            self.exact_newton_joint_hessian_directional_derivative_from_cache(
-                block_states,
-                d_beta_flat,
-                &cache,
-            )
+            Ok(None)
         }
     }
 
@@ -6169,13 +6568,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             crate::families::row_kernel::row_kernel_second_directional_derivative(&kern, su, sv)
                 .map(Some)
         } else {
-            let cache = self.build_exact_eval_cache(block_states)?;
-            self.exact_newton_joint_hessiansecond_directional_derivative_from_cache(
-                block_states,
-                d_beta_u_flat,
-                d_beta_v_flat,
-                &cache,
-            )
+            Ok(None)
         }
     }
 
@@ -6252,52 +6645,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_idx: usize,
         spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        let slices = block_slices(
-            block_states,
-            self.score_warp.is_some(),
-            self.link_dev.is_some(),
-        );
-        if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
-            if let Some(runtime) = &self.score_warp {
-                if spec.design.ncols() != runtime.basis_dim {
-                    return Err(format!(
-                        "score-warp constraint dimension mismatch: block has {}, runtime has {}",
-                        spec.design.ncols(),
-                        runtime.basis_dim
-                    ));
-                }
-                return Ok(Some(LinearInequalityConstraints {
-                    a: runtime.endpoint_d1_design.clone(),
-                    b: Array1::from_elem(
-                        runtime.endpoint_constraint_points().len(),
-                        runtime.monotonicity_eps - 1.0,
-                    ),
-                }));
-            }
-        }
-        let link_block_idx = if slices.h.is_some() { 3 } else { 2 };
-        if slices
-            .w
-            .as_ref()
-            .is_some_and(|_| block_idx == link_block_idx)
-        {
-            if let Some(runtime) = &self.link_dev {
-                if spec.design.ncols() != runtime.basis_dim {
-                    return Err(format!(
-                        "link-deviation constraint dimension mismatch: block has {}, runtime has {}",
-                        spec.design.ncols(),
-                        runtime.basis_dim
-                    ));
-                }
-                return Ok(Some(LinearInequalityConstraints {
-                    a: runtime.endpoint_d1_design.clone(),
-                    b: Array1::from_elem(
-                        runtime.endpoint_constraint_points().len(),
-                        runtime.monotonicity_eps - 1.0,
-                    ),
-                }));
-            }
-        }
+        let _ = (block_states, block_idx, spec);
+        // The exact de-nested cubic path does not expose the old endpoint-only
+        // linearized derivative constraints. Monotonicity is enforced by the
+        // exact cubic feasibility runtime and step-size limiter instead.
         Ok(None)
     }
 
@@ -6314,6 +6665,53 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 block_idx,
                 block_states.len()
             ));
+        }
+        let slices = block_slices(
+            block_states,
+            self.score_warp.is_some(),
+            self.link_dev.is_some(),
+        );
+        if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
+            if let Some(runtime) = &self.score_warp {
+                let current = &block_states[2].beta;
+                if current.len() != beta.len() {
+                    return Err(format!(
+                        "score-warp post-update beta length mismatch: current={}, proposed={}",
+                        current.len(),
+                        beta.len()
+                    ));
+                }
+                let delta = &beta - current;
+                let Some(alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
+                    return Ok(current.clone());
+                };
+                return Ok(current + &(delta * alpha));
+            }
+        }
+        let link_block_idx = if slices.h.is_some() { 3 } else { 2 };
+        if slices
+            .w
+            .as_ref()
+            .is_some_and(|_| block_idx == link_block_idx)
+        {
+            if let Some(runtime) = &self.link_dev {
+                let current = block_states
+                    .get(link_block_idx)
+                    .map(|state| &state.beta)
+                    .ok_or_else(|| "missing current link-deviation block state".to_string())?;
+                if current.len() != beta.len() {
+                    return Err(format!(
+                        "link-deviation post-update beta length mismatch: current={}, proposed={}",
+                        current.len(),
+                        beta.len()
+                    ));
+                }
+                let delta = &beta - current;
+                let Some(alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
+                    return Ok(current.clone());
+                };
+                return Ok(current + &(delta * alpha));
+            }
         }
         Ok(beta)
     }
@@ -6797,7 +7195,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         logslope_design: designs.remove(0),
         baseline_marginal: baseline.0,
         baseline_logslope: baseline.1,
-        quadrature_points,
         score_warp_runtime,
         link_dev_runtime,
     })
@@ -6806,6 +7203,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::families::bernoulli_marginal_slope_exact::{
+        DenestedCubicCell as ExactDenestedCubicCell,
+        ExactCellBranch as ExactCellBranchShared,
+        LocalSpanCubic,
+        branch_cell as branch_exact_cell,
+        build_denested_partition_cells,
+        denested_cell_coefficient_partials as exact_denested_cell_coefficient_partials,
+        global_cubic_from_local as exact_global_cubic_from_local,
+        transformed_link_cubic as exact_transformed_link_cubic,
+    };
     use crate::custom_family::CustomFamily;
     use ndarray::array;
 
@@ -6881,7 +7288,7 @@ mod tests {
     }
 
     #[test]
-    fn link_dev_without_score_warp_uses_w_block_and_constraints() {
+    fn link_dev_without_score_warp_uses_w_block_without_linear_constraint_shortcut() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
         let prepared = build_deviation_block_from_seed(
             &seed,
@@ -6968,31 +7375,24 @@ mod tests {
         );
 
         let dummy_spec = dummy_blockspec(link_dim, seed.len());
-        let constraints = family
-            .block_linear_constraints(&block_states, 2, &dummy_spec)
-            .expect("constraint lookup")
-            .expect("link block constraints");
-        let expected_a = prepared
-            .runtime
-            .first_derivative_design(prepared.runtime.endpoint_constraint_points())
-            .expect("endpoint derivative design");
-        let expected_b = Array1::from_elem(
-            prepared.runtime.endpoint_constraint_points().len(),
-            prepared.runtime.monotonicity_eps - 1.0,
-        );
-        assert_eq!(constraints.a, expected_a);
-        assert_eq!(constraints.b, expected_b);
         assert!(
             family
                 .block_linear_constraints(&block_states, 1, &dummy_spec)
                 .expect("non-link constraint lookup")
                 .is_none(),
-            "only block 2 should expose link constraints when score_warp is absent"
+            "non-link block should not expose linearized monotonicity constraints"
+        );
+        assert!(
+            family
+                .block_linear_constraints(&block_states, 2, &dummy_spec)
+                .expect("link constraint lookup")
+                .is_none(),
+            "link block should use exact monotonicity runtime rather than endpoint-only linear constraints"
         );
     }
 
     #[test]
-    fn score_warp_constraints_use_endpoint_derivative_constraints() {
+    fn score_warp_block_uses_exact_monotonicity_runtime_without_linear_constraints() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
         let prepared = build_deviation_block_from_seed(
             &seed,
@@ -7031,20 +7431,13 @@ mod tests {
         ];
 
         let dummy_spec = dummy_blockspec(score_dim, seed.len());
-        let constraints = family
-            .block_linear_constraints(&block_states, 2, &dummy_spec)
-            .expect("constraint lookup")
-            .expect("score-warp constraints");
-        let expected_a = prepared
-            .runtime
-            .first_derivative_design(prepared.runtime.endpoint_constraint_points())
-            .expect("endpoint derivative design");
-        let expected_b = Array1::from_elem(
-            prepared.runtime.endpoint_constraint_points().len(),
-            prepared.runtime.monotonicity_eps - 1.0,
+        assert!(
+            family
+                .block_linear_constraints(&block_states, 2, &dummy_spec)
+                .expect("constraint lookup")
+                .is_none(),
+            "score-warp block should rely on exact monotonicity checks, not endpoint-only linear constraints"
         );
-        assert_eq!(constraints.a, expected_a);
-        assert_eq!(constraints.b, expected_b);
     }
 
     #[test]
@@ -7106,6 +7499,53 @@ mod tests {
     }
 
     #[test]
+    fn post_update_block_beta_projects_score_warp_to_feasible_step() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared.block.design.ncols();
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(Array1::zeros(seed.len())),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            quadrature_nodes: array![0.0],
+            quadrature_weights: array![1.0],
+            score_warp: Some(prepared.runtime.clone()),
+            score_warp_obs_design: Some(prepared.block.design.clone()),
+            link_dev: None,
+        };
+        let current = Array1::<f64>::zeros(score_dim);
+        let mut proposed = current.clone();
+        proposed[0] = -128.0;
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(current.clone(), seed.len()),
+        ];
+        let spec = dummy_blockspec(score_dim, seed.len());
+        let updated = family
+            .post_update_block_beta(&block_states, 2, &spec, proposed.clone())
+            .expect("projected beta");
+        prepared
+            .runtime
+            .monotonicity_feasible(&updated, "projected score-warp")
+            .expect("post-update beta should remain feasible");
+        assert_ne!(updated, proposed);
+    }
+
+    #[test]
     fn exact_monotonicity_requires_cubic_deviation_basis() {
         let seed = array![-1.0, 0.0, 1.0];
         let err = match build_deviation_block_from_seed(
@@ -7118,7 +7558,373 @@ mod tests {
             Ok(_) => panic!("non-cubic deviation basis should be rejected"),
             Err(err) => err,
         };
-        assert!(err.contains("requires cubic splines"));
+        assert!(err.contains("requires cubic deviation blocks"));
+    }
+
+    #[test]
+    fn local_cubic_span_reconstructs_deviation_exactly() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build deviation block");
+        let dim = prepared.block.design.ncols();
+        let beta = Array1::from_iter((0..dim).map(|idx| 0.025 * (idx as f64 + 1.0)));
+
+        for span_idx in 0..prepared.runtime.span_count() {
+            let cubic = prepared
+                .runtime
+                .local_cubic_on_span(&beta, span_idx)
+                .expect("local cubic coefficients");
+            let left = cubic.left;
+            let right = cubic.right;
+            let x_eval = array![left, 0.5 * (left + right), right];
+            let value_design = prepared.runtime.design(&x_eval).expect("value design");
+            let d1_design = prepared
+                .runtime
+                .first_derivative_design(&x_eval)
+                .expect("first derivative design");
+            let d2_design = prepared
+                .runtime
+                .second_derivative_design(&x_eval)
+                .expect("second derivative design");
+            let expected = value_design.dot(&beta);
+            let expected_d1 = d1_design.dot(&beta);
+            let expected_d2 = d2_design.dot(&beta);
+            for i in 0..x_eval.len() {
+                let x = x_eval[i];
+                assert!(
+                    (cubic.evaluate(x) - expected[i]).abs() < 1e-10,
+                    "span {span_idx}, x={x:.6}: cubic value mismatch"
+                );
+                assert!(
+                    (cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10,
+                    "span {span_idx}, x={x:.6}: cubic first-derivative mismatch"
+                );
+                assert!(
+                    (cubic.second_derivative(x) - expected_d2[i]).abs() < 1e-10,
+                    "span {span_idx}, x={x:.6}: cubic second-derivative mismatch"
+                );
+                let selected = prepared
+                    .runtime
+                    .local_cubic_at(&beta, x)
+                    .expect("lookup cubic at x");
+                assert_eq!(selected.left, cubic.left);
+                assert_eq!(selected.right, cubic.right);
+            }
+        }
+    }
+
+    #[test]
+    fn basis_span_cubic_reconstructs_basis_column_exactly() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build deviation block");
+        let basis_idx = 0usize;
+        let cubic = prepared
+            .runtime
+            .basis_span_cubic(0, basis_idx)
+            .expect("basis span cubic");
+        let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
+        let design = prepared.runtime.design(&x_eval).expect("basis design");
+        let d1 = prepared
+            .runtime
+            .first_derivative_design(&x_eval)
+            .expect("basis d1 design");
+        for i in 0..x_eval.len() {
+            let x = x_eval[i];
+            assert!((cubic.evaluate(x) - design[[i, basis_idx]]).abs() < 1e-10);
+            assert!((cubic.first_derivative(x) - d1[[i, basis_idx]]).abs() < 1e-10);
+            let selected = prepared
+                .runtime
+                .basis_cubic_at(basis_idx, x)
+                .expect("basis cubic at x");
+            assert_eq!(selected.left, cubic.left);
+            assert_eq!(selected.right, cubic.right);
+        }
+    }
+
+    #[test]
+    fn denested_microcells_follow_score_and_link_breaks() {
+        let score_seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
+        let link_seed = array![-1.5, -0.5, 0.5, 1.5];
+        let score_prepared = build_deviation_block_from_seed(
+            &score_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 3,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score warp block");
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 3,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let beta_h = Array1::from_iter(
+            (0..score_prepared.block.design.ncols()).map(|idx| 0.02 * (idx as f64 + 1.0)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+        );
+
+        let exact_cells_a0 = build_denested_partition_cells(
+            0.25,
+            0.9,
+            score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
+            link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
+            |z| score_prepared.runtime.exact_local_cubic_at(&beta_h, z),
+            |u| link_prepared.runtime.exact_local_cubic_at(&beta_w, u),
+        )
+        .expect("exact module microcells for a=0.25");
+        let exact_cells_a1 = build_denested_partition_cells(
+            0.55,
+            0.9,
+            score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
+            link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
+            |z| score_prepared.runtime.exact_local_cubic_at(&beta_h, z),
+            |u| link_prepared.runtime.exact_local_cubic_at(&beta_w, u),
+        )
+        .expect("exact module microcells for a=0.55");
+
+        assert!(
+            exact_cells_a0.len() >= score_prepared.runtime.span_count(),
+            "microcell partition should refine the score spans"
+        );
+        assert!(
+            exact_cells_a0
+                .windows(2)
+                .all(|w| (w[0].cell.right - w[1].cell.left).abs() <= 1e-12),
+            "microcells should tile the partition contiguously"
+        );
+        assert!(
+            exact_cells_a0
+                .iter()
+                .zip(exact_cells_a1.iter())
+                .any(|(lhs, rhs)| (lhs.cell.left - rhs.cell.left).abs() > 1e-10),
+            "changing the intercept should move at least one link-induced breakpoint"
+        );
+    }
+
+    #[test]
+    fn denested_microcell_eta_matches_direct_denested_formula() {
+        let score_seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
+        let link_seed = array![-1.5, -0.5, 0.5, 1.5];
+        let score_prepared = build_deviation_block_from_seed(
+            &score_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 3,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score warp block");
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 3,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let beta_h = Array1::from_iter(
+            (0..score_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.block.design.ncols()).map(|idx| 0.02 * (idx as f64 + 1.0)),
+        );
+
+        let a = 0.35;
+        let b = -0.7;
+        let cells = build_denested_partition_cells(
+            a,
+            b,
+            score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
+            link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
+            |z| score_prepared.runtime.exact_local_cubic_at(&beta_h, z),
+            |u| link_prepared.runtime.exact_local_cubic_at(&beta_w, u),
+        )
+        .expect("microcells");
+
+        for cell in &cells {
+            let z = 0.5 * (cell.cell.left + cell.cell.right);
+            let h = score_prepared
+                .runtime
+                .design(&array![z])
+                .expect("score design")
+                .row(0)
+                .dot(&beta_h);
+            let link = link_prepared
+                .runtime
+                .design(&array![a + b * z])
+                .expect("link design")
+                .row(0)
+                .dot(&beta_w);
+            let expected = a + b * z + b * h + link;
+            assert!(
+                (cell.eta(z) - expected).abs() < 1e-10,
+                "microcell eta should equal the direct de-nested predictor at z={z:.6}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_cubic_global_transform_reconstructs_same_function() {
+        let cubic = DeviationSpanCubic {
+            left: -1.3,
+            right: 0.7,
+            c0: 0.4,
+            c1: -0.2,
+            c2: 0.15,
+            c3: -0.05,
+        };
+        let (g0, g1, g2, g3) = exact_global_cubic_from_local(LocalSpanCubic {
+            left: cubic.left,
+            right: cubic.right,
+            c0: cubic.c0,
+            c1: cubic.c1,
+            c2: cubic.c2,
+            c3: cubic.c3,
+        });
+        for &x in &[-1.3, -0.8, -0.1, 0.5, 0.7] {
+            let direct = cubic.evaluate(x);
+            let global = g0 + g1 * x + g2 * x * x + g3 * x * x * x;
+            assert!(
+                (direct - global).abs() < 1e-12,
+                "global cubic transform should preserve the span polynomial at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn denested_branch_selection_uses_normalized_cell_coefficients() {
+        let affine = ExactDenestedCubicCell {
+            left: -1.0,
+            right: 1.0,
+            c0: 0.2,
+            c1: -0.4,
+            c2: 1e-13,
+            c3: -1e-13,
+        };
+        let quartic = ExactDenestedCubicCell {
+            c2: 2e-4,
+            c3: 1e-13,
+            ..affine
+        };
+        let sextic = ExactDenestedCubicCell {
+            c2: 2e-4,
+            c3: 5e-3,
+            ..affine
+        };
+        assert_eq!(
+            branch_exact_cell(affine).expect("affine branch"),
+            ExactCellBranchShared::Affine
+        );
+        assert_eq!(
+            branch_exact_cell(quartic).expect("quartic branch"),
+            ExactCellBranchShared::Quartic
+        );
+        assert_eq!(
+            branch_exact_cell(sextic).expect("sextic branch"),
+            ExactCellBranchShared::Sextic
+        );
+    }
+
+    #[test]
+    fn denested_cell_coefficient_partials_match_finite_differences() {
+        let score_span = DeviationSpanCubic {
+            left: -0.75,
+            right: 0.25,
+            c0: 0.08,
+            c1: -0.03,
+            c2: 0.02,
+            c3: -0.01,
+        };
+        let link_span = DeviationSpanCubic {
+            left: -0.6,
+            right: 0.9,
+            c0: -0.05,
+            c1: 0.04,
+            c2: -0.02,
+            c3: 0.015,
+        };
+        let a = 0.3;
+        let b = -0.7;
+        let eps = 1e-6;
+
+        let coeffs = |aa: f64, bb: f64| {
+            let (h0, h1, h2, h3) = exact_global_cubic_from_local(LocalSpanCubic {
+                left: score_span.left,
+                right: score_span.right,
+                c0: score_span.c0,
+                c1: score_span.c1,
+                c2: score_span.c2,
+                c3: score_span.c3,
+            });
+            let (d0, d1, d2, d3) = exact_transformed_link_cubic(
+                LocalSpanCubic {
+                    left: link_span.left,
+                    right: link_span.right,
+                    c0: link_span.c0,
+                    c1: link_span.c1,
+                    c2: link_span.c2,
+                    c3: link_span.c3,
+                },
+                aa,
+                bb,
+            );
+            [aa + bb * h0 + d0, bb + bb * h1 + d1, bb * h2 + d2, bb * h3 + d3]
+        };
+        let (dc_da, dc_db) = exact_denested_cell_coefficient_partials(
+            LocalSpanCubic {
+                left: score_span.left,
+                right: score_span.right,
+                c0: score_span.c0,
+                c1: score_span.c1,
+                c2: score_span.c2,
+                c3: score_span.c3,
+            },
+            LocalSpanCubic {
+                left: link_span.left,
+                right: link_span.right,
+                c0: link_span.c0,
+                c1: link_span.c1,
+                c2: link_span.c2,
+                c3: link_span.c3,
+            },
+            a,
+            b,
+        );
+        let plus_a = coeffs(a + eps, b);
+        let minus_a = coeffs(a - eps, b);
+        let plus_b = coeffs(a, b + eps);
+        let minus_b = coeffs(a, b - eps);
+        for j in 0..4 {
+            let fd_a = (plus_a[j] - minus_a[j]) / (2.0 * eps);
+            let fd_b = (plus_b[j] - minus_b[j]) / (2.0 * eps);
+            assert!(
+                (dc_da[j] - fd_a).abs() < 1e-6,
+                "dc/da mismatch at coefficient {j}: analytic={}, fd={fd_a}",
+                dc_da[j]
+            );
+            assert!(
+                (dc_db[j] - fd_b).abs() < 1e-6,
+                "dc/db mismatch at coefficient {j}: analytic={}, fd={fd_b}",
+                dc_db[j]
+            );
+        }
     }
 
     #[test]
@@ -7198,6 +8004,48 @@ mod tests {
         // n=10_000 × k_pairs=6 × primary²=256 = 15_360_000 > 2M.
         assert_eq!(
             bernoulli_row_work_order(10_000, 8, 6, 3),
+            ExactOuterDerivativeOrder::First
+        );
+    }
+
+    #[test]
+    fn flexible_family_disables_high_order_outer_derivatives_during_denested_rewrite() {
+        let seed = array![-1.0, 0.0, 1.0];
+        let score_prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 3,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(3)),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0],
+                [1.0]
+            ])),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0],
+                [1.0]
+            ])),
+            quadrature_nodes: array![0.0],
+            quadrature_weights: array![1.0],
+            score_warp: Some(score_prepared.runtime),
+            score_warp_obs_design: Some(score_prepared.block.design),
+            link_dev: None,
+        };
+        let specs = vec![
+            dummy_blockspec(1, 3),
+            dummy_blockspec(1, 3),
+            dummy_blockspec(2, 3),
+        ];
+        assert_eq!(
+            family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
             ExactOuterDerivativeOrder::First
         );
     }
@@ -7460,5 +8308,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn flexible_denested_gradient_matches_loglik_finite_differences() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let (quad_nodes, quad_weights) = normal_expectation_nodes(21);
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0],
+                [1.0]
+            ])),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [1.0],
+                [1.0]
+            ])),
+            quadrature_nodes: quad_nodes,
+            quadrature_weights: quad_weights,
+            score_warp: Some(score_prepared.runtime.clone()),
+            score_warp_obs_design: Some(score_prepared.block.design.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let beta_h = Array1::from_iter(
+            (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+        );
+        let states_at = |q: f64, b: f64, bh: Array1<f64>, bw: Array1<f64>| {
+            vec![
+                ParameterBlockState {
+                    beta: array![q],
+                    eta: Array1::from_elem(z.len(), q),
+                },
+                ParameterBlockState {
+                    beta: array![b],
+                    eta: Array1::from_elem(z.len(), b),
+                },
+                ParameterBlockState {
+                    beta: bh,
+                    eta: Array1::zeros(z.len()),
+                },
+                ParameterBlockState {
+                    beta: bw,
+                    eta: Array1::zeros(z.len()),
+                },
+            ]
+        };
+
+        let q0 = 0.25;
+        let b0 = 0.6;
+        let block_states = states_at(q0, b0, beta_h.clone(), beta_w.clone());
+        let eval = family.evaluate(&block_states).expect("family evaluation");
+        let grad_q = match &eval.blockworking_sets[0] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton q block"),
+        };
+        let grad_b = match &eval.blockworking_sets[1] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton b block"),
+        };
+        let grad_h0 = match &eval.blockworking_sets[2] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton h block"),
+        };
+        let grad_w0 = match &eval.blockworking_sets[3] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton w block"),
+        };
+
+        let fd = |which: &str, eps: f64| {
+            match which {
+                "q" => {
+                    let plus = family
+                        .log_likelihood_only(&states_at(q0 + eps, b0, beta_h.clone(), beta_w.clone()))
+                        .expect("ll plus q");
+                    let minus = family
+                        .log_likelihood_only(&states_at(q0 - eps, b0, beta_h.clone(), beta_w.clone()))
+                        .expect("ll minus q");
+                    (plus - minus) / (2.0 * eps)
+                }
+                "b" => {
+                    let plus = family
+                        .log_likelihood_only(&states_at(q0, b0 + eps, beta_h.clone(), beta_w.clone()))
+                        .expect("ll plus b");
+                    let minus = family
+                        .log_likelihood_only(&states_at(q0, b0 - eps, beta_h.clone(), beta_w.clone()))
+                        .expect("ll minus b");
+                    (plus - minus) / (2.0 * eps)
+                }
+                "h0" => {
+                    let mut plus_h = beta_h.clone();
+                    plus_h[0] += eps;
+                    let mut minus_h = beta_h.clone();
+                    minus_h[0] -= eps;
+                    let plus = family
+                        .log_likelihood_only(&states_at(q0, b0, plus_h, beta_w.clone()))
+                        .expect("ll plus h");
+                    let minus = family
+                        .log_likelihood_only(&states_at(q0, b0, minus_h, beta_w.clone()))
+                        .expect("ll minus h");
+                    (plus - minus) / (2.0 * eps)
+                }
+                "w0" => {
+                    let mut plus_w = beta_w.clone();
+                    plus_w[0] += eps;
+                    let mut minus_w = beta_w.clone();
+                    minus_w[0] -= eps;
+                    let plus = family
+                        .log_likelihood_only(&states_at(q0, b0, beta_h.clone(), plus_w))
+                        .expect("ll plus w");
+                    let minus = family
+                        .log_likelihood_only(&states_at(q0, b0, beta_h.clone(), minus_w))
+                        .expect("ll minus w");
+                    (plus - minus) / (2.0 * eps)
+                }
+                _ => panic!("unknown derivative target"),
+            }
+        };
+
+        let eps = 1e-5;
+        assert!((grad_q - fd("q", eps)).abs() < 2e-4);
+        assert!((grad_b - fd("b", eps)).abs() < 2e-4);
+        assert!((grad_h0 - fd("h0", eps)).abs() < 2e-4);
+        assert!((grad_w0 - fd("w0", eps)).abs() < 2e-4);
     }
 }

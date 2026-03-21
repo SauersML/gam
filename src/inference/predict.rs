@@ -1,5 +1,4 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::bernoulli_marginal_slope_quadrature_points;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::inference::model::{SavedAnchoredDeviationRuntime, SavedLinkWiggleRuntime};
 use crate::inference::prediction_linalg::{
@@ -775,6 +774,131 @@ pub struct BernoulliMarginalSlopePredictor {
 }
 
 impl BernoulliMarginalSlopePredictor {
+    fn denested_partition_cells(
+        &self,
+        a: f64,
+        b: f64,
+        beta_score_warp: Option<&Array1<f64>>,
+        beta_link_dev: Option<&Array1<f64>>,
+    ) -> Result<Vec<crate::families::bernoulli_marginal_slope_exact::DenestedPartitionCell>, EstimationError>
+    {
+        let score_tail = 8.0;
+        let mut score_breaks = if let Some(runtime) = self.score_warp_runtime.as_ref() {
+            runtime.breakpoints().map_err(EstimationError::InvalidInput)?
+        } else {
+            vec![-8.0, 8.0]
+        };
+        if score_breaks.first().copied().unwrap_or(score_tail) > -score_tail {
+            score_breaks.insert(0, -score_tail);
+        }
+        if score_breaks.last().copied().unwrap_or(-score_tail) < score_tail {
+            score_breaks.push(score_tail);
+        }
+        let link_tail = 8.0 * (1.0 + b.abs());
+        let mut link_breaks = if let Some(runtime) = self.link_deviation_runtime.as_ref() {
+            runtime.breakpoints().map_err(EstimationError::InvalidInput)?
+        } else {
+            vec![a - link_tail, a + link_tail]
+        };
+        if link_breaks.first().copied().unwrap_or(a + link_tail) > a - link_tail {
+            link_breaks.insert(0, a - link_tail);
+        }
+        if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
+            link_breaks.push(a + link_tail);
+        }
+        crate::families::bernoulli_marginal_slope_exact::build_denested_partition_cells(
+            a,
+            b,
+            &score_breaks,
+            &link_breaks,
+            |z| {
+                if let (Some(runtime), Some(beta)) = (self.score_warp_runtime.as_ref(), beta_score_warp)
+                {
+                    runtime
+                        .exact_local_cubic_at(beta, z)
+                        .map_err(EstimationError::InvalidInput)
+                } else {
+                    Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                        left: -8.0,
+                        right: 8.0,
+                        c0: 0.0,
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    })
+                }
+            },
+            |u| {
+                if let (Some(runtime), Some(beta)) =
+                    (self.link_deviation_runtime.as_ref(), beta_link_dev)
+                {
+                    runtime
+                        .exact_local_cubic_at(beta, u)
+                        .map_err(EstimationError::InvalidInput)
+                } else {
+                    Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                        left: a - 8.0 * (1.0 + b.abs()),
+                        right: a + 8.0 * (1.0 + b.abs()),
+                        c0: 0.0,
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    })
+                }
+            },
+        )
+        .map_err(EstimationError::InvalidInput)
+    }
+
+    fn evaluate_denested_calibration(
+        &self,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_score_warp: Option<&Array1<f64>>,
+        beta_link_dev: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64, f64), EstimationError> {
+        let cells = self.denested_partition_cells(a, slope, beta_score_warp, beta_link_dev)?;
+        let mut f = -crate::probability::normal_cdf(marginal_eta);
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        for partition_cell in cells {
+            let cell = partition_cell.cell;
+            let state = crate::families::bernoulli_marginal_slope_exact::evaluate_cell_moments(
+                cell, 7,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+            f += state.value;
+            let (dc_da, _) = crate::families::bernoulli_marginal_slope_exact::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
+            let shift = a - partition_cell.link_span.left;
+            let d2c_da2 = [
+                2.0 * partition_cell.link_span.c2 + 6.0 * partition_cell.link_span.c3 * shift,
+                6.0 * partition_cell.link_span.c3 * slope,
+                0.0,
+                0.0,
+            ];
+            f_a += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+                &dc_da,
+                &state.moments,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+            f_aa += crate::families::bernoulli_marginal_slope_exact::cell_second_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &d2c_da2,
+                &state.moments,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+        }
+        Ok((f, f_a, f_aa))
+    }
+
     pub fn from_unified(
         unified: &UnifiedFitResult,
         z_column: String,
@@ -783,6 +907,58 @@ impl BernoulliMarginalSlopePredictor {
         score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
         link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
     ) -> Result<Self, String> {
+        if let Some(runtime) = score_warp_runtime.as_ref() {
+            if runtime.kernel.is_empty()
+                || runtime.kernel
+                    == crate::families::bernoulli_marginal_slope_exact::LEGACY_ANCHORED_DEVIATION_KERNEL
+            {
+                return Err(
+                    "bernoulli marginal-slope score-warp runtime is missing the ExactDenestedCubicV1 marker or uses legacy flexible semantics; refit the model"
+                        .to_string(),
+                );
+            }
+            if runtime.kernel
+                != crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+            {
+                return Err(format!(
+                    "bernoulli marginal-slope score-warp runtime uses unsupported kernel '{}'; expected {}",
+                    runtime.kernel,
+                    crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                ));
+            }
+            if runtime.degree != 3 {
+                return Err(format!(
+                    "bernoulli marginal-slope score-warp runtime must be cubic (degree=3), got degree={}",
+                    runtime.degree
+                ));
+            }
+        }
+        if let Some(runtime) = link_deviation_runtime.as_ref() {
+            if runtime.kernel.is_empty()
+                || runtime.kernel
+                    == crate::families::bernoulli_marginal_slope_exact::LEGACY_ANCHORED_DEVIATION_KERNEL
+            {
+                return Err(
+                    "bernoulli marginal-slope link-deviation runtime is missing the ExactDenestedCubicV1 marker or uses legacy flexible semantics; refit the model"
+                        .to_string(),
+                );
+            }
+            if runtime.kernel
+                != crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+            {
+                return Err(format!(
+                    "bernoulli marginal-slope link-deviation runtime uses unsupported kernel '{}'; expected {}",
+                    runtime.kernel,
+                    crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                ));
+            }
+            if runtime.degree != 3 {
+                return Err(format!(
+                    "bernoulli marginal-slope link-deviation runtime must be cubic (degree=3), got degree={}",
+                    runtime.degree
+                ));
+            }
+        }
         let blocks = &unified.blocks;
         if blocks.len() < 2 {
             return Err(format!(
@@ -825,19 +1001,6 @@ impl BernoulliMarginalSlopePredictor {
             score_warp_runtime,
             link_deviation_runtime,
         })
-    }
-
-    fn quadrature_points(&self) -> usize {
-        bernoulli_marginal_slope_quadrature_points(
-            self.score_warp_runtime
-                .as_ref()
-                .map(|runtime| runtime.basis_dim)
-                .unwrap_or(0),
-            self.link_deviation_runtime
-                .as_ref()
-                .map(|runtime| runtime.basis_dim)
-                .unwrap_or(0),
-        )
     }
 
     fn theta(&self) -> Array1<f64> {
@@ -905,39 +1068,23 @@ impl BernoulliMarginalSlopePredictor {
         Ok((marginal, logslope, score_warp, link_dev))
     }
 
-    fn normal_expectation_nodes(n: usize) -> (Array1<f64>, Array1<f64>) {
-        let gh = crate::quadrature::compute_gauss_hermite_n(n);
-        let scale = 2.0_f64.sqrt();
-        let norm = std::f64::consts::PI.sqrt();
-        (
-            Array1::from_iter(gh.nodes.into_iter().map(|x| scale * x)),
-            Array1::from_iter(gh.weights.into_iter().map(|w| w / norm)),
-        )
-    }
-
-    /// Newton solve for the marginal intercept.
-    ///
-    /// All per-iteration allocations except `runtime.design()`/`first_derivative_design()`
-    /// are eliminated: `eta_nodes_buf` is a caller-owned scratch buffer, `link_dev_beta`
-    /// is a pre-owned array (not a view), and the f/df accumulators are scalar.
-    fn solve_intercept_scalar_with_nodes(
+    /// Newton solve for the marginal intercept under the de-nested flexible model
+    ///   η(z) = a + b z + b Δ_h(z) + Δ_w(a + b z).
+    fn solve_intercept_scalar(
         &self,
         marginal_eta: f64,
         slope: f64,
-        warped_nodes: &Array1<f64>,
-        quadrature_weights: &Array1<f64>,
         link_dev_beta: Option<&Array1<f64>>,
-        eta_nodes_buf: &mut Array1<f64>,
+        score_warp_beta: Option<&Array1<f64>>,
+        warm_start_buf: &mut Array1<f64>,
     ) -> Result<f64, EstimationError> {
-        let target = crate::probability::normal_cdf(marginal_eta).clamp(1e-12, 1.0 - 1e-12);
-        let num_nodes = warped_nodes.len();
+        // Rigid warm start: a₀ = q·√(1+b²).  With affine link Δ_w(u) ≈ ℓ₀+ℓ₁·u,
+        // approximate intercept is (q·√(1+(1+ℓ₁)²b²) − ℓ₀) / (1+ℓ₁).
         let link_dim = link_dev_beta.map_or(0, Array1::len);
-        // Rigid warm start: a₀ = q·√(1+b²).  With affine link L(u) ≈ ℓ₀+ℓ₁·u,
-        // exact intercept is (q·√(1+ℓ₁²b²) − ℓ₀) / ℓ₁.
         let mut intercept = marginal_eta * (1.0 + slope * slope).sqrt();
         if let (Some(runtime), Some(beta)) = (self.link_deviation_runtime.as_ref(), link_dev_beta) {
-            eta_nodes_buf[0] = intercept;
-            let one_pt = eta_nodes_buf.slice(ndarray::s![0..1]).to_owned();
+            warm_start_buf[0] = intercept;
+            let one_pt = warm_start_buf.slice(ndarray::s![0..1]).to_owned();
             let basis = runtime
                 .design(&one_pt)
                 .map_err(EstimationError::InvalidInput)?;
@@ -952,49 +1099,19 @@ impl BernoulliMarginalSlopePredictor {
             }
             let ell1 = d1_dev + 1.0;
             if ell1 > 1e-8 {
-                let ell0 = (intercept + dev) - ell1 * intercept;
+                let ell0 = dev - (ell1 - 1.0) * intercept;
                 intercept =
                     (marginal_eta * (1.0 + ell1 * ell1 * slope * slope).sqrt() - ell0) / ell1;
             }
         }
         for _ in 0..20 {
-            for k in 0..num_nodes {
-                eta_nodes_buf[k] = intercept + slope * warped_nodes[k];
-            }
-            let (f, df) = if let (Some(runtime), Some(beta)) =
-                (self.link_deviation_runtime.as_ref(), link_dev_beta)
-            {
-                let basis = runtime
-                    .design(eta_nodes_buf)
-                    .map_err(EstimationError::InvalidInput)?;
-                let d1_basis = runtime
-                    .first_derivative_design(eta_nodes_buf)
-                    .map_err(EstimationError::InvalidInput)?;
-                let mut f_acc = 0.0;
-                let mut df_acc = 0.0;
-                for k in 0..num_nodes {
-                    let mut dev = 0.0;
-                    let mut d1_dev = 0.0;
-                    for j in 0..link_dim {
-                        dev += basis[[k, j]] * beta[j];
-                        d1_dev += d1_basis[[k, j]] * beta[j];
-                    }
-                    let linked = eta_nodes_buf[k] + dev;
-                    let d1 = d1_dev + 1.0;
-                    f_acc += quadrature_weights[k] * crate::probability::normal_cdf(linked);
-                    df_acc += quadrature_weights[k] * crate::probability::normal_pdf(linked) * d1;
-                }
-                (f_acc - target, df_acc)
-            } else {
-                let mut f_acc = 0.0;
-                let mut df_acc = 0.0;
-                for k in 0..num_nodes {
-                    let eta = eta_nodes_buf[k];
-                    f_acc += quadrature_weights[k] * crate::probability::normal_cdf(eta);
-                    df_acc += quadrature_weights[k] * crate::probability::normal_pdf(eta);
-                }
-                (f_acc - target, df_acc)
-            };
+            let (f, df, _) = self.evaluate_denested_calibration(
+                intercept,
+                marginal_eta,
+                slope,
+                score_warp_beta,
+                link_dev_beta,
+            )?;
             if f.abs() < 1e-10 {
                 break;
             }
@@ -1093,39 +1210,22 @@ impl BernoulliMarginalSlopePredictor {
         }
 
         // ── Flexible path: per-row intercept solve, chunked Jacobians ──
-        let (nodes, quadrature_weights) = Self::normal_expectation_nodes(self.quadrature_points());
         let score_warp_obs_design = self
             .score_warp_runtime
             .as_ref()
             .map(|runtime| runtime.design(z).map_err(EstimationError::InvalidInput))
             .transpose()?;
-        let score_warp_node_design = self
-            .score_warp_runtime
-            .as_ref()
-            .map(|runtime| {
-                runtime
-                    .design(&nodes)
-                    .map_err(EstimationError::InvalidInput)
-            })
-            .transpose()?;
-        let warped_z = if let (Some(design), Some(beta)) =
+        let score_dev_obs = if let (Some(design), Some(beta)) =
             (score_warp_obs_design.as_ref(), beta_score_warp.clone())
         {
-            z + &design.dot(&beta.to_owned())
+            design.dot(&beta.to_owned())
         } else {
-            z.clone()
-        };
-        let warped_nodes = if let (Some(design), Some(beta)) =
-            (score_warp_node_design.as_ref(), beta_score_warp.clone())
-        {
-            &nodes + &design.dot(&beta.to_owned())
-        } else {
-            nodes.clone()
+            Array1::zeros(n)
         };
 
         // Solve intercepts and (when gradient needed) IFT scalars in chunk-parallel passes.
+        let score_warp_beta_owned = beta_score_warp.as_ref().map(|v| v.to_owned());
         let link_dev_beta_owned = beta_link_dev.as_ref().map(|v| v.to_owned());
-        let num_nodes = warped_nodes.len();
         struct FlexSolveChunk {
             start: usize,
             end: usize,
@@ -1154,21 +1254,18 @@ impl BernoulliMarginalSlopePredictor {
                 } else {
                     None
                 };
-                let mut eta_nodes_buf = Array1::<f64>::zeros(num_nodes);
-                let mut wphi_buf = Array1::<f64>::zeros(num_nodes);
-                let mut wc1_buf = Array1::<f64>::zeros(num_nodes);
+                let mut warm_start_buf = Array1::<f64>::zeros(1);
 
                 for local_row in 0..rows {
                     let i = start + local_row;
                     let slope = logslope_eta[i];
                     let q = marginal_eta[i];
-                    intercepts[local_row] = self.solve_intercept_scalar_with_nodes(
+                    intercepts[local_row] = self.solve_intercept_scalar(
                         q,
                         slope,
-                        &warped_nodes,
-                        &quadrature_weights,
                         link_dev_beta_owned.as_ref(),
-                        &mut eta_nodes_buf,
+                        score_warp_beta_owned.as_ref(),
+                        &mut warm_start_buf,
                     )?;
 
                     if !need_gradient {
@@ -1176,59 +1273,91 @@ impl BernoulliMarginalSlopePredictor {
                     }
 
                     let intercept = intercepts[local_row];
-                    for k in 0..num_nodes {
-                        eta_nodes_buf[k] = intercept + slope * warped_nodes[k];
-                    }
-
-                    let basis_for_aw = if let (Some(runtime), Some(beta_owned)) = (
-                        self.link_deviation_runtime.as_ref(),
+                    let (_, m_a_raw, _) = self.evaluate_denested_calibration(
+                        intercept,
+                        q,
+                        slope,
+                        score_warp_beta_owned.as_ref(),
                         link_dev_beta_owned.as_ref(),
-                    ) {
-                        let basis = runtime
-                            .design(&eta_nodes_buf)
-                            .map_err(EstimationError::InvalidInput)?;
-                        let d1_basis = runtime
-                            .first_derivative_design(&eta_nodes_buf)
-                            .map_err(EstimationError::InvalidInput)?;
-                        for k in 0..num_nodes {
-                            let mut dev = 0.0;
-                            let mut d1_dev = 0.0;
-                            for j in 0..link_dev_dim {
-                                dev += basis[[k, j]] * beta_owned[j];
-                                d1_dev += d1_basis[[k, j]] * beta_owned[j];
-                            }
-                            let phi = crate::probability::normal_pdf(eta_nodes_buf[k] + dev);
-                            wphi_buf[k] = quadrature_weights[k] * phi;
-                            wc1_buf[k] = wphi_buf[k] * (d1_dev + 1.0);
-                        }
-                        if a_w.is_some() { Some(basis) } else { None }
-                    } else {
-                        for k in 0..num_nodes {
-                            let phi = crate::probability::normal_pdf(eta_nodes_buf[k]);
-                            wphi_buf[k] = quadrature_weights[k] * phi;
-                            wc1_buf[k] = wphi_buf[k];
-                        }
-                        None
-                    };
-
-                    let m_a = wc1_buf.sum().max(1e-12);
+                    )?;
+                    let m_a = m_a_raw.max(1e-12);
                     a_q.as_mut().unwrap()[local_row] = crate::probability::normal_pdf(q) / m_a;
-                    a_b.as_mut().unwrap()[local_row] = -wc1_buf.dot(&warped_nodes) / m_a;
+                    let cells = self.denested_partition_cells(
+                        intercept,
+                        slope,
+                        score_warp_beta_owned.as_ref(),
+                        link_dev_beta_owned.as_ref(),
+                    )?;
+                    let mut f_b = 0.0;
+                    let mut f_h_row = vec![0.0; score_warp_dim];
+                    let mut f_w_row = vec![0.0; link_dev_dim];
+                    for partition_cell in cells {
+                        let cell = partition_cell.cell;
+                        let state =
+                            crate::families::bernoulli_marginal_slope_exact::evaluate_cell_moments(
+                                cell, 9,
+                            )
+                            .map_err(EstimationError::InvalidInput)?;
+                        let (_, dc_db) = crate::families::bernoulli_marginal_slope_exact::denested_cell_coefficient_partials(
+                            partition_cell.score_span,
+                            partition_cell.link_span,
+                            intercept,
+                            slope,
+                        );
+                        f_b += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+                            &dc_db,
+                            &state.moments,
+                        )
+                        .map_err(EstimationError::InvalidInput)?;
 
-                    if let (Some(a_h), Some(node_design)) =
-                        (a_h.as_mut(), score_warp_node_design.as_ref())
-                    {
-                        let mut a_h_row = node_design.t().dot(&wc1_buf);
-                        let factor = -slope / m_a;
-                        a_h_row.mapv_inplace(|v| v * factor);
-                        a_h.row_mut(local_row).assign(&a_h_row);
-                    }
+                        let mid = 0.5 * (cell.left + cell.right);
+                        if let (Some(a_h), Some(runtime)) =
+                            (a_h.as_mut(), self.score_warp_runtime.as_ref())
+                        {
+                            for j in 0..score_warp_dim {
+                                let basis_span = runtime
+                                    .exact_basis_cubic_at(j, mid)
+                                    .map_err(EstimationError::InvalidInput)?;
+                                let coeffs = crate::families::bernoulli_marginal_slope_exact::score_basis_cell_coefficients(
+                                    basis_span, slope,
+                                );
+                                f_h_row[j] += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+                                    &coeffs,
+                                    &state.moments,
+                                )
+                                .map_err(EstimationError::InvalidInput)?;
+                            }
+                            let factor = -1.0 / m_a;
+                            for j in 0..score_warp_dim {
+                                a_h[[local_row, j]] = factor * f_h_row[j];
+                            }
+                        }
 
-                    if let (Some(a_w), Some(basis)) = (a_w.as_mut(), basis_for_aw.as_ref()) {
-                        let mut a_w_row = basis.t().dot(&wphi_buf);
-                        a_w_row.mapv_inplace(|v| -v / m_a);
-                        a_w.row_mut(local_row).assign(&a_w_row);
+                        if let (Some(a_w), Some(runtime)) =
+                            (a_w.as_mut(), self.link_deviation_runtime.as_ref())
+                        {
+                            for j in 0..link_dev_dim {
+                                let basis_span = runtime
+                                    .exact_basis_cubic_at(j, intercept + slope * mid)
+                                    .map_err(EstimationError::InvalidInput)?;
+                                let coeffs = crate::families::bernoulli_marginal_slope_exact::link_basis_cell_coefficients(
+                                    basis_span,
+                                    intercept,
+                                    slope,
+                                );
+                                f_w_row[j] += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+                                    &coeffs,
+                                    &state.moments,
+                                )
+                                .map_err(EstimationError::InvalidInput)?;
+                            }
+                            let factor = -1.0 / m_a;
+                            for j in 0..link_dev_dim {
+                                a_w[[local_row, j]] = factor * f_w_row[j];
+                            }
+                        }
                     }
+                    a_b.as_mut().unwrap()[local_row] = -f_b / m_a;
                 }
 
                 Ok(FlexSolveChunk {
@@ -1284,21 +1413,18 @@ impl BernoulliMarginalSlopePredictor {
             }
         }
 
-        // Compute eta_base vectorized.
-        let eta_base = &intercepts + &(&logslope_eta * &warped_z);
+        let eta_base = &intercepts + &(&logslope_eta * z);
 
-        // Apply link deviation to eta if active (vectorized over all rows).
-        // Reuse link_dev_beta_owned (pre-computed before the solve loop).
         let mut link_c_obs: Option<Array1<f64>> = None;
         let mut link_basis_obs: Option<Array2<f64>> = None;
-        let final_eta = if let (Some(runtime), Some(beta_owned)) = (
+        let link_dev_obs = if let (Some(runtime), Some(beta_owned)) = (
             self.link_deviation_runtime.as_ref(),
             link_dev_beta_owned.as_ref(),
         ) {
             let basis = runtime
                 .design(&eta_base)
                 .map_err(EstimationError::InvalidInput)?;
-            let eta = &eta_base + &basis.dot(beta_owned);
+            let dev = basis.dot(beta_owned);
             if need_gradient {
                 let d1 = runtime
                     .first_derivative_design(&eta_base)
@@ -1308,10 +1434,11 @@ impl BernoulliMarginalSlopePredictor {
                 link_c_obs = Some(c_obs);
                 link_basis_obs = Some(basis);
             }
-            eta
+            dev
         } else {
-            eta_base
+            Array1::zeros(n)
         };
+        let final_eta = &eta_base + &(&logslope_eta * &score_dev_obs) + &link_dev_obs;
 
         if !need_gradient {
             return Ok((final_eta, None));
@@ -1345,7 +1472,8 @@ impl BernoulliMarginalSlopePredictor {
                         row[j] = a_q * mc[[li, j]];
                     }
 
-                    let g_scale = a_b_vec[i] + warped_z[i];
+                    let base_multiplier = link_c_obs.as_ref().map_or(1.0, |c| c[i]);
+                    let g_scale = base_multiplier * (a_b_vec[i] + z[i]) + score_dev_obs[i];
                     for j in 0..logslope_dim {
                         row[logslope_offset + j] = g_scale * lc[[li, j]];
                     }
@@ -1356,7 +1484,8 @@ impl BernoulliMarginalSlopePredictor {
                         let slope = logslope_eta[i];
                         for j in 0..score_warp_dim {
                             row[score_warp_offset + j] =
-                                a_h_rows[[i, j]] + slope * obs_design[[i, j]];
+                                base_multiplier * a_h_rows[[i, j]]
+                                    + slope * obs_design[[i, j]];
                         }
                     }
 
@@ -1370,7 +1499,7 @@ impl BernoulliMarginalSlopePredictor {
                         (link_c_obs.as_ref(), link_basis_obs.as_ref())
                     {
                         let c = link_c[i];
-                        for j in 0..link_dev_offset {
+                        for j in 0..marginal_dim {
                             row[j] *= c;
                         }
                         for j in 0..link_dev_dim {
@@ -3413,7 +3542,7 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_marginal_slope_predictor_automatically_selects_quadrature_points() {
+    fn bernoulli_marginal_slope_predictor_rejects_non_cubic_or_unknown_runtime_kernel() {
         let score_only = BernoulliMarginalSlopePredictor {
             beta_marginal: array![0.8],
             beta_logslope: array![1.6],
@@ -3424,31 +3553,100 @@ mod tests {
             baseline_logslope: 0.0,
             covariance: None,
             score_warp_runtime: Some(SavedAnchoredDeviationRuntime {
+                kernel: "OldQuadrature".to_string(),
                 knots: vec![-10.0, -10.0, 10.0, 10.0],
                 degree: 1,
                 basis_dim: 2,
             }),
             link_deviation_runtime: None,
         };
-        let score_and_link = BernoulliMarginalSlopePredictor {
-            beta_marginal: array![0.8],
-            beta_logslope: array![1.6],
-            beta_score_warp: Some(array![0.7, -0.4]),
-            beta_link_dev: Some(array![0.1, -0.2, 0.3]),
-            z_column: "z".to_string(),
-            baseline_marginal: 0.0,
-            baseline_logslope: 0.0,
-            covariance: None,
-            score_warp_runtime: score_only.score_warp_runtime.clone(),
-            link_deviation_runtime: Some(SavedAnchoredDeviationRuntime {
-                knots: vec![-10.0, -10.0, 10.0, 10.0],
-                degree: 1,
-                basis_dim: 3,
-            }),
-        };
+        let err = score_only
+            .score_warp_runtime
+            .as_ref()
+            .unwrap()
+            .design(&array![0.0])
+            .unwrap_err();
+        assert!(err.contains("ExactDenestedCubic"));
 
-        assert_eq!(score_only.quadrature_points(), 21);
-        assert_eq!(score_and_link.quadrature_points(), 31);
+        let cubic = SavedAnchoredDeviationRuntime {
+            kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                .to_string(),
+            knots: vec![-10.0, -10.0, -10.0, -10.0, 10.0, 10.0, 10.0, 10.0],
+            degree: 3,
+            basis_dim: 2,
+        };
+        assert!(cubic.design(&array![0.0]).is_ok());
+    }
+
+    #[test]
+    fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
+        let runtime = SavedAnchoredDeviationRuntime {
+            kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                .to_string(),
+            knots: vec![-2.0, -2.0, -2.0, -2.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0],
+            degree: 3,
+            basis_dim: 3,
+        };
+        let beta = array![0.1, -0.03, 0.05];
+        let n_spans = runtime.span_count().expect("span count");
+        assert!(n_spans >= 2);
+        for span_idx in 0..n_spans {
+            let cubic = runtime
+                .local_cubic_on_span(&beta, span_idx)
+                .expect("local cubic");
+            let exact = runtime
+                .exact_local_cubic_on_span(&beta, span_idx)
+                .expect("exact local cubic");
+            let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
+            let expected = runtime.design(&x_eval).expect("design").dot(&beta);
+            let expected_d1 = runtime
+                .first_derivative_design(&x_eval)
+                .expect("d1 design")
+                .dot(&beta);
+            for i in 0..x_eval.len() {
+                let x = x_eval[i];
+                assert!((cubic.evaluate(x) - expected[i]).abs() < 1e-10);
+                assert!((cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10);
+                let selected = runtime.local_cubic_at(&beta, x).expect("local cubic at x");
+                assert_eq!(selected.left, cubic.left);
+                assert_eq!(selected.right, cubic.right);
+                assert!((exact.evaluate(x) - expected[i]).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
+        let runtime = SavedAnchoredDeviationRuntime {
+            kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                .to_string(),
+            knots: vec![-2.0, -2.0, -2.0, -2.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0],
+            degree: 3,
+            basis_dim: 3,
+        };
+        let cubic = runtime.basis_span_cubic(0, 1).expect("basis span cubic");
+        let exact = runtime
+            .exact_basis_span_cubic(0, 1)
+            .expect("exact basis span cubic");
+        let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
+        let design = runtime.design(&x_eval).expect("basis design");
+        let d1 = runtime
+            .first_derivative_design(&x_eval)
+            .expect("basis d1 design");
+        for i in 0..x_eval.len() {
+            let x = x_eval[i];
+            assert!((cubic.evaluate(x) - design[[i, 1]]).abs() < 1e-10);
+            assert!((cubic.first_derivative(x) - d1[[i, 1]]).abs() < 1e-10);
+            let selected = runtime.basis_cubic_at(1, x).expect("basis cubic at x");
+            assert_eq!(selected.left, cubic.left);
+            assert_eq!(selected.right, cubic.right);
+            let selected_exact = runtime
+                .exact_basis_cubic_at(1, x)
+                .expect("exact basis cubic at x");
+            assert!((exact.evaluate(x) - design[[i, 1]]).abs() < 1e-10);
+            assert_eq!(selected_exact.left, exact.left);
+            assert_eq!(selected_exact.right, exact.right);
+        }
     }
 
     #[test]

@@ -1321,6 +1321,7 @@ fn materialize_survival<'a>(
                 marginalspec,
                 derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                 time_block,
+                timewiggle_block: None,
                 logslopespec,
             };
 
