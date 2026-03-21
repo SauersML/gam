@@ -831,11 +831,11 @@ impl BernoulliMarginalSlopePredictor {
         bernoulli_marginal_slope_quadrature_points(
             self.score_warp_runtime
                 .as_ref()
-                .and_then(|runtime| runtime.transform.first().map(Vec::len))
+                .map(|runtime| runtime.basis_dim)
                 .unwrap_or(0),
             self.link_deviation_runtime
                 .as_ref()
-                .and_then(|runtime| runtime.transform.first().map(Vec::len))
+                .map(|runtime| runtime.basis_dim)
                 .unwrap_or(0),
         )
     }
@@ -3426,7 +3426,7 @@ mod tests {
             score_warp_runtime: Some(SavedAnchoredDeviationRuntime {
                 knots: vec![-10.0, -10.0, 10.0, 10.0],
                 degree: 1,
-                transform: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                basis_dim: 2,
             }),
             link_deviation_runtime: None,
         };
@@ -3443,11 +3443,7 @@ mod tests {
             link_deviation_runtime: Some(SavedAnchoredDeviationRuntime {
                 knots: vec![-10.0, -10.0, 10.0, 10.0],
                 degree: 1,
-                transform: vec![
-                    vec![1.0, 0.0, 0.0],
-                    vec![0.0, 1.0, 0.0],
-                    vec![0.0, 0.0, 1.0],
-                ],
+                basis_dim: 3,
             }),
         };
 

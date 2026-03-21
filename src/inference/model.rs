@@ -1,4 +1,4 @@
-use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
+use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
@@ -334,7 +334,7 @@ pub struct SavedBaselineTimeWiggleRuntime {
 pub struct SavedAnchoredDeviationRuntime {
     pub knots: Vec<f64>,
     pub degree: usize,
-    pub transform: Vec<Vec<f64>>,
+    pub basis_dim: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -424,52 +424,26 @@ impl SavedBaselineTimeWiggleRuntime {
 }
 
 impl SavedAnchoredDeviationRuntime {
-    fn transform_matrix(&self) -> Result<Array2<f64>, String> {
-        if self.transform.is_empty() {
-            return Err("saved anchored deviation transform is empty".to_string());
-        }
-        let rows = self.transform.len();
-        let cols = self.transform[0].len();
-        if cols == 0 {
-            return Err("saved anchored deviation transform has zero columns".to_string());
-        }
-        let mut out = Array2::<f64>::zeros((rows, cols));
-        for (i, row) in self.transform.iter().enumerate() {
-            if row.len() != cols {
-                return Err(
-                    "saved anchored deviation transform rows have inconsistent widths".to_string(),
-                );
-            }
-            for (j, &value) in row.iter().enumerate() {
-                out[[i, j]] = value;
-            }
-        }
-        Ok(out)
-    }
-
     fn constrained_basis(
         &self,
         values: &Array1<f64>,
         basis_options: BasisOptions,
     ) -> Result<Array2<f64>, String> {
         let knot_arr = Array1::from_vec(self.knots.clone());
-        let (basis, _) = create_basis::<Dense>(
+        let constrained = monotone_wiggle_basis_with_derivative_order(
             values.view(),
-            KnotSource::Provided(knot_arr.view()),
+            &knot_arr,
             self.degree,
-            basis_options,
-        )
-        .map_err(|e| format!("failed to evaluate saved anchored deviation basis: {e}"))?;
-        let full = basis.as_ref().clone();
-        let transform = self.transform_matrix()?;
-        if full.ncols() != transform.nrows() {
+            basis_options.derivative_order,
+        )?;
+        if constrained.ncols() != self.basis_dim {
             return Err(format!(
-                "saved anchored deviation basis/transform mismatch: basis has {} columns but transform has {} rows",
-                full.ncols(),
-                transform.nrows()
+                "saved anchored deviation basis mismatch: runtime expects {} columns but basis has {}",
+                self.basis_dim,
+                constrained.ncols()
             ));
         }
-        Ok(full.dot(&transform))
+        Ok(constrained)
     }
 
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {

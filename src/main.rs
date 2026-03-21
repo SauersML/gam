@@ -6904,12 +6904,7 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
     SavedAnchoredDeviationRuntime {
         knots: runtime.knots.to_vec(),
         degree: runtime.degree,
-        transform: runtime
-            .transform
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
+        basis_dim: runtime.basis_dim,
     }
 }
 
@@ -6923,7 +6918,6 @@ fn deviation_block_config_from_formula_linkwiggle(
         penalty_order,
         penalty_orders,
         double_penalty: wiggle.double_penalty,
-        monotonicity_eps: DeviationBlockConfig::default().monotonicity_eps,
     }
 }
 
@@ -10434,10 +10428,6 @@ mod tests {
         assert_eq!(routed.penalty_order, 1);
         assert_eq!(routed.penalty_orders, vec![3]);
         assert!(!routed.double_penalty);
-        assert_eq!(
-            routed.monotonicity_eps,
-            super::DeviationBlockConfig::default().monotonicity_eps
-        );
     }
 
     #[test]
