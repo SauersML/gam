@@ -1258,7 +1258,7 @@ fn run_fit_bernoulli_marginal_slope(
         );
     } else {
         inference_notes.push(
-            "bernoulli marginal-slope flexible score/link mode uses exact analytic derivatives of an automatically selected Gauss-Hermite quadrature approximation"
+            "bernoulli marginal-slope flexible score/link mode uses exact analytic derivatives through a calibrated 1D Gaussian marginalization; the value path is not literal closed-form"
                 .to_string(),
         );
     }
@@ -2660,6 +2660,28 @@ fn run_predict_survival(
     }
 
     if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        let has_saved_timewiggle = model.baseline_timewiggle_knots.is_some()
+            || model.baseline_timewiggle_degree.is_some()
+            || model.baseline_timewiggle_penalty_orders.is_some()
+            || model.baseline_timewiggle_double_penalty.is_some()
+            || model.beta_baseline_timewiggle.is_some();
+        let has_saved_linkwiggle = model.linkwiggle_knots.is_some()
+            || model.linkwiggle_degree.is_some()
+            || model.beta_link_wiggle.is_some();
+        if has_saved_linkwiggle {
+            return Err(
+                "saved survival marginal-slope model contains unsupported linkwiggle metadata"
+                    .to_string(),
+            );
+        }
+        let has_saved_deviations = model.score_warp_runtime.is_some()
+            || model.link_deviation_runtime.is_some();
+        if has_saved_deviations {
+            return Err(
+                "saved survival marginal-slope model contains unsupported score/link deviation metadata"
+                    .to_string(),
+            );
+        }
         let z_name = model
             .z_column
             .as_ref()
@@ -2678,7 +2700,7 @@ fn run_predict_survival(
             .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
         let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
         let blocks = &fit_saved.blocks;
-        if blocks.len() < 3 {
+        if blocks.len() != 3 {
             return Err(format!(
                 "saved survival marginal-slope model requires 3 blocks [time, marginal, slope], got {}",
                 blocks.len()
@@ -2688,11 +2710,17 @@ fn run_predict_survival(
         let beta_marginal = &blocks[1].beta;
         let beta_slope = &blocks[2].beta;
         let baseline_slope = model.logslope_baseline.unwrap_or(0.0);
-        if beta_time.len() != time_build.x_exit_time.ncols() {
+        let p_time_base = time_build.x_exit_time.ncols();
+        let p_timewiggle = model
+            .beta_baseline_timewiggle
+            .as_ref()
+            .map_or(0, |beta| beta.len());
+        if beta_time.len() != p_time_base + p_timewiggle {
             return Err(format!(
-                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but time basis has {} columns",
+                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
                 beta_time.len(),
-                time_build.x_exit_time.ncols()
+                p_time_base,
+                p_timewiggle
             ));
         }
         if beta_marginal.len() != cov_design.design.ncols() {
@@ -2709,9 +2737,45 @@ fn run_predict_survival(
                 logslope_design.design.ncols()
             ));
         }
-        let q_exit = time_build.x_exit_time.dot(beta_time)
+        let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
+        let q_entry_base = time_build.x_entry_time.dot(&beta_time_base)
+            + cov_design.design.dot(beta_marginal)
+            + &eta_offset_entry;
+        let q_exit_base = time_build.x_exit_time.dot(&beta_time_base)
             + cov_design.design.dot(beta_marginal)
             + &eta_offset_exit;
+        let qd_exit_base =
+            time_build.x_derivative_time.dot(&beta_time_base) + &derivative_offset_exit;
+        let q_exit = if has_saved_timewiggle {
+            if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
+                return Err(
+                    "saved survival marginal-slope posterior uncertainty is not implemented for dynamic timewiggle models"
+                        .to_string(),
+                );
+            }
+            let (_, exit_w, _) = saved_baseline_timewiggle_components(
+                &q_entry_base,
+                &q_exit_base,
+                &qd_exit_base,
+                model,
+            )?
+            .ok_or_else(|| {
+                "saved survival marginal-slope model is missing baseline-timewiggle runtime metadata"
+                    .to_string()
+            })?;
+            let beta_w = Array1::from_vec(
+                model
+                    .beta_baseline_timewiggle
+                    .clone()
+                    .ok_or_else(|| {
+                        "saved survival marginal-slope model is missing beta_baseline_timewiggle"
+                            .to_string()
+                    })?,
+            );
+            &q_exit_base + &exit_w.dot(&beta_w)
+        } else {
+            q_exit_base
+        };
         let slope = logslope_design
             .design
             .dot(beta_slope)
@@ -3677,7 +3741,6 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
 fn build_survival_feasible_initial_beta(
     dim: usize,
     constraints: Option<&gam::pirls::LinearInequalityConstraints>,
@@ -4243,6 +4306,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             ncols: wiggle.ncols,
         });
     }
+    let time_initial_constraints = if likelihood_mode != SurvivalLikelihoodMode::Weibull {
+        Some(gam::pirls::LinearInequalityConstraints {
+            a: time_design_derivative_exit.to_dense(),
+            b: derivative_offset_exit.mapv(|offset| exact_derivative_guard - offset),
+        })
+    } else {
+        None
+    };
+    let time_initial_beta =
+        build_survival_feasible_initial_beta(time_design_exit.ncols(), time_initial_constraints.as_ref());
 
     if likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         let mut time_initial_log_lambdas = None;
@@ -4309,7 +4382,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     penalties: time_penalties.clone(),
                     nullspace_dims: time_nullspace_dims.clone(),
                     initial_log_lambdas: time_initial_log_lambdas.clone(),
-                    initial_beta: Some(Array1::from_elem(time_design_exit.ncols(), 1e-4)),
+                    initial_beta: Some(time_initial_beta.clone()),
                 },
                 thresholdspec: termspec.clone(),
                 log_sigmaspec: log_sigmaspec.clone(),
@@ -4436,6 +4509,23 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_time_keep_cols = time_build.keep_cols.clone();
             payload.survival_time_smooth_lambda = time_build.smooth_lambda;
             payload.survival_time_anchor = Some(time_anchor);
+            payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
+            payload.baseline_timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
+            payload.baseline_timewiggle_penalty_orders = effective_timewiggle
+                .as_ref()
+                .map(|cfg| cfg.penalty_orders.clone());
+            payload.baseline_timewiggle_double_penalty =
+                effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
+            payload.beta_baseline_timewiggle = timewiggle_build.as_ref().map(|_| {
+                fit.fit
+                    .block_states
+                    .first()
+                    .map(|state| {
+                        let p_base = time_build.x_exit_time.ncols();
+                        state.beta.slice(s![p_base..]).to_vec()
+                    })
+                    .unwrap_or_default()
+            });
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
@@ -4500,14 +4590,19 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    if timewiggle_build.is_some() {
-        return Err(
-            "timewiggle is only implemented for survival-likelihood=location-scale in the exact dynamic path"
-                .to_string(),
-        );
-    }
-
     if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        if parsed.linkspec.is_some() {
+            return Err(
+                "link(...) is not implemented for the survival marginal-slope family"
+                    .to_string(),
+            );
+        }
+        if parsed.linkwiggle.is_some() {
+            return Err(
+                "linkwiggle(...) is not implemented for the survival marginal-slope family"
+                    .to_string(),
+            );
+        }
         let logslope_formula_raw = args.logslope_formula.as_deref().ok_or_else(|| {
             "--logslope-formula is required with --survival-likelihood marginal-slope".to_string()
         })?;
@@ -4568,8 +4663,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 penalties: time_penalties.clone(),
                 nullspace_dims: time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
-                initial_beta: Some(Array1::from_elem(time_design_exit.ncols(), 1e-4)),
+                initial_beta: Some(time_initial_beta),
             },
+            timewiggle_block: timewiggle_block.clone(),
             logslopespec,
         };
         let kappa_options = {
@@ -6902,6 +6998,8 @@ fn build_location_scale_saved_model(
 
 fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
     SavedAnchoredDeviationRuntime {
+        kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+            .to_string(),
         knots: runtime.knots.to_vec(),
         degree: runtime.degree,
         basis_dim: runtime.basis_dim,

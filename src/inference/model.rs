@@ -1,4 +1,5 @@
 use crate::basis::BasisOptions;
+use crate::types::BasisFamily;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
@@ -332,9 +333,40 @@ pub struct SavedBaselineTimeWiggleRuntime {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedAnchoredDeviationRuntime {
+    pub kernel: String,
     pub knots: Vec<f64>,
     pub degree: usize,
     pub basis_dim: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SavedDeviationSpanCubic {
+    pub left: f64,
+    pub right: f64,
+    pub c0: f64,
+    pub c1: f64,
+    pub c2: f64,
+    pub c3: f64,
+}
+
+impl SavedDeviationSpanCubic {
+    #[inline]
+    pub fn evaluate(self, x: f64) -> f64 {
+        let t = x - self.left;
+        self.c0 + self.c1 * t + self.c2 * t * t + self.c3 * t * t * t
+    }
+
+    #[inline]
+    pub fn first_derivative(self, x: f64) -> f64 {
+        let t = x - self.left;
+        self.c1 + 2.0 * self.c2 * t + 3.0 * self.c3 * t * t
+    }
+
+    #[inline]
+    pub fn second_derivative(self, x: f64) -> f64 {
+        let t = x - self.left;
+        2.0 * self.c2 + 6.0 * self.c3 * t
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -424,11 +456,39 @@ impl SavedBaselineTimeWiggleRuntime {
 }
 
 impl SavedAnchoredDeviationRuntime {
+    fn validate_kernel(&self) -> Result<(), String> {
+        if self.kernel.is_empty()
+            || self.kernel
+                == crate::families::bernoulli_marginal_slope_exact::LEGACY_ANCHORED_DEVIATION_KERNEL
+        {
+            return Err(
+                "saved anchored deviation runtime is missing the ExactDenestedCubicV1 marker or uses legacy flexible Bernoulli marginal-slope semantics; the model must be refit"
+                    .to_string(),
+            );
+        }
+        if self.kernel != crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+        {
+            return Err(format!(
+                "saved anchored deviation runtime uses unsupported kernel '{}'; expected {}",
+                self.kernel,
+                crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+            ));
+        }
+        if self.degree != 3 {
+            return Err(format!(
+                "saved anchored deviation runtime must be cubic (degree=3), got degree={}",
+                self.degree
+            ));
+        }
+        Ok(())
+    }
+
     fn constrained_basis(
         &self,
         values: &Array1<f64>,
         basis_options: BasisOptions,
     ) -> Result<Array2<f64>, String> {
+        self.validate_kernel()?;
         let knot_arr = Array1::from_vec(self.knots.clone());
         let constrained = monotone_wiggle_basis_with_derivative_order(
             values.view(),
@@ -446,6 +506,200 @@ impl SavedAnchoredDeviationRuntime {
         Ok(constrained)
     }
 
+    pub fn breakpoints(&self) -> Result<Vec<f64>, String> {
+        self.validate_kernel()?;
+        if self.knots.is_empty() {
+            return Err("saved anchored deviation runtime is missing knots".to_string());
+        }
+        let mut points = Vec::new();
+        for &knot in &self.knots {
+            if points
+                .last()
+                .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
+            {
+                points.push(knot);
+            }
+        }
+        if points.len() < 2 {
+            return Err(
+                "saved anchored deviation runtime requires at least two distinct breakpoints"
+                    .to_string(),
+            );
+        }
+        Ok(points)
+    }
+
+    pub fn span_count(&self) -> Result<usize, String> {
+        Ok(self.breakpoints()?.windows(2).count())
+    }
+
+    pub fn span_index_for(&self, value: f64) -> Result<usize, String> {
+        if !value.is_finite() {
+            return Err(format!(
+                "saved anchored deviation span lookup requires finite value, got {value}"
+            ));
+        }
+        let points = self.breakpoints()?;
+        let n = points.len() - 1;
+        if value <= points[0] {
+            return Ok(0);
+        }
+        if value >= points[n] {
+            return Ok(n - 1);
+        }
+        for idx in 0..n {
+            if value >= points[idx] && value <= points[idx + 1] {
+                return Ok(idx);
+            }
+        }
+        Err(format!(
+            "saved anchored deviation span lookup failed for value {value}; support is [{:.6}, {:.6}]",
+            points[0], points[n]
+        ))
+    }
+
+    pub fn local_cubic_on_span(
+        &self,
+        beta: &Array1<f64>,
+        span_idx: usize,
+    ) -> Result<SavedDeviationSpanCubic, String> {
+        self.validate_kernel()?;
+        if beta.len() != self.basis_dim {
+            return Err(format!(
+                "saved anchored deviation coefficient length mismatch: got {}, expected {}",
+                beta.len(),
+                self.basis_dim
+            ));
+        }
+        let points = self.breakpoints()?;
+        if span_idx + 1 >= points.len() {
+            return Err(format!(
+                "saved anchored deviation span index {} out of range for {} spans",
+                span_idx,
+                points.len() - 1
+            ));
+        }
+        let left = points[span_idx];
+        let right = points[span_idx + 1];
+        let left_point = Array1::from_vec(vec![left]);
+        let mid_point = Array1::from_vec(vec![0.5 * (left + right)]);
+        let value = self.design(&left_point)?.row(0).dot(beta);
+        let d1 = self.first_derivative_design(&left_point)?.row(0).dot(beta);
+        let d2 = self.second_derivative_design(&left_point)?.row(0).dot(beta);
+        let d3 = self.third_derivative_design(&mid_point)?.row(0).dot(beta);
+        Ok(SavedDeviationSpanCubic {
+            left,
+            right,
+            c0: value,
+            c1: d1,
+            c2: 0.5 * d2,
+            c3: d3 / 6.0,
+        })
+    }
+
+    pub fn basis_span_cubic(
+        &self,
+        span_idx: usize,
+        basis_idx: usize,
+    ) -> Result<SavedDeviationSpanCubic, String> {
+        self.validate_kernel()?;
+        if basis_idx >= self.basis_dim {
+            return Err(format!(
+                "saved anchored deviation basis index {} out of range for {} coefficients",
+                basis_idx, self.basis_dim
+            ));
+        }
+        let mut beta = Array1::<f64>::zeros(self.basis_dim);
+        beta[basis_idx] = 1.0;
+        self.local_cubic_on_span(&beta, span_idx)
+    }
+
+    pub fn basis_cubic_at(
+        &self,
+        basis_idx: usize,
+        value: f64,
+    ) -> Result<SavedDeviationSpanCubic, String> {
+        let span_idx = self.span_index_for(value)?;
+        self.basis_span_cubic(span_idx, basis_idx)
+    }
+
+    pub fn exact_local_cubic_on_span(
+        &self,
+        beta: &Array1<f64>,
+        span_idx: usize,
+    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
+        self.local_cubic_on_span(beta, span_idx).map(|span| {
+            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                left: span.left,
+                right: span.right,
+                c0: span.c0,
+                c1: span.c1,
+                c2: span.c2,
+                c3: span.c3,
+            }
+        })
+    }
+
+    pub fn exact_local_cubic_at(
+        &self,
+        beta: &Array1<f64>,
+        value: f64,
+    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
+        self.local_cubic_at(beta, value).map(|span| {
+            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                left: span.left,
+                right: span.right,
+                c0: span.c0,
+                c1: span.c1,
+                c2: span.c2,
+                c3: span.c3,
+            }
+        })
+    }
+
+    pub fn exact_basis_span_cubic(
+        &self,
+        span_idx: usize,
+        basis_idx: usize,
+    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
+        self.basis_span_cubic(span_idx, basis_idx).map(|span| {
+            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                left: span.left,
+                right: span.right,
+                c0: span.c0,
+                c1: span.c1,
+                c2: span.c2,
+                c3: span.c3,
+            }
+        })
+    }
+
+    pub fn exact_basis_cubic_at(
+        &self,
+        basis_idx: usize,
+        value: f64,
+    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
+        self.basis_cubic_at(basis_idx, value).map(|span| {
+            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                left: span.left,
+                right: span.right,
+                c0: span.c0,
+                c1: span.c1,
+                c2: span.c2,
+                c3: span.c3,
+            }
+        })
+    }
+
+    pub fn local_cubic_at(
+        &self,
+        beta: &Array1<f64>,
+        value: f64,
+    ) -> Result<SavedDeviationSpanCubic, String> {
+        let span_idx = self.span_index_for(value)?;
+        self.local_cubic_on_span(beta, span_idx)
+    }
+
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
         self.constrained_basis(values, BasisOptions::value())
     }
@@ -456,6 +710,26 @@ impl SavedAnchoredDeviationRuntime {
 
     pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
         self.constrained_basis(values, BasisOptions::second_derivative())
+    }
+
+    pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.constrained_basis(
+            values,
+            BasisOptions {
+                derivative_order: 3,
+                basis_family: BasisFamily::BSpline,
+            },
+        )
+    }
+
+    pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.constrained_basis(
+            values,
+            BasisOptions {
+                derivative_order: 4,
+                basis_family: BasisFamily::BSpline,
+            },
+        )
     }
 }
 
@@ -742,6 +1016,18 @@ impl FittedModel {
     }
 
     pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, String> {
+        if self.predict_model_class() == PredictModelClass::BernoulliMarginalSlope {
+            if let Some(runtime) = self.payload().score_warp_runtime.as_ref() {
+                runtime
+                    .validate_kernel()
+                    .map_err(|err| format!("saved bernoulli marginal-slope score-warp runtime is incompatible: {err}. Refit the model."))?;
+            }
+            if let Some(runtime) = self.payload().link_deviation_runtime.as_ref() {
+                runtime
+                    .validate_kernel()
+                    .map_err(|err| format!("saved bernoulli marginal-slope link-deviation runtime is incompatible: {err}. Refit the model."))?;
+            }
+        }
         Ok(SavedPredictionRuntime {
             model_class: self.predict_model_class(),
             likelihood: self.likelihood(),

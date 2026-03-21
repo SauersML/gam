@@ -312,7 +312,10 @@ fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f6
         LinkComponent::Probit => probit_pdffourth_derivative(eta),
         LinkComponent::Logit => logit_inverse_link_jet5(eta).d5,
         LinkComponent::CLogLog => {
-            // d5 = d1(t^4 - 10t^3 + 25t^2 - 15t + 1)  where t = exp(eta)
+            // Exact closed form:
+            //   d5 = exp(-t) * (t - 15t^2 + 25t^3 - 10t^4 + t^5)
+            //      = d1 * (1 - 15t + 25t^2 - 10t^3 + t^4),
+            // where t = exp(eta).
             if eta.is_nan() {
                 return f64::NAN;
             }
@@ -326,7 +329,10 @@ fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f6
             ))
         }
         LinkComponent::LogLog => {
-            // d5 = d1(-r^4 + 10r^3 - 25r^2 + 15r - 1) where r = exp(-eta)
+            // Exact closed form:
+            //   d5 = exp(-r) * (r - 15r^2 + 25r^3 - 10r^4 + r^5)
+            //      = d1 * (1 - 15r + 25r^2 - 10r^3 + r^4),
+            // where r = exp(-eta).
             if eta.is_nan() {
                 return f64::NAN;
             }
@@ -336,7 +342,7 @@ fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f6
             let r = (-eta).exp();
             canonicalzero(stable_nonnegative_poly_times_exp_neg(
                 r,
-                &[0.0, -1.0, 15.0, -25.0, 10.0, -1.0],
+                &[0.0, 1.0, -15.0, 25.0, -10.0, 1.0],
             ))
         }
         LinkComponent::Cauchit => {
@@ -2269,5 +2275,19 @@ mod tests {
             jet.mu,
             stable_mu
         );
+    }
+
+    #[test]
+    fn loglog_fifth_derivative_should_match_closed_form_sign() {
+        let eta = 0.0_f64;
+        let r = (-eta).exp();
+        let expected =
+            (-r).exp() * (r - 15.0 * r * r + 25.0 * r.powi(3) - 10.0 * r.powi(4) + r.powi(5));
+        let d5 = component_inverse_link_pdffourth_derivative(LinkComponent::LogLog, eta);
+        assert!(
+            (d5 - expected).abs() < 1e-15,
+            "loglog d5 should equal exp(-r) * (r - 15r^2 + 25r^3 - 10r^4 + r^5) at eta={eta}; got {d5} vs {expected}"
+        );
+        assert!(d5 > 0.0, "loglog d5 should be positive at eta=0; got {d5}");
     }
 }

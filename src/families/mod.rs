@@ -1,4 +1,5 @@
 pub mod bernoulli_marginal_slope;
+pub mod bernoulli_marginal_slope_exact;
 pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;

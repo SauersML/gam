@@ -4308,7 +4308,7 @@ fn matern_kernel_log_kappasecond_derivative_from_distance(
                     0.0,
                     -2.0 / 7.0,
                     -2.0 / 7.0,
-                    -6.0 / 35.0,
+                    -3.0 / 35.0,
                     1.0 / 105.0,
                     1.0 / 105.0,
                 ],
@@ -7856,6 +7856,9 @@ fn matern_operator_psi_triplet(
     //   phi''(r)      = s^2 * e^{-a} * R_nu(a),
     //   phi'(r)/r     = -s^2 * e^{-a} * Q_nu(a),  (nu>=3/2),
     // where Q_nu, R_nu are low-degree polynomials.
+    // The `q` and `rr` arrays below are the literal coefficient arrays for
+    // Q_nu(a) and R_nu(a), including the normalization factors such as 1/3,
+    // 1/15, and 1/105.
     //
     // Then psi-derivatives are obtained exactly through
     // exp_poly_scaled_s2_psi_triplet, avoiding finite differences.
@@ -7865,16 +7868,26 @@ fn matern_operator_psi_triplet(
     let (s, q, rr): (f64, &[f64], &[f64]) = match nu {
         MaternNu::Half => (kappa, &[1.0], &[1.0]),
         MaternNu::ThreeHalves => (3.0_f64.sqrt() * kappa, &[1.0], &[-1.0, 1.0]),
-        MaternNu::FiveHalves => (5.0_f64.sqrt() * kappa, &[1.0, 1.0], &[-1.0, -1.0, 1.0]),
+        MaternNu::FiveHalves => (
+            5.0_f64.sqrt() * kappa,
+            &[1.0 / 3.0, 1.0 / 3.0],
+            &[-1.0 / 3.0, -1.0 / 3.0, 1.0 / 3.0],
+        ),
         MaternNu::SevenHalves => (
             7.0_f64.sqrt() * kappa,
-            &[3.0, 3.0, 1.0],
-            &[-3.0, -3.0, 0.0, 1.0],
+            &[1.0 / 5.0, 1.0 / 5.0, 1.0 / 15.0],
+            &[-1.0 / 5.0, -1.0 / 5.0, 0.0, 1.0 / 15.0],
         ),
         MaternNu::NineHalves => (
             9.0_f64.sqrt() * kappa,
-            &[15.0, 15.0, 6.0, 1.0],
-            &[-15.0, -15.0, -3.0, 2.0, 1.0],
+            &[1.0 / 7.0, 1.0 / 7.0, 2.0 / 35.0, 1.0 / 105.0],
+            &[
+                -1.0 / 7.0,
+                -1.0 / 7.0,
+                -1.0 / 35.0,
+                2.0 / 105.0,
+                1.0 / 105.0,
+            ],
         ),
     };
     let a = s * r;
@@ -17426,6 +17439,146 @@ mod tests {
             assert!(
                 value == 0.0,
                 "matern_operator_psi_triplet component {idx} should decay to 0 for enormous finite distances; got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn matern_nine_halves_log_kappasecond_derivative_matches_closed_form() {
+        let r = 1.0_f64;
+        let length_scale = 1.0_f64;
+        let a = 3.0 * r / length_scale;
+        let expected = (-a).exp()
+            * (-(2.0 / 7.0) * a * a - (2.0 / 7.0) * a.powi(3) - (3.0 / 35.0) * a.powi(4)
+                + (1.0 / 105.0) * a.powi(5)
+                + (1.0 / 105.0) * a.powi(6));
+        let actual = matern_kernel_log_kappasecond_derivative_from_distance(
+            r,
+            length_scale,
+            MaternNu::NineHalves,
+        )
+        .expect("9/2 second log-kappa derivative");
+        assert!(
+            (actual - expected).abs() < 1e-15,
+            "nu=9/2 second log-kappa derivative should match the closed form at r={r}, length_scale={length_scale}; got {actual} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn matern_operator_psi_triplet_should_match_closed_form_polynomials() {
+        let r = 1.0_f64;
+        let length_scale = 1.0_f64;
+
+        for &nu in &[
+            MaternNu::FiveHalves,
+            MaternNu::SevenHalves,
+            MaternNu::NineHalves,
+        ] {
+            let a = match nu {
+                MaternNu::FiveHalves => 5.0_f64.sqrt() * r / length_scale,
+                MaternNu::SevenHalves => 7.0_f64.sqrt() * r / length_scale,
+                MaternNu::NineHalves => 3.0 * r / length_scale,
+                _ => unreachable!("test only covers nu >= 5/2"),
+            };
+            let (expected_ratio, expected_lap) = match nu {
+                MaternNu::FiveHalves => (
+                    -(5.0 / 3.0) * (-a).exp() * (a + 1.0),
+                    (5.0 / 3.0) * (-a).exp() * (a * a - a - 1.0),
+                ),
+                MaternNu::SevenHalves => (
+                    -(7.0 / 15.0) * (-a).exp() * (a * a + 3.0 * a + 3.0),
+                    (7.0 / 15.0) * (-a).exp() * (a.powi(3) - 3.0 * a - 3.0),
+                ),
+                MaternNu::NineHalves => (
+                    -(3.0 / 35.0) * (-a).exp() * (a.powi(3) + 6.0 * a * a + 15.0 * a + 15.0),
+                    (3.0 / 35.0)
+                        * (-a).exp()
+                        * (a.powi(4) + 2.0 * a.powi(3) - 3.0 * a * a - 15.0 * a - 15.0),
+                ),
+                _ => unreachable!("test only covers nu >= 5/2"),
+            };
+            let triplet =
+                matern_operator_psi_triplet(r, length_scale, nu, 1).expect("operator psi triplet");
+            let ratio = triplet.3;
+            let lap = triplet.6;
+            assert!(
+                (ratio - expected_ratio).abs() < 1e-14,
+                "phi'(r)/r closed form mismatch for nu={nu:?}: got {ratio} vs {expected_ratio}"
+            );
+            assert!(
+                (lap - expected_lap).abs() < 1e-14,
+                "phi'' closed form mismatch for nu={nu:?}: got {lap} vs {expected_lap}"
+            );
+        }
+    }
+
+    #[test]
+    fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d() {
+        let centers = array![[0.0], [1.0]];
+        let length_scale = 1.0_f64;
+
+        for &nu in &[
+            MaternNu::FiveHalves,
+            MaternNu::SevenHalves,
+            MaternNu::NineHalves,
+        ] {
+            let ops = build_matern_collocation_operator_matrices(
+                centers.view(),
+                None,
+                length_scale,
+                nu,
+                false,
+                None,
+                None,
+            )
+            .expect("matern collocation operators");
+
+            let r = 1.0_f64;
+            let a = match nu {
+                MaternNu::FiveHalves => 5.0_f64.sqrt() * r / length_scale,
+                MaternNu::SevenHalves => 7.0_f64.sqrt() * r / length_scale,
+                MaternNu::NineHalves => 3.0 * r / length_scale,
+                _ => unreachable!("test only covers nu >= 5/2"),
+            };
+            let (expected_phi, expected_ratio, expected_lap) = match nu {
+                MaternNu::FiveHalves => (
+                    (1.0 + a + a * a / 3.0) * (-a).exp(),
+                    -(5.0 / 3.0) * (-a).exp() * (a + 1.0),
+                    (5.0 / 3.0) * (-a).exp() * (a * a - a - 1.0),
+                ),
+                MaternNu::SevenHalves => (
+                    (1.0 + a + (2.0 / 5.0) * a * a + (1.0 / 15.0) * a.powi(3)) * (-a).exp(),
+                    -(7.0 / 15.0) * (-a).exp() * (a * a + 3.0 * a + 3.0),
+                    (7.0 / 15.0) * (-a).exp() * (a.powi(3) - 3.0 * a - 3.0),
+                ),
+                MaternNu::NineHalves => (
+                    (1.0 + a
+                        + (3.0 / 7.0) * a * a
+                        + (2.0 / 21.0) * a.powi(3)
+                        + (1.0 / 105.0) * a.powi(4))
+                        * (-a).exp(),
+                    -(3.0 / 35.0) * (-a).exp() * (a.powi(3) + 6.0 * a * a + 15.0 * a + 15.0),
+                    (3.0 / 35.0)
+                        * (-a).exp()
+                        * (a.powi(4) + 2.0 * a.powi(3) - 3.0 * a * a - 15.0 * a - 15.0),
+                ),
+                _ => unreachable!("test only covers nu >= 5/2"),
+            };
+
+            assert!(
+                (ops.d0[[1, 0]] - expected_phi).abs() < 1e-14,
+                "D0 off-diagonal mismatch for nu={nu:?}: got {} vs {expected_phi}",
+                ops.d0[[1, 0]]
+            );
+            assert!(
+                (ops.d1[[1, 0]] - expected_ratio).abs() < 1e-14,
+                "D1 off-diagonal mismatch for nu={nu:?}: got {} vs {expected_ratio}",
+                ops.d1[[1, 0]]
+            );
+            assert!(
+                (ops.d2[[1, 0]] - expected_lap).abs() < 1e-14,
+                "D2 off-diagonal mismatch for nu={nu:?}: got {} vs {expected_lap}",
+                ops.d2[[1, 0]]
             );
         }
     }
