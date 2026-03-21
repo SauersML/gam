@@ -19,7 +19,6 @@ use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_ro
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
-use crate::quadrature::compute_gauss_hermite_n;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_joint,
@@ -31,6 +30,8 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
 use std::sync::Arc;
+
+pub(crate) mod exact_kernel;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -71,36 +72,6 @@ pub struct DeviationRuntime {
     span_mid_d3_design: Array2<f64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DeviationSpanCubic {
-    pub left: f64,
-    pub right: f64,
-    pub c0: f64,
-    pub c1: f64,
-    pub c2: f64,
-    pub c3: f64,
-}
-
-impl DeviationSpanCubic {
-    #[inline]
-    fn evaluate(self, x: f64) -> f64 {
-        let t = x - self.left;
-        self.c0 + self.c1 * t + self.c2 * t * t + self.c3 * t * t * t
-    }
-
-    #[inline]
-    fn first_derivative(self, x: f64) -> f64 {
-        let t = x - self.left;
-        self.c1 + 2.0 * self.c2 * t + 3.0 * self.c3 * t * t
-    }
-
-    #[inline]
-    fn second_derivative(self, x: f64) -> f64 {
-        let t = x - self.left;
-        2.0 * self.c2 + 6.0 * self.c3 * t
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct DeviationPrepared {
     pub(crate) block: ParameterBlockInput,
@@ -137,8 +108,6 @@ struct BernoulliMarginalSlopeFamily {
     z: Arc<Array1<f64>>,
     marginal_design: DesignMatrix,
     logslope_design: DesignMatrix,
-    quadrature_nodes: Array1<f64>,
-    quadrature_weights: Array1<f64>,
     score_warp: Option<DeviationRuntime>,
     score_warp_obs_design: Option<DesignMatrix>,
     link_dev: Option<DeviationRuntime>,
@@ -252,14 +221,14 @@ impl DeviationRuntime {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<DeviationSpanCubic, String> {
+    ) -> Result<exact_kernel::LocalSpanCubic, String> {
         self.validate_beta_shape(beta, "deviation local cubic coefficients")?;
         let (left, right) = self.span_interval(span_idx)?;
         let value_design = self.span_left_value_design.row(span_idx);
         let d1_design = self.span_left_d1_design.row(span_idx);
         let d2_design = self.span_left_d2_design.row(span_idx);
         let d3 = self.span_mid_d3_design.row(span_idx).dot(beta);
-        Ok(DeviationSpanCubic {
+        Ok(exact_kernel::LocalSpanCubic {
             left,
             right,
             c0: value_design.dot(beta),
@@ -273,7 +242,7 @@ impl DeviationRuntime {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<DeviationSpanCubic, String> {
+    ) -> Result<exact_kernel::LocalSpanCubic, String> {
         if basis_idx >= self.basis_dim {
             return Err(format!(
                 "deviation basis index {} out of range for {} coefficients",
@@ -281,7 +250,7 @@ impl DeviationRuntime {
             ));
         }
         let (left, right) = self.span_interval(span_idx)?;
-        Ok(DeviationSpanCubic {
+        Ok(exact_kernel::LocalSpanCubic {
             left,
             right,
             c0: self.span_left_value_design[[span_idx, basis_idx]],
@@ -295,84 +264,16 @@ impl DeviationRuntime {
         &self,
         basis_idx: usize,
         value: f64,
-    ) -> Result<DeviationSpanCubic, String> {
+    ) -> Result<exact_kernel::LocalSpanCubic, String> {
         let span_idx = self.span_index_for(value)?;
         self.basis_span_cubic(span_idx, basis_idx)
-    }
-
-    pub fn exact_local_cubic_on_span(
-        &self,
-        beta: &Array1<f64>,
-        span_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
-        self.local_cubic_on_span(beta, span_idx).map(|span| {
-            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
-                left: span.left,
-                right: span.right,
-                c0: span.c0,
-                c1: span.c1,
-                c2: span.c2,
-                c3: span.c3,
-            }
-        })
-    }
-
-    pub fn exact_local_cubic_at(
-        &self,
-        beta: &Array1<f64>,
-        value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
-        self.local_cubic_at(beta, value).map(|span| {
-            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
-                left: span.left,
-                right: span.right,
-                c0: span.c0,
-                c1: span.c1,
-                c2: span.c2,
-                c3: span.c3,
-            }
-        })
-    }
-
-    pub fn exact_basis_span_cubic(
-        &self,
-        span_idx: usize,
-        basis_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
-        self.basis_span_cubic(span_idx, basis_idx).map(|span| {
-            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
-                left: span.left,
-                right: span.right,
-                c0: span.c0,
-                c1: span.c1,
-                c2: span.c2,
-                c3: span.c3,
-            }
-        })
-    }
-
-    pub fn exact_basis_cubic_at(
-        &self,
-        basis_idx: usize,
-        value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
-        self.basis_cubic_at(basis_idx, value).map(|span| {
-            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
-                left: span.left,
-                right: span.right,
-                c0: span.c0,
-                c1: span.c1,
-                c2: span.c2,
-                c3: span.c3,
-            }
-        })
     }
 
     fn local_cubic_at(
         &self,
         beta: &Array1<f64>,
         value: f64,
-    ) -> Result<DeviationSpanCubic, String> {
+    ) -> Result<exact_kernel::LocalSpanCubic, String> {
         let span_idx = self.span_index_for(value)?;
         self.local_cubic_on_span(beta, span_idx)
     }
@@ -889,16 +790,6 @@ fn joint_setup(
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
-    )
-}
-
-pub(crate) fn normal_expectation_nodes(n: usize) -> (Array1<f64>, Array1<f64>) {
-    let gh = compute_gauss_hermite_n(n);
-    let scale = 2.0_f64.sqrt();
-    let norm = std::f64::consts::PI.sqrt();
-    (
-        Array1::from_iter(gh.nodes.into_iter().map(|x| scale * x)),
-        Array1::from_iter(gh.weights.into_iter().map(|w| w / norm)),
     )
 }
 
@@ -1960,7 +1851,7 @@ impl BernoulliMarginalSlopeFamily {
         b: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
-    ) -> Result<Vec<crate::families::bernoulli_marginal_slope_exact::DenestedPartitionCell>, String>
+    ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String>
     {
         let score_tail = 8.0;
         let mut score_breaks = if let Some(runtime) = self.score_warp.as_ref() {
@@ -1986,16 +1877,16 @@ impl BernoulliMarginalSlopeFamily {
         if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
             link_breaks.push(a + link_tail);
         }
-        crate::families::bernoulli_marginal_slope_exact::build_denested_partition_cells(
+        exact_kernel::build_denested_partition_cells(
             a,
             b,
             &score_breaks,
             &link_breaks,
             |z| {
                 if let (Some(runtime), Some(beta)) = (self.score_warp.as_ref(), beta_h) {
-                    runtime.exact_local_cubic_at(beta, z)
+                    runtime.local_cubic_at(beta, z)
                 } else {
-                    Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                    Ok(exact_kernel::LocalSpanCubic {
                         left: -8.0,
                         right: 8.0,
                         c0: 0.0,
@@ -2007,9 +1898,9 @@ impl BernoulliMarginalSlopeFamily {
             },
             |u| {
                 if let (Some(runtime), Some(beta)) = (self.link_dev.as_ref(), beta_w) {
-                    runtime.exact_local_cubic_at(beta, u)
+                    runtime.local_cubic_at(beta, u)
                 } else {
-                    Ok(crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
+                    Ok(exact_kernel::LocalSpanCubic {
                         left: a - 8.0 * (1.0 + b.abs()),
                         right: a + 8.0 * (1.0 + b.abs()),
                         c0: 0.0,
@@ -2036,10 +1927,9 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_aa = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
-            let state =
-                crate::families::bernoulli_marginal_slope_exact::evaluate_cell_moments(cell, 9)?;
+            let state = exact_kernel::evaluate_cell_moments(cell, 9)?;
             f += state.value;
-            let (dc_da, _) = crate::families::bernoulli_marginal_slope_exact::denested_cell_coefficient_partials(
+            let (dc_da, _) = exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
@@ -2052,11 +1942,11 @@ impl BernoulliMarginalSlopeFamily {
                 0.0,
                 0.0,
             ];
-            f_a += crate::families::bernoulli_marginal_slope_exact::cell_first_derivative_from_moments(
+            f_a += exact_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
             )?;
-            f_aa += crate::families::bernoulli_marginal_slope_exact::cell_second_derivative_from_moments(
+            f_aa += exact_kernel::cell_second_derivative_from_moments(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -2127,9 +2017,9 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64), String> {
-        // Evaluate the de-nested calibration equation through the current
-        // hybrid cell-partition kernel: exact on affine cells, numeric
-        // reference on quartic/sextic cells.
+        // Evaluate the de-nested calibration equation through the exact
+        // cell-partition kernel: affine cells use the closed-form anchor and
+        // quartic/sextic cells use transported non-affine moments.
         //   F(a) = E[ Φ(a + b z + b Δ_h(z) + Δ_w(a + b z)) ] - Φ(q)
         // and its derivative with respect to a.
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
@@ -2825,7 +2715,7 @@ impl BernoulliMarginalSlopeFamily {
         need_hessian: bool,
         scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
     ) -> Result<f64, String> {
-        use crate::families::bernoulli_marginal_slope_exact as exact;
+        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
 
         let r = primary.total;
         scratch.reset(need_hessian);
@@ -2893,7 +2783,7 @@ impl BernoulliMarginalSlopeFamily {
 
             if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
                 for local_idx in 0..h_range.len() {
-                    let basis_span = runtime.exact_basis_cubic_at(local_idx, z_mid)?;
+                    let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
                     let idx = h_range.start + local_idx;
                     coeff_u[idx] = exact::score_basis_cell_coefficients(basis_span, b);
                     if need_hessian {
@@ -2904,7 +2794,7 @@ impl BernoulliMarginalSlopeFamily {
 
             if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
                 for local_idx in 0..w_range.len() {
-                    let basis_span = runtime.exact_basis_cubic_at(local_idx, u_mid)?;
+                    let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
                     let idx = w_range.start + local_idx;
                     coeff_u[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
                     if need_hessian {
@@ -3183,1109 +3073,8 @@ impl BernoulliMarginalSlopeFamily {
             "bernoulli marginal-slope flexible fourth-order directional derivatives are not available for the exact de-nested cubic kernel"
                 .to_string(),
         );
-
-        let r = primary.total;
-        let q_val = block_states[0].eta[row];
-        let b = block_states[1].eta[row];
-        let a = row_ctx.intercept;
-        let m_a = row_ctx.m_a;
-        let inv_ma = 1.0 / m_a;
-        let y_i = self.y[row];
-        let w_i = self.weights[row];
-        let s_y = 2.0 * y_i - 1.0;
-        let beta_w: Option<&Array1<f64>> = if self.link_dev.is_some() {
-            block_states.last().map(|st| &st.beta)
-        } else {
-            None
-        };
-        let n_h = primary.h.as_ref().map_or(0, |rng| rng.len());
-        let n_w = primary.w.as_ref().map_or(0, |rng| rng.len());
-        let obs_row: Option<Array1<f64>> = if let (Some(_), Some((obs_design, _))) =
-            (primary.h.as_ref(), cache.score_warp_obs.as_ref())
-        {
-            Some(obs_design.row_chunk(row..row + 1).row(0).to_owned())
-        } else {
-            None
-        };
-        let phi_q = normal_pdf(q_val);
-        let h_nodes = &cache.h_nodes;
-        let h_node_design = cache.h_node_design.as_ref();
-        let nq = h_nodes.len();
-
-        // Phase 1+2: Recompute 1st/2nd order IFT (needed for a_{klv}, a_{klu})
-        let mut m_aa = 0.0f64;
-        let mut m_u = Array1::<f64>::zeros(r);
-        let mut m_au = Array1::<f64>::zeros(r);
-        let mut m_uv = Array2::<f64>::zeros((r, r));
-        // 3rd order accumulators for BOTH directions
-        let mut m_aaa = 0.0f64;
-        let mut m_aau_k = Array1::<f64>::zeros(r);
-        let mut m_a_kl = Array2::<f64>::zeros((r, r));
-        // Contracted with v
-        let mut m_auv_v = Array1::<f64>::zeros(r);
-        let mut m_uvw_v = Array2::<f64>::zeros((r, r));
-        // Contracted with u
-        let mut m_auv_u = Array1::<f64>::zeros(r);
-        let mut m_uvw_u = Array2::<f64>::zeros((r, r));
-        // 4th order cross-contracted D_uv quantities
-        let mut d2m_a_uv = 0.0f64;
-        let mut d2m_aa_uv = 0.0f64;
-        let mut d2m_au_uv = Array1::<f64>::zeros(r);
-        let mut d2m_kl_uv = Array2::<f64>::zeros((r, r));
-        let mut xi = Array1::<f64>::zeros(r);
-        let mut dc_arr = Array1::<f64>::zeros(r);
-        let mut du_arr = Array1::<f64>::zeros(r);
-        let mut dd_arr = Array1::<f64>::zeros(r);
-        let mut dxi_v = Array1::<f64>::zeros(r);
-        let mut dxi_u = Array1::<f64>::zeros(r);
-        let mut ddc_v_arr = Array1::<f64>::zeros(r);
-        let mut ddc_u_arr = Array1::<f64>::zeros(r);
-
-        for j in 0..nq {
-            let h_j = h_nodes[j];
-            let omega_j = self.quadrature_weights[j];
-            let h_row = h_node_design.as_ref().map(|design| design.row(j));
-            let (s_j, c_j, d_j, e_j) = self.fill_fixed_a_higher_jets(
-                primary,
-                b,
-                h_j,
-                a + b * h_j,
-                h_row,
-                row_ctx.node_link.as_ref(),
-                j,
-                beta_w,
-                &mut xi,
-                &mut dc_arr,
-                &mut du_arr,
-                &mut dd_arr,
-            )?;
-
-            let r_j = omega_j * normal_pdf(s_j);
-            let t_j = -s_j * r_j;
-            let u3_j = (s_j * s_j - 1.0) * r_j;
-
-            // Directional contracted scalars for v
-            let du_v = du_arr.dot(dir_v);
-            let mut dh_v = 0.0;
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    dh_v += des[[j, k]] * dir_v[hr.start + k];
-                }
-            }
-
-            // Same for u
-            let du_u = du_arr.dot(dir_u);
-            let mut dh_u = 0.0;
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    dh_u += des[[j, k]] * dir_u[hr.start + k];
-                }
-            }
-
-            // 1st order M
-            for k in 0..r {
-                m_u[k] += r_j * xi[k];
-            }
-            // 2nd order M
-            m_aa += t_j * c_j * c_j + r_j * d_j;
-            for k in 0..r {
-                m_au[k] += t_j * c_j * xi[k] + r_j * dc_arr[k];
-            }
-            // m_uv: rank-1 + corrections (same as third function)
-            for k in 0..r {
-                for l in k..r {
-                    let mut val = t_j * xi[k] * xi[l];
-                    // dxi/dtheta corrections
-                    if k == 1 && l == 1 {
-                        val += r_j * d_j * h_j * h_j;
-                    } else if k == 1 {
-                        if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                            if l >= hr.start && l < hr.end {
-                                val += r_j
-                                    * (d_j * b * des[[j, l - hr.start]] * h_j
-                                        + c_j * des[[j, l - hr.start]]);
-                            }
-                        }
-                        if let (Some(wr), Some(ls)) =
-                            (primary.w.as_ref(), row_ctx.node_link.as_ref())
-                        {
-                            if l >= wr.start && l < wr.end {
-                                val += r_j * ls.d1[[j, l - wr.start]] * h_j;
-                            }
-                        }
-                    } else if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                        if k >= hr.start && k < hr.end && l >= hr.start && l < hr.end {
-                            val +=
-                                r_j * d_j * b * b * des[[j, k - hr.start]] * des[[j, l - hr.start]];
-                        }
-                        if let (Some(wr), Some(ls)) =
-                            (primary.w.as_ref(), row_ctx.node_link.as_ref())
-                        {
-                            if k >= hr.start && k < hr.end && l >= wr.start && l < wr.end {
-                                val += r_j * ls.d1[[j, l - wr.start]] * b * des[[j, k - hr.start]];
-                            }
-                        }
-                    }
-                    m_uv[[k, l]] += val;
-                    if l != k {
-                        m_uv[[l, k]] += val;
-                    }
-                }
-            }
-
-            // 3rd order M (needed for BOTH v and u directions)
-            m_aaa += u3_j * c_j * c_j * c_j + 3.0 * t_j * c_j * d_j + r_j * e_j;
-            for k in 0..r {
-                m_aau_k[k] += u3_j * c_j * c_j * xi[k]
-                    + t_j * (2.0 * c_j * dc_arr[k] + d_j * xi[k])
-                    + r_j * dd_arr[k];
-            }
-
-            // Build dxi_v, dxi_u, ddc_v, ddc_u per-k
-            let mut dc_v = d_j * du_v;
-            let mut dc_u = d_j * du_u;
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
-                for ell in 0..n_w {
-                    dc_v += ls.d1[[j, ell]] * dir_v[wr.start + ell];
-                    dc_u += ls.d1[[j, ell]] * dir_u[wr.start + ell];
-                }
-            }
-            let xi_v = xi.dot(dir_v);
-            let xi_u = xi.dot(dir_u);
-
-            dxi_v.fill(0.0);
-            dxi_u.fill(0.0);
-            ddc_v_arr.fill(0.0);
-            ddc_u_arr.fill(0.0);
-            dxi_v[1] = dc_v * h_j + c_j * dh_v;
-            dxi_u[1] = dc_u * h_j + c_j * dh_u;
-            ddc_v_arr[1] = e_j * h_j * du_v + d_j * dh_v;
-            ddc_u_arr[1] = e_j * h_j * du_u + d_j * dh_u;
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    dxi_v[hr.start + k] = dc_v * b * des[[j, k]] + c_j * des[[j, k]] * dir_v[1];
-                    dxi_u[hr.start + k] = dc_u * b * des[[j, k]] + c_j * des[[j, k]] * dir_u[1];
-                    ddc_v_arr[hr.start + k] =
-                        e_j * b * des[[j, k]] * du_v + d_j * des[[j, k]] * dir_v[1];
-                    ddc_u_arr[hr.start + k] =
-                        e_j * b * des[[j, k]] * du_u + d_j * des[[j, k]] * dir_u[1];
-                }
-            }
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
-                for ell in 0..n_w {
-                    dxi_v[wr.start + ell] = ls.d1[[j, ell]] * du_v;
-                    dxi_u[wr.start + ell] = ls.d1[[j, ell]] * du_u;
-                    ddc_v_arr[wr.start + ell] = ls.d2[[j, ell]] * du_v;
-                    ddc_u_arr[wr.start + ell] = ls.d2[[j, ell]] * du_u;
-                }
-            }
-
-            // Accumulate 3rd-order contracted with v
-            for k in 0..r {
-                m_auv_v[k] += u3_j * c_j * xi[k] * xi_v
-                    + t_j * (dc_v * xi[k] + c_j * dxi_v[k] + xi_v * dc_arr[k])
-                    + r_j * ddc_v_arr[k];
-            }
-            for k in 0..r {
-                if xi[k] == 0.0 && dxi_v[k] == 0.0 {
-                    continue;
-                }
-                for l in k..r {
-                    if xi[l] == 0.0 && dxi_v[l] == 0.0 {
-                        continue;
-                    }
-                    let val =
-                        u3_j * xi[k] * xi[l] * xi_v + t_j * (dxi_v[k] * xi[l] + xi[k] * dxi_v[l]);
-                    m_uvw_v[[k, l]] += val;
-                    if l != k {
-                        m_uvw_v[[l, k]] += val;
-                    }
-                }
-            }
-            // Same for u
-            for k in 0..r {
-                m_auv_u[k] += u3_j * c_j * xi[k] * xi_u
-                    + t_j * (dc_u * xi[k] + c_j * dxi_u[k] + xi_u * dc_arr[k])
-                    + r_j * ddc_u_arr[k];
-            }
-            for k in 0..r {
-                if xi[k] == 0.0 && dxi_u[k] == 0.0 {
-                    continue;
-                }
-                for l in k..r {
-                    if xi[l] == 0.0 && dxi_u[l] == 0.0 {
-                        continue;
-                    }
-                    let val =
-                        u3_j * xi[k] * xi[l] * xi_u + t_j * (dxi_u[k] * xi[l] + xi[k] * dxi_u[l]);
-                    m_uvw_u[[k, l]] += val;
-                    if l != k {
-                        m_uvw_u[[l, k]] += val;
-                    }
-                }
-            }
-
-            // M_{a,kl} (needed uncontracted for both directions)
-            for k in 0..r {
-                if xi[k] == 0.0 && dc_arr[k] == 0.0 {
-                    continue;
-                }
-                for l in k..r {
-                    if xi[l] == 0.0 && dc_arr[l] == 0.0 {
-                        continue;
-                    }
-                    let mut val =
-                        u3_j * c_j * xi[k] * xi[l] + t_j * (dc_arr[k] * xi[l] + xi[k] * dc_arr[l]);
-                    // dxi/dtheta + d^2c/dtheta^2 corrections
-                    if k == 1 && l == 1 {
-                        val += t_j * c_j * d_j * h_j * h_j + r_j * e_j * h_j * h_j;
-                    } else if k == 1 {
-                        if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                            if l >= hr.start && l < hr.end {
-                                val += t_j
-                                    * c_j
-                                    * (d_j * b * des[[j, l - hr.start]] * h_j
-                                        + c_j * des[[j, l - hr.start]])
-                                    + r_j
-                                        * (e_j * h_j * b * des[[j, l - hr.start]]
-                                            + d_j * des[[j, l - hr.start]]);
-                            }
-                        }
-                        if let (Some(wr), Some(ls)) =
-                            (primary.w.as_ref(), row_ctx.node_link.as_ref())
-                        {
-                            if l >= wr.start && l < wr.end {
-                                val += t_j * c_j * ls.d1[[j, l - wr.start]] * h_j
-                                    + r_j * ls.d2[[j, l - wr.start]] * h_j;
-                            }
-                        }
-                    } else if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                        if k >= hr.start && k < hr.end && l >= hr.start && l < hr.end {
-                            val += t_j
-                                * c_j
-                                * d_j
-                                * b
-                                * b
-                                * des[[j, k - hr.start]]
-                                * des[[j, l - hr.start]]
-                                + r_j
-                                    * e_j
-                                    * b
-                                    * b
-                                    * des[[j, k - hr.start]]
-                                    * des[[j, l - hr.start]];
-                        }
-                        if let (Some(wr), Some(ls)) =
-                            (primary.w.as_ref(), row_ctx.node_link.as_ref())
-                        {
-                            if k >= hr.start && k < hr.end && l >= wr.start && l < wr.end {
-                                val += t_j
-                                    * c_j
-                                    * ls.d1[[j, l - wr.start]]
-                                    * b
-                                    * des[[j, k - hr.start]]
-                                    + r_j * ls.d2[[j, l - wr.start]] * b * des[[j, k - hr.start]];
-                            }
-                        }
-                    }
-                    m_a_kl[[k, l]] += val;
-                    if l != k {
-                        m_a_kl[[l, k]] += val;
-                    }
-                }
-            }
-
-            // 4th order: D_uv cross quantities using total-derivative scalars.
-            // p_jv = a_v + du_jv, p_ju = a_u + du_ju (computed after IFT).
-            // sigma_jv = c_j * p_jv + B_jv = c_j * (a_v + du_v) + B_v_contracted = xi_v + c_j * a_v
-            // Similarly sigma_ju = xi_u + c_j * a_u
-            // These will be computed AFTER the node loop once a_u, a_v are known.
-            // So we defer the D_uv accumulations to a second pass.
-            // Store per-node base quantities for the second pass.
-            // (We'll do this after computing IFT 1st/2nd order.)
-        } // end first node loop
-
-        // Finalize 1st/2nd order
-        m_u[0] -= phi_q;
-        m_uv[[0, 0]] += q_val * phi_q;
-        m_uvw_v[[0, 0]] += dir_v[0] * (1.0 - q_val * q_val) * phi_q;
-        m_uvw_u[[0, 0]] += dir_u[0] * (1.0 - q_val * q_val) * phi_q;
-
-        // IFT 1st order
-        let mut a_u_vec = Array1::<f64>::zeros(r);
-        for u in 0..r {
-            a_u_vec[u] = -m_u[u] * inv_ma;
-        }
-        // IFT 2nd order
-        let mut a_uv_mat = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val = -(m_uv[[u, v]]
-                    + m_au[u] * a_u_vec[v]
-                    + m_au[v] * a_u_vec[u]
-                    + m_aa * a_u_vec[u] * a_u_vec[v])
-                    * inv_ma;
-                a_uv_mat[[u, v]] = val;
-                a_uv_mat[[v, u]] = val;
-            }
-        }
-
-        // IFT 3rd order for v
-        let a_v_s = a_u_vec.dot(dir_v);
-        let a_kv = a_uv_mat.dot(dir_v);
-        let dm_a_v = m_au.dot(dir_v) + m_aa * a_v_s;
-        let dm_aa_v = m_aau_k.dot(dir_v) + m_aaa * a_v_s;
-        let dm_au_v: Array1<f64> = &m_auv_v + &(&m_aau_k * a_v_s);
-        let dm_kl_v: Array2<f64> = &m_uvw_v + &(&m_a_kl * a_v_s);
-        let mut a_klv = Array2::<f64>::zeros((r, r));
-        for k in 0..r {
-            for l in k..r {
-                let dpsi = dm_kl_v[[k, l]]
-                    + dm_au_v[k] * a_u_vec[l]
-                    + m_au[k] * a_kv[l]
-                    + dm_au_v[l] * a_u_vec[k]
-                    + m_au[l] * a_kv[k]
-                    + dm_aa_v * a_u_vec[k] * a_u_vec[l]
-                    + m_aa * (a_kv[k] * a_u_vec[l] + a_u_vec[k] * a_kv[l]);
-                let val = -dpsi * inv_ma - a_uv_mat[[k, l]] * dm_a_v * inv_ma;
-                a_klv[[k, l]] = val;
-                a_klv[[l, k]] = val;
-            }
-        }
-
-        // IFT 3rd order for u (same structure)
-        let a_u_s = a_u_vec.dot(dir_u);
-        let a_ku = a_uv_mat.dot(dir_u);
-        let dm_a_u = m_au.dot(dir_u) + m_aa * a_u_s;
-        let dm_aa_u = m_aau_k.dot(dir_u) + m_aaa * a_u_s;
-        let dm_au_u: Array1<f64> = &m_auv_u + &(&m_aau_k * a_u_s);
-        let dm_kl_u: Array2<f64> = &m_uvw_u + &(&m_a_kl * a_u_s);
-        let mut a_klu = Array2::<f64>::zeros((r, r));
-        for k in 0..r {
-            for l in k..r {
-                let dpsi = dm_kl_u[[k, l]]
-                    + dm_au_u[k] * a_u_vec[l]
-                    + m_au[k] * a_ku[l]
-                    + dm_au_u[l] * a_u_vec[k]
-                    + m_au[l] * a_ku[k]
-                    + dm_aa_u * a_u_vec[k] * a_u_vec[l]
-                    + m_aa * (a_ku[k] * a_u_vec[l] + a_u_vec[k] * a_ku[l]);
-                let val = -dpsi * inv_ma - a_uv_mat[[k, l]] * dm_a_u * inv_ma;
-                a_klu[[k, l]] = val;
-                a_klu[[l, k]] = val;
-            }
-        }
-
-        // Contracted derived quantities
-        let a_uv_c = dir_u.dot(&a_uv_mat.dot(dir_v)); // scalar u^T a_{kl} v
-        let a_kuv = a_klv.dot(dir_u); // r-vector: eta_{kuv}
-
-        // ── Second node pass for D_uv cross quantities ────────────────
-        // Now that a_u, a_v, a_uv_c are known, compute per-node total-
-        // derivative cross scalars and accumulate D_uv[M] quantities.
-        for j in 0..nq {
-            let h_j = h_nodes[j];
-            let omega_j = self.quadrature_weights[j];
-            let (s_j, c_j, d_j, e_j, f_j_link) = if let Some(ls) = row_ctx.node_link.as_ref() {
-                let bw = beta_w.unwrap();
-                let u_j = a + b * h_j;
-                (
-                    u_j + ls.basis.row(j).dot(bw),
-                    1.0 + ls.d1.row(j).dot(bw),
-                    ls.d2.row(j).dot(bw),
-                    ls.d3.row(j).dot(bw),
-                    ls.d4.row(j).dot(bw),
-                )
-            } else {
-                (a + b * h_j, 1.0, 0.0, 0.0, 0.0)
-            };
-
-            let r_j = omega_j * normal_pdf(s_j);
-            let t_j = -s_j * r_j;
-            let u3_j = (s_j * s_j - 1.0) * r_j;
-            let u4_j = -(s_j * s_j * s_j - 3.0 * s_j) * r_j;
-
-            // du_jv, du_ju from du_arr . dir
-            let mut du_jv = h_j * dir_v[1];
-            let mut du_ju = h_j * dir_u[1];
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    du_jv += b * des[[j, k]] * dir_v[hr.start + k];
-                    du_ju += b * des[[j, k]] * dir_u[hr.start + k];
-                }
-            }
-            let p_jv = a_v_s + du_jv;
-            let p_ju = a_u_s + du_ju;
-
-            // dh contracted
-            let mut dh_jv = 0.0;
-            let mut dh_ju = 0.0;
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    dh_jv += des[[j, k]] * dir_v[hr.start + k];
-                    dh_ju += des[[j, k]] * dir_u[hr.start + k];
-                }
-            }
-            let d2u_juv = dh_ju * dir_v[1] + dir_u[1] * dh_jv;
-            let p_juv = a_uv_c + d2u_juv;
-
-            // Link basis contracted with v and u
-            let mut bp_jv = 0.0;
-            let mut bp_ju = 0.0;
-            let mut bpp_jv = 0.0;
-            let mut bpp_ju = 0.0;
-            let mut bppp_jv = 0.0;
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
-                for ell in 0..n_w {
-                    bp_jv += ls.d1[[j, ell]] * dir_v[wr.start + ell];
-                    bp_ju += ls.d1[[j, ell]] * dir_u[wr.start + ell];
-                    bpp_jv += ls.d2[[j, ell]] * dir_v[wr.start + ell];
-                    bpp_ju += ls.d2[[j, ell]] * dir_u[wr.start + ell];
-                    bppp_jv += ls.d3[[j, ell]] * dir_v[wr.start + ell];
-                }
-            }
-
-            // Total-derivative scalars
-            let mut b_jv = 0.0;
-            let mut b_ju = 0.0;
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
-                for ell in 0..n_w {
-                    b_jv += ls.basis[[j, ell]] * dir_v[wr.start + ell];
-                    b_ju += ls.basis[[j, ell]] * dir_u[wr.start + ell];
-                }
-            }
-            let sigma_jv = c_j * p_jv + b_jv;
-            let sigma_ju = c_j * p_ju + b_ju;
-            let tau_jv = d_j * p_jv + bp_jv;
-            let tau_ju = d_j * p_ju + bp_ju;
-            let rho_jv = e_j * p_jv + bpp_jv;
-            let rho_ju = e_j * p_ju + bpp_ju;
-
-            // Cross scalars
-            let sigma_juv = tau_ju * p_jv + c_j * p_juv + bp_jv * p_ju;
-            // = tau_ju * p_jv + c_j * p_juv + B'_jv * p_ju
-            // Wait no: B_jv = sum B_l(u_j) * v_{w_l}. D_u[B_jv] = sum B'_l(u_j) * D_u[u_j] * v_{w_l} = sum B'_l * p_ju * v_{w_l}.
-            // Actually no: B_jv = Σ B_l(u_j) v_{w_l}. D_u[u_j] = p_ju.
-            // D_u[B_l(u_j)] = B'_l(u_j) p_ju. So D_u[B_jv] = (Σ B'_l v_{w_l}) p_ju = bp_jv * p_ju.
-            // But wait: B_jv is NOT in sigma_jv! Let me recheck.
-            // sigma_jv = total ds_j/dv. s_j = u_j + Σ B_l(u_j) w_l.
-            // ds_j/dv_total = (∂s_j/∂u_j)(du_j/dv_total) + Σ B_l(u_j) (dw_l/dv)
-            // So sigma_juv = tau_ju * p_jv + c_j * p_juv + bp_jv * p_ju. ✓
-
-            let tau_juv = rho_ju * p_jv + d_j * p_juv + bpp_jv * p_ju;
-            let rho_juv = (f_j_link * p_ju) * p_jv + e_j * p_juv + bppp_jv * p_ju;
-
-            // D_uv[M_a] = Σ w_j [Φ''' c σ_u σ_v + Φ''(σ_uv c + σ_v τ_u + σ_u τ_v) + Φ' τ_uv]
-            d2m_a_uv += u3_j * c_j * sigma_ju * sigma_jv
-                + t_j * (sigma_juv * c_j + sigma_jv * tau_ju + sigma_ju * tau_jv)
-                + r_j * tau_juv;
-
-            // D_uv[M_{aa}] using the chain rule on G = Φ'' c² + Φ' d
-            // ∂G/∂s = Φ''' c² + Φ'' d,  ∂G/∂c = 2Φ'' c,  ∂G/∂d = Φ'
-            // D_uv[G] = (Φ'''' c² + Φ''' d) σ_u σ_v + 2Φ''' c (σ_u τ_v + σ_v τ_u)
-            //          + Φ''(σ_u ρ_v + σ_v ρ_u) + 2Φ'' τ_u τ_v
-            //          + (Φ''' c² + Φ'' d) σ_uv + 2Φ'' c τ_uv + Φ' ρ_uv
-            d2m_aa_uv += (u4_j * c_j * c_j + u3_j * d_j) * sigma_ju * sigma_jv
-                + 2.0 * u3_j * c_j * (sigma_ju * tau_jv + sigma_jv * tau_ju)
-                + t_j * (sigma_ju * rho_jv + sigma_jv * rho_ju)
-                + 2.0 * t_j * tau_ju * tau_jv
-                + (u3_j * c_j * c_j + t_j * d_j) * sigma_juv
-                + 2.0 * t_j * c_j * tau_juv
-                + r_j * rho_juv;
-
-            // D_uv[M_{ak}] for each k: per-k accumulation
-            // H_jk = Φ'' c ξ_k + Φ' dc_k. Treat as h(s, c, ξ_k, dc_k).
-            // D_uv[h] involves 9 terms (see derivation).
-            // We use total-derivative scalars: D_w[ξ_k] = dxi_w[k], D_w[dc_k] = ddc_w[k].
-            // D_uv[ξ_k] and D_uv[dc_k] need to be computed.
-
-            // Rebuild dxi_v, dxi_u, ddc_v, ddc_u for this node
-            let mut dxi_v_arr = Array1::<f64>::zeros(r);
-            let mut dxi_u_arr = Array1::<f64>::zeros(r);
-            let mut ddc_v_a = Array1::<f64>::zeros(r);
-            let mut ddc_u_a = Array1::<f64>::zeros(r);
-            // These are TOTAL derivatives D_w[ξ_k] = τ_w du_k + c_j D_w[du_k] + δ(k∈w) B'_k p_w
-            dxi_v_arr[1] = tau_jv * h_j + c_j * dh_jv;
-            dxi_u_arr[1] = tau_ju * h_j + c_j * dh_ju;
-            ddc_v_a[1] = rho_jv * h_j + d_j * dh_jv;
-            ddc_u_a[1] = rho_ju * h_j + d_j * dh_ju;
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    let idx = hr.start + k;
-                    dxi_v_arr[idx] = tau_jv * b * des[[j, k]] + c_j * des[[j, k]] * dir_v[1];
-                    dxi_u_arr[idx] = tau_ju * b * des[[j, k]] + c_j * des[[j, k]] * dir_u[1];
-                    ddc_v_a[idx] = rho_jv * b * des[[j, k]] + d_j * des[[j, k]] * dir_v[1];
-                    ddc_u_a[idx] = rho_ju * b * des[[j, k]] + d_j * des[[j, k]] * dir_u[1];
-                }
-            }
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
-                for ell in 0..n_w {
-                    let idx = wr.start + ell;
-                    dxi_v_arr[idx] = ls.d1[[j, ell]] * p_jv; // B'_l * p_jv
-                    dxi_u_arr[idx] = ls.d1[[j, ell]] * p_ju;
-                    ddc_v_a[idx] = ls.d2[[j, ell]] * p_jv; // B''_l * p_jv
-                    ddc_u_a[idx] = ls.d2[[j, ell]] * p_ju;
-                }
-            }
-
-            // D_uv[ξ_k] = tau_juv du_k + tau_jv D_u[du_k] + tau_ju D_v[du_k] + δ(k∈w)(B''_k p_ju p_jv + B'_k p_juv)
-            let mut dxi_uv = Array1::<f64>::zeros(r);
-            dxi_uv[1] = tau_juv * h_j + tau_jv * dh_ju + tau_ju * dh_jv;
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    let idx = hr.start + k;
-                    dxi_uv[idx] = tau_juv * b * des[[j, k]]
-                        + tau_jv * des[[j, k]] * dir_u[1]
-                        + tau_ju * des[[j, k]] * dir_v[1];
-                }
-            }
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
-                for ell in 0..n_w {
-                    dxi_uv[wr.start + ell] =
-                        ls.d2[[j, ell]] * p_ju * p_jv + ls.d1[[j, ell]] * p_juv;
-                }
-            }
-
-            // D_uv[dc_k] = rho_juv du_k + rho_jv D_u[du_k] + rho_ju D_v[du_k] + δ(k∈w)(B'''_k p_ju p_jv + B''_k p_juv)
-            let mut ddc_uv = Array1::<f64>::zeros(r);
-            ddc_uv[1] = rho_juv * h_j + rho_jv * dh_ju + rho_ju * dh_jv;
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    ddc_uv[hr.start + k] = rho_juv * b * des[[j, k]]
-                        + rho_jv * des[[j, k]] * dir_u[1]
-                        + rho_ju * des[[j, k]] * dir_v[1];
-                }
-            }
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
-                for ell in 0..n_w {
-                    ddc_uv[wr.start + ell] =
-                        ls.d3[[j, ell]] * p_ju * p_jv + ls.d2[[j, ell]] * p_juv;
-                }
-            }
-
-            // Rebuild xi per k (again, for this node)
-            let mut xi = Array1::<f64>::zeros(r);
-            let mut dc_a = Array1::<f64>::zeros(r);
-            xi[1] = c_j * h_j;
-            dc_a[1] = d_j * h_j;
-            if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                for k in 0..n_h {
-                    xi[hr.start + k] = c_j * b * des[[j, k]];
-                    dc_a[hr.start + k] = d_j * b * des[[j, k]];
-                }
-            }
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.node_link.as_ref()) {
-                for ell in 0..n_w {
-                    xi[wr.start + ell] = ls.basis[[j, ell]];
-                    dc_a[wr.start + ell] = ls.d1[[j, ell]];
-                }
-            }
-
-            // D_uv[M_{ak}] per k using chain rule on H(s, c, xi_k, dc_k)
-            for k in 0..r {
-                let val = (u4_j * c_j * xi[k] + u3_j * dc_a[k]) * sigma_ju * sigma_jv
-                    + u3_j * xi[k] * (sigma_ju * tau_jv + sigma_jv * tau_ju)
-                    + u3_j * c_j * (sigma_ju * dxi_v_arr[k] + sigma_jv * dxi_u_arr[k])
-                    + t_j * (sigma_ju * ddc_v_a[k] + sigma_jv * ddc_u_a[k])
-                    + t_j * (tau_ju * dxi_v_arr[k] + tau_jv * dxi_u_arr[k])
-                    + (u3_j * c_j * xi[k] + t_j * dc_a[k]) * sigma_juv
-                    + t_j * xi[k] * tau_juv
-                    + t_j * c_j * dxi_uv[k]
-                    + r_j * ddc_uv[k];
-                d2m_au_uv[k] += val;
-            }
-
-            // D_uv[M_{kl}] per (k,l) using chain rule on F(s, xi_k, xi_l, Delta_kl)
-            // F = Phi'' xi_k xi_l + Phi' Delta_kl
-            // The dominant terms: Phi'''' xi_k xi_l sigma_u sigma_v + ...
-            // For simplicity, use the "symmetric total derivative" approach:
-            // D_uv[Phi'' xi_k xi_l] = u4 xi_k xi_l sigma_u sigma_v
-            //   + u3(xi_k xi_l sigma_uv + xi_k dxi_lv sigma_u + xi_k dxi_lu sigma_v + dxi_kv xi_l sigma_u + dxi_ku xi_l sigma_v + xi_k xi_l ... hmm
-            // Actually this is getting very complex for the full (k,l) case.
-            // Let me use a simpler decomposition:
-            // M_{kl} per node = t_j * xi_k * xi_l + r_j * Delta_kl
-            // where Delta_kl = dxi_jkl (structure derivative corrections)
-            // D_uv of this = D_uv[t_j * xi_k * xi_l] + D_uv[r_j * Delta_kl]
-
-            // D_uv[t_j xi_k xi_l] where t_j = Phi''(s_j) = -s_j Phi'(s_j)
-            // = D_uv[Phi''(s)] xi_k xi_l + D_u[Phi''(s)](D_v[xi_k] xi_l + xi_k D_v[xi_l])
-            //   + D_v[Phi''(s)](D_u[xi_k] xi_l + xi_k D_u[xi_l])
-            //   + Phi''(s)(D_uv[xi_k] xi_l + D_u[xi_k] D_v[xi_l] + D_v[xi_k] D_u[xi_l] + xi_k D_uv[xi_l])
-
-            // D_w[Phi''(s)] = Phi'''(s) sigma_w = u3_j sigma_w / (omega_j phi(s_j))... hmm
-            // Actually: t_j = omega_j Phi''(s_j). D_w[t_j] = omega_j Phi'''(s_j) sigma_jw = u3_j sigma_jw.
-            // D_uv[t_j] = omega_j Phi''''(s_j) sigma_ju sigma_jv + omega_j Phi'''(s_j) sigma_juv
-            //            = u4_j sigma_ju sigma_jv + u3_j sigma_juv.
-
-            for k in 0..r {
-                if xi[k] == 0.0 && dxi_v_arr[k] == 0.0 && dxi_u_arr[k] == 0.0 && dxi_uv[k] == 0.0 {
-                    continue;
-                }
-                for l in k..r {
-                    if xi[l] == 0.0
-                        && dxi_v_arr[l] == 0.0
-                        && dxi_u_arr[l] == 0.0
-                        && dxi_uv[l] == 0.0
-                    {
-                        continue;
-                    }
-                    // D_uv[t_j xi_k xi_l]
-                    let d2t = u4_j * sigma_ju * sigma_jv + u3_j * sigma_juv;
-                    let dt_u = u3_j * sigma_ju;
-                    let dt_v = u3_j * sigma_jv;
-                    let val_main = d2t * xi[k] * xi[l]
-                        + dt_u * (dxi_v_arr[k] * xi[l] + xi[k] * dxi_v_arr[l])
-                        + dt_v * (dxi_u_arr[k] * xi[l] + xi[k] * dxi_u_arr[l])
-                        + t_j
-                            * (dxi_uv[k] * xi[l]
-                                + dxi_u_arr[k] * dxi_v_arr[l]
-                                + dxi_v_arr[k] * dxi_u_arr[l]
-                                + xi[k] * dxi_uv[l]);
-
-                    // D_uv[r_j Delta_kl]: Delta_kl = structure derivative corrections.
-                    // For simplicity and correctness, compute Delta_kl from the 2nd-order
-                    // m_uv accumulation pattern. Delta_kl per node is what gets added beyond
-                    // the t_j * xi_k * xi_l rank-1 term.
-                    // From the m_uv accumulation: the "correction" terms are r_j * something.
-                    // D_uv[r_j * Delta_kl]:
-                    //   = D_uv[r_j]*Delta + D_u[r_j]*D_v[Delta] + D_v[r_j]*D_u[Delta] + r_j*D_uv[Delta]
-                    // where D_w[r_j] = t_j*sigma_w, D_uv[r_j] = u3_j*sigma_u*sigma_v + t_j*sigma_uv.
-                    // Delta_kl = dxi_jk/dtheta_l (structure derivative correction).
-                    // D_w[Delta] depends on (k,l) type and involves link d/e derivatives.
-
-                    let mut delta_kl = 0.0;
-                    let mut d_delta_u = 0.0;
-                    let mut d_delta_v = 0.0;
-                    let mut d2_delta_uv = 0.0;
-
-                    // Compute delta_kl and its total derivatives along u and v.
-                    // delta_kl = dxi_jk/dtheta_l.  For k=g: dxi_jg/dtheta_l = dc_jl*h_j + c_j*(dh_j/dtheta_l).
-                    // For k=h_k': dxi_j,h_k'/dtheta_l = dc_jl*b*D_{jk'} + c_j*D_{jk'}*delta(l=g).
-                    // For k=w_m: dxi_j,w_m/dtheta_l = B'_m(u_j)*(du_j/dtheta_l).
-                    if k == 1 && l == 1 {
-                        // delta = d_j*h_j^2 (from dc_jg*h_j where dc_jg=d_j*h_j)
-                        delta_kl = d_j * h_j * h_j;
-                        d_delta_u = rho_ju * h_j * h_j + 2.0 * d_j * h_j * dh_ju;
-                        d_delta_v = rho_jv * h_j * h_j + 2.0 * d_j * h_j * dh_jv;
-                        d2_delta_uv = rho_juv * h_j * h_j
-                            + rho_ju * 2.0 * h_j * dh_jv
-                            + rho_jv * 2.0 * h_j * dh_ju
-                            + 2.0 * d_j * (dh_ju * dh_jv);
-                    } else if k == 1 {
-                        if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                            if l >= hr.start && l < hr.end {
-                                let dl = des[[j, l - hr.start]];
-                                // delta = d_j*b*dl*h_j + c_j*dl
-                                delta_kl = d_j * b * dl * h_j + c_j * dl;
-                                d_delta_u = rho_ju * b * dl * h_j
-                                    + d_j * dl * (dir_u[1] * h_j + b * dh_ju)
-                                    + tau_ju * dl;
-                                d_delta_v = rho_jv * b * dl * h_j
-                                    + d_j * dl * (dir_v[1] * h_j + b * dh_jv)
-                                    + tau_jv * dl;
-                                d2_delta_uv = rho_juv * b * dl * h_j
-                                    + rho_ju * dl * (dir_v[1] * h_j + b * dh_jv)
-                                    + rho_jv * dl * (dir_u[1] * h_j + b * dh_ju)
-                                    + d_j * dl * (dir_u[1] * dh_jv + dir_v[1] * dh_ju)
-                                    + tau_juv * dl;
-                            }
-                        }
-                        if let (Some(wr), Some(ls)) =
-                            (primary.w.as_ref(), row_ctx.node_link.as_ref())
-                        {
-                            if l >= wr.start && l < wr.end {
-                                let li = l - wr.start;
-                                // delta = B'_l*h_j (from dc_j,w_l = B'_l, times h_j from k=g geometry)
-                                delta_kl = ls.d1[[j, li]] * h_j;
-                                d_delta_u = ls.d2[[j, li]] * p_ju * h_j + ls.d1[[j, li]] * dh_ju;
-                                d_delta_v = ls.d2[[j, li]] * p_jv * h_j + ls.d1[[j, li]] * dh_jv;
-                                d2_delta_uv = ls.d3[[j, li]] * p_ju * p_jv * h_j
-                                    + ls.d2[[j, li]] * p_juv * h_j
-                                    + ls.d2[[j, li]] * (p_ju * dh_jv + p_jv * dh_ju)
-                                    + ls.d1[[j, li]] * 0.0; // dh is constant w.r.t. theta
-                            }
-                        }
-                    } else if let (Some(hr), Some(des)) = (primary.h.as_ref(), h_node_design) {
-                        if k >= hr.start && k < hr.end && l >= hr.start && l < hr.end {
-                            let dk_val = des[[j, k - hr.start]];
-                            let dl_val = des[[j, l - hr.start]];
-                            // delta = d_j*b^2*dk*dl
-                            delta_kl = d_j * b * b * dk_val * dl_val;
-                            d_delta_u = rho_ju * b * b * dk_val * dl_val
-                                + 2.0 * d_j * b * dk_val * dl_val * dir_u[1];
-                            d_delta_v = rho_jv * b * b * dk_val * dl_val
-                                + 2.0 * d_j * b * dk_val * dl_val * dir_v[1];
-                            d2_delta_uv = rho_juv * b * b * dk_val * dl_val
-                                + rho_ju * 2.0 * b * dk_val * dl_val * dir_v[1]
-                                + rho_jv * 2.0 * b * dk_val * dl_val * dir_u[1]
-                                + 2.0 * d_j * dk_val * dl_val * dir_u[1] * dir_v[1];
-                        }
-                        if let (Some(wr), Some(ls)) =
-                            (primary.w.as_ref(), row_ctx.node_link.as_ref())
-                        {
-                            if k >= hr.start && k < hr.end && l >= wr.start && l < wr.end {
-                                let dk_val = des[[j, k - hr.start]];
-                                let li = l - wr.start;
-                                // delta = B'_l*b*dk
-                                delta_kl = ls.d1[[j, li]] * b * dk_val;
-                                d_delta_u = ls.d2[[j, li]] * p_ju * b * dk_val
-                                    + ls.d1[[j, li]] * dk_val * dir_u[1];
-                                d_delta_v = ls.d2[[j, li]] * p_jv * b * dk_val
-                                    + ls.d1[[j, li]] * dk_val * dir_v[1];
-                                d2_delta_uv = ls.d3[[j, li]] * p_ju * p_jv * b * dk_val
-                                    + ls.d2[[j, li]] * p_juv * b * dk_val
-                                    + ls.d2[[j, li]] * dk_val * (p_ju * dir_v[1] + p_jv * dir_u[1])
-                                    + ls.d1[[j, li]] * dk_val * 0.0;
-                            }
-                        }
-                    }
-                    // D_uv[r_j*Delta] = D_uv[r_j]*Delta + D_u[r_j]*D_v[Delta] + D_v[r_j]*D_u[Delta] + r_j*D_uv[Delta]
-                    let d2r = u3_j * sigma_ju * sigma_jv + t_j * sigma_juv;
-                    let dr_u = t_j * sigma_ju;
-                    let dr_v = t_j * sigma_jv;
-                    let val_delta =
-                        d2r * delta_kl + dr_u * d_delta_v + dr_v * d_delta_u + r_j * d2_delta_uv;
-
-                    let total = val_main + val_delta;
-                    d2m_kl_uv[[k, l]] += total;
-                    if l != k {
-                        d2m_kl_uv[[l, k]] += total;
-                    }
-                }
-            }
-        } // end second node loop
-
-        // Add q-dependent terms for d2m_kl_uv[0,0]
-        // D_uv[-Phi(q)] at (0,0): d^4(-Phi(q))/dq^4 contracted with dir_u[0]*dir_v[0]
-        // d^3(-Phi)/dq^3 = -(q^2-1)phi(q), d^4(-Phi)/dq^4 = (q^3-3q)phi(q)
-        d2m_kl_uv[[0, 0]] +=
-            dir_u[0] * dir_v[0] * (q_val.powi(3) - 3.0 * q_val) * phi_q + dir_u[0] * dir_v[0] * 0.0; // (already included in node terms? no, q term is separate)
-        // Actually: d^2/du dv [q phi(q)] at (0,0) has already been accumulated from nodes? No.
-        // The m_uv[0,0] += q*phi(q) was for the second derivative.
-        // The d2m_kl_uv needs the FOURTH partial of -Phi(q)/dq^4 contracted.
-        // But wait: D_uv[M_{kl}] for (0,0) involves D_uv of (q*phi(q)):
-        // d/dq[q phi(q)] = phi(q) - q^2 phi(q) = (1-q^2)phi(q).
-        // d^2/dq^2[q phi(q)] = (-2q - (1-q^2)q)phi(q) = (-3q + q^3)phi(q) = (q^3-3q)phi(q).
-        // So D_uv[q phi(q)] = (q^3-3q)phi(q) * dir_u[0] * dir_v[0].
-        // This is what I wrote. But it should be:
-        // Actually M_{kl} at (0,0) includes q*phi(q). D_uv of this:
-        // this is a function of q only. D_v[q phi(q)] = (1-q^2)phi(q) * v_q.
-        // D_uv[q phi(q)] = (q^3-3q)phi(q) * u_q * v_q.
-        // Already correct.
-
-        // Add M_{a,kl} * a_uv_c terms to complete D_uv[M_{kl}]
-        // D_uv[M_{kl}] = d2m_kl_uv + D_uv[M_{a,kl}*...] terms
-        // Actually: D_uv[M_{kl}] as total derivative already includes the a contribution
-        // through the sigma terms. So d2m_kl_uv IS the full D_uv[M_{kl}]. No extra m_a_kl term needed.
-        // So it IS the full second total derivative. ✓
-
-        // 4th order IFT:
-        // a_{kluv} = -[D_u[Psi_3v] + D_uv[M_a]*a_{kl} + D_v[M_a]*a_{klu} + D_u[M_a]*a_{klv}] / M_a
-        //
-        // D_u[Psi_3v] expands to:
-        // D_uv[M_{kl}] + D_uv[M_{ak}]*a_l + D_v[M_{ak}]*a_{lu} + D_u[M_{ak}]*a_{lv} + M_{ak}*a_{luv}
-        // + D_uv[M_{al}]*a_k + D_v[M_{al}]*a_{ku} + D_u[M_{al}]*a_{kv} + M_{al}*a_{kuv}
-        // + D_uv[M_{aa}]*a_k*a_l + D_v[M_{aa}]*(a_{ku}*a_l + a_k*a_{lu})
-        // + D_u[M_{aa}]*(a_{kv}*a_l + a_k*a_{lv})
-        // + M_{aa}*(a_{kuv}*a_l + a_{kv}*a_{lu} + a_{ku}*a_{lv} + a_k*a_{luv})
-
-        let a_luv = a_kuv.clone(); // same vector (symmetric in klu indices)
-        let mut a_kluv = Array2::<f64>::zeros((r, r));
-        for k in 0..r {
-            for l in k..r {
-                let du_psi3v = d2m_kl_uv[[k, l]]
-                    + d2m_au_uv[k] * a_u_vec[l]
-                    + dm_au_v[k] * a_ku[l]
-                    + dm_au_u[k] * a_kv[l]
-                    + m_au[k] * a_luv[l]
-                    + d2m_au_uv[l] * a_u_vec[k]
-                    + dm_au_v[l] * a_ku[k]
-                    + dm_au_u[l] * a_kv[k]
-                    + m_au[l] * a_kuv[k]
-                    + d2m_aa_uv * a_u_vec[k] * a_u_vec[l]
-                    + dm_aa_v * (a_ku[k] * a_u_vec[l] + a_u_vec[k] * a_ku[l])
-                    + dm_aa_u * (a_kv[k] * a_u_vec[l] + a_u_vec[k] * a_kv[l])
-                    + m_aa
-                        * (a_kuv[k] * a_u_vec[l]
-                            + a_kv[k] * a_ku[l]
-                            + a_ku[k] * a_kv[l]
-                            + a_u_vec[k] * a_luv[l]);
-                let val = -(du_psi3v
-                    + d2m_a_uv * a_uv_mat[[k, l]]
-                    + dm_a_v * a_klu[[k, l]]
-                    + dm_a_u * a_klv[[k, l]])
-                    * inv_ma;
-                a_kluv[[k, l]] = val;
-                a_kluv[[l, k]] = val;
-            }
-        }
-
-        // Phase 5: Observation-point chain rule
-        let h_obs = row_ctx.h_obs_base;
-        let (c_o, d_o, e_o, f_o) = if let Some(ls) = row_ctx.obs_link.as_ref() {
-            let bw = beta_w.unwrap();
-            (
-                1.0 + ls.d1.row(0).dot(bw),
-                ls.d2.row(0).dot(bw),
-                ls.d3.row(0).dot(bw),
-                ls.d4.row(0).dot(bw),
-            )
-        } else {
-            (1.0, 0.0, 0.0, 0.0)
-        };
-
-        let mut uo_u_vec = a_u_vec.clone();
-        uo_u_vec[1] += h_obs;
-        if let (Some(hr), Some(obs)) = (primary.h.as_ref(), obs_row.as_ref()) {
-            for k in 0..n_h {
-                uo_u_vec[hr.start + k] += b * obs[k];
-            }
-        }
-        let mut eta_u_vec = uo_u_vec.mapv(|x| c_o * x);
-        if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.obs_link.as_ref()) {
-            for ell in 0..n_w {
-                eta_u_vec[wr.start + ell] += ls.basis[[0, ell]];
-            }
-        }
-
-        let eta_val = if let Some(ls) = row_ctx.obs_link.as_ref() {
-            (a + b * h_obs) + ls.basis.row(0).dot(&beta_w.unwrap().view())
-        } else {
-            a + b * h_obs
-        };
-        let signed_margin = s_y * eta_val;
-        let (k1_s, k2_s, k3_s, k4_s) =
-            signed_probit_neglog_derivatives_up_to_fourth(signed_margin, w_i);
-
-        // Contracted scalars
-        let eta_v = eta_u_vec.dot(dir_v);
-        let eta_u = eta_u_vec.dot(dir_u);
-
-        // eta_{kl}
-        let mut eta_kl = Array2::<f64>::zeros((r, r));
-        for k in 0..r {
-            for l in k..r {
-                let mut uo_kl = a_uv_mat[[k, l]];
-                if let (Some(hr), Some(obs)) = (primary.h.as_ref(), obs_row.as_ref()) {
-                    if k == 1 && hr.contains(&l) {
-                        uo_kl += obs[l - hr.start];
-                    } else if l == 1 && hr.contains(&k) {
-                        uo_kl += obs[k - hr.start];
-                    }
-                }
-                let mut val = d_o * uo_u_vec[k] * uo_u_vec[l] + c_o * uo_kl;
-                if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.obs_link.as_ref()) {
-                    if wr.contains(&k) {
-                        val += ls.d1[[0, k - wr.start]] * uo_u_vec[l];
-                    }
-                    if wr.contains(&l) {
-                        val += ls.d1[[0, l - wr.start]] * uo_u_vec[k];
-                    }
-                }
-                eta_kl[[k, l]] = val;
-                eta_kl[[l, k]] = val;
-            }
-        }
-
-        // eta_{ku}, eta_{kv}
-        let eta_ku = eta_kl.dot(dir_u);
-        let eta_kv_vec = eta_kl.dot(dir_v);
-        let eta_uv_s = dir_u.dot(&eta_kl.dot(dir_v));
-
-        // For eta_{klu}, eta_{klv}: use the observation-point chain rule from third.
-        // eta_{klw} = e_o uo_k uo_l uo_w + d_o(uo_{kw}uo_l + uo_k uo_{lw} + uo_{kl}uo_w) + c_o a_{klw}
-        //           + link B' and B'' cross terms
-        let compute_eta_klw = |a_klw: &Array2<f64>, dir_w: &Array1<f64>| -> Array2<f64> {
-            let uo_w = uo_u_vec.dot(dir_w);
-            let mut uo_kw = a_uv_mat.dot(dir_w);
-            if let (Some(hr), Some(obs)) = (primary.h.as_ref(), obs_row.as_ref()) {
-                for k in 0..n_h {
-                    uo_kw[hr.start + k] += obs[k] * dir_w[1];
-                }
-                for k in 0..n_h {
-                    uo_kw[1] += obs[k] * dir_w[hr.start + k];
-                }
-            }
-            let mut bp_w = 0.0;
-            if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.obs_link.as_ref()) {
-                for ell in 0..n_w {
-                    bp_w += ls.d1[[0, ell]] * dir_w[wr.start + ell];
-                }
-            }
-            let mut result = Array2::<f64>::zeros((r, r));
-            for k in 0..r {
-                for l in k..r {
-                    let mut uo_kl = a_uv_mat[[k, l]];
-                    if let (Some(hr), Some(obs)) = (primary.h.as_ref(), obs_row.as_ref()) {
-                        if k == 1 && hr.contains(&l) {
-                            uo_kl += obs[l - hr.start];
-                        } else if l == 1 && hr.contains(&k) {
-                            uo_kl += obs[k - hr.start];
-                        }
-                    }
-                    let mut val = e_o * uo_u_vec[k] * uo_u_vec[l] * uo_w
-                        + d_o * (uo_kw[k] * uo_u_vec[l] + uo_u_vec[k] * uo_kw[l] + uo_kl * uo_w)
-                        + c_o * a_klw[[k, l]];
-                    if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.obs_link.as_ref()) {
-                        let mut bpp_w = 0.0;
-                        for ell in 0..n_w {
-                            bpp_w += ls.d2[[0, ell]] * dir_w[wr.start + ell];
-                        }
-                        val += bpp_w * uo_u_vec[k] * uo_u_vec[l];
-                        if wr.contains(&k) {
-                            val += ls.d2[[0, k - wr.start]] * uo_u_vec[l] * uo_w;
-                            val += ls.d1[[0, k - wr.start]]
-                                * (d_o * uo_u_vec[l] * uo_w + c_o * uo_kw[l]);
-                        }
-                        if wr.contains(&l) {
-                            val += ls.d2[[0, l - wr.start]] * uo_u_vec[k] * uo_w;
-                            val += ls.d1[[0, l - wr.start]]
-                                * (d_o * uo_u_vec[k] * uo_w + c_o * uo_kw[k]);
-                        }
-                        val += bp_w * (d_o * uo_u_vec[k] * uo_u_vec[l] + c_o * uo_kl);
-                    }
-                    result[[k, l]] = val;
-                    result[[l, k]] = val;
-                }
-            }
-            result
-        };
-        let eta_klv = compute_eta_klw(&a_klv, dir_v);
-        let eta_klu = compute_eta_klw(&a_klu, dir_u);
-        let eta_kuv_vec = eta_klv.dot(dir_u); // r-vector
-
-        // eta_{kluv}: 4th derivative of the linked predictor at the observation point.
-        // The observation-point link is eta = uo + sum_m B_m(uo) * w_m, so the
-        // exact 4th derivative is the partition expansion through the scalar
-        // uo map plus the single-slot explicit w contributions.
-        let uo_v = uo_u_vec.dot(dir_v);
-        let uo_u_s = uo_u_vec.dot(dir_u);
-        let mut uo_kv = a_uv_mat.dot(dir_v);
-        let mut uo_ku = a_uv_mat.dot(dir_u);
-        if let (Some(hr), Some(obs)) = (primary.h.as_ref(), obs_row.as_ref()) {
-            for k in 0..n_h {
-                uo_kv[hr.start + k] += obs[k] * dir_v[1];
-                uo_kv[1] += obs[k] * dir_v[hr.start + k];
-                uo_ku[hr.start + k] += obs[k] * dir_u[1];
-                uo_ku[1] += obs[k] * dir_u[hr.start + k];
-            }
-        }
-        let uo_uv_s = dir_u.dot(&a_uv_mat.dot(dir_v));
-        // B-contracted scalars at observation point for the w-direction components.
-        let mut bp_u_obs = 0.0;
-        let mut bp_v_obs = 0.0;
-        let mut bpp_u_obs = 0.0;
-        let mut bpp_v_obs = 0.0;
-        let mut bppp_u_obs = 0.0;
-        let mut bppp_v_obs = 0.0;
-        if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.obs_link.as_ref()) {
-            for ell in 0..n_w {
-                let dv_w = dir_v[wr.start + ell];
-                let du_w = dir_u[wr.start + ell];
-                bp_u_obs += ls.d1[[0, ell]] * du_w;
-                bp_v_obs += ls.d1[[0, ell]] * dv_w;
-                bpp_u_obs += ls.d2[[0, ell]] * du_w;
-                bpp_v_obs += ls.d2[[0, ell]] * dv_w;
-                bppp_u_obs += ls.d3[[0, ell]] * du_w;
-                bppp_v_obs += ls.d3[[0, ell]] * dv_w;
-            }
-        }
-        let mut eta_kluv = Array2::<f64>::zeros((r, r));
-        for k in 0..r {
-            for l in k..r {
-                let mut uo_kl = a_uv_mat[[k, l]];
-                if let (Some(hr), Some(obs)) = (primary.h.as_ref(), obs_row.as_ref()) {
-                    if k == 1 && hr.contains(&l) {
-                        uo_kl += obs[l - hr.start];
-                    } else if l == 1 && hr.contains(&k) {
-                        uo_kl += obs[k - hr.start];
-                    }
-                }
-                let x_k = uo_u_vec[k];
-                let x_l = uo_u_vec[l];
-                let x_u = uo_u_s;
-                let x_v = uo_v;
-                let x_ku = uo_ku[k];
-                let x_lu = uo_ku[l];
-                let x_kv = uo_kv[k];
-                let x_lv = uo_kv[l];
-                let x_uv = uo_uv_s;
-                let x_klu = a_klu[[k, l]];
-                let x_klv = a_klv[[k, l]];
-                let x_kuv = a_kuv[k];
-                let x_luv = a_kuv[l];
-                let x_kluv = a_kluv[[k, l]];
-
-                let mut val = c_o * x_kluv
-                    + d_o
-                        * (x_klu * x_v
-                            + x_klv * x_u
-                            + x_kuv * x_l
-                            + x_luv * x_k
-                            + uo_kl * x_uv
-                            + x_ku * x_lv
-                            + x_kv * x_lu)
-                    + e_o
-                        * (uo_kl * x_u * x_v
-                            + x_ku * x_l * x_v
-                            + x_kv * x_l * x_u
-                            + x_lu * x_k * x_v
-                            + x_lv * x_k * x_u
-                            + x_uv * x_k * x_l)
-                    + f_o * x_k * x_l * x_u * x_v
-                    + bp_u_obs * x_klv
-                    + bpp_u_obs * (uo_kl * x_v + x_kv * x_l + x_k * x_lv)
-                    + bppp_u_obs * x_k * x_l * x_v
-                    + bp_v_obs * x_klu
-                    + bpp_v_obs * (uo_kl * x_u + x_ku * x_l + x_k * x_lu)
-                    + bppp_v_obs * x_k * x_l * x_u;
-
-                if let (Some(wr), Some(ls)) = (primary.w.as_ref(), row_ctx.obs_link.as_ref()) {
-                    if wr.contains(&k) {
-                        let ki = k - wr.start;
-                        val += ls.d1[[0, ki]] * x_luv;
-                        val += ls.d2[[0, ki]] * (x_lu * x_v + x_lv * x_u + x_l * x_uv);
-                        val += ls.d3[[0, ki]] * x_l * x_u * x_v;
-                    }
-                    if wr.contains(&l) {
-                        let li = l - wr.start;
-                        val += ls.d1[[0, li]] * x_kuv;
-                        val += ls.d2[[0, li]] * (x_ku * x_v + x_kv * x_u + x_k * x_uv);
-                        val += ls.d3[[0, li]] * x_k * x_u * x_v;
-                    }
-                }
-                eta_kluv[[k, l]] = val;
-                eta_kluv[[l, k]] = val;
-            }
-        }
-
-        // Phase 6: Assemble F[k,l] via Arbogast 4th-order chain rule
-        let mut out = Array2::<f64>::zeros((r, r));
-        for k in 0..r {
-            for l in k..r {
-                let val = k4_s * eta_u_vec[k] * eta_u_vec[l] * eta_u * eta_v
-                    + k3_s
-                        * s_y
-                        * (eta_kl[[k, l]] * eta_u * eta_v
-                            + eta_ku[k] * eta_u_vec[l] * eta_v
-                            + eta_kv_vec[k] * eta_u_vec[l] * eta_u
-                            + eta_ku[l] * eta_u_vec[k] * eta_v
-                            + eta_kv_vec[l] * eta_u_vec[k] * eta_u
-                            + eta_uv_s * eta_u_vec[k] * eta_u_vec[l])
-                    + k2_s
-                        * (eta_kl[[k, l]] * eta_uv_s
-                            + eta_ku[k] * eta_kv_vec[l]
-                            + eta_kv_vec[k] * eta_ku[l]
-                            + eta_klu[[k, l]] * eta_v
-                            + eta_klv[[k, l]] * eta_u
-                            + eta_kuv_vec[l] * eta_u_vec[k]
-                            + eta_kuv_vec[k] * eta_u_vec[l])
-                    + k1_s * s_y * eta_kluv[[k, l]];
-                out[[k, l]] = val;
-                out[[l, k]] = val;
-            }
-        }
     }
+
     /// Like `add_pullback_primary_hessian` but only accumulates the h/w
     /// cross-block contributions. The marginal-marginal, marginal-logslope,
     /// and logslope-logslope blocks are handled by the weighted-Gram operator.
@@ -6386,8 +5175,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             z: Arc::clone(&z),
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
-            quadrature_nodes: Array1::zeros(0),
-            quadrature_weights: Array1::zeros(0),
             score_warp: score_warp_runtime.clone(),
             score_warp_obs_design: score_warp_obs_design.clone(),
             link_dev: link_dev_runtime.clone(),
@@ -6545,7 +5332,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::bernoulli_marginal_slope_exact::{
+    use crate::families::bernoulli_marginal_slope::exact_kernel::{
         DenestedCubicCell as ExactDenestedCubicCell,
         ExactCellBranch as ExactCellBranchShared,
         LocalSpanCubic,
@@ -6657,8 +5444,6 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            quadrature_nodes: array![0.0],
-            quadrature_weights: array![1.0],
             score_warp: None,
             score_warp_obs_design: None,
             link_dev: Some(prepared.runtime.clone()),
@@ -6756,8 +5541,6 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            quadrature_nodes: array![-0.25, 0.25],
-            quadrature_weights: array![0.5, 0.5],
             score_warp: Some(prepared.runtime.clone()),
             score_warp_obs_design: Some(prepared.block.design.clone()),
             link_dev: None,
@@ -6858,8 +5641,6 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            quadrature_nodes: array![0.0],
-            quadrature_weights: array![1.0],
             score_warp: Some(prepared.runtime.clone()),
             score_warp_obs_design: Some(prepared.block.design.clone()),
             link_dev: None,
@@ -7024,8 +5805,8 @@ mod tests {
             0.9,
             score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
             link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
-            |z| score_prepared.runtime.exact_local_cubic_at(&beta_h, z),
-            |u| link_prepared.runtime.exact_local_cubic_at(&beta_w, u),
+            |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
+            |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
         )
         .expect("exact module microcells for a=0.25");
         let exact_cells_a1 = build_denested_partition_cells(
@@ -7033,8 +5814,8 @@ mod tests {
             0.9,
             score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
             link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
-            |z| score_prepared.runtime.exact_local_cubic_at(&beta_h, z),
-            |u| link_prepared.runtime.exact_local_cubic_at(&beta_w, u),
+            |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
+            |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
         )
         .expect("exact module microcells for a=0.55");
 
@@ -7091,8 +5872,8 @@ mod tests {
             b,
             score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
             link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
-            |z| score_prepared.runtime.exact_local_cubic_at(&beta_h, z),
-            |u| link_prepared.runtime.exact_local_cubic_at(&beta_w, u),
+            |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
+            |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
         )
         .expect("microcells");
 
@@ -7112,7 +5893,7 @@ mod tests {
                 .dot(&beta_w);
             let expected = a + b * z + b * h + link;
             assert!(
-                (cell.eta(z) - expected).abs() < 1e-10,
+                (cell.cell.eta(z) - expected).abs() < 1e-10,
                 "microcell eta should equal the direct de-nested predictor at z={z:.6}"
             );
         }
@@ -7120,7 +5901,7 @@ mod tests {
 
     #[test]
     fn local_cubic_global_transform_reconstructs_same_function() {
-        let cubic = DeviationSpanCubic {
+        let cubic = exact_kernel::LocalSpanCubic {
             left: -1.3,
             right: 0.7,
             c0: 0.4,
@@ -7182,7 +5963,7 @@ mod tests {
 
     #[test]
     fn denested_cell_coefficient_partials_match_finite_differences() {
-        let score_span = DeviationSpanCubic {
+        let score_span = exact_kernel::LocalSpanCubic {
             left: -0.75,
             right: 0.25,
             c0: 0.08,
@@ -7190,7 +5971,7 @@ mod tests {
             c2: 0.02,
             c3: -0.01,
         };
-        let link_span = DeviationSpanCubic {
+        let link_span = exact_kernel::LocalSpanCubic {
             left: -0.6,
             right: 0.9,
             c0: -0.05,
@@ -7371,8 +6152,6 @@ mod tests {
                 [1.0],
                 [1.0]
             ])),
-            quadrature_nodes: array![0.0],
-            quadrature_weights: array![1.0],
             score_warp: Some(score_prepared.runtime),
             score_warp_obs_design: Some(score_prepared.block.design),
             link_dev: None,
@@ -7430,8 +6209,6 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0
             ]])),
-            quadrature_nodes: array![0.0],
-            quadrature_weights: array![1.0],
             score_warp: None,
             score_warp_obs_design: None,
             link_dev: None,
@@ -7565,8 +6342,6 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            quadrature_nodes: array![0.0],
-            quadrature_weights: array![1.0],
             score_warp: None,
             score_warp_obs_design: None,
             link_dev: Some(prepared.runtime.clone()),
@@ -7662,7 +6437,6 @@ mod tests {
             },
         )
         .expect("link block");
-        let (quad_nodes, quad_weights) = normal_expectation_nodes(21);
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
@@ -7677,8 +6451,6 @@ mod tests {
                 [1.0],
                 [1.0]
             ])),
-            quadrature_nodes: quad_nodes,
-            quadrature_weights: quad_weights,
             score_warp: Some(score_prepared.runtime.clone()),
             score_warp_obs_design: Some(score_prepared.block.design.clone()),
             link_dev: Some(link_prepared.runtime.clone()),

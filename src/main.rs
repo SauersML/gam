@@ -1258,7 +1258,7 @@ fn run_fit_bernoulli_marginal_slope(
         );
     } else {
         inference_notes.push(
-            "bernoulli marginal-slope flexible score/link mode uses the calibrated de-nested cubic cell-partition kernel: exact affine cells with analytic Hessians, plus non-affine cubic cells evaluated through the current transported-kernel reference path"
+            "bernoulli marginal-slope flexible score/link mode uses the calibrated de-nested cubic cell-partition kernel: exact affine cells plus transported quartic/sextic non-affine cells with analytic gradients and Hessians"
                 .to_string(),
         );
     }
@@ -4518,6 +4518,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
             payload.beta_baseline_timewiggle = timewiggle_build.as_ref().map(|_| {
                 fit.fit
+                    .fit
                     .block_states
                     .first()
                     .map(|state| {
@@ -6998,8 +6999,7 @@ fn build_location_scale_saved_model(
 
 fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
     SavedAnchoredDeviationRuntime {
-        kernel: crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
-            .to_string(),
+        kernel: "ExactDenestedCubic".to_string(),
         knots: runtime.knots.to_vec(),
         degree: runtime.degree,
         basis_dim: runtime.basis_dim,

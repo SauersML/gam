@@ -131,7 +131,6 @@ struct SurvivalTimeWiggleGeometry {
     basis: Array2<f64>,
     basis_d1: Array2<f64>,
     basis_d2: Array2<f64>,
-    basis_d3: Array2<f64>,
     dq_dq0: Array1<f64>,
     d2q_dq02: Array1<f64>,
     d3q_dq03: Array1<f64>,
@@ -1038,7 +1037,6 @@ impl SurvivalMarginalSlopeFamily {
             basis,
             basis_d1,
             basis_d2,
-            basis_d3,
             dq_dq0,
             d2q_dq02,
             d3q_dq03,
@@ -1085,16 +1083,20 @@ impl SurvivalMarginalSlopeFamily {
                 + self.marginal_design.dot_row(row, beta_marginal);
             out.qd1 =
                 self.design_derivative_exit.dot_row(row, beta_time) + self.derivative_offset_exit[row];
-            let time_row_entry = self.design_entry.row_chunk(row..row + 1).row(0);
-            let time_row_exit = self.design_exit.row_chunk(row..row + 1).row(0);
-            let time_row_deriv = self.design_derivative_exit.row_chunk(row..row + 1).row(0);
-            out.dq0_time.assign(&time_row_entry);
-            out.dq1_time.assign(&time_row_exit);
-            out.dqd1_time.assign(&time_row_deriv);
+            let time_entry_chunk = self.design_entry.row_chunk(row..row + 1);
+            let time_exit_chunk = self.design_exit.row_chunk(row..row + 1);
+            let time_deriv_chunk = self.design_derivative_exit.row_chunk(row..row + 1);
+            let time_row_entry = time_entry_chunk.row(0).to_owned();
+            let time_row_exit = time_exit_chunk.row(0).to_owned();
+            let time_row_deriv = time_deriv_chunk.row(0).to_owned();
+            out.dq0_time.assign(&time_row_entry.view());
+            out.dq1_time.assign(&time_row_exit.view());
+            out.dqd1_time.assign(&time_row_deriv.view());
             if p_marginal > 0 {
-                let marginal_row = self.marginal_design.row_chunk(row..row + 1).row(0);
-                out.dq0_marginal.assign(&marginal_row);
-                out.dq1_marginal.assign(&marginal_row);
+                let marginal_chunk = self.marginal_design.row_chunk(row..row + 1);
+                let marginal_row = marginal_chunk.row(0).to_owned();
+                out.dq0_marginal.assign(&marginal_row.view());
+                out.dq1_marginal.assign(&marginal_row.view());
             }
             return Ok(out);
         }
@@ -1103,16 +1105,15 @@ impl SurvivalMarginalSlopeFamily {
         let p_base = time_tail.start;
         let beta_time_base = beta_time.slice(s![..p_base]);
         let beta_time_w = beta_time.slice(s![time_tail.clone()]);
-        let x_entry_base = self.design_entry.row_chunk(row..row + 1).row(0).slice(s![..p_base]).to_owned();
-        let x_exit_base = self.design_exit.row_chunk(row..row + 1).row(0).slice(s![..p_base]).to_owned();
-        let x_deriv_base = self
-            .design_derivative_exit
-            .row_chunk(row..row + 1)
-            .row(0)
-            .slice(s![..p_base])
-            .to_owned();
+        let entry_chunk = self.design_entry.row_chunk(row..row + 1);
+        let exit_chunk = self.design_exit.row_chunk(row..row + 1);
+        let deriv_chunk = self.design_derivative_exit.row_chunk(row..row + 1);
+        let x_entry_base = entry_chunk.row(0).slice(s![..p_base]).to_owned();
+        let x_exit_base = exit_chunk.row(0).slice(s![..p_base]).to_owned();
+        let x_deriv_base = deriv_chunk.row(0).slice(s![..p_base]).to_owned();
         let marginal_row = if p_marginal > 0 {
-            Some(self.marginal_design.row_chunk(row..row + 1).row(0).to_owned())
+            let marginal_chunk = self.marginal_design.row_chunk(row..row + 1);
+            Some(marginal_chunk.row(0).to_owned())
         } else {
             None
         };

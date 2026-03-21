@@ -339,36 +339,6 @@ pub struct SavedAnchoredDeviationRuntime {
     pub basis_dim: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SavedDeviationSpanCubic {
-    pub left: f64,
-    pub right: f64,
-    pub c0: f64,
-    pub c1: f64,
-    pub c2: f64,
-    pub c3: f64,
-}
-
-impl SavedDeviationSpanCubic {
-    #[inline]
-    pub fn evaluate(self, x: f64) -> f64 {
-        let t = x - self.left;
-        self.c0 + self.c1 * t + self.c2 * t * t + self.c3 * t * t * t
-    }
-
-    #[inline]
-    pub fn first_derivative(self, x: f64) -> f64 {
-        let t = x - self.left;
-        self.c1 + 2.0 * self.c2 * t + 3.0 * self.c3 * t * t
-    }
-
-    #[inline]
-    pub fn second_derivative(self, x: f64) -> f64 {
-        let t = x - self.left;
-        2.0 * self.c2 + 6.0 * self.c3 * t
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct SavedPredictionRuntime {
     pub model_class: PredictModelClass,
@@ -459,19 +429,20 @@ impl SavedAnchoredDeviationRuntime {
     fn validate_kernel(&self) -> Result<(), String> {
         if self.kernel.is_empty()
             || self.kernel
-                == crate::families::bernoulli_marginal_slope_exact::LEGACY_ANCHORED_DEVIATION_KERNEL
+                == crate::families::bernoulli_marginal_slope::exact_kernel::LEGACY_ANCHORED_DEVIATION_KERNEL
         {
             return Err(
                 "saved anchored deviation runtime is missing the ExactDenestedCubicV1 marker or uses legacy flexible Bernoulli marginal-slope semantics; the model must be refit"
                     .to_string(),
             );
         }
-        if self.kernel != crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+        if self.kernel
+            != crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
         {
             return Err(format!(
                 "saved anchored deviation runtime uses unsupported kernel '{}'; expected {}",
                 self.kernel,
-                crate::families::bernoulli_marginal_slope_exact::ANCHORED_DEVIATION_KERNEL
+                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
             ));
         }
         if self.degree != 3 {
@@ -562,7 +533,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<SavedDeviationSpanCubic, String> {
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String> {
         self.validate_kernel()?;
         if beta.len() != self.basis_dim {
             return Err(format!(
@@ -587,7 +558,7 @@ impl SavedAnchoredDeviationRuntime {
         let d1 = self.first_derivative_design(&left_point)?.row(0).dot(beta);
         let d2 = self.second_derivative_design(&left_point)?.row(0).dot(beta);
         let d3 = self.third_derivative_design(&mid_point)?.row(0).dot(beta);
-        Ok(SavedDeviationSpanCubic {
+        Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
             left,
             right,
             c0: value,
@@ -601,7 +572,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<SavedDeviationSpanCubic, String> {
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String> {
         self.validate_kernel()?;
         if basis_idx >= self.basis_dim {
             return Err(format!(
@@ -618,84 +589,16 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         basis_idx: usize,
         value: f64,
-    ) -> Result<SavedDeviationSpanCubic, String> {
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String> {
         let span_idx = self.span_index_for(value)?;
         self.basis_span_cubic(span_idx, basis_idx)
-    }
-
-    pub fn exact_local_cubic_on_span(
-        &self,
-        beta: &Array1<f64>,
-        span_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
-        self.local_cubic_on_span(beta, span_idx).map(|span| {
-            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
-                left: span.left,
-                right: span.right,
-                c0: span.c0,
-                c1: span.c1,
-                c2: span.c2,
-                c3: span.c3,
-            }
-        })
-    }
-
-    pub fn exact_local_cubic_at(
-        &self,
-        beta: &Array1<f64>,
-        value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
-        self.local_cubic_at(beta, value).map(|span| {
-            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
-                left: span.left,
-                right: span.right,
-                c0: span.c0,
-                c1: span.c1,
-                c2: span.c2,
-                c3: span.c3,
-            }
-        })
-    }
-
-    pub fn exact_basis_span_cubic(
-        &self,
-        span_idx: usize,
-        basis_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
-        self.basis_span_cubic(span_idx, basis_idx).map(|span| {
-            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
-                left: span.left,
-                right: span.right,
-                c0: span.c0,
-                c1: span.c1,
-                c2: span.c2,
-                c3: span.c3,
-            }
-        })
-    }
-
-    pub fn exact_basis_cubic_at(
-        &self,
-        basis_idx: usize,
-        value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic, String> {
-        self.basis_cubic_at(basis_idx, value).map(|span| {
-            crate::families::bernoulli_marginal_slope_exact::LocalSpanCubic {
-                left: span.left,
-                right: span.right,
-                c0: span.c0,
-                c1: span.c1,
-                c2: span.c2,
-                c3: span.c3,
-            }
-        })
     }
 
     pub fn local_cubic_at(
         &self,
         beta: &Array1<f64>,
         value: f64,
-    ) -> Result<SavedDeviationSpanCubic, String> {
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String> {
         let span_idx = self.span_index_for(value)?;
         self.local_cubic_on_span(beta, span_idx)
     }
