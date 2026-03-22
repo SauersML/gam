@@ -2,6 +2,8 @@
 #![deny(unused_variables)]
 #![deny(unused_imports)]
 
+include!(concat!(env!("OUT_DIR"), "/lint_errors.rs"));
+
 pub mod families;
 pub mod inference;
 pub mod linalg;
