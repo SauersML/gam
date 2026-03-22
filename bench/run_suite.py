@@ -3196,6 +3196,16 @@ def _formula_rhs_from_terms(terms: list[str]) -> str:
     return " + ".join(str(term) for term in terms) if terms else "1"
 
 
+def _formula_rhs_text(formula: str) -> str:
+    if "~" not in formula:
+        raise RuntimeError(f"cannot extract RHS from malformed formula: {formula!r}")
+    _lhs, rhs = formula.split("~", 1)
+    rhs = rhs.strip()
+    if not rhs:
+        raise RuntimeError(f"formula is missing RHS terms: {formula!r}")
+    return rhs
+
+
 def _select_marginal_slope_z_column(scenario_name: str, ds: dict) -> str:
     cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
@@ -3243,7 +3253,7 @@ def _rust_marginal_slope_formulas_for_scenario(scenario_name: str, ds: dict) -> 
         ds,
         cfg_override=marginal_cfg,
     )
-    return z_column, marginal_formula, logslope_formula
+    return z_column, marginal_formula, _formula_rhs_text(logslope_formula)
 
 
 def _mgcv_formula_for_scenario(scenario_name, ds):
@@ -4230,9 +4240,8 @@ def _run_rust_gamlss_scenario_cv_variant(
                 test_path = td_path / f"test_{fold_id}.csv"
                 train_df.to_csv(train_path, index=False)
                 test_df.to_csv(test_path, index=False)
-            noise_formula = (
-                f"{ds['target']} ~ "
-                + " + ".join(_sigma_feature_terms(ds, scenario_name=scenario_name, backend="rust"))
+            noise_formula = _formula_rhs_from_terms(
+                _sigma_feature_terms(ds, scenario_name=scenario_name, backend="rust")
             )
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
@@ -4819,9 +4828,7 @@ def run_rust_gamlss_survival_marginal_slope_cv(
             test_pred_df.to_csv(test_path, index=False)
 
             fit_formula = f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_formula}"
-            logslope_formula = (
-                f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_logslope}"
-            )
+            logslope_formula = rhs_logslope
             fit_cmd = [
                 str(rust_bin),
                 "fit",

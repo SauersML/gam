@@ -85,20 +85,13 @@
     {
       "name": "rust_survival_transform_ps",
       "dataset": "survival",
-      "backend": "rust_survival_transform",
+      "backend": "rust_survival",
       "family": "survival",
       "spatial_basis": "ps",
       "smooth_kind": "separate",
-      "include_sigma": false
-    },
-    {
-      "name": "rust_gamlss_survival_ps",
-      "dataset": "survival",
-      "backend": "rust_gamlss_survival",
-      "family": "survival",
-      "spatial_basis": "ps",
-      "smooth_kind": "separate",
-      "include_sigma": false
+      "include_sigma": false,
+      "survival_likelihood": "transformation",
+      "survival_distribution": "gaussian"
     },
     {
       "name": "r_mgcv_survival_ps",

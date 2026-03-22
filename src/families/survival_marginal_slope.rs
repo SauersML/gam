@@ -2050,10 +2050,8 @@ impl SurvivalMarginalSlopeFamily {
             for u in 0..p {
                 let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                 let neg_coeff_au = fixed.coeff_au[u].map(|value| -value);
-                f_u[u] += exact_kernel::cell_first_derivative_from_moments(
-                    &neg_coeff_u,
-                    &state.moments,
-                )?;
+                f_u[u] +=
+                    exact_kernel::cell_first_derivative_from_moments(&neg_coeff_u, &state.moments)?;
                 f_au[u] += exact_kernel::cell_second_derivative_from_moments(
                     neg_cell,
                     &neg_dc_da,
@@ -2165,9 +2163,9 @@ impl SurvivalMarginalSlopeFamily {
         let mut a_uv = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
-                let value =
-                    (f_uv[[u, v]] - d_u[u] * a_u[v] - d_u[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
-                        / d_check;
+                let value = (f_uv[[u, v]] - d_u[u] * a_u[v] - d_u[v] * a_u[u]
+                    + f_aa * a_u[u] * a_u[v])
+                    / d_check;
                 a_uv[[u, v]] = value;
                 a_uv[[v, u]] = value;
             }
@@ -2192,8 +2190,10 @@ impl SurvivalMarginalSlopeFamily {
             for local_idx in 0..h_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
-                rho[idx] =
-                    eval_coeff4_at(&exact_kernel::score_basis_cell_coefficients(basis_span, b), z_obs);
+                rho[idx] = eval_coeff4_at(
+                    &exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                    z_obs,
+                );
             }
         }
         if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
@@ -2224,12 +2224,10 @@ impl SurvivalMarginalSlopeFamily {
         let mut chi_uv = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
-                let r_uv = self.observed_fixed_eta_second_partial(
-                    primary, &obs, u, v, z_obs, u_obs, a, b,
-                )?;
-                let chi_uv_fixed = self.observed_fixed_chi_second_partial(
-                    primary, &obs, u, v, z_obs, u_obs, a, b,
-                )?;
+                let r_uv = self
+                    .observed_fixed_eta_second_partial(primary, &obs, u, v, z_obs, u_obs, a, b)?;
+                let chi_uv_fixed = self
+                    .observed_fixed_chi_second_partial(primary, &obs, u, v, z_obs, u_obs, a, b)?;
 
                 let eta_val = chi * a_uv[[u, v]]
                     + eta_aa * a_u[u] * a_u[v]
@@ -2389,28 +2387,10 @@ impl SurvivalMarginalSlopeFamily {
         let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
         let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
         let entry = self.compute_survival_timepoint_exact(
-            row,
-            primary,
-            q0,
-            primary.q0,
-            a0,
-            g,
-            d0,
-            beta_h,
-            beta_w,
-            false,
+            row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
         )?;
         let exit = self.compute_survival_timepoint_exact(
-            row,
-            primary,
-            q1,
-            primary.q1,
-            a1,
-            g,
-            d1,
-            beta_h,
-            beta_w,
-            true,
+            row, primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
@@ -2464,8 +2444,8 @@ impl SurvivalMarginalSlopeFamily {
         for u in 0..p {
             for v in u..p {
                 let mut value = 0.0;
-                value += entry_u2 * entry.eta_u[u] * entry.eta_u[v]
-                    + entry_u1 * entry.eta_uv[[u, v]];
+                value +=
+                    entry_u2 * entry.eta_u[u] * entry.eta_u[v] + entry_u1 * entry.eta_uv[[u, v]];
                 value += exit_surv_u2 * exit.eta_u[u] * exit.eta_u[v]
                     + exit_surv_u1 * exit.eta_uv[[u, v]];
                 value += wi * di * (exit.eta_u[u] * exit.eta_u[v] + exit.eta * exit.eta_uv[[u, v]]);
@@ -6150,6 +6130,8 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            score_warp: None,
+            link_dev: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -6210,6 +6192,8 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0
             ]])),
+            score_warp: None,
+            link_dev: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -6283,6 +6267,8 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            score_warp: None,
+            link_dev: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -6457,6 +6443,8 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            score_warp: None,
+            link_dev: None,
             time_linear_constraints: time_derivative_lower_bound_constraints(
                 &array![[1.0, 0.0]],
                 &array![0.2],
