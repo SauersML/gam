@@ -1,5 +1,5 @@
-use crate::basis::BasisOptions;
 use crate::basis::BasisFamily;
+use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
@@ -427,13 +427,9 @@ impl SavedBaselineTimeWiggleRuntime {
 
 impl SavedAnchoredDeviationRuntime {
     fn validate_kernel(&self) -> Result<(), String> {
-        if self.kernel.is_empty()
-            || self.kernel
-                == crate::families::bernoulli_marginal_slope::exact_kernel::LEGACY_ANCHORED_DEVIATION_KERNEL
-        {
+        if self.kernel.is_empty() {
             return Err(
-                "saved anchored deviation runtime is missing the ExactDenestedCubicV1 marker or uses legacy flexible Bernoulli marginal-slope semantics; the model must be refit"
-                    .to_string(),
+                "saved anchored deviation runtime is missing the exact kernel marker".to_string(),
             );
         }
         if self.kernel
@@ -533,7 +529,8 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String> {
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    {
         self.validate_kernel()?;
         if beta.len() != self.basis_dim {
             return Err(format!(
@@ -558,21 +555,24 @@ impl SavedAnchoredDeviationRuntime {
         let d1 = self.first_derivative_design(&left_point)?.row(0).dot(beta);
         let d2 = self.second_derivative_design(&left_point)?.row(0).dot(beta);
         let d3 = self.third_derivative_design(&mid_point)?.row(0).dot(beta);
-        Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-            left,
-            right,
-            c0: value,
-            c1: d1,
-            c2: 0.5 * d2,
-            c3: d3 / 6.0,
-        })
+        Ok(
+            crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                left,
+                right,
+                c0: value,
+                c1: d1,
+                c2: 0.5 * d2,
+                c3: d3 / 6.0,
+            },
+        )
     }
 
     pub fn basis_span_cubic(
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String> {
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    {
         self.validate_kernel()?;
         if basis_idx >= self.basis_dim {
             return Err(format!(
@@ -589,7 +589,8 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         basis_idx: usize,
         value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String> {
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    {
         let span_idx = self.span_index_for(value)?;
         self.basis_span_cubic(span_idx, basis_idx)
     }
@@ -598,7 +599,8 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String> {
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    {
         let span_idx = self.span_index_for(value)?;
         self.local_cubic_on_span(beta, span_idx)
     }
@@ -921,14 +923,16 @@ impl FittedModel {
     pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, String> {
         if self.predict_model_class() == PredictModelClass::BernoulliMarginalSlope {
             if let Some(runtime) = self.payload().score_warp_runtime.as_ref() {
-                runtime
-                    .validate_kernel()
-                    .map_err(|err| format!("saved bernoulli marginal-slope score-warp runtime is incompatible: {err}. Refit the model."))?;
+                runtime.validate_kernel().map_err(|err| {
+                    format!("saved bernoulli marginal-slope score-warp runtime is invalid: {err}")
+                })?;
             }
             if let Some(runtime) = self.payload().link_deviation_runtime.as_ref() {
-                runtime
-                    .validate_kernel()
-                    .map_err(|err| format!("saved bernoulli marginal-slope link-deviation runtime is incompatible: {err}. Refit the model."))?;
+                runtime.validate_kernel().map_err(|err| {
+                    format!(
+                        "saved bernoulli marginal-slope link-deviation runtime is invalid: {err}"
+                    )
+                })?;
             }
         }
         Ok(SavedPredictionRuntime {

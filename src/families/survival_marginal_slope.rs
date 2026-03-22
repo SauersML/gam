@@ -8,17 +8,17 @@ use crate::custom_family::{
     fit_custom_family, second_psi_linear_map,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::bernoulli_marginal_slope::{
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
     unary_derivatives_sqrt,
 };
+use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
+use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
     time_derivative_lower_bound_constraints,
 };
-use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
@@ -1081,8 +1081,8 @@ impl SurvivalMarginalSlopeFamily {
             out.q1 = self.design_exit.dot_row(row, beta_time)
                 + self.offset_exit[row]
                 + self.marginal_design.dot_row(row, beta_marginal);
-            out.qd1 =
-                self.design_derivative_exit.dot_row(row, beta_time) + self.derivative_offset_exit[row];
+            out.qd1 = self.design_derivative_exit.dot_row(row, beta_time)
+                + self.derivative_offset_exit[row];
             let time_entry_chunk = self.design_entry.row_chunk(row..row + 1);
             let time_exit_chunk = self.design_exit.row_chunk(row..row + 1);
             let time_deriv_chunk = self.design_derivative_exit.row_chunk(row..row + 1);
@@ -1146,19 +1146,17 @@ impl SurvivalMarginalSlopeFamily {
         for j in 0..p_base {
             out.dq0_time[j] = entry_geom.dq_dq0[0] * x_entry_base[j];
             out.dq1_time[j] = exit_geom.dq_dq0[0] * x_exit_base[j];
-            out.dqd1_time[j] =
-                exit_geom.d2q_dq02[0] * d_raw * x_exit_base[j] + exit_geom.dq_dq0[0] * x_deriv_base[j];
+            out.dqd1_time[j] = exit_geom.d2q_dq02[0] * d_raw * x_exit_base[j]
+                + exit_geom.dq_dq0[0] * x_deriv_base[j];
             for k in 0..p_base {
                 out.d2q0_time_time[[j, k]] =
                     entry_geom.d2q_dq02[0] * x_entry_base[j] * x_entry_base[k];
                 out.d2q1_time_time[[j, k]] =
                     exit_geom.d2q_dq02[0] * x_exit_base[j] * x_exit_base[k];
-                out.d2qd1_time_time[[j, k]] = exit_geom.d3q_dq03[0]
-                    * d_raw
-                    * x_exit_base[j]
-                    * x_exit_base[k]
-                    + exit_geom.d2q_dq02[0]
-                        * (x_exit_base[j] * x_deriv_base[k] + x_deriv_base[j] * x_exit_base[k]);
+                out.d2qd1_time_time[[j, k]] =
+                    exit_geom.d3q_dq03[0] * d_raw * x_exit_base[j] * x_exit_base[k]
+                        + exit_geom.d2q_dq02[0]
+                            * (x_exit_base[j] * x_deriv_base[k] + x_deriv_base[j] * x_exit_base[k]);
             }
         }
         for local_idx in 0..time_tail.len() {
@@ -1198,11 +1196,9 @@ impl SurvivalMarginalSlopeFamily {
                         entry_geom.d2q_dq02[0] * x_entry_base[k] * marginal_row[j];
                     out.d2q1_time_marginal[[k, j]] =
                         exit_geom.d2q_dq02[0] * x_exit_base[k] * marginal_row[j];
-                    out.d2qd1_time_marginal[[k, j]] = exit_geom.d3q_dq03[0]
-                        * d_raw
-                        * x_exit_base[k]
-                        * marginal_row[j]
-                        + exit_geom.d2q_dq02[0] * x_deriv_base[k] * marginal_row[j];
+                    out.d2qd1_time_marginal[[k, j]] =
+                        exit_geom.d3q_dq03[0] * d_raw * x_exit_base[k] * marginal_row[j]
+                            + exit_geom.d2q_dq02[0] * x_deriv_base[k] * marginal_row[j];
                 }
                 for local_idx in 0..time_tail.len() {
                     let coeff_idx = time_tail.start + local_idx;
@@ -2491,20 +2487,19 @@ impl SurvivalMarginalSlopeFamily {
 
                     for a in 0..p_t {
                         for b in 0..p_t {
-                            acc.4[[a, b]] += f_pipi[[0, 0]]
-                                * q_geom.dq0_time[a]
-                                * q_geom.dq0_time[b]
-                                + f_pipi[[0, 1]] * q_geom.dq0_time[a] * q_geom.dq1_time[b]
-                                + f_pipi[[0, 2]] * q_geom.dq0_time[a] * q_geom.dqd1_time[b]
-                                + f_pipi[[1, 0]] * q_geom.dq1_time[a] * q_geom.dq0_time[b]
-                                + f_pipi[[1, 1]] * q_geom.dq1_time[a] * q_geom.dq1_time[b]
-                                + f_pipi[[1, 2]] * q_geom.dq1_time[a] * q_geom.dqd1_time[b]
-                                + f_pipi[[2, 0]] * q_geom.dqd1_time[a] * q_geom.dq0_time[b]
-                                + f_pipi[[2, 1]] * q_geom.dqd1_time[a] * q_geom.dq1_time[b]
-                                + f_pipi[[2, 2]] * q_geom.dqd1_time[a] * q_geom.dqd1_time[b]
-                                + f_pi[0] * q_geom.d2q0_time_time[[a, b]]
-                                + f_pi[1] * q_geom.d2q1_time_time[[a, b]]
-                                + f_pi[2] * q_geom.d2qd1_time_time[[a, b]];
+                            acc.4[[a, b]] +=
+                                f_pipi[[0, 0]] * q_geom.dq0_time[a] * q_geom.dq0_time[b]
+                                    + f_pipi[[0, 1]] * q_geom.dq0_time[a] * q_geom.dq1_time[b]
+                                    + f_pipi[[0, 2]] * q_geom.dq0_time[a] * q_geom.dqd1_time[b]
+                                    + f_pipi[[1, 0]] * q_geom.dq1_time[a] * q_geom.dq0_time[b]
+                                    + f_pipi[[1, 1]] * q_geom.dq1_time[a] * q_geom.dq1_time[b]
+                                    + f_pipi[[1, 2]] * q_geom.dq1_time[a] * q_geom.dqd1_time[b]
+                                    + f_pipi[[2, 0]] * q_geom.dqd1_time[a] * q_geom.dq0_time[b]
+                                    + f_pipi[[2, 1]] * q_geom.dqd1_time[a] * q_geom.dq1_time[b]
+                                    + f_pipi[[2, 2]] * q_geom.dqd1_time[a] * q_geom.dqd1_time[b]
+                                    + f_pi[0] * q_geom.d2q0_time_time[[a, b]]
+                                    + f_pi[1] * q_geom.d2q1_time_time[[a, b]]
+                                    + f_pi[2] * q_geom.d2qd1_time_time[[a, b]];
                         }
                     }
                     for a in 0..p_m {
@@ -2512,27 +2507,13 @@ impl SurvivalMarginalSlopeFamily {
                             acc.5[[a, b]] += f_pipi[[0, 0]]
                                 * q_geom.dq0_marginal[a]
                                 * q_geom.dq0_marginal[b]
-                                + f_pipi[[0, 1]]
-                                    * q_geom.dq0_marginal[a]
-                                    * q_geom.dq1_marginal[b]
-                                + f_pipi[[0, 2]]
-                                    * q_geom.dq0_marginal[a]
-                                    * q_geom.dqd1_marginal[b]
-                                + f_pipi[[1, 0]]
-                                    * q_geom.dq1_marginal[a]
-                                    * q_geom.dq0_marginal[b]
-                                + f_pipi[[1, 1]]
-                                    * q_geom.dq1_marginal[a]
-                                    * q_geom.dq1_marginal[b]
-                                + f_pipi[[1, 2]]
-                                    * q_geom.dq1_marginal[a]
-                                    * q_geom.dqd1_marginal[b]
-                                + f_pipi[[2, 0]]
-                                    * q_geom.dqd1_marginal[a]
-                                    * q_geom.dq0_marginal[b]
-                                + f_pipi[[2, 1]]
-                                    * q_geom.dqd1_marginal[a]
-                                    * q_geom.dq1_marginal[b]
+                                + f_pipi[[0, 1]] * q_geom.dq0_marginal[a] * q_geom.dq1_marginal[b]
+                                + f_pipi[[0, 2]] * q_geom.dq0_marginal[a] * q_geom.dqd1_marginal[b]
+                                + f_pipi[[1, 0]] * q_geom.dq1_marginal[a] * q_geom.dq0_marginal[b]
+                                + f_pipi[[1, 1]] * q_geom.dq1_marginal[a] * q_geom.dq1_marginal[b]
+                                + f_pipi[[1, 2]] * q_geom.dq1_marginal[a] * q_geom.dqd1_marginal[b]
+                                + f_pipi[[2, 0]] * q_geom.dqd1_marginal[a] * q_geom.dq0_marginal[b]
+                                + f_pipi[[2, 1]] * q_geom.dqd1_marginal[a] * q_geom.dq1_marginal[b]
                                 + f_pipi[[2, 2]]
                                     * q_geom.dqd1_marginal[a]
                                     * q_geom.dqd1_marginal[b]
@@ -3745,7 +3726,10 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             ));
         }
         if timewiggle.ncols == 0 {
-            return Err("survival-marginal-slope timewiggle requires at least one wiggle coefficient".to_string());
+            return Err(
+                "survival-marginal-slope timewiggle requires at least one wiggle coefficient"
+                    .to_string(),
+            );
         }
         if spec.time_block.design_exit.ncols() < timewiggle.ncols {
             return Err(format!(
@@ -3780,9 +3764,10 @@ fn pooled_survival_baseline(
         let mut grad = 0.0;
         let mut hess = 0.0;
         for i in 0..n {
-            let (row_obj, row_grad, row_hess) =
-                row_primary_closed_form(q0[i], q1[i], qd1[i], slope, z[i], weights[i], event[i], 0.0)
-                    .ok()?;
+            let (row_obj, row_grad, row_hess) = row_primary_closed_form(
+                q0[i], q1[i], qd1[i], slope, z[i], weights[i], event[i], 0.0,
+            )
+            .ok()?;
             obj += row_obj;
             grad += row_grad[3];
             hess += row_hess[3][3];
@@ -3803,8 +3788,16 @@ fn pooled_survival_baseline(
     let mut best_slope = 0.0;
     let mut best = state0;
 
-    let mut bracket_lo = if state0.1 <= 0.0 { Some((0.0, state0)) } else { None };
-    let mut bracket_hi = if state0.1 >= 0.0 { Some((0.0, state0)) } else { None };
+    let mut bracket_lo = if state0.1 <= 0.0 {
+        Some((0.0, state0))
+    } else {
+        None
+    };
+    let mut bracket_hi = if state0.1 >= 0.0 {
+        Some((0.0, state0))
+    } else {
+        None
+    };
     let mut step = 0.5f64;
     for _ in 0..48 {
         for &candidate in &[-step, step] {
@@ -4002,10 +3995,7 @@ pub fn fit_survival_marginal_slope_terms(
             Some(project_onto_linear_constraints(
                 design_exit.ncols(),
                 constraints,
-                hints
-                    .0
-                    .as_ref()
-                    .or(time_block_ref.initial_beta.as_ref()),
+                hints.0.as_ref().or(time_block_ref.initial_beta.as_ref()),
             ))
         } else {
             hints
@@ -4425,14 +4415,24 @@ mod tests {
             weights: Arc::new(array![1.0, 1.0]),
             z: Arc::new(array![0.0, 0.0]),
             derivative_guard: 1e-4,
-            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((2, 2)))),
-            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((2, 2)))),
-            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 2.0], [3.0, 4.0]])),
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((2, 2)),
+            )),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((2, 2)),
+            )),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0, 2.0], [3.0, 4.0]],
+            )),
             offset_entry: Arc::new(Array1::zeros(2)),
             offset_exit: Arc::new(Array1::zeros(2)),
             derivative_offset_exit: Arc::new(array![0.25, 0.5]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((2, 0)))),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((2, 0)))),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((2, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((2, 0)),
+            )),
             time_linear_constraints: time_derivative_lower_bound_constraints(
                 &array![[1.0, 2.0], [3.0, 4.0]],
                 &array![0.25, 0.5],
@@ -4445,7 +4445,10 @@ mod tests {
         };
         let spec = ParameterBlockSpec {
             name: "time_surface".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0, 0.0], [0.0, 0.0]])),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [0.0, 0.0],
+                [0.0, 0.0]
+            ])),
             offset: Array1::zeros(2),
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
@@ -4527,14 +4530,24 @@ mod tests {
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
             derivative_guard: 1e-4,
-            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0, 0.0]])),
-            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0, 0.0]])),
-            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0, 0.0]],
+            )),
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![0.2]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((1, 0)))),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             time_linear_constraints: time_derivative_lower_bound_constraints(
                 &array![[1.0, 0.0]],
                 &array![0.2],
