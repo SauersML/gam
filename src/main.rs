@@ -16,6 +16,7 @@ use gam::estimate::{
 use gam::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime,
 };
+use gam::families::cubic_cell_kernel as exact_kernel;
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
 };
@@ -91,7 +92,7 @@ use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
     StandardFitRequest, SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
-    TransformationNormalFitRequest, fit_model,
+    TransformationNormalFitRequest, fit_model, resolve_offset_column, resolve_weight_column,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -242,6 +243,15 @@ struct FitArgs {
     /// closed form.
     #[arg(long = "z-column")]
     z_column: Option<String>,
+    /// Optional non-negative per-row training weights column.
+    #[arg(long = "weights-column")]
+    weights_column: Option<String>,
+    /// Optional additive offset column for the primary linear predictor.
+    #[arg(long = "offset-column")]
+    offset_column: Option<String>,
+    /// Optional additive offset column for the noise/log-scale predictor.
+    #[arg(long = "noise-offset-column")]
+    noise_offset_column: Option<String>,
     #[arg(long = "disable-score-warp", default_value_t = false)]
     disable_score_warp: bool,
     #[arg(long = "disable-link-dev", default_value_t = false)]
@@ -334,6 +344,10 @@ struct PredictArgs {
     new_data: PathBuf,
     #[arg(long = "out")]
     out: PathBuf,
+    #[arg(long = "offset-column")]
+    offset_column: Option<String>,
+    #[arg(long = "noise-offset-column")]
+    noise_offset_column: Option<String>,
     #[arg(long = "uncertainty", default_value_t = false)]
     uncertainty: bool,
     #[arg(long = "level", default_value_t = 0.95)]
@@ -378,6 +392,9 @@ struct SurvivalArgs {
     out: Option<PathBuf>,
     logslope_formula: Option<String>,
     z_column: Option<String>,
+    weights_column: Option<String>,
+    offset_column: Option<String>,
+    noise_offset_column: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -594,6 +611,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             out: args.out.clone(),
             logslope_formula: args.logslope_formula.clone(),
             z_column: args.z_column.clone(),
+            weights_column: args.weights_column.clone(),
+            offset_column: args.offset_column.clone(),
+            noise_offset_column: args.noise_offset_column.clone(),
         };
         return run_survival(surv_args);
     }
@@ -621,6 +641,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let mut inference_notes: Vec<String> = Vec::new();
 
     if args.transformation_normal {
+        if args.noise_offset_column.is_some() {
+            return Err(
+                "--noise-offset-column is not supported with --transformation-normal".to_string(),
+            );
+        }
         return run_fit_transformation_normal(
             &args,
             &mut progress,
@@ -846,6 +871,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             &formula_text,
         );
     }
+    if args.noise_offset_column.is_some() {
+        return Err(
+            "--noise-offset-column requires --predict-noise or survival location-scale".to_string(),
+        );
+    }
 
     progress.set_stage("fit", "building term specification");
     let mut spec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
@@ -883,8 +913,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     })?;
     let fit_max_iter = 200usize;
     let fit_tol = 1e-6f64;
-    let weights = Array1::ones(ds.values.nrows());
-    let offset = Array1::zeros(ds.values.nrows());
+    let weights = resolve_weight_column(&ds, &col_map, args.weights_column.as_deref())?;
+    let offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
     if let Some(choice) = link_choice.as_ref() {
         if matches!(choice.mode, LinkMode::Flexible) {
             if choice.mixture_components.is_some() {
@@ -1131,6 +1161,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.training_headers = Some(ds.headers.clone());
         payload.resolved_termspec = Some(saved_termspec);
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
+        set_saved_offset_columns(
+            &mut payload,
+            args.offset_column.clone(),
+            args.noise_offset_column.clone(),
+        );
         write_payload_json(&out, payload)?;
         progress.advance_workflow(5);
     }
@@ -1238,6 +1273,9 @@ fn run_fit_bernoulli_marginal_slope(
         .get(z_column)
         .ok_or_else(|| format!("z column '{z_column}' not found"))?;
     let z = ds.values.column(z_col).to_owned();
+    let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
+    let marginal_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
+    let logslope_offset = resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
     let routed_link_dev = match parsed.linkwiggle.as_ref() {
         Some(wiggle) => Some(deviation_block_config_from_formula_linkwiggle(wiggle)),
         None if args.disable_link_dev => None,
@@ -1274,10 +1312,12 @@ fn run_fit_bernoulli_marginal_slope(
             data: ds.values.view(),
             spec: BernoulliMarginalSlopeTermSpec {
                 y: y.clone(),
-                weights: Array1::ones(y.len()),
+                weights,
                 z,
                 marginalspec: marginalspec.clone(),
                 logslopespec: logslopespec.clone(),
+                marginal_offset,
+                logslope_offset,
                 score_warp: if args.disable_score_warp {
                     None
                 } else {
@@ -1320,7 +1360,7 @@ fn run_fit_bernoulli_marginal_slope(
 
     if let Some(out) = args.out.as_ref() {
         progress.set_stage("fit", "writing bernoulli marginal-slope model");
-        let model = build_bernoulli_marginal_slope_saved_model(
+        let mut model = build_bernoulli_marginal_slope_saved_model(
             formula_text.to_string(),
             ds.schema.clone(),
             logslope_formula,
@@ -1334,6 +1374,8 @@ fn run_fit_bernoulli_marginal_slope(
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
         );
+        model.offset_column = args.offset_column.clone();
+        model.noise_offset_column = args.noise_offset_column.clone();
         write_model_json(out, &model)?;
         progress.advance_workflow(fit_total_steps);
     }
@@ -1385,6 +1427,8 @@ fn run_fit_transformation_normal(
 
     let options = blockwise_options_from_fit_args(args)?;
     let config = TransformationNormalConfig::default();
+    let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
+    let offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
@@ -1396,6 +1440,8 @@ fn run_fit_transformation_normal(
         TransformationNormalFitRequest {
             data: ds.values.view(),
             response: y.clone(),
+            weights,
+            offset,
             covariate_spec: covariate_spec.clone(),
             config,
             options,
@@ -1432,7 +1478,7 @@ fn run_fit_transformation_normal(
 
     if let Some(out) = args.out.as_ref() {
         progress.set_stage("fit", "writing transformation-normal model");
-        let model = build_transformation_normal_saved_model(
+        let mut model = build_transformation_normal_saved_model(
             formula_text.to_string(),
             ds.schema.clone(),
             ds.headers.clone(),
@@ -1440,6 +1486,8 @@ fn run_fit_transformation_normal(
             solved.fit,
             &solved.family,
         );
+        model.offset_column = args.offset_column.clone();
+        model.noise_offset_column = args.noise_offset_column.clone();
         write_model_json(out, &model)?;
         progress.advance_workflow(fit_total_steps);
     }
@@ -1505,6 +1553,9 @@ fn run_fitwith_predict_noise(
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
         opts
     };
+    let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
+    let mean_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
+    let noise_offset = resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
     if family == LikelihoodFamily::GaussianIdentity {
         let response_scale = sample_std(y.view()).max(1e-6);
         let y_scaled = y.mapv(|v| v / response_scale);
@@ -1515,9 +1566,11 @@ fn run_fitwith_predict_noise(
                 data: ds.values.view(),
                 spec: GaussianLocationScaleTermSpec {
                     y: y_scaled,
-                    weights: Array1::ones(y.len()),
+                    weights: weights.clone(),
                     meanspec: meanspec.clone(),
                     log_sigmaspec: noisespec.clone(),
+                    mean_offset,
+                    log_sigma_offset: noise_offset,
                 },
                 wiggle: formula_linkwiggle.cloned().map(|cfg| LinkWiggleConfig {
                     degree: cfg.degree,
@@ -1604,7 +1657,7 @@ fn run_fitwith_predict_noise(
             let gaussian_noise_transform = build_scale_deviation_transform(
                 &dense_mean_design,
                 &dense_noise_design,
-                &Array1::ones(y.len()),
+                &weights,
                 noise_design
                     .intercept_range
                     .end
@@ -1625,6 +1678,8 @@ fn run_fitwith_predict_noise(
                 Some(&gaussian_noise_transform),
                 Some(response_scale),
             );
+            model.offset_column = args.offset_column.clone();
+            model.noise_offset_column = args.noise_offset_column.clone();
             if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
                 model.linkwiggle_knots = Some(knots.mapv(|v| v * response_scale).to_vec());
                 model.linkwiggle_degree = Some(degree);
@@ -1695,10 +1750,12 @@ fn run_fitwith_predict_noise(
             data: ds.values.view(),
             spec: BinomialLocationScaleTermSpec {
                 y: y.clone(),
-                weights: Array1::ones(y.len()),
+                weights: weights.clone(),
                 link_kind: location_scale_link_kind.clone(),
                 thresholdspec: meanspec.clone(),
                 log_sigmaspec: noisespec.clone(),
+                threshold_offset: mean_offset,
+                log_sigma_offset: noise_offset,
             },
             wiggle: formula_linkwiggle.cloned().map(|cfg| LinkWiggleConfig {
                 degree: cfg.degree,
@@ -1792,7 +1849,7 @@ fn run_fitwith_predict_noise(
         let binomial_noise_transform = build_scale_deviation_transform(
             &dense_binom_mean,
             &dense_binom_noise,
-            &Array1::ones(y.len()),
+            &weights,
             solved
                 .fit
                 .noise_design
@@ -1815,6 +1872,8 @@ fn run_fitwith_predict_noise(
             Some(&binomial_noise_transform),
             None,
         );
+        model.offset_column = args.offset_column.clone();
+        model.noise_offset_column = args.noise_offset_column.clone();
         model.family_state = FittedFamily::LocationScale {
             likelihood: inverse_link_to_binomial_family(&location_scale_link_kind),
             base_link: Some(location_scale_link_kind.clone()),
@@ -1857,12 +1916,17 @@ fn needs_special_predict_handling(model: &SavedModel) -> bool {
 /// Build a `PredictInput` for any model type that can go through the unified
 /// `PredictableModel` path.
 ///
-/// - **Standard**: single design from `resolved_termspec`, zero offset, no noise design.
+/// - **Standard**: single design from `resolved_termspec`, optional primary offset,
+///   no noise design.
 /// - **GaussianLocationScale**: mean design from
 ///   `resolved_termspec`, noise design from `resolved_termspec_noise`, with
 ///   scale deviation transform applied.
 /// - **BinomialLocationScale** (no wiggle): threshold design from `resolved_termspec`,
 ///   noise design from `resolved_termspec_noise`, with scale deviation transform applied.
+/// - **BernoulliMarginalSlope**: primary design from `resolved_termspec`, log-slope
+///   design from `resolved_termspec_noise`, plus `z_column` as the auxiliary scalar.
+/// - **TransformationNormal**: response-basis tensor product prediction with an
+///   optional primary offset added to the reconstructed scalar predictor.
 ///
 /// Survival models and special-case models should not call this function; they are
 /// handled by the model-specific `run_predict_*` functions.
@@ -1871,6 +1935,9 @@ fn build_predict_input_for_model(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    offset: &Array1<f64>,
+    offset_noise: &Array1<f64>,
+    noise_offset_supplied: bool,
 ) -> Result<PredictInput, String> {
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -1881,10 +1948,21 @@ fn build_predict_input_for_model(
     let design = build_term_collection_design(data, &spec)
         .map_err(|e| format!("failed to build prediction design: {e}"))?;
     let n = data.nrows();
-    let offset = Array1::zeros(n);
+    if offset.len() != n || offset_noise.len() != n {
+        return Err(format!(
+            "prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
+            offset.len(),
+            offset_noise.len()
+        ));
+    }
 
     match model.predict_model_class() {
         PredictModelClass::Standard => {
+            if noise_offset_supplied {
+                return Err(
+                    "--noise-offset-column is not supported for standard prediction".to_string(),
+                );
+            }
             let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
             let beta = if model.has_link_wiggle() {
                 fit_saved
@@ -1906,7 +1984,7 @@ fn build_predict_input_for_model(
             }
             Ok(PredictInput {
                 design: design.design.clone(),
-                offset,
+                offset: offset.clone(),
                 design_noise: None,
                 offset_noise: None,
                 auxiliary_scalar: None,
@@ -1940,11 +2018,11 @@ fn build_predict_input_for_model(
 
             Ok(PredictInput {
                 design: design.design.clone(),
-                offset,
+                offset: offset.clone(),
                 design_noise: Some(DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
                     prepared_noise_design,
                 ))),
-                offset_noise: Some(Array1::zeros(n)),
+                offset_noise: Some(offset_noise.clone()),
                 auxiliary_scalar: None,
             })
         }
@@ -1967,9 +2045,9 @@ fn build_predict_input_for_model(
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
             Ok(PredictInput {
                 design: design.design.clone(),
-                offset,
+                offset: offset.clone(),
                 design_noise: Some(design_logslope.design.clone()),
-                offset_noise: Some(Array1::zeros(n)),
+                offset_noise: Some(offset_noise.clone()),
                 auxiliary_scalar: Some(z),
             })
         }
@@ -1977,6 +2055,12 @@ fn build_predict_input_for_model(
             "build_predict_input_for_model should not be called for survival models".to_string(),
         ),
         PredictModelClass::TransformationNormal => {
+            if noise_offset_supplied {
+                return Err(
+                    "--noise-offset-column is not supported for transformation-normal prediction"
+                        .to_string(),
+                );
+            }
             // Build the tensor product design: response_basis(y_new) ⊗ covariate_design(x_new)
             let payload = model.payload();
             let response_knots = payload
@@ -2080,13 +2164,85 @@ fn build_predict_input_for_model(
 
             Ok(PredictInput {
                 design: DesignMatrix::from(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
-                offset: h,
+                offset: h + offset,
                 design_noise: None,
                 offset_noise: None,
                 auxiliary_scalar: None,
             })
         }
     }
+}
+
+fn saved_offset_columns<'a>(model: &'a SavedModel) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        model.offset_column.as_deref(),
+        model.noise_offset_column.as_deref(),
+    )
+}
+
+fn effective_predict_offset_columns<'a>(
+    model: &'a SavedModel,
+    args: &'a PredictArgs,
+) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        args.offset_column
+            .as_deref()
+            .or(model.offset_column.as_deref()),
+        args.noise_offset_column
+            .as_deref()
+            .or(model.noise_offset_column.as_deref()),
+    )
+}
+
+fn resolve_predict_offsets(
+    model: &SavedModel,
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+    offset_column: Option<&str>,
+    noise_offset_column: Option<&str>,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    let supports_noise_offset = match model.predict_model_class() {
+        PredictModelClass::Standard => false,
+        PredictModelClass::GaussianLocationScale => true,
+        PredictModelClass::BinomialLocationScale => true,
+        PredictModelClass::BernoulliMarginalSlope => true,
+        PredictModelClass::TransformationNormal => false,
+        PredictModelClass::Survival => {
+            let saved_likelihood_mode = parse_survival_likelihood_mode(
+                model
+                    .survival_likelihood
+                    .as_deref()
+                    .unwrap_or("transformation"),
+            )?;
+            matches!(
+                saved_likelihood_mode,
+                SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
+            )
+        }
+    };
+    if noise_offset_column.is_some() && !supports_noise_offset {
+        return Err(match model.predict_model_class() {
+            PredictModelClass::Standard => {
+                "--noise-offset-column is not supported for standard prediction".to_string()
+            }
+            PredictModelClass::TransformationNormal => {
+                "--noise-offset-column is not supported for transformation-normal prediction"
+                    .to_string()
+            }
+            PredictModelClass::Survival => {
+                "--noise-offset-column is supported only for survival location-scale or marginal-slope"
+                    .to_string()
+            }
+            _ => "internal error: unsupported noise-offset configuration".to_string(),
+        });
+    }
+    let offset = resolve_offset_column(data, col_map, offset_column)?;
+    let noise_offset = if supports_noise_offset {
+        resolve_offset_column(data, col_map, noise_offset_column)?
+    } else {
+        Array1::zeros(data.values.nrows())
+    };
+    Ok((offset, noise_offset))
 }
 
 /// Unified prediction + CSV output path for models that go through `PredictableModel`.
@@ -2251,12 +2407,22 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .collect();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("predict", "building prediction matrices");
+    let (effective_offset_column, effective_noise_offset_column) =
+        effective_predict_offset_columns(&model, &args);
+    let (predict_offset, predict_noise_offset) = resolve_predict_offsets(
+        &model,
+        &ds,
+        &col_map,
+        effective_offset_column,
+        effective_noise_offset_column,
+    )?;
 
     // ── Unified path via PredictableModel ──────────────────────────────────
     //
     // Models that do not require specialized saved-model handling go through
     // build_predict_input_for_model() + model.predictor(). This covers the
-    // common cases: plain Standard, GaussianLocationScale, and
+    // common cases: plain Standard, GaussianLocationScale,
+    // BernoulliMarginalSlope, TransformationNormal, and
     // BinomialLocationScale without wiggles.
     if !needs_special_predict_handling(&model) {
         if let Some(predictor) = model.predictor() {
@@ -2265,6 +2431,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 ds.values.view(),
                 &col_map,
                 training_headers,
+                &predict_offset,
+                &predict_noise_offset,
+                effective_noise_offset_column.is_some(),
             )?;
             progress.advance_workflow(3);
             let result =
@@ -2295,6 +2464,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             ds.values.view(),
             &col_map,
             training_headers,
+            &predict_offset,
+            &predict_noise_offset,
             saved_link_kind.as_ref(),
             saved_mixture.as_ref(),
             saved_sas.as_ref(),
@@ -2308,6 +2479,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             ds.values.view(),
             &col_map,
             training_headers,
+            &predict_offset,
+            &predict_noise_offset,
         ),
         PredictModelClass::BinomialLocationScale => run_predict_binomial_location_scale(
             &mut progress,
@@ -2316,6 +2489,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             ds.values.view(),
             &col_map,
             training_headers,
+            &predict_offset,
+            &predict_noise_offset,
             saved_link_kind.as_ref(),
             saved_mixture.as_ref(),
             saved_sas.as_ref(),
@@ -2341,6 +2516,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             ds.values.view(),
             &col_map,
             training_headers,
+            &predict_offset,
+            effective_noise_offset_column.is_some(),
             saved_link_kind.as_ref(),
             saved_mixture.as_ref(),
             saved_sas.as_ref(),
@@ -2368,6 +2545,8 @@ fn run_predict_survival(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    primary_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
     _: Option<&InverseLink>,
     _: Option<&MixtureLinkState>,
     _: Option<&SasLinkState>,
@@ -2399,6 +2578,13 @@ fn run_predict_survival(
         .map_err(|e| format!("failed to build survival prediction design: {e}"))?;
     progress.advance_workflow(3);
     let n = data.nrows();
+    if primary_offset.len() != n || noise_offset.len() != n {
+        return Err(format!(
+            "survival prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
+            primary_offset.len(),
+            noise_offset.len()
+        ));
+    }
     let p_cov = cov_design.design.ncols();
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
@@ -2548,11 +2734,11 @@ fn run_predict_survival(
                 .as_ref()
                 .map_or(0, |w| w.beta.len()),
             x_threshold: threshold_design.design.clone(),
-            eta_threshold_offset: Array1::zeros(n),
+            eta_threshold_offset: primary_offset.clone(),
             x_log_sigma: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
                 prepared_sigma_design,
             )),
-            eta_log_sigma_offset: Array1::zeros(n),
+            eta_log_sigma_offset: noise_offset.clone(),
             x_link_wiggle: None,
             link_wiggle_knots: link_wiggle_knots.clone(),
             link_wiggle_degree,
@@ -2670,17 +2856,22 @@ fn run_predict_survival(
             || model.beta_link_wiggle.is_some();
         if has_saved_linkwiggle {
             return Err(
-                "saved survival marginal-slope model contains unsupported linkwiggle metadata"
+                "saved survival marginal-slope model contains legacy linkwiggle metadata; refit with the anchored link-deviation runtime"
                     .to_string(),
             );
         }
-        let has_saved_deviations =
-            model.score_warp_runtime.is_some() || model.link_deviation_runtime.is_some();
-        if has_saved_deviations {
-            return Err(
-                "saved survival marginal-slope model contains unsupported score/link deviation metadata"
-                    .to_string(),
-            );
+        let saved_score_runtime = model.score_warp_runtime.as_ref();
+        let saved_link_runtime = model.link_deviation_runtime.as_ref();
+        let has_saved_deviations = saved_score_runtime.is_some() || saved_link_runtime.is_some();
+        if let Some(runtime) = saved_score_runtime {
+            runtime.breakpoints().map_err(|err| {
+                format!("saved survival marginal-slope score-warp runtime is invalid: {err}")
+            })?;
+        }
+        if let Some(runtime) = saved_link_runtime {
+            runtime.breakpoints().map_err(|err| {
+                format!("saved survival marginal-slope link-deviation runtime is invalid: {err}")
+            })?;
         }
         let z_name = model
             .z_column
@@ -2700,15 +2891,56 @@ fn run_predict_survival(
             .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
         let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
         let blocks = &fit_saved.blocks;
-        if blocks.len() != 3 {
+        let expected_blocks = 3
+            + usize::from(saved_score_runtime.is_some())
+            + usize::from(saved_link_runtime.is_some());
+        if blocks.len() != expected_blocks {
             return Err(format!(
-                "saved survival marginal-slope model requires 3 blocks [time, marginal, slope], got {}",
-                blocks.len()
+                "saved survival marginal-slope model requires {} blocks [time, marginal, slope{}{}], got {}",
+                expected_blocks,
+                if saved_score_runtime.is_some() {
+                    ", score-warp"
+                } else {
+                    ""
+                },
+                if saved_link_runtime.is_some() {
+                    ", link-deviation"
+                } else {
+                    ""
+                },
+                blocks.len(),
             ));
         }
         let beta_time = &blocks[0].beta;
         let beta_marginal = &blocks[1].beta;
         let beta_slope = &blocks[2].beta;
+        let beta_score = saved_score_runtime.map(|runtime| {
+            let block = &blocks[3].beta;
+            (runtime, block)
+        });
+        let beta_link = saved_link_runtime.map(|runtime| {
+            let idx = 3 + usize::from(saved_score_runtime.is_some());
+            let block = &blocks[idx].beta;
+            (runtime, block)
+        });
+        if let Some((runtime, beta)) = beta_score.as_ref() {
+            if beta.len() != runtime.basis_dim {
+                return Err(format!(
+                    "saved survival marginal-slope score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
+                    beta.len(),
+                    runtime.basis_dim
+                ));
+            }
+        }
+        if let Some((runtime, beta)) = beta_link.as_ref() {
+            if beta.len() != runtime.basis_dim {
+                return Err(format!(
+                    "saved survival marginal-slope link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
+                    beta.len(),
+                    runtime.basis_dim
+                ));
+            }
+        }
         let baseline_slope = model.logslope_baseline.unwrap_or(0.0);
         let p_time_base = time_build.x_exit_time.ncols();
         let p_timewiggle = model
@@ -2740,10 +2972,12 @@ fn run_predict_survival(
         let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
         let q_entry_base = time_build.x_entry_time.dot(&beta_time_base)
             + cov_design.design.dot(beta_marginal)
-            + &eta_offset_entry;
+            + &eta_offset_entry
+            + primary_offset;
         let q_exit_base = time_build.x_exit_time.dot(&beta_time_base)
             + cov_design.design.dot(beta_marginal)
-            + &eta_offset_exit;
+            + &eta_offset_exit
+            + primary_offset;
         let qd_exit_base =
             time_build.x_derivative_time.dot(&beta_time_base) + &derivative_offset_exit;
         let q_exit = if has_saved_timewiggle {
@@ -2775,12 +3009,33 @@ fn run_predict_survival(
         let slope = logslope_design
             .design
             .dot(beta_slope)
-            .mapv(|v| v + baseline_slope);
-        let c = slope.mapv(|b| (1.0 + b * b).sqrt());
-        let eta = &q_exit * &c + &(&slope * &z);
-        let deterministic_mean = eta.mapv(|v| normal_cdf(-v));
+            .mapv(|v| v + baseline_slope)
+            + noise_offset;
+        let (eta, deterministic_mean) = if has_saved_deviations {
+            predict_saved_survival_marginal_slope_flex_exit(
+                &q_exit,
+                &slope,
+                &z,
+                beta_score.as_ref().map(|(runtime, _)| *runtime),
+                beta_score.as_ref().map(|(_, beta)| *beta),
+                beta_link.as_ref().map(|(runtime, _)| *runtime),
+                beta_link.as_ref().map(|(_, beta)| *beta),
+            )?
+        } else {
+            let c = slope.mapv(|b| (1.0 + b * b).sqrt());
+            let eta = &q_exit * &c + &(&slope * &z);
+            let deterministic_mean = eta.mapv(|v| normal_cdf(-v));
+            (eta, deterministic_mean)
+        };
         let need_uncertainty = args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
+        if has_saved_deviations && need_uncertainty {
+            return Err(
+                "saved survival marginal-slope posterior uncertainty is not implemented for anchored score/link deviation models"
+                    .to_string(),
+            );
+        }
         let posterior_mean = if need_uncertainty {
+            let c = slope.mapv(|b| (1.0 + b * b).sqrt());
             let backend = prediction_backend_from_model(model, args.covariance_mode)?;
             let p_t = beta_time.len();
             let p_m = beta_marginal.len();
@@ -2931,6 +3186,14 @@ fn run_predict_survival(
             x_exit[[i, p_time + p_timewiggle + j]] = cov_design.design.get(i, j);
         }
     }
+    if args.noise_offset_column.is_some() {
+        return Err(
+            "--noise-offset-column is supported only for survival location-scale or marginal-slope"
+                .to_string(),
+        );
+    }
+    eta_offset_entry += primary_offset;
+    eta_offset_exit += primary_offset;
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let beta = fit_saved.beta.clone();
     if beta.len() != p {
@@ -3031,6 +3294,8 @@ fn run_predict_binomial_location_scale(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    threshold_offset: &Array1<f64>,
+    log_sigma_offset: &Array1<f64>,
     saved_link_kind: Option<&InverseLink>,
     saved_mixture: Option<&MixtureLinkState>,
     saved_sas: Option<&SasLinkState>,
@@ -3093,8 +3358,16 @@ fn run_predict_binomial_location_scale(
     } else {
         dense_design_noise.clone()
     };
-    let eta_t = dense_design_t.dot(&beta_t);
-    let eta_noise = preparednoise_design.dot(&beta_noise);
+    if threshold_offset.len() != data.nrows() || log_sigma_offset.len() != data.nrows() {
+        return Err(format!(
+            "binomial location-scale prediction offset length mismatch: rows={}, threshold_offset={}, log_sigma_offset={}",
+            data.nrows(),
+            threshold_offset.len(),
+            log_sigma_offset.len()
+        ));
+    }
+    let eta_t = dense_design_t.dot(&beta_t) + threshold_offset;
+    let eta_noise = preparednoise_design.dot(&beta_noise) + log_sigma_offset;
     let saved_loc_link = saved_link_kind.ok_or_else(|| {
         "binomial-location-scale model is missing link state/metadata".to_string()
     })?;
@@ -3126,7 +3399,7 @@ fn run_predict_binomial_location_scale(
             }
             let coeff_ls = scale * eta_t[i] * inv_sigma[i];
             for j in 0..p_ls {
-                grad[[i, p_t + j]] = coeff_ls * dense_design_noise[[i, j]];
+                grad[[i, p_t + j]] = coeff_ls * preparednoise_design[[i, j]];
             }
             if let Some(wd) = wiggle_design.as_ref() {
                 for j in 0..pw {
@@ -3147,15 +3420,15 @@ fn run_predict_binomial_location_scale(
                 .to_owned();
             let cov_tl = cov_mat.slice(s![0..p_t, p_t..p_t + p_ls]).to_owned();
             let xd_t_covtt = dense_design_t.dot(&cov_tt);
-            let xd_l_covll = dense_design_noise.dot(&cov_ll);
+            let xd_l_covll = preparednoise_design.dot(&cov_ll);
             let xd_t_covtl = dense_design_t.dot(&cov_tl);
             let quadctx = gam::quadrature::QuadratureContext::new();
             Array1::from_vec(
                 (0..eta.len())
                     .map(|i| {
                         let var_t = dense_design_t.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
-                        let var_ls = dense_design_noise.row(i).dot(&xd_l_covll.row(i)).max(0.0);
-                        let cov_tls = dense_design_noise.row(i).dot(&xd_t_covtl.row(i));
+                        let var_ls = preparednoise_design.row(i).dot(&xd_l_covll.row(i)).max(0.0);
+                        let cov_tls = preparednoise_design.row(i).dot(&xd_t_covtl.row(i));
                         gam::quadrature::normal_expectation_2d_adaptive_result(
                             &quadctx,
                             [eta_t[i], eta_noise[i]],
@@ -3189,10 +3462,10 @@ fn run_predict_binomial_location_scale(
                 .slice(s![p_t + p_ls..p_t + p_ls + pw, p_t + p_ls..p_t + p_ls + pw])
                 .to_owned();
             let xd_t_covtt = dense_design_t.dot(&cov_tt);
-            let xd_l_covll = dense_design_noise.dot(&cov_ll);
+            let xd_l_covll = preparednoise_design.dot(&cov_ll);
             let xd_t_covtl = dense_design_t.dot(&cov_tl);
             let xd_t_covtw = dense_design_t.dot(&cov_tw);
-            let xd_l_covlw = dense_design_noise.dot(&cov_lw);
+            let xd_l_covlw = preparednoise_design.dot(&cov_lw);
             let quadctx = gam::quadrature::QuadratureContext::new();
             let betaw = Array1::from_vec(model.beta_link_wiggle.clone().ok_or_else(|| {
                 "binomial-location-scale wiggle model is missing beta_link_wiggle".to_string()
@@ -3207,8 +3480,8 @@ fn run_predict_binomial_location_scale(
             let mut out = Array1::<f64>::zeros(eta.len());
             for i in 0..eta.len() {
                 let var_t = dense_design_t.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
-                let var_ls = dense_design_noise.row(i).dot(&xd_l_covll.row(i)).max(0.0);
-                let cov_tls = dense_design_noise.row(i).dot(&xd_t_covtl.row(i));
+                let var_ls = preparednoise_design.row(i).dot(&xd_l_covll.row(i)).max(0.0);
+                let cov_tls = preparednoise_design.row(i).dot(&xd_t_covtl.row(i));
                 let suv_t = xd_t_covtw.row(i).to_owned();
                 let suv_ls = xd_l_covlw.row(i).to_owned();
                 let inv_uu = invert_2x2with_jitter(var_t, cov_tls, var_ls);
@@ -3335,6 +3608,8 @@ fn run_predict_gaussian_location_scale(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    mean_offset: &Array1<f64>,
+    log_sigma_offset: &Array1<f64>,
 ) -> Result<(), String> {
     progress.set_stage(
         "predict",
@@ -3394,8 +3669,16 @@ fn run_predict_gaussian_location_scale(
         dense_design_noise_gauss.clone()
     };
 
-    let eta_mu_base = dense_design_mu.dot(&beta_mu);
-    let eta_noise = prepared_noise_design.dot(&beta_noise);
+    if mean_offset.len() != data.nrows() || log_sigma_offset.len() != data.nrows() {
+        return Err(format!(
+            "gaussian location-scale prediction offset length mismatch: rows={}, mean_offset={}, log_sigma_offset={}",
+            data.nrows(),
+            mean_offset.len(),
+            log_sigma_offset.len()
+        ));
+    }
+    let eta_mu_base = dense_design_mu.dot(&beta_mu) + mean_offset;
+    let eta_noise = prepared_noise_design.dot(&beta_noise) + log_sigma_offset;
     let response_scale = gaussian_response_scale_from_saved_model(model)?;
     let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
     let eta = apply_saved_linkwiggle(&eta_mu_base, model)?;
@@ -3475,12 +3758,17 @@ fn run_predict_standard(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    offset: &Array1<f64>,
+    noise_offset_supplied: bool,
     saved_link_kind: Option<&InverseLink>,
     saved_mixture: Option<&MixtureLinkState>,
     saved_sas: Option<&SasLinkState>,
     saved_mixture_param_cov: Option<&Array2<f64>>,
     saved_sas_param_cov: Option<&Array2<f64>>,
 ) -> Result<(), String> {
+    if noise_offset_supplied {
+        return Err("--noise-offset-column is not supported for standard prediction".to_string());
+    }
     progress.set_stage("predict", "building prediction design");
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -3504,6 +3792,7 @@ fn run_predict_standard(
             family,
             &fit_saved,
             &dense_design_for_wiggle,
+            offset,
             saved_link_kind,
             saved_mixture,
             saved_sas,
@@ -3537,7 +3826,6 @@ fn run_predict_standard(
         ));
     }
 
-    let offset = Array1::zeros(design.design.nrows());
     // Standard (no-wiggle) path: delegate to PredictableModel trait.
     let predictor = model
         .predictor()
@@ -4207,7 +4495,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut age_exit = Array1::<f64>::zeros(n);
     let mut event_target = Array1::<u8>::zeros(n);
     let event_competing = Array1::<u8>::zeros(n);
-    let weights = Array1::<f64>::ones(n);
+    let weights = resolve_weight_column(&ds, &col_map, args.weights_column.as_deref())?;
+    let threshold_offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
+    let log_sigma_offset =
+        resolve_offset_column(&ds, &col_map, args.noise_offset_column.as_deref())?;
 
     for i in 0..n {
         let (t0, t1) =
@@ -4384,6 +4675,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 },
                 thresholdspec: termspec.clone(),
                 log_sigmaspec: log_sigmaspec.clone(),
+                threshold_offset: threshold_offset.clone(),
+                log_sigma_offset: log_sigma_offset.clone(),
                 threshold_template: threshold_template.clone(),
                 log_sigma_template: log_sigma_template.clone(),
                 timewiggle_block: timewiggle_block.clone(),
@@ -4507,6 +4800,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_time_keep_cols = time_build.keep_cols.clone();
             payload.survival_time_smooth_lambda = time_build.smooth_lambda;
             payload.survival_time_anchor = Some(time_anchor);
+            set_saved_offset_columns(
+                &mut payload,
+                args.offset_column.clone(),
+                args.noise_offset_column.clone(),
+            );
             payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
             payload.baseline_timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
             payload.baseline_timewiggle_penalty_orders = effective_timewiggle
@@ -4595,12 +4893,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 "link(...) is not implemented for the survival marginal-slope family".to_string(),
             );
         }
-        if parsed.linkwiggle.is_some() {
-            return Err(
-                "linkwiggle(...) is not implemented for the survival marginal-slope family"
-                    .to_string(),
-            );
-        }
         let logslope_formula_raw = args.logslope_formula.as_deref().ok_or_else(|| {
             "--logslope-formula is required with --survival-likelihood marginal-slope".to_string()
         })?;
@@ -4641,6 +4933,25 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let lambda0 = time_build.smooth_lambda.unwrap_or(1e-2).max(1e-12).ln();
             time_initial_log_lambdas = Some(Array1::from_elem(time_penalties.len(), lambda0));
         }
+        let routed_link_dev = parsed
+            .linkwiggle
+            .as_ref()
+            .map(deviation_block_config_from_formula_linkwiggle);
+        if parsed.linkwiggle.is_some() {
+            inference_notes.push(
+                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
+            );
+        }
+        if args.disable_score_warp && routed_link_dev.is_none() {
+            inference_notes.push(
+                "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
+            );
+        } else {
+            inference_notes.push(
+                "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic cells with exact value evaluation and calibrated survival normalization"
+                    .to_string(),
+            );
+        }
 
         let spec = SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
@@ -4649,6 +4960,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             weights: weights.clone(),
             z,
             marginalspec: termspec.clone(),
+            marginal_offset: threshold_offset.clone(),
             derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
             time_block: TimeBlockInput {
                 design_entry: time_design_entry.clone(),
@@ -4665,6 +4977,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             },
             timewiggle_block: timewiggle_block.clone(),
             logslopespec,
+            logslope_offset: log_sigma_offset.clone(),
+            score_warp: if args.disable_score_warp {
+                None
+            } else {
+                Some(DeviationBlockConfig::default())
+            },
+            link_dev: routed_link_dev,
         };
         let kappa_options = {
             let mut opts = SpatialLengthScaleOptimizationOptions::default();
@@ -4738,6 +5057,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_time_keep_cols = time_build.keep_cols.clone();
             payload.survival_time_smooth_lambda = time_build.smooth_lambda;
             payload.survival_time_anchor = Some(time_anchor);
+            set_saved_offset_columns(
+                &mut payload,
+                args.offset_column.clone(),
+                args.noise_offset_column.clone(),
+            );
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
@@ -4758,12 +5082,30 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
             payload.z_column = args.z_column.clone();
             payload.logslope_baseline = Some(fit.baseline_slope);
+            payload.score_warp_runtime = fit
+                .score_warp_runtime
+                .as_ref()
+                .map(saved_anchored_deviation_runtime);
+            payload.link_deviation_runtime = fit
+                .link_dev_runtime
+                .as_ref()
+                .map(saved_anchored_deviation_runtime);
             write_payload_json(&out, payload)?;
             progress.advance_workflow(survival_total_steps);
         }
         progress.finish_progress("survival marginal-slope fit complete");
         return Ok(());
     }
+
+    if args.noise_offset_column.is_some() {
+        return Err(
+            "--noise-offset-column is supported only for survival location-scale or marginal-slope"
+                .to_string(),
+        );
+    }
+    let covariate_offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
+    eta_offset_entry += &covariate_offset;
+    eta_offset_exit += &covariate_offset;
 
     let p_time_total = time_design_exit.ncols();
     let p = p_time_total + p_cov;
@@ -5069,6 +5411,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survival_likelihood =
             Some(survival_likelihood_modename(likelihood_mode).to_string());
         payload.training_headers = Some(ds.headers.clone());
+        set_saved_offset_columns(
+            &mut payload,
+            args.offset_column.clone(),
+            args.noise_offset_column.clone(),
+        );
         payload.resolved_termspec = Some(frozen_termspec);
         write_payload_json(&out, payload)?;
         progress.advance_workflow(survival_total_steps);
@@ -5855,6 +6202,14 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .map(|(i, h)| (h.clone(), i))
         .collect();
     let training_headers = model.training_headers.as_ref();
+    let (saved_offset_column, saved_noise_offset_column) = saved_offset_columns(&model);
+    let (generate_offset, generate_noise_offset) = resolve_predict_offsets(
+        &model,
+        &ds,
+        &col_map,
+        saved_offset_column,
+        saved_noise_offset_column,
+    )?;
     progress.set_stage("generate", "building predictive state");
     // Unified path: delegate to PredictableModel for models that do not need
     // specialized saved-model handling. Use per-class helpers only for the
@@ -5867,6 +6222,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 ds.values.view(),
                 &col_map,
                 training_headers,
+                &generate_offset,
+                &generate_noise_offset,
             )?,
             PredictModelClass::Standard => run_generate_standard(
                 &mut progress,
@@ -5874,6 +6231,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 ds.values.view(),
                 &col_map,
                 training_headers,
+                &generate_offset,
+                saved_noise_offset_column.is_some(),
             )?,
             PredictModelClass::BernoulliMarginalSlope => {
                 return Err(
@@ -5898,6 +6257,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 ds.values.view(),
                 &col_map,
                 training_headers,
+                &generate_offset,
+                &generate_noise_offset,
             )?,
         }
     } else {
@@ -5907,6 +6268,9 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
             ds.values.view(),
             &col_map,
             training_headers,
+            &generate_offset,
+            &generate_noise_offset,
+            saved_noise_offset_column.is_some(),
         )?
     };
     progress.advance_workflow(3);
@@ -5945,6 +6309,9 @@ fn run_generate_unified(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    offset: &Array1<f64>,
+    offset_noise: &Array1<f64>,
+    noise_offset_supplied: bool,
 ) -> Result<gam::generative::GenerativeSpec, String> {
     progress.set_stage("generate", "building unified generation design");
 
@@ -5963,7 +6330,15 @@ fn run_generate_unified(
         );
     }
 
-    let pred_input = build_predict_input_for_model(model, data, col_map, training_headers)?;
+    let pred_input = build_predict_input_for_model(
+        model,
+        data,
+        col_map,
+        training_headers,
+        offset,
+        offset_noise,
+        noise_offset_supplied,
+    )?;
     let predictor = model
         .predictor()
         .ok_or_else(|| "failed to build predictor for generate".to_string())?;
@@ -6006,6 +6381,8 @@ fn run_generate_gaussian_location_scale(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    mean_offset: &Array1<f64>,
+    log_sigma_offset: &Array1<f64>,
 ) -> Result<gam::generative::GenerativeSpec, String> {
     progress.set_stage(
         "generate",
@@ -6049,7 +6426,7 @@ fn run_generate_gaussian_location_scale(
         &model.noise_scale,
         model.noise_non_intercept_start,
     )?;
-    let mean_base = design.design.dot(&betamu);
+    let mean_base = design.design.dot(&betamu) + mean_offset;
     let dense_gen_mean = design.design.to_dense();
     let dense_gen_noise = design_noise.design.to_dense();
     let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
@@ -6057,7 +6434,7 @@ fn run_generate_gaussian_location_scale(
     } else {
         dense_gen_noise
     };
-    let eta_noise = preparednoise_design.dot(&beta_noise);
+    let eta_noise = preparednoise_design.dot(&beta_noise) + log_sigma_offset;
     let response_scale = gaussian_response_scale_from_saved_model(model)?;
     let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
     let mean = apply_saved_linkwiggle(&mean_base, model)?;
@@ -6073,6 +6450,8 @@ fn run_generate_binomial_location_scale(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    threshold_offset: &Array1<f64>,
+    log_sigma_offset: &Array1<f64>,
 ) -> Result<gam::generative::GenerativeSpec, String> {
     progress.set_stage(
         "generate",
@@ -6119,7 +6498,7 @@ fn run_generate_binomial_location_scale(
         &model.noise_scale,
         model.noise_non_intercept_start,
     )?;
-    let eta_t = design.design.dot(&beta_t);
+    let eta_t = design.design.dot(&beta_t) + threshold_offset;
     let dense_gen_binom_mean = design.design.to_dense();
     let dense_gen_binom_noise = design_noise.design.to_dense();
     let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
@@ -6127,7 +6506,7 @@ fn run_generate_binomial_location_scale(
     } else {
         dense_gen_binom_noise
     };
-    let eta_noise = preparednoise_design.dot(&beta_noise);
+    let eta_noise = preparednoise_design.dot(&beta_noise) + log_sigma_offset;
     let sigma = eta_noise.mapv(f64::exp);
     let q0 = Array1::from_iter(eta_t.iter().zip(sigma.iter()).map(|(&t, &s)| -t / s));
     let eta = apply_saved_linkwiggle(&q0, model)?;
@@ -6150,7 +6529,12 @@ fn run_generate_standard(
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
+    offset: &Array1<f64>,
+    noise_offset_supplied: bool,
 ) -> Result<gam::generative::GenerativeSpec, String> {
+    if noise_offset_supplied {
+        return Err("--noise-offset-column is not supported for standard generation".to_string());
+    }
     progress.set_stage("generate", "building generation design");
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -6183,7 +6567,7 @@ fn run_generate_standard(
                 design.design.ncols()
             ));
         }
-        let eta_base = design.design.dot(&beta_eta);
+        let eta_base = design.design.dot(&beta_eta) + offset;
         let eta = apply_saved_linkwiggle(&eta_base, model)?;
         let mean = Array1::from_iter(
             eta.iter()
@@ -6206,10 +6590,9 @@ fn run_generate_standard(
             design.design.ncols()
         ));
     }
-    let offset = Array1::zeros(design.design.nrows());
     let pred_input = PredictInput {
         design: design.design.clone(),
-        offset,
+        offset: offset.clone(),
         design_noise: None,
         offset_noise: None,
         auxiliary_scalar: None,
@@ -6312,6 +6695,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
             .map(|(i, h)| (h.clone(), i))
             .collect();
         let training_headers = model.training_headers.as_ref();
+        let (saved_offset_column, saved_noise_offset_column) = saved_offset_columns(&model);
         let parsed = parse_formula(&model.formula)?;
 
         if let Some(y_col) = col_map.get(&parsed.response).copied() {
@@ -6319,11 +6703,21 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 let y = ds.values.column(y_col).to_owned();
                 n_obs = Some(y.len());
                 if let Some(predictor) = model.predictor() {
+                    let (report_offset, report_noise_offset) = resolve_predict_offsets(
+                        &model,
+                        &ds,
+                        &col_map,
+                        saved_offset_column,
+                        saved_noise_offset_column,
+                    )?;
                     let pred_input = build_predict_input_for_model(
                         &model,
                         ds.values.view(),
                         &col_map,
                         training_headers,
+                        &report_offset,
+                        &report_noise_offset,
+                        saved_noise_offset_column.is_some(),
                     )?;
                     progress.set_stage("report", "building report diagnostics design");
                     progress.advance_workflow(3);
@@ -6756,6 +7150,7 @@ fn predict_standard_linkwiggle(
     family: LikelihoodFamily,
     fit_saved: &UnifiedFitResult,
     design: &Array2<f64>,
+    offset: &Array1<f64>,
     saved_link_kind: &InverseLink,
     saved_mixture: Option<&MixtureLinkState>,
     saved_sas: Option<&SasLinkState>,
@@ -6783,7 +7178,14 @@ fn predict_standard_linkwiggle(
             design.ncols()
         ));
     }
-    let eta_base = design.dot(&beta);
+    if offset.len() != design.nrows() {
+        return Err(format!(
+            "standard wiggle offset length mismatch: rows={}, offset={}",
+            design.nrows(),
+            offset.len()
+        ));
+    }
+    let eta_base = design.dot(&beta) + offset;
     let eta = apply_saved_linkwiggle(&eta_base, model)?;
     let mean_mode = Array1::from_iter(
         eta.iter()
@@ -7001,6 +7403,325 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
         degree: runtime.degree,
         basis_dim: runtime.basis_dim,
     }
+}
+
+fn saved_survival_default_score_span() -> exact_kernel::LocalSpanCubic {
+    exact_kernel::LocalSpanCubic {
+        left: -8.0,
+        right: 8.0,
+        c0: 0.0,
+        c1: 0.0,
+        c2: 0.0,
+        c3: 0.0,
+    }
+}
+
+fn saved_survival_default_link_span(a: f64, b: f64) -> exact_kernel::LocalSpanCubic {
+    let link_tail = 8.0 * (1.0 + b.abs());
+    exact_kernel::LocalSpanCubic {
+        left: a - link_tail,
+        right: a + link_tail,
+        c0: 0.0,
+        c1: 0.0,
+        c2: 0.0,
+        c3: 0.0,
+    }
+}
+
+fn saved_survival_observed_spans(
+    z_obs: f64,
+    a: f64,
+    b: f64,
+    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    score_beta: Option<&Array1<f64>>,
+    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    link_beta: Option<&Array1<f64>>,
+) -> Result<(exact_kernel::LocalSpanCubic, exact_kernel::LocalSpanCubic), String> {
+    let score_span = if let (Some(runtime), Some(beta)) = (score_runtime, score_beta) {
+        runtime.local_cubic_at(beta, z_obs)?
+    } else {
+        saved_survival_default_score_span()
+    };
+    let u_obs = a + b * z_obs;
+    let link_span = if let (Some(runtime), Some(beta)) = (link_runtime, link_beta) {
+        runtime.local_cubic_at(beta, u_obs)?
+    } else {
+        saved_survival_default_link_span(a, b)
+    };
+    Ok((score_span, link_span))
+}
+
+fn saved_survival_denested_partition_cells(
+    a: f64,
+    b: f64,
+    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    score_beta: Option<&Array1<f64>>,
+    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    link_beta: Option<&Array1<f64>>,
+) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
+    let score_tail = 8.0;
+    let mut score_breaks = if let Some(runtime) = score_runtime {
+        runtime.breakpoints()?
+    } else {
+        vec![-score_tail, score_tail]
+    };
+    if score_breaks.first().copied().unwrap_or(score_tail) > -score_tail {
+        score_breaks.insert(0, -score_tail);
+    }
+    if score_breaks.last().copied().unwrap_or(-score_tail) < score_tail {
+        score_breaks.push(score_tail);
+    }
+
+    let link_tail = 8.0 * (1.0 + b.abs());
+    let mut link_breaks = if let Some(runtime) = link_runtime {
+        runtime.breakpoints()?
+    } else {
+        vec![a - link_tail, a + link_tail]
+    };
+    if link_breaks.first().copied().unwrap_or(a + link_tail) > a - link_tail {
+        link_breaks.insert(0, a - link_tail);
+    }
+    if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
+        link_breaks.push(a + link_tail);
+    }
+
+    exact_kernel::build_denested_partition_cells(
+        a,
+        b,
+        &score_breaks,
+        &link_breaks,
+        |z| {
+            if let (Some(runtime), Some(beta)) = (score_runtime, score_beta) {
+                runtime.local_cubic_at(beta, z)
+            } else {
+                Ok(exact_kernel::LocalSpanCubic {
+                    left: -score_tail,
+                    right: score_tail,
+                    c0: 0.0,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                })
+            }
+        },
+        |u| {
+            if let (Some(runtime), Some(beta)) = (link_runtime, link_beta) {
+                runtime.local_cubic_at(beta, u)
+            } else {
+                Ok(exact_kernel::LocalSpanCubic {
+                    left: a - link_tail,
+                    right: a + link_tail,
+                    c0: 0.0,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                })
+            }
+        },
+    )
+}
+
+fn evaluate_saved_survival_calibration(
+    a: f64,
+    q: f64,
+    slope: f64,
+    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    score_beta: Option<&Array1<f64>>,
+    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    link_beta: Option<&Array1<f64>>,
+) -> Result<(f64, f64), String> {
+    let cells = saved_survival_denested_partition_cells(
+        a,
+        slope,
+        score_runtime,
+        score_beta,
+        link_runtime,
+        link_beta,
+    )?;
+    let mut f = -gam::probability::normal_cdf(-q);
+    let mut f_a = 0.0;
+    for partition_cell in cells {
+        let pos_cell = partition_cell.cell;
+        let neg_cell = exact_kernel::DenestedCubicCell {
+            left: pos_cell.left,
+            right: pos_cell.right,
+            c0: -pos_cell.c0,
+            c1: -pos_cell.c1,
+            c2: -pos_cell.c2,
+            c3: -pos_cell.c3,
+        };
+        let state = exact_kernel::evaluate_cell_moments(neg_cell, 3)?;
+        f += state.value;
+        let (dc_da_pos, _) = exact_kernel::denested_cell_coefficient_partials(
+            partition_cell.score_span,
+            partition_cell.link_span,
+            a,
+            slope,
+        );
+        let dc_da = dc_da_pos.map(|value| -value);
+        f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+    }
+    Ok((f, f_a))
+}
+
+fn solve_saved_survival_intercept(
+    q: f64,
+    slope: f64,
+    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    score_beta: Option<&Array1<f64>>,
+    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    link_beta: Option<&Array1<f64>>,
+) -> Result<f64, String> {
+    let eval = |a: f64| -> Result<(f64, f64), String> {
+        evaluate_saved_survival_calibration(
+            a,
+            q,
+            slope,
+            score_runtime,
+            score_beta,
+            link_runtime,
+            link_beta,
+        )
+    };
+    let mut a = q * (1.0 + slope * slope).sqrt();
+    let (f_init, _) = eval(a)?;
+    if f_init == 0.0 {
+        return Ok(a);
+    }
+
+    let mut step = (0.25 * (1.0 + a.abs())).max(1.0);
+    let (mut lo, mut hi) = if f_init < 0.0 {
+        let lo = a;
+        loop {
+            let hi = a + step;
+            let (f_candidate, _) = eval(hi)?;
+            if f_candidate >= 0.0 {
+                break (lo, hi);
+            }
+            a = hi;
+            step *= 2.0;
+            if step > 1e6 {
+                return Err(
+                    "saved survival marginal-slope intercept solve failed to bracket root above"
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        let hi = a;
+        loop {
+            let lo = a - step;
+            let (f_candidate, _) = eval(lo)?;
+            if f_candidate <= 0.0 {
+                break (lo, hi);
+            }
+            a = lo;
+            step *= 2.0;
+            if step > 1e6 {
+                return Err(
+                    "saved survival marginal-slope intercept solve failed to bracket root below"
+                        .to_string(),
+                );
+            }
+        }
+    };
+
+    let mut best_a = a;
+    let mut best_f = f_init.abs();
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        let (f_mid, f_a_mid) = eval(mid)?;
+        if f_mid.abs() < best_f {
+            best_f = f_mid.abs();
+            best_a = mid;
+        }
+        if f_mid.abs() <= 1e-12 {
+            return Ok(mid);
+        }
+        let newton = if f_a_mid.is_finite() && f_a_mid.abs() > 1e-12 {
+            let candidate = mid - f_mid / f_a_mid;
+            if candidate > lo && candidate < hi {
+                Some(candidate)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let probe = newton.unwrap_or(mid);
+        let (f_probe, _) = eval(probe)?;
+        if f_probe.abs() < best_f {
+            best_f = f_probe.abs();
+            best_a = probe;
+        }
+        if f_probe <= 0.0 {
+            lo = probe;
+        } else {
+            hi = probe;
+        }
+        if (hi - lo).abs() <= 1e-12 * (1.0 + hi.abs() + lo.abs()) {
+            break;
+        }
+    }
+    Ok(best_a)
+}
+
+fn saved_survival_observed_eta(
+    z_obs: f64,
+    a: f64,
+    b: f64,
+    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    score_beta: Option<&Array1<f64>>,
+    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    link_beta: Option<&Array1<f64>>,
+) -> Result<f64, String> {
+    let (score_span, link_span) = saved_survival_observed_spans(
+        z_obs,
+        a,
+        b,
+        score_runtime,
+        score_beta,
+        link_runtime,
+        link_beta,
+    )?;
+    let coeff = exact_kernel::denested_cell_coefficients(score_span, link_span, a, b);
+    Ok(((coeff[3] * z_obs + coeff[2]) * z_obs + coeff[1]) * z_obs + coeff[0])
+}
+
+fn predict_saved_survival_marginal_slope_flex_exit(
+    q_exit: &Array1<f64>,
+    slope: &Array1<f64>,
+    z: &Array1<f64>,
+    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    score_beta: Option<&Array1<f64>>,
+    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+    link_beta: Option<&Array1<f64>>,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    let n = q_exit.len();
+    let mut eta = Array1::<f64>::zeros(n);
+    let mut mean = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let a = solve_saved_survival_intercept(
+            q_exit[row],
+            slope[row],
+            score_runtime,
+            score_beta,
+            link_runtime,
+            link_beta,
+        )?;
+        let eta_row = saved_survival_observed_eta(
+            z[row],
+            a,
+            slope[row],
+            score_runtime,
+            score_beta,
+            link_runtime,
+            link_beta,
+        )?;
+        eta[row] = eta_row;
+        mean[row] = normal_cdf(-eta_row);
+    }
+    Ok((eta, mean))
 }
 
 fn deviation_block_config_from_formula_linkwiggle(
@@ -7595,6 +8316,15 @@ fn print_inference_summary(notes: &[String]) {
     }
 }
 
+fn set_saved_offset_columns(
+    payload: &mut FittedModelPayload,
+    offset_column: Option<String>,
+    noise_offset_column: Option<String>,
+) {
+    payload.offset_column = offset_column;
+    payload.noise_offset_column = noise_offset_column;
+}
+
 fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
     for term in terms {
         match term {
@@ -7659,7 +8389,15 @@ fn required_columns_for_fit(args: &FitArgs, parsed: &ParsedFormula) -> Result<Ve
     if let Some(z_column) = args.z_column.as_ref() {
         required.insert(z_column.clone());
     }
-
+    if let Some(weights_column) = args.weights_column.as_ref() {
+        required.insert(weights_column.clone());
+    }
+    if let Some(offset_column) = args.offset_column.as_ref() {
+        required.insert(offset_column.clone());
+    }
+    if let Some(noise_offset_column) = args.noise_offset_column.as_ref() {
+        required.insert(noise_offset_column.clone());
+    }
     Ok(required.into_iter().collect())
 }
 
@@ -7683,7 +8421,15 @@ fn required_columns_for_survival(
     if let Some(z_column) = args.z_column.as_ref() {
         required.insert(z_column.clone());
     }
-
+    if let Some(weights_column) = args.weights_column.as_ref() {
+        required.insert(weights_column.clone());
+    }
+    if let Some(offset_column) = args.offset_column.as_ref() {
+        required.insert(offset_column.clone());
+    }
+    if let Some(noise_offset_column) = args.noise_offset_column.as_ref() {
+        required.insert(noise_offset_column.clone());
+    }
     Ok(required.into_iter().collect())
 }
 
@@ -9065,16 +9811,16 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
+        BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FittedFamily, LikelihoodFamily, LinkChoice, LinkMode,
-        MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
-        SurvivalBaselineTarget, SurvivalTimeBasisConfig, apply_saved_linkwiggle,
-        build_survival_feasible_initial_beta, build_survival_time_basis,
-        chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
-        collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
-        effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
-        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
-        parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
+        MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalBaselineTarget,
+        SurvivalTimeBasisConfig, apply_saved_linkwiggle, build_survival_feasible_initial_beta,
+        build_survival_time_basis, chi_square_survival_approx, classify_cli_error,
+        collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
+        compute_probit_q0_from_eta, core_saved_fit_result, effectivelinkwiggle_formulaspec,
+        evaluate_survival_baseline, family_to_string, linkname, load_dataset_projected,
+        parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
+        parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
         required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
@@ -9087,12 +9833,17 @@ mod tests {
         BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
         MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
+    use gam::families::bernoulli_marginal_slope::{
+        DeviationBlockConfig, build_deviation_block_from_seed,
+    };
     use gam::gamlss::buildwiggle_block_input_from_knots;
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };
     use gam::inference::formula_dsl::{ParsedTerm, parse_linkwiggle_formulaspec};
-    use gam::inference::model::{ColumnKindTag, FittedModelPayload, SchemaColumn};
+    use gam::inference::model::{
+        ColumnKindTag, FittedModelPayload, SavedAnchoredDeviationRuntime, SchemaColumn,
+    };
     use gam::smooth::{
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
         SmoothTermSpec, TermCollectionSpec,
@@ -9181,6 +9932,9 @@ mod tests {
             predict_noise: Some(noise_formula.to_string()),
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
             transformation_normal: false,
@@ -9365,6 +10119,9 @@ mod tests {
             predict_noise: Some("1".to_string()),
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
             transformation_normal: false,
@@ -9454,6 +10211,9 @@ mod tests {
             predict_noise: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
             transformation_normal: false,
@@ -9496,6 +10256,8 @@ mod tests {
             model: model_path,
             new_data: train_path,
             out: pred_path.clone(),
+            offset_column: None,
+            noise_offset_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -9532,6 +10294,9 @@ mod tests {
             predict_noise: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
             disable_score_warp: false,
             disable_link_dev: false,
             transformation_normal: false,
@@ -9574,6 +10339,8 @@ mod tests {
             model: model_path,
             new_data: train_path,
             out: pred_path.clone(),
+            offset_column: None,
+            noise_offset_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -9740,6 +10507,8 @@ mod tests {
             model: td.path().join("unused_model.json"),
             new_data: td.path().join("unused_data.csv"),
             out: out_path.clone(),
+            offset_column: None,
+            noise_offset_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -9756,6 +10525,8 @@ mod tests {
             data.view(),
             &col_map,
             Some(&headers),
+            &Array1::zeros(data.nrows()),
+            &Array1::zeros(data.nrows()),
             Some(&InverseLink::Standard(LinkFunction::Probit)),
             None,
             None,
@@ -9788,6 +10559,8 @@ mod tests {
             model: PathBuf::from("unused_model.json"),
             new_data: PathBuf::from("unused_data.csv"),
             out: PathBuf::from("unused_pred.csv"),
+            offset_column: None,
+            noise_offset_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -9800,6 +10573,7 @@ mod tests {
             LikelihoodFamily::BinomialLogit,
             model.fit_result.as_ref().expect("fit result"),
             &design,
+            &Array1::zeros(design.nrows()),
             &InverseLink::Standard(LinkFunction::Logit),
             None,
             None,
@@ -10892,6 +11666,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         let cfg = parse_survival_time_basis_config(
             &args.time_basis,
@@ -10938,6 +11715,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         let err = parse_survival_time_basis_config(
             &args.time_basis,
@@ -11025,6 +11805,98 @@ mod tests {
         let err = super::load_survival_time_basis_config_from_model(&model)
             .expect_err("survival model without basis metadata should fail");
         assert!(err.contains("missing survival_time_basis"));
+    }
+
+    #[test]
+    fn saved_survival_flex_exit_helper_matches_rigid_when_deviations_absent() {
+        let q_exit = array![-0.4, 0.2, 1.1];
+        let slope = array![-0.7, 0.0, 0.9];
+        let z = array![-1.0, 0.5, 1.3];
+
+        let (eta, mean) = super::predict_saved_survival_marginal_slope_flex_exit(
+            &q_exit, &slope, &z, None, None, None, None,
+        )
+        .expect("flex exit helper should reduce to rigid model");
+
+        for i in 0..q_exit.len() {
+            let c = (1.0 + slope[i] * slope[i]).sqrt();
+            let expected_eta = q_exit[i] * c + slope[i] * z[i];
+            let expected_mean = super::normal_cdf(-expected_eta);
+            assert!(
+                (eta[i] - expected_eta).abs() <= 1e-10,
+                "row {i}: eta mismatch: got {}, expected {}",
+                eta[i],
+                expected_eta
+            );
+            assert!(
+                (mean[i] - expected_mean).abs() <= 1e-10,
+                "row {i}: mean mismatch: got {}, expected {}",
+                mean[i],
+                expected_mean
+            );
+        }
+    }
+
+    #[test]
+    fn saved_prediction_runtime_validates_survival_anchored_deviation_runtime() {
+        let mut payload = test_payload(
+            "Surv(start, stop, event) ~ x",
+            ModelKind::Survival,
+            FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("marginal-slope".to_string()),
+                survival_distribution: Some("probit".to_string()),
+            },
+            "survival",
+        );
+        payload.score_warp_runtime = Some(SavedAnchoredDeviationRuntime {
+            kernel: "BadKernel".to_string(),
+            knots: vec![-1.0, -1.0, 1.0, 1.0],
+            degree: 3,
+            basis_dim: 2,
+        });
+        let model = SavedModel::from_payload(payload);
+
+        let err = model
+            .saved_prediction_runtime()
+            .expect_err("invalid survival anchored deviation runtime should fail validation");
+        assert!(err.contains("unsupported kernel"));
+        assert!(err.contains("anchored score-warp"));
+    }
+
+    #[test]
+    fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
+        let runtime = build_deviation_block_from_seed(
+            &array![-1.5, -0.5, 0.0, 0.5, 1.5],
+            &DeviationBlockConfig::default(),
+        )
+        .expect("score-warp runtime")
+        .runtime;
+        let saved_runtime = super::saved_anchored_deviation_runtime(&runtime);
+        let zero_beta = Array1::zeros(runtime.basis_dim);
+
+        let q_exit = array![-0.8, 0.4];
+        let slope = array![0.3, -1.1];
+        let z = array![0.2, -0.7];
+
+        let (eta, mean) = super::predict_saved_survival_marginal_slope_flex_exit(
+            &q_exit,
+            &slope,
+            &z,
+            Some(&saved_runtime),
+            Some(&zero_beta),
+            None,
+            None,
+        )
+        .expect("zero score-warp should still predict");
+
+        for i in 0..q_exit.len() {
+            let c = (1.0 + slope[i] * slope[i]).sqrt();
+            let expected_eta = q_exit[i] * c + slope[i] * z[i];
+            let expected_mean = super::normal_cdf(-expected_eta);
+            assert!((eta[i] - expected_eta).abs() <= 1e-10);
+            assert!((mean[i] - expected_mean).abs() <= 1e-10);
+        }
     }
 
     #[test]
@@ -11136,6 +12008,8 @@ mod tests {
             model: PathBuf::from("unused.model.json"),
             new_data: PathBuf::from("unused.csv"),
             out: out_path.clone(),
+            offset_column: None,
+            noise_offset_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -11149,6 +12023,8 @@ mod tests {
             data.view(),
             &col_map,
             model.training_headers.as_ref(),
+            &Array1::zeros(data.nrows()),
+            &Array1::zeros(data.nrows()),
             None,
             None,
             None,
@@ -11400,6 +12276,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("sas".to_string());
         args.sas_init = Some("0.15,-0.70".to_string());
@@ -11448,6 +12327,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("sas".to_string());
         args.beta_logistic_init = Some("0.1,0.2".to_string());
@@ -11490,6 +12372,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("logit".to_string());
         args.sas_init = Some("0.1,0.2".to_string());
@@ -11532,6 +12417,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("beta-logistic".to_string());
         args.beta_logistic_init = Some("0.25,0.80".to_string());
@@ -11580,6 +12468,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("beta-logistic".to_string());
         args.sas_init = Some("0.1,0.2".to_string());
@@ -11622,6 +12513,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("logit".to_string());
         args.beta_logistic_init = Some("0.1,0.2".to_string());
@@ -11664,6 +12558,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         let link = parse_survival_inverse_link(&args).expect("loglog survival link");
         match link {
@@ -11734,6 +12631,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("flexible(logit)".to_string());
         let link = parse_survival_inverse_link(&args).expect("flexible survival link");
@@ -11775,6 +12675,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("flexible(blended(logit,probit))".to_string());
         args.mixture_rho = Some("0.2".to_string());
@@ -11818,6 +12721,9 @@ mod tests {
             out: None,
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         args.link = Some("bogus".to_string());
         let err =
@@ -12208,6 +13114,9 @@ mod tests {
             out: Some(out_path.clone()),
             logslope_formula: None,
             z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
         };
         let result = super::run_survival(args);
         assert!(

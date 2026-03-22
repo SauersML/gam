@@ -687,12 +687,26 @@ fn validate_term_weights(
     validateweights(weights, context)
 }
 
+fn validate_term_offset(y_len: usize, offset: &Array1<f64>, label: &str) -> Result<(), String> {
+    validate_len_match(&format!("{label} vs y"), y_len, offset.len())?;
+    for (row_idx, value) in offset.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!(
+                "{label} contains non-finite value at row {row_idx}: {value}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_gaussian_location_scale_termspec(
     data: ndarray::ArrayView2<'_, f64>,
     spec: &GaussianLocationScaleTermSpec,
     context: &str,
 ) -> Result<(), String> {
-    validate_term_weights(data, spec.y.len(), &spec.weights, context)
+    validate_term_weights(data, spec.y.len(), &spec.weights, context)?;
+    validate_term_offset(spec.y.len(), &spec.mean_offset, "mean_offset")?;
+    validate_term_offset(spec.y.len(), &spec.log_sigma_offset, "log_sigma_offset")
 }
 
 fn validate_gaussian_location_scalewiggle_termspec(
@@ -702,6 +716,8 @@ fn validate_gaussian_location_scalewiggle_termspec(
 ) -> Result<(), String> {
     let n = spec.y.len();
     validate_term_weights(data, n, &spec.weights, context)?;
+    validate_term_offset(n, &spec.mean_offset, "mean_offset")?;
+    validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
     if spec.wiggle_degree < 1 {
         return Err(format!(
@@ -726,6 +742,8 @@ fn validate_binomial_location_scale_termspec(
     context: &str,
 ) -> Result<(), String> {
     validate_term_weights(data, spec.y.len(), &spec.weights, context)?;
+    validate_term_offset(spec.y.len(), &spec.threshold_offset, "threshold_offset")?;
+    validate_term_offset(spec.y.len(), &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_binomial_response(&spec.y, context)?;
     Ok(())
 }
@@ -746,6 +764,8 @@ fn validate_binomial_location_scalewiggle_termspec(
 ) -> Result<(), String> {
     let n = spec.y.len();
     validate_term_weights(data, n, &spec.weights, context)?;
+    validate_term_offset(n, &spec.threshold_offset, "threshold_offset")?;
+    validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_binomial_response(&spec.y, context)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
     if !inverse_link_supports_joint_wiggle(&spec.link_kind) {
@@ -1166,6 +1186,8 @@ pub struct GaussianLocationScaleTermSpec {
     pub weights: Array1<f64>,
     pub meanspec: TermCollectionSpec,
     pub log_sigmaspec: TermCollectionSpec,
+    pub mean_offset: Array1<f64>,
+    pub log_sigma_offset: Array1<f64>,
 }
 
 #[derive(Clone)]
@@ -1174,6 +1196,8 @@ pub struct GaussianLocationScaleWiggleTermSpec {
     pub weights: Array1<f64>,
     pub meanspec: TermCollectionSpec,
     pub log_sigmaspec: TermCollectionSpec,
+    pub mean_offset: Array1<f64>,
+    pub log_sigma_offset: Array1<f64>,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
     pub wiggle_block: ParameterBlockInput,
@@ -1186,6 +1210,8 @@ pub struct BinomialLocationScaleTermSpec {
     pub link_kind: InverseLink,
     pub thresholdspec: TermCollectionSpec,
     pub log_sigmaspec: TermCollectionSpec,
+    pub threshold_offset: Array1<f64>,
+    pub log_sigma_offset: Array1<f64>,
 }
 
 #[derive(Clone)]
@@ -1195,6 +1221,8 @@ pub struct BinomialLocationScaleWiggleTermSpec {
     pub link_kind: InverseLink,
     pub thresholdspec: TermCollectionSpec,
     pub log_sigmaspec: TermCollectionSpec,
+    pub threshold_offset: Array1<f64>,
+    pub log_sigma_offset: Array1<f64>,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
     pub wiggle_block: ParameterBlockInput,
@@ -1782,6 +1810,8 @@ struct GaussianLocationScaleTermBuilder {
     weights: Array1<f64>,
     meanspec: TermCollectionSpec,
     noisespec: TermCollectionSpec,
+    mean_offset: Array1<f64>,
+    noise_offset: Array1<f64>,
 }
 
 impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
@@ -1821,7 +1851,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         let mut meanspec = ParameterBlockSpec {
             name: "mu".to_string(),
             design: mean_design.design.clone(),
-            offset: Array1::zeros(self.y.len()),
+            offset: self.mean_offset.clone(),
             penalties: mean_design.penalties_as_penalty_matrix(),
             nullspace_dims: mean_design.nullspace_dims.clone(),
             initial_log_lambdas: mean_log_lambdas,
@@ -1842,7 +1872,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                         .min(noise_design.design.ncols()),
                 )?,
             )),
-            offset: Array1::zeros(self.y.len()),
+            offset: self.noise_offset.clone(),
             penalties: noise_design.penalties_as_penalty_matrix(),
             nullspace_dims: noise_design.nullspace_dims.clone(),
             initial_log_lambdas: noise_log_lambdas,
@@ -1938,6 +1968,8 @@ struct GaussianLocationScaleWiggleTermBuilder {
     weights: Array1<f64>,
     meanspec: TermCollectionSpec,
     noisespec: TermCollectionSpec,
+    mean_offset: Array1<f64>,
+    noise_offset: Array1<f64>,
     wiggle_knots: Array1<f64>,
     wiggle_degree: usize,
     wiggle_block: ParameterBlockInput,
@@ -1987,7 +2019,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         let mut meanspec = ParameterBlockSpec {
             name: "mu".to_string(),
             design: mean_design.design.clone(),
-            offset: Array1::zeros(self.y.len()),
+            offset: self.mean_offset.clone(),
             penalties: mean_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
@@ -2008,7 +2040,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                         .min(noise_design.design.ncols()),
                 )?,
             )),
-            offset: Array1::zeros(self.y.len()),
+            offset: self.noise_offset.clone(),
             penalties: noise_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
@@ -2142,6 +2174,8 @@ struct BinomialLocationScaleTermBuilder {
     link_kind: InverseLink,
     meanspec: TermCollectionSpec,
     noisespec: TermCollectionSpec,
+    mean_offset: Array1<f64>,
+    noise_offset: Array1<f64>,
 }
 
 impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
@@ -2197,7 +2231,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: mean_design.design.clone(),
-            offset: Array1::zeros(self.y.len()),
+            offset: self.mean_offset.clone(),
             penalties: mean_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
@@ -2208,7 +2242,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 identifiednoise_design,
             )),
-            offset: Array1::zeros(self.y.len()),
+            offset: self.noise_offset.clone(),
             penalties: log_sigma_penalty_matrices,
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
@@ -2296,6 +2330,8 @@ struct BinomialLocationScaleWiggleTermBuilder {
     link_kind: InverseLink,
     meanspec: TermCollectionSpec,
     noisespec: TermCollectionSpec,
+    mean_offset: Array1<f64>,
+    noise_offset: Array1<f64>,
     wiggle_knots: Array1<f64>,
     wiggle_degree: usize,
     wiggle_block: ParameterBlockInput,
@@ -2359,7 +2395,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         let mut thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
             design: mean_design.design.clone(),
-            offset: Array1::zeros(self.y.len()),
+            offset: self.mean_offset.clone(),
             penalties: mean_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
@@ -2370,7 +2406,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 identifiednoise_design,
             )),
-            offset: Array1::zeros(self.y.len()),
+            offset: self.noise_offset.clone(),
             penalties: log_sigma_penalty_matrices,
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
@@ -2508,6 +2544,8 @@ pub(crate) fn fit_gaussian_location_scale_terms(
             weights: spec.weights,
             meanspec: spec.meanspec,
             noisespec: spec.log_sigmaspec,
+            mean_offset: spec.mean_offset,
+            noise_offset: spec.log_sigma_offset,
         },
         options,
         kappa_options,
@@ -2532,6 +2570,8 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms(
             weights: spec.weights,
             meanspec: spec.meanspec,
             noisespec: spec.log_sigmaspec,
+            mean_offset: spec.mean_offset,
+            noise_offset: spec.log_sigma_offset,
             wiggle_knots: spec.wiggle_knots,
             wiggle_degree: spec.wiggle_degree,
             wiggle_block: spec.wiggle_block,
@@ -2575,6 +2615,8 @@ pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
             weights: spec.weights,
             meanspec: spec.meanspec,
             log_sigmaspec: spec.log_sigmaspec,
+            mean_offset: spec.mean_offset,
+            log_sigma_offset: spec.log_sigma_offset,
             wiggle_knots: wiggle_knots.clone(),
             wiggle_degree,
             wiggle_block,
@@ -2605,6 +2647,8 @@ pub(crate) fn fit_binomial_location_scale_terms(
             link_kind: spec.link_kind,
             meanspec: spec.thresholdspec,
             noisespec: spec.log_sigmaspec,
+            mean_offset: spec.threshold_offset,
+            noise_offset: spec.log_sigma_offset,
         },
         options,
         kappa_options,
@@ -2630,6 +2674,8 @@ pub(crate) fn fit_binomial_location_scalewiggle_terms(
             link_kind: spec.link_kind,
             meanspec: spec.thresholdspec,
             noisespec: spec.log_sigmaspec,
+            mean_offset: spec.threshold_offset,
+            noise_offset: spec.log_sigma_offset,
             wiggle_knots: spec.wiggle_knots,
             wiggle_degree: spec.wiggle_degree,
             wiggle_block: spec.wiggle_block,
@@ -2683,6 +2729,8 @@ pub(crate) fn fit_binomial_location_scale_terms_with_selected_wiggle(
             link_kind: spec.link_kind,
             thresholdspec: spec.thresholdspec,
             log_sigmaspec: spec.log_sigmaspec,
+            threshold_offset: spec.threshold_offset,
+            log_sigma_offset: spec.log_sigma_offset,
             wiggle_knots: wiggle_knots.clone(),
             wiggle_degree,
             wiggle_block,
@@ -16781,6 +16829,8 @@ mod tests {
             weights: Array1::from_vec(vec![1.0, 1.0, -0.5, 1.0, 1.0, 1.0, 1.0, 1.0]),
             meanspec: simple_matern_term_collection(&[0, 1], 0.35),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.6),
+            mean_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
         };
 
         let err = match fit_gaussian_location_scale_terms(
@@ -16809,6 +16859,8 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
+            threshold_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
         };
 
         let err = match fit_binomial_location_scale_terms(
@@ -16833,6 +16885,8 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
+            threshold_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
         };
 
         let err = match fit_binomial_location_scale_terms(
@@ -16867,6 +16921,8 @@ mod tests {
             weights,
             meanspec: simple_matern_term_collection(&[0, 1], 0.35),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.6),
+            mean_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
         };
         let fit = fit_gaussian_location_scale_terms(
             data.view(),
@@ -16896,6 +16952,8 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
+            threshold_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
         };
         let fit = fit_binomial_location_scale_terms(
             data.view(),
@@ -16934,6 +16992,8 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.45),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.8),
+            threshold_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
             wiggle_knots: knots,
             wiggle_degree: 2,
             wiggle_block,

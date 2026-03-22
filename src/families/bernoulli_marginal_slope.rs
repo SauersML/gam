@@ -85,6 +85,8 @@ pub struct BernoulliMarginalSlopeTermSpec {
     pub z: Array1<f64>,
     pub marginalspec: TermCollectionSpec,
     pub logslopespec: TermCollectionSpec,
+    pub marginal_offset: Array1<f64>,
+    pub logslope_offset: Array1<f64>,
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
 }
@@ -171,7 +173,7 @@ impl DeviationRuntime {
         self.span_left_points.len()
     }
 
-    fn breakpoints(&self) -> &Array1<f64> {
+    pub(crate) fn breakpoints(&self) -> &Array1<f64> {
         &self.endpoint_points
     }
 
@@ -271,7 +273,7 @@ impl DeviationRuntime {
         self.basis_span_cubic(span_idx, basis_idx)
     }
 
-    fn local_cubic_at(
+    pub(crate) fn local_cubic_at(
         &self,
         beta: &Array1<f64>,
         value: f64,
@@ -516,13 +518,20 @@ fn validate_spec(
     spec: &BernoulliMarginalSlopeTermSpec,
 ) -> Result<(), String> {
     let n = data.nrows();
-    if spec.y.len() != n || spec.weights.len() != n || spec.z.len() != n {
+    if spec.y.len() != n
+        || spec.weights.len() != n
+        || spec.z.len() != n
+        || spec.marginal_offset.len() != n
+        || spec.logslope_offset.len() != n
+    {
         return Err(format!(
-            "bernoulli-marginal-slope row mismatch: data={}, y={}, weights={}, z={}",
+            "bernoulli-marginal-slope row mismatch: data={}, y={}, weights={}, z={}, marginal_offset={}, logslope_offset={}",
             n,
             spec.y.len(),
             spec.weights.len(),
-            spec.z.len()
+            spec.z.len(),
+            spec.marginal_offset.len(),
+            spec.logslope_offset.len()
         ));
     }
     if spec
@@ -537,6 +546,12 @@ fn validate_spec(
     }
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
         return Err("bernoulli-marginal-slope requires finite z values".to_string());
+    }
+    if spec.marginal_offset.iter().any(|&value| !value.is_finite()) {
+        return Err("bernoulli-marginal-slope requires finite marginal offsets".to_string());
+    }
+    if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
+        return Err("bernoulli-marginal-slope requires finite logslope offsets".to_string());
     }
     // Enforce z is approximately standard normal.
     // The Gaussian decoupling identity E[Φ(a + β Z)] = Φ(a / √(1+β²))
@@ -2210,10 +2225,7 @@ impl BernoulliMarginalSlopeFamily {
         } else {
             (marginal_eta * (1.0 + slope * slope).sqrt(), f64::NAN)
         };
-        Ok(BernoulliMarginalSlopeRowExactContext {
-            intercept,
-            m_a,
-        })
+        Ok(BernoulliMarginalSlopeRowExactContext { intercept, m_a })
     }
 
     /// Look up the pre-solved row context from the cache.
@@ -2893,10 +2905,8 @@ impl BernoulliMarginalSlopeFamily {
         if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
             for local_idx in 0..h_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
-                rho[h_range.start + local_idx] = eval_coeff4_at(
-                    &exact::score_basis_cell_coefficients(basis_span, b),
-                    z_obs,
-                );
+                rho[h_range.start + local_idx] =
+                    eval_coeff4_at(&exact::score_basis_cell_coefficients(basis_span, b), z_obs);
             }
         }
         if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
@@ -2929,60 +2939,62 @@ impl BernoulliMarginalSlopeFamily {
             hess.fill(0.0);
             for u in 0..r {
                 for v in u..r {
-                let mut r_uv = 0.0;
-                if u == 1 && v == 1 {
-                    r_uv = eval_coeff4_at(&obs.dc_dbb, z_obs);
-                } else if u == 1 {
-                    if let Some(h_range) = h_range {
-                        if v >= h_range.start && v < h_range.end {
-                            let local_idx = v - h_range.start;
-                            let runtime = score_runtime
-                                .ok_or_else(|| "missing score-warp runtime".to_string())?;
-                            let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
-                            r_uv = eval_coeff4_at(
-                                &exact::score_basis_cell_coefficients(basis_span, 1.0),
-                                z_obs,
-                            );
+                    let mut r_uv = 0.0;
+                    if u == 1 && v == 1 {
+                        r_uv = eval_coeff4_at(&obs.dc_dbb, z_obs);
+                    } else if u == 1 {
+                        if let Some(h_range) = h_range {
+                            if v >= h_range.start && v < h_range.end {
+                                let local_idx = v - h_range.start;
+                                let runtime = score_runtime
+                                    .ok_or_else(|| "missing score-warp runtime".to_string())?;
+                                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                                r_uv = eval_coeff4_at(
+                                    &exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                    z_obs,
+                                );
+                            }
+                        }
+                        if let Some(w_range) = w_range {
+                            if v >= w_range.start && v < w_range.end {
+                                let local_idx = v - w_range.start;
+                                let runtime = link_runtime
+                                    .ok_or_else(|| "missing link runtime".to_string())?;
+                                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                                r_uv = eval_coeff4_at(
+                                    &exact::link_basis_cell_coefficient_partials(basis_span, a, b)
+                                        .1,
+                                    z_obs,
+                                );
+                            }
+                        }
+                    } else if v == 1 {
+                        if let Some(h_range) = h_range {
+                            if u >= h_range.start && u < h_range.end {
+                                let local_idx = u - h_range.start;
+                                let runtime = score_runtime
+                                    .ok_or_else(|| "missing score-warp runtime".to_string())?;
+                                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                                r_uv = eval_coeff4_at(
+                                    &exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                    z_obs,
+                                );
+                            }
+                        }
+                        if let Some(w_range) = w_range {
+                            if u >= w_range.start && u < w_range.end {
+                                let local_idx = u - w_range.start;
+                                let runtime = link_runtime
+                                    .ok_or_else(|| "missing link runtime".to_string())?;
+                                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                                r_uv = eval_coeff4_at(
+                                    &exact::link_basis_cell_coefficient_partials(basis_span, a, b)
+                                        .1,
+                                    z_obs,
+                                );
+                            }
                         }
                     }
-                    if let Some(w_range) = w_range {
-                        if v >= w_range.start && v < w_range.end {
-                            let local_idx = v - w_range.start;
-                            let runtime = link_runtime
-                                .ok_or_else(|| "missing link runtime".to_string())?;
-                            let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                            r_uv = eval_coeff4_at(
-                                &exact::link_basis_cell_coefficient_partials(basis_span, a, b).1,
-                                z_obs,
-                            );
-                        }
-                    }
-                } else if v == 1 {
-                    if let Some(h_range) = h_range {
-                        if u >= h_range.start && u < h_range.end {
-                            let local_idx = u - h_range.start;
-                            let runtime = score_runtime
-                                .ok_or_else(|| "missing score-warp runtime".to_string())?;
-                            let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
-                            r_uv = eval_coeff4_at(
-                                &exact::score_basis_cell_coefficients(basis_span, 1.0),
-                                z_obs,
-                            );
-                        }
-                    }
-                    if let Some(w_range) = w_range {
-                        if u >= w_range.start && u < w_range.end {
-                            let local_idx = u - w_range.start;
-                            let runtime = link_runtime
-                                .ok_or_else(|| "missing link runtime".to_string())?;
-                            let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                            r_uv = eval_coeff4_at(
-                                &exact::link_basis_cell_coefficient_partials(basis_span, a, b).1,
-                                z_obs,
-                            );
-                        }
-                    }
-                }
                     let eta_uv = chi_obs * a_uv[[u, v]]
                         + eta_aa_obs * a_u[u] * a_u[v]
                         + tau[u] * a_u[v]
@@ -3066,12 +3078,14 @@ impl BernoulliMarginalSlopeFamily {
         };
         let z_obs = self.z[row];
         let u_obs = a + b * z_obs;
-        let score_span_obs = if let (Some(runtime), Some(beta_h)) = (self.score_warp.as_ref(), beta_h) {
-            runtime.local_cubic_at(beta_h, z_obs)?
-        } else {
-            zero_score_span
-        };
-        let link_span_obs = if let (Some(runtime), Some(beta_w)) = (self.link_dev.as_ref(), beta_w) {
+        let score_span_obs =
+            if let (Some(runtime), Some(beta_h)) = (self.score_warp.as_ref(), beta_h) {
+                runtime.local_cubic_at(beta_h, z_obs)?
+            } else {
+                zero_score_span
+            };
+        let link_span_obs = if let (Some(runtime), Some(beta_w)) = (self.link_dev.as_ref(), beta_w)
+        {
             runtime.local_cubic_at(beta_w, u_obs)?
         } else {
             zero_link_span
@@ -3404,11 +3418,9 @@ impl BernoulliMarginalSlopeFamily {
         let mut a_uv = Array2::<f64>::zeros((r, r));
         for u in 0..r {
             for v in u..r {
-                let val = -(f_uv[[u, v]]
-                    + f_au[u] * a_u[v]
-                    + f_au[v] * a_u[u]
-                    + f_aa * a_u[u] * a_u[v])
-                    * inv_f_a;
+                let val =
+                    -(f_uv[[u, v]] + f_au[u] * a_u[v] + f_au[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
+                        * inv_f_a;
                 a_uv[[u, v]] = val;
                 a_uv[[v, u]] = val;
             }
@@ -3464,8 +3476,7 @@ impl BernoulliMarginalSlopeFamily {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                 let idx = w_range.start + local_idx;
                 g_u_fixed[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
-                let (dc_aw, dc_bw) =
-                    exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aw, dc_bw) = exact::link_basis_cell_coefficient_partials(basis_span, a, b);
                 let (dc_aaw, dc_abw, dc_bbw) =
                     exact::link_basis_cell_second_partials(basis_span, a, b);
                 g_au_fixed[idx] = dc_aw;
@@ -3698,7 +3709,9 @@ impl BernoulliMarginalSlopeFamily {
         for u in 0..r {
             for v in u..r {
                 let val = u3 * eta_u[u] * eta_u[v] * eta_dir
-                    + k2 * (eta_uv[[u, v]] * eta_dir + eta_u[u] * eta_u_dir[v] + eta_u[v] * eta_u_dir[u])
+                    + k2 * (eta_uv[[u, v]] * eta_dir
+                        + eta_u[u] * eta_u_dir[v]
+                        + eta_u[v] * eta_u_dir[u])
                     + u1 * eta_uv_dir[[u, v]];
                 out[[u, v]] = val;
                 out[[v, u]] = val;
@@ -4063,7 +4076,11 @@ impl BernoulliMarginalSlopeFamily {
 
                     add_scaled_coeff4(&mut coeff_au_dir_u[idx], &coeff_abu[idx], dir_u_b);
                     add_scaled_coeff4(&mut coeff_au_dir_v[idx], &coeff_abu[idx], dir_v_b);
-                    add_scaled_coeff4(&mut coeff_au_dir_uv[idx], &coeff_abbu[idx], dir_u_b * dir_v_b);
+                    add_scaled_coeff4(
+                        &mut coeff_au_dir_uv[idx],
+                        &coeff_abbu[idx],
+                        dir_u_b * dir_v_b,
+                    );
                 }
             }
 
@@ -4311,11 +4328,9 @@ impl BernoulliMarginalSlopeFamily {
         let mut a_uv = Array2::<f64>::zeros((r, r));
         for u in 0..r {
             for v in u..r {
-                let val = -(f_uv[[u, v]]
-                    + f_au[u] * a_u[v]
-                    + f_au[v] * a_u[u]
-                    + f_aa * a_u[u] * a_u[v])
-                    * inv_f_a;
+                let val =
+                    -(f_uv[[u, v]] + f_au[u] * a_u[v] + f_au[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
+                        * inv_f_a;
                 a_uv[[u, v]] = val;
                 a_uv[[v, u]] = val;
             }
@@ -4416,8 +4431,7 @@ impl BernoulliMarginalSlopeFamily {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                 let idx = w_range.start + local_idx;
                 g_u_fixed[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
-                let (dc_aw, dc_bw) =
-                    exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aw, dc_bw) = exact::link_basis_cell_coefficient_partials(basis_span, a, b);
                 let (dc_aaw, dc_abw, dc_bbw) =
                     exact::link_basis_cell_second_partials(basis_span, a, b);
                 let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
@@ -4873,9 +4887,12 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let a_dir_uv = a_u_dir_u.dot(dir_v);
-        let g_a_uv = g_aa * a_dir_uv + g_aa_u_fixed * a_dir_v + g_aa_v_fixed * a_dir_u + g_a_uv_fixed;
-        let g_aa_uv =
-            g_aaau.dot(dir_u) * a_dir_v + g_aaau.dot(dir_v) * a_dir_u + g_aaa * a_dir_uv + g_aa_uv_fixed;
+        let g_a_uv =
+            g_aa * a_dir_uv + g_aa_u_fixed * a_dir_v + g_aa_v_fixed * a_dir_u + g_a_uv_fixed;
+        let g_aa_uv = g_aaau.dot(dir_u) * a_dir_v
+            + g_aaau.dot(dir_v) * a_dir_u
+            + g_aaa * a_dir_uv
+            + g_aa_uv_fixed;
         let mut g_u_uv = Array1::<f64>::zeros(r);
         let mut g_au_uv = Array1::<f64>::zeros(r);
         for u in 0..r {
@@ -4946,14 +4963,14 @@ impl BernoulliMarginalSlopeFamily {
         for u in 0..r {
             for v in u..r {
                 let a_term = eta_u[u] * eta_u[v] * eta_dir_u;
-                let a_term_v =
-                    eta_u_dir_v[u] * eta_u[v] * eta_dir_u
-                        + eta_u[u] * eta_u_dir_v[v] * eta_dir_u
-                        + eta_u[u] * eta_u[v] * eta_dir_uv;
+                let a_term_v = eta_u_dir_v[u] * eta_u[v] * eta_dir_u
+                    + eta_u[u] * eta_u_dir_v[v] * eta_dir_u
+                    + eta_u[u] * eta_u[v] * eta_dir_uv;
                 let b_term = eta_uv_u[[u, v]];
                 let b_term_v = eta_uv_uv[[u, v]];
-                let c_term =
-                    eta_uv[[u, v]] * eta_dir_u + eta_u[u] * eta_u_dir_u[v] + eta_u[v] * eta_u_dir_u[u];
+                let c_term = eta_uv[[u, v]] * eta_dir_u
+                    + eta_u[u] * eta_u_dir_u[v]
+                    + eta_u[v] * eta_u_dir_u[u];
                 let c_term_v = eta_uv_v[[u, v]] * eta_dir_u
                     + eta_uv[[u, v]] * eta_dir_uv
                     + eta_u_dir_v[u] * eta_u_dir_u[v]
@@ -6873,13 +6890,14 @@ fn build_blockspec(
     name: &str,
     design: &TermCollectionDesign,
     baseline: f64,
+    offset: &Array1<f64>,
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: name.to_string(),
         design: design.design.clone(),
-        offset: Array1::from_elem(design.design.nrows(), baseline),
+        offset: offset + baseline,
         penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
@@ -6948,10 +6966,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
         .link_dev
         .as_ref()
         .map(|cfg| {
-            let a0 = baseline.0;
-            let b0 = baseline.1;
-            let scale = (1.0 + b0 * b0).sqrt();
-            let q0_seed = Array1::from_iter(spec.z.iter().map(|&zi| a0 * scale + b0 * zi));
+            let q0_seed = Array1::from_iter((0..spec.z.len()).map(|row| {
+                let a0 = baseline.0 + spec.marginal_offset[row];
+                let b0 = baseline.1 + spec.logslope_offset[row];
+                let scale = (1.0 + b0 * b0).sqrt();
+                a0 * scale + b0 * spec.z[row]
+            }));
             // Pad with a conservative envelope so the basis support covers
             // the domain reached during flexible joint optimization, not just
             // the baseline range.  Padding is 50 % of the IQR on each side.
@@ -7019,6 +7039,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 "marginal_surface",
                 marginal_design,
                 baseline.0,
+                &spec.marginal_offset,
                 rho_marginal,
                 hints.marginal_beta.clone(),
             ),
@@ -7026,6 +7047,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 "logslope_surface",
                 logslope_design,
                 baseline.1,
+                &spec.logslope_offset,
                 rho_logslope,
                 hints.logslope_beta.clone(),
             ),
@@ -7265,12 +7287,15 @@ mod tests {
         weights: Array1<f64>,
         z: Array1<f64>,
     ) -> BernoulliMarginalSlopeTermSpec {
+        let n = y.len();
         BernoulliMarginalSlopeTermSpec {
             y,
             weights,
             z,
             marginalspec: empty_termspec(),
             logslopespec: empty_termspec(),
+            marginal_offset: Array1::zeros(n),
+            logslope_offset: Array1::zeros(n),
             score_warp: None,
             link_dev: None,
         }
@@ -7360,12 +7385,7 @@ mod tests {
             .build_row_exact_context(0, &block_states)
             .expect("row context");
         let (nll, grad, hess) = family
-            .compute_row_primary_gradient_hessian(
-                0,
-                &block_states,
-                &primary,
-                &row_ctx,
-            )
+            .compute_row_primary_gradient_hessian(0, &block_states, &primary, &row_ctx)
             .expect("analytic flex eval");
         assert!(nll.is_finite(), "neglog should be finite for link-dev-only");
         assert!(
@@ -7968,19 +7988,20 @@ mod tests {
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
         );
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 1.0]),
-            weights: Arc::new(array![1.0, 0.7, 1.3]),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: None,
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(array![0.0, 1.0, 1.0]),
+                weights: Arc::new(array![1.0, 0.7, 1.3]),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: None,
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
 
         let a = 0.35;
         let b = 0.6;
@@ -8221,12 +8242,7 @@ mod tests {
             .build_row_exact_context(0, &block_states)
             .expect("rigid row context");
         let (_, primary_grad, primary_hess) = family
-            .compute_row_primary_gradient_hessian(
-                0,
-                &block_states,
-                &cache.primary,
-                &row_ctx,
-            )
+            .compute_row_primary_gradient_hessian(0, &block_states, &cache.primary, &row_ctx)
             .expect("rigid exact row derivatives");
 
         assert!(
@@ -8315,12 +8331,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
             let (_, grad, hess) = family
-                .compute_row_primary_gradient_hessian(
-                    row,
-                    &block_states,
-                    &primary,
-                    &row_ctx,
-                )
+                .compute_row_primary_gradient_hessian(row, &block_states, &primary, &row_ctx)
                 .unwrap_or_else(|e| {
                     panic!("row {row}: compute_row_primary_gradient_hessian failed: {e}")
                 });
@@ -8411,12 +8422,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
             let (_, grad, hess) = family
-                .compute_row_primary_gradient_hessian(
-                    row,
-                    &block_states,
-                    &primary,
-                    &row_ctx,
-                )
+                .compute_row_primary_gradient_hessian(row, &block_states, &primary, &row_ctx)
                 .unwrap_or_else(|e| {
                     panic!("row {row}: compute_row_primary_gradient_hessian failed: {e}")
                 });
@@ -8907,19 +8913,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -9051,19 +9058,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -9096,13 +9104,7 @@ mod tests {
                 .build_row_exact_context(row, &block_states)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
-                .row_primary_third_contracted_recompute(
-                    row,
-                    &block_states,
-                    &cache,
-                    &row_ctx,
-                    &zero,
-                )
+                .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
                 .unwrap_or_else(|e| {
                     panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
                 });
@@ -9177,13 +9179,7 @@ mod tests {
                 .build_row_exact_context(row, &block_states)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
-                .row_primary_third_contracted_recompute(
-                    row,
-                    &block_states,
-                    &cache,
-                    &row_ctx,
-                    &zero,
-                )
+                .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
                 .unwrap_or_else(|e| {
                     panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
                 });
@@ -9258,13 +9254,7 @@ mod tests {
                 .build_row_exact_context(row, &block_states)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
-                .row_primary_third_contracted_recompute(
-                    row,
-                    &block_states,
-                    &cache,
-                    &row_ctx,
-                    &zero,
-                )
+                .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
                 .unwrap_or_else(|e| {
                     panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
                 });
@@ -9314,19 +9304,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -9393,19 +9384,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -9494,19 +9486,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -9567,9 +9560,7 @@ mod tests {
                     &dir_u,
                     &dir_v,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: forward fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
             let swapped = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -9579,9 +9570,7 @@ mod tests {
                     &dir_v,
                     &dir_u,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: swapped fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: swapped fourth contraction failed: {e}"));
 
             assert_eq!(forward.dim(), (total, total));
             assert_eq!(swapped.dim(), (total, total));
@@ -9618,19 +9607,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -9691,9 +9681,7 @@ mod tests {
                     &row_ctx,
                     &dir_u,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction failed: {e}"));
             let third_neg = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -9702,9 +9690,7 @@ mod tests {
                     &row_ctx,
                     &neg_dir_u,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: negated third contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
             let fourth = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -9714,9 +9700,7 @@ mod tests {
                     &dir_u,
                     &dir_v,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
             let fourth_neg_u = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -9726,9 +9710,7 @@ mod tests {
                     &neg_dir_u,
                     &dir_v,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: negated-u fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: negated-u fourth contraction failed: {e}"));
 
             for i in 0..total {
                 for j in 0..total {
@@ -9817,9 +9799,7 @@ mod tests {
                     &dir_u,
                     &dir_v,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: forward fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
             let swapped = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -9829,9 +9809,7 @@ mod tests {
                     &dir_v,
                     &dir_u,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: swapped fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: swapped fourth contraction failed: {e}"));
 
             for i in 0..total {
                 for j in 0..total {
@@ -9916,9 +9894,7 @@ mod tests {
                     &dir_u,
                     &dir_v,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: forward fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
             let swapped = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -9928,9 +9904,7 @@ mod tests {
                     &dir_v,
                     &dir_u,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: swapped fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: swapped fourth contraction failed: {e}"));
 
             for i in 0..total {
                 for j in 0..total {
@@ -10000,16 +9974,8 @@ mod tests {
                 .build_row_exact_context(row, &block_states)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
-                .row_primary_third_contracted_recompute(
-                    row,
-                    &block_states,
-                    &cache,
-                    &row_ctx,
-                    &dir,
-                )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction failed: {e}")
-                });
+                .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir)
+                .unwrap_or_else(|e| panic!("row {row}: third contraction failed: {e}"));
             let third_neg = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -10018,9 +9984,7 @@ mod tests {
                     &row_ctx,
                     &neg_dir,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: negated third contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
             let fourth = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -10030,9 +9994,7 @@ mod tests {
                     &dir,
                     &dir,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
             let fourth_neg = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -10118,16 +10080,8 @@ mod tests {
                 .build_row_exact_context(row, &block_states)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
-                .row_primary_third_contracted_recompute(
-                    row,
-                    &block_states,
-                    &cache,
-                    &row_ctx,
-                    &dir,
-                )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction failed: {e}")
-                });
+                .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir)
+                .unwrap_or_else(|e| panic!("row {row}: third contraction failed: {e}"));
             let third_neg = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -10136,9 +10090,7 @@ mod tests {
                     &row_ctx,
                     &neg_dir,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: negated third contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
             let fourth = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -10148,9 +10100,7 @@ mod tests {
                     &dir,
                     &dir,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: fourth contraction failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
             let fourth_neg = family
                 .row_primary_fourth_contracted_recompute(
                     row,
@@ -10201,19 +10151,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -10321,19 +10272,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -10428,19 +10380,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -10533,19 +10486,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -10606,9 +10560,7 @@ mod tests {
                     &row_ctx,
                     &dir_u,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction u failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction u failed: {e}"));
             let third_v = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -10617,9 +10569,7 @@ mod tests {
                     &row_ctx,
                     &dir_v,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction v failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction v failed: {e}"));
             let third_sum = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -10628,9 +10578,7 @@ mod tests {
                     &row_ctx,
                     &dir_sum,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction sum failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction sum failed: {e}"));
 
             for i in 0..total {
                 for j in 0..total {
@@ -10716,9 +10664,7 @@ mod tests {
                     &row_ctx,
                     &dir_u,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction u failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction u failed: {e}"));
             let third_v = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -10727,9 +10673,7 @@ mod tests {
                     &row_ctx,
                     &dir_v,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction v failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction v failed: {e}"));
             let third_sum = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -10738,9 +10682,7 @@ mod tests {
                     &row_ctx,
                     &dir_sum,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction sum failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction sum failed: {e}"));
 
             for i in 0..total {
                 for j in 0..total {
@@ -10826,9 +10768,7 @@ mod tests {
                     &row_ctx,
                     &dir_u,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction u failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction u failed: {e}"));
             let third_v = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -10837,9 +10777,7 @@ mod tests {
                     &row_ctx,
                     &dir_v,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction v failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction v failed: {e}"));
             let third_sum = family
                 .row_primary_third_contracted_recompute(
                     row,
@@ -10848,9 +10786,7 @@ mod tests {
                     &row_ctx,
                     &dir_sum,
                 )
-                .unwrap_or_else(|e| {
-                    panic!("row {row}: third contraction sum failed: {e}")
-                });
+                .unwrap_or_else(|e| panic!("row {row}: third contraction sum failed: {e}"));
 
             for i in 0..total {
                 for j in 0..total {
@@ -10886,19 +10822,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -10960,7 +10897,11 @@ mod tests {
             .expect("dual-flex fourth directional derivative v,w")
             .expect("dual-flex fourth directional derivative v,w matrix");
         let fourth_sum = family
-            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_sum, &dir_w)
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &block_states,
+                &dir_sum,
+                &dir_w,
+            )
             .expect("dual-flex fourth directional derivative (u+v),w")
             .expect("dual-flex fourth directional derivative (u+v),w matrix");
 
@@ -11593,19 +11534,20 @@ mod tests {
             },
         )
         .expect("link block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: None,
-            link_dev: Some(link_prepared.runtime.clone()),
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: None,
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
         );
@@ -11697,19 +11639,20 @@ mod tests {
             },
         )
         .expect("score warp block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(y.clone()),
-            weights: Arc::new(weights.clone()),
-            z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                array![[1.0], [1.0], [1.0]],
-            )),
-            score_warp: Some(score_prepared.runtime.clone()),
-            link_dev: None,
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: None,
+            };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
         );
