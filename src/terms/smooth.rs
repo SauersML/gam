@@ -11022,7 +11022,9 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 return Ok(exact_joint);
             }
             log::warn!(
-                "[spatial-kappa] exact joint score regressed ({:.6e} -> {:.6e}); keeping baseline",
+                "[spatial-kappa] --scale-dimensions optimization made REML score worse ({:.6e} -> {:.6e}); \
+                 discarding optimized per-axis length scales and falling back to isotropic geometry. \
+                 The final model does NOT use anisotropic scaling.",
                 initial_score,
                 exact_score
             );
