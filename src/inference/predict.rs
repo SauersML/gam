@@ -941,13 +941,21 @@ impl BernoulliMarginalSlopePredictor {
         z_column: String,
         baseline_marginal: f64,
         baseline_logslope: f64,
-        frailty: Option<FrailtySpec>,
+        frailty: FrailtySpec,
         score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
         link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
     ) -> Result<Self, String> {
-        let gaussian_frailty_sd = match frailty.unwrap_or(FrailtySpec::None) {
+        let gaussian_frailty_sd = match frailty {
             FrailtySpec::None => None,
-            FrailtySpec::GaussianShift { sigma_fixed } => sigma_fixed,
+            FrailtySpec::GaussianShift {
+                sigma_fixed: Some(sigma),
+            } => Some(sigma),
+            FrailtySpec::GaussianShift { sigma_fixed: None } => {
+                return Err(
+                    "bernoulli marginal-slope predictor requires a fixed GaussianShift sigma"
+                        .to_string(),
+                );
+            }
             FrailtySpec::HazardMultiplier { .. } => {
                 return Err(
                     "bernoulli marginal-slope predictor does not support HazardMultiplier frailty"

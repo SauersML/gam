@@ -302,8 +302,7 @@ pub enum FittedFamily {
     },
     MarginalSlope {
         likelihood: LikelihoodFamily,
-        #[serde(default)]
-        frailty: Option<FrailtySpec>,
+        frailty: FrailtySpec,
     },
     Survival {
         likelihood: LikelihoodFamily,
@@ -311,8 +310,7 @@ pub enum FittedFamily {
         survival_likelihood: Option<String>,
         #[serde(default)]
         survival_distribution: Option<String>,
-        #[serde(default)]
-        frailty: Option<FrailtySpec>,
+        frailty: FrailtySpec,
     },
     TransformationNormal {
         likelihood: LikelihoodFamily,
@@ -754,9 +752,7 @@ impl FittedFamily {
     #[inline]
     pub fn frailty(&self) -> Option<&FrailtySpec> {
         match self {
-            Self::MarginalSlope { frailty, .. } | Self::Survival { frailty, .. } => {
-                frailty.as_ref()
-            }
+            Self::MarginalSlope { frailty, .. } | Self::Survival { frailty, .. } => Some(frailty),
             _ => None,
         }
     }
@@ -1287,7 +1283,7 @@ impl FittedModel {
                     z_column,
                     payload.marginal_baseline?,
                     payload.logslope_baseline?,
-                    self.family_state.frailty().cloned(),
+                    self.family_state.frailty()?.clone(),
                     runtime.score_warp,
                     runtime.link_deviation,
                 )
@@ -1398,6 +1394,57 @@ impl FittedModel {
             if self.resolved_termspec_noise.is_none() {
                 return Err(
                     "marginal-slope model is missing resolved_termspec_noise for the logslope surface"
+                        .to_string(),
+                );
+            }
+            match self.family_state.frailty() {
+                Some(FrailtySpec::None) | Some(FrailtySpec::GaussianShift { sigma_fixed: Some(_) }) => {}
+                Some(FrailtySpec::GaussianShift { sigma_fixed: None }) => {
+                    return Err(
+                        "marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
+                            .to_string(),
+                    );
+                }
+                Some(FrailtySpec::HazardMultiplier { .. }) => {
+                    return Err(
+                        "marginal-slope model does not support HazardMultiplier frailty"
+                            .to_string(),
+                    );
+                }
+                None => {
+                    return Err(
+                        "marginal-slope model is missing family_state.frailty; refit with current CLI"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        if let FittedFamily::Survival {
+            survival_likelihood,
+            frailty,
+            ..
+        } = &self.family_state
+        {
+            if survival_likelihood.as_deref() == Some("marginal-slope") {
+                match frailty {
+                    FrailtySpec::None | FrailtySpec::GaussianShift { sigma_fixed: Some(_) } => {}
+                    FrailtySpec::GaussianShift { sigma_fixed: None } => {
+                        return Err(
+                            "survival marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
+                                .to_string(),
+                        );
+                    }
+                    FrailtySpec::HazardMultiplier { .. } => {
+                        return Err(
+                            "survival marginal-slope model does not support HazardMultiplier frailty"
+                                .to_string(),
+                        );
+                    }
+                }
+            } else if !matches!(frailty, FrailtySpec::None) {
+                return Err(
+                    "non-marginal survival models do not currently persist a frailty modifier"
                         .to_string(),
                 );
             }
