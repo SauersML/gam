@@ -16,6 +16,7 @@ use crate::families::bernoulli_marginal_slope::{
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
+use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
@@ -57,7 +58,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
     /// HazardMultiplier frailty + score_warp/linkwiggle cubic marginal-slope
     /// is not finite-state exact.  For hazard-multiplier frailty, use the
     /// standalone LatentCloglogBinomial / LatentSurvival families instead.
-    pub gaussian_frailty_sd: Option<f64>,
+    pub frailty: FrailtySpec,
     /// Strict lower bound on q'(t) used by both the likelihood domain and
     /// the monotonicity constraints.
     pub derivative_guard: f64,
@@ -98,7 +99,7 @@ struct SurvivalMarginalSlopeFamily {
     event: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
     z: Arc<Array1<f64>>,
-    gaussian_frailty_sd: Option<f64>,
+    frailty: FrailtySpec,
     derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
     /// Stored as DesignMatrix to support sparse local-support bases at
@@ -230,8 +231,12 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
-fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
-    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
+fn probit_frailty_scale(frailty: &FrailtySpec) -> f64 {
+    let sigma = match frailty {
+        FrailtySpec::None => 0.0,
+        FrailtySpec::GaussianShift { sigma_fixed } => sigma_fixed.unwrap_or(0.0),
+        FrailtySpec::HazardMultiplier { .. } => 0.0,
+    };
     1.0 / (1.0 + sigma * sigma).sqrt()
 }
 
@@ -1174,7 +1179,7 @@ struct EvalCache {
 impl SurvivalMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
-        probit_frailty_scale(self.gaussian_frailty_sd)
+        probit_frailty_scale(&self.frailty)
     }
 
     fn flex_timewiggle_active(&self) -> bool {
@@ -1405,7 +1410,7 @@ impl SurvivalMarginalSlopeFamily {
     fn flex_active(&self) -> bool {
         self.score_warp.is_some()
             || self.link_dev.is_some()
-            || self.gaussian_frailty_sd.unwrap_or(0.0) > 0.0
+            || self.frailty.is_active()
     }
 
     fn flex_score_beta<'a>(
@@ -1795,8 +1800,9 @@ impl SurvivalMarginalSlopeFamily {
             exact_kernel::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
         let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact_kernel::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
-        let (dc_daaa, dc_daab, dc_dabb, _) =
+        let (dc_daaa, dc_daab, dc_dabb, dc_dbbb_raw) =
             exact_kernel::denested_cell_third_partials(link_span_obs);
+        let _dc_dbbb = scale_coeff4(dc_dbbb_raw, scale);
         Ok(ObservedDenestedCellPartials {
             coeff,
             dc_da: scale_coeff4(dc_da_raw, scale),
@@ -1832,8 +1838,9 @@ impl SurvivalMarginalSlopeFamily {
             exact_kernel::denested_cell_coefficient_partials(score_span, link_span, a, b);
         let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact_kernel::denested_cell_second_partials(score_span, link_span, a, b);
-        let (dc_daaa_raw, dc_daab_raw, dc_dabb_raw, _) =
+        let (dc_daaa_raw, dc_daab_raw, dc_dabb_raw, dc_dbbb_raw) =
             exact_kernel::denested_cell_third_partials(link_span);
+        let _dc_dbbb = scale_coeff4(dc_dbbb_raw, scale);
         let dc_da = scale_coeff4(dc_da_raw, scale);
         let dc_db = scale_coeff4(dc_db_raw, scale);
         let dc_daa = scale_coeff4(dc_daa_raw, scale);
@@ -5273,12 +5280,20 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
         return Err("survival-marginal-slope requires finite logslope offsets".to_string());
     }
-    if let Some(sigma) = spec.gaussian_frailty_sd {
-        if !sigma.is_finite() || sigma < 0.0 {
-            return Err(format!(
-                "survival-marginal-slope requires gaussian_frailty_sd >= 0, got {sigma}"
-            ));
+    spec.frailty.validate_for_marginal_slope()?;
+    match &spec.frailty {
+        FrailtySpec::None => {}
+        FrailtySpec::GaussianShift { sigma_fixed } => {
+            let sigma = sigma_fixed.ok_or_else(|| {
+                "survival-marginal-slope currently requires FrailtySpec::GaussianShift with a fixed sigma".to_string()
+            })?;
+            if !sigma.is_finite() || *sigma < 0.0 {
+                return Err(format!(
+                    "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                ));
+            }
         }
+        FrailtySpec::HazardMultiplier { .. } => unreachable!(),
     }
     validate_standardized_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
     if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
@@ -5629,7 +5644,7 @@ pub fn fit_survival_marginal_slope_terms(
             event: Arc::clone(&event),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
-            gaussian_frailty_sd: spec.gaussian_frailty_sd,
+            frailty: spec.frailty.clone(),
             derivative_guard,
             design_entry: design_entry.clone(),
             design_exit: design_exit.clone(),
