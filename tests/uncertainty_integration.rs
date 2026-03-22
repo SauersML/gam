@@ -43,6 +43,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         &[dense_penalty(s)],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -116,6 +117,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         &[dense_penalty(s)],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -200,6 +202,7 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
         &[dense_penalty(s)],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -270,6 +273,7 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
         &[dense_penalty(s)],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -348,6 +352,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         &[dense_penalty(s)],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,

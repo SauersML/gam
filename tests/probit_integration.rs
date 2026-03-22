@@ -38,6 +38,7 @@ fn probit_fit_and_predict_fast_integration() {
         &s_list,
         LikelihoodFamily::BinomialProbit,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -140,6 +141,7 @@ fn cloglog_fit_and_predict_fast_integration() {
         &s_list,
         LikelihoodFamily::BinomialCLogLog,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,

@@ -157,6 +157,7 @@ fn firthfd_step_size_sensitivity() {
     let (x, y, w, s_dense, s_list) = make_problem(31);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,

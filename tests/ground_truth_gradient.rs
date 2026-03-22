@@ -171,6 +171,7 @@ fn test_lamlgradient_nonfirthwell_conditioned() {
     let offset = Array1::<f64>::zeros(n);
     let s_list = one_penalty(p);
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -244,6 +245,7 @@ fn test_lamlgradient_logitwith_firthwell_conditioned() {
     let offset = Array1::<f64>::zeros(n);
     let s_list = one_penalty(p);
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -318,6 +320,7 @@ fn stress_test_firthgradientvs_conditioning() {
         let offset = Array1::<f64>::zeros(n);
         let s_list = one_penalty(p);
         let opts = ExternalOptimOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,

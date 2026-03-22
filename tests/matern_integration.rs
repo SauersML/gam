@@ -83,6 +83,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -175,6 +176,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -325,6 +327,7 @@ fn matern_3d_aniso_fits_successfully() {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,

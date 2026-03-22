@@ -4863,6 +4863,7 @@ mod fd_policy_tests {
 
         let opts = ExternalOptimOptions {
             family: LikelihoodFamily::BinomialSas,
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: Some(SasLinkSpec {
@@ -5081,6 +5082,7 @@ mod fd_policy_tests {
 
         let opts = ExternalOptimOptions {
             family: LikelihoodFamily::BinomialSas,
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: Some(SasLinkSpec {
@@ -5239,6 +5241,7 @@ mod fd_policy_tests {
 
         let opts = ExternalOptimOptions {
             family: LikelihoodFamily::BinomialSas,
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: Some(SasLinkSpec {

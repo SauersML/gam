@@ -67,6 +67,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         FittedFamily::Standard {
             likelihood: LikelihoodFamily::BinomialSas,
             link: Some(LinkFunction::Sas),
+            latent_cloglog_state: None,
             mixture_state: None,
             sas_state: None,
         },

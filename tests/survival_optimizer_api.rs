@@ -10,6 +10,7 @@ fn fit_gam_rejects_royston_parmar_and_points_to_survival_api() {
     let offset = array![0.0, 0.0];
     let s_list = Vec::new();
     let opts = FitOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
