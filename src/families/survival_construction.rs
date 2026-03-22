@@ -91,6 +91,7 @@ pub enum SurvivalLikelihoodMode {
     Weibull,
     LocationScale,
     MarginalSlope,
+    Latent,
 }
 
 pub struct SurvivalTimeWiggleBuild {
@@ -263,8 +264,9 @@ pub fn parse_survival_likelihood_mode(raw: &str) -> Result<SurvivalLikelihoodMod
         "weibull" => Ok(SurvivalLikelihoodMode::Weibull),
         "location-scale" => Ok(SurvivalLikelihoodMode::LocationScale),
         "marginal-slope" => Ok(SurvivalLikelihoodMode::MarginalSlope),
+        "latent" => Ok(SurvivalLikelihoodMode::Latent),
         other => Err(format!(
-            "unsupported --survival-likelihood '{other}'; use transformation|weibull|location-scale|marginal-slope"
+            "unsupported --survival-likelihood '{other}'; use transformation|weibull|location-scale|marginal-slope|latent"
         )),
     }
 }
@@ -275,6 +277,7 @@ pub fn survival_likelihood_modename(mode: SurvivalLikelihoodMode) -> &'static st
         SurvivalLikelihoodMode::Weibull => "weibull",
         SurvivalLikelihoodMode::LocationScale => "location-scale",
         SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
+        SurvivalLikelihoodMode::Latent => "latent",
     }
 }
 

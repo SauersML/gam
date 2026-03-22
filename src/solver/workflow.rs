@@ -16,7 +16,7 @@ use crate::families::gamlss::{
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
 use crate::families::latent_survival::{LatentSurvivalTermFitResult, fit_latent_survival_terms};
-use crate::families::lognormal_kernel::{FrailtySpec, LatentSurvivalRow};
+use crate::families::lognormal_kernel::{FrailtySpec, LatentSurvivalEventType, LatentSurvivalRow};
 use crate::families::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalLocationScaleTermFitResult,
     SurvivalLocationScaleTermSpec, fit_survival_location_scale_terms,
@@ -832,8 +832,8 @@ pub struct FitConfig {
     pub offset_column: Option<String>,
     /// Optional additive offset column for the noise/log-scale predictor.
     pub noise_offset_column: Option<String>,
-    /// Fixed latent Gaussian standard deviation for `latent-cloglog-binomial`.
-    pub latent_sd: Option<f64>,
+    /// Optional family-level frailty modifier.
+    pub frailty: Option<FrailtySpec>,
 
     // Survival-specific
     /// Baseline target: "linear", "weibull", "gompertz", "gompertz-makeham".
@@ -881,7 +881,7 @@ impl Default for FitConfig {
             flexible_link: false,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty: None,
             baseline_target: "linear".into(),
             baseline_scale: None,
             baseline_shape: None,
@@ -1107,16 +1107,47 @@ fn materialize_standard<'a>(
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let latent_cloglog = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+        let sigma = match config.frailty.clone().unwrap_or(FrailtySpec::None) {
+            FrailtySpec::HazardMultiplier {
+                sigma_fixed: Some(sigma),
+                loading: crate::families::lognormal_kernel::HazardLoading::Full,
+            } => sigma,
+            FrailtySpec::HazardMultiplier {
+                sigma_fixed: Some(_),
+                loading,
+            } => {
+                return Err(format!(
+                    "latent-cloglog-binomial requires HazardLoading::Full, got {loading:?}"
+                ));
+            }
+            FrailtySpec::HazardMultiplier { sigma_fixed: None, .. } => {
+                return Err(
+                    "latent-cloglog-binomial currently requires a fixed hazard-multiplier sigma"
+                        .to_string(),
+                );
+            }
+            FrailtySpec::GaussianShift { .. } => {
+                return Err(
+                    "latent-cloglog-binomial does not support GaussianShift frailty".to_string(),
+                );
+            }
+            FrailtySpec::None => {
+                return Err(
+                    "latent-cloglog-binomial requires config.frailty=HazardMultiplier with a fixed sigma"
+                        .to_string(),
+                );
+            }
+        };
         Some(
-            LatentCLogLogState::new(config.latent_sd.ok_or_else(|| {
-                "latent-cloglog-binomial requires config.latent_sd".to_string()
-            })?)
-            .map_err(|e| format!("invalid latent_cloglog state: {e}"))?,
+            LatentCLogLogState::new(sigma).map_err(|e| format!("invalid latent_cloglog state: {e}"))?,
         )
     } else {
-        // latent_sd is also used by marginal-slope families for probit frailty
-        // scaling — only reject it for standard non-latent families that don't
-        // support it.
+        if config.frailty.is_some() {
+            return Err(format!(
+                "config.frailty is not supported for standard family {:?}; use a frailty-aware family instead",
+                family
+            ));
+        }
         None
     };
     let options = FitOptions {
@@ -1386,6 +1417,12 @@ fn materialize_survival<'a>(
 
     match survival_mode {
         SurvivalLikelihoodMode::LocationScale => {
+            if config.frailty.is_some() {
+                return Err(
+                    "config.frailty is not implemented for survival-likelihood=location-scale"
+                        .to_string(),
+                );
+            }
             let spec = SurvivalLocationScaleTermSpec {
                 age_entry: age_entry.clone(),
                 age_exit: age_exit.clone(),
@@ -1454,12 +1491,7 @@ fn materialize_survival<'a>(
                 z,
                 marginalspec,
                 marginal_offset: threshold_offset,
-                frailty: match config.latent_sd {
-                    Some(sd) => crate::families::lognormal_kernel::FrailtySpec::GaussianShift {
-                        sigma_fixed: Some(sd),
-                    },
-                    None => crate::families::lognormal_kernel::FrailtySpec::None,
-                },
+                frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
                 derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                 time_block,
                 timewiggle_block: None,
@@ -1475,6 +1507,76 @@ fn materialize_survival<'a>(
                     spec,
                     options: BlockwiseFitOptions::default(),
                     kappa_options,
+                }),
+                inference_notes,
+            })
+        }
+        SurvivalLikelihoodMode::Latent => {
+            if timewiggle_build.is_some() {
+                return Err(
+                    "timewiggle is not implemented for survival-likelihood=latent"
+                        .to_string(),
+                );
+            }
+
+            // Compile LatentSurvivalRow for each data row from the baseline offsets.
+            // eta_offset_entry[i] = log H_0(entry_i)
+            // eta_offset_exit[i]  = log H_0(exit_i)
+            // derivative_offset_exit[i] = d/dt [log H_0(t)]|_{t=exit_i}
+            let eta_off_entry = &time_block.offset_entry;
+            let eta_off_exit = &time_block.offset_exit;
+            let deriv_off_exit = &time_block.derivative_offset_exit;
+
+            let mut rows = Vec::with_capacity(n);
+            for i in 0..n {
+                let h0_exit = eta_off_exit[i].exp();
+                let h0_entry = eta_off_entry[i].exp();
+                let mass_exit = h0_exit - h0_entry;
+                let mass_entry = 0.0;
+
+                let ev = event[i];
+                let event_type = if ev >= 0.5 {
+                    LatentSurvivalEventType::ExactEvent
+                } else {
+                    LatentSurvivalEventType::RightCensored
+                };
+
+                // log baseline hazard at exact event time:
+                // h_0(t_i) = H_0(t_i) * derivative_offset_exit[i]
+                // log(h_0) = eta_offset_exit[i] + ln(derivative_offset_exit[i])
+                let log_baseline_hazard = if ev >= 0.5 {
+                    eta_off_exit[i] + deriv_off_exit[i].ln()
+                } else {
+                    0.0
+                };
+
+                rows.push(LatentSurvivalRow {
+                    event_type,
+                    mass_entry,
+                    mass_exit,
+                    mass_left: 0.0,
+                    mass_right: 0.0,
+                    log_baseline_hazard,
+                    mass_unloaded_entry: 0.0,
+                    mass_unloaded_exit: 0.0,
+                    hazard_loaded: 0.0,
+                    hazard_unloaded: 0.0,
+                });
+            }
+
+            let frailty = config
+                .frailty
+                .clone()
+                .unwrap_or(FrailtySpec::None);
+
+            Ok(MaterializedModel {
+                request: FitRequest::LatentSurvival(LatentSurvivalFitRequest {
+                    data: data.values.view(),
+                    rows,
+                    weights,
+                    spec: termspec,
+                    frailty,
+                    options: BlockwiseFitOptions::default(),
                 }),
                 inference_notes,
             })
@@ -1528,6 +1630,13 @@ fn materialize_location_scale<'a>(
         penalty_orders: cfg.penalty_orders,
         double_penalty: cfg.double_penalty,
     });
+
+    if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+        return Err(
+            "latent-cloglog-binomial is not implemented for location-scale fitting"
+                .to_string(),
+        );
+    }
 
     if is_binomial_family(family) {
         let link_kind = link_choice

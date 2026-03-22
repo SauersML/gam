@@ -76,24 +76,6 @@ impl FrailtySpec {
         !matches!(self, Self::None)
     }
 
-    /// The fixed σ value, if any.
-    pub fn fixed_sigma(&self) -> Option<f64> {
-        match self {
-            Self::None => None,
-            Self::GaussianShift { sigma_fixed } => *sigma_fixed,
-            Self::HazardMultiplier { sigma_fixed, .. } => *sigma_fixed,
-        }
-    }
-
-    /// Whether σ is a learnable parameter (needs its own block).
-    pub fn sigma_is_learnable(&self) -> bool {
-        match self {
-            Self::None => false,
-            Self::GaussianShift { sigma_fixed } => sigma_fixed.is_none(),
-            Self::HazardMultiplier { sigma_fixed, .. } => sigma_fixed.is_none(),
-        }
-    }
-
     /// Validate that this frailty spec is compatible with score_warp/linkwiggle
     /// cubic marginal-slope families.
     ///
@@ -894,39 +876,6 @@ impl RowJet2Block {
         }
     }
 
-    /// Evaluate for a binary latent-cloglog row with learnable σ.
-    pub fn binary_cloglog(
-        quadctx: &QuadratureContext,
-        y: f64,
-        eta: f64,
-        log_mass: f64,
-        sigma: f64,
-    ) -> Result<Self, EstimationError> {
-        let alpha = eta + log_mass;
-        let jet = latent_cloglog_jet5(quadctx, alpha, sigma)?;
-
-        let p = jet.mean.clamp(LOG_FLOOR, 1.0 - LOG_FLOOR);
-        let q = 1.0 - p;
-
-        let log_lik = if y > 0.5 { p.ln() } else { q.ln() };
-        let dp = jet.d1.max(0.0);
-        let ddp = jet.d2;
-        let dddp = jet.d3;
-        let ddddp = jet.d4;
-
-        // μ-derivatives of log-likelihood
-        let w = if y > 0.5 { 1.0 / p } else { -1.0 / q };
-        let score_mu = w * dp;
-        let dw = -y * dp / (p * p) - (1.0 - y) * dp / (q * q);
-        let d2_ll_mu = w * ddp + dw * dp;
-
-        // 4th log-derivative formula for d⁴ℓ/dμ⁴
-        let (d4_log_p, d4_log_q) = log_4th_derivative_pair(dp, ddp, dddp, ddddp, p, q);
-        let d4_ll_mu = y * d4_log_p + (1.0 - y) * d4_log_q;
-
-        Ok(Self::from_mu_jet(log_lik, score_mu, d2_ll_mu, d4_ll_mu, sigma))
-    }
-
     /// Evaluate for a latent survival row with learnable σ.
     ///
     /// Uses exact 4th-order kernel recurrences for d⁴ℓ/dμ⁴ via
@@ -1417,32 +1366,6 @@ impl LatentSurvivalRowJet {
             })
         }
     }
-
-    /// Full (μ, t, m) jet for right-censored rows with dynamic baseline.
-    ///
-    /// Returns the `LogKernelSumFullJet` for `log K_{0,m}(μ,σ)`, giving all
-    /// partial derivatives needed when baseline parameters move the mass m.
-    /// Used by multi-block families with learned time baselines.
-    pub fn right_censored_full(
-        quadctx: &QuadratureContext,
-        mu: f64,
-        sigma: f64,
-        mass_exit: f64,
-    ) -> Result<LogKernelSumFullJet, EstimationError> {
-        LogKernelSumFullJet::single_term(quadctx, 0, mass_exit, mu, sigma)
-    }
-
-    /// Full (μ, t, m) jet for exact-event rows with dynamic baseline.
-    ///
-    /// Returns the `LogKernelSumFullJet` for `log K_{1,m}(μ,σ)`.
-    pub fn exact_event_full(
-        quadctx: &QuadratureContext,
-        mu: f64,
-        sigma: f64,
-        mass_event: f64,
-    ) -> Result<LogKernelSumFullJet, EstimationError> {
-        LogKernelSumFullJet::single_term(quadctx, 1, mass_event, mu, sigma)
-    }
 }
 
 // ─── Prediction semantics ────────────────────────────────────────────────────
@@ -1475,42 +1398,6 @@ pub enum LatentPredictionMode {
         /// Grid of evaluation points.
         mass_grid: Vec<f64>,
     },
-}
-
-/// Compute predictions from a latent-family model.
-///
-/// Given the fitted linear predictor η and a prediction mode, returns the
-/// appropriate user-facing prediction.
-pub(crate) fn latent_predict(
-    quadctx: &QuadratureContext,
-    eta: &[f64],
-    sigma: f64,
-    mode: &LatentPredictionMode,
-) -> Result<Vec<f64>, EstimationError> {
-    match mode {
-        LatentPredictionMode::LatentEta => Ok(eta.to_vec()),
-        LatentPredictionMode::RelativeRate => Ok(eta.iter().map(|&e| e.exp()).collect()),
-        LatentPredictionMode::StandardizedRisk { reference_mass } => {
-            let log_m = reference_mass.ln();
-            eta.iter()
-                .map(|&e| {
-                    let alpha = e + log_m;
-                    let jet = latent_cloglog_jet5(quadctx, alpha, sigma)?;
-                    Ok(jet.mean)
-                })
-                .collect()
-        }
-        LatentPredictionMode::ReferenceCurve { mass_grid } => {
-            if mass_grid.is_empty() {
-                return Err(EstimationError::InvalidInput(
-                    "ReferenceCurve prediction requires a non-empty mass grid".to_string(),
-                ));
-            }
-            Err(EstimationError::InvalidInput(
-                "ReferenceCurve prediction requires a dedicated curve-valued API".to_string(),
-            ))
-        }
-    }
 }
 
 #[cfg(test)]

@@ -90,9 +90,10 @@ use gam::types::{
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
-    GaussianLocationScaleFitRequest, LinkWiggleConfig, StandardBinomialWiggleConfig,
-    StandardFitRequest, SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
-    TransformationNormalFitRequest, fit_model, resolve_offset_column, resolve_weight_column,
+    GaussianLocationScaleFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig,
+    StandardBinomialWiggleConfig, StandardFitRequest, SurvivalLocationScaleFitRequest,
+    SurvivalMarginalSlopeFitRequest, TransformationNormalFitRequest, fit_model,
+    resolve_offset_column, resolve_weight_column,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -450,6 +451,7 @@ enum FamilyArg {
     BinomialLogit,
     BinomialProbit,
     BinomialCloglog,
+    LatentCloglogBinomial,
     PoissonLog,
     GammaLog,
     RoystonParmar,
@@ -979,10 +981,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         None
     };
     let latent_cloglog_state = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
-        args.latent_sd.map(|sd| {
-            gam::types::LatentCLogLogState::new(sd)
-                .expect("invalid latent_sd for latent-cloglog-binomial")
-        })
+        Some(
+            gam::types::LatentCLogLogState::new(
+                args.latent_sd.ok_or_else(|| {
+                    "--latent-sd is required for --family latent-cloglog-binomial".to_string()
+                })?,
+            )
+            .expect("invalid latent_sd for latent-cloglog-binomial"),
+        )
     } else {
         None
     };
@@ -1170,6 +1176,15 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     if let Some(out) = args.out {
         progress.set_stage("fit", "writing fitted model");
+        let latent_cloglog_state = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+            Some(
+                saved_latent_cloglog_state_from_fit(&saved_fit).expect(
+                    "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
+                ),
+            )
+        } else {
+            saved_latent_cloglog_state_from_fit(&saved_fit)
+        };
         let mut payload = FittedModelPayload::new(
             MODEL_VERSION,
             formula_text,
@@ -1177,7 +1192,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             FittedFamily::Standard {
                 likelihood: family,
                 link: Some(effective_link),
-                latent_cloglog_state: saved_latent_cloglog_state_from_fit(&saved_fit),
+                latent_cloglog_state,
                 mixture_state: saved_mixture_state_from_fit(&saved_fit),
                 sas_state: saved_sas_state_from_fit(&saved_fit),
             },
@@ -4416,6 +4431,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         .to_string(),
                 );
             }
+            SurvivalLikelihoodMode::Latent => {
+                return Err(
+                    "--predict-noise cannot be combined with --survival-likelihood latent"
+                        .to_string(),
+                );
+            }
             SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::LocationScale => {
                 SurvivalLikelihoodMode::LocationScale
             }
@@ -4453,7 +4474,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let baseline_cfg = match likelihood_mode {
         SurvivalLikelihoodMode::Transformation
         | SurvivalLikelihoodMode::LocationScale
-        | SurvivalLikelihoodMode::MarginalSlope => parse_survival_baseline_config(
+        | SurvivalLikelihoodMode::MarginalSlope
+        | SurvivalLikelihoodMode::Latent => parse_survival_baseline_config(
             &effective_args.baseline_target,
             effective_args.baseline_scale,
             effective_args.baseline_shape,
@@ -4485,7 +4507,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let time_basis_cfg = match likelihood_mode {
         SurvivalLikelihoodMode::Transformation
         | SurvivalLikelihoodMode::LocationScale
-        | SurvivalLikelihoodMode::MarginalSlope => {
+        | SurvivalLikelihoodMode::MarginalSlope
+        | SurvivalLikelihoodMode::Latent => {
             if learn_timewiggle {
                 SurvivalTimeBasisConfig::None
             } else {
@@ -4795,7 +4818,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
                     survival_distribution: Some(inverse_link_to_saved_string(&fitted_inverse_link)),
-                    frailty: None,
+                    frailty: gam::families::lognormal_kernel::FrailtySpec::None,
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             );
@@ -5068,7 +5091,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
                     survival_distribution: Some("probit".to_string()),
-                    frailty: Some(fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd)),
+                    frailty: fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd),
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             );
@@ -5129,6 +5152,146 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             progress.advance_workflow(survival_total_steps);
         }
         progress.finish_progress("survival marginal-slope fit complete");
+        return Ok(());
+    }
+
+    if likelihood_mode == SurvivalLikelihoodMode::Latent {
+        if parsed.linkspec.is_some() {
+            return Err(
+                "link(...) is not implemented for the survival latent family".to_string(),
+            );
+        }
+        let latent_sd = args.latent_sd.ok_or_else(|| {
+            "--latent-sd is required with --survival-likelihood latent".to_string()
+        })?;
+
+        // Compile LatentSurvivalRow for each data row from the baseline offsets.
+        // eta_offset_entry[i] = log H_0(entry_i)
+        // eta_offset_exit[i]  = log H_0(exit_i)
+        // derivative_offset_exit[i] = d/dt [log H_0(t)]|_{t=exit_i}
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let h0_exit = eta_offset_exit[i].exp();
+            let h0_entry = eta_offset_entry[i].exp();
+            let mass_exit_val = h0_exit - h0_entry;
+
+            let ev = event_target[i];
+            let event_type = if ev >= 1 {
+                gam::families::lognormal_kernel::LatentSurvivalEventType::ExactEvent
+            } else {
+                gam::families::lognormal_kernel::LatentSurvivalEventType::RightCensored
+            };
+
+            // log baseline hazard at exact event time:
+            // h_0(t_i) = H_0(t_i) * derivative_offset_exit[i]
+            // log(h_0) = eta_offset_exit[i] + ln(derivative_offset_exit[i])
+            let log_baseline_hazard = if ev >= 1 {
+                eta_offset_exit[i] + derivative_offset_exit[i].ln()
+            } else {
+                0.0
+            };
+
+            rows.push(gam::families::lognormal_kernel::LatentSurvivalRow {
+                event_type,
+                mass_entry: 0.0,
+                mass_exit: mass_exit_val,
+                mass_left: 0.0,
+                mass_right: 0.0,
+                log_baseline_hazard,
+                mass_unloaded_entry: 0.0,
+                mass_unloaded_exit: 0.0,
+                hazard_loaded: 0.0,
+                hazard_unloaded: 0.0,
+            });
+        }
+
+        let frailty = gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: Some(latent_sd),
+        };
+        let options = gam::families::custom_family::BlockwiseFitOptions {
+            compute_covariance: true,
+            ..Default::default()
+        };
+        progress.set_stage("fit", "running latent survival optimization");
+        let fit = match fit_model(FitRequest::LatentSurvival(LatentSurvivalFitRequest {
+            data: ds.values.view(),
+            rows,
+            weights: weights.clone(),
+            spec: termspec.clone(),
+            frailty: frailty.clone(),
+            options,
+        })) {
+            Ok(FitResult::LatentSurvival(result)) => result,
+            Ok(_) => {
+                return Err(
+                    "internal latent survival workflow returned the wrong result variant"
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                return Err(format!("latent survival fit failed: {e}"));
+            }
+        };
+        println!(
+            "latent survival fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
+            fit.fit.outer_converged,
+            fit.fit.outer_iterations,
+            fit.fit.log_likelihood,
+            fit.fit.reml_score,
+        );
+        progress.advance_workflow(3);
+        if let Some(out) = args.out {
+            progress.set_stage("fit", "writing latent survival model");
+            let mut payload = FittedModelPayload::new(
+                MODEL_VERSION,
+                formula,
+                ModelKind::Survival,
+                FittedFamily::Survival {
+                    likelihood: LikelihoodFamily::RoystonParmar,
+                    survival_likelihood: Some(
+                        survival_likelihood_modename(likelihood_mode).to_string(),
+                    ),
+                    survival_distribution: Some("probit".to_string()),
+                    frailty,
+                },
+                family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+            );
+            payload.unified = Some(fit.fit.clone());
+            payload.fit_result = Some(fit.fit.clone());
+            payload.data_schema = Some(ds.schema.clone());
+            payload.survival_entry = Some(args.entry);
+            payload.survival_exit = Some(args.exit);
+            payload.survival_event = Some(args.event);
+            payload.survivalspec = Some(effectivespec.clone());
+            payload.survival_baseline_target =
+                Some(survival_baseline_targetname(baseline_cfg.target).to_string());
+            payload.survival_baseline_scale = baseline_cfg.scale;
+            payload.survival_baseline_shape = baseline_cfg.shape;
+            payload.survival_baseline_rate = baseline_cfg.rate;
+            payload.survival_baseline_makeham = baseline_cfg.makeham;
+            payload.survival_time_basis = Some(time_build.basisname.clone());
+            payload.survival_time_degree = time_build.degree;
+            payload.survival_time_knots = time_build.knots.clone();
+            payload.survival_time_keep_cols = time_build.keep_cols.clone();
+            payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+            payload.survival_time_anchor = Some(time_anchor);
+            set_saved_offset_columns(
+                &mut payload,
+                args.offset_column.clone(),
+                args.noise_offset_column.clone(),
+            );
+            payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
+            payload.survival_likelihood =
+                Some(survival_likelihood_modename(likelihood_mode).to_string());
+            payload.training_headers = Some(ds.headers.clone());
+            payload.resolved_termspec = Some(
+                freeze_term_collection_from_design(&termspec, &cov_design)
+                    .map_err(|e| e.to_string())?,
+            );
+            write_payload_json(&out, payload)?;
+            progress.advance_workflow(survival_total_steps);
+        }
+        progress.finish_progress("latent survival fit complete");
         return Ok(());
     }
 
@@ -5409,7 +5572,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_likelihood_modename(likelihood_mode).to_string(),
                 ),
                 survival_distribution: None,
-                frailty: None,
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
         );
@@ -7812,10 +7975,16 @@ fn fixed_gaussian_shift_sigma_from_saved_family(
     family: &FittedFamily,
 ) -> Result<Option<f64>, String> {
     match family.frailty() {
-        None | Some(gam::families::lognormal_kernel::FrailtySpec::None) => Ok(None),
-        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed }) => {
-            Ok(*sigma_fixed)
-        }
+        None => Ok(None),
+        Some(gam::families::lognormal_kernel::FrailtySpec::None) => Ok(None),
+        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: Some(sigma),
+        }) => Ok(Some(sigma)),
+        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: None,
+        }) => Err(
+            "saved probit marginal-slope model requires a fixed GaussianShift sigma".to_string(),
+        ),
         Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. }) => Err(
             "saved probit marginal-slope model cannot use HazardMultiplier frailty".to_string(),
         ),
@@ -7856,7 +8025,7 @@ fn build_bernoulli_marginal_slope_saved_model(
         ModelKind::MarginalSlope,
         FittedFamily::MarginalSlope {
             likelihood: LikelihoodFamily::BinomialProbit,
-            frailty: Some(frailty),
+            frailty,
         },
         FAMILY_BERNOULLI_MARGINAL_SLOPE.to_string(),
     );
@@ -8678,6 +8847,7 @@ fn resolve_family(
         FamilyArg::BinomialLogit => LikelihoodFamily::BinomialLogit,
         FamilyArg::BinomialProbit => LikelihoodFamily::BinomialProbit,
         FamilyArg::BinomialCloglog => LikelihoodFamily::BinomialCLogLog,
+        FamilyArg::LatentCloglogBinomial => LikelihoodFamily::BinomialLatentCLogLog,
         FamilyArg::PoissonLog => LikelihoodFamily::PoissonLog,
         FamilyArg::GammaLog => LikelihoodFamily::GammaLog,
         FamilyArg::RoystonParmar => LikelihoodFamily::RoystonParmar,
@@ -12009,7 +12179,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
-                frailty: None,
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
         );
@@ -12066,7 +12236,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some("probit".to_string()),
-                frailty: None,
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
         );
@@ -12141,7 +12311,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
-                frailty: None,
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
         );
@@ -12209,7 +12379,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
-                frailty: None,
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
         );
@@ -12300,7 +12470,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
-                frailty: None,
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
         );
