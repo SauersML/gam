@@ -1163,7 +1163,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             FittedFamily::Standard {
                 likelihood: family,
                 link: Some(effective_link),
-                latent_cloglog_state: None,
+                latent_cloglog_state: saved_latent_cloglog_state_from_fit(&saved_fit),
                 mixture_state: saved_mixture_state_from_fit(&saved_fit),
                 sas_state: saved_sas_state_from_fit(&saved_fit),
             },
@@ -1186,6 +1186,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             | FittedLinkState::BetaLogistic { covariance, .. } => {
                 payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
             }
+            FittedLinkState::LatentCLogLog { .. } => {}
             FittedLinkState::Standard(_) => {}
         }
         payload.training_headers = Some(ds.headers.clone());
@@ -8082,6 +8083,15 @@ use gam::estimate::{ensure_finite_scalar, validate_all_finite};
 fn saved_mixture_state_from_fit(fit: &UnifiedFitResult) -> Option<gam::types::MixtureLinkState> {
     match &fit.fitted_link {
         FittedLinkState::Mixture { state, .. } => Some(state.clone()),
+        _ => None,
+    }
+}
+
+fn saved_latent_cloglog_state_from_fit(
+    fit: &UnifiedFitResult,
+) -> Option<gam::types::LatentCLogLogState> {
+    match &fit.fitted_link {
+        FittedLinkState::LatentCLogLog { state } => Some(*state),
         _ => None,
     }
 }

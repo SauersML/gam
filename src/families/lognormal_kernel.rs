@@ -4,7 +4,7 @@
 //! `U ~ N(μ, σ²)`, is the only special function required by all latent families.
 //!
 //! It satisfies exact μ-recurrences (see [`kernel_mu_jet`]) and heat-equation
-//! σ-identities (see [`SigmaJet`]), so the full derivative calculus for PIRLS,
+//! σ-identities, so the full derivative calculus for PIRLS,
 //! LAML outer, and learnable σ reduces to evaluating kernel bundles at shifted
 //! arguments.
 //!
@@ -606,28 +606,77 @@ impl LatentSurvivalRowJet {
     }
 }
 
-// ─── Heat-equation σ-derivatives ─────────────────────────────────────────────
+// ─── Prediction semantics ────────────────────────────────────────────────────
 
-/// Compute `∂_t f` and `∂_{tt} f` where `t = log(σ)`, from μ-jet values.
+/// Prediction mode for latent families.
 ///
-/// Uses the heat-equation identities:
-///   `∂_t f = σ² · ∂_{μμ} f`
-///   `∂_{tt} f = 2σ² · ∂_{μμ} f + σ⁴ · ∂_{μμμμ} f`
-#[derive(Clone, Copy, Debug)]
-pub struct SigmaJet {
-    /// ∂_t f where t = log σ
-    pub dt: f64,
-    /// ∂_{tt} f where t = log σ
-    pub dtt: f64,
+/// The model produces a latent linear predictor η = X·β.  How that predictor
+/// is turned into a user-facing prediction depends on the stored reference
+/// information.
+///
+/// This prevents the library from returning an unlabeled "probability" when
+/// the reference mass/horizon is unknown.
+#[derive(Clone, Debug)]
+pub enum LatentPredictionMode {
+    /// Raw latent linear predictor η (always available).
+    LatentEta,
+    /// Relative rate: exp(η).  Interpretable as a hazard ratio relative to
+    /// a reference population at η = 0.
+    RelativeRate,
+    /// Standardized risk at a reference horizon.  Only available when the
+    /// model stores a reference mass (or mass grid) so that the absolute
+    /// probability can be computed.
+    StandardizedRisk {
+        /// Reference cumulative mass at the prediction horizon.
+        reference_mass: f64,
+    },
+    /// Full risk curve over an age/mass grid.  Available when the model
+    /// stores a baseline mass curve.
+    ReferenceCurve {
+        /// Grid of evaluation points.
+        mass_grid: Vec<f64>,
+    },
 }
 
-impl SigmaJet {
-    pub fn from_mu_jet(d2_mu: f64, d4_mu: f64, sigma: f64) -> Self {
-        let s2 = sigma * sigma;
-        let s4 = s2 * s2;
-        Self {
-            dt: s2 * d2_mu,
-            dtt: 2.0 * s2 * d2_mu + s4 * d4_mu,
+/// Compute predictions from a latent-family model.
+///
+/// Given the fitted linear predictor η and a prediction mode, returns the
+/// appropriate user-facing prediction.
+pub fn latent_predict(
+    quadctx: &QuadratureContext,
+    eta: &[f64],
+    sigma: f64,
+    mode: &LatentPredictionMode,
+) -> Result<Vec<f64>, EstimationError> {
+    match mode {
+        LatentPredictionMode::LatentEta => Ok(eta.to_vec()),
+        LatentPredictionMode::RelativeRate => Ok(eta.iter().map(|&e| e.exp()).collect()),
+        LatentPredictionMode::StandardizedRisk { reference_mass } => {
+            let log_m = reference_mass.ln();
+            eta.iter()
+                .map(|&e| {
+                    let alpha = e + log_m;
+                    let jet = latent_cloglog_jet5(quadctx, alpha, sigma)?;
+                    Ok(jet.mean)
+                })
+                .collect()
+        }
+        LatentPredictionMode::ReferenceCurve { mass_grid } => {
+            // Return risk at the first grid point for now; a full curve
+            // would need a matrix output which is outside this scalar API.
+            if mass_grid.is_empty() {
+                return Err(EstimationError::InvalidInput(
+                    "ReferenceCurve prediction requires a non-empty mass grid".to_string(),
+                ));
+            }
+            let log_m = mass_grid.last().unwrap().ln();
+            eta.iter()
+                .map(|&e| {
+                    let alpha = e + log_m;
+                    let jet = latent_cloglog_jet5(quadctx, alpha, sigma)?;
+                    Ok(jet.mean)
+                })
+                .collect()
         }
     }
 }
