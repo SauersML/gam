@@ -8,7 +8,9 @@ use crate::families::custom_family::{
     ParameterBlockState, fit_custom_family,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
-use crate::families::lognormal_kernel::{LatentSurvivalRow, LatentSurvivalRowJet};
+use crate::families::lognormal_kernel::{
+    FrailtySpec, HazardLoading, LatentSurvivalRow, LatentSurvivalRowJet,
+};
 use crate::estimate::UnifiedFitResult;
 use crate::quadrature::QuadratureContext;
 use crate::smooth::{
@@ -44,10 +46,10 @@ pub fn fit_latent_survival_terms(
     rows: Vec<LatentSurvivalRow>,
     weights: Array1<f64>,
     spec: TermCollectionSpec,
-    latent_sd: f64,
+    frailty: FrailtySpec,
     options: &BlockwiseFitOptions,
 ) -> Result<LatentSurvivalTermFitResult, String> {
-    validate_latent_survival_inputs(data, &rows, &weights, latent_sd)?;
+    let latent_sd = validate_latent_survival_inputs(data, &rows, &weights, &frailty)?;
     let design = build_term_collection_design(data, &spec).map_err(|e| e.to_string())?;
     let resolvedspec =
         freeze_term_collection_from_design(&spec, &design).map_err(|e| e.to_string())?;
@@ -70,8 +72,8 @@ fn validate_latent_survival_inputs(
     data: ArrayView2<'_, f64>,
     rows: &[LatentSurvivalRow],
     weights: &Array1<f64>,
-    latent_sd: f64,
-) -> Result<(), String> {
+    frailty: &FrailtySpec,
+) -> Result<f64, String> {
     if data.nrows() == 0 {
         return Err("latent-survival requires a non-empty dataset".to_string());
     }
@@ -83,12 +85,33 @@ fn validate_latent_survival_inputs(
             weights.len()
         ));
     }
-    if !latent_sd.is_finite() || latent_sd < 0.0 {
-        return Err(format!(
-            "latent-survival requires latent_sd >= 0, got {latent_sd}"
-        ));
+    match frailty {
+        FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(sigma),
+            loading: HazardLoading::Full,
+        } if sigma.is_finite() && *sigma >= 0.0 => Ok(*sigma),
+        FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(sigma),
+            loading: HazardLoading::Full,
+        } => Err(format!(
+            "latent-survival requires a finite fixed hazard-multiplier sigma >= 0, got {sigma}"
+        )),
+        FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(_),
+            loading,
+        } => Err(format!(
+            "latent-survival currently supports only HazardLoading::Full, got {loading:?}"
+        )),
+        FrailtySpec::HazardMultiplier { sigma_fixed: None, .. } => Err(
+            "latent-survival currently requires a fixed hazard-multiplier sigma".to_string(),
+        ),
+        FrailtySpec::GaussianShift { .. } => Err(
+            "latent-survival requires HazardMultiplier frailty, not GaussianShift".to_string(),
+        ),
+        FrailtySpec::None => Err(
+            "latent-survival requires a fixed HazardMultiplier frailty specification".to_string(),
+        ),
     }
-    Ok(())
 }
 
 fn build_eta_blockspec(

@@ -16,7 +16,7 @@ use crate::families::gamlss::{
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
 use crate::families::latent_survival::{LatentSurvivalTermFitResult, fit_latent_survival_terms};
-use crate::families::lognormal_kernel::LatentSurvivalRow;
+use crate::families::lognormal_kernel::{FrailtySpec, LatentSurvivalRow};
 use crate::families::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalLocationScaleTermFitResult,
     SurvivalLocationScaleTermSpec, fit_survival_location_scale_terms,
@@ -120,7 +120,7 @@ pub struct LatentSurvivalFitRequest<'a> {
     pub rows: Vec<LatentSurvivalRow>,
     pub weights: Array1<f64>,
     pub spec: TermCollectionSpec,
-    pub latent_sd: f64,
+    pub frailty: FrailtySpec,
     pub options: BlockwiseFitOptions,
 }
 
@@ -748,7 +748,7 @@ fn fit_latent_survival_model(
         request.rows,
         request.weights,
         request.spec,
-        request.latent_sd,
+        request.frailty,
         &request.options,
     )
 }

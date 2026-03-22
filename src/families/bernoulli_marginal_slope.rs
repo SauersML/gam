@@ -1585,8 +1585,10 @@ fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
 }
 
 fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
-    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
-    1.0 / (1.0 + sigma * sigma).sqrt()
+    crate::families::lognormal_kernel::ProbitFrailtyScale::new(
+        gaussian_frailty_sd.unwrap_or(0.0),
+    )
+    .s
 }
 
 #[inline]
@@ -7500,6 +7502,7 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -7586,6 +7589,7 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -7685,6 +7689,7 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -8144,6 +8149,7 @@ mod tests {
                 y: Arc::new(array![0.0, 1.0, 1.0]),
                 weights: Arc::new(array![1.0, 0.7, 1.3]),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -8271,6 +8277,7 @@ mod tests {
                 y: Arc::new(array![0.0, 1.0, 0.0]),
                 weights: Arc::new(Array1::ones(3)),
                 z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -8328,6 +8335,7 @@ mod tests {
             y: Arc::new(array![1.0]),
             weights: Arc::new(array![1.2]),
             z: Arc::new(array![0.3]),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0
             ]])),
@@ -8450,6 +8458,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -8545,6 +8554,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -8635,6 +8645,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -8728,6 +8739,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -8821,6 +8833,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -8943,6 +8956,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -9069,6 +9083,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9214,6 +9229,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9312,6 +9328,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -9387,6 +9404,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -9460,6 +9478,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9540,6 +9559,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9642,6 +9662,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9763,6 +9784,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9907,6 +9929,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -10002,6 +10025,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -10097,6 +10121,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -10203,6 +10228,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -10307,6 +10333,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -10428,6 +10455,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -10536,6 +10564,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -10642,6 +10671,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -10772,6 +10802,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -10876,6 +10907,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -10978,6 +11010,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -11096,6 +11129,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -11178,6 +11212,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -11260,6 +11295,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -11345,6 +11381,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -11430,6 +11467,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -11506,6 +11544,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -11582,6 +11621,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -11641,6 +11681,7 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -11690,6 +11731,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -11795,6 +11837,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -11909,6 +11952,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -12048,6 +12092,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -12173,6 +12218,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
+            gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),

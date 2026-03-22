@@ -13,7 +13,7 @@ use crate::families::custom_family::{
     BlockWorkingSet, CustomFamily, FamilyEvaluation, ParameterBlockState,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
-use crate::families::lognormal_kernel::BinaryCloglogRowJet;
+use crate::families::lognormal_kernel::{BinaryCloglogRowJet, LatentPredictionMode, latent_predict};
 use crate::quadrature::QuadratureContext;
 use ndarray::Array1;
 use std::sync::Arc;
@@ -78,6 +78,20 @@ impl LatentCloglogBinomialFamily {
             parameternames: Self::parameter_names(),
             parameter_links: Self::parameter_links(),
         }
+    }
+}
+
+impl LatentCloglogBinomialFamily {
+    /// Predict from fitted coefficients using explicit prediction semantics.
+    ///
+    /// `mode` controls what the output means (latent eta, relative rate, or
+    /// standardized risk at a reference mass).
+    pub fn predict(
+        &self,
+        eta: &[f64],
+        mode: &LatentPredictionMode,
+    ) -> Result<Vec<f64>, crate::estimate::EstimationError> {
+        latent_predict(&self.quadctx, eta, self.latent_sd, mode)
     }
 }
 
