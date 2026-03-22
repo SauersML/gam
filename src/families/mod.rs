@@ -4,6 +4,7 @@ pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;
 pub mod latent_cloglog_binomial;
+pub mod latent_cloglog_binomial_learnable_sigma;
 pub mod latent_survival;
 pub mod lognormal_kernel;
 pub mod row_kernel;

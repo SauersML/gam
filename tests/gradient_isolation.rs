@@ -43,6 +43,7 @@ fn make_binary_external_problem(
 
 fn default_logit_opts() -> ExternalOptimOptions {
     ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -260,6 +261,7 @@ fn conditioned_helpercost_matches_fittedobjective() {
 
     let opts = ExternalOptimOptions {
         family: LikelihoodFamily::GaussianIdentity,
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,

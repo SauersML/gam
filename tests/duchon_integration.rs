@@ -87,6 +87,7 @@ fn fit_duchon_simulated_10d(
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -192,6 +193,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -357,6 +359,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,
@@ -495,6 +498,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
             &spec,
             LikelihoodFamily::BinomialLogit,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,

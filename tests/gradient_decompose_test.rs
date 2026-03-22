@@ -445,6 +445,7 @@ fn test_standalone_cost_fd_vs_library_cost_fd() {
     let rho = array![2.0];
 
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -554,6 +555,7 @@ fn test_single_penalty_logit_gradient() {
     let s_list = blockwise_penalties(vec![s1]);
 
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -608,6 +610,7 @@ fn test_two_overlapping_penalties_logit_gradient() {
     let s_list = blockwise_penalties(vec![s1, s2]);
 
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -665,6 +668,7 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
     let s_list = blockwise_penalties(vec![s1, s2]);
 
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -737,6 +741,7 @@ fn test_gaussian_gradient_vs_fd() {
     let s_list = blockwise_penalties(vec![s1, s2]);
 
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -788,6 +793,7 @@ fn test_probit_single_penalty_gradient() {
     let s_list = blockwise_penalties(vec![s1]);
 
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -840,6 +846,7 @@ fn test_probit_overlapping_penalties_gradient() {
     let s_list = blockwise_penalties(vec![s1, s2]);
 
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,

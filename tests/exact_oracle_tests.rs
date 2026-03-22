@@ -114,6 +114,7 @@ fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f6
     let offset = Array1::zeros(y.len());
     let s_list = vec![BlockwisePenalty::new(0..2, Array2::eye(2))];
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -369,6 +370,7 @@ fn test_externalgradient_adapter_isolated_matchesfd_direction() {
     ];
 
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,

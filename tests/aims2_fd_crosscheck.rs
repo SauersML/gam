@@ -104,6 +104,7 @@ fn build_gaussian_external_problem(
 fn gaussian_opts(nullspace_dim: usize) -> ExternalOptimOptions {
     ExternalOptimOptions {
         family: LikelihoodFamily::GaussianIdentity,
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -213,6 +214,7 @@ fn profiled_gaussian_reml_gradient_matches_fd_two_penalties() {
 
     let opts = ExternalOptimOptions {
         family: LikelihoodFamily::GaussianIdentity,
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -304,6 +306,7 @@ fn profiled_gaussian_reml_hessian_fd_symmetric_and_finite() {
 
     let opts = ExternalOptimOptions {
         family: LikelihoodFamily::GaussianIdentity,
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,

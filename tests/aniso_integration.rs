@@ -107,6 +107,7 @@ fn aniso_matern_recovers_signal_axis() {
         spec,
         family: LikelihoodFamily::BinomialLogit,
         options: FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,

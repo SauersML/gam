@@ -422,6 +422,101 @@ impl BinaryCloglogRowJet {
     }
 }
 
+// ─── Extended 2-block row jet for learnable σ ────────────────────────────────
+
+/// Extended row jet for the binary latent-cloglog model with learnable σ.
+///
+/// Returns per-block (μ and t = log σ) score and curvature needed for
+/// a 2-block diagonal IRLS family.  The σ-derivatives are computed from
+/// the heat-equation identities without numerical differentiation.
+#[derive(Clone, Copy, Debug)]
+pub struct BinaryCloglogRowJet2Block {
+    pub log_lik: f64,
+    /// dℓ/dμ
+    pub score_mu: f64,
+    /// −d²ℓ/dμ² (observed curvature for μ block)
+    pub neg_hessian_mu: f64,
+    /// dℓ/dt where t = log σ
+    pub score_t: f64,
+    /// −d²ℓ/dt² (observed curvature for t block)
+    pub neg_hessian_t: f64,
+}
+
+impl BinaryCloglogRowJet2Block {
+    /// Evaluate for the 2-block family.
+    ///
+    /// Uses the heat-equation identities:
+    ///   ∂_t ℓ = σ² · ∂_{μμ} ℓ
+    ///   ∂_{tt} ℓ = 2σ² · ∂_{μμ} ℓ + σ⁴ · ∂_{μμμμ} ℓ
+    pub fn evaluate(
+        quadctx: &QuadratureContext,
+        y: f64,
+        eta: f64,
+        log_mass: f64,
+        sigma: f64,
+    ) -> Result<Self, EstimationError> {
+        let alpha = eta + log_mass;
+        let jet = latent_cloglog_jet5(quadctx, alpha, sigma)?;
+
+        let p = jet.mean.clamp(LOG_FLOOR, 1.0 - LOG_FLOOR);
+        let q = 1.0 - p;
+
+        let log_lik = if y > 0.5 { p.ln() } else { q.ln() };
+        let dp = jet.d1.max(0.0);
+        let ddp = jet.d2;
+        let dddp = jet.d3;
+        let ddddp = jet.d4;
+
+        // ── μ-derivatives of log-likelihood ──
+        let w = if y > 0.5 { 1.0 / p } else { -1.0 / q };
+        let score_mu = w * dp;
+
+        let dw = -y * dp * dp / (p * p) - (1.0 - y) * dp * dp / (q * q);
+        let d2_ll_mu = w * ddp + dw * dp;
+
+        // d⁴ℓ/dμ⁴ via the 4th log-derivative formula:
+        // We need d2, d3, d4 of log(p) and log(q) = log(1-p).
+        //
+        // d(log f)/dμ   = f'/f
+        // d²(log f)/dμ² = f''/f − (f'/f)²
+        // d³(log f)/dμ³ = f'''/f − 3(f'/f)(f''/f) + 2(f'/f)³
+        // d⁴(log f)/dμ⁴ = f''''/f − 4(f'/f)(f'''/f) − 3(f''/f)² + 12(f'/f)²(f''/f) − 6(f'/f)⁴
+        let r1_p = dp / p;
+        let r2_p = ddp / p;
+        let r3_p = dddp / p;
+        let r4_p = ddddp / p;
+        let d4_log_p = r4_p - 4.0 * r1_p * r3_p - 3.0 * r2_p * r2_p
+            + 12.0 * r1_p * r1_p * r2_p
+            - 6.0 * r1_p * r1_p * r1_p * r1_p;
+
+        let r1_q = -dp / q;
+        let r2_q = -ddp / q;
+        let r3_q = -dddp / q;
+        let r4_q = -ddddp / q;
+        let d4_log_q = r4_q - 4.0 * r1_q * r3_q - 3.0 * r2_q * r2_q
+            + 12.0 * r1_q * r1_q * r2_q
+            - 6.0 * r1_q * r1_q * r1_q * r1_q;
+
+        let d4_ll_mu = y * d4_log_p + (1.0 - y) * d4_log_q;
+
+        // ── σ-derivatives via heat equation ──
+        // ∂_t ℓ = σ² · ∂²ℓ/∂μ²
+        // ∂²_t ℓ = 2σ² · ∂²ℓ/∂μ² + σ⁴ · ∂⁴ℓ/∂μ⁴
+        let s2 = sigma * sigma;
+        let s4 = s2 * s2;
+        let score_t = s2 * d2_ll_mu;
+        let d2_ll_t = 2.0 * s2 * d2_ll_mu + s4 * d4_ll_mu;
+
+        Ok(Self {
+            log_lik,
+            score_mu,
+            neg_hessian_mu: -d2_ll_mu,
+            score_t,
+            neg_hessian_t: -d2_ll_t,
+        })
+    }
+}
+
 // ─── Latent survival sufficient statistics ───────────────────────────────────
 
 /// Event type for compiled survival sufficient statistics.
@@ -662,21 +757,14 @@ pub fn latent_predict(
                 .collect()
         }
         LatentPredictionMode::ReferenceCurve { mass_grid } => {
-            // Return risk at the first grid point for now; a full curve
-            // would need a matrix output which is outside this scalar API.
             if mass_grid.is_empty() {
                 return Err(EstimationError::InvalidInput(
                     "ReferenceCurve prediction requires a non-empty mass grid".to_string(),
                 ));
             }
-            let log_m = mass_grid.last().unwrap().ln();
-            eta.iter()
-                .map(|&e| {
-                    let alpha = e + log_m;
-                    let jet = latent_cloglog_jet5(quadctx, alpha, sigma)?;
-                    Ok(jet.mean)
-                })
-                .collect()
+            Err(EstimationError::InvalidInput(
+                "ReferenceCurve prediction requires a dedicated curve-valued API".to_string(),
+            ))
         }
     }
 }

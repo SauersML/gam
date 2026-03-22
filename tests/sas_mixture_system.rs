@@ -34,6 +34,7 @@ fn one_penalty_for_non_intercept(p: usize) -> Vec<BlockwisePenalty> {
 
 fn base_fit_options() -> FitOptions {
     FitOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,

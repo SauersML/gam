@@ -62,6 +62,7 @@ fn make_problem(
 #[test]
 fn tracethird_auto_correction_againstfd() {
     let opts = ExternalOptimOptions {
+        latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,

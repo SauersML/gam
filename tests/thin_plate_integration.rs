@@ -50,6 +50,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
         &s_list,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -137,6 +138,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         &s_list,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -263,6 +265,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
         &s_list,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,

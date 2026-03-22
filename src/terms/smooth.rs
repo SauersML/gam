@@ -12612,6 +12612,7 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -13560,6 +13561,7 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -13671,6 +13673,7 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -13751,6 +13754,7 @@ mod tests {
         assert_eq!(spatial_length_scale_term_indices(&spec), vec![0]);
 
         let fit_opts = FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -13854,6 +13858,7 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -14048,6 +14053,7 @@ mod tests {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,
@@ -14298,6 +14304,7 @@ mod tests {
     fn adaptive_exact_psigradient_symmetrizes_nearly_symmetrichessian() {
         let family = SpatialAdaptiveExactFamily {
             family: LikelihoodFamily::GaussianIdentity,
+            latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
             y: Arc::new(array![0.0, 0.0]),
@@ -14547,6 +14554,7 @@ mod tests {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,
@@ -14632,6 +14640,7 @@ mod tests {
             &spec,
             LikelihoodFamily::BinomialSas,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: Some(crate::types::SasLinkSpec {
@@ -14715,6 +14724,7 @@ mod tests {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,
@@ -14772,6 +14782,7 @@ mod tests {
         ];
         let base_family = SpatialAdaptiveExactFamily {
             family: LikelihoodFamily::GaussianIdentity,
+            latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
             y: Arc::new(y.clone()),
@@ -14917,6 +14928,7 @@ mod tests {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,
@@ -14969,6 +14981,7 @@ mod tests {
         ];
         let base_family = SpatialAdaptiveExactFamily {
             family: LikelihoodFamily::GaussianIdentity,
+            latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
             y: Arc::new(y.clone()),
@@ -15085,6 +15098,7 @@ mod tests {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,

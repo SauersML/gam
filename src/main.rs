@@ -10612,6 +10612,7 @@ mod tests {
             FittedFamily::Standard {
                 likelihood: family,
                 link: Some(link),
+                latent_cloglog_state: None,
                 mixture_state: None,
                 sas_state: None,
             },
