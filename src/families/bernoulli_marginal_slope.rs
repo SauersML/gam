@@ -25,7 +25,7 @@ use crate::smooth::{
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-use ndarray::{array, Array1, Array2, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
@@ -109,7 +109,6 @@ struct BernoulliMarginalSlopeFamily {
     marginal_design: DesignMatrix,
     logslope_design: DesignMatrix,
     score_warp: Option<DeviationRuntime>,
-    score_warp_obs_design: Option<DesignMatrix>,
     link_dev: Option<DeviationRuntime>,
 }
 
@@ -184,7 +183,10 @@ impl DeviationRuntime {
                 self.span_count()
             ));
         }
-        Ok((self.span_left_points[span_idx], self.span_right_points[span_idx]))
+        Ok((
+            self.span_left_points[span_idx],
+            self.span_right_points[span_idx],
+        ))
     }
 
     fn span_index_for(&self, value: f64) -> Result<usize, String> {
@@ -285,10 +287,7 @@ impl DeviationRuntime {
         }
     }
 
-    pub(crate) fn exact_monotonicity_min_slack(
-        &self,
-        beta: &Array1<f64>,
-    ) -> Result<f64, String> {
+    pub(crate) fn exact_monotonicity_min_slack(&self, beta: &Array1<f64>) -> Result<f64, String> {
         if beta.len() != self.basis_dim {
             return Err(format!(
                 "deviation monotonicity length mismatch: got {}, expected {}",
@@ -1468,7 +1467,6 @@ impl HyperOperator for BernoulliBlockHessianOperator {
 struct BernoulliMarginalSlopeRowExactContext {
     intercept: f64,
     m_a: f64,
-    h_obs_base: f64,
 }
 
 struct BernoulliMarginalSlopeFlexRowScratch {
@@ -1514,6 +1512,31 @@ impl BernoulliMarginalSlopeFlexRowScratch {
             self.hess.fill(0.0);
         }
     }
+}
+
+#[inline]
+fn add_scaled_coeff4(target: &mut [f64; 4], source: &[f64; 4], scale: f64) {
+    for j in 0..4 {
+        target[j] += scale * source[j];
+    }
+}
+
+#[inline]
+fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
+    ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
+}
+
+struct ObservedDenestedCellPartials {
+    coeff: [f64; 4],
+    dc_da: [f64; 4],
+    dc_db: [f64; 4],
+    dc_daa: [f64; 4],
+    dc_dab: [f64; 4],
+    dc_dbb: [f64; 4],
+    dc_daaa: [f64; 4],
+    dc_daab: [f64; 4],
+    dc_dabb: [f64; 4],
+    dc_dbbb: [f64; 4],
 }
 
 struct BernoulliExactNewtonAccumulator {
@@ -1601,7 +1624,6 @@ const ROW_CHUNK_SIZE: usize = 1024;
 struct BernoulliMarginalSlopeExactEvalCache {
     slices: BlockSlices,
     primary: PrimarySlices,
-    score_warp_obs: Option<(DesignMatrix, Array1<f64>)>,
     /// Pre-solved row contexts (intercept, M_a, observed score-warp value).
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
 }
@@ -1851,8 +1873,7 @@ impl BernoulliMarginalSlopeFamily {
         b: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
-    ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String>
-    {
+    ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
         let score_tail = 8.0;
         let mut score_breaks = if let Some(runtime) = self.score_warp.as_ref() {
             runtime.breakpoints().to_vec()
@@ -1935,17 +1956,13 @@ impl BernoulliMarginalSlopeFamily {
                 a,
                 slope,
             );
-            let shift = a - partition_cell.link_span.left;
-            let d2c_da2 = [
-                2.0 * partition_cell.link_span.c2 + 6.0 * partition_cell.link_span.c3 * shift,
-                6.0 * partition_cell.link_span.c3 * slope,
-                0.0,
-                0.0,
-            ];
-            f_a += exact_kernel::cell_first_derivative_from_moments(
-                &dc_da,
-                &state.moments,
-            )?;
+            let (d2c_da2, _, _) = exact_kernel::denested_cell_second_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
+            f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
             f_aa += exact_kernel::cell_second_derivative_from_moments(
                 cell,
                 &dc_da,
@@ -1994,20 +2011,6 @@ impl BernoulliMarginalSlopeFamily {
         } else {
             Ok((eta0.clone(), Array1::ones(eta0.len())))
         }
-    }
-
-    fn score_warp_obs(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<Option<(DesignMatrix, Array1<f64>)>, String> {
-        let Some(obs_design) = self.score_warp_obs_design.as_ref() else {
-            return Ok(None);
-        };
-        if self.score_warp.is_none() {
-            return Ok(None);
-        }
-        let beta_h = &block_states[2].beta;
-        Ok(Some((obs_design.clone(), obs_design.dot(beta_h))))
     }
 
     fn solve_row_intercept_base(
@@ -2072,11 +2075,10 @@ impl BernoulliMarginalSlopeFamily {
                 bracket_step *= 2.0;
             }
             let Some((hi_found, f_hi_found)) = found else {
-                // Failed to bracket from below after 64 doublings.
-                // Return the last point as best-effort; the residual
-                // check at the end will decide if it's acceptable.
-                let (_, f_deriv_lo, _) = eval(lo)?;
-                return Ok((lo, f_deriv_lo.max(1e-30)));
+                return Err(format!(
+                    "bernoulli marginal-slope intercept solve failed to bracket root from below: \
+                     q={marginal_eta:.6}, slope={slope:.6}, last_a={lo:.6}"
+                ));
             };
             hi = hi_found;
             let (f_lo_val, _, _) = eval(lo)?;
@@ -2096,8 +2098,10 @@ impl BernoulliMarginalSlopeFamily {
                 bracket_step *= 2.0;
             }
             let Some((lo_found, f_lo_found)) = found else {
-                let (_, f_deriv_hi, _) = eval(hi)?;
-                return Ok((hi, f_deriv_hi.max(1e-30)));
+                return Err(format!(
+                    "bernoulli marginal-slope intercept solve failed to bracket root from above: \
+                     q={marginal_eta:.6}, slope={slope:.6}, last_a={hi:.6}"
+                ));
             };
             lo = lo_found;
             let (f_hi_val, _, _) = eval(hi)?;
@@ -2175,12 +2179,10 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
         if !best_deriv.is_finite() || best_deriv <= 0.0 {
-            // When F_a is non-positive the link is non-monotone at this
-            // configuration.  Return a small positive derivative to let
-            // the caller compute a finite (if imprecise) IFT derivative
-            // rather than crashing the REML loop.
-            let fallback_deriv = normal_pdf(best_a).max(1e-30);
-            return Ok((best_a, fallback_deriv));
+            return Err(format!(
+                "bernoulli marginal-slope intercept solve produced non-positive calibration derivative: \
+                 M_a={best_deriv:.3e} at a={best_a:.6}"
+            ));
         }
         Ok((best_a, best_deriv))
     }
@@ -2189,7 +2191,6 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
-        score_warp_obs: Option<&(DesignMatrix, Array1<f64>)>,
     ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
         let marginal_eta = block_states[0].eta[row];
         // The log-slope block now parameterizes the signed slope directly.
@@ -2198,11 +2199,6 @@ impl BernoulliMarginalSlopeFamily {
             block_states.last().map(|state| &state.beta)
         } else {
             None
-        };
-        let h_obs_base = if let Some((_, dev_obs)) = score_warp_obs {
-            dev_obs[row]
-        } else {
-            0.0
         };
         let (intercept, m_a) = if self.flex_active() {
             self.solve_row_intercept_base(
@@ -2217,7 +2213,6 @@ impl BernoulliMarginalSlopeFamily {
         Ok(BernoulliMarginalSlopeRowExactContext {
             intercept,
             m_a,
-            h_obs_base,
         })
     }
 
@@ -2240,19 +2235,15 @@ impl BernoulliMarginalSlopeFamily {
             self.link_dev.is_some(),
         );
         let primary = primary_slices(&slices);
-        let score_warp_obs = self.score_warp_obs(block_states)?;
         let n = self.y.len();
         let row_contexts: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
-            .map(|row| {
-                self.build_row_exact_context(row, block_states, score_warp_obs.as_ref())
-            })
+            .map(|row| self.build_row_exact_context(row, block_states))
             .collect();
         let row_contexts = row_contexts?;
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
-            score_warp_obs,
             row_contexts,
         })
     }
@@ -2646,17 +2637,9 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         primary: &PrimarySlices,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        score_warp_obs: Option<&(DesignMatrix, Array1<f64>)>,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         // Flex path: full IFT analytic kernel.
         if self.flex_active() {
-            let has_score_obs = score_warp_obs.is_some();
-            if has_score_obs && primary.h.is_none() {
-                return Err(
-                    "score-warp observed design present without a primary score-warp slice"
-                        .to_string(),
-                );
-            }
             let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
             let neglog = self.compute_row_analytic_flex_into(
                 row,
@@ -2715,23 +2698,48 @@ impl BernoulliMarginalSlopeFamily {
         need_hessian: bool,
         scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
     ) -> Result<f64, String> {
-        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
-
-        let r = primary.total;
-        scratch.reset(need_hessian);
         let q = block_states[0].eta[row];
         let b = block_states[1].eta[row];
-        let a = row_ctx.intercept;
-        let f_a = row_ctx.m_a;
-        let y_i = self.y[row];
-        let w_i = self.weights[row];
-        let s_y = 2.0 * y_i - 1.0;
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = if self.link_dev.is_some() {
             block_states.last().map(|st| &st.beta)
         } else {
             None
         };
+        self.compute_row_analytic_flex_from_parts_into(
+            row,
+            primary,
+            q,
+            b,
+            beta_h,
+            beta_w,
+            row_ctx,
+            need_hessian,
+            scratch,
+        )
+    }
+
+    fn compute_row_analytic_flex_from_parts_into(
+        &self,
+        row: usize,
+        primary: &PrimarySlices,
+        q: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        need_hessian: bool,
+        scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
+    ) -> Result<f64, String> {
+        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
+
+        let r = primary.total;
+        scratch.reset(need_hessian);
+        let a = row_ctx.intercept;
+        let f_a = row_ctx.m_a;
+        let y_i = self.y[row];
+        let w_i = self.weights[row];
+        let s_y = 2.0 * y_i - 1.0;
         let phi_q = normal_pdf(q);
         let inv_ma = 1.0 / f_a;
         let h_range = primary.h.as_ref();
@@ -2870,64 +2878,38 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let z_obs = self.z[row];
-        let h_obs = row_ctx.h_obs_base;
         let u_obs = a + b * z_obs;
-        let link_basis = if let Some(runtime) = link_runtime {
-            Some(runtime.design(&array![u_obs])?)
-        } else {
-            None
-        };
-        let link_d1 = if let Some(runtime) = link_runtime {
-            Some(runtime.first_derivative_design(&array![u_obs])?)
-        } else {
-            None
-        };
-        let link_d2 = if let Some(runtime) = link_runtime {
-            Some(runtime.second_derivative_design(&array![u_obs])?)
-        } else {
-            None
-        };
-        let link_dev_obs = if let (Some(basis), Some(beta)) = (link_basis.as_ref(), beta_w) {
-            basis.row(0).dot(beta)
-        } else {
-            0.0
-        };
-        let link_d1_obs = if let (Some(d1), Some(beta)) = (link_d1.as_ref(), beta_w) {
-            d1.row(0).dot(beta)
-        } else {
-            0.0
-        };
-        let link_d2_obs = if let (Some(d2), Some(beta)) = (link_d2.as_ref(), beta_w) {
-            d2.row(0).dot(beta)
-        } else {
-            0.0
-        };
-        let chi_obs = 1.0 + link_d1_obs;
-        let eta_aa_obs = link_d2_obs;
-        let eta_val = a + b * z_obs + b * h_obs + link_dev_obs;
+        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+        let chi_obs = eval_coeff4_at(&obs.dc_da, z_obs);
+        let eta_aa_obs = eval_coeff4_at(&obs.dc_daa, z_obs);
+        let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
 
-        let score_obs_basis = if let Some(runtime) = score_runtime {
-            Some(runtime.design(&array![z_obs])?)
-        } else {
-            None
-        };
         let rho = &mut scratch.rho;
         let tau = &mut scratch.tau;
         rho.fill(0.0);
         tau.fill(0.0);
-        rho[1] = z_obs + h_obs + z_obs * link_d1_obs;
-        tau[1] = z_obs * link_d2_obs;
-        if let (Some(h_range), Some(design)) = (h_range, score_obs_basis.as_ref()) {
+        rho[1] = eval_coeff4_at(&obs.dc_db, z_obs);
+        tau[1] = eval_coeff4_at(&obs.dc_dab, z_obs);
+        if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
             for local_idx in 0..h_range.len() {
-                rho[h_range.start + local_idx] = b * design[[0, local_idx]];
+                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                rho[h_range.start + local_idx] = eval_coeff4_at(
+                    &exact::score_basis_cell_coefficients(basis_span, b),
+                    z_obs,
+                );
             }
         }
-        if let (Some(w_range), Some(basis), Some(d1)) =
-            (w_range, link_basis.as_ref(), link_d1.as_ref())
-        {
+        if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
             for local_idx in 0..w_range.len() {
-                rho[w_range.start + local_idx] = basis[[0, local_idx]];
-                tau[w_range.start + local_idx] = d1[[0, local_idx]];
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                rho[w_range.start + local_idx] = eval_coeff4_at(
+                    &exact::link_basis_cell_coefficients(basis_span, a, b),
+                    z_obs,
+                );
+                tau[w_range.start + local_idx] = eval_coeff4_at(
+                    &exact::link_basis_cell_coefficient_partials(basis_span, a, b).0,
+                    z_obs,
+                );
             }
         }
 
@@ -2947,48 +2929,60 @@ impl BernoulliMarginalSlopeFamily {
             hess.fill(0.0);
             for u in 0..r {
                 for v in u..r {
-                    let mut r_uv = 0.0;
-                    if u == 1 && v == 1 {
-                        r_uv = z_obs * z_obs * link_d2_obs;
-                    } else if u == 1 {
-                        if let Some(h_range) = h_range {
-                            if v >= h_range.start && v < h_range.end {
-                                let local_idx = v - h_range.start;
-                                let basis = score_obs_basis
-                                    .as_ref()
-                                    .ok_or_else(|| "missing score-warp observed basis".to_string())?;
-                                r_uv = basis[[0, local_idx]];
-                            }
-                        }
-                        if let Some(w_range) = w_range {
-                            if v >= w_range.start && v < w_range.end {
-                                let local_idx = v - w_range.start;
-                                let d1 = link_d1
-                                    .as_ref()
-                                    .ok_or_else(|| "missing link observed first derivative".to_string())?;
-                                r_uv = z_obs * d1[[0, local_idx]];
-                            }
-                        }
-                    } else if v == 1 {
-                        if let Some(h_range) = h_range {
-                            if u >= h_range.start && u < h_range.end {
-                                let local_idx = u - h_range.start;
-                                let basis = score_obs_basis
-                                    .as_ref()
-                                    .ok_or_else(|| "missing score-warp observed basis".to_string())?;
-                                r_uv = basis[[0, local_idx]];
-                            }
-                        }
-                        if let Some(w_range) = w_range {
-                            if u >= w_range.start && u < w_range.end {
-                                let local_idx = u - w_range.start;
-                                let d1 = link_d1
-                                    .as_ref()
-                                    .ok_or_else(|| "missing link observed first derivative".to_string())?;
-                                r_uv = z_obs * d1[[0, local_idx]];
-                            }
+                let mut r_uv = 0.0;
+                if u == 1 && v == 1 {
+                    r_uv = eval_coeff4_at(&obs.dc_dbb, z_obs);
+                } else if u == 1 {
+                    if let Some(h_range) = h_range {
+                        if v >= h_range.start && v < h_range.end {
+                            let local_idx = v - h_range.start;
+                            let runtime = score_runtime
+                                .ok_or_else(|| "missing score-warp runtime".to_string())?;
+                            let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                            r_uv = eval_coeff4_at(
+                                &exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                z_obs,
+                            );
                         }
                     }
+                    if let Some(w_range) = w_range {
+                        if v >= w_range.start && v < w_range.end {
+                            let local_idx = v - w_range.start;
+                            let runtime = link_runtime
+                                .ok_or_else(|| "missing link runtime".to_string())?;
+                            let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                            r_uv = eval_coeff4_at(
+                                &exact::link_basis_cell_coefficient_partials(basis_span, a, b).1,
+                                z_obs,
+                            );
+                        }
+                    }
+                } else if v == 1 {
+                    if let Some(h_range) = h_range {
+                        if u >= h_range.start && u < h_range.end {
+                            let local_idx = u - h_range.start;
+                            let runtime = score_runtime
+                                .ok_or_else(|| "missing score-warp runtime".to_string())?;
+                            let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                            r_uv = eval_coeff4_at(
+                                &exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                z_obs,
+                            );
+                        }
+                    }
+                    if let Some(w_range) = w_range {
+                        if u >= w_range.start && u < w_range.end {
+                            let local_idx = u - w_range.start;
+                            let runtime = link_runtime
+                                .ok_or_else(|| "missing link runtime".to_string())?;
+                            let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                            r_uv = eval_coeff4_at(
+                                &exact::link_basis_cell_coefficient_partials(basis_span, a, b).1,
+                                z_obs,
+                            );
+                        }
+                    }
+                }
                     let eta_uv = chi_obs * a_uv[[u, v]]
                         + eta_aa_obs * a_u[u] * a_u[v]
                         + tau[u] * a_u[v]
@@ -3005,9 +2999,107 @@ impl BernoulliMarginalSlopeFamily {
         Ok(neglog_val)
     }
 
+    fn primary_point_from_block_states(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &PrimarySlices,
+    ) -> Array1<f64> {
+        let mut point = Array1::<f64>::zeros(primary.total);
+        point[0] = block_states[0].eta[row];
+        point[1] = block_states[1].eta[row];
+        if let Some(h_range) = primary.h.as_ref() {
+            point
+                .slice_mut(s![h_range.start..h_range.end])
+                .assign(&block_states[2].beta);
+        }
+        if let Some(w_range) = primary.w.as_ref() {
+            let beta_w = block_states.last().expect("missing link deviation beta");
+            point
+                .slice_mut(s![w_range.start..w_range.end])
+                .assign(&beta_w.beta);
+        }
+        point
+    }
+
+    fn primary_point_components(
+        &self,
+        point: &Array1<f64>,
+        primary: &PrimarySlices,
+    ) -> (f64, f64, Option<Array1<f64>>, Option<Array1<f64>>) {
+        let beta_h = primary
+            .h
+            .as_ref()
+            .map(|range| point.slice(s![range.start..range.end]).to_owned());
+        let beta_w = primary
+            .w
+            .as_ref()
+            .map(|range| point.slice(s![range.start..range.end]).to_owned());
+        (point[0], point[1], beta_h, beta_w)
+    }
+
+    fn observed_denested_cell_partials(
+        &self,
+        row: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<ObservedDenestedCellPartials, String> {
+        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
+
+        let zero_score_span = exact::LocalSpanCubic {
+            left: -8.0,
+            right: 8.0,
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        let zero_link_span = exact::LocalSpanCubic {
+            left: a - 8.0 * (1.0 + b.abs()),
+            right: a + 8.0 * (1.0 + b.abs()),
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        let z_obs = self.z[row];
+        let u_obs = a + b * z_obs;
+        let score_span_obs = if let (Some(runtime), Some(beta_h)) = (self.score_warp.as_ref(), beta_h) {
+            runtime.local_cubic_at(beta_h, z_obs)?
+        } else {
+            zero_score_span
+        };
+        let link_span_obs = if let (Some(runtime), Some(beta_w)) = (self.link_dev.as_ref(), beta_w) {
+            runtime.local_cubic_at(beta_w, u_obs)?
+        } else {
+            zero_link_span
+        };
+        let coeff = exact::denested_cell_coefficients(score_span_obs, link_span_obs, a, b);
+        let (dc_da, dc_db) =
+            exact::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
+        let (dc_daa, dc_dab, dc_dbb) =
+            exact::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
+        let denested_third = exact::denested_cell_third_partials(link_span_obs);
+        Ok(ObservedDenestedCellPartials {
+            coeff,
+            dc_da,
+            dc_db,
+            dc_daa,
+            dc_dab,
+            dc_dbb,
+            dc_daaa: denested_third.0,
+            dc_daab: denested_third.1,
+            dc_dabb: denested_third.2,
+            dc_dbbb: denested_third.3,
+        })
+    }
+
     /// Third-derivative tensor contracted with direction `dir`:
     ///   out[k,l] = sum_m f_{klm} dir[m]
-    /// Fully analytic for both rigid and flex paths -- no AD jets.
+    /// Rigid path uses the closed-form kernel. The flexible exact de-nested
+    /// path contracts the exact cell-moment kernel analytically.
     fn row_primary_third_contracted_recompute(
         &self,
         row: usize,
@@ -3028,20 +3120,597 @@ impl BernoulliMarginalSlopeFamily {
             out[[1, 1]] = t[1][1];
             return Ok(out);
         }
-        if cache.row_contexts.len() == usize::MAX
-            || row_ctx.intercept.is_nan() && dir.len() == usize::MAX
-        {
-            return Err("unreachable bernoulli flexible third-order state".to_string());
+        if dir.iter().all(|value| value.abs() <= 0.0) {
+            return Ok(Array2::<f64>::zeros((
+                cache.primary.total,
+                cache.primary.total,
+            )));
         }
-        Err(
-            "bernoulli marginal-slope flexible third-order directional derivatives are not available for the exact de-nested cubic kernel"
-                .to_string(),
-        )
+        if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
+            return Err(
+                "non-finite flexible row context in third-order directional contraction"
+                    .to_string(),
+            );
+        }
+        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
+
+        let primary = &cache.primary;
+        let point = self.primary_point_from_block_states(row, block_states, primary);
+        let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
+        let beta_h = beta_h_owned.as_ref();
+        let beta_w = beta_w_owned.as_ref();
+        let a = row_ctx.intercept;
+        let r = primary.total;
+        let phi_q = normal_pdf(q);
+        let h_range = primary.h.as_ref();
+        let w_range = primary.w.as_ref();
+        let score_runtime = self.score_warp.as_ref();
+        let link_runtime = self.link_dev.as_ref();
+
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        let mut f_a_dir = 0.0;
+        let mut f_aa_dir = 0.0;
+        let mut f_u = Array1::<f64>::zeros(r);
+        let mut f_au = Array1::<f64>::zeros(r);
+        let mut f_au_dir = Array1::<f64>::zeros(r);
+        let mut f_uv = Array2::<f64>::zeros((r, r));
+        let mut f_uv_dir = Array2::<f64>::zeros((r, r));
+
+        let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+        for partition_cell in cells {
+            let cell = partition_cell.cell;
+            let z_mid = 0.5 * (cell.left + cell.right);
+            let u_mid = a + b * z_mid;
+            let state = exact::evaluate_cell_moments(cell, 15)?;
+
+            let (dc_da, dc_db) = exact::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                b,
+            );
+            let (dc_daa, dc_dab, dc_dbb) = exact::denested_cell_second_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                b,
+            );
+            let denested_third = exact::denested_cell_third_partials(partition_cell.link_span);
+            let dc_daab = denested_third.1;
+            let dc_dabb = denested_third.2;
+            let dc_dbbb = denested_third.3;
+
+            let mut coeff_u = vec![[0.0; 4]; r];
+            let mut coeff_au = vec![[0.0; 4]; r];
+            let mut coeff_bu = vec![[0.0; 4]; r];
+            let mut coeff_aau = vec![[0.0; 4]; r];
+            let mut coeff_abu = vec![[0.0; 4]; r];
+            let mut coeff_bbu = vec![[0.0; 4]; r];
+
+            coeff_u[1] = dc_db;
+            coeff_au[1] = dc_dab;
+            coeff_bu[1] = dc_dbb;
+            coeff_aau[1] = dc_daab;
+            coeff_abu[1] = dc_dabb;
+            coeff_bbu[1] = dc_dbbb;
+
+            if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
+                for local_idx in 0..h_range.len() {
+                    let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
+                    let idx = h_range.start + local_idx;
+                    coeff_u[idx] = exact::score_basis_cell_coefficients(basis_span, b);
+                    coeff_bu[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+                }
+            }
+
+            if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
+                for local_idx in 0..w_range.len() {
+                    let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
+                    let idx = w_range.start + local_idx;
+                    coeff_u[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
+                    let (dc_aw, dc_bw) =
+                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                    let (dc_aaw, dc_abw, dc_bbw) =
+                        exact::link_basis_cell_second_partials(basis_span, a, b);
+                    coeff_au[idx] = dc_aw;
+                    coeff_bu[idx] = dc_bw;
+                    coeff_aau[idx] = dc_aaw;
+                    coeff_abu[idx] = dc_abw;
+                    coeff_bbu[idx] = dc_bbw;
+                }
+            }
+
+            f_a += exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+            f_aa += exact::cell_second_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &dc_daa,
+                &state.moments,
+            )?;
+
+            let mut coeff_dir = [0.0; 4];
+            let mut coeff_a_dir = [0.0; 4];
+            let mut coeff_b_dir = [0.0; 4];
+            let mut coeff_aa_dir = [0.0; 4];
+            for u in 1..r {
+                add_scaled_coeff4(&mut coeff_dir, &coeff_u[u], dir[u]);
+                add_scaled_coeff4(&mut coeff_a_dir, &coeff_au[u], dir[u]);
+                add_scaled_coeff4(&mut coeff_b_dir, &coeff_bu[u], dir[u]);
+                add_scaled_coeff4(&mut coeff_aa_dir, &coeff_aau[u], dir[u]);
+                f_u[u] += exact::cell_first_derivative_from_moments(&coeff_u[u], &state.moments)?;
+                f_au[u] += exact::cell_second_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &coeff_u[u],
+                    &coeff_au[u],
+                    &state.moments,
+                )?;
+            }
+
+            f_a_dir += exact::cell_second_derivative_from_moments(
+                cell,
+                &dc_da,
+                &coeff_dir,
+                &coeff_a_dir,
+                &state.moments,
+            )?;
+            f_aa_dir += exact::cell_third_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &coeff_dir,
+                &dc_daa,
+                &coeff_a_dir,
+                &coeff_a_dir,
+                &coeff_aa_dir,
+                &state.moments,
+            )?;
+
+            let dir_b = dir[1];
+            let mut coeff_u_dir = vec![[0.0; 4]; r];
+            let mut coeff_au_dir = vec![[0.0; 4]; r];
+            coeff_u_dir[1] = coeff_b_dir;
+            coeff_au_dir[1] = {
+                let mut out = [0.0; 4];
+                add_scaled_coeff4(&mut out, &coeff_abu[1], dir_b);
+                if let Some(w_range) = w_range {
+                    for idx in w_range.clone() {
+                        add_scaled_coeff4(&mut out, &coeff_abu[idx], dir[idx]);
+                    }
+                }
+                out
+            };
+
+            if let Some(h_range) = h_range {
+                for idx in h_range.clone() {
+                    let mut out = [0.0; 4];
+                    add_scaled_coeff4(&mut out, &coeff_bu[idx], dir_b);
+                    coeff_u_dir[idx] = out;
+                }
+            }
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    let mut up = [0.0; 4];
+                    add_scaled_coeff4(&mut up, &coeff_bu[idx], dir_b);
+                    coeff_u_dir[idx] = up;
+
+                    let mut aup = [0.0; 4];
+                    add_scaled_coeff4(&mut aup, &coeff_abu[idx], dir_b);
+                    coeff_au_dir[idx] = aup;
+                }
+            }
+
+            for u in 1..r {
+                f_au_dir[u] += exact::cell_third_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &coeff_u[u],
+                    &coeff_dir,
+                    &coeff_au[u],
+                    &coeff_a_dir,
+                    &coeff_u_dir[u],
+                    &coeff_au_dir[u],
+                    &state.moments,
+                )?;
+            }
+
+            for u in 1..r {
+                for v in u..r {
+                    let second_coeff = if u == 1 {
+                        coeff_bu[v]
+                    } else if v == 1 {
+                        coeff_bu[u]
+                    } else {
+                        [0.0; 4]
+                    };
+                    let val = exact::cell_second_derivative_from_moments(
+                        cell,
+                        &coeff_u[u],
+                        &coeff_u[v],
+                        &second_coeff,
+                        &state.moments,
+                    )?;
+                    f_uv[[u, v]] += val;
+                    if u != v {
+                        f_uv[[v, u]] += val;
+                    }
+
+                    let third_coeff = if u == 1 && v == 1 {
+                        let mut out = [0.0; 4];
+                        add_scaled_coeff4(&mut out, &coeff_bbu[1], dir_b);
+                        if let Some(w_range) = w_range {
+                            for idx in w_range.clone() {
+                                add_scaled_coeff4(&mut out, &coeff_bbu[idx], dir[idx]);
+                            }
+                        }
+                        out
+                    } else if u == 1 {
+                        if let Some(w_range) = w_range {
+                            if w_range.contains(&v) {
+                                let mut out = [0.0; 4];
+                                add_scaled_coeff4(&mut out, &coeff_bbu[v], dir_b);
+                                out
+                            } else {
+                                [0.0; 4]
+                            }
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else if v == 1 {
+                        if let Some(w_range) = w_range {
+                            if w_range.contains(&u) {
+                                let mut out = [0.0; 4];
+                                add_scaled_coeff4(&mut out, &coeff_bbu[u], dir_b);
+                                out
+                            } else {
+                                [0.0; 4]
+                            }
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    };
+                    let dir_val = exact::cell_third_derivative_from_moments(
+                        cell,
+                        &coeff_u[u],
+                        &coeff_u[v],
+                        &coeff_dir,
+                        &second_coeff,
+                        &coeff_u_dir[u],
+                        &coeff_u_dir[v],
+                        &third_coeff,
+                        &state.moments,
+                    )?;
+                    f_uv_dir[[u, v]] += dir_val;
+                    if u != v {
+                        f_uv_dir[[v, u]] += dir_val;
+                    }
+                }
+            }
+        }
+
+        f_u[0] = -phi_q;
+        f_uv[[0, 0]] = q * phi_q;
+        f_uv_dir[[0, 0]] = dir[0] * (1.0 - q * q) * phi_q;
+
+        let inv_f_a = 1.0 / f_a;
+        let mut a_u = Array1::<f64>::zeros(r);
+        for u in 0..r {
+            a_u[u] = -f_u[u] * inv_f_a;
+        }
+        let mut a_uv = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let val = -(f_uv[[u, v]]
+                    + f_au[u] * a_u[v]
+                    + f_au[v] * a_u[u]
+                    + f_aa * a_u[u] * a_u[v])
+                    * inv_f_a;
+                a_uv[[u, v]] = val;
+                a_uv[[v, u]] = val;
+            }
+        }
+        let a_dir = a_u.dot(dir);
+        let a_u_dir = a_uv.dot(dir);
+        let mut a_uv_dir = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let n_dir = f_uv_dir[[u, v]]
+                    + f_au_dir[u] * a_u[v]
+                    + f_au[u] * a_u_dir[v]
+                    + f_au_dir[v] * a_u[u]
+                    + f_au[v] * a_u_dir[u]
+                    + f_aa_dir * a_u[u] * a_u[v]
+                    + f_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]);
+                let val = -(n_dir + f_a_dir * a_uv[[u, v]]) * inv_f_a;
+                a_uv_dir[[u, v]] = val;
+                a_uv_dir[[v, u]] = val;
+            }
+        }
+
+        let z_obs = self.z[row];
+        let u_obs = a + b * z_obs;
+        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+        let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
+
+        let mut g_u_fixed = vec![[0.0; 4]; r];
+        let mut g_au_fixed = vec![[0.0; 4]; r];
+        let mut g_bu_fixed = vec![[0.0; 4]; r];
+        let mut g_aau_fixed = vec![[0.0; 4]; r];
+        let mut g_abu_fixed = vec![[0.0; 4]; r];
+        let mut g_bbu_fixed = vec![[0.0; 4]; r];
+
+        g_u_fixed[1] = obs.dc_db;
+        g_au_fixed[1] = obs.dc_dab;
+        g_bu_fixed[1] = obs.dc_dbb;
+        g_aau_fixed[1] = obs.dc_daab;
+        g_abu_fixed[1] = obs.dc_dabb;
+        g_bbu_fixed[1] = obs.dc_dbbb;
+
+        if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
+            for local_idx in 0..h_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                let idx = h_range.start + local_idx;
+                g_u_fixed[idx] = exact::score_basis_cell_coefficients(basis_span, b);
+                g_bu_fixed[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+            }
+        }
+
+        if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
+            for local_idx in 0..w_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let idx = w_range.start + local_idx;
+                g_u_fixed[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
+                let (dc_aw, dc_bw) =
+                    exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aaw, dc_abw, dc_bbw) =
+                    exact::link_basis_cell_second_partials(basis_span, a, b);
+                g_au_fixed[idx] = dc_aw;
+                g_bu_fixed[idx] = dc_bw;
+                g_aau_fixed[idx] = dc_aaw;
+                g_abu_fixed[idx] = dc_abw;
+                g_bbu_fixed[idx] = dc_bbw;
+            }
+        }
+
+        let g_a = eval_coeff4_at(&obs.dc_da, z_obs);
+        let g_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
+        let g_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
+        let mut g_u = Array1::<f64>::zeros(r);
+        let mut g_au = Array1::<f64>::zeros(r);
+        let mut g_aau = Array1::<f64>::zeros(r);
+        let mut g_uv = Array2::<f64>::zeros((r, r));
+        let mut g_auv = Array2::<f64>::zeros((r, r));
+        for u in 1..r {
+            g_u[u] = eval_coeff4_at(&g_u_fixed[u], z_obs);
+            g_au[u] = eval_coeff4_at(&g_au_fixed[u], z_obs);
+            g_aau[u] = eval_coeff4_at(&g_aau_fixed[u], z_obs);
+        }
+        for u in 1..r {
+            for v in u..r {
+                let second_coeff = if u == 1 {
+                    g_bu_fixed[v]
+                } else if v == 1 {
+                    g_bu_fixed[u]
+                } else {
+                    [0.0; 4]
+                };
+                let val = eval_coeff4_at(&second_coeff, z_obs);
+                g_uv[[u, v]] = val;
+                g_uv[[v, u]] = val;
+
+                let third_coeff = if u == 1 && v == 1 {
+                    g_abu_fixed[1]
+                } else if u == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&v) {
+                            g_abu_fixed[v]
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else if v == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&u) {
+                            g_abu_fixed[u]
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let third_val = eval_coeff4_at(&third_coeff, z_obs);
+                g_auv[[u, v]] = third_val;
+                g_auv[[v, u]] = third_val;
+            }
+        }
+
+        let mut g_dir_fixed = [0.0; 4];
+        let mut g_a_dir_fixed = [0.0; 4];
+        let mut g_aa_dir_fixed = [0.0; 4];
+        let mut g_u_dir_fixed = vec![[0.0; 4]; r];
+        let mut g_au_dir_fixed = vec![[0.0; 4]; r];
+        for u in 1..r {
+            add_scaled_coeff4(&mut g_dir_fixed, &g_u_fixed[u], dir[u]);
+            add_scaled_coeff4(&mut g_a_dir_fixed, &g_au_fixed[u], dir[u]);
+            add_scaled_coeff4(&mut g_aa_dir_fixed, &g_aau_fixed[u], dir[u]);
+        }
+        let g_a_dir = eval_coeff4_at(&g_a_dir_fixed, z_obs);
+        let g_aa_dir = eval_coeff4_at(&g_aa_dir_fixed, z_obs);
+
+        g_u_dir_fixed[1] = {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &g_bu_fixed[1], dir[1]);
+            if let Some(h_range) = h_range {
+                for idx in h_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_bu_fixed[idx], dir[idx]);
+                }
+            }
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_bu_fixed[idx], dir[idx]);
+                }
+            }
+            out
+        };
+        if let Some(h_range) = h_range {
+            for idx in h_range.clone() {
+                let mut out = [0.0; 4];
+                add_scaled_coeff4(&mut out, &g_bu_fixed[idx], dir[1]);
+                g_u_dir_fixed[idx] = out;
+            }
+        }
+        if let Some(w_range) = w_range {
+            for idx in w_range.clone() {
+                let mut out = [0.0; 4];
+                add_scaled_coeff4(&mut out, &g_bu_fixed[idx], dir[1]);
+                g_u_dir_fixed[idx] = out;
+
+                let mut aout = [0.0; 4];
+                add_scaled_coeff4(&mut aout, &g_abu_fixed[idx], dir[1]);
+                g_au_dir_fixed[idx] = aout;
+            }
+        }
+        g_au_dir_fixed[1] = {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &g_abu_fixed[1], dir[1]);
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_abu_fixed[idx], dir[idx]);
+                }
+            }
+            out
+        };
+
+        let mut g_u_dir = Array1::<f64>::zeros(r);
+        let mut g_uv_dir = Array2::<f64>::zeros((r, r));
+        for u in 1..r {
+            g_u_dir[u] = eval_coeff4_at(&g_u_dir_fixed[u], z_obs);
+        }
+        for u in 1..r {
+            for v in u..r {
+                let third_coeff = if u == 1 && v == 1 {
+                    let mut out = [0.0; 4];
+                    add_scaled_coeff4(&mut out, &g_bbu_fixed[1], dir[1]);
+                    if let Some(w_range) = w_range {
+                        for idx in w_range.clone() {
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[idx], dir[idx]);
+                        }
+                    }
+                    out
+                } else if u == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&v) {
+                            let mut out = [0.0; 4];
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[v], dir[1]);
+                            out
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else if v == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&u) {
+                            let mut out = [0.0; 4];
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[u], dir[1]);
+                            out
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let val = eval_coeff4_at(&third_coeff, z_obs);
+                g_uv_dir[[u, v]] = val;
+                g_uv_dir[[v, u]] = val;
+            }
+        }
+
+        let eta_u = g_a * &a_u + &g_u;
+        let mut eta_uv = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let val = g_a * a_uv[[u, v]]
+                    + g_aa * a_u[u] * a_u[v]
+                    + g_au[u] * a_u[v]
+                    + g_au[v] * a_u[u]
+                    + g_uv[[u, v]];
+                eta_uv[[u, v]] = val;
+                eta_uv[[v, u]] = val;
+            }
+        }
+        let eta_dir = eta_u.dot(dir);
+        let eta_u_dir = eta_uv.dot(dir);
+        let dg_a_dir = g_aa * a_dir + g_a_dir;
+        let dg_aa_dir = g_aaa * a_dir + g_aa_dir;
+        let mut dg_au_dir = Array1::<f64>::zeros(r);
+        let mut dg_uv_dir = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            dg_au_dir[u] = g_aau[u] * a_dir + eval_coeff4_at(&g_au_dir_fixed[u], z_obs);
+        }
+        for u in 0..r {
+            for v in u..r {
+                let val = g_auv[[u, v]] * a_dir + g_uv_dir[[u, v]];
+                dg_uv_dir[[u, v]] = val;
+                dg_uv_dir[[v, u]] = val;
+            }
+        }
+
+        let mut eta_uv_dir = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let val = dg_a_dir * a_uv[[u, v]]
+                    + g_a * a_uv_dir[[u, v]]
+                    + dg_aa_dir * a_u[u] * a_u[v]
+                    + g_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
+                    + dg_au_dir[u] * a_u[v]
+                    + g_au[u] * a_u_dir[v]
+                    + dg_au_dir[v] * a_u[u]
+                    + g_au[v] * a_u_dir[u]
+                    + dg_uv_dir[[u, v]];
+                eta_uv_dir[[u, v]] = val;
+                eta_uv_dir[[v, u]] = val;
+            }
+        }
+
+        let y_i = self.y[row];
+        let w_i = self.weights[row];
+        let s_y = 2.0 * y_i - 1.0;
+        let m = s_y * eta_val;
+        let (k1, k2, k3, _) = signed_probit_neglog_derivatives_up_to_fourth(m, w_i);
+        let u1 = s_y * k1;
+        let u3 = s_y * k3;
+
+        let mut out = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let val = u3 * eta_u[u] * eta_u[v] * eta_dir
+                    + k2 * (eta_uv[[u, v]] * eta_dir + eta_u[u] * eta_u_dir[v] + eta_u[v] * eta_u_dir[u])
+                    + u1 * eta_uv_dir[[u, v]];
+                out[[u, v]] = val;
+                out[[v, u]] = val;
+            }
+        }
+        Ok(out)
     }
 
     /// Fourth-derivative tensor contracted with two directions dir_u, dir_v:
     ///   out[k,l] = sum_{m,n} f_{klmn} dir_u[m] dir_v[n]
-    /// Fully analytic for both rigid and flex paths -- no AD jets.
+    /// Rigid path uses the closed-form kernel. The flexible exact de-nested
+    /// path contracts the exact cell-moment kernel analytically.
     fn row_primary_fourth_contracted_recompute(
         &self,
         row: usize,
@@ -3063,16 +3732,1245 @@ impl BernoulliMarginalSlopeFamily {
             out[[1, 1]] = f[1][1];
             return Ok(out);
         }
-        if cache.row_contexts.len() == usize::MAX
-            || row_ctx.intercept.is_nan()
-                && (dir_u.len() == usize::MAX || dir_v.len() == usize::MAX)
+        if dir_u.iter().all(|value| value.abs() <= 0.0)
+            || dir_v.iter().all(|value| value.abs() <= 0.0)
         {
-            return Err("unreachable bernoulli flexible fourth-order state".to_string());
+            return Ok(Array2::<f64>::zeros((
+                cache.primary.total,
+                cache.primary.total,
+            )));
         }
-        return Err(
-            "bernoulli marginal-slope flexible fourth-order directional derivatives are not available for the exact de-nested cubic kernel"
-                .to_string(),
-        );
+        if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
+            return Err(
+                "non-finite flexible row context in fourth-order directional contraction"
+                    .to_string(),
+            );
+        }
+        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
+
+        let primary = &cache.primary;
+        let point = self.primary_point_from_block_states(row, block_states, primary);
+        let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
+        let beta_h = beta_h_owned.as_ref();
+        let beta_w = beta_w_owned.as_ref();
+        let a = row_ctx.intercept;
+        let r = primary.total;
+        let phi_q = normal_pdf(q);
+        let h_range = primary.h.as_ref();
+        let w_range = primary.w.as_ref();
+        let score_runtime = self.score_warp.as_ref();
+        let link_runtime = self.link_dev.as_ref();
+
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        let mut f_u = Array1::<f64>::zeros(r);
+        let mut f_au = Array1::<f64>::zeros(r);
+        let mut f_uv = Array2::<f64>::zeros((r, r));
+
+        let mut f_a_u = 0.0;
+        let mut f_aa_u = 0.0;
+        let mut f_au_u = Array1::<f64>::zeros(r);
+        let mut f_uv_u = Array2::<f64>::zeros((r, r));
+
+        let mut f_a_v = 0.0;
+        let mut f_aa_v = 0.0;
+        let mut f_au_v = Array1::<f64>::zeros(r);
+        let mut f_uv_v = Array2::<f64>::zeros((r, r));
+
+        let mut f_a_uv = 0.0;
+        let mut f_aa_uv = 0.0;
+        let mut f_au_uv = Array1::<f64>::zeros(r);
+        let mut f_uv_uv = Array2::<f64>::zeros((r, r));
+        let dir_u_b = dir_u[1];
+        let dir_v_b = dir_v[1];
+
+        let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+        for partition_cell in cells {
+            let cell = partition_cell.cell;
+            let z_mid = 0.5 * (cell.left + cell.right);
+            let u_mid = a + b * z_mid;
+            let state = exact::evaluate_cell_moments(cell, 21)?;
+
+            let (dc_da, dc_db) = exact::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                b,
+            );
+            let (dc_daa, dc_dab, dc_dbb) = exact::denested_cell_second_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                b,
+            );
+            let denested_third = exact::denested_cell_third_partials(partition_cell.link_span);
+            let dc_daab = denested_third.1;
+            let dc_dabb = denested_third.2;
+            let dc_dbbb = denested_third.3;
+
+            let mut coeff_u = vec![[0.0; 4]; r];
+            let mut coeff_au = vec![[0.0; 4]; r];
+            let mut coeff_bu = vec![[0.0; 4]; r];
+            let mut coeff_aau = vec![[0.0; 4]; r];
+            let mut coeff_abu = vec![[0.0; 4]; r];
+            let mut coeff_bbu = vec![[0.0; 4]; r];
+            let mut coeff_aaau = vec![[0.0; 4]; r];
+            let mut coeff_aabu = vec![[0.0; 4]; r];
+            let mut coeff_abbu = vec![[0.0; 4]; r];
+            let mut coeff_bbbu = vec![[0.0; 4]; r];
+
+            coeff_u[1] = dc_db;
+            coeff_au[1] = dc_dab;
+            coeff_bu[1] = dc_dbb;
+            coeff_aau[1] = dc_daab;
+            coeff_abu[1] = dc_dabb;
+            coeff_bbu[1] = dc_dbbb;
+
+            if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
+                for local_idx in 0..h_range.len() {
+                    let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
+                    let idx = h_range.start + local_idx;
+                    coeff_u[idx] = exact::score_basis_cell_coefficients(basis_span, b);
+                    coeff_bu[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+                }
+            }
+
+            if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
+                for local_idx in 0..w_range.len() {
+                    let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
+                    let idx = w_range.start + local_idx;
+                    coeff_u[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
+                    let (dc_aw, dc_bw) =
+                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                    let (dc_aaw, dc_abw, dc_bbw) =
+                        exact::link_basis_cell_second_partials(basis_span, a, b);
+                    let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
+                        exact::link_basis_cell_third_partials(basis_span);
+                    coeff_au[idx] = dc_aw;
+                    coeff_bu[idx] = dc_bw;
+                    coeff_aau[idx] = dc_aaw;
+                    coeff_abu[idx] = dc_abw;
+                    coeff_bbu[idx] = dc_bbw;
+                    coeff_aaau[idx] = dc_aaaw;
+                    coeff_aabu[idx] = dc_aabw;
+                    coeff_abbu[idx] = dc_abbw;
+                    coeff_bbbu[idx] = dc_bbbw;
+                }
+            }
+
+            f_a += exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+            f_aa += exact::cell_second_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &dc_daa,
+                &state.moments,
+            )?;
+
+            let mut coeff_dir_u = [0.0; 4];
+            let mut coeff_dir_v = [0.0; 4];
+            let mut coeff_a_dir_u = [0.0; 4];
+            let mut coeff_a_dir_v = [0.0; 4];
+            let mut coeff_b_dir_u = [0.0; 4];
+            let mut coeff_b_dir_v = [0.0; 4];
+            let mut coeff_aa_dir_u = [0.0; 4];
+            let mut coeff_aa_dir_v = [0.0; 4];
+            for u in 1..r {
+                add_scaled_coeff4(&mut coeff_dir_u, &coeff_u[u], dir_u[u]);
+                add_scaled_coeff4(&mut coeff_dir_v, &coeff_u[u], dir_v[u]);
+                add_scaled_coeff4(&mut coeff_a_dir_u, &coeff_au[u], dir_u[u]);
+                add_scaled_coeff4(&mut coeff_a_dir_v, &coeff_au[u], dir_v[u]);
+                add_scaled_coeff4(&mut coeff_b_dir_u, &coeff_bu[u], dir_u[u]);
+                add_scaled_coeff4(&mut coeff_b_dir_v, &coeff_bu[u], dir_v[u]);
+                add_scaled_coeff4(&mut coeff_aa_dir_u, &coeff_aau[u], dir_u[u]);
+                add_scaled_coeff4(&mut coeff_aa_dir_v, &coeff_aau[u], dir_v[u]);
+                f_u[u] += exact::cell_first_derivative_from_moments(&coeff_u[u], &state.moments)?;
+                f_au[u] += exact::cell_second_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &coeff_u[u],
+                    &coeff_au[u],
+                    &state.moments,
+                )?;
+            }
+
+            f_a_u += exact::cell_second_derivative_from_moments(
+                cell,
+                &dc_da,
+                &coeff_dir_u,
+                &coeff_a_dir_u,
+                &state.moments,
+            )?;
+            f_a_v += exact::cell_second_derivative_from_moments(
+                cell,
+                &dc_da,
+                &coeff_dir_v,
+                &coeff_a_dir_v,
+                &state.moments,
+            )?;
+            f_aa_u += exact::cell_third_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &coeff_dir_u,
+                &dc_daa,
+                &coeff_a_dir_u,
+                &coeff_a_dir_u,
+                &coeff_aa_dir_u,
+                &state.moments,
+            )?;
+            f_aa_v += exact::cell_third_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &coeff_dir_v,
+                &dc_daa,
+                &coeff_a_dir_v,
+                &coeff_a_dir_v,
+                &coeff_aa_dir_v,
+                &state.moments,
+            )?;
+
+            let mut coeff_dir_uv = [0.0; 4];
+            if let Some(h_range) = h_range {
+                for idx in h_range.clone() {
+                    add_scaled_coeff4(
+                        &mut coeff_dir_uv,
+                        &coeff_bu[idx],
+                        dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                    );
+                }
+            }
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(
+                        &mut coeff_dir_uv,
+                        &coeff_bu[idx],
+                        dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                    );
+                }
+            }
+            add_scaled_coeff4(&mut coeff_dir_uv, &coeff_bu[1], dir_u_b * dir_v_b);
+
+            let mut coeff_a_dir_uv = [0.0; 4];
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(
+                        &mut coeff_a_dir_uv,
+                        &coeff_abu[idx],
+                        dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                    );
+                }
+            }
+
+            let mut coeff_aa_dir_uv = [0.0; 4];
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(
+                        &mut coeff_aa_dir_uv,
+                        &coeff_aabu[idx],
+                        dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                    );
+                }
+            }
+
+            f_a_uv += exact::cell_third_derivative_from_moments(
+                cell,
+                &dc_da,
+                &coeff_dir_u,
+                &coeff_dir_v,
+                &coeff_a_dir_u,
+                &coeff_a_dir_v,
+                &coeff_dir_uv,
+                &coeff_a_dir_uv,
+                &state.moments,
+            )?;
+            f_aa_uv += exact::cell_fourth_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &coeff_dir_u,
+                &coeff_dir_v,
+                &dc_daa,
+                &coeff_a_dir_u,
+                &coeff_a_dir_v,
+                &coeff_a_dir_u,
+                &coeff_a_dir_v,
+                &coeff_dir_uv,
+                &coeff_aa_dir_u,
+                &coeff_aa_dir_v,
+                &coeff_a_dir_uv,
+                &coeff_a_dir_uv,
+                &coeff_aa_dir_uv,
+                &state.moments,
+            )?;
+
+            let mut coeff_u_dir_u = vec![[0.0; 4]; r];
+            let mut coeff_u_dir_v = vec![[0.0; 4]; r];
+            let mut coeff_u_dir_uv = vec![[0.0; 4]; r];
+            let mut coeff_au_dir_u = vec![[0.0; 4]; r];
+            let mut coeff_au_dir_v = vec![[0.0; 4]; r];
+            let mut coeff_au_dir_uv = vec![[0.0; 4]; r];
+
+            coeff_u_dir_u[1] = coeff_b_dir_u;
+            coeff_u_dir_v[1] = coeff_b_dir_v;
+            coeff_u_dir_uv[1] = coeff_dir_uv;
+            coeff_au_dir_u[1] = {
+                let mut out = [0.0; 4];
+                add_scaled_coeff4(&mut out, &coeff_abu[1], dir_u_b);
+                if let Some(w_range) = w_range {
+                    for idx in w_range.clone() {
+                        add_scaled_coeff4(&mut out, &coeff_abu[idx], dir_u[idx]);
+                    }
+                }
+                out
+            };
+            coeff_au_dir_v[1] = {
+                let mut out = [0.0; 4];
+                add_scaled_coeff4(&mut out, &coeff_abu[1], dir_v_b);
+                if let Some(w_range) = w_range {
+                    for idx in w_range.clone() {
+                        add_scaled_coeff4(&mut out, &coeff_abu[idx], dir_v[idx]);
+                    }
+                }
+                out
+            };
+            coeff_au_dir_uv[1] = {
+                let mut out = [0.0; 4];
+                if let Some(w_range) = w_range {
+                    for idx in w_range.clone() {
+                        add_scaled_coeff4(
+                            &mut out,
+                            &coeff_abbu[idx],
+                            dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                        );
+                    }
+                }
+                out
+            };
+
+            if let Some(h_range) = h_range {
+                for idx in h_range.clone() {
+                    add_scaled_coeff4(&mut coeff_u_dir_u[idx], &coeff_bu[idx], dir_u_b);
+                    add_scaled_coeff4(&mut coeff_u_dir_v[idx], &coeff_bu[idx], dir_v_b);
+                }
+            }
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(&mut coeff_u_dir_u[idx], &coeff_bu[idx], dir_u_b);
+                    add_scaled_coeff4(&mut coeff_u_dir_v[idx], &coeff_bu[idx], dir_v_b);
+                    add_scaled_coeff4(&mut coeff_u_dir_uv[idx], &coeff_bbu[idx], dir_u_b * dir_v_b);
+
+                    add_scaled_coeff4(&mut coeff_au_dir_u[idx], &coeff_abu[idx], dir_u_b);
+                    add_scaled_coeff4(&mut coeff_au_dir_v[idx], &coeff_abu[idx], dir_v_b);
+                    add_scaled_coeff4(&mut coeff_au_dir_uv[idx], &coeff_abbu[idx], dir_u_b * dir_v_b);
+                }
+            }
+
+            for u in 1..r {
+                f_au_u[u] += exact::cell_third_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &coeff_u[u],
+                    &coeff_dir_u,
+                    &coeff_au[u],
+                    &coeff_a_dir_u,
+                    &coeff_u_dir_u[u],
+                    &coeff_au_dir_u[u],
+                    &state.moments,
+                )?;
+                f_au_v[u] += exact::cell_third_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &coeff_u[u],
+                    &coeff_dir_v,
+                    &coeff_au[u],
+                    &coeff_a_dir_v,
+                    &coeff_u_dir_v[u],
+                    &coeff_au_dir_v[u],
+                    &state.moments,
+                )?;
+                f_au_uv[u] += exact::cell_fourth_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &coeff_u[u],
+                    &coeff_dir_u,
+                    &coeff_dir_v,
+                    &coeff_au[u],
+                    &coeff_a_dir_u,
+                    &coeff_a_dir_v,
+                    &coeff_u_dir_u[u],
+                    &coeff_u_dir_v[u],
+                    &coeff_dir_uv,
+                    &coeff_au_dir_u[u],
+                    &coeff_au_dir_v[u],
+                    &coeff_a_dir_uv,
+                    &coeff_u_dir_uv[u],
+                    &coeff_au_dir_uv[u],
+                    &state.moments,
+                )?;
+            }
+
+            for u in 1..r {
+                for v in u..r {
+                    let second_coeff = if u == 1 {
+                        coeff_bu[v]
+                    } else if v == 1 {
+                        coeff_bu[u]
+                    } else {
+                        [0.0; 4]
+                    };
+                    let base_val = exact::cell_second_derivative_from_moments(
+                        cell,
+                        &coeff_u[u],
+                        &coeff_u[v],
+                        &second_coeff,
+                        &state.moments,
+                    )?;
+                    f_uv[[u, v]] += base_val;
+                    if u != v {
+                        f_uv[[v, u]] += base_val;
+                    }
+
+                    let third_u = if u == 1 && v == 1 {
+                        let mut out = [0.0; 4];
+                        add_scaled_coeff4(&mut out, &coeff_bbu[1], dir_u_b);
+                        if let Some(w_range) = w_range {
+                            for idx in w_range.clone() {
+                                add_scaled_coeff4(&mut out, &coeff_bbu[idx], dir_u[idx]);
+                            }
+                        }
+                        out
+                    } else if u == 1 {
+                        if let Some(w_range) = w_range {
+                            if w_range.contains(&v) {
+                                let mut out = [0.0; 4];
+                                add_scaled_coeff4(&mut out, &coeff_bbu[v], dir_u_b);
+                                out
+                            } else {
+                                [0.0; 4]
+                            }
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else if v == 1 {
+                        if let Some(w_range) = w_range {
+                            if w_range.contains(&u) {
+                                let mut out = [0.0; 4];
+                                add_scaled_coeff4(&mut out, &coeff_bbu[u], dir_u_b);
+                                out
+                            } else {
+                                [0.0; 4]
+                            }
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    };
+                    let third_v = if u == 1 && v == 1 {
+                        let mut out = [0.0; 4];
+                        add_scaled_coeff4(&mut out, &coeff_bbu[1], dir_v_b);
+                        if let Some(w_range) = w_range {
+                            for idx in w_range.clone() {
+                                add_scaled_coeff4(&mut out, &coeff_bbu[idx], dir_v[idx]);
+                            }
+                        }
+                        out
+                    } else if u == 1 {
+                        if let Some(w_range) = w_range {
+                            if w_range.contains(&v) {
+                                let mut out = [0.0; 4];
+                                add_scaled_coeff4(&mut out, &coeff_bbu[v], dir_v_b);
+                                out
+                            } else {
+                                [0.0; 4]
+                            }
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else if v == 1 {
+                        if let Some(w_range) = w_range {
+                            if w_range.contains(&u) {
+                                let mut out = [0.0; 4];
+                                add_scaled_coeff4(&mut out, &coeff_bbu[u], dir_v_b);
+                                out
+                            } else {
+                                [0.0; 4]
+                            }
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    };
+                    let fourth_uv = if u == 1 && v == 1 {
+                        let mut out = [0.0; 4];
+                        if let Some(w_range) = w_range {
+                            for idx in w_range.clone() {
+                                add_scaled_coeff4(
+                                    &mut out,
+                                    &coeff_bbbu[idx],
+                                    dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                                );
+                            }
+                        }
+                        out
+                    } else if u == 1 {
+                        if let Some(w_range) = w_range {
+                            if w_range.contains(&v) {
+                                let mut out = [0.0; 4];
+                                add_scaled_coeff4(&mut out, &coeff_bbbu[v], dir_u_b * dir_v_b);
+                                out
+                            } else {
+                                [0.0; 4]
+                            }
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else if v == 1 {
+                        if let Some(w_range) = w_range {
+                            if w_range.contains(&u) {
+                                let mut out = [0.0; 4];
+                                add_scaled_coeff4(&mut out, &coeff_bbbu[u], dir_u_b * dir_v_b);
+                                out
+                            } else {
+                                [0.0; 4]
+                            }
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    };
+
+                    let dir_u_val = exact::cell_third_derivative_from_moments(
+                        cell,
+                        &coeff_u[u],
+                        &coeff_u[v],
+                        &coeff_dir_u,
+                        &second_coeff,
+                        &coeff_u_dir_u[u],
+                        &coeff_u_dir_u[v],
+                        &third_u,
+                        &state.moments,
+                    )?;
+                    let dir_v_val = exact::cell_third_derivative_from_moments(
+                        cell,
+                        &coeff_u[u],
+                        &coeff_u[v],
+                        &coeff_dir_v,
+                        &second_coeff,
+                        &coeff_u_dir_v[u],
+                        &coeff_u_dir_v[v],
+                        &third_v,
+                        &state.moments,
+                    )?;
+                    let mix_val = exact::cell_fourth_derivative_from_moments(
+                        cell,
+                        &coeff_u[u],
+                        &coeff_u[v],
+                        &coeff_dir_u,
+                        &coeff_dir_v,
+                        &second_coeff,
+                        &coeff_u_dir_u[u],
+                        &coeff_u_dir_v[u],
+                        &coeff_u_dir_u[v],
+                        &coeff_u_dir_v[v],
+                        &coeff_dir_uv,
+                        &third_u,
+                        &third_v,
+                        &coeff_u_dir_uv[u],
+                        &coeff_u_dir_uv[v],
+                        &fourth_uv,
+                        &state.moments,
+                    )?;
+                    f_uv_u[[u, v]] += dir_u_val;
+                    f_uv_v[[u, v]] += dir_v_val;
+                    f_uv_uv[[u, v]] += mix_val;
+                    if u != v {
+                        f_uv_u[[v, u]] += dir_u_val;
+                        f_uv_v[[v, u]] += dir_v_val;
+                        f_uv_uv[[v, u]] += mix_val;
+                    }
+                }
+            }
+        }
+
+        f_u[0] = -phi_q;
+        f_uv[[0, 0]] = q * phi_q;
+        f_uv_u[[0, 0]] = dir_u[0] * (1.0 - q * q) * phi_q;
+        f_uv_v[[0, 0]] = dir_v[0] * (1.0 - q * q) * phi_q;
+        f_uv_uv[[0, 0]] = dir_u[0] * dir_v[0] * (q * q * q - 3.0 * q) * phi_q;
+
+        let inv_f_a = 1.0 / f_a;
+        let mut a_u = Array1::<f64>::zeros(r);
+        for u in 0..r {
+            a_u[u] = -f_u[u] * inv_f_a;
+        }
+        let mut a_uv = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let val = -(f_uv[[u, v]]
+                    + f_au[u] * a_u[v]
+                    + f_au[v] * a_u[u]
+                    + f_aa * a_u[u] * a_u[v])
+                    * inv_f_a;
+                a_uv[[u, v]] = val;
+                a_uv[[v, u]] = val;
+            }
+        }
+        let a_u_dir_u = a_uv.dot(dir_u);
+        let a_u_dir_v = a_uv.dot(dir_v);
+        let mut a_uv_u = Array2::<f64>::zeros((r, r));
+        let mut a_uv_v = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let n_u = f_uv_u[[u, v]]
+                    + f_au_u[u] * a_u[v]
+                    + f_au[u] * a_u_dir_u[v]
+                    + f_au_u[v] * a_u[u]
+                    + f_au[v] * a_u_dir_u[u]
+                    + f_aa_u * a_u[u] * a_u[v]
+                    + f_aa * (a_u_dir_u[u] * a_u[v] + a_u[u] * a_u_dir_u[v]);
+                let val_u = -(n_u + f_a_u * a_uv[[u, v]]) * inv_f_a;
+                a_uv_u[[u, v]] = val_u;
+                a_uv_u[[v, u]] = val_u;
+
+                let n_v = f_uv_v[[u, v]]
+                    + f_au_v[u] * a_u[v]
+                    + f_au[u] * a_u_dir_v[v]
+                    + f_au_v[v] * a_u[u]
+                    + f_au[v] * a_u_dir_v[u]
+                    + f_aa_v * a_u[u] * a_u[v]
+                    + f_aa * (a_u_dir_v[u] * a_u[v] + a_u[u] * a_u_dir_v[v]);
+                let val_v = -(n_v + f_a_v * a_uv[[u, v]]) * inv_f_a;
+                a_uv_v[[u, v]] = val_v;
+                a_uv_v[[v, u]] = val_v;
+            }
+        }
+        let a_u_uv = a_uv_u.dot(dir_v);
+        let mut a_uv_uv = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let n_uv = f_uv_uv[[u, v]]
+                    + f_au_uv[u] * a_u[v]
+                    + f_au_u[u] * a_u_dir_v[v]
+                    + f_au_v[u] * a_u_dir_u[v]
+                    + f_au[u] * a_u_uv[v]
+                    + f_au_uv[v] * a_u[u]
+                    + f_au_u[v] * a_u_dir_v[u]
+                    + f_au_v[v] * a_u_dir_u[u]
+                    + f_au[v] * a_u_uv[u]
+                    + f_aa_uv * a_u[u] * a_u[v]
+                    + f_aa_u * (a_u_dir_v[u] * a_u[v] + a_u[u] * a_u_dir_v[v])
+                    + f_aa_v * (a_u_dir_u[u] * a_u[v] + a_u[u] * a_u_dir_u[v])
+                    + f_aa
+                        * (a_u_uv[u] * a_u[v]
+                            + a_u_dir_u[u] * a_u_dir_v[v]
+                            + a_u_dir_v[u] * a_u_dir_u[v]
+                            + a_u[u] * a_u_uv[v]);
+                let val = -(n_uv
+                    + f_a_v * a_uv_u[[u, v]]
+                    + f_a_u * a_uv_v[[u, v]]
+                    + f_a_uv * a_uv[[u, v]])
+                    * inv_f_a;
+                a_uv_uv[[u, v]] = val;
+                a_uv_uv[[v, u]] = val;
+            }
+        }
+
+        let z_obs = self.z[row];
+        let u_obs = a + b * z_obs;
+        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+        let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
+
+        let mut g_u_fixed = vec![[0.0; 4]; r];
+        let mut g_au_fixed = vec![[0.0; 4]; r];
+        let mut g_bu_fixed = vec![[0.0; 4]; r];
+        let mut g_aau_fixed = vec![[0.0; 4]; r];
+        let mut g_abu_fixed = vec![[0.0; 4]; r];
+        let mut g_bbu_fixed = vec![[0.0; 4]; r];
+        let mut g_aaau_fixed = vec![[0.0; 4]; r];
+        let mut g_aabu_fixed = vec![[0.0; 4]; r];
+        let mut g_abbu_fixed = vec![[0.0; 4]; r];
+        let mut g_bbbu_fixed = vec![[0.0; 4]; r];
+
+        g_u_fixed[1] = obs.dc_db;
+        g_au_fixed[1] = obs.dc_dab;
+        g_bu_fixed[1] = obs.dc_dbb;
+        g_aau_fixed[1] = obs.dc_daab;
+        g_abu_fixed[1] = obs.dc_dabb;
+        g_bbu_fixed[1] = obs.dc_dbbb;
+
+        if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
+            for local_idx in 0..h_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                let idx = h_range.start + local_idx;
+                g_u_fixed[idx] = exact::score_basis_cell_coefficients(basis_span, b);
+                g_bu_fixed[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+            }
+        }
+        if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
+            for local_idx in 0..w_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let idx = w_range.start + local_idx;
+                g_u_fixed[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
+                let (dc_aw, dc_bw) =
+                    exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aaw, dc_abw, dc_bbw) =
+                    exact::link_basis_cell_second_partials(basis_span, a, b);
+                let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
+                    exact::link_basis_cell_third_partials(basis_span);
+                g_au_fixed[idx] = dc_aw;
+                g_bu_fixed[idx] = dc_bw;
+                g_aau_fixed[idx] = dc_aaw;
+                g_abu_fixed[idx] = dc_abw;
+                g_bbu_fixed[idx] = dc_bbw;
+                g_aaau_fixed[idx] = dc_aaaw;
+                g_aabu_fixed[idx] = dc_aabw;
+                g_abbu_fixed[idx] = dc_abbw;
+                g_bbbu_fixed[idx] = dc_bbbw;
+            }
+        }
+
+        let g_a = eval_coeff4_at(&obs.dc_da, z_obs);
+        let g_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
+        let g_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
+        let mut g_u = Array1::<f64>::zeros(r);
+        let mut g_au = Array1::<f64>::zeros(r);
+        let mut g_aau = Array1::<f64>::zeros(r);
+        let mut g_aaau = Array1::<f64>::zeros(r);
+        let mut g_uv = Array2::<f64>::zeros((r, r));
+        let mut g_auv = Array2::<f64>::zeros((r, r));
+        let mut g_aauv = Array2::<f64>::zeros((r, r));
+        for u in 1..r {
+            g_u[u] = eval_coeff4_at(&g_u_fixed[u], z_obs);
+            g_au[u] = eval_coeff4_at(&g_au_fixed[u], z_obs);
+            g_aau[u] = eval_coeff4_at(&g_aau_fixed[u], z_obs);
+            g_aaau[u] = eval_coeff4_at(&g_aaau_fixed[u], z_obs);
+        }
+        for u in 1..r {
+            for v in u..r {
+                let second_coeff = if u == 1 {
+                    g_bu_fixed[v]
+                } else if v == 1 {
+                    g_bu_fixed[u]
+                } else {
+                    [0.0; 4]
+                };
+                let val = eval_coeff4_at(&second_coeff, z_obs);
+                g_uv[[u, v]] = val;
+                g_uv[[v, u]] = val;
+
+                let third_coeff = if u == 1 && v == 1 {
+                    g_abu_fixed[1]
+                } else if u == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&v) {
+                            g_abu_fixed[v]
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else if v == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&u) {
+                            g_abu_fixed[u]
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let fourth_coeff = if u == 1 && v == 1 {
+                    [0.0; 4]
+                } else if u == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&v) {
+                            g_aabu_fixed[v]
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else if v == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&u) {
+                            g_aabu_fixed[u]
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let third_val = eval_coeff4_at(&third_coeff, z_obs);
+                let fourth_val = eval_coeff4_at(&fourth_coeff, z_obs);
+                g_auv[[u, v]] = third_val;
+                g_auv[[v, u]] = third_val;
+                g_aauv[[u, v]] = fourth_val;
+                g_aauv[[v, u]] = fourth_val;
+            }
+        }
+
+        let mut g_dir_u_fixed = [0.0; 4];
+        let mut g_dir_v_fixed = [0.0; 4];
+        let mut g_a_dir_u_fixed = [0.0; 4];
+        let mut g_a_dir_v_fixed = [0.0; 4];
+        let mut g_aa_dir_u_fixed = [0.0; 4];
+        let mut g_aa_dir_v_fixed = [0.0; 4];
+        let mut g_dir_uv_fixed = [0.0; 4];
+        let mut g_a_dir_uv_fixed = [0.0; 4];
+        let mut g_aa_dir_uv_fixed = [0.0; 4];
+        for u in 1..r {
+            add_scaled_coeff4(&mut g_dir_u_fixed, &g_u_fixed[u], dir_u[u]);
+            add_scaled_coeff4(&mut g_dir_v_fixed, &g_u_fixed[u], dir_v[u]);
+            add_scaled_coeff4(&mut g_a_dir_u_fixed, &g_au_fixed[u], dir_u[u]);
+            add_scaled_coeff4(&mut g_a_dir_v_fixed, &g_au_fixed[u], dir_v[u]);
+            add_scaled_coeff4(&mut g_aa_dir_u_fixed, &g_aau_fixed[u], dir_u[u]);
+            add_scaled_coeff4(&mut g_aa_dir_v_fixed, &g_aau_fixed[u], dir_v[u]);
+        }
+        add_scaled_coeff4(&mut g_dir_uv_fixed, &g_bu_fixed[1], dir_u_b * dir_v_b);
+        if let Some(h_range) = h_range {
+            for idx in h_range.clone() {
+                add_scaled_coeff4(
+                    &mut g_dir_uv_fixed,
+                    &g_bu_fixed[idx],
+                    dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                );
+            }
+        }
+        if let Some(w_range) = w_range {
+            for idx in w_range.clone() {
+                add_scaled_coeff4(
+                    &mut g_dir_uv_fixed,
+                    &g_bu_fixed[idx],
+                    dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                );
+                add_scaled_coeff4(
+                    &mut g_a_dir_uv_fixed,
+                    &g_abu_fixed[idx],
+                    dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                );
+                add_scaled_coeff4(
+                    &mut g_aa_dir_uv_fixed,
+                    &g_aabu_fixed[idx],
+                    dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                );
+            }
+        }
+
+        let g_a_u_fixed = eval_coeff4_at(&g_a_dir_u_fixed, z_obs);
+        let g_a_v_fixed = eval_coeff4_at(&g_a_dir_v_fixed, z_obs);
+        let g_aa_u_fixed = eval_coeff4_at(&g_aa_dir_u_fixed, z_obs);
+        let g_aa_v_fixed = eval_coeff4_at(&g_aa_dir_v_fixed, z_obs);
+        let g_a_uv_fixed = eval_coeff4_at(&g_a_dir_uv_fixed, z_obs);
+        let g_aa_uv_fixed = eval_coeff4_at(&g_aa_dir_uv_fixed, z_obs);
+
+        let mut g_u_u_fixed = Array1::<f64>::zeros(r);
+        let mut g_u_v_fixed = Array1::<f64>::zeros(r);
+        let mut g_u_uv_fixed = Array1::<f64>::zeros(r);
+        let mut g_au_u_fixed = Array1::<f64>::zeros(r);
+        let mut g_au_v_fixed = Array1::<f64>::zeros(r);
+        let mut g_au_uv_fixed = Array1::<f64>::zeros(r);
+        let mut g_uv_u_fixed = Array2::<f64>::zeros((r, r));
+        let mut g_uv_v_fixed = Array2::<f64>::zeros((r, r));
+        let mut g_uv_uv_fixed = Array2::<f64>::zeros((r, r));
+
+        let mut tmp_u = vec![[0.0; 4]; r];
+        let mut tmp_v = vec![[0.0; 4]; r];
+        let mut tmp_uv = vec![[0.0; 4]; r];
+        let mut tmp_au_u = vec![[0.0; 4]; r];
+        let mut tmp_au_v = vec![[0.0; 4]; r];
+        let mut tmp_au_uv = vec![[0.0; 4]; r];
+
+        tmp_u[1] = {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &g_bu_fixed[1], dir_u_b);
+            if let Some(h_range) = h_range {
+                for idx in h_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_bu_fixed[idx], dir_u[idx]);
+                }
+            }
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_bu_fixed[idx], dir_u[idx]);
+                }
+            }
+            out
+        };
+        tmp_v[1] = {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &g_bu_fixed[1], dir_v_b);
+            if let Some(h_range) = h_range {
+                for idx in h_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_bu_fixed[idx], dir_v[idx]);
+                }
+            }
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_bu_fixed[idx], dir_v[idx]);
+                }
+            }
+            out
+        };
+        tmp_uv[1] = g_dir_uv_fixed;
+        tmp_au_u[1] = {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &g_abu_fixed[1], dir_u_b);
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_abu_fixed[idx], dir_u[idx]);
+                }
+            }
+            out
+        };
+        tmp_au_v[1] = {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &g_abu_fixed[1], dir_v_b);
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(&mut out, &g_abu_fixed[idx], dir_v[idx]);
+                }
+            }
+            out
+        };
+        tmp_au_uv[1] = {
+            let mut out = [0.0; 4];
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(
+                        &mut out,
+                        &g_abbu_fixed[idx],
+                        dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                    );
+                }
+            }
+            out
+        };
+
+        if let Some(h_range) = h_range {
+            for idx in h_range.clone() {
+                add_scaled_coeff4(&mut tmp_u[idx], &g_bu_fixed[idx], dir_u_b);
+                add_scaled_coeff4(&mut tmp_v[idx], &g_bu_fixed[idx], dir_v_b);
+            }
+        }
+        if let Some(w_range) = w_range {
+            for idx in w_range.clone() {
+                add_scaled_coeff4(&mut tmp_u[idx], &g_bu_fixed[idx], dir_u_b);
+                add_scaled_coeff4(&mut tmp_v[idx], &g_bu_fixed[idx], dir_v_b);
+                add_scaled_coeff4(&mut tmp_uv[idx], &g_bbu_fixed[idx], dir_u_b * dir_v_b);
+                add_scaled_coeff4(&mut tmp_au_u[idx], &g_abu_fixed[idx], dir_u_b);
+                add_scaled_coeff4(&mut tmp_au_v[idx], &g_abu_fixed[idx], dir_v_b);
+                add_scaled_coeff4(&mut tmp_au_uv[idx], &g_abbu_fixed[idx], dir_u_b * dir_v_b);
+            }
+        }
+
+        for u in 1..r {
+            g_u_u_fixed[u] = eval_coeff4_at(&tmp_u[u], z_obs);
+            g_u_v_fixed[u] = eval_coeff4_at(&tmp_v[u], z_obs);
+            g_u_uv_fixed[u] = eval_coeff4_at(&tmp_uv[u], z_obs);
+            g_au_u_fixed[u] = eval_coeff4_at(&tmp_au_u[u], z_obs);
+            g_au_v_fixed[u] = eval_coeff4_at(&tmp_au_v[u], z_obs);
+            g_au_uv_fixed[u] = eval_coeff4_at(&tmp_au_uv[u], z_obs);
+        }
+        for u in 1..r {
+            for v in u..r {
+                let third_u = if u == 1 && v == 1 {
+                    let mut out = [0.0; 4];
+                    add_scaled_coeff4(&mut out, &g_bbu_fixed[1], dir_u_b);
+                    if let Some(w_range) = w_range {
+                        for idx in w_range.clone() {
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[idx], dir_u[idx]);
+                        }
+                    }
+                    out
+                } else if u == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&v) {
+                            let mut out = [0.0; 4];
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[v], dir_u_b);
+                            out
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else if v == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&u) {
+                            let mut out = [0.0; 4];
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[u], dir_u_b);
+                            out
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let third_v = if u == 1 && v == 1 {
+                    let mut out = [0.0; 4];
+                    add_scaled_coeff4(&mut out, &g_bbu_fixed[1], dir_v_b);
+                    if let Some(w_range) = w_range {
+                        for idx in w_range.clone() {
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[idx], dir_v[idx]);
+                        }
+                    }
+                    out
+                } else if u == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&v) {
+                            let mut out = [0.0; 4];
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[v], dir_v_b);
+                            out
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else if v == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&u) {
+                            let mut out = [0.0; 4];
+                            add_scaled_coeff4(&mut out, &g_bbu_fixed[u], dir_v_b);
+                            out
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let fourth_uv = if u == 1 && v == 1 {
+                    let mut out = [0.0; 4];
+                    if let Some(w_range) = w_range {
+                        for idx in w_range.clone() {
+                            add_scaled_coeff4(
+                                &mut out,
+                                &g_bbbu_fixed[idx],
+                                dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                            );
+                        }
+                    }
+                    out
+                } else if u == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&v) {
+                            let mut out = [0.0; 4];
+                            add_scaled_coeff4(&mut out, &g_bbbu_fixed[v], dir_u_b * dir_v_b);
+                            out
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else if v == 1 {
+                    if let Some(w_range) = w_range {
+                        if w_range.contains(&u) {
+                            let mut out = [0.0; 4];
+                            add_scaled_coeff4(&mut out, &g_bbbu_fixed[u], dir_u_b * dir_v_b);
+                            out
+                        } else {
+                            [0.0; 4]
+                        }
+                    } else {
+                        [0.0; 4]
+                    }
+                } else {
+                    [0.0; 4]
+                };
+                let vu = eval_coeff4_at(&third_u, z_obs);
+                let vv = eval_coeff4_at(&third_v, z_obs);
+                let vuv = eval_coeff4_at(&fourth_uv, z_obs);
+                g_uv_u_fixed[[u, v]] = vu;
+                g_uv_v_fixed[[u, v]] = vv;
+                g_uv_uv_fixed[[u, v]] = vuv;
+                g_uv_u_fixed[[v, u]] = vu;
+                g_uv_v_fixed[[v, u]] = vv;
+                g_uv_uv_fixed[[v, u]] = vuv;
+            }
+        }
+
+        let eta_u = g_a * &a_u + &g_u;
+        let mut eta_uv = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let val = g_a * a_uv[[u, v]]
+                    + g_aa * a_u[u] * a_u[v]
+                    + g_au[u] * a_u[v]
+                    + g_au[v] * a_u[u]
+                    + g_uv[[u, v]];
+                eta_uv[[u, v]] = val;
+                eta_uv[[v, u]] = val;
+            }
+        }
+
+        let a_dir_u = a_u.dot(dir_u);
+        let a_dir_v = a_u.dot(dir_v);
+        let g_a_u = g_aa * a_dir_u + g_a_u_fixed;
+        let g_a_v = g_aa * a_dir_v + g_a_v_fixed;
+        let g_aa_u = g_aaa * a_dir_u + g_aa_u_fixed;
+        let g_aa_v = g_aaa * a_dir_v + g_aa_v_fixed;
+
+        let mut g_u_u = Array1::<f64>::zeros(r);
+        let mut g_u_v = Array1::<f64>::zeros(r);
+        let mut g_au_u = Array1::<f64>::zeros(r);
+        let mut g_au_v = Array1::<f64>::zeros(r);
+        for u in 0..r {
+            g_u_u[u] = g_au[u] * a_dir_u + g_u_u_fixed[u];
+            g_u_v[u] = g_au[u] * a_dir_v + g_u_v_fixed[u];
+            g_au_u[u] = g_aau[u] * a_dir_u + g_au_u_fixed[u];
+            g_au_v[u] = g_aau[u] * a_dir_v + g_au_v_fixed[u];
+        }
+
+        let mut eta_uv_u = Array2::<f64>::zeros((r, r));
+        let mut eta_uv_v = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let g_uv_u = g_auv[[u, v]] * a_dir_u + g_uv_u_fixed[[u, v]];
+                let g_uv_v = g_auv[[u, v]] * a_dir_v + g_uv_v_fixed[[u, v]];
+                let val_u = g_a_u * a_uv[[u, v]]
+                    + g_a * a_uv_u[[u, v]]
+                    + g_aa_u * a_u[u] * a_u[v]
+                    + g_aa * (a_u_dir_u[u] * a_u[v] + a_u[u] * a_u_dir_u[v])
+                    + g_au_u[u] * a_u[v]
+                    + g_au[u] * a_u_dir_u[v]
+                    + g_au_u[v] * a_u[u]
+                    + g_au[v] * a_u_dir_u[u]
+                    + g_uv_u;
+                eta_uv_u[[u, v]] = val_u;
+                eta_uv_u[[v, u]] = val_u;
+
+                let val_v = g_a_v * a_uv[[u, v]]
+                    + g_a * a_uv_v[[u, v]]
+                    + g_aa_v * a_u[u] * a_u[v]
+                    + g_aa * (a_u_dir_v[u] * a_u[v] + a_u[u] * a_u_dir_v[v])
+                    + g_au_v[u] * a_u[v]
+                    + g_au[u] * a_u_dir_v[v]
+                    + g_au_v[v] * a_u[u]
+                    + g_au[v] * a_u_dir_v[u]
+                    + g_uv_v;
+                eta_uv_v[[u, v]] = val_v;
+                eta_uv_v[[v, u]] = val_v;
+            }
+        }
+
+        let a_dir_uv = a_u_dir_u.dot(dir_v);
+        let g_a_uv = g_aa * a_dir_uv + g_aa_u_fixed * a_dir_v + g_aa_v_fixed * a_dir_u + g_a_uv_fixed;
+        let g_aa_uv =
+            g_aaau.dot(dir_u) * a_dir_v + g_aaau.dot(dir_v) * a_dir_u + g_aaa * a_dir_uv + g_aa_uv_fixed;
+        let mut g_u_uv = Array1::<f64>::zeros(r);
+        let mut g_au_uv = Array1::<f64>::zeros(r);
+        for u in 0..r {
+            g_u_uv[u] = g_aau[u] * a_dir_u * a_dir_v
+                + g_au[u] * a_dir_uv
+                + g_au_u_fixed[u] * a_dir_v
+                + g_au_v_fixed[u] * a_dir_u
+                + g_u_uv_fixed[u];
+            let row_u_u = g_aauv.row(u).dot(dir_u);
+            let row_u_v = g_aauv.row(u).dot(dir_v);
+            g_au_uv[u] = g_aaau[u] * a_dir_u * a_dir_v
+                + g_aau[u] * a_dir_uv
+                + row_u_u * a_dir_v
+                + row_u_v * a_dir_u
+                + g_au_uv_fixed[u];
+        }
+
+        let mut eta_uv_uv = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let g_uv_uv = g_aauv[[u, v]] * a_dir_u * a_dir_v
+                    + g_auv[[u, v]] * a_dir_uv
+                    + g_uv_u_fixed[[u, v]] * a_dir_v
+                    + g_uv_v_fixed[[u, v]] * a_dir_u
+                    + g_uv_uv_fixed[[u, v]];
+                let val = g_a_uv * a_uv[[u, v]]
+                    + g_a_u * a_uv_v[[u, v]]
+                    + g_a_v * a_uv_u[[u, v]]
+                    + g_a * a_uv_uv[[u, v]]
+                    + g_aa_uv * a_u[u] * a_u[v]
+                    + g_aa_u * (a_u_dir_v[u] * a_u[v] + a_u[u] * a_u_dir_v[v])
+                    + g_aa_v * (a_u_dir_u[u] * a_u[v] + a_u[u] * a_u_dir_u[v])
+                    + g_aa
+                        * (a_u_uv[u] * a_u[v]
+                            + a_u_dir_u[u] * a_u_dir_v[v]
+                            + a_u_dir_v[u] * a_u_dir_u[v]
+                            + a_u[u] * a_u_uv[v])
+                    + g_au_uv[u] * a_u[v]
+                    + g_au_u[u] * a_u_dir_v[v]
+                    + g_au_v[u] * a_u_dir_u[v]
+                    + g_au[u] * a_u_uv[v]
+                    + g_au_uv[v] * a_u[u]
+                    + g_au_u[v] * a_u_dir_v[u]
+                    + g_au_v[v] * a_u_dir_u[u]
+                    + g_au[v] * a_u_uv[u]
+                    + g_uv_uv;
+                eta_uv_uv[[u, v]] = val;
+                eta_uv_uv[[v, u]] = val;
+            }
+        }
+
+        let eta_dir_u = eta_u.dot(dir_u);
+        let eta_dir_v = eta_u.dot(dir_v);
+        let eta_u_dir_u = eta_uv.dot(dir_u);
+        let eta_u_dir_v = eta_uv.dot(dir_v);
+        let eta_dir_uv = eta_u_dir_u.dot(dir_v);
+        let eta_u_uv = eta_uv_u.dot(dir_v);
+
+        let y_i = self.y[row];
+        let w_i = self.weights[row];
+        let s_y = 2.0 * y_i - 1.0;
+        let m = s_y * eta_val;
+        let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w_i);
+        let u1 = s_y * k1;
+        let u3 = s_y * k3;
+
+        let mut out = Array2::<f64>::zeros((r, r));
+        for u in 0..r {
+            for v in u..r {
+                let a_term = eta_u[u] * eta_u[v] * eta_dir_u;
+                let a_term_v =
+                    eta_u_dir_v[u] * eta_u[v] * eta_dir_u
+                        + eta_u[u] * eta_u_dir_v[v] * eta_dir_u
+                        + eta_u[u] * eta_u[v] * eta_dir_uv;
+                let b_term = eta_uv_u[[u, v]];
+                let b_term_v = eta_uv_uv[[u, v]];
+                let c_term =
+                    eta_uv[[u, v]] * eta_dir_u + eta_u[u] * eta_u_dir_u[v] + eta_u[v] * eta_u_dir_u[u];
+                let c_term_v = eta_uv_v[[u, v]] * eta_dir_u
+                    + eta_uv[[u, v]] * eta_dir_uv
+                    + eta_u_dir_v[u] * eta_u_dir_u[v]
+                    + eta_u[u] * eta_u_uv[v]
+                    + eta_u_dir_v[v] * eta_u_dir_u[u]
+                    + eta_u[v] * eta_u_uv[u];
+                let val = k4 * eta_dir_v * a_term
+                    + u3 * a_term_v
+                    + u3 * eta_dir_v * c_term
+                    + k2 * c_term_v
+                    + k2 * eta_dir_v * b_term
+                    + u1 * b_term_v;
+                out[[u, v]] = val;
+                out[[v, u]] = val;
+            }
+        }
+        Ok(out)
     }
 
     /// Like `add_pullback_primary_hessian` but only accumulates the h/w
@@ -3281,7 +5179,6 @@ impl BernoulliMarginalSlopeFamily {
                             block_states,
                             primary,
                             row_ctx,
-                            cache.score_warp_obs.as_ref(),
                         )?;
                         let row_action = row_hessian.dot(&row_dir);
                         chunk_out +=
@@ -3367,7 +5264,6 @@ impl BernoulliMarginalSlopeFamily {
                             block_states,
                             primary,
                             row_ctx,
-                            cache.score_warp_obs.as_ref(),
                         )?;
 
                         {
@@ -3495,7 +5391,6 @@ impl BernoulliMarginalSlopeFamily {
                                     block_states,
                                     primary,
                                     row_ctx,
-                                    cache.score_warp_obs.as_ref(),
                                 )?;
                                 let third = self.row_primary_third_contracted_recompute(
                                     row,
@@ -3688,7 +5583,6 @@ impl BernoulliMarginalSlopeFamily {
                             block_states,
                             primary,
                             row_ctx,
-                            cache.score_warp_obs.as_ref(),
                         )?;
                         let third = self.row_primary_third_contracted_recompute(
                             row,
@@ -3824,7 +5718,6 @@ impl BernoulliMarginalSlopeFamily {
                             block_states,
                             primary,
                             row_ctx,
-                            cache.score_warp_obs.as_ref(),
                         )?;
                         let third_i = self.row_primary_third_contracted_recompute(
                             row,
@@ -4475,9 +6368,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        if self.flex_active() {
-            return ExactOuterDerivativeOrder::First;
-        }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
@@ -4544,7 +6434,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         } else {
             None
         };
-        let score_warp_obs = self.score_warp_obs(block_states)?;
         let n = self.y.len();
         (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
@@ -4563,19 +6452,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                             )?
                             .0;
                         let slope = block_states[1].eta[row];
-                        let h_obs = score_warp_obs
-                            .as_ref()
-                            .map(|(_, dev_obs)| dev_obs[row])
-                            .unwrap_or(0.0);
-                        let eta_obs = intercept
-                            + slope * self.z[row]
-                            + slope * h_obs;
-                        let s_i = if beta_w.is_some() {
-                            self.link_terms_value_d1(&Array1::from_vec(vec![eta_obs]), beta_w)?
-                                .0[0]
-                        } else {
-                            eta_obs
-                        };
+                        let obs = self.observed_denested_cell_partials(
+                            row, intercept, slope, beta_h, beta_w,
+                        )?;
+                        let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
                         let signed = (2.0 * self.y[row] - 1.0) * s_i;
                         let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
                         ll += self.weights[row] * log_cdf;
@@ -4689,7 +6569,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
             crate::families::row_kernel::row_kernel_directional_derivative(&kern, sl).map(Some)
         } else {
-            Ok(None)
+            let cache = self.build_exact_eval_cache(block_states)?;
+            self.exact_newton_joint_hessian_directional_derivative_from_cache(
+                block_states,
+                d_beta_flat,
+                &cache,
+            )
         }
     }
 
@@ -4706,7 +6591,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             crate::families::row_kernel::row_kernel_second_directional_derivative(&kern, su, sv)
                 .map(Some)
         } else {
-            Ok(None)
+            let cache = self.build_exact_eval_cache(block_states)?;
+            self.exact_newton_joint_hessiansecond_directional_derivative_from_cache(
+                block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &cache,
+            )
         }
     }
 
@@ -5107,7 +6998,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
     let hints = RefCell::new(ThetaHints::default());
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
-    let score_warp_obs_design = score_warp_prepared.as_ref().map(|p| p.block.design.clone());
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
 
     let build_blocks = |rho: &Array1<f64>,
@@ -5176,7 +7066,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
             score_warp: score_warp_runtime.clone(),
-            score_warp_obs_design: score_warp_obs_design.clone(),
             link_dev: link_dev_runtime.clone(),
         }
     };
@@ -5332,17 +7221,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_family::CustomFamily;
     use crate::families::bernoulli_marginal_slope::exact_kernel::{
-        DenestedCubicCell as ExactDenestedCubicCell,
-        ExactCellBranch as ExactCellBranchShared,
-        LocalSpanCubic,
-        branch_cell as branch_exact_cell,
-        build_denested_partition_cells,
+        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
+        LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
         denested_cell_coefficient_partials as exact_denested_cell_coefficient_partials,
         global_cubic_from_local as exact_global_cubic_from_local,
         transformed_link_cubic as exact_transformed_link_cubic,
     };
-    use crate::custom_family::CustomFamily;
     use ndarray::array;
 
     fn empty_termspec() -> TermCollectionSpec {
@@ -5445,7 +7331,6 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: None,
-            score_warp_obs_design: None,
             link_dev: Some(prepared.runtime.clone()),
         };
         let block_states = vec![
@@ -5468,15 +7353,11 @@ mod tests {
 
         // Verify that the analytic IFT path produces finite gradient/Hessian
         // for a link-dev-only family.
-        let cache = family
+        family
             .build_exact_eval_cache(&block_states)
             .expect("eval cache");
         let row_ctx = family
-            .build_row_exact_context(
-                0,
-                &block_states,
-                cache.score_warp_obs.as_ref(),
-            )
+            .build_row_exact_context(0, &block_states)
             .expect("row context");
         let (nll, grad, hess) = family
             .compute_row_primary_gradient_hessian(
@@ -5484,7 +7365,6 @@ mod tests {
                 &block_states,
                 &primary,
                 &row_ctx,
-                cache.score_warp_obs.as_ref(),
             )
             .expect("analytic flex eval");
         assert!(nll.is_finite(), "neglog should be finite for link-dev-only");
@@ -5542,7 +7422,6 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            score_warp_obs_design: Some(prepared.block.design.clone()),
             link_dev: None,
         };
         let block_states = vec![
@@ -5642,7 +7521,6 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            score_warp_obs_design: Some(prepared.block.design.clone()),
             link_dev: None,
         };
         let current = Array1::<f64>::zeros(score_dim);
@@ -5803,8 +7681,16 @@ mod tests {
         let exact_cells_a0 = build_denested_partition_cells(
             0.25,
             0.9,
-            score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
-            link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
+            score_prepared
+                .runtime
+                .breakpoints()
+                .as_slice()
+                .expect("score breaks"),
+            link_prepared
+                .runtime
+                .breakpoints()
+                .as_slice()
+                .expect("link breaks"),
             |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
             |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
         )
@@ -5812,8 +7698,16 @@ mod tests {
         let exact_cells_a1 = build_denested_partition_cells(
             0.55,
             0.9,
-            score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
-            link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
+            score_prepared
+                .runtime
+                .breakpoints()
+                .as_slice()
+                .expect("score breaks"),
+            link_prepared
+                .runtime
+                .breakpoints()
+                .as_slice()
+                .expect("link breaks"),
             |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
             |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
         )
@@ -5870,8 +7764,16 @@ mod tests {
         let cells = build_denested_partition_cells(
             a,
             b,
-            score_prepared.runtime.breakpoints().as_slice().expect("score breaks"),
-            link_prepared.runtime.breakpoints().as_slice().expect("link breaks"),
+            score_prepared
+                .runtime
+                .breakpoints()
+                .as_slice()
+                .expect("score breaks"),
+            link_prepared
+                .runtime
+                .breakpoints()
+                .as_slice()
+                .expect("link breaks"),
             |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
             |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
         )
@@ -6004,7 +7906,12 @@ mod tests {
                 aa,
                 bb,
             );
-            [aa + bb * h0 + d0, bb + bb * h1 + d1, bb * h2 + d2, bb * h3 + d3]
+            [
+                aa + bb * h0 + d0,
+                bb + bb * h1 + d1,
+                bb * h2 + d2,
+                bb * h3 + d3,
+            ]
         };
         let (dc_da, dc_db) = exact_denested_cell_coefficient_partials(
             LocalSpanCubic {
@@ -6044,6 +7951,55 @@ mod tests {
                 dc_db[j]
             );
         }
+    }
+
+    #[test]
+    fn observed_denested_partials_include_nonzero_third_a_derivative() {
+        let z = array![-0.8, 0.2, 1.1];
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+        );
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 1.0]),
+            weights: Arc::new(array![1.0, 0.7, 1.3]),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: None,
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+
+        let a = 0.35;
+        let b = 0.6;
+        let row = 1usize;
+        let obs = family
+            .observed_denested_cell_partials(row, a, b, None, Some(&beta_w))
+            .expect("observed denested partials");
+        let u_obs = a + b * z[row];
+        let link_span = link_prepared
+            .runtime
+            .local_cubic_at(&beta_w, u_obs)
+            .expect("local cubic at observed point");
+        let expected_daaa = exact_kernel::denested_cell_third_partials(link_span).0;
+
+        assert_eq!(obs.dc_daaa, expected_daaa);
+        assert!(
+            eval_coeff4_at(&obs.dc_daaa, z[row]).abs() > 1e-12,
+            "expected a nonzero observed d^3 eta / da^3 contribution for a nontrivial cubic link span"
+        );
     }
 
     #[test]
@@ -6128,7 +8084,7 @@ mod tests {
     }
 
     #[test]
-    fn flexible_family_disables_high_order_outer_derivatives_during_denested_rewrite() {
+    fn flexible_family_exposes_exact_outer_derivative_path() {
         let seed = array![-1.0, 0.0, 1.0];
         let score_prepared = build_deviation_block_from_seed(
             &seed,
@@ -6138,24 +8094,20 @@ mod tests {
             },
         )
         .expect("score warp block");
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(3)),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [1.0],
-                [1.0]
-            ])),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [1.0],
-                [1.0]
-            ])),
-            score_warp: Some(score_prepared.runtime),
-            score_warp_obs_design: Some(score_prepared.block.design),
-            link_dev: None,
-        };
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(array![0.0, 1.0, 0.0]),
+                weights: Arc::new(Array1::ones(3)),
+                z: Arc::new(seed.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime),
+                link_dev: None,
+            };
         let specs = vec![
             dummy_blockspec(1, 3),
             dummy_blockspec(1, 3),
@@ -6163,8 +8115,9 @@ mod tests {
         ];
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
         );
+        assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
     }
 
     #[test]
@@ -6210,7 +8163,6 @@ mod tests {
                 1.0
             ]])),
             score_warp: None,
-            score_warp_obs_design: None,
             link_dev: None,
         };
         let states_at = |q: f64, g: f64| {
@@ -6266,11 +8218,7 @@ mod tests {
             .build_exact_eval_cache(&block_states)
             .expect("rigid exact eval cache");
         let row_ctx = family
-            .build_row_exact_context(
-                0,
-                &block_states,
-                cache.score_warp_obs.as_ref(),
-            )
+            .build_row_exact_context(0, &block_states)
             .expect("rigid row context");
         let (_, primary_grad, primary_hess) = family
             .compute_row_primary_gradient_hessian(
@@ -6278,7 +8226,6 @@ mod tests {
                 &block_states,
                 &cache.primary,
                 &row_ctx,
-                cache.score_warp_obs.as_ref(),
             )
             .expect("rigid exact row derivatives");
 
@@ -6343,7 +8290,6 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: None,
-            score_warp_obs_design: None,
             link_dev: Some(prepared.runtime.clone()),
         };
 
@@ -6365,7 +8311,7 @@ mod tests {
         // regimes (negative tail, near zero, positive tail).
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states, None)
+                .build_row_exact_context(row, &block_states)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
             let (_, grad, hess) = family
@@ -6374,7 +8320,6 @@ mod tests {
                     &block_states,
                     &primary,
                     &row_ctx,
-                    None, // score_warp_obs: absent
                 )
                 .unwrap_or_else(|e| {
                     panic!("row {row}: compute_row_primary_gradient_hessian failed: {e}")
@@ -6416,7 +8361,464 @@ mod tests {
     }
 
     #[test]
-    fn flexible_denested_gradient_matches_loglik_finite_differences() {
+    fn h_only_gradient_hessian_finite_and_symmetric() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let beta_score = Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0)));
+
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(beta_score, seed.len()),
+        ];
+
+        let slices = block_slices(&block_states, true, false);
+        assert!(slices.w.is_none(), "link-dev absent → no w slice");
+        let primary = primary_slices(&slices);
+        assert!(primary.w.is_none(), "primary w absent");
+        assert_eq!(primary.total, 2 + score_dim);
+
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+
+            let (_, grad, hess) = family
+                .compute_row_primary_gradient_hessian(
+                    row,
+                    &block_states,
+                    &primary,
+                    &row_ctx,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: compute_row_primary_gradient_hessian failed: {e}")
+                });
+
+            assert_eq!(
+                grad.len(),
+                primary.total,
+                "row {row}: gradient length mismatch"
+            );
+            assert_eq!(
+                hess.dim(),
+                (primary.total, primary.total),
+                "row {row}: hessian shape mismatch"
+            );
+            assert!(
+                grad.iter().all(|v| v.is_finite()),
+                "row {row}: non-finite gradient entry: {grad:?}"
+            );
+            assert!(
+                hess.iter().all(|v| v.is_finite()),
+                "row {row}: non-finite hessian entry"
+            );
+
+            for a in 0..primary.total {
+                for b in 0..a {
+                    let diff = (hess[[a, b]] - hess[[b, a]]).abs();
+                    assert!(
+                        diff < 1e-10,
+                        "row {row}: hessian asymmetry at ({a},{b}): \
+                         H[{a},{b}]={:.6e} vs H[{b},{a}]={:.6e}, diff={diff:.3e}",
+                        hess[[a, b]],
+                        hess[[b, a]]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0)));
+
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(beta_link, seed.len()),
+        ];
+
+        let slices = block_slices(&block_states, false, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.4;
+        dir_u[slices.logslope.start] = -0.3;
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.15;
+        if w_range.len() > 1 {
+            dir_u[w_range.start + 1] = -0.07;
+        }
+
+        dir_v[slices.marginal.start] = -0.2;
+        dir_v[slices.logslope.start] = 0.25;
+        dir_v[w_range.start] = 0.09;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = 0.03;
+        }
+
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
+            .expect("w-only third directional derivative")
+            .expect("w-only third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
+            .expect("w-only fourth directional derivative")
+            .expect("w-only fourth directional derivative matrix");
+
+        assert_eq!(third.dim(), (total, total));
+        assert_eq!(fourth.dim(), (total, total));
+        assert!(third.iter().all(|value| value.is_finite()));
+        assert!(fourth.iter().all(|value| value.is_finite()));
+
+        for i in 0..total {
+            for j in 0..i {
+                assert!((third[[i, j]] - third[[j, i]]).abs() < 1e-8);
+                assert!((fourth[[i, j]] - fourth[[j, i]]).abs() < 1e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_exact_outer_directional_derivatives_are_present_and_finite() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let beta_score = Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0)));
+
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(beta_score, seed.len()),
+        ];
+
+        let slices = block_slices(&block_states, true, false);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = -0.35;
+        dir_u[slices.logslope.start] = 0.28;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.12;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.06;
+        }
+
+        dir_v[slices.marginal.start] = 0.18;
+        dir_v[slices.logslope.start] = -0.22;
+        dir_v[h_range.start] = 0.07;
+        if h_range.len() > 1 {
+            dir_v[h_range.start + 1] = 0.05;
+        }
+
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
+            .expect("h-only third directional derivative")
+            .expect("h-only third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
+            .expect("h-only fourth directional derivative")
+            .expect("h-only fourth directional derivative matrix");
+
+        assert_eq!(third.dim(), (total, total));
+        assert_eq!(fourth.dim(), (total, total));
+        assert!(third.iter().all(|value| value.is_finite()));
+        assert!(fourth.iter().all(|value| value.is_finite()));
+
+        for i in 0..total {
+            for j in 0..i {
+                assert!((third[[i, j]] - third[[j, i]]).abs() < 1e-8);
+                assert!((fourth[[i, j]] - fourth[[j, i]]).abs() < 1e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let beta_score = Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0)));
+
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(beta_score, seed.len()),
+        ];
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = -0.35;
+        dir_u[cache.slices.logslope.start] = 0.28;
+        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.12;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.06;
+        }
+
+        dir_v[cache.slices.marginal.start] = 0.18;
+        dir_v[cache.slices.logslope.start] = -0.22;
+        dir_v[h_range.start] = 0.07;
+        if h_range.len() > 1 {
+            dir_v[h_range.start + 1] = 0.05;
+        }
+
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                });
+
+            assert_eq!(third.dim(), (total, total));
+            assert_eq!(fourth.dim(), (total, total));
+            assert!(third.iter().all(|value| value.is_finite()));
+            assert!(fourth.iter().all(|value| value.is_finite()));
+
+            for i in 0..total {
+                for j in 0..i {
+                    assert!((third[[i, j]] - third[[j, i]]).abs() < 1e-8);
+                    assert!((fourth[[i, j]] - fourth[[j, i]]).abs() < 1e-8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0)));
+
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(beta_link, seed.len()),
+        ];
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = 0.4;
+        dir_u[cache.slices.logslope.start] = -0.3;
+        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.15;
+        if w_range.len() > 1 {
+            dir_u[w_range.start + 1] = -0.07;
+        }
+
+        dir_v[cache.slices.marginal.start] = -0.2;
+        dir_v[cache.slices.logslope.start] = 0.25;
+        dir_v[w_range.start] = 0.09;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = 0.03;
+        }
+
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                });
+
+            assert_eq!(third.dim(), (total, total));
+            assert_eq!(fourth.dim(), (total, total));
+            assert!(third.iter().all(|value| value.is_finite()));
+            assert!(fourth.iter().all(|value| value.is_finite()));
+
+            for i in 0..total {
+                for j in 0..i {
+                    assert!((third[[i, j]] - third[[j, i]]).abs() < 1e-8);
+                    assert!((fourth[[i, j]] - fourth[[j, i]]).abs() < 1e-8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
@@ -6441,20 +8843,349 @@ mod tests {
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [1.0],
-                [1.0]
-            ])),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [1.0],
-                [1.0]
-            ])),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
             score_warp: Some(score_prepared.runtime.clone()),
-            score_warp_obs_design: Some(score_prepared.block.design.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
         };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = 0.7;
+        dir_u[cache.slices.logslope.start] = -0.2;
+        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[cache.slices.marginal.start] = -0.4;
+        dir_v[cache.slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        for row in 0..z.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                });
+
+            assert_eq!(third.dim(), (total, total));
+            assert_eq!(fourth.dim(), (total, total));
+            assert!(third.iter().all(|value| value.is_finite()));
+            assert!(fourth.iter().all(|value| value.is_finite()));
+
+            for i in 0..total {
+                for j in 0..i {
+                    assert!((third[[i, j]] - third[[j, i]]).abs() < 1e-8);
+                    assert!((fourth[[i, j]] - fourth[[j, i]]).abs() < 1e-8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_gradient_matches_loglik_finite_differences() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: None,
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+        );
+        let states_at = |q: f64, b: f64, bw: Array1<f64>| {
+            vec![
+                ParameterBlockState {
+                    beta: array![q],
+                    eta: Array1::from_elem(z.len(), q),
+                },
+                ParameterBlockState {
+                    beta: array![b],
+                    eta: Array1::from_elem(z.len(), b),
+                },
+                ParameterBlockState {
+                    beta: bw,
+                    eta: Array1::zeros(z.len()),
+                },
+            ]
+        };
+
+        let q0 = 0.25;
+        let b0 = 0.6;
+        let block_states = states_at(q0, b0, beta_w.clone());
+        let eval = family.evaluate(&block_states).expect("family evaluation");
+        let grad_q = match &eval.blockworking_sets[0] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton q block"),
+        };
+        let grad_b = match &eval.blockworking_sets[1] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton b block"),
+        };
+        let grad_w0 = match &eval.blockworking_sets[2] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton w block"),
+        };
+
+        let fd = |which: &str, eps: f64| match which {
+            "q" => {
+                let plus = family
+                    .log_likelihood_only(&states_at(q0 + eps, b0, beta_w.clone()))
+                    .expect("ll plus q");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0 - eps, b0, beta_w.clone()))
+                    .expect("ll minus q");
+                (plus - minus) / (2.0 * eps)
+            }
+            "b" => {
+                let plus = family
+                    .log_likelihood_only(&states_at(q0, b0 + eps, beta_w.clone()))
+                    .expect("ll plus b");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0, b0 - eps, beta_w.clone()))
+                    .expect("ll minus b");
+                (plus - minus) / (2.0 * eps)
+            }
+            "w0" => {
+                let mut plus_w = beta_w.clone();
+                plus_w[0] += eps;
+                let mut minus_w = beta_w.clone();
+                minus_w[0] -= eps;
+                let plus = family
+                    .log_likelihood_only(&states_at(q0, b0, plus_w))
+                    .expect("ll plus w");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0, b0, minus_w))
+                    .expect("ll minus w");
+                (plus - minus) / (2.0 * eps)
+            }
+            _ => panic!("unknown derivative target"),
+        };
+
+        let eps = 1e-5;
+        assert!((grad_q - fd("q", eps)).abs() < 2e-4);
+        assert!((grad_b - fd("b", eps)).abs() < 2e-4);
+        assert!((grad_w0 - fd("w0", eps)).abs() < 2e-4);
+    }
+
+    #[test]
+    fn h_only_gradient_matches_loglik_finite_differences() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let beta_h = Array1::from_iter(
+            (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+        );
+        let states_at = |q: f64, b: f64, bh: Array1<f64>| {
+            vec![
+                ParameterBlockState {
+                    beta: array![q],
+                    eta: Array1::from_elem(z.len(), q),
+                },
+                ParameterBlockState {
+                    beta: array![b],
+                    eta: Array1::from_elem(z.len(), b),
+                },
+                ParameterBlockState {
+                    beta: bh,
+                    eta: Array1::zeros(z.len()),
+                },
+            ]
+        };
+
+        let q0 = 0.25;
+        let b0 = 0.6;
+        let block_states = states_at(q0, b0, beta_h.clone());
+        let eval = family.evaluate(&block_states).expect("family evaluation");
+        let grad_q = match &eval.blockworking_sets[0] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton q block"),
+        };
+        let grad_b = match &eval.blockworking_sets[1] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton b block"),
+        };
+        let grad_h0 = match &eval.blockworking_sets[2] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact-newton h block"),
+        };
+
+        let fd = |which: &str, eps: f64| match which {
+            "q" => {
+                let plus = family
+                    .log_likelihood_only(&states_at(q0 + eps, b0, beta_h.clone()))
+                    .expect("ll plus q");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0 - eps, b0, beta_h.clone()))
+                    .expect("ll minus q");
+                (plus - minus) / (2.0 * eps)
+            }
+            "b" => {
+                let plus = family
+                    .log_likelihood_only(&states_at(q0, b0 + eps, beta_h.clone()))
+                    .expect("ll plus b");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0, b0 - eps, beta_h.clone()))
+                    .expect("ll minus b");
+                (plus - minus) / (2.0 * eps)
+            }
+            "h0" => {
+                let mut plus_h = beta_h.clone();
+                plus_h[0] += eps;
+                let mut minus_h = beta_h.clone();
+                minus_h[0] -= eps;
+                let plus = family
+                    .log_likelihood_only(&states_at(q0, b0, plus_h))
+                    .expect("ll plus h");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0, b0, minus_h))
+                    .expect("ll minus h");
+                (plus - minus) / (2.0 * eps)
+            }
+            _ => panic!("unknown derivative target"),
+        };
+
+        let eps = 1e-5;
+        assert!((grad_q - fd("q", eps)).abs() < 2e-4);
+        assert!((grad_b - fd("b", eps)).abs() < 2e-4);
+        assert!((grad_h0 - fd("h0", eps)).abs() < 2e-4);
+    }
+
+    #[test]
+    fn flexible_denested_gradient_matches_loglik_finite_differences() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
         );
@@ -6503,54 +9234,52 @@ mod tests {
             _ => panic!("expected exact-newton w block"),
         };
 
-        let fd = |which: &str, eps: f64| {
-            match which {
-                "q" => {
-                    let plus = family
-                        .log_likelihood_only(&states_at(q0 + eps, b0, beta_h.clone(), beta_w.clone()))
-                        .expect("ll plus q");
-                    let minus = family
-                        .log_likelihood_only(&states_at(q0 - eps, b0, beta_h.clone(), beta_w.clone()))
-                        .expect("ll minus q");
-                    (plus - minus) / (2.0 * eps)
-                }
-                "b" => {
-                    let plus = family
-                        .log_likelihood_only(&states_at(q0, b0 + eps, beta_h.clone(), beta_w.clone()))
-                        .expect("ll plus b");
-                    let minus = family
-                        .log_likelihood_only(&states_at(q0, b0 - eps, beta_h.clone(), beta_w.clone()))
-                        .expect("ll minus b");
-                    (plus - minus) / (2.0 * eps)
-                }
-                "h0" => {
-                    let mut plus_h = beta_h.clone();
-                    plus_h[0] += eps;
-                    let mut minus_h = beta_h.clone();
-                    minus_h[0] -= eps;
-                    let plus = family
-                        .log_likelihood_only(&states_at(q0, b0, plus_h, beta_w.clone()))
-                        .expect("ll plus h");
-                    let minus = family
-                        .log_likelihood_only(&states_at(q0, b0, minus_h, beta_w.clone()))
-                        .expect("ll minus h");
-                    (plus - minus) / (2.0 * eps)
-                }
-                "w0" => {
-                    let mut plus_w = beta_w.clone();
-                    plus_w[0] += eps;
-                    let mut minus_w = beta_w.clone();
-                    minus_w[0] -= eps;
-                    let plus = family
-                        .log_likelihood_only(&states_at(q0, b0, beta_h.clone(), plus_w))
-                        .expect("ll plus w");
-                    let minus = family
-                        .log_likelihood_only(&states_at(q0, b0, beta_h.clone(), minus_w))
-                        .expect("ll minus w");
-                    (plus - minus) / (2.0 * eps)
-                }
-                _ => panic!("unknown derivative target"),
+        let fd = |which: &str, eps: f64| match which {
+            "q" => {
+                let plus = family
+                    .log_likelihood_only(&states_at(q0 + eps, b0, beta_h.clone(), beta_w.clone()))
+                    .expect("ll plus q");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0 - eps, b0, beta_h.clone(), beta_w.clone()))
+                    .expect("ll minus q");
+                (plus - minus) / (2.0 * eps)
             }
+            "b" => {
+                let plus = family
+                    .log_likelihood_only(&states_at(q0, b0 + eps, beta_h.clone(), beta_w.clone()))
+                    .expect("ll plus b");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0, b0 - eps, beta_h.clone(), beta_w.clone()))
+                    .expect("ll minus b");
+                (plus - minus) / (2.0 * eps)
+            }
+            "h0" => {
+                let mut plus_h = beta_h.clone();
+                plus_h[0] += eps;
+                let mut minus_h = beta_h.clone();
+                minus_h[0] -= eps;
+                let plus = family
+                    .log_likelihood_only(&states_at(q0, b0, plus_h, beta_w.clone()))
+                    .expect("ll plus h");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0, b0, minus_h, beta_w.clone()))
+                    .expect("ll minus h");
+                (plus - minus) / (2.0 * eps)
+            }
+            "w0" => {
+                let mut plus_w = beta_w.clone();
+                plus_w[0] += eps;
+                let mut minus_w = beta_w.clone();
+                minus_w[0] -= eps;
+                let plus = family
+                    .log_likelihood_only(&states_at(q0, b0, beta_h.clone(), plus_w))
+                    .expect("ll plus w");
+                let minus = family
+                    .log_likelihood_only(&states_at(q0, b0, beta_h.clone(), minus_w))
+                    .expect("ll minus w");
+                (plus - minus) / (2.0 * eps)
+            }
+            _ => panic!("unknown derivative target"),
         };
 
         let eps = 1e-5;
@@ -6558,5 +9287,196 @@ mod tests {
         assert!((grad_b - fd("b", eps)).abs() < 2e-4);
         assert!((grad_h0 - fd("h0", eps)).abs() < 2e-4);
         assert!((grad_w0 - fd("w0", eps)).abs() < 2e-4);
+    }
+
+    #[test]
+    fn flexible_exact_outer_directional_derivatives_are_present_and_finite() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
+        let beta_h = Array1::from_iter(
+            (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+        );
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: beta_h.clone(),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: beta_w.clone(),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let slices = block_slices(&block_states, true, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.7;
+        dir_u[slices.logslope.start] = -0.2;
+        if let Some(h_range) = slices.h.as_ref() {
+            dir_u[h_range.start] = 0.1;
+            if h_range.len() > 1 {
+                dir_u[h_range.start + 1] = -0.05;
+            }
+        }
+        if let Some(w_range) = slices.w.as_ref() {
+            dir_u[w_range.start] = 0.08;
+        }
+
+        dir_v[slices.marginal.start] = -0.4;
+        dir_v[slices.logslope.start] = 0.3;
+        if let Some(h_range) = slices.h.as_ref() {
+            dir_v[h_range.start] = -0.03;
+        }
+        if let Some(w_range) = slices.w.as_ref() {
+            dir_v[w_range.start] = 0.06;
+            if w_range.len() > 1 {
+                dir_v[w_range.start + 1] = -0.02;
+            }
+        }
+
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
+            .expect("flex third directional derivative")
+            .expect("flex third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
+            .expect("flex fourth directional derivative")
+            .expect("flex fourth directional derivative matrix");
+
+        assert_eq!(third.dim(), (total, total));
+        assert_eq!(fourth.dim(), (total, total));
+        assert!(third.iter().all(|value| value.is_finite()));
+        assert!(fourth.iter().all(|value| value.is_finite()));
+
+        for i in 0..total {
+            for j in 0..i {
+                assert!((third[[i, j]] - third[[j, i]]).abs() < 1e-8);
+                assert!((fourth[[i, j]] - fourth[[j, i]]).abs() < 1e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn flexible_family_exposes_exact_newton_workspaces() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+        let specs = vec![
+            dummy_blockspec(1, z.len()),
+            dummy_blockspec(1, z.len()),
+            dummy_blockspec(score_prepared.block.design.ncols(), z.len()),
+            dummy_blockspec(link_prepared.block.design.ncols(), z.len()),
+        ];
+        let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+
+        assert!(
+            family
+                .exact_newton_joint_hessian_workspace(&block_states, &specs)
+                .expect("flex hessian workspace")
+                .is_some()
+        );
+        assert!(
+            family
+                .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
+                .expect("flex psi workspace")
+                .is_some()
+        );
     }
 }

@@ -8890,12 +8890,19 @@ mod tests {
             },
         ];
         let alpha = family
-            .max_feasible_step_size(&states, SurvivalLocationScaleFamily::BLOCK_TIME, &array![-2.0])
+            .max_feasible_step_size(
+                &states,
+                SurvivalLocationScaleFamily::BLOCK_TIME,
+                &array![-2.0],
+            )
             .expect("time step ceiling")
             .expect("time step should be bounded");
         assert!(alpha > 0.0 && alpha < 1.0);
         let feasible = states[0].beta[0] + alpha * -2.0;
-        let constraints = family.time_linear_constraints.as_ref().expect("constraints");
+        let constraints = family
+            .time_linear_constraints
+            .as_ref()
+            .expect("constraints");
         let slack = constraints.a[[0, 0]] * feasible - constraints.b[0];
         assert!(slack >= 0.0);
     }

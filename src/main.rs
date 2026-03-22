@@ -2674,8 +2674,8 @@ fn run_predict_survival(
                     .to_string(),
             );
         }
-        let has_saved_deviations = model.score_warp_runtime.is_some()
-            || model.link_deviation_runtime.is_some();
+        let has_saved_deviations =
+            model.score_warp_runtime.is_some() || model.link_deviation_runtime.is_some();
         if has_saved_deviations {
             return Err(
                 "saved survival marginal-slope model contains unsupported score/link deviation metadata"
@@ -2763,15 +2763,11 @@ fn run_predict_survival(
                 "saved survival marginal-slope model is missing baseline-timewiggle runtime metadata"
                     .to_string()
             })?;
-            let beta_w = Array1::from_vec(
-                model
-                    .beta_baseline_timewiggle
-                    .clone()
-                    .ok_or_else(|| {
-                        "saved survival marginal-slope model is missing beta_baseline_timewiggle"
-                            .to_string()
-                    })?,
-            );
+            let beta_w =
+                Array1::from_vec(model.beta_baseline_timewiggle.clone().ok_or_else(|| {
+                    "saved survival marginal-slope model is missing beta_baseline_timewiggle"
+                        .to_string()
+                })?);
             &q_exit_base + &exit_w.dot(&beta_w)
         } else {
             q_exit_base
@@ -4314,8 +4310,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     } else {
         None
     };
-    let time_initial_beta =
-        build_survival_feasible_initial_beta(time_design_exit.ncols(), time_initial_constraints.as_ref());
+    let time_initial_beta = build_survival_feasible_initial_beta(
+        time_design_exit.ncols(),
+        time_initial_constraints.as_ref(),
+    );
 
     if likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         let mut time_initial_log_lambdas = None;
@@ -4594,8 +4592,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
         if parsed.linkspec.is_some() {
             return Err(
-                "link(...) is not implemented for the survival marginal-slope family"
-                    .to_string(),
+                "link(...) is not implemented for the survival marginal-slope family".to_string(),
             );
         }
         if parsed.linkwiggle.is_some() {
@@ -10542,7 +10539,7 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_marginal_slope_saved_model_does_not_require_quadrature_metadata() {
+    fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
         let model = super::build_bernoulli_marginal_slope_saved_model(
             "y ~ 1".to_string(),
             DataSchema { columns: vec![] },
