@@ -1425,6 +1425,7 @@ fn materialize_survival<'a>(
                 z,
                 marginalspec,
                 marginal_offset: threshold_offset,
+                gaussian_frailty_sd: None,
                 derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                 time_block,
                 timewiggle_block: None,
