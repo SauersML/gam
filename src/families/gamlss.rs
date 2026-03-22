@@ -16216,6 +16216,8 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             meanspec: simple_matern_term_collection(&[0, 1], 0.4),
             noisespec: simple_matern_term_collection(&[0, 1], 0.75),
+            mean_offset: Array1::zeros(n),
+            noise_offset: Array1::zeros(n),
         };
         assert!(builder.exact_spatial_joint_supported());
         assert!(builder.require_exact_spatial_joint());
@@ -16251,6 +16253,8 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             meanspec: simple_matern_term_collection(&[0, 1], 0.4),
             noisespec: simple_matern_term_collection(&[0, 1], 0.75),
+            mean_offset: Array1::zeros(n),
+            noise_offset: Array1::zeros(n),
             wiggle_knots: knots,
             wiggle_degree: 2,
             wiggle_block,
@@ -16284,6 +16288,8 @@ mod tests {
         let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
         let weights = Array1::from_elem(n, 1.0);
         let builder = BinomialLocationScaleTermBuilder {
+            mean_offset: Array1::zeros(y.len()),
+            noise_offset: Array1::zeros(y.len()),
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
@@ -16330,6 +16336,8 @@ mod tests {
         )
         .expect("wiggle block");
         let builder = BinomialLocationScaleWiggleTermBuilder {
+            mean_offset: Array1::zeros(y.len()),
+            noise_offset: Array1::zeros(y.len()),
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
@@ -16372,6 +16380,8 @@ mod tests {
         let meanspec = simple_matern_term_collection(&[0, 1], 0.45);
         let noisespec = simple_matern_term_collection(&[0, 1], 0.8);
         let builder = BinomialLocationScaleTermBuilder {
+            mean_offset: Array1::zeros(y.len()),
+            noise_offset: Array1::zeros(y.len()),
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
@@ -16454,6 +16464,8 @@ mod tests {
         )
         .expect("wiggle block");
         let builder = BinomialLocationScaleWiggleTermBuilder {
+            mean_offset: Array1::zeros(y.len()),
+            noise_offset: Array1::zeros(y.len()),
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
@@ -16616,6 +16628,8 @@ mod tests {
         )
         .expect("wiggle block");
         let builder = BinomialLocationScaleWiggleTermBuilder {
+            mean_offset: Array1::zeros(y.len()),
+            noise_offset: Array1::zeros(y.len()),
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),

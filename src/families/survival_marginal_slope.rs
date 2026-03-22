@@ -6344,6 +6344,8 @@ mod tests {
                 1e-4,
             )
             .expect("time derivative constraints"),
+            score_warp: None,
+            link_dev: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
@@ -6400,6 +6402,8 @@ mod tests {
                 1e-6,
             )
             .expect("time derivative constraints"),
+            score_warp: None,
+            link_dev: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
@@ -6517,6 +6521,8 @@ mod tests {
             derivative_offset_exit: Arc::new(array![0.05, 0.05]),
             marginal_design: sparse_design(&array![[1.0, 0.0], [0.0, 1.0]]),
             logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.5]])),
+            score_warp: None,
+            link_dev: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
