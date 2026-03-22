@@ -42,7 +42,7 @@ use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
     Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodFamily,
     LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
-    MixtureLinkState, RidgePassport, SasLinkState,
+    LatentCLogLogState, MixtureLinkState, RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -1265,6 +1265,7 @@ pub struct ExternalOptimResult {
 #[derive(Clone)]
 pub struct ExternalOptimOptions {
     pub family: crate::types::LikelihoodFamily,
+    pub latent_cloglog: Option<LatentCLogLogState>,
     pub mixture_link: Option<MixtureLinkSpec>,
     pub optimize_mixture: bool,
     pub sas_link: Option<SasLinkSpec>,
@@ -1343,9 +1344,13 @@ fn effective_sas_link_for_family(
 #[inline]
 fn resolved_external_inverse_link(
     link: LinkFunction,
+    latent_cloglog: Option<LatentCLogLogState>,
     mixture_link: Option<&MixtureLinkSpec>,
     sas_link: Option<SasLinkSpec>,
 ) -> Result<InverseLink, EstimationError> {
+    if let Some(state) = latent_cloglog {
+        return Ok(InverseLink::LatentCLogLog(state));
+    }
     if let Some(spec) = mixture_link {
         return Ok(InverseLink::Mixture(state_fromspec(spec).map_err(|e| {
             EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
@@ -1371,9 +1376,28 @@ fn resolved_external_inverse_link(
 fn resolved_external_config(
     opts: &ExternalOptimOptions,
 ) -> Result<(RemlConfig, Option<SasLinkSpec>), EstimationError> {
+    if opts.latent_cloglog.is_some() && (opts.mixture_link.is_some() || opts.sas_link.is_some()) {
+        return Err(EstimationError::InvalidInput(
+            "latent_cloglog cannot be combined with mixture_link or sas_link".to_string(),
+        ));
+    }
     if opts.mixture_link.is_some() && opts.sas_link.is_some() {
         return Err(EstimationError::InvalidInput(
             "mixture_link and sas_link are mutually exclusive".to_string(),
+        ));
+    }
+    if matches!(opts.family, crate::types::LikelihoodFamily::BinomialLatentCLogLog)
+        && opts.latent_cloglog.is_none()
+    {
+        return Err(EstimationError::InvalidInput(
+            "BinomialLatentCLogLog requires latent_cloglog state".to_string(),
+        ));
+    }
+    if opts.latent_cloglog.is_some()
+        && !matches!(opts.family, crate::types::LikelihoodFamily::BinomialLatentCLogLog)
+    {
+        return Err(EstimationError::InvalidInput(
+            "latent_cloglog is only supported with BinomialLatentCLogLog".to_string(),
         ));
     }
     let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
@@ -1381,8 +1405,12 @@ fn resolved_external_config(
         resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let mut cfg = RemlConfig::external(likelihood, opts.tol, firth_active);
     let link = likelihood.link_function();
-    cfg.link_kind =
-        resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
+    cfg.link_kind = resolved_external_inverse_link(
+        link,
+        opts.latent_cloglog,
+        opts.mixture_link.as_ref(),
+        effective_sas_link,
+    )?;
     Ok((cfg, effective_sas_link))
 }
 
@@ -2586,6 +2614,8 @@ where
                 state,
                 covariance: final_mixture_param_covariance,
             }
+        } else if let Some(state) = opts.latent_cloglog {
+            FittedLinkState::LatentCLogLog { state }
         } else if let Some(state) = final_sas_state {
             match opts.family {
                 crate::types::LikelihoodFamily::BinomialSas => FittedLinkState::Sas {
@@ -2816,6 +2846,7 @@ where
 
 #[derive(Clone)]
 pub struct FitOptions {
+    pub latent_cloglog: Option<LatentCLogLogState>,
     pub mixture_link: Option<MixtureLinkSpec>,
     pub optimize_mixture: bool,
     pub sas_link: Option<SasLinkSpec>,
@@ -2940,6 +2971,9 @@ pub struct FitInference {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FittedLinkState {
     Standard(Option<LinkFunction>),
+    LatentCLogLog {
+        state: LatentCLogLogState,
+    },
     Sas {
         state: SasLinkState,
         covariance: Option<Array2<f64>>,
@@ -2957,6 +2991,10 @@ pub enum FittedLinkState {
 fn validate_fitted_link_estimation(fitted_link: &FittedLinkState) -> Result<(), EstimationError> {
     match fitted_link {
         FittedLinkState::Standard(_) => Ok(()),
+        FittedLinkState::LatentCLogLog { state } => ensure_finite_scalar_estimation(
+            "fit_result.latent_cloglog.latent_sd",
+            state.latent_sd,
+        ),
         FittedLinkState::Mixture { state, covariance } => {
             validate_all_finite_estimation(
                 "fit_result.mixture_link_rho",
@@ -3660,6 +3698,14 @@ impl UnifiedFitResult {
             crate::types::LikelihoodFamily::BinomialCLogLog => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::CLogLog)))
             }
+            crate::types::LikelihoodFamily::BinomialLatentCLogLog => match &self.fitted_link {
+                FittedLinkState::LatentCLogLog { state } => {
+                    Ok(FittedLinkState::LatentCLogLog { state: *state })
+                }
+                _ => Err(EstimationError::InvalidInput(
+                    "BinomialLatentCLogLog requires fixed latent cloglog state".to_string(),
+                )),
+            },
             crate::types::LikelihoodFamily::BinomialSas => match &self.fitted_link {
                 FittedLinkState::Sas { state, covariance } => Ok(FittedLinkState::Sas {
                     state: state.clone(),
@@ -4341,6 +4387,7 @@ where
     validate_penalty_specs(&specs, x.ncols(), "fit_gam")?;
     let mut ext_opts = ExternalOptimOptions {
         family: resolved_family,
+        latent_cloglog: opts.latent_cloglog,
         mixture_link: opts.mixture_link.clone(),
         optimize_mixture: opts.optimize_mixture,
         sas_link: effective_sas_link,

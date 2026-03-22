@@ -39,7 +39,9 @@ use crate::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
+use crate::types::{
+    InverseLink, LatentCLogLogState, LikelihoodFamily, MixtureLinkState, SasLinkState,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -5145,6 +5147,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         })
         .transpose()
         .map_err(EstimationError::InvalidInput)?;
+    let latent_cloglog_state = options.latent_cloglog;
     let shared_y = Arc::new(y.to_owned());
     let sharedweights = Arc::new(weights.to_owned());
     let shared_design = baseline.design.design.to_dense_arc();
@@ -5157,6 +5160,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     )));
     let base_family = SpatialAdaptiveExactFamily {
         family,
+        latent_cloglog_state,
         mixture_link_state: mixture_link_state.clone(),
         sas_link_state,
         y: shared_y.clone(),
@@ -5586,6 +5590,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     })
     .collect::<Vec<_>>();
     let fitted_link = match family {
+        LikelihoodFamily::BinomialLatentCLogLog => latent_cloglog_state
+            .map(|state| FittedLinkState::LatentCLogLog { state })
+            .unwrap_or(FittedLinkState::Standard(None)),
         LikelihoodFamily::BinomialMixture => mixture_link_state
             .clone()
             .map(|state| FittedLinkState::Mixture {
@@ -5743,6 +5750,7 @@ fn weighted_operator_gram_from_d2(d2: &Array2<f64>, weight: &Array1<f64>) -> Arr
 
 fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign) -> FitOptions {
     FitOptions {
+        latent_cloglog: options.latent_cloglog,
         mixture_link: options.mixture_link.clone(),
         optimize_mixture: options.optimize_mixture,
         sas_link: options.sas_link,
@@ -5775,6 +5783,7 @@ struct BoundedLinearTermMeta {
 #[derive(Clone)]
 struct BoundedLinearFamily {
     family: LikelihoodFamily,
+    latent_cloglog_state: Option<LatentCLogLogState>,
     mixture_link_state: Option<MixtureLinkState>,
     sas_link_state: Option<SasLinkState>,
     y: Array1<f64>,
@@ -5857,6 +5866,7 @@ fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64,
 
 fn evaluate_standard_familyobservations(
     family: LikelihoodFamily,
+    latent_cloglog_state: Option<&LatentCLogLogState>,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
     y: &Array1<f64>,
@@ -5906,10 +5916,13 @@ fn evaluate_standard_familyobservations(
             }
             LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialLatentCLogLog
             | LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => {
-                let inverse_link = if let Some(state) = mixture_link_state {
+                let inverse_link = if let Some(state) = latent_cloglog_state {
+                    Some(InverseLink::LatentCLogLog(*state))
+                } else if let Some(state) = mixture_link_state {
                     Some(InverseLink::Mixture(state.clone()))
                 } else if let Some(state) = sas_link_state {
                     Some(
@@ -6097,6 +6110,7 @@ impl SpatialAdaptiveExactEvaluation {
 #[derive(Clone)]
 struct SpatialAdaptiveExactFamily {
     family: LikelihoodFamily,
+    latent_cloglog_state: Option<LatentCLogLogState>,
     mixture_link_state: Option<MixtureLinkState>,
     sas_link_state: Option<SasLinkState>,
     y: Arc<Array1<f64>>,
@@ -6118,6 +6132,7 @@ impl SpatialAdaptiveExactFamily {
     ) -> Self {
         Self {
             family: self.family,
+            latent_cloglog_state: self.latent_cloglog_state,
             mixture_link_state: self.mixture_link_state.clone(),
             sas_link_state: self.sas_link_state,
             y: self.y.clone(),
@@ -6819,6 +6834,7 @@ impl SpatialAdaptiveExactFamily {
         let eta = self.total_eta(beta);
         let obs = evaluate_standard_familyobservations(
             self.family,
+            self.latent_cloglog_state.as_ref(),
             self.mixture_link_state.as_ref(),
             self.sas_link_state.as_ref(),
             &self.y,
@@ -7277,6 +7293,7 @@ impl BoundedLinearFamily {
             self.designzeroed.dot(latent_beta) + self.nonlinear_offset_from_latent(latent_beta);
         let obs = evaluate_standard_familyobservations(
             self.family,
+            self.latent_cloglog_state.as_ref(),
             self.mixture_link_state.as_ref(),
             self.sas_link_state.as_ref(),
             &self.y,
@@ -7692,6 +7709,7 @@ fn fit_bounded_term_collection_with_design(
 
     let family_adapter = BoundedLinearFamily {
         family,
+        latent_cloglog_state: options.latent_cloglog,
         mixture_link_state: options
             .mixture_link
             .clone()
@@ -8099,6 +8117,7 @@ fn external_opts_for_design(
 ) -> ExternalOptimOptions {
     ExternalOptimOptions {
         family,
+        latent_cloglog: options.latent_cloglog,
         mixture_link: options.mixture_link.clone(),
         optimize_mixture: options.optimize_mixture,
         sas_link: options.sas_link,
@@ -10508,6 +10527,7 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
         LikelihoodFamily::BinomialLogit
         | LikelihoodFamily::BinomialProbit
         | LikelihoodFamily::BinomialCLogLog
+        | LikelihoodFamily::BinomialLatentCLogLog
         | LikelihoodFamily::BinomialSas
         | LikelihoodFamily::BinomialBetaLogistic
         | LikelihoodFamily::BinomialMixture
@@ -14183,6 +14203,7 @@ mod tests {
         let weights = Array1::ones(y.len());
         let family = BoundedLinearFamily {
             family: LikelihoodFamily::GaussianIdentity,
+            latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
             y: y.clone(),
@@ -15112,6 +15133,7 @@ mod tests {
             LikelihoodFamily::BinomialLogit,
             None,
             None,
+            None,
             &y,
             &weights,
             &eta,
@@ -15156,8 +15178,9 @@ mod tests {
             LikelihoodFamily::BinomialProbit,
             LikelihoodFamily::BinomialCLogLog,
         ] {
-            let obs = evaluate_standard_familyobservations(family, None, None, &y, &weights, &eta)
-                .expect("tail observations");
+            let obs =
+                evaluate_standard_familyobservations(family, None, None, None, &y, &weights, &eta)
+                    .expect("tail observations");
             assert!(obs.log_likelihood.is_finite(), "family={family:?}");
             assert!(
                 obs.score.iter().all(|v| v.is_finite())

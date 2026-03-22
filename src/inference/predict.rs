@@ -3205,6 +3205,7 @@ where
     };
     let link_kind = match fitted_link_state.as_ref() {
         Some(FittedLinkState::Standard(Some(link))) => Some(InverseLink::Standard(*link)),
+        Some(FittedLinkState::LatentCLogLog { state }) => Some(InverseLink::LatentCLogLog(*state)),
         Some(FittedLinkState::Sas { state, .. }) => Some(InverseLink::Sas(*state)),
         Some(FittedLinkState::BetaLogistic { state, .. }) => {
             Some(InverseLink::BetaLogistic(*state))

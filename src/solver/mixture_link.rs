@@ -1,16 +1,35 @@
 use crate::estimate::EstimationError;
+use crate::families::lognormal_kernel::latent_cloglog_jet5;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::types::{
-    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
-    SasLinkSpec, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkComponent, LinkFunction,
+    MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
 };
 use ndarray::Array1;
 use statrs::function::beta::{beta_reg, ln_beta};
 use statrs::function::gamma::digamma;
+use std::sync::OnceLock;
 
 const SAS_U_CLAMP: f64 = 50.0;
 const SAS_LOG_DELTA_BOUND: f64 = 12.0;
 const BETA_LOGISTIC_U_EPS: f64 = 1e-12;
+
+#[inline]
+fn latent_cloglog_quadctx() -> &'static crate::quadrature::QuadratureContext {
+    static QUADCTX: OnceLock<crate::quadrature::QuadratureContext> = OnceLock::new();
+    QUADCTX.get_or_init(crate::quadrature::QuadratureContext::new)
+}
+
+#[inline]
+fn latent_cloglog_point_jet(state: &LatentCLogLogState, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+    let jet = latent_cloglog_jet5(latent_cloglog_quadctx(), eta, state.latent_sd)?;
+    Ok(InverseLinkJet {
+        mu: jet.mean,
+        d1: jet.d1,
+        d2: jet.d2,
+        d3: jet.d3,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InverseLinkJet {
@@ -800,6 +819,7 @@ impl InverseLinkKernel for InverseLink {
     fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
         match self {
             InverseLink::Standard(link_fn) => link_fn.jet(eta),
+            InverseLink::LatentCLogLog(state) => latent_cloglog_point_jet(state, eta),
             InverseLink::Sas(state) => state.jet(eta),
             InverseLink::BetaLogistic(state) => BetaLogisticKernel {
                 delta: state.log_delta,
@@ -813,6 +833,7 @@ impl InverseLinkKernel for InverseLink {
     fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
         match self {
             InverseLink::Standard(_) => Ok(None),
+            InverseLink::LatentCLogLog(_) => Ok(None),
             InverseLink::Sas(state) => state.param_partials(eta),
             InverseLink::BetaLogistic(state) => BetaLogisticKernel {
                 delta: state.log_delta,
@@ -866,6 +887,12 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
         InverseLink::Standard(LinkFunction::CLogLog) => Ok(
             component_inverse_link_pdfthird_derivative(LinkComponent::CLogLog, eta),
         ),
+        InverseLink::LatentCLogLog(state) => Ok(latent_cloglog_jet5(
+            latent_cloglog_quadctx(),
+            eta,
+            state.latent_sd,
+        )?
+        .d4),
         InverseLink::Standard(LinkFunction::Sas) => {
             Ok(sas_inverse_link_pdfthird_derivative(eta, 0.0, 0.0))
         }
@@ -912,6 +939,12 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
         InverseLink::Standard(LinkFunction::CLogLog) => Ok(
             component_inverse_link_pdffourth_derivative(LinkComponent::CLogLog, eta),
         ),
+        InverseLink::LatentCLogLog(state) => Ok(latent_cloglog_jet5(
+            latent_cloglog_quadctx(),
+            eta,
+            state.latent_sd,
+        )?
+        .d5),
         InverseLink::Standard(LinkFunction::Sas) => {
             Ok(sas_inverse_link_pdffourth_derivative(eta, 0.0, 0.0))
         }
@@ -1019,6 +1052,10 @@ pub fn inverse_link_jet_for_family(
             mixture_link_state,
             sas_link_state,
         ),
+        LikelihoodFamily::BinomialLatentCLogLog => Err(EstimationError::InvalidInput(
+            "BinomialLatentCLogLog inverse-link requires explicit latent cloglog state"
+                .to_string(),
+        )),
         LikelihoodFamily::BinomialSas => inverse_link_jet_for_link_function(
             LinkFunction::Sas,
             eta,

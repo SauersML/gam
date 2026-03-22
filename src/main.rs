@@ -973,6 +973,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         None
     };
     let base_fit_options = FitOptions {
+        latent_cloglog: None,
         mixture_link: mixture_linkspec.clone(),
         optimize_mixture: true,
         sas_link: sas_linkspec,
@@ -1049,6 +1050,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             design.penalties.clone(),
             &ExternalOptimOptions {
                 family,
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: true,
                 sas_link: None,
@@ -1161,6 +1163,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             FittedFamily::Standard {
                 likelihood: family,
                 link: Some(effective_link),
+                latent_cloglog_state: None,
                 mixture_state: saved_mixture_state_from_fit(&saved_fit),
                 sas_state: saved_sas_state_from_fit(&saved_fit),
             },
@@ -3987,6 +3990,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             &design.penalties,
             family,
             &FitOptions {
+                latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,
                 sas_link: None,
@@ -4709,7 +4713,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 optimize_inverse_link: match &survival_inverse_link {
                     InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => true,
                     InverseLink::Mixture(state) => !state.rho.is_empty(),
-                    InverseLink::Standard(_) => false,
+                    InverseLink::LatentCLogLog(_) | InverseLink::Standard(_) => false,
                 },
             },
         )) {
@@ -5951,6 +5955,7 @@ fn run_sample_standard(
         &design.penalties,
         family,
         &FitOptions {
+            latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
             sas_link: None,
@@ -8646,6 +8651,7 @@ fn link_choice_to_string(choice: &LinkChoice) -> String {
 fn inverse_link_to_saved_string(link: &InverseLink) -> String {
     match link {
         InverseLink::Standard(link_fn) => linkname(*link_fn).to_string(),
+        InverseLink::LatentCLogLog(state) => format!("latent-cloglog(sd={})", state.latent_sd),
         InverseLink::Sas(_) => "sas".to_string(),
         InverseLink::BetaLogistic(_) => "beta-logistic".to_string(),
         InverseLink::Mixture(state) => {
@@ -8678,6 +8684,7 @@ fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
         InverseLink::Standard(LinkFunction::BetaLogistic) | InverseLink::BetaLogistic(_) => {
             LikelihoodFamily::BinomialBetaLogistic
         }
+        InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
         InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
         InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
     }
@@ -8902,6 +8909,7 @@ fn apply_inverse_link_state_to_fit_result(
     inverse_link: &InverseLink,
 ) {
     let link = match inverse_link {
+        InverseLink::LatentCLogLog(state) => FittedLinkState::LatentCLogLog { state: *state },
         InverseLink::Sas(state) => FittedLinkState::Sas {
             state: state.clone(),
             covariance: None,
@@ -9114,6 +9122,7 @@ fn build_model_summary(
         LikelihoodFamily::BinomialLogit
         | LikelihoodFamily::BinomialProbit
         | LikelihoodFamily::BinomialCLogLog
+        | LikelihoodFamily::BinomialLatentCLogLog
         | LikelihoodFamily::BinomialSas
         | LikelihoodFamily::BinomialBetaLogistic
         | LikelihoodFamily::BinomialMixture => {
@@ -9464,6 +9473,7 @@ fn response_sd_from_eta_for_family(
         LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture
+            | LikelihoodFamily::BinomialLatentCLogLog
     ) {
         return Err(
             "stateful link response uncertainty must be computed via library prediction APIs"
@@ -9490,7 +9500,8 @@ fn response_sd_from_eta_for_family(
             }
             LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture => unreachable!(),
+            | LikelihoodFamily::BinomialMixture
+            | LikelihoodFamily::BinomialLatentCLogLog => unreachable!(),
             LikelihoodFamily::RoystonParmar => {
                 let (_, v) =
                     gam::quadrature::survival_posterior_meanvariance(&quadctx, eta[i], eta_se[i]);
