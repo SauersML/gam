@@ -8525,6 +8525,20 @@ mod tests {
         assert_eq!(fourth.dim(), (total, total));
         assert!(third.iter().all(|value| value.is_finite()));
         assert!(fourth.iter().all(|value| value.is_finite()));
+        let max_abs_third = third
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let max_abs_fourth = fourth
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            max_abs_third > 1e-10,
+            "expected nonzero w-only third directional derivative"
+        );
+        assert!(
+            max_abs_fourth > 1e-10,
+            "expected nonzero w-only fourth directional derivative"
+        );
 
         for i in 0..total {
             for j in 0..i {
@@ -8604,6 +8618,20 @@ mod tests {
         assert_eq!(fourth.dim(), (total, total));
         assert!(third.iter().all(|value| value.is_finite()));
         assert!(fourth.iter().all(|value| value.is_finite()));
+        let max_abs_third = third
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let max_abs_fourth = fourth
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            max_abs_third > 1e-10,
+            "expected nonzero h-only third directional derivative"
+        );
+        assert!(
+            max_abs_fourth > 1e-10,
+            "expected nonzero h-only fourth directional derivative"
+        );
 
         for i in 0..total {
             for j in 0..i {
@@ -8673,6 +8701,8 @@ mod tests {
             dir_v[h_range.start + 1] = 0.05;
         }
 
+        let mut max_abs_third = 0.0_f64;
+        let mut max_abs_fourth = 0.0_f64;
         for row in 0..seed.len() {
             let row_ctx = family
                 .build_row_exact_context(row, &block_states)
@@ -8705,6 +8735,16 @@ mod tests {
             assert_eq!(fourth.dim(), (total, total));
             assert!(third.iter().all(|value| value.is_finite()));
             assert!(fourth.iter().all(|value| value.is_finite()));
+            max_abs_third = max_abs_third.max(
+                third
+                    .iter()
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+            );
+            max_abs_fourth = max_abs_fourth.max(
+                fourth
+                    .iter()
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+            );
 
             for i in 0..total {
                 for j in 0..i {
@@ -8713,6 +8753,14 @@ mod tests {
                 }
             }
         }
+        assert!(
+            max_abs_third > 1e-10,
+            "expected nonzero h-only third contraction"
+        );
+        assert!(
+            max_abs_fourth > 1e-10,
+            "expected nonzero h-only fourth contraction"
+        );
     }
 
     #[test]
@@ -8775,6 +8823,8 @@ mod tests {
             dir_v[w_range.start + 1] = 0.03;
         }
 
+        let mut max_abs_third = 0.0_f64;
+        let mut max_abs_fourth = 0.0_f64;
         for row in 0..seed.len() {
             let row_ctx = family
                 .build_row_exact_context(row, &block_states)
@@ -8807,6 +8857,16 @@ mod tests {
             assert_eq!(fourth.dim(), (total, total));
             assert!(third.iter().all(|value| value.is_finite()));
             assert!(fourth.iter().all(|value| value.is_finite()));
+            max_abs_third = max_abs_third.max(
+                third
+                    .iter()
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+            );
+            max_abs_fourth = max_abs_fourth.max(
+                fourth
+                    .iter()
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+            );
 
             for i in 0..total {
                 for j in 0..i {
@@ -8815,6 +8875,14 @@ mod tests {
                 }
             }
         }
+        assert!(
+            max_abs_third > 1e-10,
+            "expected nonzero w-only third contraction"
+        );
+        assert!(
+            max_abs_fourth > 1e-10,
+            "expected nonzero w-only fourth contraction"
+        );
     }
 
     #[test]
@@ -8899,6 +8967,8 @@ mod tests {
             dir_v[w_range.start + 1] = -0.02;
         }
 
+        let mut max_abs_third = 0.0_f64;
+        let mut max_abs_fourth = 0.0_f64;
         for row in 0..z.len() {
             let row_ctx = family
                 .build_row_exact_context(row, &block_states)
@@ -8931,6 +9001,16 @@ mod tests {
             assert_eq!(fourth.dim(), (total, total));
             assert!(third.iter().all(|value| value.is_finite()));
             assert!(fourth.iter().all(|value| value.is_finite()));
+            max_abs_third = max_abs_third.max(
+                third
+                    .iter()
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+            );
+            max_abs_fourth = max_abs_fourth.max(
+                fourth
+                    .iter()
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs())),
+            );
 
             for i in 0..total {
                 for j in 0..i {
@@ -8939,6 +9019,2564 @@ mod tests {
                 }
             }
         }
+        assert!(
+            max_abs_third > 1e-10,
+            "expected nonzero dual-flex third contraction"
+        );
+        assert!(
+            max_abs_fourth > 1e-10,
+            "expected nonzero dual-flex fourth contraction"
+        );
+    }
+
+    #[test]
+    fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let zero = Array1::<f64>::zeros(cache.primary.total);
+        for row in 0..z.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &zero,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &zero,
+                    &zero,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                });
+
+            assert!(
+                third.iter().all(|value| value.abs() <= 0.0),
+                "row {row}: expected zero third contraction for zero direction"
+            );
+            assert!(
+                fourth.iter().all(|value| value.abs() <= 0.0),
+                "row {row}: expected zero fourth contraction for zero directions"
+            );
+        }
+    }
+
+    #[test]
+    fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let zero = Array1::<f64>::zeros(cache.primary.total);
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &zero,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &zero,
+                    &zero,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                });
+
+            assert!(
+                third.iter().all(|value| value.abs() <= 0.0),
+                "row {row}: expected zero h-only third contraction for zero direction"
+            );
+            assert!(
+                fourth.iter().all(|value| value.abs() <= 0.0),
+                "row {row}: expected zero h-only fourth contraction for zero directions"
+            );
+        }
+    }
+
+    #[test]
+    fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let zero = Array1::<f64>::zeros(cache.primary.total);
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &zero,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &zero,
+                    &zero,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                });
+
+            assert!(
+                third.iter().all(|value| value.abs() <= 0.0),
+                "row {row}: expected zero w-only third contraction for zero direction"
+            );
+            assert!(
+                fourth.iter().all(|value| value.abs() <= 0.0),
+                "row {row}: expected zero w-only fourth contraction for zero directions"
+            );
+        }
+    }
+
+    #[test]
+    fn dual_flex_exact_outer_zero_direction_returns_zero() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let slices = block_slices(&block_states, true, true);
+        let zero = Array1::<f64>::zeros(slices.total);
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &zero)
+            .expect("dual-flex third directional derivative")
+            .expect("dual-flex third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &zero, &zero)
+            .expect("dual-flex fourth directional derivative")
+            .expect("dual-flex fourth directional derivative matrix");
+
+        assert!(
+            third.iter().all(|value| value.abs() <= 0.0),
+            "expected zero dual-flex third directional derivative for zero direction"
+        );
+        assert!(
+            fourth.iter().all(|value| value.abs() <= 0.0),
+            "expected zero dual-flex fourth directional derivative for zero directions"
+        );
+    }
+
+    #[test]
+    fn dual_flex_exact_outer_fourth_direction_swap_is_symmetric() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let slices = block_slices(&block_states, true, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.7;
+        dir_u[slices.logslope.start] = -0.2;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[slices.marginal.start] = -0.4;
+        dir_v[slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        let forward = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
+            .expect("dual-flex fourth directional derivative")
+            .expect("dual-flex fourth directional derivative matrix");
+        let swapped = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_v, &dir_u)
+            .expect("dual-flex swapped fourth directional derivative")
+            .expect("dual-flex swapped fourth directional derivative matrix");
+
+        assert_eq!(forward.dim(), (total, total));
+        assert_eq!(swapped.dim(), (total, total));
+        for i in 0..total {
+            for j in 0..total {
+                assert!(
+                    (forward[[i, j]] - swapped[[i, j]]).abs() < 1e-8,
+                    "fourth directional derivative should be symmetric in direction arguments at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = 0.7;
+        dir_u[cache.slices.logslope.start] = -0.2;
+        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[cache.slices.marginal.start] = -0.4;
+        dir_v[cache.slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        for row in 0..z.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let forward = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: forward fourth contraction failed: {e}")
+                });
+            let swapped = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_v,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: swapped fourth contraction failed: {e}")
+                });
+
+            assert_eq!(forward.dim(), (total, total));
+            assert_eq!(swapped.dim(), (total, total));
+            for i in 0..total {
+                for j in 0..total {
+                    assert!(
+                        (forward[[i, j]] - swapped[[i, j]]).abs() < 1e-8,
+                        "row {row}: fourth contraction should be symmetric in direction arguments at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = 0.7;
+        dir_u[cache.slices.logslope.start] = -0.2;
+        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[cache.slices.marginal.start] = -0.4;
+        dir_v[cache.slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        let neg_dir_u = dir_u.mapv(|value| -value);
+        for row in 0..z.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction failed: {e}")
+                });
+            let third_neg = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &neg_dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: negated third contraction failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: fourth contraction failed: {e}")
+                });
+            let fourth_neg_u = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &neg_dir_u,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: negated-u fourth contraction failed: {e}")
+                });
+
+            for i in 0..total {
+                for j in 0..total {
+                    assert!(
+                        (third_neg[[i, j]] + third[[i, j]]).abs() < 1e-8,
+                        "row {row}: third contraction should be odd in its direction at ({i},{j})"
+                    );
+                    assert!(
+                        (fourth_neg_u[[i, j]] + fourth[[i, j]]).abs() < 1e-8,
+                        "row {row}: fourth contraction should be linear in dir_u sign at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = -0.35;
+        dir_u[cache.slices.logslope.start] = 0.28;
+        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.12;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.06;
+        }
+
+        dir_v[cache.slices.marginal.start] = 0.18;
+        dir_v[cache.slices.logslope.start] = -0.22;
+        dir_v[h_range.start] = 0.07;
+        if h_range.len() > 1 {
+            dir_v[h_range.start + 1] = 0.05;
+        }
+
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let forward = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: forward fourth contraction failed: {e}")
+                });
+            let swapped = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_v,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: swapped fourth contraction failed: {e}")
+                });
+
+            for i in 0..total {
+                for j in 0..total {
+                    assert!(
+                        (forward[[i, j]] - swapped[[i, j]]).abs() < 1e-8,
+                        "row {row}: h-only fourth contraction should be symmetric in direction arguments at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = 0.4;
+        dir_u[cache.slices.logslope.start] = -0.3;
+        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.15;
+        if w_range.len() > 1 {
+            dir_u[w_range.start + 1] = -0.07;
+        }
+
+        dir_v[cache.slices.marginal.start] = -0.2;
+        dir_v[cache.slices.logslope.start] = 0.25;
+        dir_v[w_range.start] = 0.09;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = 0.03;
+        }
+
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let forward = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: forward fourth contraction failed: {e}")
+                });
+            let swapped = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_v,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: swapped fourth contraction failed: {e}")
+                });
+
+            for i in 0..total {
+                for j in 0..total {
+                    assert!(
+                        (forward[[i, j]] - swapped[[i, j]]).abs() < 1e-8,
+                        "row {row}: w-only fourth contraction should be symmetric in direction arguments at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir = Array1::<f64>::zeros(total);
+        dir[cache.slices.marginal.start] = -0.35;
+        dir[cache.slices.logslope.start] = 0.28;
+        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir[h_range.start] = 0.12;
+        if h_range.len() > 1 {
+            dir[h_range.start + 1] = -0.06;
+        }
+        let neg_dir = dir.mapv(|value| -value);
+
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction failed: {e}")
+                });
+            let third_neg = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &neg_dir,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: negated third contraction failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir,
+                    &dir,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: fourth contraction failed: {e}")
+                });
+            let fourth_neg = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &neg_dir,
+                    &neg_dir,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: doubly-negated fourth contraction failed: {e}")
+                });
+
+            for i in 0..total {
+                for j in 0..total {
+                    assert!(
+                        (third_neg[[i, j]] + third[[i, j]]).abs() < 1e-8,
+                        "row {row}: h-only third contraction should be odd at ({i},{j})"
+                    );
+                    assert!(
+                        (fourth_neg[[i, j]] - fourth[[i, j]]).abs() < 1e-8,
+                        "row {row}: h-only fourth contraction should be invariant under flipping both directions at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir = Array1::<f64>::zeros(total);
+        dir[cache.slices.marginal.start] = 0.4;
+        dir[cache.slices.logslope.start] = -0.3;
+        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir[w_range.start] = 0.15;
+        if w_range.len() > 1 {
+            dir[w_range.start + 1] = -0.07;
+        }
+        let neg_dir = dir.mapv(|value| -value);
+
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction failed: {e}")
+                });
+            let third_neg = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &neg_dir,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: negated third contraction failed: {e}")
+                });
+            let fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir,
+                    &dir,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: fourth contraction failed: {e}")
+                });
+            let fourth_neg = family
+                .row_primary_fourth_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &neg_dir,
+                    &neg_dir,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: doubly-negated fourth contraction failed: {e}")
+                });
+
+            for i in 0..total {
+                for j in 0..total {
+                    assert!(
+                        (third_neg[[i, j]] + third[[i, j]]).abs() < 1e-8,
+                        "row {row}: w-only third contraction should be odd at ({i},{j})"
+                    );
+                    assert!(
+                        (fourth_neg[[i, j]] - fourth[[i, j]]).abs() < 1e-8,
+                        "row {row}: w-only fourth contraction should be invariant under flipping both directions at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dual_flex_exact_outer_direction_sign_rules_hold() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let slices = block_slices(&block_states, true, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.7;
+        dir_u[slices.logslope.start] = -0.2;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[slices.marginal.start] = -0.4;
+        dir_v[slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        let neg_dir_u = dir_u.mapv(|value| -value);
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
+            .expect("dual-flex third directional derivative")
+            .expect("dual-flex third directional derivative matrix");
+        let third_neg = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &neg_dir_u)
+            .expect("dual-flex negated third directional derivative")
+            .expect("dual-flex negated third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
+            .expect("dual-flex fourth directional derivative")
+            .expect("dual-flex fourth directional derivative matrix");
+        let fourth_neg_u = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &block_states,
+                &neg_dir_u,
+                &dir_v,
+            )
+            .expect("dual-flex negated-u fourth directional derivative")
+            .expect("dual-flex negated-u fourth directional derivative matrix");
+
+        assert_eq!(third.dim(), (total, total));
+        assert_eq!(third_neg.dim(), (total, total));
+        assert_eq!(fourth.dim(), (total, total));
+        assert_eq!(fourth_neg_u.dim(), (total, total));
+        for i in 0..total {
+            for j in 0..total {
+                assert!(
+                    (third_neg[[i, j]] + third[[i, j]]).abs() < 1e-8,
+                    "third directional derivative should be odd in its direction at ({i},{j})"
+                );
+                assert!(
+                    (fourth_neg_u[[i, j]] + fourth[[i, j]]).abs() < 1e-8,
+                    "fourth directional derivative should be linear in dir_u sign at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dual_flex_exact_outer_fourth_double_sign_flip_is_invariant() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let slices = block_slices(&block_states, true, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.7;
+        dir_u[slices.logslope.start] = -0.2;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[slices.marginal.start] = -0.4;
+        dir_v[slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        let neg_dir_u = dir_u.mapv(|value| -value);
+        let neg_dir_v = dir_v.mapv(|value| -value);
+        let forward = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
+            .expect("dual-flex fourth directional derivative")
+            .expect("dual-flex fourth directional derivative matrix");
+        let flipped = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &block_states,
+                &neg_dir_u,
+                &neg_dir_v,
+            )
+            .expect("dual-flex doubly-negated fourth directional derivative")
+            .expect("dual-flex doubly-negated fourth directional derivative matrix");
+
+        assert_eq!(forward.dim(), (total, total));
+        assert_eq!(flipped.dim(), (total, total));
+        for i in 0..total {
+            for j in 0..total {
+                assert!(
+                    (forward[[i, j]] - flipped[[i, j]]).abs() < 1e-8,
+                    "fourth directional derivative should be invariant under flipping both directions at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dual_flex_exact_outer_third_direction_is_linear() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let slices = block_slices(&block_states, true, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.7;
+        dir_u[slices.logslope.start] = -0.2;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[slices.marginal.start] = -0.4;
+        dir_v[slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        let dir_sum = &dir_u + &dir_v;
+        let third_u = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
+            .expect("dual-flex third directional derivative u")
+            .expect("dual-flex third directional derivative u matrix");
+        let third_v = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_v)
+            .expect("dual-flex third directional derivative v")
+            .expect("dual-flex third directional derivative v matrix");
+        let third_sum = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_sum)
+            .expect("dual-flex third directional derivative sum")
+            .expect("dual-flex third directional derivative sum matrix");
+
+        for i in 0..total {
+            for j in 0..total {
+                let expected = third_u[[i, j]] + third_v[[i, j]];
+                assert!(
+                    (third_sum[[i, j]] - expected).abs() < 1e-8,
+                    "third directional derivative should be linear in its direction at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dual_flex_row_primary_third_direction_is_linear() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = 0.7;
+        dir_u[cache.slices.logslope.start] = -0.2;
+        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[cache.slices.marginal.start] = -0.4;
+        dir_v[cache.slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        let dir_sum = &dir_u + &dir_v;
+        for row in 0..z.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third_u = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction u failed: {e}")
+                });
+            let third_v = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction v failed: {e}")
+                });
+            let third_sum = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_sum,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction sum failed: {e}")
+                });
+
+            for i in 0..total {
+                for j in 0..total {
+                    let expected = third_u[[i, j]] + third_v[[i, j]];
+                    assert!(
+                        (third_sum[[i, j]] - expected).abs() < 1e-8,
+                        "row {row}: third contraction should be linear in its direction at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_row_primary_third_direction_is_linear() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = -0.35;
+        dir_u[cache.slices.logslope.start] = 0.28;
+        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.12;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.06;
+        }
+
+        dir_v[cache.slices.marginal.start] = 0.18;
+        dir_v[cache.slices.logslope.start] = -0.22;
+        dir_v[h_range.start] = 0.07;
+        if h_range.len() > 1 {
+            dir_v[h_range.start + 1] = 0.05;
+        }
+
+        let dir_sum = &dir_u + &dir_v;
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third_u = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction u failed: {e}")
+                });
+            let third_v = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction v failed: {e}")
+                });
+            let third_sum = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_sum,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction sum failed: {e}")
+                });
+
+            for i in 0..total {
+                for j in 0..total {
+                    let expected = third_u[[i, j]] + third_v[[i, j]];
+                    assert!(
+                        (third_sum[[i, j]] - expected).abs() < 1e-8,
+                        "row {row}: h-only third contraction should be linear at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_row_primary_third_direction_is_linear() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        let total = cache.primary.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[cache.slices.marginal.start] = 0.4;
+        dir_u[cache.slices.logslope.start] = -0.3;
+        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.15;
+        if w_range.len() > 1 {
+            dir_u[w_range.start + 1] = -0.07;
+        }
+
+        dir_v[cache.slices.marginal.start] = -0.2;
+        dir_v[cache.slices.logslope.start] = 0.25;
+        dir_v[w_range.start] = 0.09;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = 0.03;
+        }
+
+        let dir_sum = &dir_u + &dir_v;
+        for row in 0..seed.len() {
+            let row_ctx = family
+                .build_row_exact_context(row, &block_states)
+                .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
+            let third_u = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_u,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction u failed: {e}")
+                });
+            let third_v = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_v,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction v failed: {e}")
+                });
+            let third_sum = family
+                .row_primary_third_contracted_recompute(
+                    row,
+                    &block_states,
+                    &cache,
+                    &row_ctx,
+                    &dir_sum,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: third contraction sum failed: {e}")
+                });
+
+            for i in 0..total {
+                for j in 0..total {
+                    let expected = third_u[[i, j]] + third_v[[i, j]];
+                    assert!(
+                        (third_sum[[i, j]] - expected).abs() < 1e-8,
+                        "row {row}: w-only third contraction should be linear at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dual_flex_exact_outer_fourth_first_direction_is_linear() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+
+        let slices = block_slices(&block_states, true, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        let mut dir_w = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.7;
+        dir_u[slices.logslope.start] = -0.2;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.1;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.05;
+        }
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.08;
+
+        dir_v[slices.marginal.start] = -0.4;
+        dir_v[slices.logslope.start] = 0.3;
+        dir_v[h_range.start] = -0.03;
+        dir_v[w_range.start] = 0.06;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = -0.02;
+        }
+
+        dir_w[slices.marginal.start] = 0.11;
+        dir_w[slices.logslope.start] = -0.09;
+        dir_w[h_range.start] = 0.04;
+        dir_w[w_range.start] = -0.05;
+
+        let dir_sum = &dir_u + &dir_v;
+        let fourth_u = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_w)
+            .expect("dual-flex fourth directional derivative u,w")
+            .expect("dual-flex fourth directional derivative u,w matrix");
+        let fourth_v = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_v, &dir_w)
+            .expect("dual-flex fourth directional derivative v,w")
+            .expect("dual-flex fourth directional derivative v,w matrix");
+        let fourth_sum = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_sum, &dir_w)
+            .expect("dual-flex fourth directional derivative (u+v),w")
+            .expect("dual-flex fourth directional derivative (u+v),w matrix");
+
+        for i in 0..total {
+            for j in 0..total {
+                let expected = fourth_u[[i, j]] + fourth_v[[i, j]];
+                assert!(
+                    (fourth_sum[[i, j]] - expected).abs() < 1e-8,
+                    "fourth directional derivative should be linear in its first direction at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_exact_outer_third_direction_is_linear() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let slices = block_slices(&block_states, true, false);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = -0.35;
+        dir_u[slices.logslope.start] = 0.28;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.12;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.06;
+        }
+
+        dir_v[slices.marginal.start] = 0.18;
+        dir_v[slices.logslope.start] = -0.22;
+        dir_v[h_range.start] = 0.07;
+        if h_range.len() > 1 {
+            dir_v[h_range.start + 1] = 0.05;
+        }
+
+        let dir_sum = &dir_u + &dir_v;
+        let third_u = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
+            .expect("h-only third directional derivative u")
+            .expect("h-only third directional derivative u matrix");
+        let third_v = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_v)
+            .expect("h-only third directional derivative v")
+            .expect("h-only third directional derivative v matrix");
+        let third_sum = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_sum)
+            .expect("h-only third directional derivative sum")
+            .expect("h-only third directional derivative sum matrix");
+
+        for i in 0..total {
+            for j in 0..total {
+                let expected = third_u[[i, j]] + third_v[[i, j]];
+                assert!(
+                    (third_sum[[i, j]] - expected).abs() < 1e-8,
+                    "h-only third directional derivative should be linear at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_exact_outer_third_direction_is_linear() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let slices = block_slices(&block_states, false, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.4;
+        dir_u[slices.logslope.start] = -0.3;
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.15;
+        if w_range.len() > 1 {
+            dir_u[w_range.start + 1] = -0.07;
+        }
+
+        dir_v[slices.marginal.start] = -0.2;
+        dir_v[slices.logslope.start] = 0.25;
+        dir_v[w_range.start] = 0.09;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = 0.03;
+        }
+
+        let dir_sum = &dir_u + &dir_v;
+        let third_u = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
+            .expect("w-only third directional derivative u")
+            .expect("w-only third directional derivative u matrix");
+        let third_v = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_v)
+            .expect("w-only third directional derivative v")
+            .expect("w-only third directional derivative v matrix");
+        let third_sum = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_sum)
+            .expect("w-only third directional derivative sum")
+            .expect("w-only third directional derivative sum matrix");
+
+        for i in 0..total {
+            for j in 0..total {
+                let expected = third_u[[i, j]] + third_v[[i, j]];
+                assert!(
+                    (third_sum[[i, j]] - expected).abs() < 1e-8,
+                    "w-only third directional derivative should be linear at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_exact_outer_direction_sign_rules_hold() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let slices = block_slices(&block_states, true, false);
+        let total = slices.total;
+        let mut dir = Array1::<f64>::zeros(total);
+        dir[slices.marginal.start] = -0.35;
+        dir[slices.logslope.start] = 0.28;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir[h_range.start] = 0.12;
+        if h_range.len() > 1 {
+            dir[h_range.start + 1] = -0.06;
+        }
+        let neg_dir = dir.mapv(|value| -value);
+
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir)
+            .expect("h-only third directional derivative")
+            .expect("h-only third directional derivative matrix");
+        let third_neg = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &neg_dir)
+            .expect("h-only negated third directional derivative")
+            .expect("h-only negated third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir, &dir)
+            .expect("h-only fourth directional derivative")
+            .expect("h-only fourth directional derivative matrix");
+        let fourth_neg = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &block_states,
+                &neg_dir,
+                &neg_dir,
+            )
+            .expect("h-only doubly-negated fourth directional derivative")
+            .expect("h-only doubly-negated fourth directional derivative matrix");
+
+        for i in 0..total {
+            for j in 0..total {
+                assert!(
+                    (third_neg[[i, j]] + third[[i, j]]).abs() < 1e-8,
+                    "h-only third directional derivative should be odd at ({i},{j})"
+                );
+                assert!(
+                    (fourth_neg[[i, j]] - fourth[[i, j]]).abs() < 1e-8,
+                    "h-only fourth directional derivative should be invariant under flipping both directions at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_exact_outer_direction_sign_rules_hold() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let slices = block_slices(&block_states, false, true);
+        let total = slices.total;
+        let mut dir = Array1::<f64>::zeros(total);
+        dir[slices.marginal.start] = 0.4;
+        dir[slices.logslope.start] = -0.3;
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir[w_range.start] = 0.15;
+        if w_range.len() > 1 {
+            dir[w_range.start + 1] = -0.07;
+        }
+        let neg_dir = dir.mapv(|value| -value);
+
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &dir)
+            .expect("w-only third directional derivative")
+            .expect("w-only third directional derivative matrix");
+        let third_neg = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &neg_dir)
+            .expect("w-only negated third directional derivative")
+            .expect("w-only negated third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir, &dir)
+            .expect("w-only fourth directional derivative")
+            .expect("w-only fourth directional derivative matrix");
+        let fourth_neg = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &block_states,
+                &neg_dir,
+                &neg_dir,
+            )
+            .expect("w-only doubly-negated fourth directional derivative")
+            .expect("w-only doubly-negated fourth directional derivative matrix");
+
+        for i in 0..total {
+            for j in 0..total {
+                assert!(
+                    (third_neg[[i, j]] + third[[i, j]]).abs() < 1e-8,
+                    "w-only third directional derivative should be odd at ({i},{j})"
+                );
+                assert!(
+                    (fourth_neg[[i, j]] - fourth[[i, j]]).abs() < 1e-8,
+                    "w-only fourth directional derivative should be invariant under flipping both directions at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_exact_outer_fourth_direction_swap_is_symmetric() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let slices = block_slices(&block_states, true, false);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = -0.35;
+        dir_u[slices.logslope.start] = 0.28;
+        let h_range = slices.h.as_ref().expect("h slice");
+        dir_u[h_range.start] = 0.12;
+        if h_range.len() > 1 {
+            dir_u[h_range.start + 1] = -0.06;
+        }
+
+        dir_v[slices.marginal.start] = 0.18;
+        dir_v[slices.logslope.start] = -0.22;
+        dir_v[h_range.start] = 0.07;
+        if h_range.len() > 1 {
+            dir_v[h_range.start + 1] = 0.05;
+        }
+
+        let forward = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
+            .expect("h-only fourth directional derivative")
+            .expect("h-only fourth directional derivative matrix");
+        let swapped = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_v, &dir_u)
+            .expect("h-only swapped fourth directional derivative")
+            .expect("h-only swapped fourth directional derivative matrix");
+
+        for i in 0..total {
+            for j in 0..total {
+                assert!(
+                    (forward[[i, j]] - swapped[[i, j]]).abs() < 1e-8,
+                    "h-only fourth directional derivative should be symmetric in direction arguments at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w_only_exact_outer_fourth_direction_swap_is_symmetric() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let slices = block_slices(&block_states, false, true);
+        let total = slices.total;
+        let mut dir_u = Array1::<f64>::zeros(total);
+        let mut dir_v = Array1::<f64>::zeros(total);
+        dir_u[slices.marginal.start] = 0.4;
+        dir_u[slices.logslope.start] = -0.3;
+        let w_range = slices.w.as_ref().expect("w slice");
+        dir_u[w_range.start] = 0.15;
+        if w_range.len() > 1 {
+            dir_u[w_range.start + 1] = -0.07;
+        }
+
+        dir_v[slices.marginal.start] = -0.2;
+        dir_v[slices.logslope.start] = 0.25;
+        dir_v[w_range.start] = 0.09;
+        if w_range.len() > 1 {
+            dir_v[w_range.start + 1] = 0.03;
+        }
+
+        let forward = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
+            .expect("w-only fourth directional derivative")
+            .expect("w-only fourth directional derivative matrix");
+        let swapped = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_v, &dir_u)
+            .expect("w-only swapped fourth directional derivative")
+            .expect("w-only swapped fourth directional derivative matrix");
+
+        for i in 0..total {
+            for j in 0..total {
+                assert!(
+                    (forward[[i, j]] - swapped[[i, j]]).abs() < 1e-8,
+                    "w-only fourth directional derivative should be symmetric in direction arguments at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_exact_outer_zero_direction_returns_zero() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            link_dev: None,
+        };
+        let slices = block_slices(&block_states, true, false);
+        let zero = Array1::<f64>::zeros(slices.total);
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &zero)
+            .expect("h-only third directional derivative")
+            .expect("h-only third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &zero, &zero)
+            .expect("h-only fourth directional derivative")
+            .expect("h-only fourth directional derivative matrix");
+
+        assert!(
+            third.iter().all(|value| value.abs() <= 0.0),
+            "expected zero h-only third directional derivative for zero direction"
+        );
+        assert!(
+            fourth.iter().all(|value| value.abs() <= 0.0),
+            "expected zero h-only fourth directional derivative for zero directions"
+        );
+    }
+
+    #[test]
+    fn w_only_exact_outer_zero_direction_returns_zero() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: None,
+            link_dev: Some(prepared.runtime.clone()),
+        };
+        let slices = block_slices(&block_states, false, true);
+        let zero = Array1::<f64>::zeros(slices.total);
+        let third = family
+            .exact_newton_joint_hessian_directional_derivative(&block_states, &zero)
+            .expect("w-only third directional derivative")
+            .expect("w-only third directional derivative matrix");
+        let fourth = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &zero, &zero)
+            .expect("w-only fourth directional derivative")
+            .expect("w-only fourth directional derivative matrix");
+
+        assert!(
+            third.iter().all(|value| value.abs() <= 0.0),
+            "expected zero w-only third directional derivative for zero direction"
+        );
+        assert!(
+            fourth.iter().all(|value| value.abs() <= 0.0),
+            "expected zero w-only fourth directional derivative for zero directions"
+        );
     }
 
     #[test]
@@ -9391,6 +12029,20 @@ mod tests {
         assert_eq!(fourth.dim(), (total, total));
         assert!(third.iter().all(|value| value.is_finite()));
         assert!(fourth.iter().all(|value| value.is_finite()));
+        let max_abs_third = third
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let max_abs_fourth = fourth
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            max_abs_third > 1e-10,
+            "expected nonzero dual-flex third directional derivative"
+        );
+        assert!(
+            max_abs_fourth > 1e-10,
+            "expected nonzero dual-flex fourth directional derivative"
+        );
 
         for i in 0..total {
             for j in 0..i {
