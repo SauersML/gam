@@ -1,5 +1,5 @@
 target/
-target-codex/
+target-*/
 Cargo.lock
 libbuild.rmeta
 __pycache__/
