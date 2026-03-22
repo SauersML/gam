@@ -1217,8 +1217,9 @@ fn evaluate_non_affine_transport_step(
         ExactCellBranch::Affine => 5,
     };
     let n_eval = basis_len.max(4);
+    let series_len = order + 1;
     let transport_polys = build_transport_series_polynomials(state.cell, delta_c2, delta_c3, order);
-    let mut moment_series = vec![vec![0.0; order + 1]; n_eval];
+    let mut moment_series = vec![0.0; n_eval * series_len];
     for n in 0..n_eval {
         for m in 0..=order {
             let poly = &transport_polys[m];
@@ -1226,31 +1227,53 @@ fn evaluate_non_affine_transport_step(
             for (deg, poly_coeff) in poly.iter().enumerate() {
                 coeff += poly_coeff * current_full[n + deg];
             }
-            moment_series[n][m] = coeff;
+            moment_series[n * series_len + m] = coeff;
         }
     }
 
-    let mut value_series = vec![0.0; order + 1];
-    value_series[0] = state.value;
+    let mut next_value = state.value;
+    let mut step_pow = step;
+    let mut value_tail_prev = if order == 1 {
+        state.value.abs()
+    } else {
+        0.0
+    };
+    let mut value_tail_last = if order == 0 {
+        state.value.abs()
+    } else {
+        0.0
+    };
     for m in 0..order {
-        value_series[m + 1] =
-            (delta_c2 * moment_series[2][m] + delta_c3 * moment_series[3][m]) * INV_TWO_PI
+        let coeff =
+            (delta_c2 * moment_series[2 * series_len + m]
+                + delta_c3 * moment_series[3 * series_len + m])
+                * INV_TWO_PI
                 / (m as f64 + 1.0);
-    }
-
-    let mut next_value = 0.0;
-    let mut step_pow = 1.0;
-    for coeff in &value_series {
         next_value += coeff * step_pow;
+        if m + 1 == order.saturating_sub(1) {
+            value_tail_prev = coeff.abs() * step_pow;
+        }
+        if m + 1 == order {
+            value_tail_last = coeff.abs() * step_pow;
+        }
         step_pow *= step;
     }
 
     let mut next_basis = vec![0.0; basis_len];
+    let mut basis_tail_prev = [0.0; 5];
+    let mut basis_tail_last = [0.0; 5];
     for n in 0..basis_len {
+        let row = &moment_series[(n * series_len)..((n + 1) * series_len)];
         let mut acc = 0.0;
         let mut pow = 1.0;
-        for coeff in &moment_series[n] {
+        for (m, coeff) in row.iter().enumerate() {
             acc += coeff * pow;
+            if m == order.saturating_sub(1) {
+                basis_tail_prev[n] = coeff.abs() * pow;
+            }
+            if m == order {
+                basis_tail_last[n] = coeff.abs() * pow;
+            }
             pow *= step;
         }
         next_basis[n] = acc;
@@ -1258,21 +1281,15 @@ fn evaluate_non_affine_transport_step(
 
     let mut err_est = 0.0_f64;
     let mut scale = next_value.abs().max(1.0);
-    let last_pow = step.powi(order as i32);
-    let prev_pow = if order > 0 {
-        step.powi((order - 1) as i32)
-    } else {
-        1.0
-    };
-    err_est = err_est.max(value_series[order].abs() * last_pow);
+    err_est = err_est.max(value_tail_last);
     if order > 0 {
-        err_est = err_est.max(value_series[order - 1].abs() * prev_pow);
+        err_est = err_est.max(value_tail_prev);
     }
     for n in 0..basis_len {
         scale = scale.max(next_basis[n].abs());
-        err_est = err_est.max(moment_series[n][order].abs() * last_pow);
+        err_est = err_est.max(basis_tail_last[n]);
         if order > 0 {
-            err_est = err_est.max(moment_series[n][order - 1].abs() * prev_pow);
+            err_est = err_est.max(basis_tail_prev[n]);
         }
     }
     let tol = abs_tol.max(rel_tol * scale);
@@ -1509,7 +1526,10 @@ mod tests {
         };
         let a = 0.3;
         let b = -0.7;
-        let (dc_daa, dc_dab, dc_dbb) = denested_cell_second_partials(score_span, link_span, a, b);
+        let second_partials = denested_cell_second_partials(score_span, link_span, a, b);
+        let dc_daa = second_partials.0;
+        let dc_dab = second_partials.1;
+        let dc_dbb = second_partials.2;
         for &z in &[-0.75, -0.4, -0.1, 0.2] {
             let u = a + b * z;
             let eta_aa = link_span.second_derivative(u);
@@ -2279,15 +2299,25 @@ mod tests {
             c2: coeffs[2],
             c3: coeffs[3],
         };
-        let state = evaluate_cell_moments(cell, 20).expect("cell moments");
+        let state = evaluate_cell_moments(cell, 24).expect("cell moments");
         let (dc_da, dc_db) = denested_cell_coefficient_partials(score_span, link_span, a, b);
-        let (dc_daa, dc_dab, dc_dbb) = denested_cell_second_partials(score_span, link_span, a, b);
+        let second_partials = denested_cell_second_partials(score_span, link_span, a, b);
+        let dc_daa = second_partials.0;
+        let dc_dab = second_partials.1;
+        let dc_dbb = second_partials.2;
+        let denested_third = denested_cell_third_partials(link_span);
+        let dc_daaa = denested_third.0;
+        let dc_dbbb = denested_third.3;
 
         let coeff_w = link_basis_cell_coefficients(link_basis_span, a, b);
         let (coeff_aw, coeff_bw) = link_basis_cell_coefficient_partials(link_basis_span, a, b);
         let (coeff_aaw, coeff_abw, coeff_bbw) =
             link_basis_cell_second_partials(link_basis_span, a, b);
+        let link_basis_third = link_basis_cell_third_partials(link_basis_span);
+        let coeff_aaaw = link_basis_third.0;
+        let coeff_bbbw = link_basis_third.3;
         let zero = [0.0; 4];
+        let basis_third = 6.0 * link_basis_span.c3;
 
         let eta_a = |z: f64| 1.0 + link_span.first_derivative(a + b * z);
         let eta_b = |z: f64| z + score_span.evaluate(z) + z * link_span.first_derivative(a + b * z);
@@ -2300,6 +2330,8 @@ mod tests {
         let eta_aaw = |z: f64| link_basis_span.second_derivative(a + b * z);
         let eta_abw = |z: f64| z * link_basis_span.second_derivative(a + b * z);
         let eta_bbw = |z: f64| z * z * link_basis_span.second_derivative(a + b * z);
+        let eta_aaaw = |z: f64| basis_third + 0.0 * z;
+        let eta_bbbw = |z: f64| z * z * z * basis_third;
 
         let exact_w = cell_first_derivative_from_moments(&coeff_w, &state.moments).expect("w");
         let exact_aw =
@@ -2359,6 +2391,126 @@ mod tests {
             &state.moments,
         )
         .expect("www");
+        let exact_aaaw = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_da,
+            &dc_da,
+            &dc_da,
+            &coeff_w,
+            &dc_daa,
+            &dc_daa,
+            &coeff_aw,
+            &dc_daa,
+            &coeff_aw,
+            &coeff_aw,
+            &dc_daaa,
+            &coeff_aaw,
+            &coeff_aaw,
+            &coeff_aaw,
+            &coeff_aaaw,
+            &state.moments,
+        )
+        .expect("aaaw");
+        let exact_aaww = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_da,
+            &dc_da,
+            &coeff_w,
+            &coeff_w,
+            &dc_daa,
+            &coeff_aw,
+            &coeff_aw,
+            &coeff_aw,
+            &coeff_aw,
+            &zero,
+            &coeff_aaw,
+            &coeff_aaw,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("aaww");
+        let exact_abww = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_da,
+            &dc_db,
+            &coeff_w,
+            &coeff_w,
+            &dc_dab,
+            &coeff_aw,
+            &coeff_aw,
+            &coeff_bw,
+            &coeff_bw,
+            &zero,
+            &coeff_abw,
+            &coeff_abw,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("abww");
+        let exact_bbww = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_db,
+            &dc_db,
+            &coeff_w,
+            &coeff_w,
+            &dc_dbb,
+            &coeff_bw,
+            &coeff_bw,
+            &coeff_bw,
+            &coeff_bw,
+            &zero,
+            &coeff_bbw,
+            &coeff_bbw,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("bbww");
+        let exact_bbbw = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_db,
+            &dc_db,
+            &dc_db,
+            &coeff_w,
+            &dc_dbb,
+            &dc_dbb,
+            &coeff_bw,
+            &dc_dbb,
+            &coeff_bw,
+            &coeff_bw,
+            &dc_dbbb,
+            &coeff_bbw,
+            &coeff_bbw,
+            &coeff_bbw,
+            &coeff_bbbw,
+            &state.moments,
+        )
+        .expect("bbbw");
+        let exact_wwww = cell_fourth_derivative_from_moments(
+            cell,
+            &coeff_w,
+            &coeff_w,
+            &coeff_w,
+            &coeff_w,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("wwww");
 
         let numeric_w = simpson_integral(cell.left, cell.right, 5000, |z| {
             eta_w(z) * (-cell.q(z)).exp() * INV_TWO_PI
@@ -2406,6 +2558,77 @@ mod tests {
             let w_z = eta_w(z);
             ((eta * eta - 1.0) * w_z * w_z * w_z) * (-cell.q(z)).exp() * INV_TWO_PI
         });
+        let numeric_aaaw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let a_z = eta_a(z);
+            let w_z = eta_w(z);
+            let aa_z = eta_aa(z);
+            let aw_z = eta_aw(z);
+            (eta_aaaw(z)
+                - eta * ((dc_daaa[0] + 0.0 * z) * w_z + 3.0 * eta_aaw(z) * a_z + 3.0 * aa_z * aw_z)
+                + (eta * eta - 1.0) * (3.0 * aa_z * a_z * w_z + 3.0 * aw_z * a_z * a_z)
+                + (-eta * eta * eta + 3.0 * eta) * a_z * a_z * a_z * w_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_aaww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let a_z = eta_a(z);
+            let w_z = eta_w(z);
+            let aw_z = eta_aw(z);
+            (-(2.0 * eta * (eta_aaw(z) * w_z + aw_z * aw_z))
+                + (eta * eta - 1.0) * (eta_aa(z) * w_z * w_z + 4.0 * aw_z * a_z * w_z)
+                + (-eta * eta * eta + 3.0 * eta) * a_z * a_z * w_z * w_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_abww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let a_z = eta_a(z);
+            let b_z = eta_b(z);
+            let w_z = eta_w(z);
+            let aw_z = eta_aw(z);
+            let bw_z = eta_bw(z);
+            (-(2.0 * eta * (eta_abw(z) * w_z + aw_z * bw_z))
+                + (eta * eta - 1.0)
+                    * (eta_ab(z) * w_z * w_z
+                        + 2.0 * aw_z * b_z * w_z
+                        + 2.0 * bw_z * a_z * w_z)
+                + (-eta * eta * eta + 3.0 * eta) * a_z * b_z * w_z * w_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bbww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let b_z = eta_b(z);
+            let w_z = eta_w(z);
+            let bw_z = eta_bw(z);
+            (-(2.0 * eta * (eta_bbw(z) * w_z + bw_z * bw_z))
+                + (eta * eta - 1.0) * (eta_bb(z) * w_z * w_z + 4.0 * bw_z * b_z * w_z)
+                + (-eta * eta * eta + 3.0 * eta) * b_z * b_z * w_z * w_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bbbw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let b_z = eta_b(z);
+            let w_z = eta_w(z);
+            let bb_z = eta_bb(z);
+            let bw_z = eta_bw(z);
+            (eta_bbbw(z)
+                - eta * ((dc_dbbb[3] * z * z * z) * w_z + 3.0 * eta_bbw(z) * b_z + 3.0 * bb_z * bw_z)
+                + (eta * eta - 1.0) * (3.0 * bb_z * b_z * w_z + 3.0 * bw_z * b_z * b_z)
+                + (-eta * eta * eta + 3.0 * eta) * b_z * b_z * b_z * w_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_wwww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let w_z = eta_w(z);
+            ((-eta * eta * eta + 3.0 * eta) * w_z * w_z * w_z * w_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
 
         assert!((exact_w - numeric_w).abs() < 1e-8);
         assert!((exact_aw - numeric_aw).abs() < 1e-7);
@@ -2415,6 +2638,720 @@ mod tests {
         assert!((exact_abw - numeric_abw).abs() < 2e-6);
         assert!((exact_bbw - numeric_bbw).abs() < 2e-6);
         assert!((exact_www - numeric_www).abs() < 2e-6);
+        assert!((exact_aaaw - numeric_aaaw).abs() < 3e-6);
+        assert!((exact_aaww - numeric_aaww).abs() < 3e-6);
+        assert!((exact_abww - numeric_abww).abs() < 3e-6);
+        assert!((exact_bbww - numeric_bbww).abs() < 3e-6);
+        assert!((exact_bbbw - numeric_bbbw).abs() < 3e-6);
+        assert!((exact_wwww - numeric_wwww).abs() < 3e-6);
+    }
+
+    #[test]
+    fn score_basis_cell_derivatives_match_exact_integrands() {
+        let score_span = LocalSpanCubic {
+            left: -0.75,
+            right: 0.25,
+            c0: 0.08,
+            c1: -0.03,
+            c2: 0.02,
+            c3: -0.01,
+        };
+        let score_basis_span = LocalSpanCubic {
+            left: -0.75,
+            right: 0.25,
+            c0: -0.04,
+            c1: 0.06,
+            c2: -0.01,
+            c3: 0.02,
+        };
+        let link_span = LocalSpanCubic {
+            left: -0.6,
+            right: 0.9,
+            c0: -0.05,
+            c1: 0.04,
+            c2: -0.02,
+            c3: 0.015,
+        };
+        let a = 0.3;
+        let b = -0.7;
+        let coeffs = denested_cell_coefficients(score_span, link_span, a, b);
+        let cell = DenestedCubicCell {
+            left: score_span.left,
+            right: score_span.right,
+            c0: coeffs[0],
+            c1: coeffs[1],
+            c2: coeffs[2],
+            c3: coeffs[3],
+        };
+        let state = evaluate_cell_moments(cell, 24).expect("cell moments");
+        let (dc_da, dc_db) = denested_cell_coefficient_partials(score_span, link_span, a, b);
+        let second_partials = denested_cell_second_partials(score_span, link_span, a, b);
+        let dc_daa = second_partials.0;
+        let dc_dab = second_partials.1;
+        let dc_dbb = second_partials.2;
+        let denested_third = denested_cell_third_partials(link_span);
+        let dc_dbbb = denested_third.3;
+
+        let coeff_h = score_basis_cell_coefficients(score_basis_span, b);
+        let coeff_bh = score_basis_cell_coefficients(score_basis_span, 1.0);
+        let zero = [0.0; 4];
+
+        let eta_a = |z: f64| 1.0 + link_span.first_derivative(a + b * z);
+        let eta_b = |z: f64| z + score_span.evaluate(z) + z * link_span.first_derivative(a + b * z);
+        let eta_ab = |z: f64| z * link_span.second_derivative(a + b * z);
+        let eta_bb = |z: f64| z * z * link_span.second_derivative(a + b * z);
+        let eta_h = |z: f64| b * score_basis_span.evaluate(z);
+        let eta_bh = |z: f64| score_basis_span.evaluate(z);
+
+        let exact_h = cell_first_derivative_from_moments(&coeff_h, &state.moments).expect("h");
+        let exact_ah =
+            cell_second_derivative_from_moments(cell, &dc_da, &coeff_h, &zero, &state.moments)
+                .expect("ah");
+        let exact_bh =
+            cell_second_derivative_from_moments(cell, &dc_db, &coeff_h, &coeff_bh, &state.moments)
+                .expect("bh");
+        let exact_hh =
+            cell_second_derivative_from_moments(cell, &coeff_h, &coeff_h, &zero, &state.moments)
+                .expect("hh");
+        let exact_abh = cell_third_derivative_from_moments(
+            cell,
+            &dc_da,
+            &dc_db,
+            &coeff_h,
+            &dc_dab,
+            &zero,
+            &coeff_bh,
+            &zero,
+            &state.moments,
+        )
+        .expect("abh");
+        let exact_bbh = cell_third_derivative_from_moments(
+            cell,
+            &dc_db,
+            &dc_db,
+            &coeff_h,
+            &dc_dbb,
+            &coeff_bh,
+            &coeff_bh,
+            &zero,
+            &state.moments,
+        )
+        .expect("bbh");
+        let exact_bhh = cell_third_derivative_from_moments(
+            cell,
+            &dc_db,
+            &coeff_h,
+            &coeff_h,
+            &coeff_bh,
+            &coeff_bh,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("bhh");
+        let exact_hhh = cell_third_derivative_from_moments(
+            cell,
+            &coeff_h,
+            &coeff_h,
+            &coeff_h,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("hhh");
+        let exact_bbbh = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_db,
+            &dc_db,
+            &dc_db,
+            &coeff_h,
+            &dc_dbb,
+            &dc_dbb,
+            &coeff_bh,
+            &dc_dbb,
+            &coeff_bh,
+            &coeff_bh,
+            &dc_dbbb,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("bbbh");
+        let exact_aahh = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_da,
+            &dc_da,
+            &coeff_h,
+            &coeff_h,
+            &dc_daa,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("aahh");
+        let exact_abhh = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_da,
+            &dc_db,
+            &coeff_h,
+            &coeff_h,
+            &dc_dab,
+            &zero,
+            &zero,
+            &coeff_bh,
+            &coeff_bh,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("abhh");
+        let exact_bbhh = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_db,
+            &dc_db,
+            &coeff_h,
+            &coeff_h,
+            &dc_dbb,
+            &coeff_bh,
+            &coeff_bh,
+            &coeff_bh,
+            &coeff_bh,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("bbhh");
+        let exact_bhhh = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_db,
+            &coeff_h,
+            &coeff_h,
+            &coeff_h,
+            &coeff_bh,
+            &coeff_bh,
+            &coeff_bh,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("bhhh");
+        let exact_hhhh = cell_fourth_derivative_from_moments(
+            cell,
+            &coeff_h,
+            &coeff_h,
+            &coeff_h,
+            &coeff_h,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("hhhh");
+
+        let numeric_h = simpson_integral(cell.left, cell.right, 5000, |z| {
+            eta_h(z) * (-cell.q(z)).exp() * INV_TWO_PI
+        });
+        let numeric_ah = simpson_integral(cell.left, cell.right, 5000, |z| {
+            (-cell.eta(z) * eta_a(z) * eta_h(z)) * (-cell.q(z)).exp() * INV_TWO_PI
+        });
+        let numeric_bh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            (eta_bh(z) - cell.eta(z) * eta_b(z) * eta_h(z)) * (-cell.q(z)).exp() * INV_TWO_PI
+        });
+        let numeric_hh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            (-cell.eta(z) * eta_h(z) * eta_h(z)) * (-cell.q(z)).exp() * INV_TWO_PI
+        });
+        let numeric_abh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            (-(eta * (eta_ab(z) * eta_h(z) + eta_bh(z) * eta_a(z)))
+                + (eta * eta - 1.0) * eta_a(z) * eta_b(z) * eta_h(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bbh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            (-(eta * (eta_bb(z) * eta_h(z) + 2.0 * eta_bh(z) * eta_b(z)))
+                + (eta * eta - 1.0) * eta_b(z) * eta_b(z) * eta_h(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bhh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            (-(2.0 * eta * eta_bh(z) * eta_h(z))
+                + (eta * eta - 1.0) * eta_b(z) * eta_h(z) * eta_h(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_hhh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            ((eta * eta - 1.0) * eta_h(z) * eta_h(z) * eta_h(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bbbh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let b_z = eta_b(z);
+            let h_z = eta_h(z);
+            let bb_z = eta_bb(z);
+            let bh_z = eta_bh(z);
+            (-(eta * ((dc_dbbb[3] * z * z * z) * h_z + 3.0 * bb_z * bh_z))
+                + (eta * eta - 1.0) * (3.0 * bb_z * b_z * h_z + 3.0 * bh_z * b_z * b_z)
+                + (-eta * eta * eta + 3.0 * eta) * b_z * b_z * b_z * h_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_aahh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let a_z = eta_a(z);
+            let h_z = eta_h(z);
+            ((eta * eta - 1.0) * polynomial_value(&dc_daa, z) * h_z * h_z
+                + (-eta * eta * eta + 3.0 * eta) * a_z * a_z * h_z * h_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_abhh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let a_z = eta_a(z);
+            let b_z = eta_b(z);
+            let h_z = eta_h(z);
+            ((eta * eta - 1.0)
+                * (eta_ab(z) * h_z * h_z + 2.0 * eta_bh(z) * a_z * h_z)
+                + (-eta * eta * eta + 3.0 * eta) * a_z * b_z * h_z * h_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bbhh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let b_z = eta_b(z);
+            let h_z = eta_h(z);
+            let bh_z = eta_bh(z);
+            (-(2.0 * eta * bh_z * bh_z)
+                + (eta * eta - 1.0) * (eta_bb(z) * h_z * h_z + 4.0 * bh_z * b_z * h_z)
+                + (-eta * eta * eta + 3.0 * eta) * b_z * b_z * h_z * h_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bhhh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let h_z = eta_h(z);
+            (-(eta * (3.0 * eta_bh(z) * h_z * h_z))
+                + (eta * eta - 1.0) * (3.0 * eta_bh(z) * h_z * h_z)
+                + (-eta * eta * eta + 3.0 * eta) * eta_b(z) * h_z * h_z * h_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_hhhh = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let h_z = eta_h(z);
+            ((-eta * eta * eta + 3.0 * eta) * h_z * h_z * h_z * h_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+
+        assert!((exact_h - numeric_h).abs() < 1e-8);
+        assert!((exact_ah - numeric_ah).abs() < 1e-7);
+        assert!((exact_bh - numeric_bh).abs() < 1e-7);
+        assert!((exact_hh - numeric_hh).abs() < 1e-7);
+        assert!((exact_abh - numeric_abh).abs() < 2e-6);
+        assert!((exact_bbh - numeric_bbh).abs() < 2e-6);
+        assert!((exact_bhh - numeric_bhh).abs() < 2e-6);
+        assert!((exact_hhh - numeric_hhh).abs() < 2e-6);
+        assert!((exact_bbbh - numeric_bbbh).abs() < 3e-6);
+        assert!((exact_aahh - numeric_aahh).abs() < 3e-6);
+        assert!((exact_abhh - numeric_abhh).abs() < 3e-6);
+        assert!((exact_bbhh - numeric_bbhh).abs() < 3e-6);
+        assert!((exact_bhhh - numeric_bhhh).abs() < 3e-6);
+        assert!((exact_hhhh - numeric_hhhh).abs() < 3e-6);
+    }
+
+    #[test]
+    fn cross_basis_cell_derivatives_match_exact_integrands() {
+        let score_span = LocalSpanCubic {
+            left: -0.75,
+            right: 0.25,
+            c0: 0.08,
+            c1: -0.03,
+            c2: 0.02,
+            c3: -0.01,
+        };
+        let score_basis_span = LocalSpanCubic {
+            left: -0.75,
+            right: 0.25,
+            c0: -0.04,
+            c1: 0.06,
+            c2: -0.01,
+            c3: 0.02,
+        };
+        let link_span = LocalSpanCubic {
+            left: -0.6,
+            right: 0.9,
+            c0: -0.05,
+            c1: 0.04,
+            c2: -0.02,
+            c3: 0.015,
+        };
+        let link_basis_span = LocalSpanCubic {
+            left: -0.6,
+            right: 0.9,
+            c0: 0.02,
+            c1: -0.01,
+            c2: 0.03,
+            c3: -0.02,
+        };
+        let a = 0.3;
+        let b = -0.7;
+        let coeffs = denested_cell_coefficients(score_span, link_span, a, b);
+        let cell = DenestedCubicCell {
+            left: score_span.left,
+            right: score_span.right,
+            c0: coeffs[0],
+            c1: coeffs[1],
+            c2: coeffs[2],
+            c3: coeffs[3],
+        };
+        let state = evaluate_cell_moments(cell, 24).expect("cell moments");
+        let (dc_da, dc_db) = denested_cell_coefficient_partials(score_span, link_span, a, b);
+        let (dc_daa, dc_dab, _) = denested_cell_second_partials(score_span, link_span, a, b);
+
+        let coeff_h = score_basis_cell_coefficients(score_basis_span, b);
+        let coeff_bh = score_basis_cell_coefficients(score_basis_span, 1.0);
+        let coeff_w = link_basis_cell_coefficients(link_basis_span, a, b);
+        let (coeff_aw, coeff_bw) = link_basis_cell_coefficient_partials(link_basis_span, a, b);
+        let (coeff_aaw, coeff_abw, _) = link_basis_cell_second_partials(link_basis_span, a, b);
+        let zero = [0.0; 4];
+
+        let eta_a = |z: f64| 1.0 + link_span.first_derivative(a + b * z);
+        let eta_b = |z: f64| z + score_span.evaluate(z) + z * link_span.first_derivative(a + b * z);
+        let eta_h = |z: f64| b * score_basis_span.evaluate(z);
+        let eta_bh = |z: f64| score_basis_span.evaluate(z);
+        let eta_w = |z: f64| link_basis_span.evaluate(a + b * z);
+        let eta_ab = |z: f64| z * link_span.second_derivative(a + b * z);
+        let eta_aw = |z: f64| link_basis_span.first_derivative(a + b * z);
+        let eta_bw = |z: f64| z * link_basis_span.first_derivative(a + b * z);
+
+        let exact_hw =
+            cell_second_derivative_from_moments(cell, &coeff_h, &coeff_w, &zero, &state.moments)
+                .expect("hw");
+        let exact_ahw = cell_third_derivative_from_moments(
+            cell,
+            &dc_da,
+            &coeff_h,
+            &coeff_w,
+            &zero,
+            &coeff_aw,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("ahw");
+        let exact_bhw = cell_third_derivative_from_moments(
+            cell,
+            &dc_db,
+            &coeff_h,
+            &coeff_w,
+            &coeff_bh,
+            &coeff_bw,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("bhw");
+        let exact_hhw = cell_third_derivative_from_moments(
+            cell,
+            &coeff_h,
+            &coeff_h,
+            &coeff_w,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("hhw");
+        let exact_hww = cell_third_derivative_from_moments(
+            cell,
+            &coeff_h,
+            &coeff_w,
+            &coeff_w,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("hww");
+        let exact_aahw = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_da,
+            &dc_da,
+            &coeff_h,
+            &coeff_w,
+            &dc_daa,
+            &zero,
+            &coeff_aw,
+            &zero,
+            &coeff_aw,
+            &zero,
+            &zero,
+            &coeff_aaw,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("aahw");
+        let exact_hhww = cell_fourth_derivative_from_moments(
+            cell,
+            &coeff_h,
+            &coeff_h,
+            &coeff_w,
+            &coeff_w,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("hhww");
+        let exact_hhhw = cell_fourth_derivative_from_moments(
+            cell,
+            &coeff_h,
+            &coeff_h,
+            &coeff_h,
+            &coeff_w,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("hhhw");
+        let exact_abhw = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_da,
+            &dc_db,
+            &coeff_h,
+            &coeff_w,
+            &dc_dab,
+            &zero,
+            &coeff_aw,
+            &coeff_bh,
+            &coeff_bw,
+            &zero,
+            &zero,
+            &coeff_abw,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("abhw");
+        let exact_ahww = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_da,
+            &coeff_h,
+            &coeff_w,
+            &coeff_w,
+            &zero,
+            &coeff_aw,
+            &coeff_aw,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("ahww");
+        let exact_bhww = cell_fourth_derivative_from_moments(
+            cell,
+            &dc_db,
+            &coeff_h,
+            &coeff_w,
+            &coeff_w,
+            &coeff_bh,
+            &coeff_bw,
+            &coeff_bw,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("bhww");
+        let exact_hwww = cell_fourth_derivative_from_moments(
+            cell,
+            &coeff_h,
+            &coeff_w,
+            &coeff_w,
+            &coeff_w,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &state.moments,
+        )
+        .expect("hwww");
+
+        let numeric_hw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            (-cell.eta(z) * eta_h(z) * eta_w(z)) * (-cell.q(z)).exp() * INV_TWO_PI
+        });
+        let numeric_ahw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            (-(eta * eta_aw(z) * eta_h(z))
+                + (eta * eta - 1.0) * eta_a(z) * eta_h(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bhw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            (-(eta * (eta_bh(z) * eta_w(z) + eta_bw(z) * eta_h(z)))
+                + (eta * eta - 1.0) * eta_b(z) * eta_h(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_hhw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            ((eta * eta - 1.0) * eta_h(z) * eta_h(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_hww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            ((eta * eta - 1.0) * eta_h(z) * eta_w(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_aahw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            (-(eta * polynomial_value(&coeff_aaw, z) * eta_h(z))
+                + (eta * eta - 1.0)
+                    * (polynomial_value(&dc_daa, z) * eta_h(z) * eta_w(z)
+                        + 2.0 * eta_aw(z) * eta_a(z) * eta_h(z))
+                + (-eta * eta * eta + 3.0 * eta) * eta_a(z) * eta_a(z) * eta_h(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_hhww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            ((-eta * eta * eta + 3.0 * eta) * eta_h(z) * eta_h(z) * eta_w(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_hhhw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            ((-eta * eta * eta + 3.0 * eta) * eta_h(z) * eta_h(z) * eta_h(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_abhw = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            (-(eta * polynomial_value(&coeff_abw, z) * eta_h(z) + eta * eta_aw(z) * eta_bh(z))
+                + (eta * eta - 1.0)
+                    * (eta_ab(z) * eta_h(z) * eta_w(z)
+                        + eta_aw(z) * eta_b(z) * eta_h(z)
+                        + eta_bh(z) * eta_a(z) * eta_w(z)
+                        + eta_bw(z) * eta_a(z) * eta_h(z))
+                + (-eta * eta * eta + 3.0 * eta) * eta_a(z) * eta_b(z) * eta_h(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_ahww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            (2.0 * (eta * eta - 1.0) * eta_aw(z) * eta_h(z) * eta_w(z)
+                + (-eta * eta * eta + 3.0 * eta) * eta_a(z) * eta_h(z) * eta_w(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_bhww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            let h_z = eta_h(z);
+            let w_z = eta_w(z);
+            ((eta * eta - 1.0) * (eta_bh(z) * w_z * w_z + 2.0 * eta_bw(z) * h_z * w_z)
+                + (-eta * eta * eta + 3.0 * eta) * eta_b(z) * h_z * w_z * w_z)
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+        let numeric_hwww = simpson_integral(cell.left, cell.right, 5000, |z| {
+            let eta = cell.eta(z);
+            ((-eta * eta * eta + 3.0 * eta) * eta_h(z) * eta_w(z) * eta_w(z) * eta_w(z))
+                * (-cell.q(z)).exp()
+                * INV_TWO_PI
+        });
+
+        assert!((exact_hw - numeric_hw).abs() < 1e-7);
+        assert!((exact_ahw - numeric_ahw).abs() < 2e-6);
+        assert!((exact_bhw - numeric_bhw).abs() < 2e-6);
+        assert!((exact_hhw - numeric_hhw).abs() < 2e-6);
+        assert!((exact_hww - numeric_hww).abs() < 2e-6);
+        assert!((exact_aahw - numeric_aahw).abs() < 3e-6);
+        assert!((exact_hhww - numeric_hhww).abs() < 3e-6);
+        assert!((exact_hhhw - numeric_hhhw).abs() < 3e-6);
+        assert!((exact_abhw - numeric_abhw).abs() < 3e-6);
+        assert!((exact_ahww - numeric_ahww).abs() < 3e-6);
+        assert!((exact_bhww - numeric_bhww).abs() < 3e-6);
+        assert!((exact_hwww - numeric_hwww).abs() < 3e-6);
     }
 
     #[test]
