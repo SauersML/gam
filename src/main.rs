@@ -253,6 +253,12 @@ struct FitArgs {
     /// Optional additive offset column for the noise/log-scale predictor.
     #[arg(long = "noise-offset-column")]
     noise_offset_column: Option<String>,
+    /// Fixed latent standard deviation for latent-variable families.
+    /// For latent-cloglog-binomial: lognormal hazard multiplier SD.
+    /// For marginal-slope (probit): Gaussian shift on the final index,
+    /// scaling by 1/sqrt(1 + latent_sd^2).
+    #[arg(long = "latent-sd")]
+    latent_sd: Option<f64>,
     #[arg(long = "disable-score-warp", default_value_t = false)]
     disable_score_warp: bool,
     #[arg(long = "disable-link-dev", default_value_t = false)]
@@ -972,8 +978,16 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     } else {
         None
     };
+    let latent_cloglog_state = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+        args.latent_sd.map(|sd| {
+            gam::types::LatentCLogLogState::new(sd)
+                .expect("invalid latent_sd for latent-cloglog-binomial")
+        })
+    } else {
+        None
+    };
     let base_fit_options = FitOptions {
-        latent_cloglog: None,
+        latent_cloglog: latent_cloglog_state,
         mixture_link: mixture_linkspec.clone(),
         optimize_mixture: true,
         sas_link: sas_linkspec,
@@ -1349,7 +1363,12 @@ fn run_fit_bernoulli_marginal_slope(
                 logslopespec: logslopespec.clone(),
                 marginal_offset,
                 logslope_offset,
-                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+                frailty: match args.latent_sd {
+                    Some(sd) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+                        sigma_fixed: Some(sd),
+                    },
+                    None => gam::families::lognormal_kernel::FrailtySpec::None,
+                },
                 score_warp: if args.disable_score_warp {
                     None
                 } else {

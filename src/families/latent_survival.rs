@@ -39,6 +39,33 @@ pub struct LatentSurvivalTermFitResult {
     pub resolvedspec: TermCollectionSpec,
 }
 
+pub fn fit_latent_survival_terms(
+    data: ArrayView2<'_, f64>,
+    rows: Vec<LatentSurvivalRow>,
+    weights: Array1<f64>,
+    spec: TermCollectionSpec,
+    latent_sd: f64,
+    options: &BlockwiseFitOptions,
+) -> Result<LatentSurvivalTermFitResult, String> {
+    validate_latent_survival_inputs(data, &rows, &weights, latent_sd)?;
+    let design = build_term_collection_design(data, &spec).map_err(|e| e.to_string())?;
+    let resolvedspec =
+        freeze_term_collection_from_design(&spec, &design).map_err(|e| e.to_string())?;
+    let family = LatentSurvivalFamily {
+        rows,
+        weights,
+        latent_sd,
+        quadctx: Arc::new(QuadratureContext::new()),
+    };
+    let block = build_eta_blockspec(&design, data.nrows());
+    let fit = fit_custom_family(&family, &[block], options).map_err(|e| e.to_string())?;
+    Ok(LatentSurvivalTermFitResult {
+        fit,
+        design,
+        resolvedspec,
+    })
+}
+
 fn validate_latent_survival_inputs(
     data: ArrayView2<'_, f64>,
     rows: &[LatentSurvivalRow],

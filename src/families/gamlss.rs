@@ -443,10 +443,31 @@ fn initialize_monotone_wiggle_knots_from_seed(
     degree: usize,
     num_internal_knots: usize,
 ) -> Result<Array1<f64>, String> {
-    let bs_degree = degree
+    initializewiggle_knots_from_seed(seed, degree, num_internal_knots)
+}
+
+#[inline]
+fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, String> {
+    // Public wiggle degree is the polynomial degree of the deviation
+    // function itself. This basis layer's I-spline constructor is one order
+    // higher than that public convention, so a cubic wiggle (degree=3) must
+    // use internal_degree=2 here to stay piecewise cubic.
+    //
+    // The low-level I-spline builder requires internal_degree >= 1, so the
+    // smallest supported public monotone-wiggle degree is 2 (piecewise
+    // quadratic).
+    degree
+        .checked_sub(1)
+        .filter(|&internal_degree| internal_degree >= 1)
+        .ok_or_else(|| "monotone wiggle degree must be >= 2".to_string())
+}
+
+#[inline]
+fn minimum_monotone_wiggle_knot_count(degree: usize) -> Result<usize, String> {
+    degree
         .checked_add(1)
-        .ok_or_else(|| "monotone wiggle degree overflow while initializing knots".to_string())?;
-    initializewiggle_knots_from_seed(seed, bs_degree, num_internal_knots)
+        .and_then(|order| order.checked_mul(2))
+        .ok_or_else(|| "monotone wiggle knot-count overflow".to_string())
 }
 
 pub fn buildwiggle_block_input_from_knots(
@@ -512,10 +533,11 @@ pub(crate) fn monotone_wiggle_basis_from_knots(
     knots: &Array1<f64>,
     degree: usize,
 ) -> Result<Array2<f64>, String> {
+    let internal_degree = monotone_wiggle_internal_degree(degree)?;
     let (basis, _) = create_basis::<Dense>(
         seed,
         KnotSource::Provided(knots.view()),
-        degree,
+        internal_degree,
         BasisOptions::i_spline(),
     )
     .map_err(|e| e.to_string())?;
@@ -531,7 +553,8 @@ pub fn monotone_wiggle_basis_with_derivative_order(
     if derivative_order == 0 {
         return monotone_wiggle_basis_from_knots(seed, knots, degree);
     }
-    create_ispline_derivative_dense(seed, knots, degree, derivative_order)
+    let internal_degree = monotone_wiggle_internal_degree(degree)?;
+    create_ispline_derivative_dense(seed, knots, internal_degree, derivative_order)
         .map_err(|e| e.to_string())
 }
 
@@ -719,16 +742,17 @@ fn validate_gaussian_location_scalewiggle_termspec(
     validate_term_offset(n, &spec.mean_offset, "mean_offset")?;
     validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
-    if spec.wiggle_degree < 1 {
+    if spec.wiggle_degree < 2 {
         return Err(format!(
-            "{context}: wiggle_degree must be >= 1, got {}",
+            "{context}: wiggle_degree must be >= 2, got {}",
             spec.wiggle_degree
         ));
     }
-    if spec.wiggle_knots.len() < spec.wiggle_degree + 2 {
+    let minimum_knots = minimum_monotone_wiggle_knot_count(spec.wiggle_degree)?;
+    if spec.wiggle_knots.len() < minimum_knots {
         return Err(format!(
             "{context}: wiggle_knots must have at least {} entries for degree {}, got {}",
-            spec.wiggle_degree + 2,
+            minimum_knots,
             spec.wiggle_degree,
             spec.wiggle_knots.len()
         ));
@@ -773,16 +797,17 @@ fn validate_binomial_location_scalewiggle_termspec(
             "{context}: link wiggle does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
         ));
     }
-    if spec.wiggle_degree < 1 {
+    if spec.wiggle_degree < 2 {
         return Err(format!(
-            "{context}: wiggle_degree must be >= 1, got {}",
+            "{context}: wiggle_degree must be >= 2, got {}",
             spec.wiggle_degree
         ));
     }
-    if spec.wiggle_knots.len() < spec.wiggle_degree + 2 {
+    let minimum_knots = minimum_monotone_wiggle_knot_count(spec.wiggle_degree)?;
+    if spec.wiggle_knots.len() < minimum_knots {
         return Err(format!(
             "{context}: wiggle_knots must have at least {} entries for degree {}, got {}",
-            spec.wiggle_degree + 2,
+            minimum_knots,
             spec.wiggle_degree,
             spec.wiggle_knots.len()
         ));
@@ -1510,17 +1535,19 @@ fn fit_binomial_mean_wiggle(
                 .to_string(),
         );
     }
-    if spec.wiggle_degree < 1 {
+    if spec.wiggle_degree < 2 {
         return Err(format!(
-            "fit_binomial_mean_wiggle: wiggle_degree must be >= 1, got {}",
+            "fit_binomial_mean_wiggle: wiggle_degree must be >= 2, got {}",
             spec.wiggle_degree
         ));
     }
-    if spec.wiggle_knots.len() < spec.wiggle_degree + 2 {
+    let minimum_knots = minimum_monotone_wiggle_knot_count(spec.wiggle_degree)?;
+    if spec.wiggle_knots.len() < minimum_knots {
         return Err(format!(
-            "fit_binomial_mean_wiggle: wiggle_knots length {} is too short for degree {}",
+            "fit_binomial_mean_wiggle: wiggle_knots length {} is too short for degree {} (need at least {})",
             spec.wiggle_knots.len(),
-            spec.wiggle_degree
+            spec.wiggle_degree,
+            minimum_knots
         ));
     }
 
@@ -15413,7 +15440,9 @@ mod tests {
         knots: &Array1<f64>,
         degree: usize,
     ) -> Array1<D> {
-        let bs_degree = degree + 1;
+        let bs_degree = monotone_wiggle_internal_degree(degree)
+            .expect("monotone wiggle degree")
+            + 1;
         let left = knots[bs_degree];
         let full = bspline_basis_scalar_numdual(x, knots, bs_degree);
         let left_full = bspline_basis_scalar_numdual(D::from(left), knots, bs_degree);
@@ -18652,7 +18681,7 @@ mod tests {
         let degree = 3usize;
         let knots = initialize_monotone_wiggle_knots_from_seed(q_seed.view(), degree, 5)
             .expect("initialize degenerate wiggle knots");
-        let bs_degree = degree + 1;
+        let bs_degree = monotone_wiggle_internal_degree(degree).expect("cubic wiggle degree") + 1;
         let domain_min = knots[bs_degree];
         let domain_max = knots[knots.len() - bs_degree - 1];
         assert!(
@@ -18683,7 +18712,7 @@ mod tests {
         let (basis, _) = create_basis::<Dense>(
             q_seed.view(),
             KnotSource::Provided(knots.view()),
-            degree,
+            monotone_wiggle_internal_degree(degree).expect("wiggle degree"),
             BasisOptions::i_spline(),
         )
         .expect("I-spline basis");

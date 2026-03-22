@@ -1800,9 +1800,8 @@ impl SurvivalMarginalSlopeFamily {
             exact_kernel::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
         let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact_kernel::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
-        let (dc_daaa, dc_daab, dc_dabb, dc_dbbb_raw) =
+        let (dc_daaa, dc_daab, dc_dabb, _) =
             exact_kernel::denested_cell_third_partials(link_span_obs);
-        let _dc_dbbb = scale_coeff4(dc_dbbb_raw, scale);
         Ok(ObservedDenestedCellPartials {
             coeff,
             dc_da: scale_coeff4(dc_da_raw, scale),
@@ -1838,9 +1837,8 @@ impl SurvivalMarginalSlopeFamily {
             exact_kernel::denested_cell_coefficient_partials(score_span, link_span, a, b);
         let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact_kernel::denested_cell_second_partials(score_span, link_span, a, b);
-        let (dc_daaa_raw, dc_daab_raw, dc_dabb_raw, dc_dbbb_raw) =
+        let (dc_daaa_raw, dc_daab_raw, dc_dabb_raw, _) =
             exact_kernel::denested_cell_third_partials(link_span);
-        let _dc_dbbb = scale_coeff4(dc_dbbb_raw, scale);
         let dc_da = scale_coeff4(dc_da_raw, scale);
         let dc_db = scale_coeff4(dc_db_raw, scale);
         let dc_daa = scale_coeff4(dc_daa_raw, scale);
@@ -5287,7 +5285,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             let sigma = sigma_fixed.ok_or_else(|| {
                 "survival-marginal-slope currently requires FrailtySpec::GaussianShift with a fixed sigma".to_string()
             })?;
-            if !sigma.is_finite() || *sigma < 0.0 {
+            if !sigma.is_finite() || sigma < 0.0 {
                 return Err(format!(
                     "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
                 ));

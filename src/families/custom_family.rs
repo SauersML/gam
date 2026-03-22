@@ -3527,6 +3527,60 @@ fn solve_spd_systemwith_policy(
         .ok_or_else(|| "exact-newton block solve failed after ridge retries".to_string())
 }
 
+fn exact_newton_stabilizing_shift(lhs_dense: &Array2<f64>, ridge_floor: f64) -> Option<f64> {
+    let floor = effective_solverridge(ridge_floor);
+    match FaerEigh::eigh(lhs_dense, Side::Lower) {
+        Ok((evals, _)) => {
+            let min_eval = evals.iter().copied().fold(f64::INFINITY, |a, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.min(b)
+                }
+            });
+            if !min_eval.is_finite() || min_eval <= floor {
+                Some(floor - min_eval.min(0.0).max(-1e12))
+            } else {
+                None
+            }
+        }
+        Err(_) => {
+            let diag_max = (0..lhs_dense.nrows())
+                .map(|d| lhs_dense[[d, d]].abs())
+                .fold(0.0_f64, f64::max);
+            Some(floor.max(diag_max * 1e-6).max(1e-6))
+        }
+    }
+}
+
+fn stabilize_exact_newton_lhs_in_place<F: CustomFamily + ?Sized>(
+    family: &F,
+    lhs_dense: &mut Array2<f64>,
+    ridge_floor: f64,
+) {
+    if use_exact_newton_strict_spd(family) {
+        return;
+    }
+    if let Some(shift) = exact_newton_stabilizing_shift(lhs_dense, ridge_floor) {
+        for d in 0..lhs_dense.nrows() {
+            lhs_dense[[d, d]] += shift;
+        }
+    }
+}
+
+fn shift_linear_constraints_to_delta(
+    constraints: &LinearInequalityConstraints,
+    beta: &Array1<f64>,
+) -> Result<LinearInequalityConstraints, String> {
+    if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
+        return Err("linear constraints: shape mismatch".to_string());
+    }
+    Ok(LinearInequalityConstraints {
+        a: constraints.a.clone(),
+        b: &constraints.b - &constraints.a.dot(beta),
+    })
+}
+
 struct BlockUpdateContext<'a> {
     family: &'a dyn CustomFamily,
     states: &'a [ParameterBlockState],
@@ -3676,8 +3730,12 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         }
 
         let lhs = self.hessian.add_dense(ctx.s_lambda)?;
-        let mut rhs = self.hessian.dot(&ctx.states[ctx.block_idx].beta);
-        rhs += self.gradient;
+        // Solve in delta-space for both constrained and unconstrained blocks.
+        // That keeps the linear system consistent even when we add a
+        // numerical ridge to stabilize an indefinite exact-Newton Hessian.
+        let rhs_step = self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta);
+        let mut lhs_dense = lhs.to_dense();
+        stabilize_exact_newton_lhs_in_place(ctx.family, &mut lhs_dense, ctx.options.ridge_floor);
 
         if let Some(constraints) = ctx.linear_constraints {
             check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
@@ -3688,12 +3746,20 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                     )
                 },
             )?;
-            let lhs_dense = lhs.to_dense();
-            let (beta_constrained, active_set) = solve_quadraticwith_linear_constraints(
+            let delta_constraints =
+                shift_linear_constraints_to_delta(constraints, &ctx.states[ctx.block_idx].beta)
+                    .map_err(|e| {
+                        format!(
+                            "block {} ({}) constrained exact-newton solve: {e}",
+                            ctx.block_idx, ctx.spec.name
+                        )
+                    })?;
+            let delta_start = Array1::zeros(p);
+            let (delta, active_set) = solve_quadraticwith_linear_constraints(
                 &lhs_dense,
-                &rhs,
-                &ctx.states[ctx.block_idx].beta,
-                constraints,
+                &rhs_step,
+                &delta_start,
+                &delta_constraints,
                 ctx.cached_active_set,
             )
             .map_err(|e| {
@@ -3703,7 +3769,7 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 )
             })?;
             Ok(BlockUpdateResult {
-                beta_new_raw: beta_constrained,
+                beta_new_raw: &ctx.states[ctx.block_idx].beta + &delta,
                 active_set: Some(active_set),
             })
         } else {
@@ -3729,43 +3795,6 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             // right-hand side; without it the step is distorted, which can trap
             // exact-Newton block updates on nonconvex blocks such as survival
             // `log_sigma`.
-            let rhs_step = self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta);
-            let mut lhs_dense = lhs.to_dense();
-            if !use_exact_newton_strict_spd(ctx.family) {
-                let floor = effective_solverridge(ctx.options.ridge_floor);
-                let shift = match FaerEigh::eigh(&lhs_dense, Side::Lower) {
-                    Ok((evals, _)) => {
-                        // NaN-propagating min: if ANY eigenvalue is NaN,
-                        // min_eval becomes NaN, triggering ridging.
-                        // (f64::min silently drops NaN — that was the old bug.)
-                        let min_eval = evals.iter().copied().fold(f64::INFINITY, |a, b| {
-                            if a.is_nan() || b.is_nan() {
-                                f64::NAN
-                            } else {
-                                a.min(b)
-                            }
-                        });
-                        if !min_eval.is_finite() || min_eval <= floor {
-                            Some(floor - min_eval.min(0.0).max(-1e12))
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => {
-                        // Eigendecomposition failed (e.g. NaN in matrix).
-                        // Apply a conservative ridge instead of aborting.
-                        let diag_max = (0..lhs_dense.nrows())
-                            .map(|d| lhs_dense[[d, d]].abs())
-                            .fold(0.0_f64, f64::max);
-                        Some(floor.max(diag_max * 1e-6).max(1e-6))
-                    }
-                };
-                if let Some(shift) = shift {
-                    for d in 0..lhs_dense.nrows() {
-                        lhs_dense[[d, d]] += shift;
-                    }
-                }
-            }
             let delta = if use_exact_newton_strict_spd(ctx.family) {
                 strict_solve_spd(&lhs_dense, &rhs_step)?
             } else {
@@ -5343,7 +5372,7 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut h_joint = symmetrized_square_matrix(
             curvature.hessian,
             total,
-            "joint exact-newton Hessian shape mismatch in logdet terms (rescaled)",
+            "joint exact-newton Hessian validation in logdet terms (rescaled)",
         )?;
         for (b, s_lambda) in s_lambdas.iter().enumerate() {
             let (start, end) = ranges[b];
@@ -5402,7 +5431,7 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         states,
         specs,
         total,
-        "joint exact-newton Hessian shape mismatch in logdet terms",
+        "joint exact-newton Hessian validation in logdet terms",
     )? {
         for (b, s_lambda) in s_lambdas.iter().enumerate() {
             let (start, end) = ranges[b];
@@ -9024,6 +9053,36 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct OneBlockConstrainedIndefiniteHessianFamily;
+
+    impl CustomFamily for OneBlockConstrainedIndefiniteHessianFamily {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![-1.0],
+                    hessian: SymmetricMatrix::Dense(array![[-1.0]]),
+                }],
+            })
+        }
+
+        fn block_linear_constraints(
+            &self,
+            _: &[ParameterBlockState],
+            block_idx: usize,
+            _: &ParameterBlockSpec,
+        ) -> Result<Option<LinearInequalityConstraints>, String> {
+            if block_idx != 0 {
+                return Ok(None);
+            }
+            Ok(Some(LinearInequalityConstraints {
+                a: array![[1.0]],
+                b: array![1.0],
+            }))
+        }
+    }
+
+    #[derive(Clone)]
     struct PreferJointExactFamily;
 
     impl CustomFamily for PreferJointExactFamily {
@@ -10567,6 +10626,47 @@ mod tests {
             (beta - 1.0).abs() < 1e-8,
             "expected constrained optimum at lower bound, got {beta}"
         );
+    }
+
+    #[test]
+    fn constrained_exact_newton_indefinite_hessian_uses_stabilized_delta_solve() {
+        let spec = ParameterBlockSpec {
+            name: "exact_block".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![1.5]),
+        };
+        let states = vec![ParameterBlockState {
+            beta: array![1.5],
+            eta: array![1.5],
+        }];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![1.0],
+        };
+        let hessian = SymmetricMatrix::Dense(array![[-1.0]]);
+        let updater = ExactNewtonBlockUpdater {
+            gradient: &array![-1.0],
+            hessian: &hessian,
+        };
+        let s_lambda = Array2::zeros((1, 1));
+        let update = updater
+            .compute_update_step(&BlockUpdateContext {
+                family: &OneBlockConstrainedIndefiniteHessianFamily,
+                states: &states,
+                spec: &spec,
+                block_idx: 0,
+                s_lambda: &s_lambda,
+                options: &BlockwiseFitOptions::default(),
+                linear_constraints: Some(&constraints),
+                cached_active_set: None,
+            })
+            .expect("indefinite constrained exact-newton update should be stabilized");
+        assert_relative_eq!(update.beta_new_raw[0], 1.0, epsilon = 1e-12);
+        assert_eq!(update.active_set, Some(vec![0]));
     }
 
     #[test]

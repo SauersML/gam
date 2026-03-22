@@ -574,7 +574,7 @@ fn validate_spec(
             let sigma = sigma_fixed.ok_or_else(|| {
                 "bernoulli-marginal-slope currently requires FrailtySpec::GaussianShift with a fixed sigma".to_string()
             })?;
-            if !sigma.is_finite() || *sigma < 0.0 {
+            if !sigma.is_finite() || sigma < 0.0 {
                 return Err(format!(
                     "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
                 ));
