@@ -4,6 +4,7 @@ use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
+use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
@@ -301,6 +302,8 @@ pub enum FittedFamily {
     },
     MarginalSlope {
         likelihood: LikelihoodFamily,
+        #[serde(default)]
+        frailty: Option<FrailtySpec>,
     },
     Survival {
         likelihood: LikelihoodFamily,
@@ -308,6 +311,8 @@ pub enum FittedFamily {
         survival_likelihood: Option<String>,
         #[serde(default)]
         survival_distribution: Option<String>,
+        #[serde(default)]
+        frailty: Option<FrailtySpec>,
     },
     TransformationNormal {
         likelihood: LikelihoodFamily,
@@ -743,6 +748,16 @@ impl FittedFamily {
             | Self::MarginalSlope { likelihood, .. }
             | Self::Survival { likelihood, .. }
             | Self::TransformationNormal { likelihood, .. } => *likelihood,
+        }
+    }
+
+    #[inline]
+    pub fn frailty(&self) -> Option<&FrailtySpec> {
+        match self {
+            Self::MarginalSlope { frailty, .. } | Self::Survival { frailty, .. } => {
+                frailty.as_ref()
+            }
+            _ => None,
         }
     }
 }
@@ -1272,6 +1287,7 @@ impl FittedModel {
                     z_column,
                     payload.marginal_baseline?,
                     payload.logslope_baseline?,
+                    self.family_state.frailty().cloned(),
                     runtime.score_warp,
                     runtime.link_deviation,
                 )

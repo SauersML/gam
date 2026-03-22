@@ -240,8 +240,10 @@ fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
 }
 
 fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
-    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
-    1.0 / (1.0 + sigma * sigma).sqrt()
+    crate::families::lognormal_kernel::ProbitFrailtyScale::new(
+        gaussian_frailty_sd.unwrap_or(0.0),
+    )
+    .s
 }
 
 struct ObservedDenestedCellPartials {

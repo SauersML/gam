@@ -1,4 +1,5 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
+use crate::families::lognormal_kernel::{FrailtySpec, ProbitFrailtyScale};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::inference::model::{SavedAnchoredDeviationRuntime, SavedLinkWiggleRuntime};
 use crate::inference::prediction_linalg::{
@@ -771,9 +772,23 @@ pub struct BernoulliMarginalSlopePredictor {
     pub covariance: Option<Array2<f64>>,
     pub score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
     pub link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
+    pub gaussian_frailty_sd: Option<f64>,
 }
 
 impl BernoulliMarginalSlopePredictor {
+    fn probit_frailty_scale(&self) -> f64 {
+        ProbitFrailtyScale::new(self.gaussian_frailty_sd.unwrap_or(0.0)).s
+    }
+
+    fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
+        [
+            scale * coefficients[0],
+            scale * coefficients[1],
+            scale * coefficients[2],
+            scale * coefficients[3],
+        ]
+    }
+
     fn denested_partition_cells(
         &self,
         a: f64,
@@ -812,7 +827,8 @@ impl BernoulliMarginalSlopePredictor {
         if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
             link_breaks.push(a + link_tail);
         }
-        crate::families::bernoulli_marginal_slope::exact_kernel::build_denested_partition_cells(
+        let mut cells =
+            crate::families::bernoulli_marginal_slope::exact_kernel::build_denested_partition_cells(
             a,
             b,
             &score_breaks,
@@ -854,7 +870,17 @@ impl BernoulliMarginalSlopePredictor {
                 }
             },
         )
-        .map_err(EstimationError::InvalidInput)
+        .map_err(EstimationError::InvalidInput)?;
+        let scale = self.probit_frailty_scale();
+        if scale != 1.0 {
+            for partition_cell in &mut cells {
+                partition_cell.cell.c0 *= scale;
+                partition_cell.cell.c1 *= scale;
+                partition_cell.cell.c2 *= scale;
+                partition_cell.cell.c3 *= scale;
+            }
+        }
+        Ok(cells)
     }
 
     fn evaluate_denested_calibration(
@@ -866,6 +892,7 @@ impl BernoulliMarginalSlopePredictor {
         beta_link_dev: Option<&Array1<f64>>,
     ) -> Result<(f64, f64, f64), EstimationError> {
         let cells = self.denested_partition_cells(a, slope, beta_score_warp, beta_link_dev)?;
+        let scale = self.probit_frailty_scale();
         let mut f = -crate::probability::normal_cdf(marginal_eta);
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
@@ -877,19 +904,21 @@ impl BernoulliMarginalSlopePredictor {
                 )
                 .map_err(EstimationError::InvalidInput)?;
             f += state.value;
-            let (dc_da, _) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
+            let (dc_da_raw, _) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 slope,
             );
             let shift = a - partition_cell.link_span.left;
-            let d2c_da2 = [
+            let d2c_da2_raw = [
                 2.0 * partition_cell.link_span.c2 + 6.0 * partition_cell.link_span.c3 * shift,
                 6.0 * partition_cell.link_span.c3 * slope,
                 0.0,
                 0.0,
             ];
+            let dc_da = Self::scale_coeff4(dc_da_raw, scale);
+            let d2c_da2 = Self::scale_coeff4(d2c_da2_raw, scale);
             f_a += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
@@ -912,9 +941,20 @@ impl BernoulliMarginalSlopePredictor {
         z_column: String,
         baseline_marginal: f64,
         baseline_logslope: f64,
+        frailty: Option<FrailtySpec>,
         score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
         link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
     ) -> Result<Self, String> {
+        let gaussian_frailty_sd = match frailty.unwrap_or(FrailtySpec::None) {
+            FrailtySpec::None => None,
+            FrailtySpec::GaussianShift { sigma_fixed } => sigma_fixed,
+            FrailtySpec::HazardMultiplier { .. } => {
+                return Err(
+                    "bernoulli marginal-slope predictor does not support HazardMultiplier frailty"
+                        .to_string(),
+                );
+            }
+        };
         if let Some(runtime) = score_warp_runtime.as_ref() {
             if runtime.kernel.is_empty() {
                 return Err(
@@ -1005,6 +1045,7 @@ impl BernoulliMarginalSlopePredictor {
             covariance: unified.beta_covariance().cloned(),
             score_warp_runtime,
             link_deviation_runtime,
+            gaussian_frailty_sd,
         })
     }
 
@@ -1193,13 +1234,14 @@ impl BernoulliMarginalSlopePredictor {
         let link_dev_offset = score_warp_offset + score_warp_dim;
         let chunk_size = prediction_chunk_rows(theta.len(), 1, n);
         let num_chunks = (n + chunk_size - 1) / chunk_size;
+        let scale = self.probit_frailty_scale();
 
         // ── Rigid closed-form path: η = q·√(1+b²) + b·z ──────────────
         // When neither score-warp nor link-deviation is active, z passes
         // through unwarped and the intercept has a closed-form solution.
         if !flex_active {
             let c_vec = logslope_eta.mapv(|b| (1.0 + b * b).sqrt());
-            let final_eta = &c_vec * &marginal_eta + &logslope_eta * z;
+            let final_eta = (&c_vec * &marginal_eta + &logslope_eta * z).mapv(|v| scale * v);
 
             if !need_gradient {
                 return Ok((final_eta, None));
@@ -1220,10 +1262,10 @@ impl BernoulliMarginalSlopePredictor {
                     let g_scale = marginal_eta[i] * b / c + z[i];
                     let mut row = grad.row_mut(i);
                     for j in 0..marginal_dim {
-                        row[j] = c * mc[[li, j]];
+                        row[j] = scale * c * mc[[li, j]];
                     }
                     for j in 0..logslope_dim {
-                        row[logslope_offset + j] = g_scale * lc[[li, j]];
+                        row[logslope_offset + j] = scale * g_scale * lc[[li, j]];
                     }
                 }
 
@@ -1461,7 +1503,8 @@ impl BernoulliMarginalSlopePredictor {
         } else {
             Array1::zeros(n)
         };
-        let final_eta = &eta_base + &(&logslope_eta * &score_dev_obs) + &link_dev_obs;
+        let final_eta = (&eta_base + &(&logslope_eta * &score_dev_obs) + &link_dev_obs)
+            .mapv(|v| scale * v);
 
         if !need_gradient {
             return Ok((final_eta, None));
@@ -1538,6 +1581,9 @@ impl BernoulliMarginalSlopePredictor {
         for chunk in grad_chunks {
             grad.slice_mut(ndarray::s![chunk.start..chunk.end, ..])
                 .assign(&chunk.grad);
+        }
+        if scale != 1.0 {
+            grad.mapv_inplace(|v| scale * v);
         }
         Ok((final_eta, Some(grad)))
     }
@@ -3582,6 +3628,7 @@ mod tests {
                 basis_dim: 2,
             }),
             link_deviation_runtime: None,
+            gaussian_frailty_sd: None,
         };
         let err = score_only
             .score_warp_runtime

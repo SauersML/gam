@@ -17,12 +17,14 @@ use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
     lognormal_laplace_term_shared,
 };
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // ─── Frailty specification ───────────────────────────────────────────────────
 
 /// How the hazard multiplier frailty loads onto the hazard components.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum HazardLoading {
     /// Frailty multiplies the entire hazard: h(t|U) = exp(U) · h_0(t).
     Full,
@@ -46,7 +48,8 @@ pub enum HazardLoading {
 ///    K_{k,m}(μ, σ) kernel terms.
 ///
 /// These are mathematically distinct families.  Do not mix them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "frailty_kind", rename_all = "kebab-case")]
 pub enum FrailtySpec {
     /// No frailty modifier.
     None,
@@ -160,20 +163,20 @@ impl ProbitFrailtyScale {
     }
 
     /// ∂_{ttt} s
-    pub fn d3s_dt3(&self) -> f64 {
+    pub(crate) fn d3s_dt3(&self) -> f64 {
         let a = self.alpha;
         a * (-15.0 * a * a + 18.0 * a - 4.0) * self.s
     }
 
     /// ∂_{tttt} s
-    pub fn d4s_dt4(&self) -> f64 {
+    pub(crate) fn d4s_dt4(&self) -> f64 {
         let a = self.alpha;
         a * (105.0 * a * a * a - 180.0 * a * a + 84.0 * a - 8.0) * self.s
     }
 
     /// Scale a denested cubic cell's coefficients by s.
     /// Input: [c0, c1, c2, c3].  Output: [s*c0, s*c1, s*c2, s*c3].
-    pub fn scale_cell(&self, coeffs: &[f64; 4]) -> [f64; 4] {
+    pub(crate) fn scale_cell(&self, coeffs: &[f64; 4]) -> [f64; 4] {
         [
             self.s * coeffs[0],
             self.s * coeffs[1],
@@ -390,7 +393,7 @@ pub fn kernel_mu_jet(bundle: &LognormalKernelBundle, k: usize, m: f64, order: us
 ///
 /// Returns a struct with all partials needed for exact score and Hessian.
 #[derive(Clone, Copy, Debug)]
-pub struct KernelFullJet {
+struct KernelFullJet {
     /// K_{k,m}
     pub value: f64,
     /// ∂_μ K
@@ -611,7 +614,7 @@ impl LogKernelSumJet {
 /// first and second partial derivatives of ℓ with respect to μ, t = log σ,
 /// and m.
 #[derive(Clone, Copy, Debug)]
-pub struct LogKernelSumFullJet {
+pub(crate) struct LogKernelSumFullJet {
     /// log(S)
     pub value: f64,
     /// ∂_μ log(S)
@@ -1414,6 +1417,32 @@ impl LatentSurvivalRowJet {
             })
         }
     }
+
+    /// Full (μ, t, m) jet for right-censored rows with dynamic baseline.
+    ///
+    /// Returns the `LogKernelSumFullJet` for `log K_{0,m}(μ,σ)`, giving all
+    /// partial derivatives needed when baseline parameters move the mass m.
+    /// Used by multi-block families with learned time baselines.
+    pub fn right_censored_full(
+        quadctx: &QuadratureContext,
+        mu: f64,
+        sigma: f64,
+        mass_exit: f64,
+    ) -> Result<LogKernelSumFullJet, EstimationError> {
+        LogKernelSumFullJet::single_term(quadctx, 0, mass_exit, mu, sigma)
+    }
+
+    /// Full (μ, t, m) jet for exact-event rows with dynamic baseline.
+    ///
+    /// Returns the `LogKernelSumFullJet` for `log K_{1,m}(μ,σ)`.
+    pub fn exact_event_full(
+        quadctx: &QuadratureContext,
+        mu: f64,
+        sigma: f64,
+        mass_event: f64,
+    ) -> Result<LogKernelSumFullJet, EstimationError> {
+        LogKernelSumFullJet::single_term(quadctx, 1, mass_event, mu, sigma)
+    }
 }
 
 // ─── Prediction semantics ────────────────────────────────────────────────────
@@ -1452,7 +1481,7 @@ pub enum LatentPredictionMode {
 ///
 /// Given the fitted linear predictor η and a prediction mode, returns the
 /// appropriate user-facing prediction.
-pub fn latent_predict(
+pub(crate) fn latent_predict(
     quadctx: &QuadratureContext,
     eta: &[f64],
     sigma: f64,
@@ -1708,5 +1737,101 @@ mod tests {
         assert!((jet.d3 - d3).abs() < 1e-12);
         assert!((jet.d4 - d4).abs() < 1e-12);
         assert!((jet.d5 - d5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn probit_frailty_scale_derivatives_fd() {
+        let sigma = 0.6;
+        let pfs = ProbitFrailtyScale::new(sigma);
+        let h = 1e-5;
+
+        // FD on s(sigma) via t = log(sigma)
+        let t = sigma.ln();
+        let s_p = ProbitFrailtyScale::new((t + h).exp()).s;
+        let s_m = ProbitFrailtyScale::new((t - h).exp()).s;
+        let s_c = pfs.s;
+
+        let fd_d1 = (s_p - s_m) / (2.0 * h);
+        assert!(
+            (pfs.ds_dt() - fd_d1).abs() / fd_d1.abs().max(1e-15) < 1e-4,
+            "ds_dt: exact={}, fd={fd_d1}",
+            pfs.ds_dt()
+        );
+
+        let fd_d2 = (s_p - 2.0 * s_c + s_m) / (h * h);
+        assert!(
+            (pfs.d2s_dt2() - fd_d2).abs() / fd_d2.abs().max(1e-15) < 1e-3,
+            "d2s_dt2: exact={}, fd={fd_d2}",
+            pfs.d2s_dt2()
+        );
+
+        // Higher derivatives via FD on ds_dt
+        let ds_p = ProbitFrailtyScale::new((t + h).exp()).ds_dt();
+        let ds_m = ProbitFrailtyScale::new((t - h).exp()).ds_dt();
+        let fd_d2_from_d1 = (ds_p - ds_m) / (2.0 * h);
+        assert!(
+            (pfs.d2s_dt2() - fd_d2_from_d1).abs() / fd_d2_from_d1.abs().max(1e-15) < 1e-3,
+            "d2s_dt2 from d1: exact={}, fd={fd_d2_from_d1}",
+            pfs.d2s_dt2()
+        );
+
+        let d2s_p = ProbitFrailtyScale::new((t + h).exp()).d2s_dt2();
+        let d2s_m = ProbitFrailtyScale::new((t - h).exp()).d2s_dt2();
+        let fd_d3 = (d2s_p - d2s_m) / (2.0 * h);
+        assert!(
+            (pfs.d3s_dt3() - fd_d3).abs() / fd_d3.abs().max(1e-15) < 1e-2,
+            "d3s_dt3: exact={}, fd={fd_d3}",
+            pfs.d3s_dt3()
+        );
+
+        let d3s_p = ProbitFrailtyScale::new((t + h).exp()).d3s_dt3();
+        let d3s_m = ProbitFrailtyScale::new((t - h).exp()).d3s_dt3();
+        let fd_d4 = (d3s_p - d3s_m) / (2.0 * h);
+        assert!(
+            (pfs.d4s_dt4() - fd_d4).abs() / fd_d4.abs().max(1e-15) < 1e-2,
+            "d4s_dt4: exact={}, fd={fd_d4}",
+            pfs.d4s_dt4()
+        );
+
+        // scale_cell
+        let coeffs = [1.0, 2.0, 3.0, 4.0];
+        let scaled = pfs.scale_cell(&coeffs);
+        for r in 0..4 {
+            assert!((scaled[r] - pfs.s * coeffs[r]).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn kernel_full_jet_m_derivative_fd() {
+        let ctx = QuadratureContext::new();
+        let mu = 0.3;
+        let sigma = 0.5;
+        let m = 1.0;
+        let k = 0usize;
+        let h = 1e-5;
+
+        // Use LogKernelSumFullJet which exercises KernelFullJet internally.
+        let jet = LogKernelSumFullJet::single_term(&ctx, k, m, mu, sigma).unwrap();
+
+        // FD d_m: d(log K)/dm
+        let v_p = kernel_term(&ctx, k, m + h, mu, sigma).unwrap().0.ln();
+        let v_m = kernel_term(&ctx, k, m - h, mu, sigma).unwrap().0.ln();
+        let fd_dm = (v_p - v_m) / (2.0 * h);
+        assert!(
+            (jet.d_m - fd_dm).abs() / fd_dm.abs().max(1e-15) < 1e-3,
+            "d_m: exact={}, fd={fd_dm}",
+            jet.d_m
+        );
+
+        // FD d_t: d(log K)/dt where t = log(sigma)
+        let t = sigma.ln();
+        let v_tp = kernel_term(&ctx, k, m, mu, (t + h).exp()).unwrap().0.ln();
+        let v_tm = kernel_term(&ctx, k, m, mu, (t - h).exp()).unwrap().0.ln();
+        let fd_dt = (v_tp - v_tm) / (2.0 * h);
+        assert!(
+            (jet.d_t - fd_dt).abs() / fd_dt.abs().max(1e-15) < 1e-3,
+            "d_t: exact={}, fd={fd_dt}",
+            jet.d_t
+        );
     }
 }

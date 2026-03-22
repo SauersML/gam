@@ -1363,12 +1363,7 @@ fn run_fit_bernoulli_marginal_slope(
                 logslopespec: logslopespec.clone(),
                 marginal_offset,
                 logslope_offset,
-                frailty: match args.latent_sd {
-                    Some(sd) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
-                        sigma_fixed: Some(sd),
-                    },
-                    None => gam::families::lognormal_kernel::FrailtySpec::None,
-                },
+                frailty: fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd),
                 score_warp: if args.disable_score_warp {
                     None
                 } else {
@@ -1424,6 +1419,7 @@ fn run_fit_bernoulli_marginal_slope(
             solved.baseline_logslope,
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
+            fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd),
         );
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
@@ -2883,6 +2879,7 @@ fn run_predict_survival(
     }
 
     if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        let gaussian_frailty_sd = fixed_gaussian_shift_sigma_from_saved_family(&model.family_state)?;
         let has_saved_timewiggle = model.baseline_timewiggle_knots.is_some()
             || model.baseline_timewiggle_degree.is_some()
             || model.baseline_timewiggle_penalty_orders.is_some()
@@ -3050,9 +3047,8 @@ fn run_predict_survival(
             + noise_offset;
         let (eta, deterministic_mean) = if has_saved_deviations {
             predict_saved_survival_marginal_slope_flex_exit(
-                &q_exit,
-                &slope,
-                &z,
+                &q_exit, &slope, &z,
+                gaussian_frailty_sd,
                 beta_score.as_ref().map(|(runtime, _)| *runtime),
                 beta_score.as_ref().map(|(_, beta)| *beta),
                 beta_link.as_ref().map(|(runtime, _)| *runtime),
@@ -3060,7 +3056,8 @@ fn run_predict_survival(
             )?
         } else {
             let c = slope.mapv(|b| (1.0 + b * b).sqrt());
-            let eta = &q_exit * &c + &(&slope * &z);
+            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let eta = (&q_exit * &c + &(&slope * &z)).mapv(|v| scale * v);
             let deterministic_mean = eta.mapv(|v| normal_cdf(-v));
             (eta, deterministic_mean)
         };
@@ -3073,6 +3070,7 @@ fn run_predict_survival(
         }
         let posterior_mean = if need_uncertainty {
             let c = slope.mapv(|b| (1.0 + b * b).sqrt());
+            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
             let backend = prediction_backend_from_model(model, args.covariance_mode)?;
             let p_t = beta_time.len();
             let p_m = beta_marginal.len();
@@ -3095,7 +3093,7 @@ fn run_predict_survival(
                     let mut dst = jac.slice_mut(s![.., ..p_t]);
                     dst.assign(&x_t);
                     for i in 0..cs {
-                        let ci = c[start + i];
+                        let ci = scale * c[start + i];
                         dst.row_mut(i).mapv_inplace(|v| v * ci);
                     }
                 }
@@ -3104,7 +3102,7 @@ fn run_predict_survival(
                     let mut dst = jac.slice_mut(s![.., p_t..p_t + p_m]);
                     dst.assign(&x_m);
                     for i in 0..cs {
-                        let ci = c[start + i];
+                        let ci = scale * c[start + i];
                         dst.row_mut(i).mapv_inplace(|v| v * ci);
                     }
                 }
@@ -3113,7 +3111,8 @@ fn run_predict_survival(
                     let mut dst = jac.slice_mut(s![.., p_t + p_m..]);
                     dst.assign(&x_s);
                     for i in 0..cs {
-                        let gi = q_exit[start + i] * slope[start + i] / c[start + i] + z[start + i];
+                        let gi =
+                            scale * (q_exit[start + i] * slope[start + i] / c[start + i] + z[start + i]);
                         dst.row_mut(i).mapv_inplace(|v| v * gi);
                     }
                 }
@@ -4796,6 +4795,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
                     survival_distribution: Some(inverse_link_to_saved_string(&fitted_inverse_link)),
+                    frailty: None,
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             );
@@ -4997,7 +4997,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             z,
             marginalspec: termspec.clone(),
             marginal_offset: threshold_offset.clone(),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd),
             derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
             time_block: TimeBlockInput {
                 design_entry: time_design_entry.clone(),
@@ -5068,6 +5068,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
                     survival_distribution: Some("probit".to_string()),
+                    frailty: Some(fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd)),
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             );
@@ -5408,6 +5409,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_likelihood_modename(likelihood_mode).to_string(),
                 ),
                 survival_distribution: None,
+                frailty: None,
             },
             family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
         );
@@ -7487,6 +7489,7 @@ fn saved_survival_observed_spans(
 fn saved_survival_denested_partition_cells(
     a: f64,
     b: f64,
+    gaussian_frailty_sd: Option<f64>,
     score_runtime: Option<&SavedAnchoredDeviationRuntime>,
     score_beta: Option<&Array1<f64>>,
     link_runtime: Option<&SavedAnchoredDeviationRuntime>,
@@ -7518,7 +7521,7 @@ fn saved_survival_denested_partition_cells(
         link_breaks.push(a + link_tail);
     }
 
-    exact_kernel::build_denested_partition_cells(
+    let mut cells = exact_kernel::build_denested_partition_cells(
         a,
         b,
         &score_breaks,
@@ -7551,13 +7554,24 @@ fn saved_survival_denested_partition_cells(
                 })
             }
         },
-    )
+    )?;
+    let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+    if scale != 1.0 {
+        for partition_cell in &mut cells {
+            partition_cell.cell.c0 *= scale;
+            partition_cell.cell.c1 *= scale;
+            partition_cell.cell.c2 *= scale;
+            partition_cell.cell.c3 *= scale;
+        }
+    }
+    Ok(cells)
 }
 
 fn evaluate_saved_survival_calibration(
     a: f64,
     q: f64,
     slope: f64,
+    gaussian_frailty_sd: Option<f64>,
     score_runtime: Option<&SavedAnchoredDeviationRuntime>,
     score_beta: Option<&Array1<f64>>,
     link_runtime: Option<&SavedAnchoredDeviationRuntime>,
@@ -7566,11 +7580,13 @@ fn evaluate_saved_survival_calibration(
     let cells = saved_survival_denested_partition_cells(
         a,
         slope,
+        gaussian_frailty_sd,
         score_runtime,
         score_beta,
         link_runtime,
         link_beta,
     )?;
+    let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
     let mut f = -gam::probability::normal_cdf(-q);
     let mut f_a = 0.0;
     for partition_cell in cells {
@@ -7591,7 +7607,7 @@ fn evaluate_saved_survival_calibration(
             a,
             slope,
         );
-        let dc_da = dc_da_pos.map(|value| -value);
+        let dc_da = scale_coeff4(dc_da_pos, -scale);
         f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
     }
     Ok((f, f_a))
@@ -7600,6 +7616,7 @@ fn evaluate_saved_survival_calibration(
 fn solve_saved_survival_intercept(
     q: f64,
     slope: f64,
+    gaussian_frailty_sd: Option<f64>,
     score_runtime: Option<&SavedAnchoredDeviationRuntime>,
     score_beta: Option<&Array1<f64>>,
     link_runtime: Option<&SavedAnchoredDeviationRuntime>,
@@ -7610,6 +7627,7 @@ fn solve_saved_survival_intercept(
             a,
             q,
             slope,
+            gaussian_frailty_sd,
             score_runtime,
             score_beta,
             link_runtime,
@@ -7703,6 +7721,7 @@ fn saved_survival_observed_eta(
     z_obs: f64,
     a: f64,
     b: f64,
+    gaussian_frailty_sd: Option<f64>,
     score_runtime: Option<&SavedAnchoredDeviationRuntime>,
     score_beta: Option<&Array1<f64>>,
     link_runtime: Option<&SavedAnchoredDeviationRuntime>,
@@ -7717,7 +7736,11 @@ fn saved_survival_observed_eta(
         link_runtime,
         link_beta,
     )?;
-    let coeff = exact_kernel::denested_cell_coefficients(score_span, link_span, a, b);
+    let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+    let coeff = scale_coeff4(
+        exact_kernel::denested_cell_coefficients(score_span, link_span, a, b),
+        scale,
+    );
     Ok(((coeff[3] * z_obs + coeff[2]) * z_obs + coeff[1]) * z_obs + coeff[0])
 }
 
@@ -7725,6 +7748,7 @@ fn predict_saved_survival_marginal_slope_flex_exit(
     q_exit: &Array1<f64>,
     slope: &Array1<f64>,
     z: &Array1<f64>,
+    gaussian_frailty_sd: Option<f64>,
     score_runtime: Option<&SavedAnchoredDeviationRuntime>,
     score_beta: Option<&Array1<f64>>,
     link_runtime: Option<&SavedAnchoredDeviationRuntime>,
@@ -7737,6 +7761,7 @@ fn predict_saved_survival_marginal_slope_flex_exit(
         let a = solve_saved_survival_intercept(
             q_exit[row],
             slope[row],
+            gaussian_frailty_sd,
             score_runtime,
             score_beta,
             link_runtime,
@@ -7746,6 +7771,7 @@ fn predict_saved_survival_marginal_slope_flex_exit(
             z[row],
             a,
             slope[row],
+            gaussian_frailty_sd,
             score_runtime,
             score_beta,
             link_runtime,
@@ -7771,6 +7797,44 @@ fn deviation_block_config_from_formula_linkwiggle(
     }
 }
 
+fn fixed_gaussian_shift_frailty_from_latent_sd(
+    latent_sd: Option<f64>,
+) -> gam::families::lognormal_kernel::FrailtySpec {
+    match latent_sd {
+        Some(sd) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: Some(sd),
+        },
+        None => gam::families::lognormal_kernel::FrailtySpec::None,
+    }
+}
+
+fn fixed_gaussian_shift_sigma_from_saved_family(
+    family: &FittedFamily,
+) -> Result<Option<f64>, String> {
+    match family.frailty() {
+        None | Some(gam::families::lognormal_kernel::FrailtySpec::None) => Ok(None),
+        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed }) => {
+            Ok(*sigma_fixed)
+        }
+        Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. }) => Err(
+            "saved probit marginal-slope model cannot use HazardMultiplier frailty".to_string(),
+        ),
+    }
+}
+
+fn probit_frailty_scale_from_sigma(sigma: Option<f64>) -> f64 {
+    gam::families::lognormal_kernel::ProbitFrailtyScale::new(sigma.unwrap_or(0.0)).s
+}
+
+fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
+    [
+        scale * coefficients[0],
+        scale * coefficients[1],
+        scale * coefficients[2],
+        scale * coefficients[3],
+    ]
+}
+
 fn build_bernoulli_marginal_slope_saved_model(
     formula: String,
     data_schema: DataSchema,
@@ -7784,6 +7848,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     baseline_logslope: f64,
     score_warp_runtime: Option<&DeviationRuntime>,
     link_dev_runtime: Option<&DeviationRuntime>,
+    frailty: gam::families::lognormal_kernel::FrailtySpec,
 ) -> SavedModel {
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -7791,6 +7856,7 @@ fn build_bernoulli_marginal_slope_saved_model(
         ModelKind::MarginalSlope,
         FittedFamily::MarginalSlope {
             likelihood: LikelihoodFamily::BinomialProbit,
+            frailty: Some(frailty),
         },
         FAMILY_BERNOULLI_MARGINAL_SLOPE.to_string(),
     );
@@ -11484,6 +11550,7 @@ mod tests {
             0.0,
             None,
             None,
+            gam::families::lognormal_kernel::FrailtySpec::None,
         );
         assert_eq!(model.payload().marginal_baseline, Some(0.0));
         assert_eq!(model.payload().logslope_baseline, Some(0.0));
@@ -11942,6 +12009,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
+                frailty: None,
             },
             "survival",
         );
@@ -11966,7 +12034,7 @@ mod tests {
         let z = array![-1.0, 0.5, 1.3];
 
         let (eta, mean) = super::predict_saved_survival_marginal_slope_flex_exit(
-            &q_exit, &slope, &z, None, None, None, None,
+            &q_exit, &slope, &z, None, None, None, None, None,
         )
         .expect("flex exit helper should reduce to rigid model");
 
@@ -11998,6 +12066,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some("probit".to_string()),
+                frailty: None,
             },
             "survival",
         );
@@ -12044,6 +12113,7 @@ mod tests {
             &q_exit,
             &slope,
             &z,
+            None,
             Some(&saved_runtime),
             Some(&zero_beta),
             None,
@@ -12071,6 +12141,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
+                frailty: None,
             },
             "survival",
         );
@@ -12138,6 +12209,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
+                frailty: None,
             },
             "survival",
         );
@@ -12228,6 +12300,7 @@ mod tests {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some("gaussian".to_string()),
+                frailty: None,
             },
             "survival",
         );
