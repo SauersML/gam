@@ -14,7 +14,8 @@ use crate::inference::predict::{
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::types::{
-    InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState,
+    SasLinkSpec, SasLinkState,
 };
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -286,6 +287,8 @@ pub enum FittedFamily {
     Standard {
         likelihood: LikelihoodFamily,
         link: Option<LinkFunction>,
+        #[serde(default)]
+        latent_cloglog_state: Option<LatentCLogLogState>,
         #[serde(default)]
         mixture_state: Option<MixtureLinkState>,
         #[serde(default)]
@@ -820,6 +823,16 @@ impl FittedModel {
         match (&mut payload.family_state, &fit.fitted_link) {
             (
                 FittedFamily::Standard {
+                    likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+                    latent_cloglog_state,
+                    ..
+                },
+                FittedLinkState::LatentCLogLog { state },
+            ) => {
+                *latent_cloglog_state = Some(*state);
+            }
+            (
+                FittedFamily::Standard {
                     likelihood: LikelihoodFamily::BinomialSas,
                     sas_state,
                     ..
@@ -1128,9 +1141,38 @@ impl FittedModel {
         }
     }
 
+    pub fn saved_latent_cloglog_state(&self) -> Result<Option<LatentCLogLogState>, String> {
+        let payload = self.payload();
+        match &payload.family_state {
+            FittedFamily::Standard {
+                likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+                latent_cloglog_state,
+                ..
+            } => latent_cloglog_state
+                .ok_or_else(|| {
+                    "latent-cloglog-binomial model is missing state in family_state.latent_cloglog_state"
+                        .to_string()
+                })
+                .map(Some),
+            FittedFamily::LocationScale {
+                likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+                base_link,
+            } => match base_link {
+                Some(InverseLink::LatentCLogLog(state)) => Ok(Some(*state)),
+                _ => Err(
+                    "latent-cloglog-binomial location-scale model is missing latent cloglog base_link state"
+                        .to_string(),
+                ),
+            },
+            _ => Ok(None),
+        }
+    }
+
     pub fn resolved_inverse_link(&self) -> Result<Option<InverseLink>, String> {
         let stateful = if let Some(state) = self.saved_mixture_state()? {
             Some(InverseLink::Mixture(state))
+        } else if let Some(state) = self.saved_latent_cloglog_state()? {
+            Some(InverseLink::LatentCLogLog(state))
         } else if let Some(state) = self.saved_beta_logistic_state()? {
             Some(InverseLink::BetaLogistic(state))
         } else {

@@ -698,6 +698,7 @@ fn joint_family_logp_and_grad(
         LikelihoodFamily::BinomialLogit
         | LikelihoodFamily::BinomialProbit
         | LikelihoodFamily::BinomialCLogLog
+        | LikelihoodFamily::BinomialLatentCLogLog
         | LikelihoodFamily::BinomialSas
         | LikelihoodFamily::BinomialBetaLogistic
         | LikelihoodFamily::BinomialMixture => {
@@ -2709,6 +2710,17 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
+        (LikelihoodFamily::BinomialLatentCLogLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+            glm.x,
+            glm.y,
+            glm.weights,
+            glm.penalty_matrix,
+            glm.mode,
+            glm.hessian,
+            NutsFamily::BinomialCLogLog,
+            glm.firth_bias_reduction,
+            config,
+        ),
         (LikelihoodFamily::BinomialMixture, FamilyNutsInputs::Glm(_)) => Err(
             "BinomialMixture NUTS is not implemented yet; use fit_gam/predict_gam for blended inverse-link models"
                 .to_string(),
@@ -3662,6 +3674,14 @@ impl JointBetaRhoPosterior {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::CLogLog)) {
                     return Err(
                         "Joint HMC BinomialCLogLog requires a cloglog inverse link".to_string()
+                    );
+                }
+            }
+            LikelihoodFamily::BinomialLatentCLogLog => {
+                if !matches!(&inverse_link, InverseLink::LatentCLogLog(_)) {
+                    return Err(
+                        "Joint HMC BinomialLatentCLogLog requires latent cloglog link state"
+                            .to_string(),
                     );
                 }
             }

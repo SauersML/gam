@@ -3,6 +3,7 @@ pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;
+pub mod lognormal_kernel;
 pub mod row_kernel;
 pub mod royston_parmar;
 pub mod scale_design;

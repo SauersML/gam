@@ -1,4 +1,5 @@
 use crate::estimate::{EstimationError, FittedLinkState, UnifiedFitResult};
+use crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet;
 use crate::inference::generative::NoiseModel;
 use crate::mixture_link::{InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet};
 use crate::quadrature::{
@@ -78,6 +79,7 @@ pub fn strategy_from_fit(
     let inverse_link = match fit.fitted_link_state(family)? {
         FittedLinkState::Standard(Some(link)) => Some(InverseLink::Standard(link)),
         FittedLinkState::Standard(None) => None,
+        FittedLinkState::LatentCLogLog { state } => Some(InverseLink::LatentCLogLog(state)),
         FittedLinkState::Sas { state, .. } => Some(InverseLink::Sas(state)),
         FittedLinkState::BetaLogistic { state, .. } => Some(InverseLink::BetaLogistic(state)),
         FittedLinkState::Mixture { state, .. } => Some(InverseLink::Mixture(state)),
@@ -96,6 +98,13 @@ impl ResolvedFamilyStrategy {
     #[inline]
     fn sas_state(&self) -> Option<&crate::types::SasLinkState> {
         self.inverse_link.as_ref().and_then(InverseLink::sas_state)
+    }
+
+    #[inline]
+    fn latent_cloglog_state(&self) -> Option<&crate::types::LatentCLogLogState> {
+        self.inverse_link
+            .as_ref()
+            .and_then(InverseLink::latent_cloglog_state)
     }
 }
 
@@ -128,6 +137,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     }
 
     fn inverse_link_jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        if let Some(inverse_link) = &self.inverse_link {
+            return crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta);
+        }
         inverse_link_jet_for_family(self.family, eta, self.mixture_state(), self.sas_state())
     }
 
@@ -148,6 +160,16 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 se_eta,
             )
             .map(|v| v.mean),
+            LikelihoodFamily::BinomialLatentCLogLog => {
+                let state = self.latent_cloglog_state().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "BinomialLatentCLogLog posterior mean requires fixed latent cloglog state"
+                            .to_string(),
+                    )
+                })?;
+                latent_cloglog_inverse_link_jet(quadctx, eta, se_eta.hypot(state.latent_sd))
+                    .map(|v| v.mean)
+            }
             LikelihoodFamily::BinomialSas | LikelihoodFamily::BinomialBetaLogistic => {
                 integrated_inverse_link_jetwith_state(
                     quadctx,
@@ -200,6 +222,29 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             }
             LikelihoodFamily::BinomialCLogLog => {
                 Ok(cloglog_posterior_meanvariance(quadctx, eta, se_eta))
+            }
+            LikelihoodFamily::BinomialLatentCLogLog => {
+                let state = self.latent_cloglog_state().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "BinomialLatentCLogLog posterior mean requires fixed latent cloglog state"
+                            .to_string(),
+                    )
+                })?;
+                let total_sigma = se_eta.hypot(state.latent_sd);
+                let m1 = latent_cloglog_inverse_link_jet(quadctx, eta, total_sigma)?.mean;
+                let m2 = normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
+                    latent_cloglog_inverse_link_jet(
+                        quadctx,
+                        x,
+                        state.latent_sd,
+                    )
+                    .map(|jet| {
+                        let p = jet.mean;
+                        p * p
+                    })
+                    .unwrap_or(f64::NAN)
+                });
+                Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
             LikelihoodFamily::BinomialSas => {
                 let state = self.sas_state().ok_or_else(|| {
@@ -287,6 +332,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialLatentCLogLog
             | LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => Ok(NoiseModel::Bernoulli),
@@ -310,6 +356,18 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         eta: f64,
         se_eta: f64,
     ) -> Result<IntegratedMomentsJet, EstimationError> {
+        if let Some(state) = self.latent_cloglog_state() {
+            let jet = latent_cloglog_inverse_link_jet(quadctx, eta, se_eta.hypot(state.latent_sd))?;
+            let mean = jet.mean;
+            return Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean)).max(1e-12),
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            });
+        }
         integrated_family_moments_jetwith_state(
             quadctx,
             self.family,

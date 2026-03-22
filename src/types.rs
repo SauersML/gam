@@ -63,10 +63,29 @@ pub struct SasLinkState {
     pub delta: f64,
 }
 
+/// Fixed latent Gaussian scale for the exact marginal cloglog family.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LatentCLogLogState {
+    pub latent_sd: f64,
+}
+
+impl LatentCLogLogState {
+    #[inline]
+    pub fn new(latent_sd: f64) -> Result<Self, String> {
+        if !latent_sd.is_finite() || latent_sd < 0.0 {
+            return Err(format!(
+                "latent cloglog standard deviation must be finite and >= 0, got {latent_sd}"
+            ));
+        }
+        Ok(Self { latent_sd })
+    }
+}
+
 /// Parameterized inverse-link selector used where mu/derivatives are evaluated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InverseLink {
     Standard(LinkFunction),
+    LatentCLogLog(LatentCLogLogState),
     Sas(SasLinkState),
     BetaLogistic(SasLinkState),
     Mixture(MixtureLinkState),
@@ -77,6 +96,7 @@ impl InverseLink {
     pub fn link_function(&self) -> LinkFunction {
         match self {
             Self::Standard(link) => *link,
+            Self::LatentCLogLog(_) => LinkFunction::CLogLog,
             Self::Sas(_) => LinkFunction::Sas,
             Self::BetaLogistic(_) => LinkFunction::BetaLogistic,
             Self::Mixture(_) => LinkFunction::Logit,
@@ -95,6 +115,14 @@ impl InverseLink {
     pub fn sas_state(&self) -> Option<&SasLinkState> {
         match self {
             Self::Sas(state) | Self::BetaLogistic(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn latent_cloglog_state(&self) -> Option<&LatentCLogLogState> {
+        match self {
+            Self::LatentCLogLog(state) => Some(state),
             _ => None,
         }
     }
@@ -121,6 +149,7 @@ pub enum LikelihoodFamily {
     BinomialLogit,
     BinomialProbit,
     BinomialCLogLog,
+    BinomialLatentCLogLog,
     BinomialSas,
     BinomialBetaLogistic,
     BinomialMixture,
@@ -137,7 +166,7 @@ impl LikelihoodFamily {
             Self::PoissonLog | Self::GammaLog => LinkFunction::Log,
             Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
             Self::BinomialProbit => LinkFunction::Probit,
-            Self::BinomialCLogLog => LinkFunction::CLogLog,
+            Self::BinomialCLogLog | Self::BinomialLatentCLogLog => LinkFunction::CLogLog,
             Self::BinomialSas => LinkFunction::Sas,
             Self::BinomialBetaLogistic => LinkFunction::BetaLogistic,
         }
@@ -150,6 +179,7 @@ impl LikelihoodFamily {
             Self::BinomialLogit => "binomial-logit",
             Self::BinomialProbit => "binomial-probit",
             Self::BinomialCLogLog => "binomial-cloglog",
+            Self::BinomialLatentCLogLog => "latent-cloglog-binomial",
             Self::BinomialSas => "binomial-sas",
             Self::BinomialBetaLogistic => "binomial-beta-logistic",
             Self::BinomialMixture => "binomial-blended-inverse-link",
@@ -166,6 +196,7 @@ impl LikelihoodFamily {
             Self::BinomialLogit => "Binomial Logit",
             Self::BinomialProbit => "Binomial Probit",
             Self::BinomialCLogLog => "Binomial CLogLog",
+            Self::BinomialLatentCLogLog => "Latent CLogLog Binomial",
             Self::BinomialSas => "Binomial SAS",
             Self::BinomialBetaLogistic => "Binomial Beta-Logistic",
             Self::BinomialMixture => "Binomial Blended Inverse-Link",
@@ -189,6 +220,7 @@ impl LikelihoodFamily {
             Self::BinomialLogit
                 | Self::BinomialProbit
                 | Self::BinomialCLogLog
+                | Self::BinomialLatentCLogLog
                 | Self::BinomialSas
                 | Self::BinomialBetaLogistic
                 | Self::BinomialMixture
@@ -203,6 +235,7 @@ impl LikelihoodFamily {
             Self::BinomialLogit
             | Self::BinomialProbit
             | Self::BinomialCLogLog
+            | Self::BinomialLatentCLogLog
             | Self::BinomialSas
             | Self::BinomialBetaLogistic
             | Self::BinomialMixture
@@ -335,7 +368,9 @@ impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
             LikelihoodFamily::GaussianIdentity => Ok(Self::GaussianIdentity),
             LikelihoodFamily::BinomialLogit => Ok(Self::BinomialLogit),
             LikelihoodFamily::BinomialProbit => Ok(Self::BinomialProbit),
-            LikelihoodFamily::BinomialCLogLog => Ok(Self::BinomialCLogLog),
+            LikelihoodFamily::BinomialCLogLog | LikelihoodFamily::BinomialLatentCLogLog => {
+                Ok(Self::BinomialCLogLog)
+            }
             LikelihoodFamily::BinomialSas => Ok(Self::BinomialSas),
             LikelihoodFamily::BinomialBetaLogistic => Ok(Self::BinomialBetaLogistic),
             LikelihoodFamily::BinomialMixture => Ok(Self::BinomialMixture),

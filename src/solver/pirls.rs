@@ -11,8 +11,7 @@ use crate::linalg::sparse_exact::{
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
 use crate::mixture_link::{
-    InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
-    logit_inverse_link_jet5,
+    InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5,
 };
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
@@ -1602,7 +1601,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     )?;
                 }
             }
-            InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => {
+            InverseLink::LatentCLogLog(_) | InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => {
                 if let Some(integ) = integrated {
                     update_glmvectors_integrated_for_link(
                         integ.quadctx,
@@ -5512,12 +5511,7 @@ fn standard_inverse_link_jet(
     inverse_link: &InverseLink,
     eta: f64,
 ) -> Result<MixtureInverseLinkJet, EstimationError> {
-    inverse_link_jet_for_link_function(
-        inverse_link.link_function(),
-        eta,
-        inverse_link.mixture_state(),
-        inverse_link.sas_state(),
-    )
+    crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta)
 }
 
 #[inline]
@@ -5958,6 +5952,7 @@ pub fn update_glmvectors_integrated_for_link(
         InverseLink::Standard(LinkFunction::Logit)
             | InverseLink::Standard(LinkFunction::Probit)
             | InverseLink::Standard(LinkFunction::CLogLog)
+            | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
@@ -5971,14 +5966,22 @@ pub fn update_glmvectors_integrated_for_link(
     let zero_on_nonsmooth = matches!(link, LinkFunction::Logit) && logit_clampzero_enabled();
     let mut derivatives = derivatives;
     for i in 0..n {
-        let jet = crate::quadrature::integrated_inverse_link_jetwith_state(
-            quadctx,
-            link,
-            eta[i],
-            se[i],
-            inverse_link.mixture_state(),
-            inverse_link.sas_state(),
-        )?;
+        let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
+            crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet(
+                quadctx,
+                eta[i],
+                se[i].hypot(state.latent_sd),
+            )?
+        } else {
+            crate::quadrature::integrated_inverse_link_jetwith_state(
+                quadctx,
+                link,
+                eta[i],
+                se[i],
+                inverse_link.mixture_state(),
+                inverse_link.sas_state(),
+            )?
+        };
         let local_jet = MixtureInverseLinkJet {
             mu: jet.mean,
             d1: jet.d1,
@@ -6309,6 +6312,7 @@ fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
         | InverseLink::Standard(LinkFunction::CLogLog)
         | InverseLink::Standard(LinkFunction::Sas)
         | InverseLink::Standard(LinkFunction::BetaLogistic)
+        | InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
         | InverseLink::Mixture(_) => WeightLink::Other,

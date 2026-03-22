@@ -34,7 +34,9 @@ use crate::smooth::{
     AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
     TermCollectionSpec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec};
+use crate::types::{
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::HashMap;
 
@@ -93,7 +95,7 @@ pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> b
     match link {
         InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => true,
         InverseLink::Mixture(state) => !state.rho.is_empty(),
-        InverseLink::Standard(_) => false,
+        InverseLink::LatentCLogLog(_) | InverseLink::Standard(_) => false,
     }
 }
 
@@ -190,6 +192,7 @@ fn resolved_wiggle_inverse_link(
     let resolved = match fit.fitted_link_state(family).map_err(|e| e.to_string())? {
         FittedLinkState::Standard(Some(link)) => InverseLink::Standard(link),
         FittedLinkState::Standard(None) => fallback.clone(),
+        FittedLinkState::LatentCLogLog { state } => InverseLink::LatentCLogLog(state),
         FittedLinkState::Sas { state, .. } => InverseLink::Sas(state),
         FittedLinkState::BetaLogistic { state, .. } => InverseLink::BetaLogistic(state),
         FittedLinkState::Mixture { state, .. } => InverseLink::Mixture(state),
@@ -202,6 +205,7 @@ fn ensure_joint_wiggle_supported(link: &InverseLink, context: &str) -> Result<()
     match link {
         InverseLink::Standard(crate::types::LinkFunction::Sas)
         | InverseLink::Standard(crate::types::LinkFunction::BetaLogistic)
+        | InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
         | InverseLink::Mixture(_) => Err(format!(
@@ -799,6 +803,8 @@ pub struct FitConfig {
     pub offset_column: Option<String>,
     /// Optional additive offset column for the noise/log-scale predictor.
     pub noise_offset_column: Option<String>,
+    /// Fixed latent Gaussian standard deviation for `latent-cloglog-binomial`.
+    pub latent_sd: Option<f64>,
 
     // Survival-specific
     /// Baseline target: "linear", "weibull", "gompertz", "gompertz-makeham".
@@ -846,6 +852,7 @@ impl Default for FitConfig {
             flexible_link: false,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
             baseline_target: "linear".into(),
             baseline_scale: None,
             baseline_shape: None,
@@ -927,6 +934,7 @@ pub fn resolve_family(
         "binomial" | "binomial-logit" => Some(LikelihoodFamily::BinomialLogit),
         "binomial-probit" => Some(LikelihoodFamily::BinomialProbit),
         "binomial-cloglog" => Some(LikelihoodFamily::BinomialCLogLog),
+        "latent-cloglog-binomial" => Some(LikelihoodFamily::BinomialLatentCLogLog),
         "poisson" => Some(LikelihoodFamily::PoissonLog),
         "gamma" => Some(LikelihoodFamily::GammaLog),
         _ => None,
@@ -1069,7 +1077,21 @@ fn materialize_standard<'a>(
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
+    let latent_cloglog = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+        Some(
+            LatentCLogLogState::new(config.latent_sd.ok_or_else(|| {
+                "latent-cloglog-binomial requires config.latent_sd".to_string()
+            })?)
+            .map_err(|e| format!("invalid latent_cloglog state: {e}"))?,
+        )
+    } else {
+        if config.latent_sd.is_some() {
+            return Err("latent_sd is only supported with family='latent-cloglog-binomial'".to_string());
+        }
+        None
+    };
     let options = FitOptions {
+        latent_cloglog,
         mixture_link: None,
         optimize_mixture: false,
         sas_link: None,
@@ -1094,7 +1116,13 @@ fn materialize_standard<'a>(
         let link_kind = link_choice
             .as_ref()
             .map(|c| InverseLink::Standard(c.link))
-            .unwrap_or(InverseLink::Standard(LinkFunction::Logit));
+            .unwrap_or_else(|| {
+                if let Some(state) = latent_cloglog {
+                    InverseLink::LatentCLogLog(state)
+                } else {
+                    InverseLink::Standard(LinkFunction::Logit)
+                }
+            });
         Some(StandardBinomialWiggleConfig {
             link_kind,
             wiggle: LinkWiggleConfig {

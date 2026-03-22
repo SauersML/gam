@@ -1579,6 +1579,16 @@ fn lognormal_laplace_term_controlled(
 }
 
 #[inline]
+pub(crate) fn lognormal_laplace_term_shared(
+    ctx: &QuadratureContext,
+    z: f64,
+    mu: f64,
+    sigma: f64,
+) -> (f64, IntegratedExpectationMode) {
+    lognormal_laplace_term_controlled(ctx, z, mu, sigma)
+}
+
+#[inline]
 fn cloglog_survivalsecond_moment_controlled(
     ctx: &QuadratureContext,
     mu: f64,
@@ -2350,12 +2360,9 @@ pub fn integrated_inverse_link_jet(
             |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
             |x| component_point_jet(LinkComponent::Logit, x),
         ),
-        LinkFunction::CLogLog => integrate_inverse_link_jet_from_scalar_backend(
-            mu,
-            sigma,
-            |m, s| Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, m, s)),
-            |x| component_point_jet(LinkComponent::CLogLog, x),
-        ),
+        LinkFunction::CLogLog => {
+            crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet(quadctx, mu, sigma)
+        }
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
         )),
@@ -2422,13 +2429,10 @@ fn integrated_mixture_component_jet(
         )
         .unwrap_or_else(|_| integrated_logit_jet_ghq(ctx, mu, sigma)),
         LinkComponent::Probit => integrated_probit_jet(mu, sigma),
-        LinkComponent::CLogLog => integrate_inverse_link_jet_from_scalar_backend(
-            mu,
-            sigma,
-            |m, s| Ok(cloglog_posterior_meanwith_deriv_controlled(ctx, m, s)),
-            |x| component_point_jet(LinkComponent::CLogLog, x),
-        )
-        .unwrap_or_else(|_| integrated_cloglog_jet_ghq(ctx, mu, sigma)),
+        LinkComponent::CLogLog => {
+            crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet(ctx, mu, sigma)
+                .unwrap_or_else(|_| integrated_cloglog_jet_ghq(ctx, mu, sigma))
+        }
         LinkComponent::LogLog | LinkComponent::Cauchit => {
             let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
                 component_point_jet(component, x)
@@ -2658,6 +2662,10 @@ pub fn integrated_family_moments_jetwith_state(
                 mode: jet.mode,
             })
         }
+        LikelihoodFamily::BinomialLatentCLogLog => Err(EstimationError::InvalidInput(
+            "BinomialLatentCLogLog integrated moments require an explicit latent cloglog inverse-link state"
+                .to_string(),
+        )),
         LikelihoodFamily::BinomialSas => {
             let jet = integrated_inverse_link_jetwith_state(
                 quadctx,

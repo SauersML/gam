@@ -4051,7 +4051,10 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
         InverseLink::Standard(LinkFunction::Log) => {
             panic!("state-less log inverse link is invalid for survival prediction")
         }
-        InverseLink::Sas(_) | InverseLink::BetaLogistic(_) | InverseLink::Mixture(_) => {
+        InverseLink::LatentCLogLog(_)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => {
             inverse_link_survival_prob_checked(inverse_link, eta)
                 .expect("validated inverse link should evaluate during prediction")
         }
