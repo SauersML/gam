@@ -181,6 +181,65 @@ fn safe_product3(a: f64, b: f64, c: f64) -> f64 {
     safe_product(safe_product(factors[0], factors[1]), factors[2])
 }
 
+fn safe_hadamard_product(lhs: &Array1<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
+    if lhs.len() != rhs.len() {
+        return Err(format!(
+            "safe_hadamard_product length mismatch: lhs has {}, rhs has {}",
+            lhs.len(),
+            rhs.len()
+        ));
+    }
+    let out = Array1::from_shape_fn(lhs.len(), |i| safe_product(lhs[i], rhs[i]));
+    if out.iter().any(|value| value.is_nan()) {
+        return Err("safe_hadamard_product produced NaN values".to_string());
+    }
+    Ok(out)
+}
+
+fn safe_linear_combo2_arrays(
+    a: &Array1<f64>,
+    b: &Array1<f64>,
+    c: &Array1<f64>,
+    d: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    if a.len() != b.len() || a.len() != c.len() || a.len() != d.len() {
+        return Err(format!(
+            "safe_linear_combo2_arrays length mismatch: a={}, b={}, c={}, d={}",
+            a.len(),
+            b.len(),
+            c.len(),
+            d.len()
+        ));
+    }
+    let out = Array1::from_shape_fn(a.len(), |i| {
+        safe_sum2(safe_product(a[i], b[i]), safe_product(c[i], d[i]))
+    });
+    if out.iter().any(|value| value.is_nan()) {
+        return Err("safe_linear_combo2_arrays produced NaN values".to_string());
+    }
+    Ok(out)
+}
+
+fn sanitize_survival_weight_vector(weights: &Array1<f64>) -> Array1<f64> {
+    Array1::from_shape_fn(weights.len(), |i| {
+        let value = weights[i];
+        if value.is_finite() {
+            value
+        } else if value == f64::INFINITY {
+            f64::MAX
+        } else if value == f64::NEG_INFINITY {
+            f64::MIN
+        } else {
+            0.0
+        }
+    })
+}
+
+fn safe_fast_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
+    let sanitized = sanitize_survival_weight_vector(weights);
+    fast_xt_diag_x(x, &sanitized)
+}
+
 /// Layer 2 defense: compute q0 = -eta_t * exp(-eta_ls) with log-space
 /// overflow detection.  When log|q0| = ln|eta_t| + (-eta_ls) exceeds the
 /// clamp ceiling, the product would overflow; we saturate to ±MAX instead.
@@ -3994,17 +4053,15 @@ fn weighted_crossprod_dense(
             right.ncols()
         ));
     }
-    if left.iter().any(|value| !value.is_finite())
-        || weights.iter().any(|value| !value.is_finite())
-        || right.iter().any(|value| !value.is_finite())
-    {
-        return Err("weighted_crossprod_dense inputs contain non-finite values".to_string());
+    if left.iter().any(|value| !value.is_finite()) || right.iter().any(|value| !value.is_finite()) {
+        return Err("weighted_crossprod_dense inputs contain non-finite design values".to_string());
     }
 
+    let sanitized_weights = sanitize_survival_weight_vector(weights);
     let mut weighted_right = right.clone();
     let mut fast_path_ok = true;
     'outer: for i in 0..weighted_right.nrows() {
-        let wi = weights[i];
+        let wi = sanitized_weights[i];
         if wi == 0.0 {
             weighted_right.row_mut(i).fill(0.0);
             continue;
@@ -4028,7 +4085,7 @@ fn weighted_crossprod_dense(
         }
     }
 
-    weighted_crossprod_dense_stable(left, weights, right)
+    weighted_crossprod_dense_stable(left, &sanitized_weights, right)
 }
 
 fn scale_dense_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -4039,9 +4096,14 @@ fn scale_dense_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f6
             coeffs.len()
         ));
     }
-    Ok(Array2::from_shape_fn(mat.dim(), |(i, j)| {
-        mat[[i, j]] * coeffs[i]
-    }))
+    let sanitized_coeffs = sanitize_survival_weight_vector(coeffs);
+    let out = Array2::from_shape_fn(mat.dim(), |(i, j)| {
+        safe_product(mat[[i, j]], sanitized_coeffs[i])
+    });
+    if out.iter().any(|value| value.is_nan()) {
+        return Err("row scaling produced NaN values".to_string());
+    }
+    Ok(out)
 }
 
 fn embed_tail_columns(
@@ -4533,9 +4595,10 @@ impl SurvivalLocationScaleFamily {
             hdot_exit = &wig_exit.dq_dq0 * &d_base;
             time_jac_entry = scale_dense_rows(self.x_time_entry.as_ref(), &wig_entry.dq_dq0)?;
             time_jac_exit = scale_dense_rows(self.x_time_exit.as_ref(), &wig_exit.dq_dq0)?;
-            time_jac_deriv =
-                scale_dense_rows(self.x_time_exit.as_ref(), &(&wig_exit.d2q_dq02 * &d_base))?
-                    + &scale_dense_rows(self.x_time_deriv.as_ref(), &wig_exit.dq_dq0)?;
+            time_jac_deriv = scale_dense_rows(
+                self.x_time_exit.as_ref(),
+                &safe_hadamard_product(&wig_exit.d2q_dq02, &d_base)?,
+            )? + &scale_dense_rows(self.x_time_deriv.as_ref(), &wig_exit.dq_dq0)?;
             time_jac_entry
                 .slice_mut(s![.., time_wiggle_range.start..time_wiggle_range.end])
                 .assign(&wig_entry.basis);
@@ -4958,9 +5021,9 @@ impl SurvivalLocationScaleFamily {
             Ok(())
         };
 
-        let h_time = fast_xt_diag_x(&dynamic.time_jac_entry, &(-&q.h_time_h0))
-            + fast_xt_diag_x(&dynamic.time_jac_exit, &(-&q.h_time_h1))
-            + fast_xt_diag_x(&dynamic.time_jac_deriv, &q.h_time_d);
+        let h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&q.h_time_h0))
+            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&q.h_time_h1))
+            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &q.h_time_d);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &h_time);
 
         if let Some(x_t_deriv) = x_threshold_deriv {
@@ -5118,24 +5181,38 @@ impl SurvivalLocationScaleFamily {
             let q0_ls_exit = Array1::from_iter(
                 (0..self.n).map(|i| q_chain_derivs_scalar(eta_t_exit[i], dynamic.eta_ls_exit[i]).1),
             );
-            let r_base_exit = &q0_t_exit * &eta_t_deriv_exit + &q0_ls_exit * &eta_ls_deriv_exit;
+            let r_base_exit = safe_linear_combo2_arrays(
+                &q0_t_exit,
+                &eta_t_deriv_exit,
+                &q0_ls_exit,
+                &eta_ls_deriv_exit,
+            )?;
             let r_t_base_exit = Array1::from_iter((0..self.n).map(|i| {
-                q_chain_derivs_scalar(eta_t_exit[i], dynamic.eta_ls_exit[i]).2
-                    * eta_ls_deriv_exit[i]
+                safe_product(
+                    q_chain_derivs_scalar(eta_t_exit[i], dynamic.eta_ls_exit[i]).2,
+                    eta_ls_deriv_exit[i],
+                )
             }));
             let r_ls_base_exit = Array1::from_iter((0..self.n).map(|i| {
                 let (_, _, q_tl, q_ll, _, _) =
                     q_chain_derivs_scalar(eta_t_exit[i], dynamic.eta_ls_exit[i]);
-                q_tl * eta_t_deriv_exit[i] + q_ll * eta_ls_deriv_exit[i]
+                safe_sum2(
+                    safe_product(q_tl, eta_t_deriv_exit[i]),
+                    safe_product(q_ll, eta_ls_deriv_exit[i]),
+                )
             }));
             let tw_entry_d2 = scale_dense_rows(xw_d1_entry, &q0_t_entry)?;
             let tw_exit_d2 = scale_dense_rows(xw_d1_exit, &q0_t_exit)?;
             let lw_entry_d2 = scale_dense_rows(xw_d1_entry, &q0_ls_entry)?;
             let lw_exit_d2 = scale_dense_rows(xw_d1_exit, &q0_ls_exit)?;
-            let qdot_t_w = scale_dense_rows(xw_d2_exit, &(&q0_t_exit * &r_base_exit))?
-                + scale_dense_rows(xw_d1_exit, &r_t_base_exit)?;
-            let qdot_ls_w = scale_dense_rows(xw_d2_exit, &(&q0_ls_exit * &r_base_exit))?
-                + scale_dense_rows(xw_d1_exit, &r_ls_base_exit)?;
+            let qdot_t_w = scale_dense_rows(
+                xw_d2_exit,
+                &safe_hadamard_product(&q0_t_exit, &r_base_exit)?,
+            )? + scale_dense_rows(xw_d1_exit, &r_t_base_exit)?;
+            let qdot_ls_w = scale_dense_rows(
+                xw_d2_exit,
+                &safe_hadamard_product(&q0_ls_exit, &r_base_exit)?,
+            )? + scale_dense_rows(xw_d1_exit, &r_ls_base_exit)?;
             let qdot_td_w = scale_dense_rows(xw_d1_exit, &q0_t_exit)?;
             let qdot_lsd_w = scale_dense_rows(xw_d1_exit, &q0_ls_exit)?;
 
@@ -5515,10 +5592,10 @@ impl SurvivalLocationScaleFamily {
         }
 
         let mut hessian_psi_psi = Array2::<f64>::zeros((p_total, p_total));
-        let h_time_time = fast_xt_diag_x(
+        let h_time_time = safe_fast_xt_diag_x(
             &self.x_time_entry,
             &(-(&q.d3_q0 * &q0_ab) - &(&q.d2_h_h0 * &(&q0_i * &q0_j))),
-        ) + fast_xt_diag_x(
+        ) + safe_fast_xt_diag_x(
             &self.x_time_exit,
             &(-(&q.d3_q1 * &q1_ab) - &(&q.d2_h_h1 * &(&q1_i * &q1_j))),
         );
@@ -6117,10 +6194,10 @@ impl SurvivalLocationScaleFamily {
             + &(&q.dq_ls * &z_ls_exit_psi_u);
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
-        let time_time = fast_xt_diag_x(
+        let time_time = safe_fast_xt_diag_x(
             &self.x_time_entry,
             &(-(&q.d2_h_h0 * &entry_deltas.delta_q * q0_psi) - &(&q.d3_q0 * &q0_psi_u)),
-        ) + fast_xt_diag_x(
+        ) + safe_fast_xt_diag_x(
             &self.x_time_exit,
             &(-(&q.d2_h_h1 * &delta_q_exit * q1_psi) - &(&q.d3_q1 * &q1_psi_u)),
         );
@@ -6845,9 +6922,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let dh_h0 = &q.d_h_h0 * &(&delta_h0 + &entry_deltas.delta_q);
         let dh_h1 = &q.d_h_h1 * &(&delta_h1 + &delta_q_exit);
         let dh_d = &q.d_h_d * &delta_d;
-        let d_h_time = fast_xt_diag_x(&dynamic.time_jac_entry, &dh_h0)
-            + fast_xt_diag_x(&dynamic.time_jac_exit, &dh_h1)
-            + fast_xt_diag_x(&dynamic.time_jac_deriv, &dh_d);
+        let d_h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &dh_h0)
+            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &dh_h1)
+            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &dh_d);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d_h_time);
 
         // Threshold-threshold D_u H.
@@ -7199,8 +7276,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 .assign(&wiggle_score);
         }
 
-        let h_time_time = fast_xt_diag_x(&dynamic.time_jac_entry, &(-&q.d3_q0 * &q0_psi))
-            + fast_xt_diag_x(&dynamic.time_jac_exit, &(-&q.d3_q1 * &q1_psi));
+        let h_time_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&q.d3_q0 * &q0_psi))
+            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&q.d3_q1 * &q1_psi));
 
         let h_tt_entry = -(&q.d2_q0 * &dq_t_entry.mapv(|v| v * v));
         let h_tt_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| v * v));
@@ -7967,9 +8044,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d2h_h0 = &q.d2_h_h0 * &(&xi_h0_u * &xi_h0_v);
         let d2h_h1 = &q.d2_h_h1 * &(&xi_h1_u * &xi_h1_v);
         let d2h_d = &q.d_h_d * &(&delta_d_u * &delta_d_v);
-        let d2_h_time = fast_xt_diag_x(&dynamic.time_jac_entry, &d2h_h0)
-            + fast_xt_diag_x(&dynamic.time_jac_exit, &d2h_h1)
-            + fast_xt_diag_x(&dynamic.time_jac_deriv, &d2h_d);
+        let d2_h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &d2h_h0)
+            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &d2h_h1)
+            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &d2h_d);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d2_h_time);
 
         // --- Threshold-threshold D²H[u,v] ---
@@ -9804,6 +9881,19 @@ mod tests {
             "unexpected weighted cross-product: {}",
             cross[[0, 0]]
         );
+    }
+
+    #[test]
+    fn scale_dense_rows_saturates_without_nan_when_coefficients_are_huge() {
+        let mat = array![[1.0e200], [2.0e-200]];
+        let coeffs = array![1.0e200, 1.0e200];
+
+        let scaled = scale_dense_rows(&mat, &coeffs)
+            .expect("row scaling should saturate overflow instead of producing NaN");
+
+        assert!(scaled.iter().all(|value| value.is_finite()));
+        assert!(scaled[[0, 0]] > 1.0e300);
+        assert!((scaled[[1, 0]] - 2.0).abs() <= 1e-12);
     }
 
     #[test]

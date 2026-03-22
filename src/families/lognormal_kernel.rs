@@ -813,7 +813,7 @@ impl BinaryCloglogRowJet {
 
         // Second derivative:
         // d²ℓ/dμ² = w·p'' + dw/dμ·p'
-        // where dw/dμ = −y·(p')²/p² − (1−y)·(p')²/q²
+        // where dw/dμ = −y·p'/p² − (1−y)·p'/q²
         let dw = -y * dp / (p * p) - (1.0 - y) * dp / (q * q);
         let d2_ll = w * ddp + dw * dp;
 

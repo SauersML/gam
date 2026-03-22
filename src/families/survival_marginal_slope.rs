@@ -99,7 +99,7 @@ struct SurvivalMarginalSlopeFamily {
     event: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
     z: Arc<Array1<f64>>,
-    frailty: FrailtySpec,
+    gaussian_frailty_sd: Option<f64>,
     derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
     /// Stored as DesignMatrix to support sparse local-support bases at
@@ -231,12 +231,16 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
-fn probit_frailty_scale(frailty: &FrailtySpec) -> f64 {
-    let sigma = match frailty {
-        FrailtySpec::None => 0.0,
-        FrailtySpec::GaussianShift { sigma_fixed } => sigma_fixed.unwrap_or(0.0),
-        FrailtySpec::HazardMultiplier { .. } => 0.0,
-    };
+fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
+    match frailty {
+        FrailtySpec::None => None,
+        FrailtySpec::GaussianShift { sigma_fixed } => *sigma_fixed,
+        FrailtySpec::HazardMultiplier { .. } => None,
+    }
+}
+
+fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
+    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
     1.0 / (1.0 + sigma * sigma).sqrt()
 }
 
@@ -1179,7 +1183,7 @@ struct EvalCache {
 impl SurvivalMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
-        probit_frailty_scale(&self.frailty)
+        probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
     fn flex_timewiggle_active(&self) -> bool {
@@ -1410,7 +1414,7 @@ impl SurvivalMarginalSlopeFamily {
     fn flex_active(&self) -> bool {
         self.score_warp.is_some()
             || self.link_dev.is_some()
-            || self.frailty.is_active()
+            || self.gaussian_frailty_sd.unwrap_or(0.0) > 0.0
     }
 
     fn flex_score_beta<'a>(
@@ -5642,7 +5646,7 @@ pub fn fit_survival_marginal_slope_terms(
             event: Arc::clone(&event),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
-            frailty: spec.frailty.clone(),
+            gaussian_frailty_sd: fixed_gaussian_shift_sigma(&spec.frailty),
             derivative_guard,
             design_entry: design_entry.clone(),
             design_exit: design_exit.clone(),
@@ -5972,6 +5976,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
             design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -6000,6 +6005,7 @@ mod tests {
             z: array![-1.0, 1.0],
             marginalspec: empty_termspec(),
             marginal_offset: Array1::zeros(2),
+            frailty: FrailtySpec::None,
             derivative_guard: 1e-4,
             time_block: TimeBlockInput {
                 design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
@@ -6064,6 +6070,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.7]),
             z: Arc::new(array![0.25]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
             design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -6133,6 +6140,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![0.9]),
             z: Arc::new(array![-0.35]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
             design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -6210,6 +6218,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-4,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 1)),
@@ -6274,6 +6283,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.2]),
             z: Arc::new(array![0.3]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0
@@ -6349,6 +6359,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-4,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 0.0
@@ -6404,6 +6415,7 @@ mod tests {
             event: Arc::new(array![0.0, 1.0]),
             weights: Arc::new(array![1.0, 1.0]),
             z: Arc::new(array![0.0, 0.0]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-4,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((2, 2)),
@@ -6462,6 +6474,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0, 0.0
@@ -6523,6 +6536,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-4,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 0.0, 0.0
@@ -6596,6 +6610,7 @@ mod tests {
             event: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 0.8]),
             z: Arc::new(array![0.1, -0.2]),
+            gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.6]])),
             design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.9], [0.5]])),

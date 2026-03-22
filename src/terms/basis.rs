@@ -9636,17 +9636,44 @@ fn duchon_radial_jets(
             duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 15.0;
 
         let r2 = r * r;
-        out.phi_r = phi_rr * r + 0.5 * t_collision * r * r2;
-        out.phi_rr = phi_rr + 1.5 * t_collision * r2;
-        out.q = phi_rr + 0.5 * t_collision * r2;
-        out.lap = k_dim as f64 * phi_rr + 0.5 * (k_dim as f64 + 2.0) * t_collision * r2;
-        out.q_r = t_collision * r;
-        out.q_rr = t_collision;
-        out.lap_r = (k_dim as f64 + 2.0) * t_collision * r;
-        out.lap_rr = (k_dim as f64 + 2.0) * t_collision;
+        let r3 = r2 * r;
+        let r4 = r2 * r2;
+        let r5 = r4 * r;
+        let d = k_dim as f64;
+
+        // Consistent even-power Taylor expansions near r=0:
+        //
+        //   phi(r) = a0 + a2 r^2 + a4 r^4 + a6 r^6 + ...
+        //   phi_rr(0) = 2 a2
+        //   t(0)      = phi''''(0) / 3  = 8 a4
+        //   t_rr(0)   = phi''''''(0) / 15 = 48 a6
+        //
+        // which imply
+        //
+        //   phi_r  = phi_rr(0) r + 0.5 t(0) r^3 + (1/8) t_rr(0) r^5 + ...
+        //   phi_rr = phi_rr(0) + 1.5 t(0) r^2 + (5/8) t_rr(0) r^4 + ...
+        //   q      = phi_r / r = phi_rr(0) + 0.5 t(0) r^2 + (1/8) t_rr(0) r^4 + ...
+        //   q_r    = t(0) r + 0.5 t_rr(0) r^3 + ...
+        //   q_rr   = t(0) + 1.5 t_rr(0) r^2 + ...
+        //   lap    = d q + r^2 t
+        //          = d phi_rr(0)
+        //            + 0.5 (d + 2) t(0) r^2
+        //            + (1/8) (d + 4) t_rr(0) r^4 + ...
+        //   lap_r  = (d + 2) t(0) r + 0.5 (d + 4) t_rr(0) r^3 + ...
+        //   lap_rr = (d + 2) t(0) + 1.5 (d + 4) t_rr(0) r^2 + ...
+        out.phi_r = phi_rr * r + 0.5 * t_collision * r3 + 0.125 * t_rr_collision * r5;
+        out.phi_rr = phi_rr + 1.5 * t_collision * r2 + 0.625 * t_rr_collision * r4;
+        out.q = phi_rr + 0.5 * t_collision * r2 + 0.125 * t_rr_collision * r4;
+        out.q_r = t_collision * r + 0.5 * t_rr_collision * r3;
+        out.q_rr = t_collision + 1.5 * t_rr_collision * r2;
         out.t = t_collision + 0.5 * t_rr_collision * r2;
         out.t_r = t_rr_collision * r;
         out.t_rr = t_rr_collision;
+        out.lap = d * phi_rr
+            + 0.5 * (d + 2.0) * t_collision * r2
+            + 0.125 * (d + 4.0) * t_rr_collision * r4;
+        out.lap_r = (d + 2.0) * t_collision * r + 0.5 * (d + 4.0) * t_rr_collision * r3;
+        out.lap_rr = (d + 2.0) * t_collision + 1.5 * (d + 4.0) * t_rr_collision * r2;
     }
     if !out.phi_r.is_finite()
         || !out.phi_rr.is_finite()

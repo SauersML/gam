@@ -121,7 +121,7 @@ struct BernoulliMarginalSlopeFamily {
     y: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
     z: Arc<Array1<f64>>,
-    frailty: FrailtySpec,
+    gaussian_frailty_sd: Option<f64>,
     marginal_design: DesignMatrix,
     logslope_design: DesignMatrix,
     score_warp: Option<DeviationRuntime>,
@@ -1576,12 +1576,16 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
-fn probit_frailty_scale(frailty: &FrailtySpec) -> f64 {
-    let sigma = match frailty {
-        FrailtySpec::None => 0.0,
-        FrailtySpec::GaussianShift { sigma_fixed } => sigma_fixed.unwrap_or(0.0),
-        FrailtySpec::HazardMultiplier { .. } => 0.0,
-    };
+fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
+    match frailty {
+        FrailtySpec::None => None,
+        FrailtySpec::GaussianShift { sigma_fixed } => *sigma_fixed,
+        FrailtySpec::HazardMultiplier { .. } => None,
+    }
+}
+
+fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
+    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
     1.0 / (1.0 + sigma * sigma).sqrt()
 }
 
@@ -1920,7 +1924,7 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
 impl BernoulliMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
-        probit_frailty_scale(&self.frailty)
+        probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
     fn flex_score_beta<'a>(
@@ -2059,7 +2063,7 @@ impl BernoulliMarginalSlopeFamily {
     fn flex_active(&self) -> bool {
         self.score_warp.is_some()
             || self.link_dev.is_some()
-            || self.frailty.is_active()
+            || self.gaussian_frailty_sd.unwrap_or(0.0) > 0.0
     }
 
     fn validate_exact_monotonicity(
@@ -7230,7 +7234,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
-            frailty: spec.frailty.clone(),
+            gaussian_frailty_sd: fixed_gaussian_shift_sigma(&spec.frailty),
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
             score_warp: score_warp_runtime.clone(),
