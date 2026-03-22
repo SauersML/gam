@@ -114,6 +114,8 @@ pub struct SurvivalMarginalSlopeFitRequest<'a> {
 pub struct TransformationNormalFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub response: Array1<f64>,
+    pub weights: Array1<f64>,
+    pub offset: Array1<f64>,
     pub covariate_spec: TermCollectionSpec,
     pub config: TransformationNormalConfig,
     pub options: BlockwiseFitOptions,
@@ -287,6 +289,8 @@ fn fit_gaussian_location_scale_model(
                 weights: request.spec.weights.clone(),
                 meanspec: request.spec.meanspec.clone(),
                 log_sigmaspec: request.spec.log_sigmaspec.clone(),
+                mean_offset: request.spec.mean_offset.clone(),
+                log_sigma_offset: request.spec.log_sigma_offset.clone(),
             },
             &request.options,
             &request.kappa_options,
@@ -354,6 +358,8 @@ fn fit_binomial_location_scale_model(
                 link_kind: request.spec.link_kind.clone(),
                 thresholdspec: request.spec.thresholdspec.clone(),
                 log_sigmaspec: request.spec.log_sigmaspec.clone(),
+                threshold_offset: request.spec.threshold_offset.clone(),
+                log_sigma_offset: request.spec.log_sigma_offset.clone(),
             },
             &request.options,
             &request.kappa_options,
@@ -722,6 +728,8 @@ fn fit_transformation_normal_model(
 ) -> Result<TransformationNormalFitResult, String> {
     fit_transformation_normal(
         &request.response,
+        &request.weights,
+        &request.offset,
         request.data,
         &request.covariate_spec,
         &request.config,
@@ -787,6 +795,10 @@ pub struct FitConfig {
     pub link: Option<String>,
     /// Whether to use flexible (wiggle-augmented) link.
     pub flexible_link: bool,
+    /// Optional additive offset column for the primary linear predictor.
+    pub offset_column: Option<String>,
+    /// Optional additive offset column for the noise/log-scale predictor.
+    pub noise_offset_column: Option<String>,
 
     // Survival-specific
     /// Baseline target: "linear", "weibull", "gompertz", "gompertz-makeham".
@@ -818,6 +830,8 @@ pub struct FitConfig {
     pub logslope_formula: Option<String>,
     /// Column name for the z (exposure/dose) variable in marginal-slope models.
     pub z_column: Option<String>,
+    /// Optional non-negative per-row training weights column.
+    pub weight_column: Option<String>,
 
     // Fitting options
     pub scale_dimensions: bool,
@@ -830,6 +844,8 @@ impl Default for FitConfig {
             family: None,
             link: None,
             flexible_link: false,
+            offset_column: None,
+            noise_offset_column: None,
             baseline_target: "linear".into(),
             baseline_scale: None,
             baseline_shape: None,
@@ -848,6 +864,7 @@ impl Default for FitConfig {
             noise_formula: None,
             logslope_formula: None,
             z_column: None,
+            weight_column: None,
             scale_dimensions: false,
             ridge_lambda: 1e-6,
         }
@@ -972,12 +989,67 @@ fn build_col_map(data: &Dataset) -> HashMap<String, usize> {
         .collect()
 }
 
+fn resolve_continuous_column(
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+    column_name: &str,
+    role: &str,
+) -> Result<Array1<f64>, String> {
+    let col_idx = *col_map
+        .get(column_name)
+        .ok_or_else(|| format!("{role} column '{column_name}' not found"))?;
+    let values = data.values.column(col_idx).to_owned();
+    for (row_idx, value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!(
+                "{role} column '{column_name}' contains non-finite value at row {row_idx}: {value}"
+            ));
+        }
+    }
+    Ok(values)
+}
+
+pub fn resolve_offset_column(
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+    column_name: Option<&str>,
+) -> Result<Array1<f64>, String> {
+    let Some(column_name) = column_name else {
+        return Ok(Array1::zeros(data.values.nrows()));
+    };
+    resolve_continuous_column(data, col_map, column_name, "offset")
+}
+
+pub fn resolve_weight_column(
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+    column_name: Option<&str>,
+) -> Result<Array1<f64>, String> {
+    let Some(column_name) = column_name else {
+        return Ok(Array1::ones(data.values.nrows()));
+    };
+    let values = resolve_continuous_column(data, col_map, column_name, "weights")?;
+    for (row_idx, value) in values.iter().enumerate() {
+        if *value < 0.0 {
+            return Err(format!(
+                "weights column '{column_name}' must be non-negative; found {value} at row {row_idx}"
+            ));
+        }
+    }
+    Ok(values)
+}
+
 fn materialize_standard<'a>(
     parsed: &ParsedFormula,
     data: &'a Dataset,
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
+    if config.noise_offset_column.is_some() {
+        return Err(
+            "noise_offset_column requires a location-scale model with noise_formula".to_string(),
+        );
+    }
     let y_col = *col_map
         .get(&parsed.response)
         .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
@@ -995,9 +1067,8 @@ fn materialize_standard<'a>(
         enable_scale_dimensions(&mut spec);
     }
 
-    let n = data.values.nrows();
-    let weights = Array1::ones(n);
-    let offset = Array1::zeros(n);
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let options = FitOptions {
         mixture_link: None,
         optimize_mixture: false,
@@ -1251,6 +1322,10 @@ fn materialize_survival<'a>(
     };
 
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let threshold_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
+    let log_sigma_offset =
+        resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
 
     match survival_mode {
         SurvivalLikelihoodMode::LocationScale => {
@@ -1258,7 +1333,7 @@ fn materialize_survival<'a>(
                 age_entry: age_entry.clone(),
                 age_exit: age_exit.clone(),
                 event_target: event,
-                weights: Array1::ones(n),
+                weights: weights.clone(),
                 inverse_link: survival_inverse_link,
                 derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
                 max_iter: 200,
@@ -1266,6 +1341,8 @@ fn materialize_survival<'a>(
                 time_block,
                 thresholdspec: termspec,
                 log_sigmaspec,
+                threshold_offset,
+                log_sigma_offset,
                 threshold_template,
                 log_sigma_template,
                 timewiggle_block,
@@ -1316,13 +1393,17 @@ fn materialize_survival<'a>(
                 age_entry: age_entry.clone(),
                 age_exit: age_exit.clone(),
                 event_target: event,
-                weights: Array1::ones(n),
+                weights: weights.clone(),
                 z,
                 marginalspec,
+                marginal_offset: threshold_offset,
                 derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                 time_block,
                 timewiggle_block: None,
                 logslopespec,
+                logslope_offset: log_sigma_offset,
+                score_warp: None,
+                link_dev: None,
             };
 
             Ok(MaterializedModel {
@@ -1372,7 +1453,9 @@ fn materialize_location_scale<'a>(
         enable_scale_dimensions(&mut log_sigmaspec);
     }
 
-    let weights = Array1::ones(data.values.nrows());
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let mean_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
+    let noise_offset = resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
     let options = BlockwiseFitOptions::default();
 
@@ -1397,6 +1480,8 @@ fn materialize_location_scale<'a>(
                     link_kind,
                     thresholdspec: meanspec,
                     log_sigmaspec,
+                    threshold_offset: mean_offset,
+                    log_sigma_offset: noise_offset,
                 },
                 wiggle: wiggle_cfg,
                 options,
@@ -1413,6 +1498,8 @@ fn materialize_location_scale<'a>(
                     weights,
                     meanspec,
                     log_sigmaspec,
+                    mean_offset,
+                    log_sigma_offset: noise_offset,
                 },
                 wiggle: wiggle_cfg,
                 options,

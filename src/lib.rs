@@ -33,5 +33,5 @@ pub use solver::workflow::{
     StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
     SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult,
     SurvivalMarginalSlopeFitRequest, TransformationNormalFitRequest, fit_from_formula, fit_model,
-    is_binary_response, materialize, resolve_family,
+    is_binary_response, materialize, resolve_family, resolve_offset_column, resolve_weight_column,
 };

@@ -67,6 +67,10 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub formula_logslope: Option<String>,
     #[serde(default)]
+    pub offset_column: Option<String>,
+    #[serde(default)]
+    pub noise_offset_column: Option<String>,
+    #[serde(default)]
     pub beta_noise: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_projection: Option<Vec<Vec<f64>>>,
@@ -198,6 +202,8 @@ impl FittedModelPayload {
             sas_param_covariance: None,
             formula_noise: None,
             formula_logslope: None,
+            offset_column: None,
+            noise_offset_column: None,
             beta_noise: None,
             noise_projection: None,
             noise_center: None,
@@ -921,17 +927,18 @@ impl FittedModel {
     }
 
     pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, String> {
-        if self.predict_model_class() == PredictModelClass::BernoulliMarginalSlope {
+        if matches!(
+            self.predict_model_class(),
+            PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival
+        ) {
             if let Some(runtime) = self.payload().score_warp_runtime.as_ref() {
                 runtime.validate_kernel().map_err(|err| {
-                    format!("saved bernoulli marginal-slope score-warp runtime is invalid: {err}")
+                    format!("saved anchored score-warp runtime is invalid: {err}")
                 })?;
             }
             if let Some(runtime) = self.payload().link_deviation_runtime.as_ref() {
                 runtime.validate_kernel().map_err(|err| {
-                    format!(
-                        "saved bernoulli marginal-slope link-deviation runtime is invalid: {err}"
-                    )
+                    format!("saved anchored link-deviation runtime is invalid: {err}")
                 })?;
             }
         }

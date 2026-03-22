@@ -635,6 +635,8 @@ pub struct SurvivalLocationScaleTermSpec {
     pub time_block: TimeBlockInput,
     pub thresholdspec: TermCollectionSpec,
     pub log_sigmaspec: TermCollectionSpec,
+    pub threshold_offset: Array1<f64>,
+    pub log_sigma_offset: Array1<f64>,
     pub threshold_template: SurvivalCovariateTermBlockTemplate,
     pub log_sigma_template: SurvivalCovariateTermBlockTemplate,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
@@ -2839,6 +2841,7 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
 fn build_survival_covariate_block_from_design(
     cov_design: &TermCollectionDesign,
     template: &SurvivalCovariateTermBlockTemplate,
+    offset: &Array1<f64>,
     initial_log_lambdas: Option<Array1<f64>>,
     initial_beta: Option<Array1<f64>>,
 ) -> Result<CovariateBlockKind, String> {
@@ -2846,7 +2849,7 @@ fn build_survival_covariate_block_from_design(
         SurvivalCovariateTermBlockTemplate::Static => {
             Ok(CovariateBlockKind::Static(CovariateBlockInput {
                 design: cov_design.design.clone(),
-                offset: Array1::zeros(cov_design.design.nrows()),
+                offset: offset.clone(),
                 penalties: cov_design
                     .penalties
                     .iter()
@@ -2896,7 +2899,7 @@ fn build_survival_covariate_block_from_design(
                     penalties,
                     initial_log_lambdas,
                     initial_beta,
-                    offset: Array1::zeros(cov_design.design.nrows()),
+                    offset: offset.clone(),
                 },
             ))
         }
@@ -8401,6 +8404,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         let threshold_block = build_survival_covariate_block_from_design(
             threshold_design,
             &spec.threshold_template,
+            &spec.threshold_offset,
             Some(layout.threshold_from(rho)),
             filtered_initial_beta(
                 threshold_beta_hint.borrow().as_ref(),
@@ -8415,6 +8419,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         let log_sigma_block = build_survival_covariate_block_from_design(
             log_sigma_design,
             &spec.log_sigma_template,
+            &spec.log_sigma_offset,
             Some(layout.log_sigma_from(rho)),
             filtered_initial_beta(
                 log_sigma_beta_hint.borrow().as_ref(),

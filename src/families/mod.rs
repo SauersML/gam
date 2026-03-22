@@ -1,4 +1,5 @@
 pub mod bernoulli_marginal_slope;
+pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;

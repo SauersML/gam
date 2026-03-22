@@ -9,10 +9,12 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
+    DeviationBlockConfig, DeviationPrepared, DeviationRuntime, build_deviation_block_from_seed,
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
     unary_derivatives_sqrt,
 };
+use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::families::survival_location_scale::{
@@ -43,12 +45,16 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub weights: Array1<f64>,
     pub z: Array1<f64>,
     pub marginalspec: TermCollectionSpec,
+    pub marginal_offset: Array1<f64>,
     /// Strict lower bound on q'(t) used by both the likelihood domain and
     /// the monotonicity constraints.
     pub derivative_guard: f64,
     pub time_block: TimeBlockInput,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub logslopespec: TermCollectionSpec,
+    pub logslope_offset: Array1<f64>,
+    pub score_warp: Option<DeviationBlockConfig>,
+    pub link_dev: Option<DeviationBlockConfig>,
 }
 
 pub const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
@@ -61,6 +67,8 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub logslope_design: TermCollectionDesign,
     pub baseline_slope: f64,
     pub time_block_penalties_len: usize,
+    pub score_warp_runtime: Option<DeviationRuntime>,
+    pub link_dev_runtime: Option<DeviationRuntime>,
 }
 
 // ── Family struct ─────────────────────────────────────────────────────
@@ -92,10 +100,21 @@ struct SurvivalMarginalSlopeFamily {
     marginal_design: DesignMatrix,
     /// Log-slope block: standard single design.
     logslope_design: DesignMatrix,
+    score_warp: Option<DeviationRuntime>,
+    link_dev: Option<DeviationRuntime>,
     time_linear_constraints: Option<LinearInequalityConstraints>,
     time_wiggle_knots: Option<Array1<f64>>,
     time_wiggle_degree: Option<usize>,
     time_wiggle_ncols: usize,
+}
+
+#[derive(Clone, Default)]
+struct ThetaHints {
+    time_beta: Option<Array1<f64>>,
+    marginal_beta: Option<Array1<f64>>,
+    logslope_beta: Option<Array1<f64>>,
+    score_warp_beta: Option<Array1<f64>>,
+    link_dev_beta: Option<Array1<f64>>,
 }
 
 // ── Block layout ──────────────────────────────────────────────────────
@@ -105,18 +124,36 @@ struct BlockSlices {
     time: std::ops::Range<usize>,
     marginal: std::ops::Range<usize>,
     logslope: std::ops::Range<usize>,
+    score_warp: Option<std::ops::Range<usize>>,
+    link_dev: Option<std::ops::Range<usize>>,
     total: usize,
 }
 
-fn block_slices(block_states: &[ParameterBlockState]) -> BlockSlices {
+fn block_slices(
+    family: &SurvivalMarginalSlopeFamily,
+    block_states: &[ParameterBlockState],
+) -> BlockSlices {
     let time = 0..block_states[0].beta.len();
     let marginal = time.end..time.end + block_states[1].beta.len();
     let logslope = marginal.end..marginal.end + block_states[2].beta.len();
-    let total = logslope.end;
+    let mut cursor = logslope.end;
+    let score_warp = family.score_warp.as_ref().map(|runtime| {
+        let range = cursor..cursor + runtime.basis_dim;
+        cursor = range.end;
+        range
+    });
+    let link_dev = family.link_dev.as_ref().map(|runtime| {
+        let range = cursor..cursor + runtime.basis_dim;
+        cursor = range.end;
+        range
+    });
+    let total = cursor;
     BlockSlices {
         time,
         marginal,
         logslope,
+        score_warp,
+        link_dev,
         total,
     }
 }
@@ -125,6 +162,84 @@ fn block_slices(block_states: &[ParameterBlockState]) -> BlockSlices {
 
 // Primary scalar indices: 0=q0, 1=q1, 2=qd1, 3=g
 const N_PRIMARY: usize = 4;
+
+#[derive(Clone)]
+struct FlexPrimarySlices {
+    q0: usize,
+    q1: usize,
+    qd1: usize,
+    g: usize,
+    h: Option<std::ops::Range<usize>>,
+    w: Option<std::ops::Range<usize>>,
+    total: usize,
+}
+
+fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlices {
+    let q0 = 0usize;
+    let q1 = 1usize;
+    let qd1 = 2usize;
+    let g = 3usize;
+    let mut cursor = 4usize;
+    let h = family.score_warp.as_ref().map(|runtime| {
+        let range = cursor..cursor + runtime.basis_dim;
+        cursor = range.end;
+        range
+    });
+    let w = family.link_dev.as_ref().map(|runtime| {
+        let range = cursor..cursor + runtime.basis_dim;
+        cursor = range.end;
+        range
+    });
+    FlexPrimarySlices {
+        q0,
+        q1,
+        qd1,
+        g,
+        h,
+        w,
+        total: cursor,
+    }
+}
+
+#[inline]
+fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
+    ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
+}
+
+struct ObservedDenestedCellPartials {
+    coeff: [f64; 4],
+    dc_da: [f64; 4],
+    dc_db: [f64; 4],
+    dc_daa: [f64; 4],
+    dc_dab: [f64; 4],
+    dc_dbb: [f64; 4],
+    dc_daaa: [f64; 4],
+    dc_daab: [f64; 4],
+    dc_dabb: [f64; 4],
+}
+
+struct DenestedCellPrimaryFixedPartials {
+    dc_da: [f64; 4],
+    dc_daa: [f64; 4],
+    dc_daaa: [f64; 4],
+    coeff_u: Vec<[f64; 4]>,
+    coeff_au: Vec<[f64; 4]>,
+    coeff_bu: Vec<[f64; 4]>,
+    coeff_aau: Vec<[f64; 4]>,
+    coeff_abu: Vec<[f64; 4]>,
+}
+
+struct SurvivalFlexTimepointExact {
+    eta: f64,
+    chi: f64,
+    d: f64,
+    eta_u: Array1<f64>,
+    eta_uv: Array2<f64>,
+    chi_u: Array1<f64>,
+    chi_uv: Array2<f64>,
+    d_u: Array1<f64>,
+    d_uv: Array2<f64>,
+}
 
 #[derive(Clone)]
 struct SurvivalTimeWiggleGeometry {
@@ -162,6 +277,42 @@ fn unit_primary_direction(idx: usize) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(N_PRIMARY);
     out[idx] = 1.0;
     out
+}
+
+fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0; lhs.len() + rhs.len() - 1];
+    for (i, &lv) in lhs.iter().enumerate() {
+        for (j, &rv) in rhs.iter().enumerate() {
+            out[i + j] += lv * rv;
+        }
+    }
+    out
+}
+
+fn poly_sub(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0; lhs.len().max(rhs.len())];
+    for (idx, value) in lhs.iter().enumerate() {
+        out[idx] += value;
+    }
+    for (idx, value) in rhs.iter().enumerate() {
+        out[idx] -= value;
+    }
+    out
+}
+
+fn poly_add(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0; lhs.len().max(rhs.len())];
+    for (idx, value) in lhs.iter().enumerate() {
+        out[idx] += value;
+    }
+    for (idx, value) in rhs.iter().enumerate() {
+        out[idx] += value;
+    }
+    out
+}
+
+fn poly_scale(poly: &[f64], scale: f64) -> Vec<f64> {
+    poly.iter().map(|value| scale * value).collect()
 }
 
 fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String> {
@@ -1077,10 +1228,10 @@ impl SurvivalMarginalSlopeFamily {
         if !self.flex_timewiggle_active() {
             out.q0 = self.design_entry.dot_row(row, beta_time)
                 + self.offset_entry[row]
-                + self.marginal_design.dot_row(row, beta_marginal);
+                + block_states[1].eta[row];
             out.q1 = self.design_exit.dot_row(row, beta_time)
                 + self.offset_exit[row]
-                + self.marginal_design.dot_row(row, beta_marginal);
+                + block_states[1].eta[row];
             out.qd1 = self.design_derivative_exit.dot_row(row, beta_time)
                 + self.derivative_offset_exit[row];
             let time_entry_chunk = self.design_entry.row_chunk(row..row + 1);
@@ -1118,10 +1269,7 @@ impl SurvivalMarginalSlopeFamily {
             None
         };
 
-        let base_marginal = marginal_row
-            .as_ref()
-            .map(|row_vec| row_vec.dot(beta_marginal))
-            .unwrap_or(0.0);
+        let base_marginal = block_states[1].eta[row];
         let h0 = x_entry_base.dot(&beta_time_base) + self.offset_entry[row] + base_marginal;
         let h1 = x_exit_base.dot(&beta_time_base) + self.offset_exit[row] + base_marginal;
         let d_raw = x_deriv_base.dot(&beta_time_base) + self.derivative_offset_exit[row];
@@ -1220,6 +1368,268 @@ impl SurvivalMarginalSlopeFamily {
         self.derivative_guard
     }
 
+    fn flex_active(&self) -> bool {
+        self.score_warp.is_some() || self.link_dev.is_some()
+    }
+
+    fn flex_score_beta<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<Option<&'a Array1<f64>>, String> {
+        if self.score_warp.is_none() {
+            return Ok(None);
+        }
+        block_states
+            .get(3)
+            .map(|state| Some(&state.beta))
+            .ok_or_else(|| "missing survival score-warp block state".to_string())
+    }
+
+    fn flex_link_beta<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<Option<&'a Array1<f64>>, String> {
+        if self.link_dev.is_none() {
+            return Ok(None);
+        }
+        let idx = if self.score_warp.is_some() { 4 } else { 3 };
+        block_states
+            .get(idx)
+            .map(|state| Some(&state.beta))
+            .ok_or_else(|| "missing survival link-deviation block state".to_string())
+    }
+
+    fn denested_partition_cells(
+        &self,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
+        let score_tail = 8.0;
+        let mut score_breaks = if let Some(runtime) = self.score_warp.as_ref() {
+            runtime.breakpoints().to_vec()
+        } else {
+            vec![-score_tail, score_tail]
+        };
+        if score_breaks.first().copied().unwrap_or(score_tail) > -score_tail {
+            score_breaks.insert(0, -score_tail);
+        }
+        if score_breaks.last().copied().unwrap_or(-score_tail) < score_tail {
+            score_breaks.push(score_tail);
+        }
+
+        let link_tail = 8.0 * (1.0 + b.abs());
+        let mut link_breaks = if let Some(runtime) = self.link_dev.as_ref() {
+            runtime.breakpoints().to_vec()
+        } else {
+            vec![a - link_tail, a + link_tail]
+        };
+        if link_breaks.first().copied().unwrap_or(a + link_tail) > a - link_tail {
+            link_breaks.insert(0, a - link_tail);
+        }
+        if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
+            link_breaks.push(a + link_tail);
+        }
+
+        exact_kernel::build_denested_partition_cells(
+            a,
+            b,
+            &score_breaks,
+            &link_breaks,
+            |z| {
+                if let (Some(runtime), Some(beta)) = (self.score_warp.as_ref(), beta_h) {
+                    runtime.local_cubic_at(beta, z)
+                } else {
+                    Ok(exact_kernel::LocalSpanCubic {
+                        left: -score_tail,
+                        right: score_tail,
+                        c0: 0.0,
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    })
+                }
+            },
+            |u| {
+                if let (Some(runtime), Some(beta)) = (self.link_dev.as_ref(), beta_w) {
+                    runtime.local_cubic_at(beta, u)
+                } else {
+                    Ok(exact_kernel::LocalSpanCubic {
+                        left: a - link_tail,
+                        right: a + link_tail,
+                        c0: 0.0,
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    })
+                }
+            },
+        )
+    }
+
+    fn evaluate_denested_survival_calibration(
+        &self,
+        a: f64,
+        q: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64, f64), String> {
+        let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
+        let mut f = -crate::probability::normal_cdf(-q);
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        for partition_cell in cells {
+            let pos_cell = partition_cell.cell;
+            let neg_cell = exact_kernel::DenestedCubicCell {
+                left: pos_cell.left,
+                right: pos_cell.right,
+                c0: -pos_cell.c0,
+                c1: -pos_cell.c1,
+                c2: -pos_cell.c2,
+                c3: -pos_cell.c3,
+            };
+            let state = exact_kernel::evaluate_cell_moments(neg_cell, 9)?;
+            f += state.value;
+            let (dc_da_pos, _) = exact_kernel::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
+            let (dc_daa_pos, _, _) = exact_kernel::denested_cell_second_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
+            let dc_da = dc_da_pos.map(|value| -value);
+            let dc_daa = dc_daa_pos.map(|value| -value);
+            f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+            f_aa += exact_kernel::cell_second_derivative_from_moments(
+                neg_cell,
+                &dc_da,
+                &dc_da,
+                &dc_daa,
+                &state.moments,
+            )?;
+        }
+        Ok((f, f_a, f_aa))
+    }
+
+    fn solve_row_survival_intercept(
+        &self,
+        q: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64), String> {
+        let eval = |a: f64| -> Result<(f64, f64, f64), String> {
+            self.evaluate_denested_survival_calibration(a, q, slope, beta_h, beta_w)
+        };
+
+        let mut a = q * (1.0 + slope * slope).sqrt();
+        let (f_init, f_deriv_init, _) = eval(a)?;
+        if f_init == 0.0 {
+            return Ok((a, f_deriv_init));
+        }
+
+        let mut step = (0.25 * (1.0 + a.abs())).max(1.0);
+        let (mut lo, mut hi, f_lo, f_hi) = if f_init < 0.0 {
+            let mut lo = a;
+            let f_lo = f_init;
+            loop {
+                let hi = a + step;
+                let (f_candidate, _, _) = eval(hi)?;
+                if f_candidate >= 0.0 {
+                    break (lo, hi, f_lo, f_candidate);
+                }
+                a = hi;
+                lo = a;
+                step *= 2.0;
+                if step > 1e6 {
+                    return Err("survival intercept solve failed to bracket root above".to_string());
+                }
+            }
+        } else {
+            let mut hi = a;
+            let f_hi = f_init;
+            loop {
+                let lo = a - step;
+                let (f_candidate, _, _) = eval(lo)?;
+                if f_candidate <= 0.0 {
+                    break (lo, hi, f_candidate, f_hi);
+                }
+                a = lo;
+                hi = a;
+                step *= 2.0;
+                if step > 1e6 {
+                    return Err("survival intercept solve failed to bracket root below".to_string());
+                }
+            }
+        };
+
+        let mut best_a = if f_lo.abs() < f_hi.abs() { lo } else { hi };
+        let mut best_f = if f_lo.abs() < f_hi.abs() { f_lo } else { f_hi };
+        let mut best_deriv = f64::NAN;
+        for _ in 0..64 {
+            let mid = 0.5 * (lo + hi);
+            let mid_state = eval(mid)?;
+            let f_mid = mid_state.0;
+            let f_a_mid = mid_state.1;
+            if f_mid.abs() < best_f.abs() {
+                best_a = mid;
+                best_f = f_mid;
+                best_deriv = f_a_mid;
+            }
+            if f_mid.abs() <= 1e-12 {
+                if !f_a_mid.is_finite() || f_a_mid >= 0.0 {
+                    return Err(format!(
+                        "survival intercept solve produced invalid calibration derivative: F_a={f_a_mid:.3e} at a={mid:.6}"
+                    ));
+                }
+                return Ok((mid, -f_a_mid));
+            }
+            let newton = if f_a_mid.is_finite() && f_a_mid.abs() > 1e-12 {
+                let candidate = mid - f_mid / f_a_mid;
+                if candidate > lo && candidate < hi {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let probe = newton.unwrap_or(mid);
+            let (f_probe, f_a_probe, _) = eval(probe)?;
+            if f_probe.abs() < best_f.abs() {
+                best_a = probe;
+                best_f = f_probe;
+                best_deriv = f_a_probe;
+            }
+            if f_probe <= 0.0 {
+                lo = probe;
+            } else {
+                hi = probe;
+            }
+            if (hi - lo).abs() <= 1e-12 * (1.0 + hi.abs() + lo.abs()) {
+                break;
+            }
+        }
+
+        if !best_deriv.is_finite() || best_deriv >= 0.0 {
+            let (_, f_a_best, _) = eval(best_a)?;
+            best_deriv = f_a_best;
+        }
+        if !best_deriv.is_finite() || best_deriv >= 0.0 {
+            return Err(format!(
+                "survival intercept solve produced non-negative calibration derivative: F_a={best_deriv:.3e} at a={best_a:.6}"
+            ));
+        }
+        Ok((best_a, -best_deriv))
+    }
+
     fn max_feasible_time_step(
         &self,
         beta: &Array1<f64>,
@@ -1257,6 +1667,830 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    fn validate_exact_monotonicity(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(), String> {
+        if let Some(runtime) = &self.score_warp {
+            let beta_h = self
+                .flex_score_beta(block_states)?
+                .ok_or_else(|| "missing survival score-warp coefficients".to_string())?;
+            runtime.monotonicity_feasible(beta_h, "survival marginal-slope score-warp")?;
+        }
+        if let Some(runtime) = &self.link_dev {
+            let beta_w = self
+                .flex_link_beta(block_states)?
+                .ok_or_else(|| "missing survival link-deviation coefficients".to_string())?;
+            runtime.monotonicity_feasible(beta_w, "survival marginal-slope link deviation")?;
+        }
+        Ok(())
+    }
+
+    fn observed_denested_eta_chi(
+        &self,
+        row: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64), String> {
+        let z_obs = self.z[row];
+        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+        let eta = eval_coeff4_at(&obs.coeff, z_obs);
+        let chi = eval_coeff4_at(&obs.dc_da, z_obs);
+        Ok((eta, chi))
+    }
+
+    fn observed_denested_cell_partials(
+        &self,
+        row: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<ObservedDenestedCellPartials, String> {
+        let zero_score_span = exact_kernel::LocalSpanCubic {
+            left: -8.0,
+            right: 8.0,
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        let zero_link_span = exact_kernel::LocalSpanCubic {
+            left: a - 8.0 * (1.0 + b.abs()),
+            right: a + 8.0 * (1.0 + b.abs()),
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        let z_obs = self.z[row];
+        let u_obs = a + b * z_obs;
+        let score_span_obs =
+            if let (Some(runtime), Some(beta_h)) = (self.score_warp.as_ref(), beta_h) {
+                runtime.local_cubic_at(beta_h, z_obs)?
+            } else {
+                zero_score_span
+            };
+        let link_span_obs = if let (Some(runtime), Some(beta_w)) = (self.link_dev.as_ref(), beta_w)
+        {
+            runtime.local_cubic_at(beta_w, u_obs)?
+        } else {
+            zero_link_span
+        };
+        let coeff = exact_kernel::denested_cell_coefficients(score_span_obs, link_span_obs, a, b);
+        let (dc_da, dc_db) =
+            exact_kernel::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
+        let (dc_daa, dc_dab, dc_dbb) =
+            exact_kernel::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
+        let (dc_daaa, dc_daab, dc_dabb, _) =
+            exact_kernel::denested_cell_third_partials(link_span_obs);
+        Ok(ObservedDenestedCellPartials {
+            coeff,
+            dc_da,
+            dc_db,
+            dc_daa,
+            dc_dab,
+            dc_dbb,
+            dc_daaa,
+            dc_daab,
+            dc_dabb,
+        })
+    }
+
+    fn denested_cell_primary_fixed_partials(
+        &self,
+        primary: &FlexPrimarySlices,
+        a: f64,
+        b: f64,
+        score_span: exact_kernel::LocalSpanCubic,
+        link_span: exact_kernel::LocalSpanCubic,
+        z_basis: f64,
+        u_basis: f64,
+    ) -> Result<DenestedCellPrimaryFixedPartials, String> {
+        let r = primary.total;
+        let mut coeff_u = vec![[0.0; 4]; r];
+        let mut coeff_au = vec![[0.0; 4]; r];
+        let mut coeff_bu = vec![[0.0; 4]; r];
+        let mut coeff_aau = vec![[0.0; 4]; r];
+        let mut coeff_abu = vec![[0.0; 4]; r];
+
+        let (dc_da, dc_db) =
+            exact_kernel::denested_cell_coefficient_partials(score_span, link_span, a, b);
+        let (dc_daa, dc_dab, dc_dbb) =
+            exact_kernel::denested_cell_second_partials(score_span, link_span, a, b);
+        let (dc_daaa, dc_daab, dc_dabb, _) = exact_kernel::denested_cell_third_partials(link_span);
+
+        coeff_u[primary.g] = dc_db;
+        coeff_au[primary.g] = dc_dab;
+        coeff_bu[primary.g] = dc_dbb;
+        coeff_aau[primary.g] = dc_daab;
+        coeff_abu[primary.g] = dc_dabb;
+
+        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+            for local_idx in 0..h_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, z_basis)?;
+                let idx = h_range.start + local_idx;
+                coeff_u[idx] = exact_kernel::score_basis_cell_coefficients(basis_span, b);
+                coeff_bu[idx] = exact_kernel::score_basis_cell_coefficients(basis_span, 1.0);
+            }
+        }
+
+        if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
+            for local_idx in 0..w_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, u_basis)?;
+                let idx = w_range.start + local_idx;
+                coeff_u[idx] = exact_kernel::link_basis_cell_coefficients(basis_span, a, b);
+                let (dc_aw, dc_bw) =
+                    exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aaw, dc_abw, _) =
+                    exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                coeff_au[idx] = dc_aw;
+                coeff_bu[idx] = dc_bw;
+                coeff_aau[idx] = dc_aaw;
+                coeff_abu[idx] = dc_abw;
+            }
+        }
+
+        Ok(DenestedCellPrimaryFixedPartials {
+            dc_da,
+            dc_daa,
+            dc_daaa,
+            coeff_u,
+            coeff_au,
+            coeff_bu,
+            coeff_aau,
+            coeff_abu,
+        })
+    }
+
+    fn observed_fixed_eta_second_partial(
+        &self,
+        primary: &FlexPrimarySlices,
+        obs: &ObservedDenestedCellPartials,
+        u: usize,
+        v: usize,
+        z_obs: f64,
+        u_obs: f64,
+        a: f64,
+        b: f64,
+    ) -> Result<f64, String> {
+        if u == primary.g && v == primary.g {
+            return Ok(eval_coeff4_at(&obs.dc_dbb, z_obs));
+        }
+        if u == primary.g {
+            if let Some(h_range) = primary.h.as_ref() {
+                if v >= h_range.start && v < h_range.end {
+                    let local_idx = v - h_range.start;
+                    let runtime = self
+                        .score_warp
+                        .as_ref()
+                        .ok_or_else(|| "missing survival score-warp runtime".to_string())?;
+                    let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                    return Ok(eval_coeff4_at(
+                        &exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                        z_obs,
+                    ));
+                }
+            }
+            if let Some(w_range) = primary.w.as_ref() {
+                if v >= w_range.start && v < w_range.end {
+                    let local_idx = v - w_range.start;
+                    let runtime = self
+                        .link_dev
+                        .as_ref()
+                        .ok_or_else(|| "missing survival link runtime".to_string())?;
+                    let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                    let (_, dc_bw) =
+                        exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+                    return Ok(eval_coeff4_at(&dc_bw, z_obs));
+                }
+            }
+        }
+        if v == primary.g {
+            return self.observed_fixed_eta_second_partial(primary, obs, v, u, z_obs, u_obs, a, b);
+        }
+        Ok(0.0)
+    }
+
+    fn observed_fixed_chi_second_partial(
+        &self,
+        primary: &FlexPrimarySlices,
+        obs: &ObservedDenestedCellPartials,
+        u: usize,
+        v: usize,
+        z_obs: f64,
+        u_obs: f64,
+        a: f64,
+        b: f64,
+    ) -> Result<f64, String> {
+        if u == primary.g && v == primary.g {
+            return Ok(eval_coeff4_at(&obs.dc_dabb, z_obs));
+        }
+        if u == primary.g {
+            if let Some(w_range) = primary.w.as_ref() {
+                if v >= w_range.start && v < w_range.end {
+                    let local_idx = v - w_range.start;
+                    let runtime = self
+                        .link_dev
+                        .as_ref()
+                        .ok_or_else(|| "missing survival link runtime".to_string())?;
+                    let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                    let (_, dc_abw, _) =
+                        exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                    return Ok(eval_coeff4_at(&dc_abw, z_obs));
+                }
+            }
+        }
+        if v == primary.g {
+            return self.observed_fixed_chi_second_partial(primary, obs, v, u, z_obs, u_obs, a, b);
+        }
+        Ok(0.0)
+    }
+
+    fn evaluate_survival_denom_d(
+        &self,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<f64, String> {
+        let mut d = 0.0;
+        for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
+            let cell = partition_cell.cell;
+            let state = exact_kernel::evaluate_cell_moments(cell, 4)?;
+            let (dc_da, _) = exact_kernel::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                b,
+            );
+            d += exact_kernel::cell_polynomial_integral_from_moments(
+                &dc_da,
+                &state.moments,
+                "survival D_t",
+            )?;
+        }
+        Ok(d)
+    }
+
+    fn row_neglog_flex_value(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+    ) -> Result<f64, String> {
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+        self.row_neglog_flex_value_from_parts(
+            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w,
+        )
+    }
+
+    fn row_neglog_flex_value_from_parts(
+        &self,
+        row: usize,
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        g: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<f64, String> {
+        if qd1 < self.derivative_guard {
+            return Err(format!(
+                "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
+                self.derivative_guard
+            ));
+        }
+        let (a0, _) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
+        let (a1, d1_calib) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+        let d1 = self.evaluate_survival_denom_d(a1, g, beta_h, beta_w)?;
+        if !d1.is_finite() || d1 <= 0.0 {
+            return Err(format!(
+                "survival marginal-slope row {row} produced non-positive density normalization D1={d1:.3e} (calibration derivative {:.3e})",
+                d1_calib
+            ));
+        }
+        let (eta0, _) = self.observed_denested_eta_chi(row, a0, g, beta_h, beta_w)?;
+        let (eta1, chi1) = self.observed_denested_eta_chi(row, a1, g, beta_h, beta_w)?;
+        if !chi1.is_finite() || chi1 <= 0.0 {
+            return Err(format!(
+                "survival marginal-slope row {row} produced non-positive observed chi1={chi1:.3e}"
+            ));
+        }
+        let wi = self.weights[row];
+        let di = self.event[row];
+        let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
+        let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
+        let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+        let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
+        Ok(wi
+            * (log_surv0
+                - (1.0 - di) * log_surv1
+                - di * log_phi_eta1
+                - di * chi1.ln()
+                - di * log_phi_q1
+                + di * d1.ln()
+                - di * qd1.ln()))
+    }
+
+    fn compute_survival_timepoint_exact(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        d_calibration: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        need_d_uv: bool,
+    ) -> Result<SurvivalFlexTimepointExact, String> {
+        let p = primary.total;
+        let mut f_u = Array1::<f64>::zeros(p);
+        let mut f_au = Array1::<f64>::zeros(p);
+        let mut f_uv = Array2::<f64>::zeros((p, p));
+        let mut f_aa = 0.0;
+
+        for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
+            let cell = partition_cell.cell;
+            let neg_cell = exact_kernel::DenestedCubicCell {
+                left: cell.left,
+                right: cell.right,
+                c0: -cell.c0,
+                c1: -cell.c1,
+                c2: -cell.c2,
+                c3: -cell.c3,
+            };
+            let z_mid = 0.5 * (cell.left + cell.right);
+            let u_mid = a + b * z_mid;
+            let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
+            let fixed = self.denested_cell_primary_fixed_partials(
+                primary,
+                a,
+                b,
+                partition_cell.score_span,
+                partition_cell.link_span,
+                z_mid,
+                u_mid,
+            )?;
+            let neg_dc_da = fixed.dc_da.map(|value| -value);
+            let neg_dc_daa = fixed.dc_daa.map(|value| -value);
+            f_aa += exact_kernel::cell_second_derivative_from_moments(
+                neg_cell,
+                &neg_dc_da,
+                &neg_dc_da,
+                &neg_dc_daa,
+                &state.moments,
+            )?;
+            for u in 0..p {
+                let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                let neg_coeff_au = fixed.coeff_au[u].map(|value| -value);
+                f_u[u] += exact_kernel::cell_first_derivative_from_moments(
+                    &neg_coeff_u,
+                    &state.moments,
+                )?;
+                f_au[u] += exact_kernel::cell_second_derivative_from_moments(
+                    neg_cell,
+                    &neg_dc_da,
+                    &neg_coeff_u,
+                    &neg_coeff_au,
+                    &state.moments,
+                )?;
+            }
+            for u in 0..p {
+                for v in u..p {
+                    let second_coeff = if u == primary.g {
+                        fixed.coeff_bu[v]
+                    } else if v == primary.g {
+                        fixed.coeff_bu[u]
+                    } else {
+                        [0.0; 4]
+                    };
+                    let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
+                    let neg_second_coeff = second_coeff.map(|value| -value);
+                    let value = exact_kernel::cell_second_derivative_from_moments(
+                        neg_cell,
+                        &neg_coeff_u,
+                        &neg_coeff_v,
+                        &neg_second_coeff,
+                        &state.moments,
+                    )?;
+                    f_uv[[u, v]] += value;
+                    f_uv[[v, u]] = f_uv[[u, v]];
+                }
+            }
+        }
+
+        let phi_q = crate::probability::normal_pdf(q);
+        f_u[q_index] += phi_q;
+        f_uv[[q_index, q_index]] += -q * phi_q;
+
+        let mut d_check = 0.0;
+        for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
+            let cell = partition_cell.cell;
+            let z_mid = 0.5 * (cell.left + cell.right);
+            let u_mid = a + b * z_mid;
+            let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
+            let fixed = self.denested_cell_primary_fixed_partials(
+                primary,
+                a,
+                b,
+                partition_cell.score_span,
+                partition_cell.link_span,
+                z_mid,
+                u_mid,
+            )?;
+            let chi_poly = fixed.dc_da.to_vec();
+            d_check += exact_kernel::cell_polynomial_integral_from_moments(
+                &chi_poly,
+                &state.moments,
+                "survival D_t",
+            )?;
+        }
+        if !d_check.is_finite() || d_check <= 0.0 {
+            return Err(format!(
+                "survival marginal-slope row {row} produced non-positive density normalization D={d_check:.3e}"
+            ));
+        }
+        let d_rel_err = (d_check - d_calibration).abs() / d_check.max(d_calibration.abs()).max(1.0);
+        if !d_calibration.is_finite() || d_calibration <= 0.0 || d_rel_err > 1e-8 {
+            return Err(format!(
+                "survival marginal-slope row {row} produced inconsistent calibration derivative: solve={d_calibration:.12e}, direct={d_check:.12e}"
+            ));
+        }
+
+        let mut a_u = Array1::<f64>::zeros(p);
+        for u in 0..p {
+            a_u[u] = f_u[u] / d_check;
+        }
+
+        let mut d_u = Array1::<f64>::zeros(p);
+        for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
+            let cell = partition_cell.cell;
+            let z_mid = 0.5 * (cell.left + cell.right);
+            let u_mid = a + b * z_mid;
+            let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
+            let fixed = self.denested_cell_primary_fixed_partials(
+                primary,
+                a,
+                b,
+                partition_cell.score_span,
+                partition_cell.link_span,
+                z_mid,
+                u_mid,
+            )?;
+            let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+            let chi_poly = fixed.dc_da.to_vec();
+            for u in 0..p {
+                let eta_u_poly = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
+                let chi_u_poly = poly_add(&poly_scale(&fixed.dc_daa, a_u[u]), &fixed.coeff_au[u]);
+                let integrand = poly_sub(
+                    &chi_u_poly,
+                    &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
+                );
+                d_u[u] += exact_kernel::cell_polynomial_integral_from_moments(
+                    &integrand,
+                    &state.moments,
+                    "survival D_t first derivative",
+                )?;
+            }
+        }
+
+        let mut a_uv = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let value =
+                    (f_uv[[u, v]] - d_u[u] * a_u[v] - d_u[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
+                        / d_check;
+                a_uv[[u, v]] = value;
+                a_uv[[v, u]] = value;
+            }
+        }
+
+        let z_obs = self.z[row];
+        let u_obs = a + b * z_obs;
+        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+        let eta = eval_coeff4_at(&obs.coeff, z_obs);
+        let chi = eval_coeff4_at(&obs.dc_da, z_obs);
+        let eta_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
+        let eta_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
+
+        let mut rho = Array1::<f64>::zeros(p);
+        let mut tau = Array1::<f64>::zeros(p);
+        let mut tau_a = Array1::<f64>::zeros(p);
+        rho[primary.g] = eval_coeff4_at(&obs.dc_db, z_obs);
+        tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
+        tau_a[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs);
+
+        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+            for local_idx in 0..h_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                let idx = h_range.start + local_idx;
+                rho[idx] =
+                    eval_coeff4_at(&exact_kernel::score_basis_cell_coefficients(basis_span, b), z_obs);
+            }
+        }
+        if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
+            for local_idx in 0..w_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let idx = w_range.start + local_idx;
+                rho[idx] = eval_coeff4_at(
+                    &exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+                    z_obs,
+                );
+                let (dc_aw, _) =
+                    exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aaw, _, _) =
+                    exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                tau[idx] = eval_coeff4_at(&dc_aw, z_obs);
+                tau_a[idx] = eval_coeff4_at(&dc_aaw, z_obs);
+            }
+        }
+
+        let mut eta_u = Array1::<f64>::zeros(p);
+        let mut chi_u = Array1::<f64>::zeros(p);
+        for u in 0..p {
+            eta_u[u] = chi * a_u[u] + rho[u];
+            chi_u[u] = eta_aa * a_u[u] + tau[u];
+        }
+
+        let mut eta_uv = Array2::<f64>::zeros((p, p));
+        let mut chi_uv = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let r_uv = self.observed_fixed_eta_second_partial(
+                    primary, &obs, u, v, z_obs, u_obs, a, b,
+                )?;
+                let chi_uv_fixed = self.observed_fixed_chi_second_partial(
+                    primary, &obs, u, v, z_obs, u_obs, a, b,
+                )?;
+
+                let eta_val = chi * a_uv[[u, v]]
+                    + eta_aa * a_u[u] * a_u[v]
+                    + tau[u] * a_u[v]
+                    + tau[v] * a_u[u]
+                    + r_uv;
+                eta_uv[[u, v]] = eta_val;
+                eta_uv[[v, u]] = eta_val;
+
+                let chi_val = eta_aa * a_uv[[u, v]]
+                    + eta_aaa * a_u[u] * a_u[v]
+                    + tau_a[u] * a_u[v]
+                    + tau_a[v] * a_u[u]
+                    + chi_uv_fixed;
+                chi_uv[[u, v]] = chi_val;
+                chi_uv[[v, u]] = chi_val;
+            }
+        }
+
+        let mut d_uv = Array2::<f64>::zeros((p, p));
+        if need_d_uv {
+            for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
+                let cell = partition_cell.cell;
+                let z_mid = 0.5 * (cell.left + cell.right);
+                let u_mid = a + b * z_mid;
+                let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
+                let fixed = self.denested_cell_primary_fixed_partials(
+                    primary,
+                    a,
+                    b,
+                    partition_cell.score_span,
+                    partition_cell.link_span,
+                    z_mid,
+                    u_mid,
+                )?;
+                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+                let chi_poly = fixed.dc_da.to_vec();
+                let eta_aa_poly = fixed.dc_daa.to_vec();
+                let eta_aaa_poly = fixed.dc_daaa.to_vec();
+                let mut eta_u_poly = vec![Vec::new(); p];
+                let mut chi_u_poly = vec![Vec::new(); p];
+                for u in 0..p {
+                    eta_u_poly[u] = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
+                    chi_u_poly[u] = poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
+                }
+                for u in 0..p {
+                    for v in u..p {
+                        let r_uv_fixed = if u == primary.g {
+                            fixed.coeff_bu[v].to_vec()
+                        } else if v == primary.g {
+                            fixed.coeff_bu[u].to_vec()
+                        } else {
+                            vec![0.0; 4]
+                        };
+                        let chi_uv_fixed = if u == primary.g {
+                            fixed.coeff_abu[v].to_vec()
+                        } else if v == primary.g {
+                            fixed.coeff_abu[u].to_vec()
+                        } else {
+                            vec![0.0; 4]
+                        };
+                        let eta_uv_poly = poly_add(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_scale(&chi_poly, a_uv[[u, v]]),
+                                    &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
+                                ),
+                                &poly_scale(&fixed.coeff_au[u], a_u[v]),
+                            ),
+                            &poly_add(&poly_scale(&fixed.coeff_au[v], a_u[u]), &r_uv_fixed),
+                        );
+                        let chi_uv_poly = poly_add(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_scale(&eta_aa_poly, a_uv[[u, v]]),
+                                    &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
+                                ),
+                                &poly_scale(&fixed.coeff_aau[u], a_u[v]),
+                            ),
+                            &poly_add(&poly_scale(&fixed.coeff_aau[v], a_u[u]), &chi_uv_fixed),
+                        );
+                        let term2 = poly_scale(
+                            &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]),
+                            -1.0,
+                        );
+                        let term3 = poly_scale(
+                            &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]),
+                            -1.0,
+                        );
+                        let term4 = poly_scale(
+                            &poly_mul(
+                                &chi_poly,
+                                &poly_add(
+                                    &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                    &poly_mul(&eta_poly, &eta_uv_poly),
+                                ),
+                            ),
+                            -1.0,
+                        );
+                        let term5 = poly_mul(
+                            &chi_poly,
+                            &poly_mul(
+                                &poly_mul(&eta_poly, &eta_poly),
+                                &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                            ),
+                        );
+                        let integrand = poly_add(
+                            &poly_add(&poly_add(&chi_uv_poly, &term2), &term3),
+                            &poly_add(&term4, &term5),
+                        );
+                        let value = exact_kernel::cell_polynomial_integral_from_moments(
+                            &integrand,
+                            &state.moments,
+                            "survival D_t second derivative",
+                        )?;
+                        d_uv[[u, v]] += value;
+                        d_uv[[v, u]] = d_uv[[u, v]];
+                    }
+                }
+            }
+        }
+
+        Ok(SurvivalFlexTimepointExact {
+            eta,
+            chi,
+            d: d_check,
+            eta_u,
+            eta_uv,
+            chi_u,
+            chi_uv,
+            d_u,
+            d_uv,
+        })
+    }
+
+    fn compute_row_flex_primary_gradient_hessian_exact(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary: &FlexPrimarySlices,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let q0 = q_geom.q0;
+        let q1 = q_geom.q1;
+        let qd1 = q_geom.qd1;
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+
+        if qd1 < self.derivative_guard {
+            return Err(format!(
+                "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
+                self.derivative_guard
+            ));
+        }
+
+        let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
+        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+        let entry = self.compute_survival_timepoint_exact(
+            row,
+            primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            d0,
+            beta_h,
+            beta_w,
+            false,
+        )?;
+        let exit = self.compute_survival_timepoint_exact(
+            row,
+            primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            d1,
+            beta_h,
+            beta_w,
+            true,
+        )?;
+
+        if !exit.chi.is_finite() || exit.chi <= 0.0 {
+            return Err(format!(
+                "survival marginal-slope row {row} produced non-positive observed chi1={:.3e}",
+                exit.chi
+            ));
+        }
+
+        let wi = self.weights[row];
+        let di = self.event[row];
+        let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-entry.eta);
+        let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-exit.eta);
+        let (entry_k1, entry_k2, _, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi);
+        let (exit_k1, exit_k2, _, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di));
+        let log_phi_eta1 = -0.5 * (exit.eta * exit.eta + std::f64::consts::TAU.ln());
+        let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
+        let row_nll = wi
+            * (log_surv0
+                - (1.0 - di) * log_surv1
+                - di * log_phi_eta1
+                - di * exit.chi.ln()
+                - di * log_phi_q1
+                + di * exit.d.ln()
+                - di * qd1.ln());
+
+        let p = primary.total;
+        let mut grad = Array1::<f64>::zeros(p);
+        let mut hess = Array2::<f64>::zeros((p, p));
+        let entry_u1 = -entry_k1;
+        let entry_u2 = entry_k2;
+        let exit_surv_u1 = -exit_k1;
+        let exit_surv_u2 = exit_k2;
+
+        for u in 0..p {
+            grad[u] += entry_u1 * entry.eta_u[u];
+            grad[u] += exit_surv_u1 * exit.eta_u[u];
+            grad[u] += wi * di * exit.eta * exit.eta_u[u];
+            grad[u] -= wi * di * exit.chi_u[u] / exit.chi;
+            if u == primary.q1 {
+                grad[u] += wi * di * q1;
+            }
+            grad[u] += wi * di * exit.d_u[u] / exit.d;
+            if u == primary.qd1 {
+                grad[u] -= wi * di / qd1;
+            }
+        }
+
+        for u in 0..p {
+            for v in u..p {
+                let mut value = 0.0;
+                value += entry_u2 * entry.eta_u[u] * entry.eta_u[v]
+                    + entry_u1 * entry.eta_uv[[u, v]];
+                value += exit_surv_u2 * exit.eta_u[u] * exit.eta_u[v]
+                    + exit_surv_u1 * exit.eta_uv[[u, v]];
+                value += wi * di * (exit.eta_u[u] * exit.eta_u[v] + exit.eta * exit.eta_uv[[u, v]]);
+                value -= wi
+                    * di
+                    * (exit.chi_uv[[u, v]] / exit.chi
+                        - (exit.chi_u[u] * exit.chi_u[v]) / (exit.chi * exit.chi));
+                if u == primary.q1 && v == primary.q1 {
+                    value += wi * di;
+                }
+                value += wi
+                    * di
+                    * (exit.d_uv[[u, v]] / exit.d
+                        - (exit.d_u[u] * exit.d_u[v]) / (exit.d * exit.d));
+                if u == primary.qd1 && v == primary.qd1 {
+                    value += wi * di / (qd1 * qd1);
+                }
+                hess[[u, v]] = value;
+                hess[[v, u]] = value;
+            }
+        }
+
+        Ok((row_nll, grad, hess))
+    }
+
     /// Per-row NLL and its directional derivatives through 4 primary scalars.
     ///
     /// NLL_i = w_i * [ (1-d)·neglogΦ(-η₁) + logΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
@@ -1292,13 +2526,12 @@ impl SurvivalMarginalSlopeFamily {
         // covariate block. The time block has a single beta vector but 3
         // different design matrices (entry, exit, derivative).
         let beta_time = &block_states[0].beta;
-        let beta_marginal = &block_states[1].beta;
         let q0_val = self.design_entry.dot_row(row, beta_time)
             + self.offset_entry[row]
-            + self.marginal_design.dot_row(row, beta_marginal);
+            + block_states[1].eta[row];
         let q1_val = self.design_exit.dot_row(row, beta_time)
             + self.offset_exit[row]
-            + self.marginal_design.dot_row(row, beta_marginal);
+            + block_states[1].eta[row];
         let qd1_val =
             self.design_derivative_exit.dot_row(row, beta_time) + self.derivative_offset_exit[row];
         let g_val = block_states[2].eta[row];
@@ -1772,7 +3005,7 @@ impl SurvivalMarginalSlopeFamily {
         psi_index: usize,
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let slices = block_slices(block_states);
+        let slices = block_slices(self, block_states);
         let Some((block_idx, local_idx, p_psi, psi_label)) =
             self.psi_block_info(derivative_blocks, psi_index)?
         else {
@@ -1890,7 +3123,7 @@ impl SurvivalMarginalSlopeFamily {
         psi_j: usize,
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let slices = block_slices(block_states);
+        let slices = block_slices(self, block_states);
         let Some((block_idx_i, local_idx_i, p_psi_i, label_i)) =
             self.psi_block_info(derivative_blocks, psi_i)?
         else {
@@ -2073,7 +3306,7 @@ impl SurvivalMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let slices = block_slices(block_states);
+        let slices = block_slices(self, block_states);
         let Some((block_idx, local_idx, p_psi, psi_label)) =
             self.psi_block_info(derivative_blocks, psi_index)?
         else {
@@ -2207,7 +3440,7 @@ struct SurvivalMarginalSlopeRowKernel {
 
 impl SurvivalMarginalSlopeRowKernel {
     fn new(family: SurvivalMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
-        let slices = block_slices(&block_states);
+        let slices = block_slices(&family, &block_states);
         Self {
             family,
             block_states,
@@ -2226,13 +3459,12 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
         let beta_time = &self.block_states[0].beta;
-        let beta_marginal = &self.block_states[1].beta;
         let q0 = self.family.design_entry.dot_row(row, beta_time)
             + self.family.offset_entry[row]
-            + self.family.marginal_design.dot_row(row, beta_marginal);
+            + self.block_states[1].eta[row];
         let q1 = self.family.design_exit.dot_row(row, beta_time)
             + self.family.offset_exit[row]
-            + self.family.marginal_design.dot_row(row, beta_marginal);
+            + self.block_states[1].eta[row];
         let qd1 = self.family.design_derivative_exit.dot_row(row, beta_time)
             + self.family.derivative_offset_exit[row];
         let g = self.block_states[2].eta[row];
@@ -2384,6 +3616,9 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
+        if self.flex_active() {
+            return self.evaluate_blockwise_exact_newton_flexible_dense(block_states);
+        }
         if self.flex_timewiggle_active() {
             return self.evaluate_blockwise_exact_newton_timewiggle_dense(block_states);
         }
@@ -2433,11 +3668,245 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    fn evaluate_blockwise_exact_newton_flexible_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<FamilyEvaluation, String> {
+        self.validate_exact_monotonicity(block_states)?;
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, std::ops::Range::len);
+        let p_w = slices.link_dev.as_ref().map_or(0, std::ops::Range::len);
+
+        type Acc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Option<Array1<f64>>,
+            Option<Array1<f64>>,
+            Array2<f64>,
+            Array2<f64>,
+            Array2<f64>,
+            Option<Array2<f64>>,
+            Option<Array2<f64>>,
+        );
+
+        let make_acc = || -> Acc {
+            (
+                0.0,
+                Array1::zeros(p_t),
+                Array1::zeros(p_m),
+                Array1::zeros(p_g),
+                (p_h > 0).then(|| Array1::zeros(p_h)),
+                (p_w > 0).then(|| Array1::zeros(p_w)),
+                Array2::zeros((p_t, p_t)),
+                Array2::zeros((p_m, p_m)),
+                Array2::zeros((p_g, p_g)),
+                (p_h > 0).then(|| Array2::zeros((p_h, p_h))),
+                (p_w > 0).then(|| Array2::zeros((p_w, p_w))),
+            )
+        };
+
+        let (
+            ll,
+            grad_time,
+            grad_marginal,
+            grad_logslope,
+            grad_score,
+            grad_link,
+            hess_time,
+            hess_marginal,
+            hess_logslope,
+            hess_score,
+            hess_link,
+        ) = (0..self.n)
+            .into_par_iter()
+            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let (row_nll, f_pi, f_pipi) = self
+                    .compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        &primary,
+                    )?;
+                acc.0 -= row_nll;
+
+                acc.1 -= &(f_pi[primary.q0] * &q_geom.dq0_time
+                    + f_pi[primary.q1] * &q_geom.dq1_time
+                    + f_pi[primary.qd1] * &q_geom.dqd1_time);
+                if p_m > 0 {
+                    acc.2 -= &(f_pi[primary.q0] * &q_geom.dq0_marginal
+                        + f_pi[primary.q1] * &q_geom.dq1_marginal
+                        + f_pi[primary.qd1] * &q_geom.dqd1_marginal);
+                }
+                self.logslope_design
+                    .axpy_row_into(row, -f_pi[primary.g], &mut acc.3.view_mut())
+                    .expect("survival logslope block axpy should match block dimensions");
+
+                if let (Some(range), Some(grad)) = (primary.h.as_ref(), acc.4.as_mut()) {
+                    for local in 0..range.len() {
+                        grad[local] -= f_pi[range.start + local];
+                    }
+                }
+                if let (Some(range), Some(grad)) = (primary.w.as_ref(), acc.5.as_mut()) {
+                    for local in 0..range.len() {
+                        grad[local] -= f_pi[range.start + local];
+                    }
+                }
+
+                for a in 0..p_t {
+                    for b in 0..p_t {
+                        acc.6[[a, b]] += f_pipi[[primary.q0, primary.q0]]
+                            * q_geom.dq0_time[a]
+                            * q_geom.dq0_time[b]
+                            + f_pipi[[primary.q0, primary.q1]]
+                                * q_geom.dq0_time[a]
+                                * q_geom.dq1_time[b]
+                            + f_pipi[[primary.q0, primary.qd1]]
+                                * q_geom.dq0_time[a]
+                                * q_geom.dqd1_time[b]
+                            + f_pipi[[primary.q1, primary.q0]]
+                                * q_geom.dq1_time[a]
+                                * q_geom.dq0_time[b]
+                            + f_pipi[[primary.q1, primary.q1]]
+                                * q_geom.dq1_time[a]
+                                * q_geom.dq1_time[b]
+                            + f_pipi[[primary.q1, primary.qd1]]
+                                * q_geom.dq1_time[a]
+                                * q_geom.dqd1_time[b]
+                            + f_pipi[[primary.qd1, primary.q0]]
+                                * q_geom.dqd1_time[a]
+                                * q_geom.dq0_time[b]
+                            + f_pipi[[primary.qd1, primary.q1]]
+                                * q_geom.dqd1_time[a]
+                                * q_geom.dq1_time[b]
+                            + f_pipi[[primary.qd1, primary.qd1]]
+                                * q_geom.dqd1_time[a]
+                                * q_geom.dqd1_time[b]
+                            + f_pi[primary.q0] * q_geom.d2q0_time_time[[a, b]]
+                            + f_pi[primary.q1] * q_geom.d2q1_time_time[[a, b]]
+                            + f_pi[primary.qd1] * q_geom.d2qd1_time_time[[a, b]];
+                    }
+                }
+                for a in 0..p_m {
+                    for b in 0..p_m {
+                        acc.7[[a, b]] += f_pipi[[primary.q0, primary.q0]]
+                            * q_geom.dq0_marginal[a]
+                            * q_geom.dq0_marginal[b]
+                            + f_pipi[[primary.q0, primary.q1]]
+                                * q_geom.dq0_marginal[a]
+                                * q_geom.dq1_marginal[b]
+                            + f_pipi[[primary.q0, primary.qd1]]
+                                * q_geom.dq0_marginal[a]
+                                * q_geom.dqd1_marginal[b]
+                            + f_pipi[[primary.q1, primary.q0]]
+                                * q_geom.dq1_marginal[a]
+                                * q_geom.dq0_marginal[b]
+                            + f_pipi[[primary.q1, primary.q1]]
+                                * q_geom.dq1_marginal[a]
+                                * q_geom.dq1_marginal[b]
+                            + f_pipi[[primary.q1, primary.qd1]]
+                                * q_geom.dq1_marginal[a]
+                                * q_geom.dqd1_marginal[b]
+                            + f_pipi[[primary.qd1, primary.q0]]
+                                * q_geom.dqd1_marginal[a]
+                                * q_geom.dq0_marginal[b]
+                            + f_pipi[[primary.qd1, primary.q1]]
+                                * q_geom.dqd1_marginal[a]
+                                * q_geom.dq1_marginal[b]
+                            + f_pipi[[primary.qd1, primary.qd1]]
+                                * q_geom.dqd1_marginal[a]
+                                * q_geom.dqd1_marginal[b]
+                            + f_pi[primary.q0] * q_geom.d2q0_marginal_marginal[[a, b]]
+                            + f_pi[primary.q1] * q_geom.d2q1_marginal_marginal[[a, b]]
+                            + f_pi[primary.qd1] * q_geom.d2qd1_marginal_marginal[[a, b]];
+                    }
+                }
+                self.logslope_design
+                    .syr_row_into(row, f_pipi[[primary.g, primary.g]], &mut acc.8)
+                    .expect("survival logslope block syr should match block dimensions");
+
+                if let (Some(range), Some(hess)) = (primary.h.as_ref(), acc.9.as_mut()) {
+                    for a in 0..range.len() {
+                        for b in 0..range.len() {
+                            hess[[a, b]] += f_pipi[[range.start + a, range.start + b]];
+                        }
+                    }
+                }
+                if let (Some(range), Some(hess)) = (primary.w.as_ref(), acc.10.as_mut()) {
+                    for a in 0..range.len() {
+                        for b in 0..range.len() {
+                            hess[[a, b]] += f_pipi[[range.start + a, range.start + b]];
+                        }
+                    }
+                }
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
+                a.0 += b.0;
+                a.1 += &b.1;
+                a.2 += &b.2;
+                a.3 += &b.3;
+                if let (Some(lhs), Some(rhs)) = (a.4.as_mut(), b.4.as_ref()) {
+                    *lhs += rhs;
+                }
+                if let (Some(lhs), Some(rhs)) = (a.5.as_mut(), b.5.as_ref()) {
+                    *lhs += rhs;
+                }
+                a.6 += &b.6;
+                a.7 += &b.7;
+                a.8 += &b.8;
+                if let (Some(lhs), Some(rhs)) = (a.9.as_mut(), b.9.as_ref()) {
+                    *lhs += rhs;
+                }
+                if let (Some(lhs), Some(rhs)) = (a.10.as_mut(), b.10.as_ref()) {
+                    *lhs += rhs;
+                }
+                Ok(a)
+            })?;
+
+        let mut blockworking_sets = vec![
+            BlockWorkingSet::ExactNewton {
+                gradient: grad_time,
+                hessian: SymmetricMatrix::Dense(hess_time),
+            },
+            BlockWorkingSet::ExactNewton {
+                gradient: grad_marginal,
+                hessian: SymmetricMatrix::Dense(hess_marginal),
+            },
+            BlockWorkingSet::ExactNewton {
+                gradient: grad_logslope,
+                hessian: SymmetricMatrix::Dense(hess_logslope),
+            },
+        ];
+        if let (Some(gradient), Some(hessian)) = (grad_score, hess_score) {
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(hessian),
+            });
+        }
+        if let (Some(gradient), Some(hessian)) = (grad_link, hess_link) {
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(hessian),
+            });
+        }
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets,
+        })
+    }
+
     fn evaluate_blockwise_exact_newton_timewiggle_dense(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
-        let slices = block_slices(block_states);
+        let slices = block_slices(self, block_states);
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
@@ -2593,7 +4062,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        let slices = block_slices(block_states);
+        let slices = block_slices(self, block_states);
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
@@ -2873,7 +4342,7 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
-        let slices = block_slices(block_states);
+        let slices = block_slices(self, block_states);
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
@@ -2996,7 +4465,7 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<FamilyEvaluation, String> {
         use crate::matrix::SparseHessianAccumulator;
 
-        let slices = block_slices(block_states);
+        let slices = block_slices(self, block_states);
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
@@ -3209,7 +4678,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
+            // Flexible survival now has exact row value/gradient/Hessian, but
+            // the higher-order outer derivative hooks remain disabled.
             return ExactOuterDerivativeOrder::Zeroth;
         }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
@@ -3230,7 +4701,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
-        true
+        // Flexible survival does not yet expose the exact psi workspace path.
+        !(self.flex_timewiggle_active() || self.flex_active())
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -3238,6 +4710,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        if self.flex_active() {
+            self.validate_exact_monotonicity(block_states)?;
+            let mut ll = 0.0;
+            for i in 0..self.n {
+                ll -= self.row_neglog_flex_value(i, block_states)?;
+            }
+            return Ok(ll);
+        }
         // True fast path: closed-form scalar NLL, no jets, no Vecs, no gradients.
         let guard = self.derivative_guard;
         let mut ll = 0.0;
@@ -3263,13 +4743,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             if block_states.len() == usize::MAX {
                 return Err("unreachable survival hessian state".to_string());
             }
             return Ok(None);
         }
-        let slices = block_slices(block_states);
+        let slices = block_slices(self, block_states);
         if slices.total >= 512 {
             return Ok(None);
         }
@@ -3281,7 +4761,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             return false;
         }
         true
@@ -3292,7 +4772,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             if block_states.len() == usize::MAX {
                 return Err("unreachable survival workspace state".to_string());
             }
@@ -3307,7 +4787,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             if block_states.len() == usize::MAX || d_beta_flat.len() == usize::MAX {
                 return Err("unreachable survival directional state".to_string());
             }
@@ -3324,7 +4804,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             if block_states.len() == usize::MAX
                 || d_beta_u_flat.len() == usize::MAX
                 || d_beta_v_flat.len() == usize::MAX
@@ -3347,7 +4827,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             if block_states.len() == usize::MAX
                 || derivative_blocks.len() == usize::MAX
                 || psi_index == usize::MAX
@@ -3367,7 +4847,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             if block_states.len() == usize::MAX
                 || derivative_blocks.len() == usize::MAX
                 || psi_i == usize::MAX
@@ -3388,7 +4868,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             if block_states.len() == usize::MAX
                 || derivative_blocks.len() == usize::MAX
                 || psi_index == usize::MAX
@@ -3412,7 +4892,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        if self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             if block_states.len() == usize::MAX || derivative_blocks.len() == usize::MAX {
                 return Err("unreachable survival psi workspace state".to_string());
             }
@@ -3447,6 +4927,21 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         if block_idx == 0 {
             return self.max_feasible_time_step(&block_states[0].beta, delta);
         }
+        if self.score_warp.is_some() && block_idx == 3 {
+            if let Some(runtime) = &self.score_warp {
+                return runtime.max_feasible_monotone_step(&block_states[3].beta, delta);
+            }
+        }
+        let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
+        if self.link_dev.is_some() && block_idx == link_block_idx {
+            if let Some(runtime) = &self.link_dev {
+                let current = block_states
+                    .get(link_block_idx)
+                    .map(|state| &state.beta)
+                    .ok_or_else(|| "missing survival link-deviation block state".to_string())?;
+                return runtime.max_feasible_monotone_step(current, delta);
+            }
+        }
         Ok(None)
     }
 
@@ -3463,6 +4958,44 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 block_idx,
                 block_states.len()
             ));
+        }
+        if self.score_warp.is_some() && block_idx == 3 {
+            if let Some(runtime) = &self.score_warp {
+                let current = &block_states[3].beta;
+                if current.len() != beta.len() {
+                    return Err(format!(
+                        "survival score-warp post-update beta length mismatch: current={}, proposed={}",
+                        current.len(),
+                        beta.len()
+                    ));
+                }
+                let delta = &beta - current;
+                let Some(alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
+                    return Ok(current.clone());
+                };
+                return Ok(current + &(delta * alpha));
+            }
+        }
+        let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
+        if self.link_dev.is_some() && block_idx == link_block_idx {
+            if let Some(runtime) = &self.link_dev {
+                let current = block_states
+                    .get(link_block_idx)
+                    .map(|state| &state.beta)
+                    .ok_or_else(|| "missing survival link-deviation block state".to_string())?;
+                if current.len() != beta.len() {
+                    return Err(format!(
+                        "survival link-deviation post-update beta length mismatch: current={}, proposed={}",
+                        current.len(),
+                        beta.len()
+                    ));
+                }
+                let delta = &beta - current;
+                let Some(alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
+                    return Ok(current.clone());
+                };
+                return Ok(current + &(delta * alpha));
+            }
         }
         Ok(beta)
     }
@@ -3495,13 +5028,14 @@ fn build_time_blockspec(
 fn build_logslope_blockspec(
     design: &TermCollectionDesign,
     baseline: f64,
+    offset: &Array1<f64>,
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "logslope_surface".to_string(),
         design: design.design.clone(),
-        offset: Array1::from_elem(design.design.nrows(), baseline),
+        offset: offset + baseline,
         penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
@@ -3511,18 +5045,31 @@ fn build_logslope_blockspec(
 
 fn build_marginal_blockspec(
     design: &TermCollectionDesign,
+    offset: &Array1<f64>,
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "marginal_surface".to_string(),
         design: design.design.clone(),
-        offset: Array1::zeros(design.design.nrows()),
+        offset: offset.clone(),
         penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }
+}
+
+fn build_aux_blockspec(
+    name: &str,
+    prepared: &DeviationPrepared,
+    rho: Array1<f64>,
+    beta_hint: Option<Array1<f64>>,
+) -> Result<ParameterBlockSpec, String> {
+    let mut block = prepared.block.clone();
+    block.initial_log_lambdas = Some(rho);
+    block.initial_beta = beta_hint.or_else(|| block.initial_beta.clone());
+    block.intospec(name)
 }
 
 fn inner_fit(
@@ -3539,12 +5086,19 @@ fn joint_setup(
     marginal_penalties: usize,
     logslopespec: &TermCollectionSpec,
     logslope_penalties: usize,
+    extra_rho0: &[f64],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
     let marginal_terms = spatial_length_scale_term_indices(marginalspec);
     let logslope_terms = spatial_length_scale_term_indices(logslopespec);
-    let rho_dim = time_penalties + marginal_penalties + logslope_penalties;
-    let rho0vec = Array1::<f64>::zeros(rho_dim);
+    let rho_dim = time_penalties + marginal_penalties + logslope_penalties + extra_rho0.len();
+    let mut rho0vec = Array1::<f64>::zeros(rho_dim);
+    if !extra_rho0.is_empty() {
+        let start = time_penalties + marginal_penalties + logslope_penalties;
+        for (idx, value) in extra_rho0.iter().copied().enumerate() {
+            rho0vec[start + idx] = value;
+        }
+    }
     let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
     let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
     // Time block has no spatial length scales (pure B-spline on time)
@@ -3635,14 +5189,18 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         || spec.event_target.len() != n
         || spec.weights.len() != n
         || spec.z.len() != n
+        || spec.marginal_offset.len() != n
+        || spec.logslope_offset.len() != n
     {
         return Err(format!(
-            "survival-marginal-slope row mismatch: entry={}, exit={}, event={}, weights={}, z={}",
+            "survival-marginal-slope row mismatch: entry={}, exit={}, event={}, weights={}, z={}, marginal_offset={}, logslope_offset={}",
             n,
             spec.age_exit.len(),
             spec.event_target.len(),
             spec.weights.len(),
-            spec.z.len()
+            spec.z.len(),
+            spec.marginal_offset.len(),
+            spec.logslope_offset.len()
         ));
     }
     if spec.weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
@@ -3650,6 +5208,12 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     }
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
         return Err("survival-marginal-slope requires finite z values".to_string());
+    }
+    if spec.marginal_offset.iter().any(|&value| !value.is_finite()) {
+        return Err("survival-marginal-slope requires finite marginal offsets".to_string());
+    }
+    if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
+        return Err("survival-marginal-slope requires finite logslope offsets".to_string());
     }
     validate_standardized_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
     if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
@@ -3736,6 +5300,22 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
                 "survival-marginal-slope timewiggle requests {} tail columns but time block only has {} columns",
                 timewiggle.ncols,
                 spec.time_block.design_exit.ncols()
+            ));
+        }
+    }
+    if let Some(cfg) = spec.score_warp.as_ref() {
+        if cfg.degree != 3 {
+            return Err(format!(
+                "survival-marginal-slope score-warp requires cubic degree=3, got {}",
+                cfg.degree
+            ));
+        }
+    }
+    if let Some(cfg) = spec.link_dev.as_ref() {
+        if cfg.degree != 3 {
+            return Err(format!(
+                "survival-marginal-slope link deviation requires cubic degree=3, got {}",
+                cfg.degree
             ));
         }
     }
@@ -3915,20 +5495,44 @@ pub fn fit_survival_marginal_slope_terms(
             .map_err(|e| e.to_string())?;
 
     let time_penalties_len = spec.time_block.penalties.len();
+    let score_warp_prepared = spec
+        .score_warp
+        .as_ref()
+        .map(|cfg| build_deviation_block_from_seed(&spec.z, cfg))
+        .transpose()?;
+    let link_dev_prepared = spec
+        .link_dev
+        .as_ref()
+        .map(|cfg| {
+            let q0_seed = Array1::from_iter((0..n).map(|row| {
+                spec.time_block.offset_exit[row]
+                    + spec.marginal_offset[row]
+                    + spec.z[row] * (baseline_slope + spec.logslope_offset[row])
+            }));
+            build_deviation_block_from_seed(&q0_seed, cfg)
+        })
+        .transpose()?;
+    let extra_rho0 = {
+        let mut out = Vec::new();
+        if let Some(ref prepared) = score_warp_prepared {
+            out.extend(std::iter::repeat(0.0).take(prepared.block.penalties.len()));
+        }
+        if let Some(ref prepared) = link_dev_prepared {
+            out.extend(std::iter::repeat(0.0).take(prepared.block.penalties.len()));
+        }
+        out
+    };
     let setup = joint_setup(
         time_penalties_len,
         &marginalspec_boot,
         marginal_design.penalties.len(),
         &logslopespec_boot,
         logslope_design.penalties.len(),
+        &extra_rho0,
         kappa_options,
     );
 
-    let hints = RefCell::new((
-        None::<Array1<f64>>,
-        None::<Array1<f64>>,
-        None::<Array1<f64>>,
-    ));
+    let hints = RefCell::new(ThetaHints::default());
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
 
     let event = Arc::new(spec.event_target.clone());
@@ -3944,6 +5548,8 @@ pub fn fit_survival_marginal_slope_terms(
     let offset_exit = Arc::new(spec.time_block.offset_exit.clone());
     let derivative_offset_exit = Arc::new(spec.time_block.derivative_offset_exit.clone());
     let time_block_ref = spec.time_block.clone();
+    let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
+    let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
     let time_linear_constraints = time_derivative_lower_bound_constraints(
         &design_derivative_exit.to_dense(),
         derivative_offset_exit.as_ref(),
@@ -3967,6 +5573,8 @@ pub fn fit_survival_marginal_slope_terms(
             derivative_offset_exit: Arc::clone(&derivative_offset_exit),
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
+            score_warp: score_warp_runtime.clone(),
+            link_dev: link_dev_runtime.clone(),
             time_linear_constraints: time_linear_constraints.clone(),
             time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
@@ -3991,47 +5599,100 @@ pub fn fit_survival_marginal_slope_terms(
         let rho_logslope = rho
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
+        cursor += logslope_design.penalties.len();
         let time_beta_hint = if let Some(constraints) = time_linear_constraints.as_ref() {
             Some(project_onto_linear_constraints(
                 design_exit.ncols(),
                 constraints,
-                hints.0.as_ref().or(time_block_ref.initial_beta.as_ref()),
+                hints
+                    .time_beta
+                    .as_ref()
+                    .or(time_block_ref.initial_beta.as_ref()),
             ))
         } else {
             hints
-                .0
+                .time_beta
                 .clone()
                 .or_else(|| time_block_ref.initial_beta.clone())
         };
-        Ok(vec![
+        let mut blocks = vec![
             build_time_blockspec(&time_block_ref, &design_exit, rho_time, time_beta_hint),
-            build_marginal_blockspec(marginal_design, rho_marginal, hints.1.clone()),
+            build_marginal_blockspec(
+                marginal_design,
+                &spec.marginal_offset,
+                rho_marginal,
+                hints.marginal_beta.clone(),
+            ),
             build_logslope_blockspec(
                 logslope_design,
                 baseline_slope,
+                &spec.logslope_offset,
                 rho_logslope,
-                hints.2.clone(),
+                hints.logslope_beta.clone(),
             ),
-        ])
+        ];
+        if let Some(ref prepared) = score_warp_prepared {
+            let rho_h = rho
+                .slice(s![cursor..cursor + prepared.block.penalties.len()])
+                .to_owned();
+            cursor += prepared.block.penalties.len();
+            blocks.push(build_aux_blockspec(
+                "score_warp_dev",
+                prepared,
+                rho_h,
+                hints.score_warp_beta.clone(),
+            )?);
+        }
+        if let Some(ref prepared) = link_dev_prepared {
+            let rho_w = rho
+                .slice(s![cursor..cursor + prepared.block.penalties.len()])
+                .to_owned();
+            blocks.push(build_aux_blockspec(
+                "link_dev",
+                prepared,
+                rho_w,
+                hints.link_dev_beta.clone(),
+            )?);
+        }
+        Ok(blocks)
     };
 
     // ── Pilot fit: rigid (zero-penalty) to seed coefficients ────────────
     {
         let rigid_rho = Array1::<f64>::zeros(
-            time_penalties_len + marginal_design.penalties.len() + logslope_design.penalties.len(),
+            time_penalties_len
+                + marginal_design.penalties.len()
+                + logslope_design.penalties.len()
+                + score_warp_prepared
+                    .as_ref()
+                    .map_or(0, |prepared| prepared.block.penalties.len())
+                + link_dev_prepared
+                    .as_ref()
+                    .map_or(0, |prepared| prepared.block.penalties.len()),
         );
         let rigid_blocks = build_blocks(&rigid_rho, &marginal_design, &logslope_design)?;
         let rigid_family = make_family(&marginal_design, &logslope_design);
         if let Ok(rigid_fit) = inner_fit(&rigid_family, &rigid_blocks, options) {
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = rigid_fit.block_states.get(0) {
-                hints_mut.0 = Some(block.beta.clone());
+                hints_mut.time_beta = Some(block.beta.clone());
             }
             if let Some(block) = rigid_fit.block_states.get(1) {
-                hints_mut.1 = Some(block.beta.clone());
+                hints_mut.marginal_beta = Some(block.beta.clone());
             }
             if let Some(block) = rigid_fit.block_states.get(2) {
-                hints_mut.2 = Some(block.beta.clone());
+                hints_mut.logslope_beta = Some(block.beta.clone());
+            }
+            if score_warp_prepared.is_some() {
+                if let Some(block) = rigid_fit.block_states.get(3) {
+                    hints_mut.score_warp_beta = Some(block.beta.clone());
+                }
+            }
+            if link_dev_prepared.is_some() {
+                let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
+                if let Some(block) = rigid_fit.block_states.get(link_idx) {
+                    hints_mut.link_dev_beta = Some(block.beta.clone());
+                }
             }
         }
     }
@@ -4088,26 +5749,43 @@ pub fn fit_survival_marginal_slope_terms(
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = fit.block_states.get(0) {
-                hints_mut.0 = Some(block.beta.clone());
+                hints_mut.time_beta = Some(block.beta.clone());
             }
             if let Some(block) = fit.block_states.get(1) {
-                hints_mut.1 = Some(block.beta.clone());
+                hints_mut.marginal_beta = Some(block.beta.clone());
             }
             if let Some(block) = fit.block_states.get(2) {
-                hints_mut.2 = Some(block.beta.clone());
+                hints_mut.logslope_beta = Some(block.beta.clone());
+            }
+            if score_warp_prepared.is_some() {
+                if let Some(block) = fit.block_states.get(3) {
+                    hints_mut.score_warp_beta = Some(block.beta.clone());
+                }
+            }
+            if link_dev_prepared.is_some() {
+                let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
+                if let Some(block) = fit.block_states.get(link_idx) {
+                    hints_mut.link_dev_beta = Some(block.beta.clone());
+                }
             }
             Ok(fit)
         },
         |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             let blocks = build_blocks(rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1]);
-            let derivative_blocks = vec![
+            let mut derivative_blocks = vec![
                 Vec::new(),
                 build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
                     .unwrap_or_default(),
                 build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
                     .unwrap_or_default(),
             ];
+            if family.score_warp.is_some() {
+                derivative_blocks.push(Vec::new());
+            }
+            if family.link_dev.is_some() {
+                derivative_blocks.push(Vec::new());
+            }
             let eval = evaluate_custom_family_joint_hyper(
                 &family,
                 &blocks,
@@ -4138,6 +5816,8 @@ pub fn fit_survival_marginal_slope_terms(
         logslope_design: designs[1].clone(),
         baseline_slope,
         time_block_penalties_len: time_penalties_len,
+        score_warp_runtime,
+        link_dev_runtime,
     })
 }
 
@@ -4188,6 +5868,49 @@ mod tests {
         DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse))
     }
 
+    fn test_deviation_runtime() -> DeviationRuntime {
+        build_deviation_block_from_seed(
+            &array![-1.0, 0.0, 1.0],
+            &DeviationBlockConfig {
+                degree: 3,
+                num_internal_knots: 1,
+                penalty_order: 2,
+                penalty_orders: vec![1, 2, 3],
+                double_penalty: false,
+                monotonicity_eps: 1e-4,
+            },
+        )
+        .expect("build test deviation runtime")
+        .runtime
+    }
+
+    fn test_family(
+        score_warp: Option<DeviationRuntime>,
+        link_dev: Option<DeviationRuntime>,
+    ) -> SurvivalMarginalSlopeFamily {
+        SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
+            offset_entry: Arc::new(Array1::zeros(1)),
+            offset_exit: Arc::new(Array1::zeros(1)),
+            derivative_offset_exit: Arc::new(Array1::zeros(1)),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 2))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 3))),
+            score_warp,
+            link_dev,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        }
+    }
+
     #[test]
     fn validate_spec_rejects_nonstructural_time_block() {
         let spec = SurvivalMarginalSlopeTermSpec {
@@ -4197,6 +5920,7 @@ mod tests {
             weights: array![1.0, 1.0],
             z: array![-1.0, 1.0],
             marginalspec: empty_termspec(),
+            marginal_offset: Array1::zeros(2),
             derivative_guard: 1e-4,
             time_block: TimeBlockInput {
                 design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
@@ -4210,6 +5934,9 @@ mod tests {
             },
             timewiggle_block: None,
             logslopespec: empty_termspec(),
+            logslope_offset: Array1::zeros(2),
+            score_warp: None,
+            link_dev: None,
         };
 
         let err = validate_spec(&spec).expect_err("non-structural time block should fail");
@@ -4217,6 +5944,184 @@ mod tests {
             err.contains("requires structural time monotonicity"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn block_slices_handles_link_only_survival_flex_layout() {
+        let link_runtime = test_deviation_runtime();
+        let family = test_family(None, Some(link_runtime.clone()));
+        let block_states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(2),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(3),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim),
+                eta: Array1::zeros(1),
+            },
+        ];
+
+        let slices = block_slices(&family, &block_states);
+        assert!(slices.score_warp.is_none());
+        assert_eq!(
+            slices.link_dev.as_ref().expect("link-only slice").len(),
+            link_runtime.basis_dim
+        );
+        assert_eq!(slices.total, 1 + 2 + 3 + link_runtime.basis_dim);
+    }
+
+    #[test]
+    fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.7]),
+            z: Arc::new(array![0.25]),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            offset_entry: Arc::new(array![0.2]),
+            offset_exit: Arc::new(array![0.4]),
+            derivative_offset_exit: Arc::new(array![0.8]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.6],
+            },
+        ];
+        let q_geom = family
+            .row_dynamic_q_geometry(0, &block_states)
+            .expect("row geometry");
+        let primary = flex_primary_slices(&family);
+        let (nll_exact, grad_exact, hess_exact) = family
+            .compute_row_flex_primary_gradient_hessian_exact(0, &block_states, &q_geom, &primary)
+            .expect("exact flex row");
+        let (nll_rigid, grad_rigid, hess_rigid) = row_primary_closed_form(
+            q_geom.q0,
+            q_geom.q1,
+            q_geom.qd1,
+            block_states[2].eta[0],
+            family.z[0],
+            family.weights[0],
+            family.event[0],
+            family.derivative_guard,
+        )
+        .expect("rigid row");
+
+        assert!((nll_exact - nll_rigid).abs() < 1e-10);
+        for idx in 0..N_PRIMARY {
+            assert!((grad_exact[idx] - grad_rigid[idx]).abs() < 1e-8);
+        }
+        for i in 0..N_PRIMARY {
+            for j in 0..N_PRIMARY {
+                assert!((hess_exact[[i, j]] - hess_rigid[i][j]).abs() < 1e-7);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![0.9]),
+            z: Arc::new(array![-0.35]),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            offset_entry: Arc::new(array![-0.1]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.6]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.45],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim),
+                eta: Array1::zeros(1),
+            },
+        ];
+        let q_geom = family
+            .row_dynamic_q_geometry(0, &block_states)
+            .expect("row geometry");
+        let primary = flex_primary_slices(&family);
+        let (nll_exact, grad_exact, hess_exact) = family
+            .compute_row_flex_primary_gradient_hessian_exact(0, &block_states, &q_geom, &primary)
+            .expect("exact flex row");
+        let (nll_rigid, grad_rigid, hess_rigid) = row_primary_closed_form(
+            q_geom.q0,
+            q_geom.q1,
+            q_geom.qd1,
+            block_states[2].eta[0],
+            family.z[0],
+            family.weights[0],
+            family.event[0],
+            family.derivative_guard,
+        )
+        .expect("rigid row");
+
+        assert!((nll_exact - nll_rigid).abs() < 1e-10);
+        assert!((grad_exact[primary.q0] - grad_rigid[0]).abs() < 1e-8);
+        assert!((grad_exact[primary.q1] - grad_rigid[1]).abs() < 1e-8);
+        assert!((grad_exact[primary.qd1] - grad_rigid[2]).abs() < 1e-8);
+        assert!((grad_exact[primary.g] - grad_rigid[3]).abs() < 1e-8);
+        assert!((hess_exact[[primary.q0, primary.q0]] - hess_rigid[0][0]).abs() < 1e-7);
+        assert!((hess_exact[[primary.q0, primary.g]] - hess_rigid[0][3]).abs() < 1e-7);
+        assert!((hess_exact[[primary.q1, primary.q1]] - hess_rigid[1][1]).abs() < 1e-7);
+        assert!((hess_exact[[primary.q1, primary.g]] - hess_rigid[1][3]).abs() < 1e-7);
+        assert!((hess_exact[[primary.qd1, primary.qd1]] - hess_rigid[2][2]).abs() < 1e-7);
+        assert!((hess_exact[[primary.g, primary.g]] - hess_rigid[3][3]).abs() < 1e-7);
     }
 
     #[test]

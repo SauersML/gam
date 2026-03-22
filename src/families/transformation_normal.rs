@@ -114,6 +114,10 @@ pub struct TransformationNormalFamily {
     // --- Covariate side (rebuilt on κ change) ---
     /// Original covariate design used on the right side of the tensor product.
     covariate_design: DesignMatrix,
+    /// Optional non-negative row weights folded directly into the likelihood.
+    weights: Arc<Array1<f64>>,
+    /// Additive offset for the transformation linear predictor.
+    offset: Arc<Array1<f64>>,
     // --- Tensor penalties ---
     tensor_penalties: Vec<PenaltyMatrix>,
 
@@ -148,6 +152,8 @@ impl TransformationNormalFamily {
     /// * `warm_start` - Optional location/scale from a prior normalizer.
     pub fn new(
         response: &Array1<f64>,
+        weights: &Array1<f64>,
+        offset: &Array1<f64>,
         covariate_design: DesignMatrix,
         covariate_penalties: Vec<PenaltyMatrix>,
         config: &TransformationNormalConfig,
@@ -164,6 +170,33 @@ impl TransformationNormalFamily {
         let p_cov = covariate_design.ncols();
         if p_cov == 0 {
             return Err("covariate design has zero columns".to_string());
+        }
+        if weights.len() != n {
+            return Err(format!(
+                "response length {} != weights length {}",
+                n,
+                weights.len()
+            ));
+        }
+        if offset.len() != n {
+            return Err(format!(
+                "response length {} != offset length {}",
+                n,
+                offset.len()
+            ));
+        }
+        for (i, &weight) in weights.iter().enumerate() {
+            if !weight.is_finite() {
+                return Err(format!("weights[{i}] is not finite: {weight}"));
+            }
+            if weight < 0.0 {
+                return Err(format!("weights[{i}] must be non-negative: {weight}"));
+            }
+        }
+        for (i, &value) in offset.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!("offset[{i}] is not finite: {value}"));
+            }
         }
         for (i, sp) in covariate_penalties.iter().enumerate() {
             let (r, c) = sp.shape();
@@ -218,6 +251,8 @@ impl TransformationNormalFamily {
             response_val_basis: resp_val,
             response_deriv_basis: resp_deriv,
             covariate_design,
+            weights: Arc::new(weights.clone()),
+            offset: Arc::new(offset.clone()),
             tensor_penalties,
             initial_beta,
             initial_log_lambdas,
@@ -240,6 +275,8 @@ impl TransformationNormalFamily {
         response_knots: Array1<f64>,
         response_degree: usize,
         response_transform: Array2<f64>,
+        weights: &Array1<f64>,
+        offset: &Array1<f64>,
         covariate_design: DesignMatrix,
         covariate_penalties: Vec<PenaltyMatrix>,
         config: &TransformationNormalConfig,
@@ -256,6 +293,33 @@ impl TransformationNormalFamily {
         let p_cov = covariate_design.ncols();
         if p_cov == 0 {
             return Err("covariate design has zero columns".to_string());
+        }
+        if weights.len() != n {
+            return Err(format!(
+                "response basis rows {} != weights length {}",
+                n,
+                weights.len()
+            ));
+        }
+        if offset.len() != n {
+            return Err(format!(
+                "response basis rows {} != offset length {}",
+                n,
+                offset.len()
+            ));
+        }
+        for (i, &weight) in weights.iter().enumerate() {
+            if !weight.is_finite() {
+                return Err(format!("weights[{i}] is not finite: {weight}"));
+            }
+            if weight < 0.0 {
+                return Err(format!("weights[{i}] must be non-negative: {weight}"));
+            }
+        }
+        for (i, &value) in offset.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!("offset[{i}] is not finite: {value}"));
+            }
         }
         for (i, sp) in covariate_penalties.iter().enumerate() {
             let (r, c) = sp.shape();
@@ -313,6 +377,8 @@ impl TransformationNormalFamily {
             response_val_basis,
             response_deriv_basis,
             covariate_design,
+            weights: Arc::new(weights.clone()),
+            offset: Arc::new(offset.clone()),
             tensor_penalties,
             initial_beta,
             initial_log_lambdas,
@@ -343,7 +409,7 @@ impl TransformationNormalFamily {
         ParameterBlockSpec {
             name: self.block_name.clone(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(self.x_val_kron.clone()))),
-            offset: Array1::zeros(self.x_val_kron.nrows()),
+            offset: self.offset.as_ref().clone(),
             penalties: self.tensor_penalties.clone(),
             nullspace_dims: vec![],
             initial_log_lambdas: self.initial_log_lambdas.clone(),
@@ -368,7 +434,7 @@ impl TransformationNormalFamily {
     /// Uses the Kronecker-aware operators directly, avoiding full
     /// n × p_total matrix-vector products through a materialized tensor product.
     fn compute_h_and_h_prime(&self, beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-        let h = self.x_val_kron.forward_mul(beta);
+        let h = self.x_val_kron.forward_mul(beta) + self.offset.as_ref();
         let h_prime = self.x_deriv_kron.forward_mul(beta);
         (h, h_prime)
     }
@@ -402,24 +468,27 @@ impl CustomFamily for TransformationNormalFamily {
         // Log-likelihood: Σ [-½ h² + log(h')]
         let mut log_likelihood = 0.0;
         for i in 0..n {
-            log_likelihood += -0.5 * h[i] * h[i] + h_prime[i].ln();
+            log_likelihood += self.weights[i] * (-0.5 * h[i] * h[i] + h_prime[i].ln());
         }
 
         // Gradient of log-likelihood: ∇ℓ = -X_val^T h + X_deriv^T (1/h')
         let inv_h_prime = h_prime.mapv(|v| 1.0 / v);
+        let weighted_h = &h * self.weights.as_ref();
+        let weighted_inv_h_prime = &inv_h_prime * self.weights.as_ref();
         // gradient = -X_val^T h + X_deriv^T inv_h_prime
         let grad = {
-            let neg_xvt_h = self.x_val_kron.transpose_mul(&h).mapv(|v| -v);
-            let xdt_inv = self.x_deriv_kron.transpose_mul(&inv_h_prime);
+            let neg_xvt_h = self.x_val_kron.transpose_mul(&weighted_h).mapv(|v| -v);
+            let xdt_inv = self.x_deriv_kron.transpose_mul(&weighted_inv_h_prime);
             neg_xvt_h + &xdt_inv
         };
 
         // Hessian of negative log-likelihood: -∇²ℓ = X_val^T X_val + X_deriv^T diag(1/h'²) X_deriv
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
+        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
         let hessian = {
-            let xtx_val = self.x_val_kron.gram();
+            let xtx_val = self.x_val_kron.weighted_gram(self.weights.as_ref());
             // X_deriv^T diag(w) X_deriv where w = 1/h'^2
-            let xtx_deriv = self.x_deriv_kron.weighted_gram(&inv_h_prime_sq);
+            let xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_h_prime_sq);
             xtx_val + &xtx_deriv
         };
 
@@ -444,7 +513,7 @@ impl CustomFamily for TransformationNormalFamily {
                 // return -inf so the backtracking loop rejects the step.
                 return Ok(f64::NEG_INFINITY);
             }
-            ll += -0.5 * h[i] * h[i] + h_prime[i].ln();
+            ll += self.weights[i] * (-0.5 * h[i] * h[i] + h_prime[i].ln());
         }
         Ok(ll)
     }
@@ -537,7 +606,8 @@ impl CustomFamily for TransformationNormalFamily {
         let n = h_prime.len();
         let mut weight = Array1::zeros(n);
         for i in 0..n {
-            weight[i] = -2.0 * d_h_prime[i] / (h_prime[i] * h_prime[i] * h_prime[i]);
+            weight[i] =
+                -2.0 * self.weights[i] * d_h_prime[i] / (h_prime[i] * h_prime[i] * h_prime[i]);
         }
         let dd = self.x_deriv_kron.weighted_gram(&weight);
         Ok(Some(dd))
@@ -551,8 +621,9 @@ impl CustomFamily for TransformationNormalFamily {
         let beta = &block_states[0].beta;
         let h_prime = self.x_deriv_kron.forward_mul(beta);
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
-        let xtx_val = self.x_val_kron.gram();
-        let xtx_deriv = self.x_deriv_kron.weighted_gram(&inv_h_prime_sq);
+        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
+        let xtx_val = self.x_val_kron.weighted_gram(self.weights.as_ref());
+        let xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_h_prime_sq);
         Ok(Some(xtx_val + &xtx_deriv))
     }
 
@@ -581,6 +652,9 @@ impl CustomFamily for TransformationNormalFamily {
         let inv_h_prime: Array1<f64> = h_prime.mapv(|v| 1.0 / v);
         let inv_h_prime_sq: Array1<f64> = h_prime.mapv(|v| 1.0 / (v * v));
         let inv_h_prime_cu: Array1<f64> = h_prime.mapv(|v| 1.0 / (v * v * v));
+        let weighted_h = &h * self.weights.as_ref();
+        let weighted_inv_h_prime = &inv_h_prime * self.weights.as_ref();
+        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
 
         let op = deriv
             .implicit_operator
@@ -600,19 +674,20 @@ impl CustomFamily for TransformationNormalFamily {
 
         let mut obj_psi = 0.0;
         for i in 0..n {
-            obj_psi += h[i] * v_val[i] - inv_h_prime[i] * v_deriv[i];
+            obj_psi += self.weights[i] * (h[i] * v_val[i] - inv_h_prime[i] * v_deriv[i]);
         }
 
         let score_psi = {
             let term1 = op
-                .transpose_mul(axis, &h.view())
+                .transpose_mul(axis, &weighted_h.view())
                 .map_err(|e| format!("tensor psi transpose_mul failed: {e}"))?;
-            let term2 = self.x_val_kron.transpose_mul(&v_val);
+            let weighted_v_val = &v_val * self.weights.as_ref();
+            let term2 = self.x_val_kron.transpose_mul(&weighted_v_val);
             let term3 = op
-                .transpose_mul_deriv(axis, &inv_h_prime)
+                .transpose_mul_deriv(axis, &weighted_inv_h_prime)
                 .map_err(|e| format!("tensor psi derivative transpose_mul failed: {e}"))?
                 .mapv(|v| -v);
-            let w_deriv = &v_deriv * &inv_h_prime_sq;
+            let w_deriv = &v_deriv * &weighted_inv_h_prime_sq;
             let term4 = self.x_deriv_kron.transpose_mul(&w_deriv);
             term1 + &term2 + &term3 + &term4
         };
@@ -623,7 +698,7 @@ impl CustomFamily for TransformationNormalFamily {
                     &self.response_val_basis,
                     &self.response_val_basis,
                     axis,
-                    &Array1::ones(n),
+                    self.weights.as_ref(),
                 )
                 .map_err(|e| format!("tensor psi weighted_cross(value) failed: {e}"))?;
             let sym_val = &xvt_xvp + &xvt_xvp.t();
@@ -633,12 +708,12 @@ impl CustomFamily for TransformationNormalFamily {
                     &self.response_deriv_basis,
                     &self.response_deriv_basis,
                     axis,
-                    &inv_h_prime_sq,
+                    &weighted_inv_h_prime_sq,
                 )
                 .map_err(|e| format!("tensor psi weighted_cross(derivative) failed: {e}"))?;
             let sym_deriv = &xdt_xdp + &xdt_xdp.t();
 
-            let w_cubic = (&v_deriv * &inv_h_prime_cu).mapv(|v| -2.0 * v);
+            let w_cubic = ((&v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             let cubic_term = self.x_deriv_kron.weighted_gram(&w_cubic);
 
             sym_val + &sym_deriv + &cubic_term
@@ -944,17 +1019,6 @@ impl KroneckerDesign {
                     out.slice_mut(s![j * pb..(j + 1) * pb]).assign(&cov_block);
                 }
                 out
-            }
-        }
-    }
-
-    /// Compute `self^T · self`, the Gram matrix.
-    /// Returns a (p_a·p_b) × (p_a·p_b) matrix.
-    fn gram(&self) -> Array2<f64> {
-        match self {
-            KroneckerDesign::Factored { .. } => {
-                let dense = self.to_dense();
-                fast_atb(&dense, &dense)
             }
         }
     }
@@ -1795,6 +1859,8 @@ pub struct TransformationNormalFitResult {
 /// optimizer is used with a single block (the covariate spec).
 pub fn fit_transformation_normal(
     response: &Array1<f64>,
+    weights: &Array1<f64>,
+    offset: &Array1<f64>,
     covariate_data: ArrayView2<'_, f64>,
     covariate_spec: &TermCollectionSpec,
     config: &TransformationNormalConfig,
@@ -1825,6 +1891,8 @@ pub fn fit_transformation_normal(
             resp_knots.clone(),
             config.response_degree,
             resp_transform,
+            weights,
+            offset,
             cov_design.design.clone(),
             cov_design
                 .penalties
@@ -1884,6 +1952,8 @@ pub fn fit_transformation_normal(
         resp_knots.clone(),
         config.response_degree,
         resp_transform.clone(),
+        weights,
+        offset,
         boot_design.design.clone(),
         boot_design
             .penalties
@@ -1931,6 +2001,8 @@ pub fn fit_transformation_normal(
                 rk.clone(),
                 rdeg,
                 rt.clone(),
+                weights,
+                offset,
                 cov_design.design.clone(),
                 cov_design
                     .penalties

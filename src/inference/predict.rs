@@ -1157,13 +1157,31 @@ impl BernoulliMarginalSlopePredictor {
             ));
         }
         let n = z.len();
+        if input.offset.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope prediction primary offset length mismatch: rows={n}, offset={}",
+                input.offset.len()
+            )));
+        }
+        let logslope_offset = input
+            .offset_noise
+            .as_ref()
+            .map_or_else(|| Array1::zeros(n), Clone::clone);
+        if logslope_offset.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope prediction logslope offset length mismatch: rows={n}, offset_noise={}",
+                logslope_offset.len()
+            )));
+        }
         let marginal_eta = input
             .design
             .dot(&beta_marginal.to_owned())
-            .mapv(|v| v + self.baseline_marginal);
+            .mapv(|v| v + self.baseline_marginal)
+            + &input.offset;
         let logslope_eta = design_logslope
             .dot(&beta_logslope.to_owned())
-            .mapv(|v| v + self.baseline_logslope);
+            .mapv(|v| v + self.baseline_logslope)
+            + &logslope_offset;
         let flex_active =
             self.score_warp_runtime.is_some() || self.link_deviation_runtime.is_some();
         let marginal_dim = self.beta_marginal.len();
