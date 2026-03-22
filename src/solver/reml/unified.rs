@@ -2211,6 +2211,14 @@ pub struct InnerSolution<'dp> {
     /// Optional exact Jeffreys/Firth term in the active coefficient basis.
     pub firth: Option<ExactJeffreysTerm>,
 
+    /// Additive correction for the Hessian logdet when `hessian_op` encodes a
+    /// uniformly rescaled exact curvature matrix.
+    pub hessian_logdet_correction: f64,
+
+    /// Uniform scale applied to rho-coordinate penalty derivatives only in the
+    /// H-dependent trace / solve parts of the outer calculus.
+    pub rho_curvature_scale: f64,
+
     // === Model dimensions ===
     /// Number of observations.
     pub n_observations: usize,
@@ -2262,6 +2270,8 @@ pub struct InnerSolutionBuilder<'dp> {
     tk_correction: f64,
     tk_gradient: Option<Array1<f64>>,
     firth: Option<ExactJeffreysTerm>,
+    hessian_logdet_correction: f64,
+    rho_curvature_scale: f64,
     nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
     ext_coords: Vec<HyperCoord>,
@@ -2296,6 +2306,8 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             tk_correction: 0.0,
             tk_gradient: None,
             firth: None,
+            hessian_logdet_correction: 0.0,
+            rho_curvature_scale: 1.0,
             nullspace_dim_override: None,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -2318,6 +2330,16 @@ impl<'dp> InnerSolutionBuilder<'dp> {
 
     pub fn firth(mut self, op: Option<std::sync::Arc<super::FirthDenseOperator>>) -> Self {
         self.firth = op.map(ExactJeffreysTerm::new);
+        self
+    }
+
+    pub fn hessian_logdet_correction(mut self, correction: f64) -> Self {
+        self.hessian_logdet_correction = correction;
+        self
+    }
+
+    pub fn rho_curvature_scale(mut self, scale: f64) -> Self {
+        self.rho_curvature_scale = scale;
         self
     }
 
@@ -2385,6 +2407,8 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             tk_correction: self.tk_correction,
             tk_gradient: self.tk_gradient,
             firth: self.firth,
+            hessian_logdet_correction: self.hessian_logdet_correction,
+            rho_curvature_scale: self.rho_curvature_scale,
             n_observations: self.n_observations,
             nullspace_dim,
             dispersion: self.dispersion,
@@ -2434,6 +2458,11 @@ fn penalty_a_k_beta(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: f64) 
 
 fn penalty_a_k_quadratic(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: f64) -> f64 {
     coord.quadratic(beta, lambda)
+}
+
+#[inline]
+fn rho_curvature_lambda(solution: &InnerSolution<'_>, lambda: f64) -> f64 {
+    solution.rho_curvature_scale * lambda
 }
 
 fn trace_hinv_penalty_cross(
@@ -2561,11 +2590,16 @@ pub fn reml_laml_evaluate(
 ) -> Result<RemlLamlResult, String> {
     let k = rho.len();
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let curvature_lambdas: Vec<f64> = lambdas
+        .iter()
+        .copied()
+        .map(|lambda| rho_curvature_lambda(solution, lambda))
+        .collect();
     let hop = &*solution.hessian_op;
 
     // ─── Shared intermediates (computed once, used by both cost and gradient) ───
 
-    let log_det_h = hop.logdet();
+    let log_det_h = hop.logdet() + solution.hessian_logdet_correction;
     let log_det_s = solution.penalty_logdet.value;
 
     let (cost, profiled_scale, dp_cgrad) = match &solution.dispersion {
@@ -2681,16 +2715,22 @@ pub fn reml_laml_evaluate(
 
     let ext_dim = solution.ext_coords.len();
     let mut grad = Array1::zeros(k + ext_dim);
-    let rho_a_k_betas: Vec<Array1<f64>> = solution
+    let rho_penalty_a_k_betas: Vec<Array1<f64>> = solution
         .penalty_coords
         .iter()
         .zip(lambdas.iter().copied())
         .map(|(coord, lambda)| penalty_a_k_beta(coord, &solution.beta, lambda))
         .collect();
+    let rho_curvature_a_k_betas: Vec<Array1<f64>> = solution
+        .penalty_coords
+        .iter()
+        .zip(curvature_lambdas.iter().copied())
+        .map(|(coord, lambda)| penalty_a_k_beta(coord, &solution.beta, lambda))
+        .collect();
     let need_rho_v = effective_deriv.has_corrections() || solution.firth.is_some();
     let rho_v_ks: Option<Vec<Array1<f64>>> = if need_rho_v {
         Some(
-            rho_a_k_betas
+            rho_curvature_a_k_betas
                 .iter()
                 .map(|a_k_beta| hop.solve(a_k_beta))
                 .collect(),
@@ -2749,11 +2789,13 @@ pub fn reml_laml_evaluate(
             for idx in 0..k {
                 let coord = &solution.penalty_coords[idx];
                 if coord.uses_operator_fast_path() {
-                    rho_ops
-                        .push(coord.scaled_operator(lambdas[idx], rho_corrections[idx].as_ref()));
+                    rho_ops.push(
+                        coord
+                            .scaled_operator(curvature_lambdas[idx], rho_corrections[idx].as_ref()),
+                    );
                     coord_has_operator.push(true);
                 } else {
-                    let mut a_k = coord.scaled_dense_matrix(lambdas[idx]);
+                    let mut a_k = coord.scaled_dense_matrix(curvature_lambdas[idx]);
                     if let Some(corr) = rho_corrections[idx].as_ref() {
                         a_k += corr;
                     }
@@ -2831,7 +2873,8 @@ pub fn reml_laml_evaluate(
 
             // rho-coordinates: H_k = A_k + correction(v_k)
             for idx in 0..k {
-                let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(lambdas[idx]);
+                let mut a_k =
+                    solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
                 if let Some(corr) = rho_corrections[idx].as_ref() {
                     a_k += corr;
                 }
@@ -2862,7 +2905,7 @@ pub fn reml_laml_evaluate(
 
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
-        let a_k_beta = &rho_a_k_betas[idx];
+        let a_k_beta = &rho_penalty_a_k_betas[idx];
 
         // Term 1: penalty quadratic derivative.
         // For Gaussian (profiled): dp_cgrad × D_k / (2φ̂) where D_k = β̂ᵀAₖβ̂.
@@ -2888,15 +2931,16 @@ pub fn reml_laml_evaluate(
             0.5 * stoch_traces[idx]
         } else {
             if coord.uses_operator_fast_path() {
-                let op = coord.scaled_operator(lambdas[idx], rho_corrections[idx].as_ref());
+                let op =
+                    coord.scaled_operator(curvature_lambdas[idx], rho_corrections[idx].as_ref());
                 0.5 * hop.trace_logdet_h_k_operator(&op, None)
             } else if coord.is_block_local() && rho_corrections[idx].is_none() {
                 // Block-local penalty with no observation correction:
                 // compute trace using only the block slice of the eigenbasis.
                 let (block, start, end) = coord.scaled_block_local(1.0);
-                0.5 * hop.trace_logdet_block_local(&block, lambdas[idx], start, end)
+                0.5 * hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
             } else {
-                let mut a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+                let mut a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
                 if let Some(corr) = rho_corrections[idx].as_ref() {
                     a_k_matrix += corr;
                 }
@@ -3257,6 +3301,11 @@ fn compute_outer_hessian(
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
     let mut hess = Array2::zeros((total, total));
+    let curvature_lambdas: Vec<f64> = lambdas
+        .iter()
+        .copied()
+        .map(|lambda| rho_curvature_lambda(solution, lambda))
+        .collect();
 
     let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => (true, true),
@@ -3290,7 +3339,7 @@ fn compute_outer_hessian(
 
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
-        let a_k_beta = penalty_a_k_beta(coord, &solution.beta, lambdas[idx]);
+        let a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
         let v_k = hop.solve(&a_k_beta);
         a_k_betas.push(a_k_beta);
         v_ks.push(v_k);
@@ -3310,7 +3359,7 @@ fn compute_outer_hessian(
     let mut a_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
     let mut h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
     for idx in 0..k {
-        let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(lambdas[idx]);
+        let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
         a_k_matrices.push(a_k.clone());
 
         let correction = if effective_deriv.has_corrections() {
@@ -3518,7 +3567,7 @@ fn compute_outer_hessian(
                 // Base is tr(G_ε Aₖ), NOT tr(G_ε Ḣₖ).
                 let base = if solution.penalty_coords[kk].is_block_local() {
                     let (block, start, end) = solution.penalty_coords[kk].scaled_block_local(1.0);
-                    hop.trace_logdet_block_local(&block, lambdas[kk], start, end)
+                    hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
                 } else {
                     hop.trace_logdet_gradient(&a_k_matrices[kk])
                 };
@@ -3526,7 +3575,8 @@ fn compute_outer_hessian(
                     // β_{kk} RHS = Ḣₖ vₖ + Aₖ vₖ − Aₖ β̂
                     // Use scaled_matvec for block-local penalty efficiency.
                     let mut rhs = h_k_matrices[kk].dot(&v_ks[kk]);
-                    rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[kk], lambdas[kk]);
+                    rhs += &solution.penalty_coords[kk]
+                        .scaled_matvec(&v_ks[kk], curvature_lambdas[kk]);
                     rhs -= &a_k_betas[kk];
 
                     if let Some(ref z_c) = adjoint_z_c {
@@ -3556,7 +3606,8 @@ fn compute_outer_hessian(
                 // Off-diagonal: Ḧ_{kl} = correction(β_{kl}, vₖ, vₗ) only (no Aₖ base).
                 if effective_deriv.has_corrections() {
                     let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
-                    rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], lambdas[kk]);
+                    rhs += &solution.penalty_coords[kk]
+                        .scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
 
                     if let Some(ref z_c) = adjoint_z_c {
                         let c_trace = rhs.dot(z_c);
@@ -3650,7 +3701,7 @@ fn compute_outer_hessian(
                     };
                     let mut rhs = ext_h_v_rho;
                     rhs += &solution.penalty_coords[rho_idx]
-                        .scaled_matvec(&ext_v[ext_idx], lambdas[rho_idx]);
+                        .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
                     rhs -= &pair.g;
 
                     // Ḧ_{rho,ext}: second Hessian drift.
@@ -3862,7 +3913,7 @@ fn compute_outer_hessian(
             &h_k_matrices,
             &a_k_betas,
             &solution.penalty_coords,
-            lambdas,
+            &curvature_lambdas,
         );
         let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
         sl += &fh;
@@ -3945,6 +3996,11 @@ const EFS_MAX_STEP: f64 = 5.0;
 pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64> {
     let k = rho.len();
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let curvature_lambdas: Vec<f64> = lambdas
+        .iter()
+        .copied()
+        .map(|lambda| rho_curvature_lambda(solution, lambda))
+        .collect();
     let hop = &*solution.hessian_op;
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
@@ -3981,25 +4037,31 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         // Numerator: 2·a_k - tr(H⁻¹ B_k)
         // We drop the C[β_k] correction for EFS (pass None).
         let trace_term = if coord.uses_operator_fast_path() {
-            let op = coord.scaled_operator(lambdas[idx], None);
+            let op = coord.scaled_operator(curvature_lambdas[idx], None);
             hop.trace_hinv_operator(&op)
         } else if coord.is_block_local() {
             let (block, start, end) = coord.scaled_block_local(1.0);
-            hop.trace_hinv_block_local(&block, lambdas[idx], start, end)
+            hop.trace_hinv_block_local(&block, curvature_lambdas[idx], start, end)
         } else {
-            let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+            let a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
             hop.trace_hinv_h_k(&a_k_matrix, None)
         };
         let numerator = 2.0 * a_k_eff - trace_term;
 
         // Denominator: tr(H⁻¹ B_k H⁻¹ B_k)
         let denominator = if coord.uses_operator_fast_path() {
-            trace_hinv_penalty_cross(hop, coord, lambdas[idx], coord, lambdas[idx])
+            trace_hinv_penalty_cross(
+                hop,
+                coord,
+                curvature_lambdas[idx],
+                coord,
+                curvature_lambdas[idx],
+            )
         } else if coord.is_block_local() {
             let (block, start, end) = coord.scaled_block_local(1.0);
-            hop.trace_hinv_block_local_cross(&block, lambdas[idx], start, end)
+            hop.trace_hinv_block_local_cross(&block, curvature_lambdas[idx], start, end)
         } else {
-            let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+            let a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
             hop.trace_hinv_product_cross(&a_k_matrix, &a_k_matrix)
         };
 
@@ -4164,6 +4226,11 @@ pub fn compute_hybrid_efs_update(
 ) -> HybridEfsResult {
     let k = rho.len();
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let curvature_lambdas: Vec<f64> = lambdas
+        .iter()
+        .copied()
+        .map(|lambda| rho_curvature_lambda(solution, lambda))
+        .collect();
     let hop = &*solution.hessian_op;
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
@@ -4191,23 +4258,29 @@ pub fn compute_hybrid_efs_update(
         };
 
         let trace_term = if coord.uses_operator_fast_path() {
-            let op = coord.scaled_operator(lambdas[idx], None);
+            let op = coord.scaled_operator(curvature_lambdas[idx], None);
             hop.trace_hinv_operator(&op)
         } else if coord.is_block_local() {
             let (block, start, end) = coord.scaled_block_local(1.0);
-            hop.trace_hinv_block_local(&block, lambdas[idx], start, end)
+            hop.trace_hinv_block_local(&block, curvature_lambdas[idx], start, end)
         } else {
-            let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+            let a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
             hop.trace_hinv_h_k(&a_k_matrix, None)
         };
         let numerator = 2.0 * a_k_eff - trace_term;
         let denominator = if coord.uses_operator_fast_path() {
-            trace_hinv_penalty_cross(hop, coord, lambdas[idx], coord, lambdas[idx])
+            trace_hinv_penalty_cross(
+                hop,
+                coord,
+                curvature_lambdas[idx],
+                coord,
+                curvature_lambdas[idx],
+            )
         } else if coord.is_block_local() {
             let (block, start, end) = coord.scaled_block_local(1.0);
-            hop.trace_hinv_block_local_cross(&block, lambdas[idx], start, end)
+            hop.trace_hinv_block_local_cross(&block, curvature_lambdas[idx], start, end)
         } else {
-            let a_k_matrix = coord.scaled_dense_matrix(lambdas[idx]);
+            let a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
             hop.trace_hinv_product_cross(&a_k_matrix, &a_k_matrix)
         };
 
@@ -6718,6 +6791,8 @@ mod tests {
             tk_correction: 0.0,
             tk_gradient: None,
             firth: None,
+            hessian_logdet_correction: 0.0,
+            rho_curvature_scale: 1.0,
             n_observations: 100,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
@@ -6843,6 +6918,8 @@ mod tests {
             tk_correction: 0.0,
             tk_gradient: None,
             firth: None,
+            hessian_logdet_correction: 0.0,
+            rho_curvature_scale: 1.0,
             n_observations: n,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,

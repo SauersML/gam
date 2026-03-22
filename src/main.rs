@@ -229,13 +229,14 @@ struct FitArgs {
         long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary penalized linear term (all non-intercept linear coefficients are ridge-penalized by default)\n- linear(x, min=..., max=...): penalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for penalized generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula_positional: String,
-    /// Fit a second formula for the scale/noise block in location-scale mode.
+    /// Fit a second RHS-only formula for the scale/noise block in
+    /// location-scale mode. Pass terms like `smooth(x)` or `1`, not `y ~ ...`.
     /// This does not change the base mean link; use `link(type=...)` when you
     /// want a non-default binomial link.
     #[arg(long = "predict-noise", alias = "predict-variance")]
     predict_noise: Option<String>,
-    /// Secondary formula for the ancestry-varying log-slope surface in the
-    /// Bernoulli marginal-slope family.
+    /// Secondary RHS-only formula for the ancestry-varying log-slope surface
+    /// in the Bernoulli marginal-slope family. Pass terms only, not `y ~ ...`.
     #[arg(long = "logslope-formula")]
     logslope_formula: Option<String>,
     /// Column containing the latent-N(0,1) score z for the Bernoulli
@@ -552,6 +553,32 @@ fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
         pirls: None,
         ..Default::default()
     };
+}
+
+fn gaussian_saved_fit_scale_for_role(role: BlockRole, response_scale: f64) -> f64 {
+    match role {
+        BlockRole::Mean | BlockRole::Location | BlockRole::LinkWiggle => response_scale,
+        BlockRole::Scale | BlockRole::Time | BlockRole::Threshold => 1.0,
+    }
+}
+
+fn scale_covariance_by_block_role(
+    cov: &Array2<f64>,
+    blocks: &[gam::estimate::FittedBlock],
+    response_scale: f64,
+) -> Array2<f64> {
+    let mut scaled = cov.clone();
+    let mut scales = Vec::with_capacity(cov.nrows());
+    for block in blocks {
+        let factor = gaussian_saved_fit_scale_for_role(block.role.clone(), response_scale);
+        scales.extend(std::iter::repeat_n(factor, block.beta.len()));
+    }
+    for i in 0..scaled.nrows() {
+        for j in 0..scaled.ncols() {
+            scaled[[i, j]] *= scales[i] * scales[j];
+        }
+    }
+    scaled
 }
 
 fn run_fit(args: FitArgs) -> Result<(), String> {
@@ -1625,26 +1652,23 @@ fn run_fitwith_predict_noise(
         print_spatial_aniso_scales(&noisespec_resolved);
         if let Some(out) = args.out.as_ref() {
             progress.set_stage("fit", "writing gaussian location-scale model");
-            let beta_mean = fit
-                .block_states
-                .first()
-                .map(|b| b.beta.clone())
-                .unwrap_or_else(|| Array1::zeros(0))
-                .mapv(|v| v * response_scale);
-            let p_mean = beta_mean.len();
-            // The joint covariance covers all blocks (mean + log-sigma).
-            // Extract the mean-block submatrix (top-left p_mean × p_mean)
-            // so that the saved fit result dimensions are consistent.
-            let beta_covariance = fit.covariance_conditional.as_ref().map(|cov| {
-                cov.slice(ndarray::s![..p_mean, ..p_mean])
-                    .mapv(|v| v * response_scale * response_scale)
-            });
-            let beta_covariance_corrected = fit.covariance_conditional.as_ref().map(|cov| {
-                cov.slice(ndarray::s![..p_mean, ..p_mean])
-                    .mapv(|v| v * response_scale * response_scale)
-            });
-            let fit_result = core_saved_fit_result(
-                beta_mean,
+            let mut blocks = fit.blocks.clone();
+            for block in &mut blocks {
+                let factor = gaussian_saved_fit_scale_for_role(block.role.clone(), response_scale);
+                if factor != 1.0 {
+                    block.beta.mapv_inplace(|value| value * factor);
+                }
+            }
+            let beta_covariance = fit
+                .covariance_conditional
+                .as_ref()
+                .map(|cov| scale_covariance_by_block_role(cov, &blocks, response_scale));
+            let beta_covariance_corrected = fit
+                .covariance_corrected
+                .as_ref()
+                .map(|cov| scale_covariance_by_block_role(cov, &blocks, response_scale));
+            let fit_result = compact_saved_multiblock_fit_result(
+                blocks,
                 fit.lambdas.clone(),
                 1.0,
                 beta_covariance,
@@ -1674,7 +1698,8 @@ fn run_fitwith_predict_noise(
                 frozen_meanspec,
                 frozen_noisespec,
                 fit_result,
-                fit.block_states.get(1).map(|b| b.beta.to_vec()),
+                fit.block_by_role(BlockRole::Scale)
+                    .map(|block| block.beta.to_vec()),
                 Some(&gaussian_noise_transform),
                 Some(response_scale),
             );
@@ -1823,25 +1848,12 @@ fn run_fitwith_predict_noise(
     print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
     if let Some(out) = args.out.as_ref() {
         progress.set_stage("fit", "writing binomial location-scale model");
-        let beta_threshold = fit
-            .block_states
-            .first()
-            .map(|b| b.beta.clone())
-            .unwrap_or_else(|| Array1::zeros(0));
-        let p_threshold = beta_threshold.len();
-        // The joint covariance covers all blocks (threshold + noise).
-        // Extract the threshold-block submatrix (top-left p_threshold × p_threshold)
-        // so that the saved fit result dimensions are consistent.
-        let covariance_threshold = fit.covariance_conditional.as_ref().map(|cov| {
-            cov.slice(ndarray::s![..p_threshold, ..p_threshold])
-                .to_owned()
-        });
-        let fit_result = core_saved_fit_result(
-            beta_threshold,
+        let fit_result = compact_saved_multiblock_fit_result(
+            fit.blocks.clone(),
             fit.lambdas.clone(),
             1.0,
-            covariance_threshold.clone(),
-            covariance_threshold,
+            fit.covariance_conditional.clone(),
+            fit.covariance_corrected.clone(),
             SavedFitSummary::from_blockwise_fit(&fit)?,
         );
         let dense_binom_mean = solved.fit.mean_design.design.to_dense();
@@ -1868,7 +1880,8 @@ fn run_fitwith_predict_noise(
             frozen_meanspec,
             frozen_noisespec,
             fit_result,
-            fit.block_states.get(1).map(|b| b.beta.to_vec()),
+            fit.block_by_role(BlockRole::Scale)
+                .map(|block| block.beta.to_vec()),
             Some(&binomial_noise_transform),
             None,
         );
@@ -3315,7 +3328,7 @@ fn run_predict_binomial_location_scale(
     let design_t = build_term_collection_design(data, &spec_t)
         .map_err(|e| format!("failed to build threshold prediction design: {e}"))?;
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let beta_t = fit_saved.beta.clone();
+    let beta_t = saved_binomial_location_scale_threshold_beta(&fit_saved)?;
     if beta_t.len() != design_t.design.ncols() {
         return Err(format!(
             "threshold model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -3332,12 +3345,11 @@ fn run_predict_binomial_location_scale(
     let design_noise = build_term_collection_design(data, &spec_noise)
         .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
     progress.advance_workflow(3);
-    let beta_noise = Array1::from_vec(
-        model
-            .beta_noise
-            .clone()
-            .ok_or_else(|| "binomial-location-scale model is missing beta_noise".to_string())?,
-    );
+    let beta_noise = saved_location_scale_noise_beta(
+        model,
+        &fit_saved,
+        "binomial-location-scale model is missing beta_noise",
+    )?;
     if beta_noise.len() != design_noise.design.ncols() {
         return Err(format!(
             "noise model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -3624,7 +3636,7 @@ fn run_predict_gaussian_location_scale(
     let design_mu = build_term_collection_design(data, &spec_mu)
         .map_err(|e| format!("failed to build gaussian mean prediction design: {e}"))?;
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let beta_mu = fit_saved.beta.clone();
+    let beta_mu = saved_gaussian_location_scale_mean_beta(&fit_saved)?;
     if beta_mu.len() != design_mu.design.ncols() {
         return Err(format!(
             "gaussian mean model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -3641,12 +3653,11 @@ fn run_predict_gaussian_location_scale(
     let design_noise = build_term_collection_design(data, &spec_noise)
         .map_err(|e| format!("failed to build gaussian noise prediction design: {e}"))?;
     progress.advance_workflow(3);
-    let beta_noise = Array1::from_vec(
-        model
-            .beta_noise
-            .clone()
-            .ok_or_else(|| "gaussian-location-scale model is missing beta_noise".to_string())?,
-    );
+    let beta_noise = saved_location_scale_noise_beta(
+        model,
+        &fit_saved,
+        "gaussian-location-scale model is missing beta_noise",
+    )?;
     if beta_noise.len() != design_noise.design.ncols() {
         return Err(format!(
             "gaussian noise model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -4900,7 +4911,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             "--z-column is required with --survival-likelihood marginal-slope".to_string()
         })?;
         let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
-        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+        let (logslope_formula, parsed_logslope) = parse_matching_auxiliary_formula(
             logslope_formula_raw,
             &response_expr,
             "--logslope-formula",
@@ -5076,6 +5087,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 )
                 .map_err(|e| e.to_string())?,
             );
+            payload.formula_logslope = Some(logslope_formula);
             payload.z_column = args.z_column.clone();
             payload.logslope_baseline = Some(fit.baseline_slope);
             payload.score_warp_runtime = fit
@@ -6398,7 +6410,7 @@ fn run_generate_gaussian_location_scale(
     let design = build_term_collection_design(data, &spec)
         .map_err(|e| format!("failed to build design: {e}"))?;
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let betamu = fit_saved.beta.clone();
+    let betamu = saved_gaussian_location_scale_mean_beta(&fit_saved)?;
     let spec_noise = resolve_termspec_for_prediction(
         &model.resolved_termspec_noise,
         training_headers,
@@ -6407,12 +6419,11 @@ fn run_generate_gaussian_location_scale(
     )?;
     let design_noise = build_term_collection_design(data, &spec_noise)
         .map_err(|e| format!("failed to build noise design: {e}"))?;
-    let beta_noise = Array1::from_vec(
-        model
-            .beta_noise
-            .clone()
-            .ok_or_else(|| "gaussian-location-scale model is missing beta_noise".to_string())?,
-    );
+    let beta_noise = saved_location_scale_noise_beta(
+        model,
+        &fit_saved,
+        "gaussian-location-scale model is missing beta_noise",
+    )?;
     if betamu.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols() {
         return Err("location-scale model/design dimension mismatch".to_string());
     }
@@ -6470,7 +6481,7 @@ fn run_generate_binomial_location_scale(
     let saved_link_kind = model
         .resolved_inverse_link()?
         .ok_or_else(|| "saved binomial-location-scale model is missing link state".to_string())?;
-    let beta_t = fit_saved.beta.clone();
+    let beta_t = saved_binomial_location_scale_threshold_beta(&fit_saved)?;
     let spec_noise = resolve_termspec_for_prediction(
         &model.resolved_termspec_noise,
         training_headers,
@@ -6479,12 +6490,11 @@ fn run_generate_binomial_location_scale(
     )?;
     let design_noise = build_term_collection_design(data, &spec_noise)
         .map_err(|e| format!("failed to build noise design: {e}"))?;
-    let beta_noise = Array1::from_vec(
-        model
-            .beta_noise
-            .clone()
-            .ok_or_else(|| "binomial-location-scale model is missing beta_noise".to_string())?,
-    );
+    let beta_noise = saved_location_scale_noise_beta(
+        model,
+        &fit_saved,
+        "binomial-location-scale model is missing beta_noise",
+    )?;
     if beta_t.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols() {
         return Err("location-scale model/design dimension mismatch".to_string());
     }
@@ -8284,6 +8294,72 @@ fn print_spatial_aniso_scales(spec: &TermCollectionSpec) {
     }
 }
 
+fn compact_saved_multiblock_fit_result(
+    blocks: Vec<gam::estimate::FittedBlock>,
+    lambdas: Array1<f64>,
+    standard_deviation: f64,
+    beta_covariance: Option<Array2<f64>>,
+    beta_covariance_corrected: Option<Array2<f64>>,
+    summary: SavedFitSummary,
+) -> UnifiedFitResult {
+    let total: usize = blocks.iter().map(|block| block.beta.len()).sum();
+    let mut beta = Array1::zeros(total);
+    let mut offset = 0;
+    for block in &blocks {
+        let width = block.beta.len();
+        beta.slice_mut(s![offset..offset + width])
+            .assign(&block.beta);
+        offset += width;
+    }
+    let mut fit_result = core_saved_fit_result(
+        beta,
+        lambdas,
+        standard_deviation,
+        beta_covariance,
+        beta_covariance_corrected,
+        summary,
+    );
+    fit_result.blocks = blocks;
+    fit_result
+}
+
+fn saved_gaussian_location_scale_mean_beta(fit: &UnifiedFitResult) -> Result<Array1<f64>, String> {
+    fit.block_by_role(BlockRole::Location)
+        .or_else(|| fit.block_by_role(BlockRole::Mean))
+        .map(|block| block.beta.clone())
+        .ok_or_else(|| {
+            "gaussian-location-scale fit_result is missing the mean/location block".to_string()
+        })
+}
+
+fn saved_binomial_location_scale_threshold_beta(
+    fit: &UnifiedFitResult,
+) -> Result<Array1<f64>, String> {
+    fit.block_by_role(BlockRole::Threshold)
+        .or_else(|| fit.block_by_role(BlockRole::Location))
+        .or_else(|| fit.block_by_role(BlockRole::Mean))
+        .map(|block| block.beta.clone())
+        .ok_or_else(|| {
+            "binomial-location-scale fit_result is missing the threshold/location block".to_string()
+        })
+}
+
+fn saved_location_scale_noise_beta(
+    model: &SavedModel,
+    fit: &UnifiedFitResult,
+    missing_message: &str,
+) -> Result<Array1<f64>, String> {
+    if let Some(block) = fit.block_by_role(BlockRole::Scale) {
+        return Ok(block.beta.clone());
+    }
+    model
+        .payload()
+        .beta_noise
+        .clone()
+        .map(Array1::from_vec)
+        .ok_or_else(|| missing_message.to_string())
+}
+
 fn validate_frozen_term_collectionspec(
     spec: &TermCollectionSpec,
     label: &str,
@@ -9807,16 +9883,17 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
+        BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FittedFamily, LikelihoodFamily, LinkChoice, LinkMode,
-        MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalBaselineTarget,
-        SurvivalTimeBasisConfig, apply_saved_linkwiggle, build_survival_feasible_initial_beta,
-        build_survival_time_basis, chi_square_survival_approx, classify_cli_error,
-        collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
+        MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
+        SurvivalBaselineTarget, SurvivalTimeBasisConfig, apply_saved_linkwiggle,
+        build_survival_feasible_initial_beta, build_survival_time_basis,
+        chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
+        collect_spatial_smooth_usagewarnings, compact_saved_multiblock_fit_result,
         compute_probit_q0_from_eta, core_saved_fit_result, effectivelinkwiggle_formulaspec,
-        evaluate_survival_baseline, family_to_string, linkname, load_dataset_projected,
-        parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
-        parse_survival_baseline_config, parse_survival_inverse_link,
+        evaluate_survival_baseline, exact_kernel, family_to_string, linkname,
+        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
+        parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
         required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
@@ -9829,10 +9906,10 @@ mod tests {
         BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
         MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
-    use gam::families::bernoulli_marginal_slope::{
-        DeviationBlockConfig, build_deviation_block_from_seed,
+    use gam::families::bernoulli_marginal_slope::DeviationBlockConfig;
+    use gam::gamlss::{
+        buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
     };
-    use gam::gamlss::buildwiggle_block_input_from_knots;
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };
@@ -9983,9 +10060,9 @@ mod tests {
             PathBuf::from("train.csv"),
             PathBuf::from("model.json"),
             "y ~ x + s(pc1, pc2, type=tensor)",
-            "y ~ z + smooth(w)",
+            "z + smooth(w)",
         );
-        args.logslope_formula = Some("y ~ slope_x + slope_z".to_string());
+        args.logslope_formula = Some("slope_x + slope_z".to_string());
         args.z_column = Some("z_anchor".to_string());
 
         let required = required_columns_for_fit(&args, &parsed).expect("required columns");
@@ -10071,7 +10148,7 @@ mod tests {
             train_path,
             model_path.clone(),
             "y ~ x1",
-            "y ~ x2",
+            "x2",
         ))
         .expect("location-scale fit should succeed");
 
@@ -10147,10 +10224,7 @@ mod tests {
 
         let saved = SavedModel::load_from_path(&model_path).expect("load fitted survival model");
         assert_eq!(saved.formula, "Surv(entry, exit, event) ~ 1");
-        assert_eq!(
-            saved.formula_noise.as_deref(),
-            Some("Surv(entry, exit, event) ~ 1")
-        );
+        assert_eq!(saved.formula_noise.as_deref(), Some("1"));
         assert_eq!(saved.survival_likelihood.as_deref(), Some("location-scale"));
         assert!(saved.survival_beta_log_sigma.is_some());
         assert!(saved.resolved_termspec_noise.is_some());
@@ -10167,7 +10241,7 @@ mod tests {
             train_path,
             model_path.clone(),
             "y ~ x1 + link(type=probit)",
-            "y ~ x2",
+            "x2",
         ))
         .expect("explicit probit location-scale fit should succeed");
 
@@ -10375,8 +10449,21 @@ mod tests {
         beta_log_sigma: f64,
         response_scale: f64,
     ) -> SavedModel {
-        let fit_result = core_saved_fit_result(
-            array![beta_mu],
+        let fit_result = compact_saved_multiblock_fit_result(
+            vec![
+                gam::estimate::FittedBlock {
+                    beta: array![beta_mu],
+                    role: BlockRole::Location,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                },
+                gam::estimate::FittedBlock {
+                    beta: array![beta_log_sigma],
+                    role: BlockRole::Scale,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                },
+            ],
             Array1::zeros(0),
             1.0,
             None,
@@ -10393,7 +10480,7 @@ mod tests {
             FAMILY_GAUSSIAN_LOCATION_SCALE,
         );
         payload.fit_result = Some(fit_result);
-        payload.formula_noise = Some("y ~ 1".to_string());
+        payload.formula_noise = Some("1".to_string());
         payload.beta_noise = Some(vec![beta_log_sigma]);
         payload.gaussian_response_scale = Some(response_scale);
         payload.training_headers = Some(vec![]);
@@ -10410,8 +10497,30 @@ mod tests {
         wiggle_knots: Option<Vec<f64>>,
         wiggle_degree: Option<usize>,
     ) -> SavedModel {
-        let fit_result = core_saved_fit_result(
-            array![beta_t],
+        let mut blocks = vec![
+            gam::estimate::FittedBlock {
+                beta: array![beta_t],
+                role: BlockRole::Location,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            gam::estimate::FittedBlock {
+                beta: array![beta_ls],
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ];
+        if let Some(beta_wiggle) = beta_link_wiggle.as_ref() {
+            blocks.push(gam::estimate::FittedBlock {
+                beta: Array1::from_vec(beta_wiggle.clone()),
+                role: BlockRole::LinkWiggle,
+                edf: beta_wiggle.len() as f64,
+                lambdas: Array1::zeros(0),
+            });
+        }
+        let fit_result = compact_saved_multiblock_fit_result(
+            blocks,
             Array1::zeros(0),
             1.0,
             Some(covariance.clone()),
@@ -10429,7 +10538,7 @@ mod tests {
         );
         payload.fit_result = Some(fit_result);
         payload.link = Some("probit".to_string());
-        payload.formula_noise = Some("y ~ 1".to_string());
+        payload.formula_noise = Some("1".to_string());
         payload.beta_noise = Some(vec![beta_ls]);
         payload.linkwiggle_knots = wiggle_knots;
         payload.linkwiggle_degree = wiggle_degree;
@@ -10623,6 +10732,8 @@ mod tests {
             ndarray::Array2::<f64>::zeros((3, 0)).view(),
             &HashMap::new(),
             Some(&vec![]),
+            &Array1::zeros(3),
+            false,
         )
         .expect("generate spec");
         assert_eq!(spec.mean.len(), 3);
@@ -11616,6 +11727,8 @@ mod tests {
             data.view(),
             &col_map,
             Some(&headers),
+            &Array1::zeros(data.nrows()),
+            &Array1::zeros(data.nrows()),
         )
         .expect("generate gaussian location-scale");
         assert_eq!(spec.mean.to_vec(), vec![-3.0, -3.0]);
@@ -11862,14 +11975,23 @@ mod tests {
 
     #[test]
     fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
-        let runtime = build_deviation_block_from_seed(
-            &array![-1.5, -0.5, 0.0, 0.5, 1.5],
-            &DeviationBlockConfig::default(),
+        let knots = vec![-1.5, -1.5, -1.5, -1.5, 1.5, 1.5, 1.5, 1.5];
+        let degree = DeviationBlockConfig::default().degree;
+        let basis_dim = monotone_wiggle_basis_with_derivative_order(
+            array![-1.5, -0.5, 0.0, 0.5, 1.5].view(),
+            &Array1::from_vec(knots.clone()),
+            degree,
+            0,
         )
-        .expect("score-warp runtime")
-        .runtime;
-        let saved_runtime = super::saved_anchored_deviation_runtime(&runtime);
-        let zero_beta = Array1::zeros(runtime.basis_dim);
+        .expect("score-warp basis")
+        .ncols();
+        let saved_runtime = SavedAnchoredDeviationRuntime {
+            kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
+            knots,
+            degree,
+            basis_dim,
+        };
+        let zero_beta = Array1::zeros(basis_dim);
 
         let q_exit = array![-0.8, 0.4];
         let slope = array![0.3, -1.1];
@@ -13503,34 +13625,35 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_formula_normalizes_rhs_only_input_to_main_response() {
+    fn auxiliary_formula_accepts_rhs_only_input() {
         let (normalized, parsed) = parse_matching_auxiliary_formula("s(x)", "y", "--predict-noise")
             .expect("auxiliary formula");
-        assert_eq!(normalized, "y ~ s(x)");
+        assert_eq!(normalized, "s(x)");
         assert_eq!(parsed.response, "y");
     }
 
     #[test]
-    fn auxiliary_formula_rejects_mismatched_response_column() {
+    fn auxiliary_formula_rejects_explicit_response_column() {
         let err = parse_matching_auxiliary_formula("noise ~ s(x)", "y", "--predict-noise")
-            .expect_err("mismatched response should fail");
+            .expect_err("explicit response should fail");
         assert_eq!(
             err,
-            "--predict-noise must use the same response expression as the main formula"
+            "--predict-noise accepts only RHS terms; remove the response and pass terms like 'smooth(x)' or '1'"
         );
     }
 
     #[test]
-    fn auxiliary_formula_accepts_matching_surv_response_with_different_spacing() {
-        let response = "Surv(entry, exit, event)";
-        let (normalized, parsed) = parse_matching_auxiliary_formula(
+    fn auxiliary_formula_rejects_explicit_survival_response() {
+        let err = parse_matching_auxiliary_formula(
             "Surv(entry,exit,event) ~ s(x)",
-            response,
+            "Surv(entry, exit, event)",
             "--predict-noise",
         )
-        .expect("matching Surv auxiliary formula");
-        assert_eq!(normalized, "Surv(entry,exit,event) ~ s(x)");
-        assert_eq!(parsed.response, "Surv(entry,exit,event)");
+        .expect_err("explicit survival response should fail");
+        assert_eq!(
+            err,
+            "--predict-noise accepts only RHS terms; remove the response and pass terms like 'smooth(x)' or '1'"
+        );
     }
 
     #[test]

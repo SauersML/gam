@@ -5,8 +5,8 @@ use crate::custom_family::{
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    build_embedded_dense_psi_operator, build_rowwise_kronecker_psi_operator,
+    ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, build_embedded_dense_psi_operator, build_rowwise_kronecker_psi_operator,
     evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
     shared_dense_arc, should_materialize_custom_family_psi_dense, weighted_crossprod_psi_maps,
@@ -6625,11 +6625,20 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         self.assemble_joint_hessian_from_quantities(&q, block_states)
     }
 
-    fn exact_newton_joint_hessian_for_logdet(
+    fn exact_newton_outer_curvature(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<Option<(Array2<f64>, f64)>, String> {
-        self.exact_newton_joint_hessian_rescaled(block_states)
+    ) -> Result<Option<ExactNewtonOuterCurvature>, String> {
+        Ok(self
+            .exact_newton_joint_hessian_rescaled(block_states)?
+            .map(|(hessian, log_scale)| {
+                let p = hessian.nrows();
+                ExactNewtonOuterCurvature {
+                    hessian,
+                    rho_curvature_scale: (-log_scale).exp(),
+                    hessian_logdet_correction: p as f64 * log_scale,
+                }
+            }))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -6637,7 +6646,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let q = self.collect_joint_quantities(block_states)?;
+        let q = self.collect_joint_quantities_rescaled(
+            block_states,
+            self.hessian_deriv_log_rescale(block_states),
+        )?;
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
@@ -7580,7 +7592,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let q = self.collect_joint_quantities(block_states)?;
+        let q = self.collect_joint_quantities_rescaled(
+            block_states,
+            self.hessian_deriv_log_rescale(block_states),
+        )?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let offsets = self.joint_block_offsets();
         let p_total = *offsets

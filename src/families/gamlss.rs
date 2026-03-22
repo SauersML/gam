@@ -16550,6 +16550,8 @@ mod tests {
             weights,
             meanspec: meanspec.clone(),
             noisespec: noisespec.clone(),
+            mean_offset: Array1::zeros(n),
+            noise_offset: Array1::zeros(n),
         };
         let mean_design =
             build_term_collection_design(data.view(), &meanspec).expect("build mean design");
@@ -16745,6 +16747,8 @@ mod tests {
             weights,
             meanspec: meanspec.clone(),
             noisespec: noisespec.clone(),
+            mean_offset: Array1::zeros(n),
+            noise_offset: Array1::zeros(n),
         };
         let mean_design =
             build_term_collection_design(data.view(), &meanspec).expect("build mean design");

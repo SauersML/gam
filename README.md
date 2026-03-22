@@ -145,7 +145,7 @@ gam fit data.csv 'y ~ age + smooth(bmi) + group(site)' --out model.json
 
 ```bash
 gam fit data.csv 'y ~ smooth(x1) + smooth(x2)' \
-  --predict-noise 'y ~ smooth(x1)' \
+  --predict-noise 'smooth(x1)' \
   --out model.json
 ```
 
@@ -167,7 +167,7 @@ Add `--predict-noise` for distributional (location-scale) survival:
 ```bash
 gam fit data.csv \
   'Surv(t0, t1, event) ~ age + smooth(bmi) + survmodel(spec=net, distribution=gaussian)' \
-  --predict-noise 'Surv(t0, t1, event) ~ smooth(age)' \
+  --predict-noise 'smooth(age)' \
   --out model.json
 ```
 
@@ -178,7 +178,7 @@ Models `P(case | covariates, z)` where `z` is a standardized score (e.g. a polyg
 ```bash
 gam fit data.csv \
   'case ~ smooth(age) + matern(pc1, pc2, pc3)' \
-  --logslope-formula 'case ~ matern(pc1, pc2, pc3)' \
+  --logslope-formula 'matern(pc1, pc2, pc3)' \
   --z-column prs_z \
   --out model.json
 ```

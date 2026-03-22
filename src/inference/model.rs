@@ -356,6 +356,74 @@ pub struct SavedPredictionRuntime {
     pub link_deviation: Option<SavedAnchoredDeviationRuntime>,
 }
 
+fn gaussian_location_scale_mean_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
+    fit.block_by_role(BlockRole::Location)
+        .or_else(|| fit.block_by_role(BlockRole::Mean))
+        .map(|block| block.beta.clone())
+}
+
+fn binomial_location_scale_threshold_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
+    fit.block_by_role(BlockRole::Threshold)
+        .or_else(|| fit.block_by_role(BlockRole::Location))
+        .or_else(|| fit.block_by_role(BlockRole::Mean))
+        .map(|block| block.beta.clone())
+}
+
+fn location_scale_noise_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
+    fit.block_by_role(BlockRole::Scale)
+        .map(|block| block.beta.clone())
+}
+
+fn validate_location_scale_saved_fit(
+    fit: &UnifiedFitResult,
+    model_class: PredictModelClass,
+    link_wiggle: Option<&SavedLinkWiggleRuntime>,
+) -> Result<(), String> {
+    let primary = match model_class {
+        PredictModelClass::GaussianLocationScale => gaussian_location_scale_mean_beta(fit),
+        PredictModelClass::BinomialLocationScale => binomial_location_scale_threshold_beta(fit),
+        _ => None,
+    }
+    .ok_or_else(|| match model_class {
+        PredictModelClass::GaussianLocationScale => {
+            "gaussian-location-scale saved fit is missing mean/location block".to_string()
+        }
+        PredictModelClass::BinomialLocationScale => {
+            "binomial-location-scale saved fit is missing threshold/location block".to_string()
+        }
+        _ => "location-scale saved fit is missing primary block".to_string(),
+    })?;
+
+    let scale = location_scale_noise_beta(fit)
+        .ok_or_else(|| "location-scale saved fit is missing scale block".to_string())?;
+    let expected =
+        primary.len() + scale.len() + link_wiggle.map_or(0, |runtime| runtime.beta.len());
+
+    if let Some(cov) = fit.beta_covariance()
+        && (cov.nrows() != expected || cov.ncols() != expected)
+    {
+        return Err(format!(
+            "location-scale saved conditional covariance shape mismatch: got {}x{}, expected {}x{}",
+            cov.nrows(),
+            cov.ncols(),
+            expected,
+            expected
+        ));
+    }
+    if let Some(cov) = fit.beta_covariance_corrected()
+        && (cov.nrows() != expected || cov.ncols() != expected)
+    {
+        return Err(format!(
+            "location-scale saved corrected covariance shape mismatch: got {}x{}, expected {}x{}",
+            cov.nrows(),
+            cov.ncols(),
+            expected,
+            expected
+        ));
+    }
+    Ok(())
+}
+
 impl SavedLinkWiggleRuntime {
     fn validate_global_monotonicity(&self) -> Result<(), String> {
         validate_monotone_wiggle_beta_nonnegative(&self.beta, "saved link-wiggle")
@@ -942,7 +1010,7 @@ impl FittedModel {
                 })?;
             }
         }
-        Ok(SavedPredictionRuntime {
+        let runtime = SavedPredictionRuntime {
             model_class: self.predict_model_class(),
             likelihood: self.likelihood(),
             inverse_link: self.resolved_inverse_link()?,
@@ -950,7 +1018,21 @@ impl FittedModel {
             baseline_time_wiggle: self.saved_baseline_time_wiggle()?,
             score_warp: self.payload().score_warp_runtime.clone(),
             link_deviation: self.payload().link_deviation_runtime.clone(),
-        })
+        };
+        if matches!(
+            runtime.model_class,
+            PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale
+        ) {
+            let fit = self.payload().fit_result.as_ref().ok_or_else(|| {
+                "location-scale model is missing canonical fit_result payload".to_string()
+            })?;
+            validate_location_scale_saved_fit(
+                fit,
+                runtime.model_class,
+                runtime.link_wiggle.as_ref(),
+            )?;
+        }
+        Ok(runtime)
     }
 
     pub fn saved_sas_state(&self) -> Result<Option<SasLinkState>, String> {
@@ -1074,8 +1156,9 @@ impl FittedModel {
         match self.predict_model_class() {
             PredictModelClass::GaussianLocationScale => {
                 let fit = self.fit_result.as_ref()?;
-                let beta_mu = fit.beta.clone();
-                let beta_noise = Array1::from_vec(self.payload().beta_noise.clone()?);
+                let beta_mu = gaussian_location_scale_mean_beta(fit)?;
+                let beta_noise = location_scale_noise_beta(fit)
+                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
                 let response_scale = self.gaussian_response_scale.unwrap_or(1.0);
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
@@ -1127,8 +1210,9 @@ impl FittedModel {
                     .flatten()
                     .unwrap_or(InverseLink::Standard(LinkFunction::Probit));
                 let fit = self.fit_result.as_ref()?;
-                let beta_threshold = fit.beta.clone();
-                let beta_noise = Array1::from_vec(self.payload().beta_noise.clone()?);
+                let beta_threshold = binomial_location_scale_threshold_beta(fit)?;
+                let beta_noise = location_scale_noise_beta(fit)
+                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
                 Some(Box::new(BinomialLocationScalePredictor {
                     beta_threshold,
                     beta_noise,

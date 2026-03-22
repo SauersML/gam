@@ -2596,6 +2596,8 @@ impl<'a> RemlState<'a> {
             penalty_coords: self.build_penalty_coords(),
             penalty_logdet,
             dispersion: ctx.dispersion,
+            rho_curvature_scale: 1.0,
+            hessian_logdet_correction: 0.0,
             deriv_provider: Some(ctx.deriv_provider),
             tk_correction: 0.0,
             tk_gradient: None,

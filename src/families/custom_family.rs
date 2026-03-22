@@ -280,6 +280,29 @@ pub struct ParameterBlockSpec {
     pub initial_beta: Option<Array1<f64>>,
 }
 
+fn custom_family_block_role(
+    name: &str,
+    index: usize,
+    n_blocks: usize,
+) -> crate::solver::estimate::BlockRole {
+    use crate::solver::estimate::BlockRole;
+
+    if n_blocks == 1 {
+        return BlockRole::Mean;
+    }
+
+    match name.trim().to_ascii_lowercase().as_str() {
+        "eta" | "mean" | "beta" => BlockRole::Mean,
+        "mu" | "location" | "marginal_surface" => BlockRole::Location,
+        "threshold" => BlockRole::Threshold,
+        "log_sigma" | "scale" | "logslope_surface" => BlockRole::Scale,
+        "time" | "time_transform" | "time_surface" => BlockRole::Time,
+        "wiggle" | "linkwiggle" => BlockRole::LinkWiggle,
+        _ if index == 0 => BlockRole::Location,
+        _ => BlockRole::Scale,
+    }
+}
+
 /// Current state for a parameter block.
 #[derive(Clone, Debug)]
 pub struct ParameterBlockState {
@@ -743,22 +766,81 @@ pub trait CustomFamily {
         self.exact_newton_joint_hessian(block_states)
     }
 
-    /// Rescaled joint Hessian for logdet computation.  Returns
-    /// `(H_scaled, deriv_log_scale)` where `H_scaled ≈ exp(-L) * H_exact`,
-    /// so `logdet(H) = logdet(H_scaled) + p * L`.
+    /// Optional scale-aware exact joint curvature for the outer REML calculus.
     ///
-    /// Families whose derivatives can overflow (e.g. CLogLog survival)
-    /// override this to shift `exp(u)` to `exp(u − L)`, keeping every
-    /// Hessian entry finite while preserving the logdet up to the
-    /// additive correction `p * L`.
+    /// Families whose exact derivatives can overflow may return a uniformly
+    /// rescaled Hessian together with the metadata needed to keep every outer
+    /// path consistent:
     ///
-    /// The default returns `None`, falling through to the standard
-    /// (non-rescaled) logdet path.
-    fn exact_newton_joint_hessian_for_logdet(
+    /// - `hessian`: the scale-stabilized unpenalized joint Hessian
+    /// - `rho_curvature_scale`: the uniform factor applied to every ρ-driven
+    ///   penalty Hessian derivative in H-dependent trace / solve terms
+    /// - `hessian_logdet_correction`: the additive correction needed to recover
+    ///   `log|H_exact|` from `log|H_scaled|`
+    ///
+    /// The scale is evaluation-local metadata: callers must use the same
+    /// factor for `H`, `dH`, `d²H`, and penalized trace operators within that
+    /// evaluation, but they do not differentiate the scale itself.
+    ///
+    /// Families overriding this must also make
+    /// `exact_newton_outer_curvature_directional_derivative[_with_specs]` and
+    /// `exact_newton_outer_curvature_second_directional_derivative[_with_specs]`
+    /// return derivatives in that same scaled curvature space.
+    fn exact_newton_outer_curvature(
         &self,
         _: &[ParameterBlockState],
-    ) -> Result<Option<(Array2<f64>, f64)>, String> {
+    ) -> Result<Option<ExactNewtonOuterCurvature>, String> {
         Ok(None)
+    }
+
+    /// Optional first directional derivative matching
+    /// `exact_newton_outer_curvature`.
+    fn exact_newton_outer_curvature_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)
+    }
+
+    /// Spec-aware variant of `exact_newton_outer_curvature_directional_derivative`.
+    fn exact_newton_outer_curvature_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_outer_curvature_directional_derivative(block_states, d_beta_flat)
+    }
+
+    /// Optional second directional derivative matching
+    /// `exact_newton_outer_curvature`.
+    fn exact_newton_outer_curvature_second_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessiansecond_directional_derivative(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+    }
+
+    /// Spec-aware variant of `exact_newton_outer_curvature_second_directional_derivative`.
+    fn exact_newton_outer_curvature_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_outer_curvature_second_directional_derivative(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
     }
 
     /// Optional spec-aware exact first directional derivative of the joint Hessian.
@@ -1242,18 +1324,12 @@ pub fn blockwise_fit_from_parts(
     }
 
     // Build unified blocks from the blockwise states.
-    use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts};
+    use crate::solver::estimate::{FittedBlock, FittedLinkState, UnifiedFitResultParts};
     let blocks: Vec<FittedBlock> = block_states
         .iter()
         .enumerate()
         .map(|(i, bs)| {
-            let role = if block_states.len() == 1 {
-                BlockRole::Mean
-            } else if i == 0 {
-                BlockRole::Location
-            } else {
-                BlockRole::Scale
-            };
+            let role = custom_family_block_role(&specs[i].name, i, block_states.len());
             FittedBlock {
                 beta: bs.beta.clone(),
                 role,
@@ -3909,7 +3985,71 @@ fn solve_kkt_step(
 
 struct CompressedActiveConstraintSet {
     constraints: LinearInequalityConstraints,
-    groups: Vec<Vec<usize>>,
+    member_constraint_ids: Vec<Vec<usize>>,
+}
+
+fn validate_active_constraint_ids(active: &[usize], num_constraints: usize) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::with_capacity(active.len());
+    for &constraint_id in active {
+        if constraint_id >= num_constraints {
+            return Err(format!(
+                "active-set constraint id {constraint_id} out of bounds for {num_constraints} constraints"
+            ));
+        }
+        if !seen.insert(constraint_id) {
+            return Err(format!(
+                "active-set contains duplicate constraint id {constraint_id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_active_constraints_by_id(
+    active: &mut Vec<usize>,
+    is_active: &mut [bool],
+    constraint_ids_to_drop: &[usize],
+) -> Result<(), String> {
+    if constraint_ids_to_drop.is_empty() {
+        return Ok(());
+    }
+    if is_active.len() < active.len() {
+        return Err(format!(
+            "active membership bitmap shorter than active set: active={}, is_active={}",
+            active.len(),
+            is_active.len()
+        ));
+    }
+    validate_active_constraint_ids(active, is_active.len())?;
+
+    let mut active_pos_by_constraint_id = std::collections::HashMap::with_capacity(active.len());
+    for (active_pos, &constraint_id) in active.iter().enumerate() {
+        active_pos_by_constraint_id.insert(constraint_id, active_pos);
+    }
+
+    let mut active_positions_to_remove = Vec::with_capacity(constraint_ids_to_drop.len());
+    for &constraint_id in constraint_ids_to_drop {
+        if constraint_id >= is_active.len() {
+            return Err(format!(
+                "cannot drop constraint id {constraint_id}; bitmap has {} entries",
+                is_active.len()
+            ));
+        }
+        let Some(&active_pos) = active_pos_by_constraint_id.get(&constraint_id) else {
+            return Err(format!(
+                "compressed active-set requested release of inactive constraint id {constraint_id}"
+            ));
+        };
+        active_positions_to_remove.push(active_pos);
+    }
+    active_positions_to_remove.sort_unstable();
+    active_positions_to_remove.dedup();
+
+    for active_pos in active_positions_to_remove.into_iter().rev() {
+        let constraint_id = active.remove(active_pos);
+        is_active[constraint_id] = false;
+    }
+    Ok(())
 }
 
 fn compress_active_constraint_set(
@@ -3920,10 +4060,12 @@ fn compress_active_constraint_set(
     const KEY_TOL: f64 = 1e-10;
 
     let p = constraints.a.ncols();
+    validate_active_constraint_ids(active, constraints.a.nrows())?;
+
     let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64, Vec<usize>)> = BTreeMap::new();
     let mut fallback_rows: Vec<(Vec<f64>, f64, Vec<usize>)> = Vec::new();
 
-    for (pos, &idx) in active.iter().enumerate() {
+    for &idx in active {
         if idx >= constraints.a.nrows() {
             return Err(format!(
                 "compressed active-set index {idx} out of bounds for {} constraints",
@@ -3933,7 +4075,7 @@ fn compress_active_constraint_set(
         let row = constraints.a.row(idx);
         let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if !scale.is_finite() || scale <= SCALE_TOL {
-            fallback_rows.push((row.to_vec(), constraints.b[idx], vec![pos]));
+            fallback_rows.push((row.to_vec(), constraints.b[idx], vec![idx]));
             continue;
         }
 
@@ -3951,15 +4093,15 @@ fn compress_active_constraint_set(
             .collect();
 
         match grouped.get_mut(&key) {
-            Some((row_rep, rhs_max, positions)) => {
+            Some((row_rep, rhs_max, member_constraint_ids)) => {
                 if normalized_rhs > *rhs_max {
                     *row_rep = normalized_row;
                     *rhs_max = normalized_rhs;
                 }
-                positions.push(pos);
+                member_constraint_ids.push(idx);
             }
             None => {
-                grouped.insert(key, (normalized_row, normalized_rhs, vec![pos]));
+                grouped.insert(key, (normalized_row, normalized_rhs, vec![idx]));
             }
         }
     }
@@ -3967,23 +4109,23 @@ fn compress_active_constraint_set(
     let nrows = grouped.len() + fallback_rows.len();
     let mut a = Array2::<f64>::zeros((nrows, p));
     let mut b = Array1::<f64>::zeros(nrows);
-    let mut groups = Vec::with_capacity(nrows);
+    let mut member_constraint_ids = Vec::with_capacity(nrows);
     let mut out_row = 0usize;
 
-    for (_, (row, rhs, positions)) in grouped {
+    for (_, (row, rhs, group_constraint_ids)) in grouped {
         for (j, value) in row.into_iter().enumerate() {
             a[[out_row, j]] = value;
         }
         b[out_row] = rhs;
-        groups.push(positions);
+        member_constraint_ids.push(group_constraint_ids);
         out_row += 1;
     }
-    for (row, rhs, positions) in fallback_rows {
+    for (row, rhs, group_constraint_ids) in fallback_rows {
         for (j, value) in row.into_iter().enumerate() {
             a[[out_row, j]] = value;
         }
         b[out_row] = rhs;
-        groups.push(positions);
+        member_constraint_ids.push(group_constraint_ids);
         out_row += 1;
     }
 
@@ -3996,15 +4138,23 @@ fn compress_active_constraint_set(
     // SVD pseudoinverse fallback to produce inaccurate directions.
     //
     // We incrementally build an orthonormal basis of the row space and keep
-    // only those rows that contribute a new independent direction.  Dropped
-    // rows have their groups merged into the most-aligned kept row so that
-    // the active-set QP can still release individual constraint groups via
-    // multiplier signs.
-    let (a, b, groups) = rank_reduce_constraint_rows(a, b, groups);
+    // only those rows that contribute a new independent direction. Dropped
+    // rows have their member constraint ids merged into the most-aligned kept
+    // row so that the active-set QP can still release the underlying original
+    // constraints via multiplier signs.
+    let (a, b, member_constraint_ids) = rank_reduce_constraint_rows(a, b, member_constraint_ids);
+
+    for (row_idx, group_constraint_ids) in member_constraint_ids.iter().enumerate() {
+        if group_constraint_ids.is_empty() {
+            return Err(format!(
+                "compressed active-set row {row_idx} has no member constraints"
+            ));
+        }
+    }
 
     Ok(CompressedActiveConstraintSet {
         constraints: LinearInequalityConstraints { a, b },
-        groups,
+        member_constraint_ids,
     })
 }
 
@@ -4013,18 +4163,18 @@ fn compress_active_constraint_set(
 /// Gram-Schmidt for rank detection, which is O(k · p · r) where k is the
 /// input row count, p the column count, and r the numerical rank.
 ///
-/// For each dropped row its group is merged into the kept row with the
-/// largest absolute dot product, preserving the active-set QP's ability to
-/// release constraint groups via multiplier signs.
+/// For each dropped row its member constraint ids are merged into the kept row
+/// with the largest absolute dot product, preserving the active-set QP's
+/// ability to release the original constraints represented by that row.
 fn rank_reduce_constraint_rows(
     a: Array2<f64>,
     b: Array1<f64>,
-    groups: Vec<Vec<usize>>,
+    member_constraint_ids: Vec<Vec<usize>>,
 ) -> (Array2<f64>, Array1<f64>, Vec<Vec<usize>>) {
     let k = a.nrows();
     let p = a.ncols();
     if k <= 1 {
-        return (a, b, groups);
+        return (a, b, member_constraint_ids);
     }
 
     // Row norms for tolerance scaling.
@@ -4083,29 +4233,29 @@ fn rank_reduce_constraint_rows(
 
     // If nothing was dropped the matrix is already full rank.
     if kept.len() == k {
-        return (a, b, groups);
+        return (a, b, member_constraint_ids);
     }
 
     // Build the reduced output.
     let r = kept.len();
     let mut a_out = Array2::<f64>::zeros((r, p));
     let mut b_out = Array1::<f64>::zeros(r);
-    let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(r);
+    let mut member_constraint_ids_out: Vec<Vec<usize>> = Vec::with_capacity(r);
     let mut orig_to_out = std::collections::HashMap::with_capacity(r);
     for (out_idx, &orig_idx) in kept.iter().enumerate() {
         a_out.row_mut(out_idx).assign(&a.row(orig_idx));
         b_out[out_idx] = b[orig_idx];
-        groups_out.push(groups[orig_idx].clone());
+        member_constraint_ids_out.push(member_constraint_ids[orig_idx].clone());
         orig_to_out.insert(orig_idx, out_idx);
     }
 
-    // Merge dropped groups into their targets.
+    // Merge dropped member-constraint ids into their targets.
     for i in 0..k {
         if let Some(target_orig) = merge_target[i] {
             let &out_idx = orig_to_out
                 .get(&target_orig)
                 .expect("merge target must be a kept row");
-            groups_out[out_idx].extend_from_slice(&groups[i]);
+            member_constraint_ids_out[out_idx].extend_from_slice(&member_constraint_ids[i]);
         }
     }
 
@@ -4118,7 +4268,7 @@ fn rank_reduce_constraint_rows(
         );
     }
 
-    (a_out, b_out, groups_out)
+    (a_out, b_out, member_constraint_ids_out)
 }
 
 fn check_linear_feasibility(
@@ -4200,6 +4350,7 @@ fn solve_quadraticwith_linear_constraints(
     for &idx in &active {
         is_active[idx] = true;
     }
+    validate_active_constraint_ids(&active, m)?;
 
     let max_iterations = ((p + m + 8) * (active.len().max(1) + 8)).max((p + m + 8) * 8);
     for _ in 0..max_iterations {
@@ -4219,14 +4370,14 @@ fn solve_quadraticwith_linear_constraints(
         let x_norm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
         let step_tol = tol_step * (1.0 + x_norm);
         if step_norm <= step_tol {
-            if compressed.groups.is_empty() {
+            if compressed.member_constraint_ids.is_empty() {
                 return Ok((x, active));
             }
             // solve_kkt_step returns multipliers from:
             //   H d + Aw^T lambda_sys = -gradient.
             // For constraints A*x >= b, true multipliers satisfy
             //   gradient + H d = Aw^T lambda_true, so lambda_true = -lambda_sys.
-            // Release active rows with lambda_true < 0.
+            // Release active constraints with lambda_true < 0.
             let mut most_negative_true = -tol_dual;
             let mut remove_pos: Option<usize> = None;
             for (pos, &lam_sys) in lambda_sys.iter().enumerate() {
@@ -4237,10 +4388,11 @@ fn solve_quadraticwith_linear_constraints(
                 }
             }
             if let Some(pos) = remove_pos {
-                for &active_pos in compressed.groups[pos].iter().rev() {
-                    let idx = active.remove(active_pos);
-                    is_active[idx] = false;
-                }
+                remove_active_constraints_by_id(
+                    &mut active,
+                    &mut is_active,
+                    &compressed.member_constraint_ids[pos],
+                )?;
                 continue;
             }
             return Ok((x, active));
@@ -4582,12 +4734,29 @@ fn exact_newton_joint_hessian_symmetrized<F: CustomFamily + Clone + Send + Sync 
     Ok(Some(h))
 }
 
+/// Scale-aware exact joint curvature payload for the outer REML evaluator.
+pub struct ExactNewtonOuterCurvature {
+    pub hessian: Array2<f64>,
+    pub rho_curvature_scale: f64,
+    pub hessian_logdet_correction: f64,
+}
+
 enum JointHessianSource {
     Dense(Array2<f64>),
     Operator {
         apply: Arc<dyn Fn(&Array1<f64>) -> Result<Array1<f64>, String> + Send + Sync>,
         diagonal: Array1<f64>,
     },
+}
+
+struct JointHessianBundle<'a> {
+    source: JointHessianSource,
+    beta_flat: Array1<f64>,
+    compute_dh: Box<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
+    compute_d2h:
+        Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
+    rho_curvature_scale: f64,
+    hessian_logdet_correction: f64,
 }
 
 fn materialize_joint_hessian_source(
@@ -4688,6 +4857,9 @@ fn symmetrized_square_matrix(
             expected
         ));
     }
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(format!("{context}: matrix contains non-finite values"));
+    }
     symmetrize_dense_in_place(&mut matrix);
     Ok(matrix)
 }
@@ -4705,15 +4877,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
     specs: &'a [ParameterBlockSpec],
     total: usize,
     need_hessian: bool,
-) -> Result<
-    Option<(
-        JointHessianSource,
-        Array1<f64>,
-        Box<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
-        Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
-    )>,
-    String,
-> {
+) -> Result<Option<JointHessianBundle<'a>>, String> {
     // Path 1: exact Newton joint Hessian (preferred).
     let beta_flat = flatten_state_betas(block_states, specs);
     let synced = Arc::new(synchronized_states_from_flat_beta(
@@ -4723,6 +4887,39 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
         &beta_flat,
     )?);
     let hessian_workspace = family.exact_newton_joint_hessian_workspace(synced.as_ref(), specs)?;
+    if let Some(curvature) = family.exact_newton_outer_curvature(block_states)? {
+        let h_joint_unpen = JointHessianSource::Dense(symmetrized_square_matrix(
+            curvature.hessian,
+            total,
+            "joint exact-newton Hessian shape mismatch in outer gradient (rescaled)",
+        )?);
+        let compute_dh = Box::new(exact_newton_dh_closure(
+            family,
+            Arc::clone(&synced),
+            specs,
+            total,
+            true,
+            1.0,
+            hessian_workspace.clone(),
+        ));
+        let compute_d2h = Box::new(exact_newton_d2h_closure(
+            family,
+            Arc::clone(&synced),
+            specs,
+            total,
+            true,
+            1.0,
+            hessian_workspace,
+        ));
+        return Ok(Some(JointHessianBundle {
+            source: h_joint_unpen,
+            beta_flat,
+            compute_dh,
+            compute_d2h,
+            rho_curvature_scale: curvature.rho_curvature_scale,
+            hessian_logdet_correction: curvature.hessian_logdet_correction,
+        }));
+    }
     let exact_joint_source = if use_joint_matrix_free_path(total, need_hessian) {
         hessian_workspace
             .as_ref()
@@ -4755,6 +4952,8 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             Arc::clone(&synced),
             specs,
             total,
+            false,
+            1.0,
             hessian_workspace.clone(),
         ));
         let compute_d2h = Box::new(exact_newton_d2h_closure(
@@ -4762,9 +4961,18 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             Arc::clone(&synced),
             specs,
             total,
+            false,
+            1.0,
             hessian_workspace,
         ));
-        return Ok(Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)));
+        return Ok(Some(JointHessianBundle {
+            source: h_joint_unpen,
+            beta_flat,
+            compute_dh,
+            compute_d2h,
+            rho_curvature_scale: 1.0,
+            hessian_logdet_correction: 0.0,
+        }));
     }
 
     // Path 2: surrogate joint Hessian (fallback).
@@ -4819,12 +5027,14 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
                 }
             },
         );
-        return Ok(Some((
-            JointHessianSource::Dense(h_joint_unpen),
+        return Ok(Some(JointHessianBundle {
+            source: JointHessianSource::Dense(h_joint_unpen),
             beta_flat,
             compute_dh,
             compute_d2h,
-        )));
+            rho_curvature_scale: 1.0,
+            hessian_logdet_correction: 0.0,
+        }));
     }
 
     Ok(None)
@@ -4837,10 +5047,18 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
     synced_states: Arc<Vec<ParameterBlockState>>,
     specs: &'a [ParameterBlockSpec],
     total: usize,
+    use_outer_curvature_derivatives: bool,
+    scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 ) -> impl Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
     move |v_k: &Array1<f64>| {
-        let h_rho = if let Some(workspace) = workspace.as_ref() {
+        let h_rho = if use_outer_curvature_derivatives {
+            family.exact_newton_outer_curvature_directional_derivative_with_specs(
+                synced_states.as_ref(),
+                specs,
+                v_k,
+            )?
+        } else if let Some(workspace) = workspace.as_ref() {
             workspace.directional_derivative(v_k)?
         } else {
             family.exact_newton_joint_hessian_directional_derivative_with_specs(
@@ -4854,11 +5072,15 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
                 if h.iter().any(|v| !v.is_finite()) {
                     Err("joint exact-newton dH returned non-finite values".to_string())
                 } else {
-                    Ok(Some(symmetrized_square_matrix(
+                    let mut sym = symmetrized_square_matrix(
                         h,
                         total,
                         "joint exact-newton dH shape mismatch",
-                    )?))
+                    )?;
+                    if scale != 1.0 {
+                        sym *= scale;
+                    }
+                    Ok(Some(sym))
                 }
             }
             None => {
@@ -4874,9 +5096,18 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily>(
     synced_states: Arc<Vec<ParameterBlockState>>,
     specs: &'a [ParameterBlockSpec],
     total: usize,
+    use_outer_curvature_derivatives: bool,
+    scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 ) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
-    move |u: &Array1<f64>, v: &Array1<f64>| match if let Some(workspace) = workspace.as_ref() {
+    move |u: &Array1<f64>, v: &Array1<f64>| match if use_outer_curvature_derivatives {
+        family.exact_newton_outer_curvature_second_directional_derivative_with_specs(
+            synced_states.as_ref(),
+            specs,
+            u,
+            v,
+        )?
+    } else if let Some(workspace) = workspace.as_ref() {
         workspace.second_directional_derivative(u, v)?
     } else {
         family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
@@ -4886,11 +5117,14 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily>(
             v,
         )?
     } {
-        Some(m) => Ok(Some(symmetrized_square_matrix(
-            m,
-            total,
-            "joint exact-newton d2H shape mismatch",
-        )?)),
+        Some(m) => {
+            let mut sym =
+                symmetrized_square_matrix(m, total, "joint exact-newton d2H shape mismatch")?;
+            if scale != 1.0 {
+                sym *= scale;
+            }
+            Ok(Some(sym))
+        }
         None => Ok(None),
     }
 }
@@ -5104,6 +5338,31 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
         s_lambdas.push(s_lambda);
     }
+    // Try the shared scale-aware exact curvature path first.
+    if let Some(curvature) = family.exact_newton_outer_curvature(states)? {
+        let mut h_joint = symmetrized_square_matrix(
+            curvature.hessian,
+            total,
+            "joint exact-newton Hessian shape mismatch in logdet terms (rescaled)",
+        )?;
+        for (b, s_lambda) in s_lambdas.iter().enumerate() {
+            let (start, end) = ranges[b];
+            h_joint
+                .slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(curvature.rho_curvature_scale, s_lambda);
+        }
+        let logdet_h_scaled = if strict_spd {
+            strict_logdet_spd_with_semidefinite_option(&h_joint, allow_semidefinite)?
+        } else {
+            stable_logdet_with_ridge_policy(
+                &h_joint,
+                options.ridge_floor * curvature.rho_curvature_scale,
+                options.ridge_policy,
+            )?
+        };
+        let logdet_h_total = logdet_h_scaled + curvature.hessian_logdet_correction;
+        return Ok((logdet_h_total, penalty_logdet_s_total));
+    }
     let exact_joint_source = if !strict_spd && use_joint_matrix_free_path(total, false) {
         family
             .exact_newton_joint_hessian_workspace(states, specs)?
@@ -5135,36 +5394,8 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
-    // Try the rescaled logdet path first — it returns (H_scaled, L) where
-    // H_scaled = exp(-L) * H_exact, avoiding exp(u) overflow entirely.
-    // When L = 0 (no rescaling needed), this reduces to the normal path.
-    if let Some((h_raw, deriv_log_scale)) = family.exact_newton_joint_hessian_for_logdet(states)? {
-        let mut h_joint = symmetrized_square_matrix(
-            h_raw,
-            total,
-            "joint exact-newton Hessian shape mismatch in logdet terms (rescaled)",
-        )?;
-        let penalty_scale = (-deriv_log_scale).exp();
-        for (b, s_lambda) in s_lambdas.iter().enumerate() {
-            let (start, end) = ranges[b];
-            h_joint
-                .slice_mut(ndarray::s![start..end, start..end])
-                .scaled_add(penalty_scale, s_lambda);
-        }
-        let logdet_h_scaled = if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(&h_joint, allow_semidefinite)?
-        } else {
-            stable_logdet_with_ridge_policy(
-                &h_joint,
-                options.ridge_floor * penalty_scale,
-                options.ridge_policy,
-            )?
-        };
-        let logdet_h_total = logdet_h_scaled + total as f64 * deriv_log_scale;
-        return Ok((logdet_h_total, penalty_logdet_s_total));
-    }
     // Fallback: try the non-rescaled symmetrized path (for families that
-    // don't implement exact_newton_joint_hessian_for_logdet but do provide
+    // don't implement exact_newton_outer_curvature but do provide
     // a plain joint Hessian).
     if let Some(mut h_joint) = exact_newton_joint_hessian_symmetrized(
         family,
@@ -5994,6 +6225,122 @@ struct ExtCoordBundle {
     drift_fn: Option<FixedDriftDerivFn>,
 }
 
+struct ScaledHyperOperator {
+    inner: Box<dyn HyperOperator>,
+    scale: f64,
+}
+
+impl HyperOperator for ScaledHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.inner.mul_vec(v).mapv(|value| self.scale * value)
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        self.scale * self.inner.bilinear(v, u)
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.inner.to_dense().mapv(|value| self.scale * value)
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
+}
+
+fn scale_hypercoord_drift(mut drift: HyperCoordDrift, scale: f64) -> HyperCoordDrift {
+    if scale == 1.0 {
+        return drift;
+    }
+    if let Some(ref mut dense) = drift.dense {
+        *dense *= scale;
+    }
+    if let Some(ref mut block_local) = drift.block_local {
+        block_local.local *= scale;
+    }
+    if let Some(operator) = drift.operator.take() {
+        drift.operator = Some(Box::new(ScaledHyperOperator {
+            inner: operator,
+            scale,
+        }));
+    }
+    drift
+}
+
+fn scale_hypercoord(mut coord: HyperCoord, scale: f64) -> HyperCoord {
+    if scale == 1.0 {
+        return coord;
+    }
+    coord.g *= scale;
+    coord.drift = scale_hypercoord_drift(coord.drift, scale);
+    coord
+}
+
+fn scale_hypercoord_pair(mut pair: HyperCoordPair, scale: f64) -> HyperCoordPair {
+    if scale == 1.0 {
+        return pair;
+    }
+    pair.g *= scale;
+    pair.b_mat *= scale;
+    if let Some(operator) = pair.b_operator.take() {
+        pair.b_operator = Some(Box::new(ScaledHyperOperator {
+            inner: operator,
+            scale,
+        }));
+    }
+    pair
+}
+
+fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> DriftDerivResult {
+    if scale == 1.0 {
+        return result;
+    }
+    match result {
+        DriftDerivResult::Dense(mut dense) => {
+            dense *= scale;
+            DriftDerivResult::Dense(dense)
+        }
+        DriftDerivResult::Operator(operator) => {
+            DriftDerivResult::Operator(Box::new(ScaledHyperOperator {
+                inner: operator,
+                scale,
+            }))
+        }
+    }
+}
+
+impl ExtCoordBundle {
+    fn scaled(self, scale: f64) -> Self {
+        if scale == 1.0 {
+            return self;
+        }
+        let coords = self
+            .coords
+            .into_iter()
+            .map(|coord| scale_hypercoord(coord, scale))
+            .collect();
+        let ext_ext_fn = self.ext_ext_fn.map(|callback| {
+            Box::new(move |i: usize, j: usize| scale_hypercoord_pair(callback(i, j), scale))
+                as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
+        });
+        let rho_ext_fn = self.rho_ext_fn.map(|callback| {
+            Box::new(move |i: usize, j: usize| scale_hypercoord_pair(callback(i, j), scale))
+                as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
+        });
+        let drift_fn = self.drift_fn.map(|callback| {
+            Box::new(move |ext_idx: usize, direction: &Array1<f64>| {
+                callback(ext_idx, direction).map(|result| scale_drift_deriv_result(result, scale))
+            }) as FixedDriftDerivFn
+        });
+        Self {
+            coords,
+            ext_ext_fn,
+            rho_ext_fn,
+            drift_fn,
+        }
+    }
+}
+
 /// Build an `InnerSolution` from joint Hessian data and call the unified evaluator.
 ///
 /// Bridge between the custom family's joint Hessian infrastructure and the
@@ -6008,6 +6355,8 @@ fn unified_joint_cost_gradient(
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
+    rho_curvature_scale: f64,
+    hessian_logdet_correction: f64,
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
@@ -6087,6 +6436,8 @@ fn unified_joint_cost_gradient(
             include_logdet_h,
             include_logdet_s,
         },
+        rho_curvature_scale,
+        hessian_logdet_correction,
         deriv_provider: Some(deriv_provider),
         tk_correction: 0.0,
         tk_gradient: None,
@@ -6131,6 +6482,8 @@ fn joint_outer_evaluate(
     ridge: f64,
     moderidge: f64,
     extra_logdet_ridge: f64,
+    rho_curvature_scale: f64,
+    hessian_logdet_correction: f64,
     include_logdet_h: bool,
     include_logdet_s: bool,
     strict_spd: bool,
@@ -6141,6 +6494,7 @@ fn joint_outer_evaluate(
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
+    let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
 
     // Build derivative provider from the caller-supplied closures.
     let compute_d2h_ref: Option<
@@ -6157,12 +6511,24 @@ fn joint_outer_evaluate(
     } else {
         EvalMode::ValueAndGradient
     };
+    let scaled_s_lambdas: Vec<Array2<f64>> = inner
+        .s_lambdas
+        .iter()
+        .map(|matrix| {
+            if rho_curvature_scale == 1.0 {
+                matrix.clone()
+            } else {
+                matrix.mapv(|value| rho_curvature_scale * value)
+            }
+        })
+        .collect();
 
     let hessian_op: Box<dyn crate::solver::estimate::reml::unified::HessianOperator> =
         if use_joint_matrix_free_path(total, need_hessian) {
             let ranges_vec = ranges.to_vec();
-            let s_lambdas = Arc::new(inner.s_lambdas.clone());
-            let trace_diagonal_ridge = joint_trace_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
+            let s_lambdas = Arc::new(scaled_s_lambdas.clone());
+            let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
+                + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
             match h_joint_unpen {
                 JointHessianSource::Dense(h_joint) => {
                     let h_joint = Arc::new(h_joint);
@@ -6193,7 +6559,7 @@ fn joint_outer_evaluate(
                                 &mut j_for_traces,
                                 &ranges_vec,
                                 s_lambdas.as_ref(),
-                                joint_trace_diagonal_ridge,
+                                scaled_joint_trace_diagonal_ridge,
                             );
                             Box::new(
                                 BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
@@ -6213,7 +6579,7 @@ fn joint_outer_evaluate(
                         &mut j_for_traces,
                         &ranges_vec,
                         s_lambdas.as_ref(),
-                        joint_trace_diagonal_ridge,
+                        scaled_joint_trace_diagonal_ridge,
                     );
                     Box::new(
                         BlockCoupledOperator::from_joint_hessian(&j_for_traces)
@@ -6230,8 +6596,8 @@ fn joint_outer_evaluate(
             add_joint_penalty_to_matrix(
                 &mut j_for_traces,
                 ranges,
-                &inner.s_lambdas,
-                joint_trace_diagonal_ridge,
+                &scaled_s_lambdas,
+                scaled_joint_trace_diagonal_ridge,
             );
             Box::new(
                 BlockCoupledOperator::from_joint_hessian(&j_for_traces)
@@ -6249,12 +6615,14 @@ fn joint_outer_evaluate(
         ranges,
         total,
         ridge,
+        rho_curvature_scale,
+        hessian_logdet_correction,
         include_logdet_h,
         include_logdet_s,
         options,
         provider_box,
         eval_mode,
-        ext_bundle,
+        ext_bundle.map(|bundle| bundle.scaled(rho_curvature_scale)),
     )?;
 
     let warm = ConstrainedWarmStart {
@@ -7111,37 +7479,60 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
         )?);
         let hessian_workspace =
             family.exact_newton_joint_hessian_workspace(synced_joint_states.as_ref(), specs)?;
-        let h_joint_unpen = if use_joint_matrix_free_path(total, need_hessian) {
-            hessian_workspace
-                .as_ref()
-                .map(|workspace| {
-                    exact_newton_joint_hessian_source_from_workspace(
-                        workspace,
-                        total,
-                        "joint exact-newton operator mismatch in joint hyper evaluator",
-                    )
-                })
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
-        let h_joint_unpen = match h_joint_unpen {
-            Some(source) => Some(source),
-            None => exact_newton_joint_hessian_symmetrized(
-                family,
-                &inner.block_states,
-                specs,
-                total,
-                "joint exact-newton Hessian shape mismatch in joint hyper evaluator",
+        let (
+            h_joint_unpen,
+            rho_curvature_scale,
+            hessian_logdet_correction,
+            use_outer_curvature_derivatives,
+        ) = if let Some(curvature) = family.exact_newton_outer_curvature(&inner.block_states)? {
+            (
+                JointHessianSource::Dense(symmetrized_square_matrix(
+                    curvature.hessian,
+                    total,
+                    "joint exact-newton Hessian shape mismatch in joint hyper evaluator (rescaled)",
+                )?),
+                curvature.rho_curvature_scale,
+                curvature.hessian_logdet_correction,
+                true,
             )
-            .map(|source| source.map(JointHessianSource::Dense))?,
-        }
-        .ok_or_else(|| -> CustomFamilyError {
-            "joint exact-newton Hessian unavailable for full [rho, psi] outer calculus"
-                .to_string()
-                .into()
-        })?;
+        } else {
+            let h_joint_unpen = if use_joint_matrix_free_path(total, need_hessian) {
+                hessian_workspace
+                    .as_ref()
+                    .map(|workspace| {
+                        exact_newton_joint_hessian_source_from_workspace(
+                            workspace,
+                            total,
+                            "joint exact-newton operator mismatch in joint hyper evaluator",
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            (
+                match h_joint_unpen {
+                    Some(source) => Some(source),
+                    None => exact_newton_joint_hessian_symmetrized(
+                        family,
+                        &inner.block_states,
+                        specs,
+                        total,
+                        "joint exact-newton Hessian shape mismatch in joint hyper evaluator",
+                    )
+                    .map(|source| source.map(JointHessianSource::Dense))?,
+                }
+                .ok_or_else(|| -> CustomFamilyError {
+                    "joint exact-newton Hessian unavailable for full [rho, psi] outer calculus"
+                        .to_string()
+                        .into()
+                })?,
+                1.0,
+                0.0,
+                false,
+            )
+        };
 
         // Build the exact pseudologdet eigenspace for each penalty block so
         // the value, ψ gradient, ψψ Hessian, and ρψ mixed block all
@@ -7249,6 +7640,12 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             Arc::clone(&synced_joint_states),
             specs,
             total,
+            use_outer_curvature_derivatives,
+            if use_outer_curvature_derivatives {
+                1.0
+            } else {
+                rho_curvature_scale
+            },
             hessian_workspace.clone(),
         );
         let compute_d2h = exact_newton_d2h_closure(
@@ -7256,6 +7653,12 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             Arc::clone(&synced_joint_states),
             specs,
             total,
+            use_outer_curvature_derivatives,
+            if use_outer_curvature_derivatives {
+                1.0
+            } else {
+                rho_curvature_scale
+            },
             hessian_workspace,
         );
 
@@ -7272,6 +7675,8 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             ridge,
             moderidge,
             extra_logdet_ridge,
+            rho_curvature_scale,
+            hessian_logdet_correction,
             include_logdet_h,
             include_logdet_s,
             strict_spd,
@@ -7293,9 +7698,17 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
     // Try build_joint_hessian_closures which handles both exact Newton and
     // surrogate Hessian sources, then call joint_outer_evaluate with no
     // extended coordinates.
-    if let Some((h_joint_unpen, beta_flat, compute_dh, compute_d2h)) =
+    if let Some(joint_bundle) =
         build_joint_hessian_closures(family, &inner.block_states, specs, total, need_hessian)?
     {
+        let JointHessianBundle {
+            source: h_joint_unpen,
+            beta_flat,
+            compute_dh,
+            compute_d2h,
+            rho_curvature_scale,
+            hessian_logdet_correction,
+        } = joint_bundle;
         let eval_result = joint_outer_evaluate(
             &inner,
             specs,
@@ -7308,13 +7721,15 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             ridge,
             moderidge,
             extra_logdet_ridge,
+            rho_curvature_scale,
+            hessian_logdet_correction,
             include_logdet_h,
             include_logdet_s,
             strict_spd,
             need_hessian,
             options,
-            &compute_dh,
-            &compute_d2h,
+            compute_dh.as_ref(),
+            compute_d2h.as_ref(),
             None, // no ext_coords when psi_dim == 0
         )?;
 
@@ -7480,6 +7895,8 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
         ridge,
         moderidge,
         extra_logdet_ridge,
+        1.0,
+        0.0,
         include_logdet_h,
         include_logdet_s,
         strict_spd,
@@ -10270,12 +10687,91 @@ mod tests {
     }
 
     #[test]
+    fn compressed_active_constraint_set_preserves_constraint_ids_not_active_positions() {
+        let mut a = Array2::<f64>::zeros((20, 2));
+        a[[11, 0]] = 1.0;
+        a[[7, 0]] = 2.0;
+        a[[19, 1]] = 1.0;
+        a[[3, 1]] = 3.0;
+        let constraints = LinearInequalityConstraints {
+            a,
+            b: Array1::zeros(20),
+        };
+        let active = vec![11, 7, 19, 3];
+        let compressed = compress_active_constraint_set(&constraints, &active)
+            .expect("compressed active-set should succeed");
+
+        let mut members = compressed.member_constraint_ids.clone();
+        for group in &mut members {
+            group.sort_unstable();
+        }
+        members.sort();
+
+        assert_eq!(
+            members,
+            vec![vec![3, 19], vec![7, 11]],
+            "compressed groups must track original constraint ids, not active positions"
+        );
+    }
+
+    #[test]
+    fn remove_active_constraints_by_id_handles_out_of_order_active_positions() {
+        let mut active = vec![31, 7, 44, 12, 28, 3];
+        let mut is_active = vec![false; 50];
+        for &constraint_id in &active {
+            is_active[constraint_id] = true;
+        }
+
+        remove_active_constraints_by_id(&mut active, &mut is_active, &[3, 44, 7])
+            .expect("active-set release by constraint id should succeed");
+
+        assert_eq!(active, vec![31, 12, 28]);
+        assert!(is_active[31]);
+        assert!(is_active[12]);
+        assert!(is_active[28]);
+        assert!(!is_active[3]);
+        assert!(!is_active[44]);
+        assert!(!is_active[7]);
+    }
+
+    #[test]
+    fn quadratic_linear_constraints_release_merged_constraint_group_by_id() {
+        // Two redundant lower-bound rows compress into one active KKT row.
+        // Releasing that merged row must drop both original constraint ids,
+        // not transient positions in the active vector.
+        let hessian = array![[1.0]];
+        let rhs = array![1.0];
+        let beta_start = array![0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0], [2.0], [-1.0]],
+            b: array![0.0, 0.0, -0.1],
+        };
+
+        let (beta, active) = solve_quadraticwith_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            Some(&[0, 1]),
+        )
+        .expect("merged active constraint group should release cleanly");
+
+        assert!(
+            (beta[0] - 0.1).abs() <= 1e-10,
+            "expected constrained optimum at upper bound 0.1, got {}",
+            beta[0]
+        );
+        assert_eq!(active, vec![2]);
+    }
+
+    #[test]
     fn rank_reduce_drops_exactly_dependent_row() {
         // Row 3 = Row 1 + Row 2 exactly. Rank reduction should drop it.
         let a = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],];
         let b = array![0.0, 0.0, 0.0];
-        let groups = vec![vec![0], vec![1], vec![2]];
-        let (a_out, b_out, groups_out) = rank_reduce_constraint_rows(a, b, groups);
+        let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
+        let (a_out, b_out, member_constraint_ids_out) =
+            rank_reduce_constraint_rows(a, b, member_constraint_ids);
         assert_eq!(
             a_out.nrows(),
             2,
@@ -10283,11 +10779,11 @@ mod tests {
             a_out.nrows()
         );
         assert_eq!(b_out.len(), 2);
-        // The third group should have been merged into one of the first two.
-        let total_positions: usize = groups_out.iter().map(|g| g.len()).sum();
+        // The third constraint id should have been merged into one of the first two rows.
+        let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
         assert_eq!(
-            total_positions, 3,
-            "all original positions must be preserved"
+            total_constraint_ids, 3,
+            "all original constraint ids must be preserved"
         );
     }
 
@@ -10295,14 +10791,15 @@ mod tests {
     fn rank_reduce_preserves_full_rank_matrix() {
         let a = array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0],];
         let b = array![0.0, 0.0, 0.0];
-        let groups = vec![vec![0], vec![1], vec![2]];
-        let (a_out, b_out, groups_out) = rank_reduce_constraint_rows(a, b, groups);
+        let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
+        let (a_out, b_out, member_constraint_ids_out) =
+            rank_reduce_constraint_rows(a, b, member_constraint_ids);
         // All three rows are independent in R^2 (but we only have rank 2).
         // The first two span R^2, so row 3 = row 1 + row 2 is dependent.
         assert_eq!(a_out.nrows(), 2);
         assert_eq!(b_out.len(), 2);
-        let total_positions: usize = groups_out.iter().map(|g| g.len()).sum();
-        assert_eq!(total_positions, 3);
+        let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
+        assert_eq!(total_constraint_ids, 3);
     }
 
     #[test]
@@ -10669,7 +11166,8 @@ mod tests {
             synchronized_states_from_flat_beta(&family, &specs, &states, &array![0.0])
                 .expect("sync states for exact_newton_dh_closure"),
         );
-        let compute_dh = exact_newton_dh_closure(&family, synced_states, &specs, 1, None);
+        let compute_dh =
+            exact_newton_dh_closure(&family, synced_states, &specs, 1, false, 1.0, None);
         let err = compute_dh(&array![1.0]).expect_err("non-finite dH should fail loudly");
         assert!(err.contains("non-finite"), "unexpected error: {err}");
     }

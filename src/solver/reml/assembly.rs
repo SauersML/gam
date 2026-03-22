@@ -36,6 +36,8 @@ pub struct InnerAssembly<'dp> {
     pub penalty_coords: Vec<PenaltyCoordinate>,
     pub penalty_logdet: PenaltyLogdetDerivs,
     pub dispersion: DispersionHandling,
+    pub rho_curvature_scale: f64,
+    pub hessian_logdet_correction: f64,
 
     // === Optional decorations (sensible defaults when None/zero) ===
     pub deriv_provider: Option<Box<dyn HessianDerivativeProvider + 'dp>>,
@@ -65,6 +67,8 @@ impl<'dp> InnerAssembly<'dp> {
             self.penalty_logdet,
             self.dispersion,
         );
+        builder = builder.rho_curvature_scale(self.rho_curvature_scale);
+        builder = builder.hessian_logdet_correction(self.hessian_logdet_correction);
 
         if let Some(dp) = self.deriv_provider {
             builder = builder.deriv_provider(dp);

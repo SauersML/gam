@@ -1451,6 +1451,8 @@ impl WorkingModelSurvival {
                 include_logdet_h: true,
                 include_logdet_s: true,
             },
+            rho_curvature_scale: 1.0,
+            hessian_logdet_correction: 0.0,
             deriv_provider: Some(Box::new(provider)),
             tk_correction: 0.0,
             tk_gradient: None,

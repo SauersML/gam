@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -28,6 +29,16 @@ HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 MAX_CAPTURE_CHARS = 200000
 MAX_SURVIVAL_GRID_POINTS = 256
+SURVIVAL_ENTRY_COLUMN = "__entry"
+SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS = {"transformation", "location-scale"}
+SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS = {
+    "gaussian",
+    "probit",
+    "gumbel",
+    "cloglog",
+    "logistic",
+    "logit",
+}
 
 
 @dataclass(frozen=True)
@@ -40,6 +51,8 @@ class MethodSpec:
     centers: int | None = None
     smooth_kind: str = "joint"
     include_sigma: bool = False
+    survival_likelihood: str | None = None
+    survival_distribution: str | None = None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -50,6 +63,51 @@ def load_config(path: Path) -> dict[str, Any]:
         raise RuntimeError(
             f"{path} must contain JSON-compatible YAML so this runner can parse it without external dependencies: {exc}"
         ) from exc
+
+
+def validate_method_spec(spec: MethodSpec) -> None:
+    if spec.dataset == "disease":
+        if spec.backend not in {"rust_gam", "r_mgcv"}:
+            raise RuntimeError(
+                f"unsupported disease backend '{spec.backend}' for '{spec.name}'"
+            )
+        if spec.survival_likelihood is not None or spec.survival_distribution is not None:
+            raise RuntimeError(
+                f"disease method '{spec.name}' cannot set survival_likelihood or survival_distribution"
+            )
+        return
+    if spec.dataset != "survival":
+        raise RuntimeError(f"unsupported dataset '{spec.dataset}' for '{spec.name}'")
+    if spec.backend in {"rust_survival_transform", "rust_gamlss_survival"}:
+        raise RuntimeError(
+            f"legacy survival backend '{spec.backend}' is not supported for '{spec.name}'; "
+            "use backend='rust_survival' with explicit survival_likelihood and survival_distribution"
+        )
+    if spec.backend == "rust_survival":
+        if spec.survival_likelihood not in SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS:
+            supported = "|".join(sorted(SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS))
+            raise RuntimeError(
+                f"survival method '{spec.name}' requires survival_likelihood in {supported}"
+            )
+        if spec.survival_distribution not in SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS:
+            supported = "|".join(sorted(SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS))
+            raise RuntimeError(
+                f"survival method '{spec.name}' requires survival_distribution in {supported}"
+            )
+        if spec.include_sigma:
+            raise RuntimeError(
+                f"survival method '{spec.name}' cannot use include_sigma; choose survival_likelihood explicitly"
+            )
+        return
+    if spec.backend == "r_mgcv_survival":
+        if spec.survival_likelihood is not None or spec.survival_distribution is not None:
+            raise RuntimeError(
+                f"mgcv survival method '{spec.name}' cannot set survival_likelihood or survival_distribution"
+            )
+        return
+    raise RuntimeError(
+        f"unsupported survival backend '{spec.backend}' for '{spec.name}'"
+    )
 
 
 def survival_generation_params(cfg: dict[str, Any]) -> tuple[float, float]:
@@ -751,8 +809,6 @@ def write_cohort_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "sex",
         "lat_true",
         "lon_true",
-        "lat_obs",
-        "lon_obs",
         "lat_final",
         "lon_final",
         "pgs_raw",
@@ -764,7 +820,6 @@ def write_cohort_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "lat_final_std",
         "lon_final_std",
         "age_entry_std",
-        "sex_std",
         "pgs_std",
         *[f"pc{i}_std" for i in range(1, 17)],
     ]
@@ -826,18 +881,28 @@ def do_prepare(args: argparse.Namespace) -> int:
 def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
     out = []
     for item in cfg.get("methods", []):
-        out.append(
-            MethodSpec(
-                name=str(item["name"]),
-                dataset=str(item["dataset"]),
-                backend=str(item["backend"]),
-                family=str(item["family"]),
-                spatial_basis=str(item["spatial_basis"]),
-                centers=int(item["centers"]) if item.get("centers") is not None else None,
-                smooth_kind=str(item.get("smooth_kind", "joint")),
-                include_sigma=bool(item.get("include_sigma", False)),
-            )
+        spec = MethodSpec(
+            name=str(item["name"]),
+            dataset=str(item["dataset"]),
+            backend=str(item["backend"]),
+            family=str(item["family"]),
+            spatial_basis=str(item["spatial_basis"]),
+            centers=int(item["centers"]) if item.get("centers") is not None else None,
+            smooth_kind=str(item.get("smooth_kind", "joint")),
+            include_sigma=bool(item.get("include_sigma", False)),
+            survival_likelihood=(
+                str(item["survival_likelihood"])
+                if item.get("survival_likelihood") is not None
+                else None
+            ),
+            survival_distribution=(
+                str(item["survival_distribution"])
+                if item.get("survival_distribution") is not None
+                else None
+            ),
         )
+        validate_method_spec(spec)
+        out.append(spec)
     return out
 
 
@@ -859,7 +924,9 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
             *[f"pc{i}_std" for i in range(1, 17)],
         ]
         mean_formula = "phenotype ~ " + " + ".join(base_terms)
-        sigma_formula = "sigma ~ " + " + ".join(["smooth(age_entry_std)", spatial, *[f"pc{i}_std" for i in range(1, 5)]])
+        sigma_formula = " + ".join(
+            ["smooth(age_entry_std)", spatial, *[f"pc{i}_std" for i in range(1, 5)]]
+        )
         return mean_formula, sigma_formula
     mean_terms = [
         "pgs_std",
@@ -875,11 +942,73 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
         "smooth(lon_final_std)",
         *[f"pc{i}_std" for i in range(1, 5)],
     ]
-    return "phenotype ~ " + " + ".join(mean_terms), "sigma ~ " + " + ".join(sigma_terms)
+    return "phenotype ~ " + " + ".join(mean_terms), " + ".join(sigma_terms)
 
 
-def rust_formula_survival(spec: MethodSpec) -> str:
-    return "pgs_std + sex + smooth(age_entry_std) + smooth(lat_final_std) + smooth(lon_final_std) + pc1_std + pc2_std + pc3_std + pc4_std"
+def rust_survival_formula_rhs(spec: MethodSpec) -> str:
+    distribution = spec.survival_distribution
+    if distribution is None:
+        raise RuntimeError(
+            f"survival method '{spec.name}' is missing survival_distribution"
+        )
+    terms = [
+        "pgs_std",
+        "sex",
+        "smooth(age_entry_std)",
+        "smooth(lat_final_std)",
+        "smooth(lon_final_std)",
+        "pc1_std",
+        "pc2_std",
+        "pc3_std",
+        "pc4_std",
+        f"survmodel(spec=net, distribution={distribution})",
+    ]
+    return " + ".join(terms)
+
+
+def rust_survival_formula(spec: MethodSpec) -> str:
+    return f"Surv({SURVIVAL_ENTRY_COLUMN}, time, event) ~ {rust_survival_formula_rhs(spec)}"
+
+
+def survival_eval_horizon_from_rows(rows: list[dict[str, Any]]) -> float:
+    times = np.array([float(r["time"]) for r in rows], dtype=float)
+    horizon = float(np.median(times))
+    if (not np.isfinite(horizon)) or horizon <= 0.0:
+        horizon = 1.0
+    return horizon
+
+
+def prepare_survival_benchmark_rows(
+    rows: list[dict[str, Any]],
+    *,
+    prediction_horizon: float | None = None,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        prepared = dict(row)
+        prepared[SURVIVAL_ENTRY_COLUMN] = 0.0
+        if prediction_horizon is not None:
+            prepared["time"] = float(prediction_horizon)
+        out.append(prepared)
+    return out
+
+
+def write_survival_benchmark_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    prediction_horizon: float | None = None,
+) -> None:
+    prepared_rows = prepare_survival_benchmark_rows(
+        rows,
+        prediction_horizon=prediction_horizon,
+    )
+    if not prepared_rows:
+        raise RuntimeError(f"cannot write empty survival benchmark frame to {path}")
+    fieldnames = [SURVIVAL_ENTRY_COLUMN] + [
+        key for key in prepared_rows[0].keys() if key != SURVIVAL_ENTRY_COLUMN
+    ]
+    write_csv_rows(path, prepared_rows, fieldnames)
 
 
 def mgcv_formula_classification(spec: MethodSpec) -> str:
@@ -955,55 +1084,78 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
 
 def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir: Path) -> dict[str, Any]:
     rust_bin = load_or_build_rust_binary()
-    formula_rhs = rust_formula_survival(spec)
+    fit_formula = rust_survival_formula(spec)
     model_path = out_dir / f"{spec.name}.model.json"
     pred_path = out_dir / f"{spec.name}.pred.csv"
-    likelihood_mode = "transformation" if spec.backend == "rust_survival_transform" else "probit-location-scale"
-    fit_cmd = [
-        str(rust_bin), "fit",
-        "--survival-likelihood", likelihood_mode,
-        "--time-basis", "ispline",
-        "--time-degree", "3",
-        "--time-num-internal-knots", "8",
-        "--time-smooth-lambda", "0.01",
-        "--ridge-lambda", "1e-6",
-        "--out", str(model_path),
-        str(train_csv),
-        f"Surv(time, event) ~ {formula_rhs}",
-    ]
-    t0 = time.perf_counter()
-    rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
-    fit_sec = time.perf_counter() - t0
-    if rc != 0:
-        raise RuntimeError(err.strip() or out.strip() or f"{spec.name} fit failed")
-    pred_cmd = [str(rust_bin), "predict", str(model_path), str(test_csv), "--out", str(pred_path)]
-    t1 = time.perf_counter()
-    rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
-    predict_sec = time.perf_counter() - t1
-    if rc != 0:
-        raise RuntimeError(err.strip() or out.strip() or f"{spec.name} predict failed")
-    pred_rows = read_csv_rows(pred_path)
-    risk_cols = ["failure_prob", "risk_score", "eta"]
-    risk_key = next((k for k in risk_cols if k in pred_rows[0]), None)
-    if risk_key is None:
-        raise RuntimeError(f"{spec.name} prediction output missing risk column")
-    test_risk = np.array([float(r[risk_key]) for r in pred_rows], dtype=float)
-    train_pred_path = out_dir / f"{spec.name}.trainpred.csv"
-    pred_train_cmd = [str(rust_bin), "predict", str(model_path), str(train_csv), "--out", str(train_pred_path)]
-    rc, out, err = run_cmd_stream(pred_train_cmd, cwd=ROOT)
-    if rc != 0:
-        raise RuntimeError(err.strip() or out.strip() or f"{spec.name} train predict failed")
-    train_pred_rows = read_csv_rows(train_pred_path)
-    train_risk = np.array([float(r[risk_key]) for r in train_pred_rows], dtype=float)
-    train_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(train_csv)]
-    test_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(test_csv)]
+    likelihood_mode = spec.survival_likelihood
+    if likelihood_mode is None:
+        raise RuntimeError(
+            f"survival method '{spec.name}' is missing survival_likelihood"
+        )
+    train_rows_raw = read_csv_rows(train_csv)
+    test_rows_raw = read_csv_rows(test_csv)
+    horizon = survival_eval_horizon_from_rows(train_rows_raw)
+    with tempfile.TemporaryDirectory(prefix="gam_biobank_survival_", dir=out_dir) as td:
+        td_path = Path(td)
+        train_fit_path = td_path / "train_fit.csv"
+        train_pred_input_path = td_path / "train_predict.csv"
+        test_pred_input_path = td_path / "test_predict.csv"
+        train_pred_path = td_path / "trainpred.csv"
+        write_survival_benchmark_csv(train_fit_path, train_rows_raw)
+        write_survival_benchmark_csv(
+            train_pred_input_path,
+            train_rows_raw,
+            prediction_horizon=horizon,
+        )
+        write_survival_benchmark_csv(
+            test_pred_input_path,
+            test_rows_raw,
+            prediction_horizon=horizon,
+        )
+        fit_cmd = [
+            str(rust_bin), "fit",
+            "--survival-likelihood", likelihood_mode,
+            "--time-basis", "ispline",
+            "--time-degree", "3",
+            "--time-num-internal-knots", "8",
+            "--time-smooth-lambda", "0.01",
+            "--ridge-lambda", "1e-6",
+            "--out", str(model_path),
+            str(train_fit_path),
+            fit_formula,
+        ]
+        t0 = time.perf_counter()
+        rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
+        fit_sec = time.perf_counter() - t0
+        if rc != 0:
+            raise RuntimeError(err.strip() or out.strip() or f"{spec.name} fit failed")
+        pred_cmd = [str(rust_bin), "predict", str(model_path), str(test_pred_input_path), "--out", str(pred_path)]
+        t1 = time.perf_counter()
+        rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
+        predict_sec = time.perf_counter() - t1
+        if rc != 0:
+            raise RuntimeError(err.strip() or out.strip() or f"{spec.name} predict failed")
+        pred_rows = read_csv_rows(pred_path)
+        risk_cols = ["failure_prob", "risk_score", "eta"]
+        risk_key = next((k for k in risk_cols if k in pred_rows[0]), None)
+        if risk_key is None:
+            raise RuntimeError(f"{spec.name} prediction output missing risk column")
+        test_risk = np.array([float(r[risk_key]) for r in pred_rows], dtype=float)
+        pred_train_cmd = [str(rust_bin), "predict", str(model_path), str(train_pred_input_path), "--out", str(train_pred_path)]
+        rc, out, err = run_cmd_stream(pred_train_cmd, cwd=ROOT)
+        if rc != 0:
+            raise RuntimeError(err.strip() or out.strip() or f"{spec.name} train predict failed")
+        train_pred_rows = read_csv_rows(train_pred_path)
+        train_risk = np.array([float(r[risk_key]) for r in train_pred_rows], dtype=float)
+    train_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in train_rows_raw]
+    test_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in test_rows_raw]
     metrics = survival_metrics(train_rows, test_rows, train_risk, test_risk)
     return {
         "fit_sec": fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
         "prediction_path": str(pred_path),
-        "model_spec": f"Rust survival {likelihood_mode} holdout",
+        "model_spec": f"{fit_formula} [survival-likelihood={likelihood_mode}; predict_horizon={horizon:.6g}]",
     }
 
 
@@ -1112,7 +1264,7 @@ def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path) -> dict[str, Any
         else:
             raise RuntimeError(f"unsupported disease backend '{spec.backend}'")
     elif spec.dataset == "survival":
-        if spec.backend in {"rust_survival", "rust_survival_transform", "rust_gamlss_survival"}:
+        if spec.backend == "rust_survival":
             result = run_rust_survival(spec, survival_train, survival_test, out_dir)
         elif spec.backend == "r_mgcv_survival":
             result = run_r_mgcv_survival(spec, survival_train, survival_test, out_dir)

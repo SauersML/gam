@@ -784,12 +784,28 @@ pub fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>
     Ok(Some((vars[0].clone(), vars[1].clone(), vars[2].clone())))
 }
 
-pub fn normalizenoise_formula(noise: &str, response: &str) -> String {
-    if noise.contains('~') {
-        noise.to_string()
-    } else {
-        format!("{response} ~ {noise}")
+fn top_level_formula_separator(input: &str) -> Result<Option<usize>, String> {
+    let mut depth = 0_i32;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '(' | '[' | '{' if !in_single && !in_double => depth += 1,
+            ')' | ']' | '}' if !in_single && !in_double && depth > 0 => depth -= 1,
+            '~' if !in_single && !in_double && depth == 0 => return Ok(Some(idx)),
+            _ => {}
+        }
     }
+
+    if in_single || in_double || depth != 0 {
+        return Err(
+            "invalid auxiliary formula syntax: unbalanced parentheses or quotes".to_string(),
+        );
+    }
+    Ok(None)
 }
 
 pub fn parse_matching_auxiliary_formula(
@@ -797,25 +813,14 @@ pub fn parse_matching_auxiliary_formula(
     response: &str,
     flag_name: &str,
 ) -> Result<(String, ParsedFormula), String> {
-    let normalized_formula = normalizenoise_formula(formula, response);
-    let parsed_formula = parse_formula(&normalized_formula)?;
-    let responses_match = if parsed_formula.response == response {
-        true
-    } else {
-        match (
-            parse_surv_response(response)?,
-            parse_surv_response(&parsed_formula.response)?,
-        ) {
-            (Some(expected), Some(actual)) => expected == actual,
-            _ => false,
-        }
-    };
-    if !responses_match {
+    let rhs = formula.trim();
+    if top_level_formula_separator(rhs)?.is_some() {
         return Err(format!(
-            "{flag_name} must use the same response expression as the main formula"
+            "{flag_name} accepts only RHS terms; remove the response and pass terms like 'smooth(x)' or '1'"
         ));
     }
-    Ok((normalized_formula, parsed_formula))
+    let parsed_formula = parse_formula(&format!("{response} ~ {rhs}"))?;
+    Ok((rhs.to_string(), parsed_formula))
 }
 
 pub fn validate_auxiliary_formula_controls(
