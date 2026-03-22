@@ -4,12 +4,18 @@
 //! Model: Λ(a|U) = B(a)·exp(U),  U ~ N(μ, σ²),  σ fixed.
 
 use crate::families::custom_family::{
-    BlockWorkingSet, CustomFamily, FamilyEvaluation, ParameterBlockState,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, fit_custom_family,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
 use crate::families::lognormal_kernel::{LatentSurvivalRow, LatentSurvivalRowJet};
+use crate::estimate::UnifiedFitResult;
 use crate::quadrature::QuadratureContext;
-use ndarray::Array1;
+use crate::smooth::{
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    freeze_term_collection_from_design,
+};
+use ndarray::{Array1, ArrayView2};
 use std::sync::Arc;
 
 const MIN_WEIGHT: f64 = 1e-12;
@@ -25,6 +31,52 @@ fn expect_single_block<'a>(
         ));
     }
     Ok(&block_states[0])
+}
+
+pub struct LatentSurvivalTermFitResult {
+    pub fit: UnifiedFitResult,
+    pub design: TermCollectionDesign,
+    pub resolvedspec: TermCollectionSpec,
+}
+
+fn validate_latent_survival_inputs(
+    data: ArrayView2<'_, f64>,
+    rows: &[LatentSurvivalRow],
+    weights: &Array1<f64>,
+    latent_sd: f64,
+) -> Result<(), String> {
+    if data.nrows() == 0 {
+        return Err("latent-survival requires a non-empty dataset".to_string());
+    }
+    if rows.len() != data.nrows() || weights.len() != data.nrows() {
+        return Err(format!(
+            "latent-survival size mismatch: data has {} rows, rows has {}, weights has {}",
+            data.nrows(),
+            rows.len(),
+            weights.len()
+        ));
+    }
+    if !latent_sd.is_finite() || latent_sd < 0.0 {
+        return Err(format!(
+            "latent-survival requires latent_sd >= 0, got {latent_sd}"
+        ));
+    }
+    Ok(())
+}
+
+fn build_eta_blockspec(
+    design: &TermCollectionDesign,
+    n_rows: usize,
+) -> ParameterBlockSpec {
+    ParameterBlockSpec {
+        name: "eta".to_string(),
+        design: design.design.clone(),
+        offset: Array1::zeros(n_rows),
+        penalties: design.penalties_as_penalty_matrix(),
+        nullspace_dims: design.nullspace_dims.clone(),
+        initial_log_lambdas: Array1::zeros(design.penalties.len()),
+        initial_beta: None,
+    }
 }
 
 /// Latent-frailty survival family with compiled sufficient statistics.

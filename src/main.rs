@@ -1349,7 +1349,7 @@ fn run_fit_bernoulli_marginal_slope(
                 logslopespec: logslopespec.clone(),
                 marginal_offset,
                 logslope_offset,
-                gaussian_frailty_sd: None,
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
                 score_warp: if args.disable_score_warp {
                     None
                 } else {
@@ -4978,7 +4978,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             z,
             marginalspec: termspec.clone(),
             marginal_offset: threshold_offset.clone(),
-            gaussian_frailty_sd: None,
+            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
             time_block: TimeBlockInput {
                 design_entry: time_design_entry.clone(),

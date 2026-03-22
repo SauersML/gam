@@ -15,6 +15,7 @@ use crate::families::gamlss::{
     ParameterBlockInput, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
     select_wiggle_basis_from_seed,
 };
+use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -98,7 +99,7 @@ pub struct BernoulliMarginalSlopeTermSpec {
     /// HazardMultiplier frailty + score_warp/linkwiggle cubic marginal-slope
     /// is not finite-state exact.  For hazard-multiplier frailty, use the
     /// standalone LatentCloglogBinomial / LatentSurvival families instead.
-    pub gaussian_frailty_sd: Option<f64>,
+    pub frailty: FrailtySpec,
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
 }
@@ -120,7 +121,7 @@ struct BernoulliMarginalSlopeFamily {
     y: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
     z: Arc<Array1<f64>>,
-    gaussian_frailty_sd: Option<f64>,
+    frailty: FrailtySpec,
     marginal_design: DesignMatrix,
     logslope_design: DesignMatrix,
     score_warp: Option<DeviationRuntime>,
@@ -566,12 +567,20 @@ fn validate_spec(
     if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
         return Err("bernoulli-marginal-slope requires finite logslope offsets".to_string());
     }
-    if let Some(sigma) = spec.gaussian_frailty_sd {
-        if !sigma.is_finite() || sigma < 0.0 {
-            return Err(format!(
-                "bernoulli-marginal-slope requires gaussian_frailty_sd >= 0, got {sigma}"
-            ));
+    spec.frailty.validate_for_marginal_slope()?;
+    match &spec.frailty {
+        FrailtySpec::None => {}
+        FrailtySpec::GaussianShift { sigma_fixed } => {
+            let sigma = sigma_fixed.ok_or_else(|| {
+                "bernoulli-marginal-slope currently requires FrailtySpec::GaussianShift with a fixed sigma".to_string()
+            })?;
+            if !sigma.is_finite() || *sigma < 0.0 {
+                return Err(format!(
+                    "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                ));
+            }
         }
+        FrailtySpec::HazardMultiplier { .. } => unreachable!(),
     }
     // Enforce z is approximately standard normal.
     // The Gaussian decoupling identity E[Φ(a + β Z)] = Φ(a / √(1+β²))
@@ -1567,8 +1576,12 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
-fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
-    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
+fn probit_frailty_scale(frailty: &FrailtySpec) -> f64 {
+    let sigma = match frailty {
+        FrailtySpec::None => 0.0,
+        FrailtySpec::GaussianShift { sigma_fixed } => sigma_fixed.unwrap_or(0.0),
+        FrailtySpec::HazardMultiplier { .. } => 0.0,
+    };
     1.0 / (1.0 + sigma * sigma).sqrt()
 }
 
@@ -1907,7 +1920,7 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
 impl BernoulliMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
-        probit_frailty_scale(self.gaussian_frailty_sd)
+        probit_frailty_scale(&self.frailty)
     }
 
     fn flex_score_beta<'a>(
@@ -2046,7 +2059,7 @@ impl BernoulliMarginalSlopeFamily {
     fn flex_active(&self) -> bool {
         self.score_warp.is_some()
             || self.link_dev.is_some()
-            || self.gaussian_frailty_sd.unwrap_or(0.0) > 0.0
+            || self.frailty.is_active()
     }
 
     fn validate_exact_monotonicity(
@@ -2824,8 +2837,6 @@ impl BernoulliMarginalSlopeFamily {
         let mut coeff_au = vec![[0.0; 4]; r];
         let mut coeff_bu = vec![[0.0; 4]; r];
 
-        let scale = self.probit_frailty_scale();
-        let scale = self.probit_frailty_scale();
         let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
         for partition_cell in cells {
             let cell = partition_cell.cell;
@@ -3259,6 +3270,7 @@ impl BernoulliMarginalSlopeFamily {
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();
+        let scale = self.probit_frailty_scale();
 
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
@@ -3889,6 +3901,7 @@ impl BernoulliMarginalSlopeFamily {
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();
+        let scale = self.probit_frailty_scale();
 
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
@@ -4548,29 +4561,35 @@ impl BernoulliMarginalSlopeFamily {
             for local_idx in 0..h_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
-                g_u_fixed[idx] = exact::score_basis_cell_coefficients(basis_span, b);
-                g_bu_fixed[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+                g_u_fixed[idx] =
+                    scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
+                g_bu_fixed[idx] = scale_coeff4(
+                    exact::score_basis_cell_coefficients(basis_span, 1.0),
+                    scale,
+                );
             }
         }
         if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
             for local_idx in 0..w_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                 let idx = w_range.start + local_idx;
-                g_u_fixed[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
-                let (dc_aw, dc_bw) = exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                let (dc_aaw, dc_abw, dc_bbw) =
+                g_u_fixed[idx] =
+                    scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
+                let (dc_aw_raw, dc_bw_raw) =
+                    exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
                     exact::link_basis_cell_second_partials(basis_span, a, b);
                 let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
                     exact::link_basis_cell_third_partials(basis_span);
-                g_au_fixed[idx] = dc_aw;
-                g_bu_fixed[idx] = dc_bw;
-                g_aau_fixed[idx] = dc_aaw;
-                g_abu_fixed[idx] = dc_abw;
-                g_bbu_fixed[idx] = dc_bbw;
-                g_aaau_fixed[idx] = dc_aaaw;
-                g_aabu_fixed[idx] = dc_aabw;
-                g_abbu_fixed[idx] = dc_abbw;
-                g_bbbu_fixed[idx] = dc_bbbw;
+                g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
+                g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
+                g_aau_fixed[idx] = scale_coeff4(dc_aaw_raw, scale);
+                g_abu_fixed[idx] = scale_coeff4(dc_abw_raw, scale);
+                g_bbu_fixed[idx] = scale_coeff4(dc_bbw_raw, scale);
+                g_aaau_fixed[idx] = scale_coeff4(dc_aaaw, scale);
+                g_aabu_fixed[idx] = scale_coeff4(dc_aabw, scale);
+                g_abbu_fixed[idx] = scale_coeff4(dc_abbw, scale);
+                g_bbbu_fixed[idx] = scale_coeff4(dc_bbbw, scale);
             }
         }
 
@@ -7211,7 +7230,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
-            gaussian_frailty_sd: spec.gaussian_frailty_sd,
+            frailty: spec.frailty.clone(),
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
             score_warp: score_warp_runtime.clone(),
@@ -7423,7 +7442,7 @@ mod tests {
             logslopespec: empty_termspec(),
             marginal_offset: Array1::zeros(n),
             logslope_offset: Array1::zeros(n),
-            gaussian_frailty_sd: None,
+            frailty: FrailtySpec::None,
             score_warp: None,
             link_dev: None,
         }
