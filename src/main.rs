@@ -4942,7 +4942,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
             );
         }
-        if args.disable_score_warp && routed_link_dev.is_none() {
+        if routed_link_dev.is_none() {
             inference_notes.push(
                 "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
             );
@@ -4978,11 +4978,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             timewiggle_block: timewiggle_block.clone(),
             logslopespec,
             logslope_offset: log_sigma_offset.clone(),
-            score_warp: if args.disable_score_warp {
-                None
-            } else {
-                Some(DeviationBlockConfig::default())
-            },
+            score_warp: Some(DeviationBlockConfig::default()),
             link_dev: routed_link_dev,
         };
         let kappa_options = {
