@@ -87,6 +87,18 @@ pub struct BernoulliMarginalSlopeTermSpec {
     pub logslopespec: TermCollectionSpec,
     pub marginal_offset: Array1<f64>,
     pub logslope_offset: Array1<f64>,
+    /// GaussianShift frailty on the final probit index: U ~ N(0, σ²) added
+    /// to the scalar argument of Φ.  This is exact because the sextic
+    /// microcell kernel is preserved — the Gaussian-decoupling identity
+    /// E[Φ(η + U)] = Φ(η / √(1+σ²)) rescales the index by 1/τ where
+    /// τ = √(1+σ²), and every derivative chain rule factor is polynomial
+    /// in τ, so all six kernel derivatives remain closed-form.
+    ///
+    /// **HazardMultiplier frailty is NOT supported in this family.**
+    /// HazardMultiplier frailty + score_warp/linkwiggle cubic marginal-slope
+    /// is not finite-state exact.  For hazard-multiplier frailty, use the
+    /// standalone LatentCloglogBinomial / LatentSurvival families instead.
+    pub gaussian_frailty_sd: Option<f64>,
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
 }
@@ -108,6 +120,7 @@ struct BernoulliMarginalSlopeFamily {
     y: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
     z: Arc<Array1<f64>>,
+    gaussian_frailty_sd: Option<f64>,
     marginal_design: DesignMatrix,
     logslope_design: DesignMatrix,
     score_warp: Option<DeviationRuntime>,
@@ -552,6 +565,13 @@ fn validate_spec(
     }
     if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
         return Err("bernoulli-marginal-slope requires finite logslope offsets".to_string());
+    }
+    if let Some(sigma) = spec.gaussian_frailty_sd {
+        if !sigma.is_finite() || sigma < 0.0 {
+            return Err(format!(
+                "bernoulli-marginal-slope requires gaussian_frailty_sd >= 0, got {sigma}"
+            ));
+        }
     }
     // Enforce z is approximately standard normal.
     // The Gaussian decoupling identity E[Φ(a + β Z)] = Φ(a / √(1+β²))
@@ -1537,6 +1557,22 @@ fn add_scaled_coeff4(target: &mut [f64; 4], source: &[f64; 4], scale: f64) {
 }
 
 #[inline]
+fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
+    [
+        source[0] * scale,
+        source[1] * scale,
+        source[2] * scale,
+        source[3] * scale,
+    ]
+}
+
+#[inline]
+fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
+    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
+    1.0 / (1.0 + sigma * sigma).sqrt()
+}
+
+#[inline]
 fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
     ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
 }
@@ -1869,6 +1905,11 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
 }
 
 impl BernoulliMarginalSlopeFamily {
+    #[inline]
+    fn probit_frailty_scale(&self) -> f64 {
+        probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
     fn flex_score_beta<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
@@ -1913,7 +1954,7 @@ impl BernoulliMarginalSlopeFamily {
         if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
             link_breaks.push(a + link_tail);
         }
-        exact_kernel::build_denested_partition_cells(
+        let mut cells = exact_kernel::build_denested_partition_cells(
             a,
             b,
             &score_breaks,
@@ -1946,7 +1987,17 @@ impl BernoulliMarginalSlopeFamily {
                     })
                 }
             },
-        )
+        )?;
+        let scale = self.probit_frailty_scale();
+        if scale != 1.0 {
+            for partition_cell in &mut cells {
+                partition_cell.cell.c0 *= scale;
+                partition_cell.cell.c1 *= scale;
+                partition_cell.cell.c2 *= scale;
+                partition_cell.cell.c3 *= scale;
+            }
+        }
+        Ok(cells)
     }
 
     fn evaluate_denested_calibration(
@@ -1958,6 +2009,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64, f64), String> {
         let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
+        let scale = self.probit_frailty_scale();
         let mut f = -normal_cdf(marginal_eta);
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
@@ -1965,18 +2017,20 @@ impl BernoulliMarginalSlopeFamily {
             let cell = partition_cell.cell;
             let state = exact_kernel::evaluate_cell_moments(cell, 9)?;
             f += state.value;
-            let (dc_da, _) = exact_kernel::denested_cell_coefficient_partials(
+            let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 slope,
             );
-            let (d2c_da2, _, _) = exact_kernel::denested_cell_second_partials(
+            let (d2c_da2_raw, _, _) = exact_kernel::denested_cell_second_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 slope,
             );
+            let dc_da = scale_coeff4(dc_da_raw, scale);
+            let d2c_da2 = scale_coeff4(d2c_da2_raw, scale);
             f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
             f_aa += exact_kernel::cell_second_derivative_from_moments(
                 cell,
@@ -1990,7 +2044,9 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     fn flex_active(&self) -> bool {
-        self.score_warp.is_some() || self.link_dev.is_some()
+        self.score_warp.is_some()
+            || self.link_dev.is_some()
+            || self.gaussian_frailty_sd.unwrap_or(0.0) > 0.0
     }
 
     fn validate_exact_monotonicity(
@@ -2758,6 +2814,7 @@ impl BernoulliMarginalSlopeFamily {
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();
+        let scale = self.probit_frailty_scale();
 
         let f_u = &mut scratch.m_u;
         let f_au = &mut scratch.m_au;
@@ -2767,29 +2824,36 @@ impl BernoulliMarginalSlopeFamily {
         let mut coeff_au = vec![[0.0; 4]; r];
         let mut coeff_bu = vec![[0.0; 4]; r];
 
+        let scale = self.probit_frailty_scale();
+        let scale = self.probit_frailty_scale();
         let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
         for partition_cell in cells {
             let cell = partition_cell.cell;
             let z_mid = 0.5 * (cell.left + cell.right);
             let u_mid = a + b * z_mid;
             let state = exact::evaluate_cell_moments(cell, if need_hessian { 9 } else { 3 })?;
-            let (dc_da, dc_db) = exact::denested_cell_coefficient_partials(
+            let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 b,
             );
+            let dc_da = scale_coeff4(dc_da_raw, scale);
+            let dc_db = scale_coeff4(dc_db_raw, scale);
 
             coeff_u[1] = dc_db;
             coeff_au[1] = [0.0; 4];
             coeff_bu[1] = [0.0; 4];
             if need_hessian {
-                let (dc_daa, dc_dab, dc_dbb) = exact::denested_cell_second_partials(
+                let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
                     partition_cell.score_span,
                     partition_cell.link_span,
                     a,
                     b,
                 );
+                let dc_daa = scale_coeff4(dc_daa_raw, scale);
+                let dc_dab = scale_coeff4(dc_dab_raw, scale);
+                let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
                 f_aa += exact::cell_second_derivative_from_moments(
                     cell,
                     &dc_da,
@@ -2805,9 +2869,13 @@ impl BernoulliMarginalSlopeFamily {
                 for local_idx in 0..h_range.len() {
                     let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
                     let idx = h_range.start + local_idx;
-                    coeff_u[idx] = exact::score_basis_cell_coefficients(basis_span, b);
+                    coeff_u[idx] =
+                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
                     if need_hessian {
-                        coeff_bu[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+                        coeff_bu[idx] = scale_coeff4(
+                            exact::score_basis_cell_coefficients(basis_span, 1.0),
+                            scale,
+                        );
                     }
                 }
             }
@@ -2816,12 +2884,13 @@ impl BernoulliMarginalSlopeFamily {
                 for local_idx in 0..w_range.len() {
                     let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
                     let idx = w_range.start + local_idx;
-                    coeff_u[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
+                    coeff_u[idx] =
+                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
                     if need_hessian {
-                        let (dc_aw, dc_bw) =
+                        let (dc_aw_raw, dc_bw_raw) =
                             exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        coeff_au[idx] = dc_aw;
-                        coeff_bu[idx] = dc_bw;
+                        coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
+                        coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
                     }
                 }
             }
@@ -2905,19 +2974,24 @@ impl BernoulliMarginalSlopeFamily {
         if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
             for local_idx in 0..h_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
-                rho[h_range.start + local_idx] =
-                    eval_coeff4_at(&exact::score_basis_cell_coefficients(basis_span, b), z_obs);
+                rho[h_range.start + local_idx] = eval_coeff4_at(
+                    &scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale),
+                    z_obs,
+                );
             }
         }
         if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
             for local_idx in 0..w_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                 rho[w_range.start + local_idx] = eval_coeff4_at(
-                    &exact::link_basis_cell_coefficients(basis_span, a, b),
+                    &scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale),
                     z_obs,
                 );
                 tau[w_range.start + local_idx] = eval_coeff4_at(
-                    &exact::link_basis_cell_coefficient_partials(basis_span, a, b).0,
+                    &scale_coeff4(
+                        exact::link_basis_cell_coefficient_partials(basis_span, a, b).0,
+                        scale,
+                    ),
                     z_obs,
                 );
             }
@@ -2950,7 +3024,10 @@ impl BernoulliMarginalSlopeFamily {
                                     .ok_or_else(|| "missing score-warp runtime".to_string())?;
                                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                                 r_uv = eval_coeff4_at(
-                                    &exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                    &scale_coeff4(
+                                        exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                        scale,
+                                    ),
                                     z_obs,
                                 );
                             }
@@ -2962,8 +3039,13 @@ impl BernoulliMarginalSlopeFamily {
                                     .ok_or_else(|| "missing link runtime".to_string())?;
                                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                                 r_uv = eval_coeff4_at(
-                                    &exact::link_basis_cell_coefficient_partials(basis_span, a, b)
+                                    &scale_coeff4(
+                                        exact::link_basis_cell_coefficient_partials(
+                                            basis_span, a, b,
+                                        )
                                         .1,
+                                        scale,
+                                    ),
                                     z_obs,
                                 );
                             }
@@ -2976,7 +3058,10 @@ impl BernoulliMarginalSlopeFamily {
                                     .ok_or_else(|| "missing score-warp runtime".to_string())?;
                                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                                 r_uv = eval_coeff4_at(
-                                    &exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                    &scale_coeff4(
+                                        exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                        scale,
+                                    ),
                                     z_obs,
                                 );
                             }
@@ -2988,8 +3073,13 @@ impl BernoulliMarginalSlopeFamily {
                                     .ok_or_else(|| "missing link runtime".to_string())?;
                                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                                 r_uv = eval_coeff4_at(
-                                    &exact::link_basis_cell_coefficient_partials(basis_span, a, b)
+                                    &scale_coeff4(
+                                        exact::link_basis_cell_coefficient_partials(
+                                            basis_span, a, b,
+                                        )
                                         .1,
+                                        scale,
+                                    ),
                                     z_obs,
                                 );
                             }
@@ -3060,6 +3150,7 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<ObservedDenestedCellPartials, String> {
         use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
 
+        let scale = self.probit_frailty_scale();
         let zero_score_span = exact::LocalSpanCubic {
             left: -8.0,
             right: 8.0,
@@ -3090,12 +3181,20 @@ impl BernoulliMarginalSlopeFamily {
         } else {
             zero_link_span
         };
-        let coeff = exact::denested_cell_coefficients(score_span_obs, link_span_obs, a, b);
-        let (dc_da, dc_db) =
+        let coeff = scale_coeff4(
+            exact::denested_cell_coefficients(score_span_obs, link_span_obs, a, b),
+            scale,
+        );
+        let (dc_da_raw, dc_db_raw) =
             exact::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
-        let (dc_daa, dc_dab, dc_dbb) =
+        let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
         let denested_third = exact::denested_cell_third_partials(link_span_obs);
+        let dc_da = scale_coeff4(dc_da_raw, scale);
+        let dc_db = scale_coeff4(dc_db_raw, scale);
+        let dc_daa = scale_coeff4(dc_daa_raw, scale);
+        let dc_dab = scale_coeff4(dc_dab_raw, scale);
+        let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
         Ok(ObservedDenestedCellPartials {
             coeff,
             dc_da,
@@ -3103,10 +3202,10 @@ impl BernoulliMarginalSlopeFamily {
             dc_daa,
             dc_dab,
             dc_dbb,
-            dc_daaa: denested_third.0,
-            dc_daab: denested_third.1,
-            dc_dabb: denested_third.2,
-            dc_dbbb: denested_third.3,
+            dc_daaa: scale_coeff4(denested_third.0, scale),
+            dc_daab: scale_coeff4(denested_third.1, scale),
+            dc_dabb: scale_coeff4(denested_third.2, scale),
+            dc_dbbb: scale_coeff4(denested_third.3, scale),
         })
     }
 
@@ -3178,22 +3277,27 @@ impl BernoulliMarginalSlopeFamily {
             let u_mid = a + b * z_mid;
             let state = exact::evaluate_cell_moments(cell, 15)?;
 
-            let (dc_da, dc_db) = exact::denested_cell_coefficient_partials(
+            let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 b,
             );
-            let (dc_daa, dc_dab, dc_dbb) = exact::denested_cell_second_partials(
+            let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 b,
             );
             let denested_third = exact::denested_cell_third_partials(partition_cell.link_span);
-            let dc_daab = denested_third.1;
-            let dc_dabb = denested_third.2;
-            let dc_dbbb = denested_third.3;
+            let dc_da = scale_coeff4(dc_da_raw, scale);
+            let dc_db = scale_coeff4(dc_db_raw, scale);
+            let dc_daa = scale_coeff4(dc_daa_raw, scale);
+            let dc_dab = scale_coeff4(dc_dab_raw, scale);
+            let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+            let dc_daab = scale_coeff4(denested_third.1, scale);
+            let dc_dabb = scale_coeff4(denested_third.2, scale);
+            let dc_dbbb = scale_coeff4(denested_third.3, scale);
 
             let mut coeff_u = vec![[0.0; 4]; r];
             let mut coeff_au = vec![[0.0; 4]; r];
@@ -3213,8 +3317,12 @@ impl BernoulliMarginalSlopeFamily {
                 for local_idx in 0..h_range.len() {
                     let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
                     let idx = h_range.start + local_idx;
-                    coeff_u[idx] = exact::score_basis_cell_coefficients(basis_span, b);
-                    coeff_bu[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+                    coeff_u[idx] =
+                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
+                    coeff_bu[idx] = scale_coeff4(
+                        exact::score_basis_cell_coefficients(basis_span, 1.0),
+                        scale,
+                    );
                 }
             }
 
@@ -3222,16 +3330,17 @@ impl BernoulliMarginalSlopeFamily {
                 for local_idx in 0..w_range.len() {
                     let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
                     let idx = w_range.start + local_idx;
-                    coeff_u[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
-                    let (dc_aw, dc_bw) =
+                    coeff_u[idx] =
+                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
+                    let (dc_aw_raw, dc_bw_raw) =
                         exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    let (dc_aaw, dc_abw, dc_bbw) =
+                    let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
                         exact::link_basis_cell_second_partials(basis_span, a, b);
-                    coeff_au[idx] = dc_aw;
-                    coeff_bu[idx] = dc_bw;
-                    coeff_aau[idx] = dc_aaw;
-                    coeff_abu[idx] = dc_abw;
-                    coeff_bbu[idx] = dc_bbw;
+                    coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
+                    coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
+                    coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
+                    coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
+                    coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
                 }
             }
 
@@ -3461,13 +3570,18 @@ impl BernoulliMarginalSlopeFamily {
         g_aau_fixed[1] = obs.dc_daab;
         g_abu_fixed[1] = obs.dc_dabb;
         g_bbu_fixed[1] = obs.dc_dbbb;
+        let scale = self.probit_frailty_scale();
 
         if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
             for local_idx in 0..h_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
-                g_u_fixed[idx] = exact::score_basis_cell_coefficients(basis_span, b);
-                g_bu_fixed[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+                g_u_fixed[idx] =
+                    scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
+                g_bu_fixed[idx] = scale_coeff4(
+                    exact::score_basis_cell_coefficients(basis_span, 1.0),
+                    scale,
+                );
             }
         }
 
@@ -3475,15 +3589,17 @@ impl BernoulliMarginalSlopeFamily {
             for local_idx in 0..w_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                 let idx = w_range.start + local_idx;
-                g_u_fixed[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
-                let (dc_aw, dc_bw) = exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                let (dc_aaw, dc_abw, dc_bbw) =
+                g_u_fixed[idx] =
+                    scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
+                let (dc_aw_raw, dc_bw_raw) =
+                    exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
                     exact::link_basis_cell_second_partials(basis_span, a, b);
-                g_au_fixed[idx] = dc_aw;
-                g_bu_fixed[idx] = dc_bw;
-                g_aau_fixed[idx] = dc_aaw;
-                g_abu_fixed[idx] = dc_abw;
-                g_bbu_fixed[idx] = dc_bbw;
+                g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
+                g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
+                g_aau_fixed[idx] = scale_coeff4(dc_aaw_raw, scale);
+                g_abu_fixed[idx] = scale_coeff4(dc_abw_raw, scale);
+                g_bbu_fixed[idx] = scale_coeff4(dc_bbw_raw, scale);
             }
         }
 
@@ -3804,22 +3920,27 @@ impl BernoulliMarginalSlopeFamily {
             let u_mid = a + b * z_mid;
             let state = exact::evaluate_cell_moments(cell, 21)?;
 
-            let (dc_da, dc_db) = exact::denested_cell_coefficient_partials(
+            let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 b,
             );
-            let (dc_daa, dc_dab, dc_dbb) = exact::denested_cell_second_partials(
+            let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 b,
             );
             let denested_third = exact::denested_cell_third_partials(partition_cell.link_span);
-            let dc_daab = denested_third.1;
-            let dc_dabb = denested_third.2;
-            let dc_dbbb = denested_third.3;
+            let dc_da = scale_coeff4(dc_da_raw, scale);
+            let dc_db = scale_coeff4(dc_db_raw, scale);
+            let dc_daa = scale_coeff4(dc_daa_raw, scale);
+            let dc_dab = scale_coeff4(dc_dab_raw, scale);
+            let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+            let dc_daab = scale_coeff4(denested_third.1, scale);
+            let dc_dabb = scale_coeff4(denested_third.2, scale);
+            let dc_dbbb = scale_coeff4(denested_third.3, scale);
 
             let mut coeff_u = vec![[0.0; 4]; r];
             let mut coeff_au = vec![[0.0; 4]; r];
@@ -3843,8 +3964,12 @@ impl BernoulliMarginalSlopeFamily {
                 for local_idx in 0..h_range.len() {
                     let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
                     let idx = h_range.start + local_idx;
-                    coeff_u[idx] = exact::score_basis_cell_coefficients(basis_span, b);
-                    coeff_bu[idx] = exact::score_basis_cell_coefficients(basis_span, 1.0);
+                    coeff_u[idx] =
+                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
+                    coeff_bu[idx] = scale_coeff4(
+                        exact::score_basis_cell_coefficients(basis_span, 1.0),
+                        scale,
+                    );
                 }
             }
 
@@ -3852,22 +3977,23 @@ impl BernoulliMarginalSlopeFamily {
                 for local_idx in 0..w_range.len() {
                     let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
                     let idx = w_range.start + local_idx;
-                    coeff_u[idx] = exact::link_basis_cell_coefficients(basis_span, a, b);
-                    let (dc_aw, dc_bw) =
+                    coeff_u[idx] =
+                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
+                    let (dc_aw_raw, dc_bw_raw) =
                         exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    let (dc_aaw, dc_abw, dc_bbw) =
+                    let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
                         exact::link_basis_cell_second_partials(basis_span, a, b);
                     let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
                         exact::link_basis_cell_third_partials(basis_span);
-                    coeff_au[idx] = dc_aw;
-                    coeff_bu[idx] = dc_bw;
-                    coeff_aau[idx] = dc_aaw;
-                    coeff_abu[idx] = dc_abw;
-                    coeff_bbu[idx] = dc_bbw;
-                    coeff_aaau[idx] = dc_aaaw;
-                    coeff_aabu[idx] = dc_aabw;
-                    coeff_abbu[idx] = dc_abbw;
-                    coeff_bbbu[idx] = dc_bbbw;
+                    coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
+                    coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
+                    coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
+                    coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
+                    coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
+                    coeff_aaau[idx] = scale_coeff4(dc_aaaw, scale);
+                    coeff_aabu[idx] = scale_coeff4(dc_aabw, scale);
+                    coeff_abbu[idx] = scale_coeff4(dc_abbw, scale);
+                    coeff_bbbu[idx] = scale_coeff4(dc_bbbw, scale);
                 }
             }
 
@@ -7085,6 +7211,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
+            gaussian_frailty_sd: spec.gaussian_frailty_sd,
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
             score_warp: score_warp_runtime.clone(),
@@ -7296,6 +7423,7 @@ mod tests {
             logslopespec: empty_termspec(),
             marginal_offset: Array1::zeros(n),
             logslope_offset: Array1::zeros(n),
+            gaussian_frailty_sd: None,
             score_warp: None,
             link_dev: None,
         }

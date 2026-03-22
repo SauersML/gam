@@ -46,6 +46,18 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub z: Array1<f64>,
     pub marginalspec: TermCollectionSpec,
     pub marginal_offset: Array1<f64>,
+    /// GaussianShift frailty on the final probit index: U ~ N(0, σ²) added
+    /// to the scalar argument of Φ.  This is exact because the sextic
+    /// microcell kernel is preserved — the Gaussian-decoupling identity
+    /// E[Φ(η + U)] = Φ(η / √(1+σ²)) rescales the index by 1/τ where
+    /// τ = √(1+σ²), and every derivative chain rule factor is polynomial
+    /// in τ, so all six kernel derivatives remain closed-form.
+    ///
+    /// **HazardMultiplier frailty is NOT supported in this family.**
+    /// HazardMultiplier frailty + score_warp/linkwiggle cubic marginal-slope
+    /// is not finite-state exact.  For hazard-multiplier frailty, use the
+    /// standalone LatentCloglogBinomial / LatentSurvival families instead.
+    pub gaussian_frailty_sd: Option<f64>,
     /// Strict lower bound on q'(t) used by both the likelihood domain and
     /// the monotonicity constraints.
     pub derivative_guard: f64,
@@ -86,6 +98,7 @@ struct SurvivalMarginalSlopeFamily {
     event: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
     z: Arc<Array1<f64>>,
+    gaussian_frailty_sd: Option<f64>,
     derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
     /// Stored as DesignMatrix to support sparse local-support bases at
@@ -204,6 +217,22 @@ fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlice
 #[inline]
 fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
     ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
+}
+
+#[inline]
+fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
+    [
+        source[0] * scale,
+        source[1] * scale,
+        source[2] * scale,
+        source[3] * scale,
+    ]
+}
+
+#[inline]
+fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
+    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
+    1.0 / (1.0 + sigma * sigma).sqrt()
 }
 
 struct ObservedDenestedCellPartials {
@@ -1143,6 +1172,11 @@ struct EvalCache {
 // ── Row-level NLL computation ─────────────────────────────────────────
 
 impl SurvivalMarginalSlopeFamily {
+    #[inline]
+    fn probit_frailty_scale(&self) -> f64 {
+        probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
     fn flex_timewiggle_active(&self) -> bool {
         self.time_wiggle_ncols > 0
     }
@@ -1369,7 +1403,9 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     fn flex_active(&self) -> bool {
-        self.score_warp.is_some() || self.link_dev.is_some()
+        self.score_warp.is_some()
+            || self.link_dev.is_some()
+            || self.gaussian_frailty_sd.unwrap_or(0.0) > 0.0
     }
 
     fn flex_score_beta<'a>(
@@ -1432,7 +1468,7 @@ impl SurvivalMarginalSlopeFamily {
             link_breaks.push(a + link_tail);
         }
 
-        exact_kernel::build_denested_partition_cells(
+        let mut cells = exact_kernel::build_denested_partition_cells(
             a,
             b,
             &score_breaks,
@@ -1465,7 +1501,17 @@ impl SurvivalMarginalSlopeFamily {
                     })
                 }
             },
-        )
+        )?;
+        let scale = self.probit_frailty_scale();
+        if scale != 1.0 {
+            for partition_cell in &mut cells {
+                partition_cell.cell.c0 *= scale;
+                partition_cell.cell.c1 *= scale;
+                partition_cell.cell.c2 *= scale;
+                partition_cell.cell.c3 *= scale;
+            }
+        }
+        Ok(cells)
     }
 
     fn evaluate_denested_survival_calibration(
@@ -1477,6 +1523,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64, f64), String> {
         let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
+        let scale = self.probit_frailty_scale();
         let mut f = -crate::probability::normal_cdf(-q);
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
@@ -1504,8 +1551,8 @@ impl SurvivalMarginalSlopeFamily {
                 a,
                 slope,
             );
-            let dc_da = dc_da_pos.map(|value| -value);
-            let dc_daa = dc_daa_pos.map(|value| -value);
+            let dc_da = scale_coeff4(dc_da_pos, -scale);
+            let dc_daa = scale_coeff4(dc_daa_pos, -scale);
             f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
             f_aa += exact_kernel::cell_second_derivative_from_moments(
                 neg_cell,
@@ -1709,6 +1756,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<ObservedDenestedCellPartials, String> {
+        let scale = self.probit_frailty_scale();
         let zero_score_span = exact_kernel::LocalSpanCubic {
             left: -8.0,
             right: 8.0,
@@ -1739,23 +1787,26 @@ impl SurvivalMarginalSlopeFamily {
         } else {
             zero_link_span
         };
-        let coeff = exact_kernel::denested_cell_coefficients(score_span_obs, link_span_obs, a, b);
-        let (dc_da, dc_db) =
+        let coeff = scale_coeff4(
+            exact_kernel::denested_cell_coefficients(score_span_obs, link_span_obs, a, b),
+            scale,
+        );
+        let (dc_da_raw, dc_db_raw) =
             exact_kernel::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
-        let (dc_daa, dc_dab, dc_dbb) =
+        let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact_kernel::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
         let (dc_daaa, dc_daab, dc_dabb, _) =
             exact_kernel::denested_cell_third_partials(link_span_obs);
         Ok(ObservedDenestedCellPartials {
             coeff,
-            dc_da,
-            dc_db,
-            dc_daa,
-            dc_dab,
-            dc_dbb,
-            dc_daaa,
-            dc_daab,
-            dc_dabb,
+            dc_da: scale_coeff4(dc_da_raw, scale),
+            dc_db: scale_coeff4(dc_db_raw, scale),
+            dc_daa: scale_coeff4(dc_daa_raw, scale),
+            dc_dab: scale_coeff4(dc_dab_raw, scale),
+            dc_dbb: scale_coeff4(dc_dbb_raw, scale),
+            dc_daaa: scale_coeff4(dc_daaa, scale),
+            dc_daab: scale_coeff4(dc_daab, scale),
+            dc_dabb: scale_coeff4(dc_dabb, scale),
         })
     }
 
@@ -1769,6 +1820,7 @@ impl SurvivalMarginalSlopeFamily {
         z_basis: f64,
         u_basis: f64,
     ) -> Result<DenestedCellPrimaryFixedPartials, String> {
+        let scale = self.probit_frailty_scale();
         let r = primary.total;
         let mut coeff_u = vec![[0.0; 4]; r];
         let mut coeff_au = vec![[0.0; 4]; r];
@@ -1776,11 +1828,20 @@ impl SurvivalMarginalSlopeFamily {
         let mut coeff_aau = vec![[0.0; 4]; r];
         let mut coeff_abu = vec![[0.0; 4]; r];
 
-        let (dc_da, dc_db) =
+        let (dc_da_raw, dc_db_raw) =
             exact_kernel::denested_cell_coefficient_partials(score_span, link_span, a, b);
-        let (dc_daa, dc_dab, dc_dbb) =
+        let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact_kernel::denested_cell_second_partials(score_span, link_span, a, b);
-        let (dc_daaa, dc_daab, dc_dabb, _) = exact_kernel::denested_cell_third_partials(link_span);
+        let (dc_daaa_raw, dc_daab_raw, dc_dabb_raw, _) =
+            exact_kernel::denested_cell_third_partials(link_span);
+        let dc_da = scale_coeff4(dc_da_raw, scale);
+        let dc_db = scale_coeff4(dc_db_raw, scale);
+        let dc_daa = scale_coeff4(dc_daa_raw, scale);
+        let dc_dab = scale_coeff4(dc_dab_raw, scale);
+        let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+        let dc_daaa = scale_coeff4(dc_daaa_raw, scale);
+        let dc_daab = scale_coeff4(dc_daab_raw, scale);
+        let dc_dabb = scale_coeff4(dc_dabb_raw, scale);
 
         coeff_u[primary.g] = dc_db;
         coeff_au[primary.g] = dc_dab;
@@ -1792,8 +1853,14 @@ impl SurvivalMarginalSlopeFamily {
             for local_idx in 0..h_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_basis)?;
                 let idx = h_range.start + local_idx;
-                coeff_u[idx] = exact_kernel::score_basis_cell_coefficients(basis_span, b);
-                coeff_bu[idx] = exact_kernel::score_basis_cell_coefficients(basis_span, 1.0);
+                coeff_u[idx] = scale_coeff4(
+                    exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                    scale,
+                );
+                coeff_bu[idx] = scale_coeff4(
+                    exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                    scale,
+                );
             }
         }
 
@@ -1801,15 +1868,18 @@ impl SurvivalMarginalSlopeFamily {
             for local_idx in 0..w_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_basis)?;
                 let idx = w_range.start + local_idx;
-                coeff_u[idx] = exact_kernel::link_basis_cell_coefficients(basis_span, a, b);
-                let (dc_aw, dc_bw) =
+                coeff_u[idx] = scale_coeff4(
+                    exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+                    scale,
+                );
+                let (dc_aw_raw, dc_bw_raw) =
                     exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
-                let (dc_aaw, dc_abw, _) =
+                let (dc_aaw_raw, dc_abw_raw, _) =
                     exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                coeff_au[idx] = dc_aw;
-                coeff_bu[idx] = dc_bw;
-                coeff_aau[idx] = dc_aaw;
-                coeff_abu[idx] = dc_abw;
+                coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
+                coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
+                coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
+                coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
             }
         }
 
@@ -1836,6 +1906,7 @@ impl SurvivalMarginalSlopeFamily {
         a: f64,
         b: f64,
     ) -> Result<f64, String> {
+        let scale = self.probit_frailty_scale();
         if u == primary.g && v == primary.g {
             return Ok(eval_coeff4_at(&obs.dc_dbb, z_obs));
         }
@@ -1849,7 +1920,10 @@ impl SurvivalMarginalSlopeFamily {
                         .ok_or_else(|| "missing survival score-warp runtime".to_string())?;
                     let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                     return Ok(eval_coeff4_at(
-                        &exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                        &scale_coeff4(
+                            exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                            scale,
+                        ),
                         z_obs,
                     ));
                 }
@@ -1864,7 +1938,7 @@ impl SurvivalMarginalSlopeFamily {
                     let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                     let (_, dc_bw) =
                         exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    return Ok(eval_coeff4_at(&dc_bw, z_obs));
+                    return Ok(eval_coeff4_at(&scale_coeff4(dc_bw, scale), z_obs));
                 }
             }
         }
@@ -1885,6 +1959,7 @@ impl SurvivalMarginalSlopeFamily {
         a: f64,
         b: f64,
     ) -> Result<f64, String> {
+        let scale = self.probit_frailty_scale();
         if u == primary.g && v == primary.g {
             return Ok(eval_coeff4_at(&obs.dc_dabb, z_obs));
         }
@@ -1899,7 +1974,7 @@ impl SurvivalMarginalSlopeFamily {
                     let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                     let (_, dc_abw, _) =
                         exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                    return Ok(eval_coeff4_at(&dc_abw, z_obs));
+                    return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs));
                 }
             }
         }
@@ -1916,16 +1991,18 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<f64, String> {
+        let scale = self.probit_frailty_scale();
         let mut d = 0.0;
         for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
             let cell = partition_cell.cell;
             let state = exact_kernel::evaluate_cell_moments(cell, 4)?;
-            let (dc_da, _) = exact_kernel::denested_cell_coefficient_partials(
+            let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
                 a,
                 b,
             );
+            let dc_da = scale_coeff4(dc_da_raw, scale);
             d += exact_kernel::cell_polynomial_integral_from_moments(
                 &dc_da,
                 &state.moments,
@@ -2182,6 +2259,7 @@ impl SurvivalMarginalSlopeFamily {
         let mut rho = Array1::<f64>::zeros(p);
         let mut tau = Array1::<f64>::zeros(p);
         let mut tau_a = Array1::<f64>::zeros(p);
+        let scale = self.probit_frailty_scale();
         rho[primary.g] = eval_coeff4_at(&obs.dc_db, z_obs);
         tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
         tau_a[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs);
@@ -2191,7 +2269,7 @@ impl SurvivalMarginalSlopeFamily {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
                 rho[idx] = eval_coeff4_at(
-                    &exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                    &scale_coeff4(exact_kernel::score_basis_cell_coefficients(basis_span, b), scale),
                     z_obs,
                 );
             }
@@ -2201,15 +2279,15 @@ impl SurvivalMarginalSlopeFamily {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                 let idx = w_range.start + local_idx;
                 rho[idx] = eval_coeff4_at(
-                    &exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+                    &scale_coeff4(exact_kernel::link_basis_cell_coefficients(basis_span, a, b), scale),
                     z_obs,
                 );
                 let (dc_aw, _) =
                     exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
                 let (dc_aaw, _, _) =
                     exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                tau[idx] = eval_coeff4_at(&dc_aw, z_obs);
-                tau_a[idx] = eval_coeff4_at(&dc_aaw, z_obs);
+                tau[idx] = eval_coeff4_at(&scale_coeff4(dc_aw, scale), z_obs);
+                tau_a[idx] = eval_coeff4_at(&scale_coeff4(dc_aaw, scale), z_obs);
             }
         }
 
@@ -5195,6 +5273,13 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
         return Err("survival-marginal-slope requires finite logslope offsets".to_string());
     }
+    if let Some(sigma) = spec.gaussian_frailty_sd {
+        if !sigma.is_finite() || sigma < 0.0 {
+            return Err(format!(
+                "survival-marginal-slope requires gaussian_frailty_sd >= 0, got {sigma}"
+            ));
+        }
+    }
     validate_standardized_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
     if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
         return Err(
@@ -5544,6 +5629,7 @@ pub fn fit_survival_marginal_slope_terms(
             event: Arc::clone(&event),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
+            gaussian_frailty_sd: spec.gaussian_frailty_sd,
             derivative_guard,
             design_entry: design_entry.clone(),
             design_exit: design_exit.clone(),
