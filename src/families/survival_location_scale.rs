@@ -174,6 +174,13 @@ fn safe_sum3(a: f64, b: f64, c: f64) -> f64 {
     safe_sum2(safe_sum2(a, b), c)
 }
 
+#[inline]
+fn safe_product3(a: f64, b: f64, c: f64) -> f64 {
+    let mut factors = [a, b, c];
+    factors.sort_by(|lhs, rhs| lhs.abs().total_cmp(&rhs.abs()));
+    safe_product(safe_product(factors[0], factors[1]), factors[2])
+}
+
 /// Layer 2 defense: compute q0 = -eta_t * exp(-eta_ls) with log-space
 /// overflow detection.  When log|q0| = ln|eta_t| + (-eta_ls) exceeds the
 /// clamp ceiling, the product would overflow; we saturate to ±MAX instead.
@@ -3938,6 +3945,40 @@ fn initial_log_lambdas<T>(
     Ok(rho)
 }
 
+fn weighted_crossprod_dense_stable(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
+    for i in 0..weights.len() {
+        let wi = weights[i];
+        if wi == 0.0 {
+            continue;
+        }
+        for j in 0..left.ncols() {
+            let lij = left[[i, j]];
+            if lij == 0.0 {
+                continue;
+            }
+            for k in 0..right.ncols() {
+                let rijk = right[[i, k]];
+                if rijk == 0.0 {
+                    continue;
+                }
+                let contrib = safe_product3(wi, lij, rijk);
+                out[[j, k]] = safe_sum2(out[[j, k]], contrib);
+            }
+        }
+    }
+    if out.iter().any(|value| !value.is_finite()) {
+        return Err(
+            "weighted_crossprod_dense stable accumulation produced non-finite values".to_string(),
+        );
+    }
+    Ok(out)
+}
+
 fn weighted_crossprod_dense(
     left: &Array2<f64>,
     weights: &Array1<f64>,
@@ -3953,15 +3994,41 @@ fn weighted_crossprod_dense(
             right.ncols()
         ));
     }
+    if left.iter().any(|value| !value.is_finite())
+        || weights.iter().any(|value| !value.is_finite())
+        || right.iter().any(|value| !value.is_finite())
+    {
+        return Err("weighted_crossprod_dense inputs contain non-finite values".to_string());
+    }
+
     let mut weighted_right = right.clone();
-    for i in 0..weighted_right.nrows() {
+    let mut fast_path_ok = true;
+    'outer: for i in 0..weighted_right.nrows() {
         let wi = weights[i];
+        if wi == 0.0 {
+            weighted_right.row_mut(i).fill(0.0);
+            continue;
+        }
         if wi == 1.0 {
             continue;
         }
-        weighted_right.row_mut(i).mapv_inplace(|v| wi * v);
+        for j in 0..weighted_right.ncols() {
+            let scaled = wi * weighted_right[[i, j]];
+            if !scaled.is_finite() {
+                fast_path_ok = false;
+                break 'outer;
+            }
+            weighted_right[[i, j]] = scaled;
+        }
     }
-    Ok(left.t().dot(&weighted_right))
+    if fast_path_ok {
+        let out = left.t().dot(&weighted_right);
+        if out.iter().all(|value| value.is_finite()) {
+            return Ok(out);
+        }
+    }
+
+    weighted_crossprod_dense_stable(left, weights, right)
 }
 
 fn scale_dense_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -4054,10 +4121,8 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
         InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
-        | InverseLink::Mixture(_) => {
-            inverse_link_survival_prob_checked(inverse_link, eta)
-                .expect("validated inverse link should evaluate during prediction")
-        }
+        | InverseLink::Mixture(_) => inverse_link_survival_prob_checked(inverse_link, eta)
+            .expect("validated inverse link should evaluate during prediction"),
         InverseLink::Standard(LinkFunction::Sas)
         | InverseLink::Standard(LinkFunction::BetaLogistic) => {
             panic!("state-less SAS/Beta-Logistic inverse link is invalid for prediction")
@@ -9720,6 +9785,25 @@ mod tests {
         assert!((lifted[[0, 5]] - 0.4).abs() <= 1e-12);
         assert!((lifted[[3, 5]] - 0.9).abs() <= 1e-12);
         assert!((lifted[[4, 5]] - 1.1).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn weighted_crossprod_dense_falls_back_when_row_scaling_would_overflow() {
+        let left = array![[1.0e-200]];
+        let right = array![[1.0e200]];
+        let weights = array![1.0e200];
+
+        let cross = weighted_crossprod_dense(&left, &weights, &right)
+            .expect("stable weighted cross-product should avoid overflow");
+        let expected = 1.0e200;
+        let rel_err = ((cross[[0, 0]] - expected) / expected).abs();
+
+        assert!(cross[[0, 0]].is_finite());
+        assert!(
+            rel_err <= 1e-12,
+            "unexpected weighted cross-product: {}",
+            cross[[0, 0]]
+        );
     }
 
     #[test]

@@ -196,18 +196,19 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             hessian_source: H::Analytic,
         },
 
-        // FD Hessian available but expensive; prefer BFGS with analytic gradient.
-        (Analytic, FiniteDifference) => OuterPlan {
-            solver: S::Bfgs,
-            hessian_source: H::BfgsApprox,
+        // For small problems, an analytic gradient plus an explicit FD Hessian
+        // is still the best-conditioned outer model and matches the intended
+        // "few hyperparameters -> Newton" policy.
+        (Analytic, FiniteDifference) if cap.n_params <= 8 => OuterPlan {
+            solver: S::NewtonTrustRegion,
+            hessian_source: H::FiniteDifference,
         },
 
-        // Analytic gradient but no Hessian: use BFGS which builds a
-        // curvature approximation from gradient history.  FD Hessian
-        // would cost 2k extra evaluations per step and is never preferred.
+        // Analytic gradient but no Hessian: for a small number of outer
+        // coordinates we still prefer Newton with an internal FD Hessian.
         (Analytic, Unavailable) if cap.n_params <= 8 => OuterPlan {
-            solver: S::Bfgs,
-            hessian_source: H::BfgsApprox,
+            solver: S::NewtonTrustRegion,
+            hessian_source: H::FiniteDifference,
         },
 
         // EFS: all penalty-like coords, no analytic Hessian, many params.
@@ -266,6 +267,11 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         }
 
         // With many params, FD Hessian is too expensive; fall back to BFGS.
+        (Analytic, FiniteDifference) => OuterPlan {
+            solver: S::Bfgs,
+            hessian_source: H::BfgsApprox,
+        },
+
         (Analytic, Unavailable) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,

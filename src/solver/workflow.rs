@@ -15,6 +15,8 @@ use crate::families::gamlss::{
     select_binomial_mean_link_wiggle_basis_from_pilot,
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
+use crate::families::latent_survival::{LatentSurvivalTermFitResult, fit_latent_survival_terms};
+use crate::families::lognormal_kernel::LatentSurvivalRow;
 use crate::families::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalLocationScaleTermFitResult,
     SurvivalLocationScaleTermSpec, fit_survival_location_scale_terms,
@@ -113,6 +115,15 @@ pub struct SurvivalMarginalSlopeFitRequest<'a> {
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
 
+pub struct LatentSurvivalFitRequest<'a> {
+    pub data: ArrayView2<'a, f64>,
+    pub rows: Vec<LatentSurvivalRow>,
+    pub weights: Array1<f64>,
+    pub spec: TermCollectionSpec,
+    pub latent_sd: f64,
+    pub options: BlockwiseFitOptions,
+}
+
 pub struct TransformationNormalFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub response: Array1<f64>,
@@ -132,6 +143,7 @@ pub enum FitRequest<'a> {
     SurvivalLocationScale(SurvivalLocationScaleFitRequest<'a>),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest<'a>),
     SurvivalMarginalSlope(SurvivalMarginalSlopeFitRequest<'a>),
+    LatentSurvival(LatentSurvivalFitRequest<'a>),
     TransformationNormal(TransformationNormalFitRequest<'a>),
 }
 
@@ -181,6 +193,7 @@ pub enum FitResult {
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitResult),
     SurvivalMarginalSlope(SurvivalMarginalSlopeFitResult),
+    LatentSurvival(LatentSurvivalTermFitResult),
     TransformationNormal(TransformationNormalFitResult),
 }
 
@@ -727,6 +740,19 @@ fn fit_survival_marginal_slope_model(
     )
 }
 
+fn fit_latent_survival_model(
+    request: LatentSurvivalFitRequest<'_>,
+) -> Result<LatentSurvivalTermFitResult, String> {
+    fit_latent_survival_terms(
+        request.data,
+        request.rows,
+        request.weights,
+        request.spec,
+        request.latent_sd,
+        &request.options,
+    )
+}
+
 fn fit_transformation_normal_model(
     request: TransformationNormalFitRequest<'_>,
 ) -> Result<TransformationNormalFitResult, String> {
@@ -760,6 +786,9 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
         }
         FitRequest::SurvivalMarginalSlope(request) => {
             fit_survival_marginal_slope_model(request).map(FitResult::SurvivalMarginalSlope)
+        }
+        FitRequest::LatentSurvival(request) => {
+            fit_latent_survival_model(request).map(FitResult::LatentSurvival)
         }
         FitRequest::TransformationNormal(request) => {
             fit_transformation_normal_model(request).map(FitResult::TransformationNormal)
@@ -1085,9 +1114,9 @@ fn materialize_standard<'a>(
             .map_err(|e| format!("invalid latent_cloglog state: {e}"))?,
         )
     } else {
-        if config.latent_sd.is_some() {
-            return Err("latent_sd is only supported with family='latent-cloglog-binomial'".to_string());
-        }
+        // latent_sd is also used by marginal-slope families for probit frailty
+        // scaling — only reject it for standard non-latent families that don't
+        // support it.
         None
     };
     let options = FitOptions {
@@ -1425,7 +1454,12 @@ fn materialize_survival<'a>(
                 z,
                 marginalspec,
                 marginal_offset: threshold_offset,
-                frailty: crate::families::lognormal_kernel::FrailtySpec::None,
+                frailty: match config.latent_sd {
+                    Some(sd) => crate::families::lognormal_kernel::FrailtySpec::GaussianShift {
+                        sigma_fixed: Some(sd),
+                    },
+                    None => crate::families::lognormal_kernel::FrailtySpec::None,
+                },
                 derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                 time_block,
                 timewiggle_block: None,

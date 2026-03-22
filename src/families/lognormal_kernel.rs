@@ -814,7 +814,7 @@ impl BinaryCloglogRowJet {
         // Second derivative:
         // d²ℓ/dμ² = w·p'' + dw/dμ·p'
         // where dw/dμ = −y·(p')²/p² − (1−y)·(p')²/q²
-        let dw = -y * dp * dp / (p * p) - (1.0 - y) * dp * dp / (q * q);
+        let dw = -y * dp / (p * p) - (1.0 - y) * dp / (q * q);
         let d2_ll = w * ddp + dw * dp;
 
         // Third derivative via d³(log f)/dμ³:
@@ -914,7 +914,7 @@ impl RowJet2Block {
         // μ-derivatives of log-likelihood
         let w = if y > 0.5 { 1.0 / p } else { -1.0 / q };
         let score_mu = w * dp;
-        let dw = -y * dp * dp / (p * p) - (1.0 - y) * dp * dp / (q * q);
+        let dw = -y * dp / (p * p) - (1.0 - y) * dp / (q * q);
         let d2_ll_mu = w * ddp + dw * dp;
 
         // 4th log-derivative formula for d⁴ℓ/dμ⁴
