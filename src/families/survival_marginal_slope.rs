@@ -11,8 +11,8 @@ use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, build_deviation_block_from_seed,
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
-    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
-    unary_derivatives_sqrt,
+    standardize_latent_z, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::{
@@ -11503,56 +11503,6 @@ fn joint_setup(
     )
 }
 
-fn validate_standardized_z(
-    z: &Array1<f64>,
-    weights: &Array1<f64>,
-    context: &str,
-) -> Result<(), String> {
-    let weight_sum = weights.iter().copied().sum::<f64>();
-    if !(weight_sum.is_finite() && weight_sum > 0.0) {
-        return Err(format!("{context} requires positive finite total weight"));
-    }
-    let mean = z
-        .iter()
-        .zip(weights.iter())
-        .map(|(&zi, &wi)| wi * zi)
-        .sum::<f64>()
-        / weight_sum;
-    let var = z
-        .iter()
-        .zip(weights.iter())
-        .map(|(&zi, &wi)| wi * (zi - mean) * (zi - mean))
-        .sum::<f64>()
-        / weight_sum;
-    let sd = var.sqrt();
-    if mean.abs() > 1e-6 || (sd - 1.0).abs() > 1e-6 {
-        return Err(format!(
-            "{context} requires z to already represent a latent N(0,1) score; weighted mean 0 and weighted sd 1 are necessary sanity checks. got mean={mean:.6e}, sd={sd:.6e}"
-        ));
-    }
-    if sd > 1e-12 {
-        let skew = z
-            .iter()
-            .zip(weights.iter())
-            .map(|(&zi, &wi)| wi * ((zi - mean) / sd).powi(3))
-            .sum::<f64>()
-            / weight_sum;
-        let kurt = z
-            .iter()
-            .zip(weights.iter())
-            .map(|(&zi, &wi)| wi * ((zi - mean) / sd).powi(4))
-            .sum::<f64>()
-            / weight_sum
-            - 3.0;
-        if skew.abs() > 0.5 || kurt.abs() > 1.5 {
-            log::warn!(
-                "{context}: z has skewness={skew:.3} and excess kurtosis={kurt:.3}; the Gaussian marginalization identity is only exact for Z~N(0,1). Results may be biased if z is not approximately normal."
-            );
-        }
-    }
-    Ok(())
-}
-
 fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     let n = spec.age_entry.len();
     if spec.age_exit.len() != n
@@ -11599,7 +11549,6 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
     }
-    validate_standardized_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
     if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
         return Err(
             "survival-marginal-slope requires binary event indicators (0.0 or 1.0)".to_string(),
@@ -11867,7 +11816,9 @@ pub fn fit_survival_marginal_slope_terms(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
+    let mut spec = spec;
     validate_spec(&spec)?;
+    spec.z = standardize_latent_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
     let n = spec.age_entry.len();
     let sigma_learnable = matches!(
         &spec.frailty,

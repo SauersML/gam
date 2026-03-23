@@ -229,7 +229,18 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
 
-        // ----- 3. Tensor penalties (Kronecker-separable) -----
+        // ----- 3. Warm start -----
+        let initial_beta = compute_warm_start(
+            response,
+            weights,
+            &covariate_design,
+            &covariate_penalties,
+            p_resp,
+            p_cov,
+            warm_start,
+        )?;
+
+        // ----- 4. Tensor penalties (Kronecker-separable) -----
         let tensor_penalties = build_tensor_penalties_kronecker(
             &resp_penalties,
             covariate_penalties,
@@ -237,10 +248,6 @@ impl TransformationNormalFamily {
             p_cov,
             config,
         )?;
-
-        // ----- 4. Warm start -----
-        let initial_beta =
-            compute_warm_start(response, &covariate_design, p_resp, p_cov, warm_start)?;
 
         // ----- 5. Initial log-lambdas (one per penalty, start at 0.0) -----
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
@@ -349,6 +356,19 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
 
+        // Warm start: need response values for location-scale init.
+        // Extract response from column 1 of response_val_basis (which stores y).
+        let response_approx = response_val_basis.column(1).to_owned();
+        let initial_beta = compute_warm_start(
+            &response_approx,
+            weights,
+            &covariate_design,
+            &covariate_penalties,
+            p_resp,
+            p_cov,
+            warm_start,
+        )?;
+
         // Tensor penalties (Kronecker-separable).
         let tensor_penalties = build_tensor_penalties_kronecker(
             &response_penalties,
@@ -356,17 +376,6 @@ impl TransformationNormalFamily {
             p_resp,
             p_cov,
             config,
-        )?;
-
-        // Warm start: need response values for location-scale init.
-        // Extract response from column 1 of response_val_basis (which stores y).
-        let response_approx = response_val_basis.column(1).to_owned();
-        let initial_beta = compute_warm_start(
-            &response_approx,
-            &covariate_design,
-            p_resp,
-            p_cov,
-            warm_start,
         )?;
 
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
@@ -1182,10 +1191,14 @@ fn build_tensor_penalties_kronecker(
 
 /// Compute initial β so that h(y|x) ≈ (y - μ(x)) / τ(x).
 ///
-/// If no warm start is provided, uses global mean and SD.
+/// If no warm start is provided, estimate a penalized conditional location-scale
+/// surrogate on the covariate design and project that affine normalizer back
+/// into the transformation basis.
 fn compute_warm_start(
     response: &Array1<f64>,
+    weights: &Array1<f64>,
     covariate_design: &DesignMatrix,
+    covariate_penalties: &[PenaltyMatrix],
     p_resp: usize,
     p_cov: usize,
     warm_start: Option<&TransformationWarmStart>,
@@ -1193,81 +1206,129 @@ fn compute_warm_start(
     let n = response.len();
     let p_total = p_resp * p_cov;
     let mut beta = Array1::zeros(p_total);
+    if p_resp < 2 {
+        return Err(format!(
+            "transformation warm start requires at least 2 response basis rows, got {p_resp}"
+        ));
+    }
 
     // Target: for the intercept row (j=0), Θ[0,:] · cov[i,:] = -μ(x_i)/τ(x_i)
     //         for the linear row (j=1),  Θ[1,:] · cov[i,:] = 1/τ(x_i)
     //         for deviation rows (j≥2),  Θ[j,:] = 0
 
-    let (target_intercept, target_slope) = match warm_start {
-        Some(ws) => {
-            if ws.location.len() != n || ws.scale.len() != n {
-                return Err("warm start location/scale length mismatch".to_string());
-            }
-            let mut intercept = Array1::zeros(n);
-            let mut slope = Array1::zeros(n);
-            for i in 0..n {
-                let tau = ws.scale[i].max(1e-12);
-                intercept[i] = -ws.location[i] / tau;
-                slope[i] = 1.0 / tau;
-            }
-            (intercept, slope)
-        }
+    let default_ws;
+    let ws = match warm_start {
+        Some(ws) => ws,
         None => {
-            let mean = response.mean().unwrap_or(0.0);
-            let var = response
-                .iter()
-                .map(|&v| (v - mean) * (v - mean))
-                .sum::<f64>()
-                / (n.max(2) - 1) as f64;
-            let sd = var.sqrt().max(1e-12);
-            let intercept = Array1::from_elem(n, -mean / sd);
-            let slope = Array1::from_elem(n, 1.0 / sd);
-            (intercept, slope)
+            default_ws = estimate_default_warm_start(
+                response,
+                weights,
+                covariate_design,
+                covariate_penalties,
+            )?;
+            &default_ws
         }
     };
-
-    // Least-squares fit: Θ[j,:] = (cov^T cov)^{-1} cov^T target_j
-    // Use pseudoinverse via normal equations.
-    let ctc = covariate_design
-        .diag_xtw_x(&Array1::ones(covariate_design.nrows()))
-        .map_err(|e| format!("warm start X'X failed: {e}"))?;
-    // Add small ridge for numerical stability.
-    let mut ctc_ridge = ctc;
-    for i in 0..p_cov {
-        ctc_ridge[[i, i]] += 1e-10;
+    if ws.location.len() != n || ws.scale.len() != n {
+        return Err("warm start location/scale length mismatch".to_string());
+    }
+    let mut target_intercept = Array1::zeros(n);
+    let mut target_slope = Array1::zeros(n);
+    for i in 0..n {
+        let tau = ws.scale[i].max(1e-12);
+        target_intercept[i] = -ws.location[i] / tau;
+        target_slope[i] = 1.0 / tau;
     }
 
-    // Solve via Cholesky (ctc_ridge is SPD).
-    use crate::faer_ndarray::FaerCholesky;
-    match ctc_ridge.cholesky(faer::Side::Lower) {
-        Ok(chol) => {
-            let ct_int = covariate_design.apply_transpose(&target_intercept);
-            let coeff_int = chol.solvevec(&ct_int);
-            let ct_slope = covariate_design.apply_transpose(&target_slope);
-            let coeff_slope = chol.solvevec(&ct_slope);
+    let projection_log_lambdas = Array1::zeros(covariate_penalties.len());
+    let zero_offset = Array1::zeros(n);
+    let coeff_int = solve_penalizedweighted_projection(
+        covariate_design,
+        &zero_offset,
+        &target_intercept,
+        weights,
+        covariate_penalties,
+        &projection_log_lambdas,
+        1e-8,
+    )?;
+    let coeff_slope = solve_penalizedweighted_projection(
+        covariate_design,
+        &zero_offset,
+        &target_slope,
+        weights,
+        covariate_penalties,
+        &projection_log_lambdas,
+        1e-8,
+    )?;
 
-            // Place into β: Θ[0,:] = coeff_int, Θ[1,:] = coeff_slope
-            beta.slice_mut(s![0..p_cov]).assign(&coeff_int);
-            beta.slice_mut(s![p_cov..2 * p_cov]).assign(&coeff_slope);
-        }
-        Err(_) => {
-            // Fallback: use global mean/SD.
-            let mean = response.mean().unwrap_or(0.0);
-            let var = response
-                .iter()
-                .map(|&v| (v - mean) * (v - mean))
-                .sum::<f64>()
-                / (n.max(2) - 1) as f64;
-            let sd = var.sqrt().max(1e-12);
-            // Only set the first covariate column (assumes intercept is first column).
-            if p_cov > 0 {
-                beta[0] = -mean / sd; // intercept row, first cov column
-                beta[p_cov] = 1.0 / sd; // slope row, first cov column
-            }
-        }
-    }
+    beta.slice_mut(s![0..p_cov]).assign(&coeff_int);
+    beta.slice_mut(s![p_cov..2 * p_cov]).assign(&coeff_slope);
 
     Ok(beta)
+}
+
+fn estimate_default_warm_start(
+    response: &Array1<f64>,
+    weights: &Array1<f64>,
+    covariate_design: &DesignMatrix,
+    covariate_penalties: &[PenaltyMatrix],
+) -> Result<TransformationWarmStart, String> {
+    let n = response.len();
+    if weights.len() != n {
+        return Err(format!(
+            "transformation warm start weights length mismatch: response={}, weights={}",
+            n,
+            weights.len()
+        ));
+    }
+    let zero_offset = Array1::zeros(n);
+    let log_lambdas = Array1::zeros(covariate_penalties.len());
+    let beta_location = solve_penalizedweighted_projection(
+        covariate_design,
+        &zero_offset,
+        response,
+        weights,
+        covariate_penalties,
+        &log_lambdas,
+        1e-8,
+    )?;
+    let location = covariate_design.matrixvectormultiply(&beta_location);
+    let weight_sum = weights.iter().copied().sum::<f64>();
+    if !(weight_sum.is_finite() && weight_sum > 0.0) {
+        return Err("transformation warm start requires positive finite total weight".to_string());
+    }
+    let weighted_ss = response
+        .iter()
+        .zip(location.iter())
+        .zip(weights.iter())
+        .map(|((&y, &mu), &w)| {
+            let resid = y - mu;
+            w * resid * resid
+        })
+        .sum::<f64>();
+    if !weighted_ss.is_finite() {
+        return Err("transformation warm start residual variance is not finite".to_string());
+    }
+    let global_scale = (weighted_ss / weight_sum).sqrt().max(1e-6);
+    let residual_floor = global_scale * 1e-3 + 1e-12;
+    let log_scale_target =
+        Array1::from_iter(response.iter().zip(location.iter()).map(|(&y, &mu)| {
+            (y - mu).abs().max(residual_floor).ln() - STANDARD_NORMAL_LOG_ABS_MEAN
+        }));
+    let beta_log_scale = solve_penalizedweighted_projection(
+        covariate_design,
+        &zero_offset,
+        &log_scale_target,
+        weights,
+        covariate_penalties,
+        &log_lambdas,
+        1e-8,
+    )?;
+    let scale = covariate_design
+        .matrixvectormultiply(&beta_log_scale)
+        .mapv(|eta| eta.exp().max(residual_floor));
+
+    Ok(TransformationWarmStart { location, scale })
 }
 
 // ---------------------------------------------------------------------------
@@ -1896,8 +1957,7 @@ pub fn fit_transformation_normal(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
-    let mut options = options.clone();
-    options.use_outer_hessian = true;
+    let options = options.clone();
 
     // 1. Build a bootstrap covariate design first so the response basis can
     // adapt to the tensor width instead of always using the global default.
