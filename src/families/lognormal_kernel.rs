@@ -513,6 +513,34 @@ pub struct LatentSurvivalRow {
     pub hazard_unloaded: f64,
 }
 
+impl LatentSurvivalRow {
+    /// Standard delayed-entry frailty row under full loading.
+    ///
+    /// `mass_entry` and `mass_exit` are cumulative masses `B(a_in)` and
+    /// `B(a_out)` / `B(a_event)`, not an increment over `(a_in, a_out]`.
+    /// This preserves survivor selection at entry via the denominator
+    /// `K_{0,B(a_in)}` instead of resetting frailty at study entry.
+    pub fn from_full_loading_cumulative_mass(
+        event_type: LatentSurvivalEventType,
+        mass_entry: f64,
+        mass_exit: f64,
+        log_baseline_hazard: f64,
+    ) -> Self {
+        Self {
+            event_type,
+            mass_entry,
+            mass_exit,
+            mass_left: 0.0,
+            mass_right: 0.0,
+            log_baseline_hazard,
+            mass_unloaded_entry: 0.0,
+            mass_unloaded_exit: 0.0,
+            hazard_loaded: 0.0,
+            hazard_unloaded: 0.0,
+        }
+    }
+}
+
 /// Row-level log-likelihood and μ-derivatives for the latent survival model.
 ///
 /// The conditional model is:

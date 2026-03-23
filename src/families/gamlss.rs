@@ -16635,9 +16635,17 @@ mod tests {
             .map(|state| state.beta.len())
             .sum::<usize>();
         assert_eq!(psi_terms.score_psi.len(), total);
-        assert_eq!(psi_terms.hessian_psi.dim(), (total, total));
+        if psi_terms.hessian_psi_operator.is_some() {
+            assert_eq!(psi_terms.hessian_psi.dim(), (0, 0));
+        } else {
+            assert_eq!(psi_terms.hessian_psi.dim(), (total, total));
+        }
         assert_eq!(psi2_terms.score_psi_psi.len(), total);
-        assert_eq!(psi2_terms.hessian_psi_psi.dim(), (total, total));
+        if psi2_terms.hessian_psi_psi_operator.is_some() {
+            assert_eq!(psi2_terms.hessian_psi_psi.dim(), (0, 0));
+        } else {
+            assert_eq!(psi2_terms.hessian_psi_psi.dim(), (total, total));
+        }
 
         let mut d_beta_flat = Array1::<f64>::zeros(total);
         let mut at = 0usize;

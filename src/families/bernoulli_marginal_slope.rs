@@ -532,9 +532,31 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
     (weight * k1, weight * k2, weight * k3, weight * k4)
 }
 
+#[inline]
+fn rigid_observed_logslope(logslope: f64, probit_scale: f64) -> f64 {
+    probit_scale * logslope
+}
+
+#[inline]
+fn rigid_observed_scale(logslope: f64, probit_scale: f64) -> f64 {
+    let observed_logslope = rigid_observed_logslope(logslope, probit_scale);
+    (1.0 + observed_logslope * observed_logslope).sqrt()
+}
+
+#[inline]
+fn rigid_intercept_from_marginal(marginal_eta: f64, logslope: f64, probit_scale: f64) -> f64 {
+    marginal_eta * rigid_observed_scale(logslope, probit_scale)
+}
+
+#[inline]
+fn rigid_observed_eta(marginal_eta: f64, logslope: f64, z: f64, probit_scale: f64) -> f64 {
+    rigid_intercept_from_marginal(marginal_eta, logslope, probit_scale)
+        + rigid_observed_logslope(logslope, probit_scale) * z
+}
+
 /// Rigid probit scalar kernel: closed-form derivatives up to 4th order.
 ///
-/// η = q·c(g) + g·z,  c(g) = √(1+g²),  s = 2y−1,  m = s·η.
+/// η = q·c(g) + s_f·g·z,  c(g) = √(1+(s_f g)²),  s = 2y−1,  m = s·η.
 /// u_k absorb weight and sign: u1=w·s·κ₁, u2=w·κ₂, u3=w·s·κ₃, u4=w·κ₄.
 struct RigidProbitKernel {
     logcdf: f64,
@@ -552,15 +574,16 @@ struct RigidProbitKernel {
 
 impl RigidProbitKernel {
     #[inline]
-    fn new(q: f64, g: f64, z: f64, y: f64, w: f64) -> Self {
+    fn new(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Self {
         let s = 2.0 * y - 1.0;
-        let g2 = g * g;
+        let observed_logslope = rigid_observed_logslope(g, probit_scale);
+        let g2 = observed_logslope * observed_logslope;
         let c = (1.0 + g2).sqrt();
-        let c1 = g / c;
+        let c1 = probit_scale * observed_logslope / c;
         let c_inv3 = 1.0 / (c * c * c);
         let c_inv5 = c_inv3 / (c * c);
         let c_inv7 = c_inv5 / (c * c);
-        let eta = q * c + g * z;
+        let eta = q * c + observed_logslope * z;
         let m = s * eta;
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
         let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w);
@@ -571,11 +594,11 @@ impl RigidProbitKernel {
             u3: s * k3,
             u4: k4,
             c1,
-            c2: c_inv3,
-            c3: -3.0 * g * c_inv5,
-            c4: (12.0 * g2 - 3.0) * c_inv7,
+            c2: probit_scale * probit_scale * c_inv3,
+            c3: -3.0 * probit_scale.powi(3) * observed_logslope * c_inv5,
+            c4: probit_scale.powi(4) * (12.0 * g2 - 3.0) * c_inv7,
             eta_q: c,
-            eta_g: q * c1 + z,
+            eta_g: q * c1 + probit_scale * z,
         }
     }
 
@@ -1202,6 +1225,11 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
+fn coefficients_exactly_zero(beta: &Array1<f64>) -> bool {
+    beta.iter().all(|value| *value == 0.0)
+}
+
+#[inline]
 fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
     match frailty {
         FrailtySpec::None => None,
@@ -1682,12 +1710,14 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
         let q = self.block_states[0].eta[row];
         let g = self.block_states[1].eta[row];
+        let probit_scale = self.family.probit_frailty_scale();
         let k = RigidProbitKernel::new(
             q,
             g,
             self.family.z[row],
             self.family.y[row],
             self.family.weights[row],
+            probit_scale,
         );
         let nll = -self.family.weights[row] * k.logcdf;
         let grad = [-k.u1 * k.eta_q, -k.u1 * k.eta_g];
@@ -1795,12 +1825,14 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     fn row_third_contracted(&self, row: usize, dir: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
         let q = self.block_states[0].eta[row];
         let g = self.block_states[1].eta[row];
+        let probit_scale = self.family.probit_frailty_scale();
         let k = RigidProbitKernel::new(
             q,
             g,
             self.family.z[row],
             self.family.y[row],
             self.family.weights[row],
+            probit_scale,
         );
         Ok(k.third_contracted(q, dir[0], dir[1]))
     }
@@ -1813,12 +1845,14 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     ) -> Result<[[f64; 2]; 2], String> {
         let q = self.block_states[0].eta[row];
         let g = self.block_states[1].eta[row];
+        let probit_scale = self.family.probit_frailty_scale();
         let k = RigidProbitKernel::new(
             q,
             g,
             self.family.z[row],
             self.family.y[row],
             self.family.weights[row],
+            probit_scale,
         );
         Ok(k.fourth_contracted(q, dir_u[0], dir_u[1], dir_v[0], dir_v[1]))
     }
@@ -1893,6 +1927,15 @@ impl BernoulliMarginalSlopeFamily {
             .map(|state| &state.beta))
     }
 
+    fn effective_score_beta<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<Option<&'a Array1<f64>>, String> {
+        Ok(self
+            .score_beta(block_states)?
+            .filter(|beta| !coefficients_exactly_zero(beta)))
+    }
+
     fn link_beta<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
@@ -1900,6 +1943,15 @@ impl BernoulliMarginalSlopeFamily {
         Ok(self
             .link_block_state(block_states)?
             .map(|state| &state.beta))
+    }
+
+    fn effective_link_beta<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<Option<&'a Array1<f64>>, String> {
+        Ok(self
+            .link_beta(block_states)?
+            .filter(|beta| !coefficients_exactly_zero(beta)))
     }
 
     fn validate_exact_block_state_shapes(
@@ -2001,31 +2053,24 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
-        let score_tail = 8.0;
-        let mut score_breaks = if let Some(runtime) = self.score_warp.as_ref() {
-            runtime.breakpoints().to_vec()
+        let score_breaks = if beta_h.is_some() {
+            self.score_warp
+                .as_ref()
+                .map(|runtime| runtime.breakpoints().to_vec())
+                .unwrap_or_default()
         } else {
-            vec![-8.0, 8.0]
+            Vec::new()
         };
-        if score_breaks.first().copied().unwrap_or(score_tail) > -score_tail {
-            score_breaks.insert(0, -score_tail);
-        }
-        if score_breaks.last().copied().unwrap_or(-score_tail) < score_tail {
-            score_breaks.push(score_tail);
-        }
-        let link_tail = 8.0 * (1.0 + b.abs());
-        let mut link_breaks = if let Some(runtime) = self.link_dev.as_ref() {
-            runtime.breakpoints().to_vec()
+        let link_breaks = if beta_w.is_some() {
+            self.link_dev
+                .as_ref()
+                .map(|runtime| runtime.breakpoints().to_vec())
+                .unwrap_or_default()
         } else {
-            vec![a - link_tail, a + link_tail]
+            Vec::new()
         };
-        if link_breaks.first().copied().unwrap_or(a + link_tail) > a - link_tail {
-            link_breaks.insert(0, a - link_tail);
-        }
-        if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
-            link_breaks.push(a + link_tail);
-        }
-        let mut cells = exact_kernel::build_denested_partition_cells(
+
+        let mut cells = exact_kernel::build_denested_partition_cells_with_tails(
             a,
             b,
             &score_breaks,
@@ -2035,8 +2080,8 @@ impl BernoulliMarginalSlopeFamily {
                     runtime.local_cubic_at(beta, z)
                 } else {
                     Ok(exact_kernel::LocalSpanCubic {
-                        left: -8.0,
-                        right: 8.0,
+                        left: 0.0,
+                        right: 1.0,
                         c0: 0.0,
                         c1: 0.0,
                         c2: 0.0,
@@ -2049,8 +2094,8 @@ impl BernoulliMarginalSlopeFamily {
                     runtime.local_cubic_at(beta, u)
                 } else {
                     Ok(exact_kernel::LocalSpanCubic {
-                        left: a - 8.0 * (1.0 + b.abs()),
-                        right: a + 8.0 * (1.0 + b.abs()),
+                        left: 0.0,
+                        right: 1.0,
                         c0: 0.0,
                         c1: 0.0,
                         c2: 0.0,
@@ -2165,17 +2210,24 @@ impl BernoulliMarginalSlopeFamily {
             self.evaluate_denested_calibration(a, marginal_eta, slope, beta_h, beta_w)
         };
 
-        // Initial guess: closed-form for rigid probit: a₀ = q·√(1+b²).
+        let probit_scale = self.probit_frailty_scale();
+
+        // Initial guess: closed-form for rigid probit:
+        //   a₀ = q·√(1 + (s_f b)²),  s_f = 1/√(1+σ²).
         // When link deviation is active, upgrade to affine-link warm start:
-        //   L(u) ≈ ℓ₀ + ℓ₁·u  ⟹  a = (q·√(1+ℓ₁²b²) − ℓ₀) / ℓ₁
-        let a_rigid = marginal_eta * (1.0 + slope * slope).sqrt();
+        //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)
+        //   ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁
+        let a_rigid = rigid_intercept_from_marginal(marginal_eta, slope, probit_scale);
         let a_init = if beta_w.is_some() {
             let v = Array1::from_vec(vec![a_rigid]);
             let (l_val, l_d1) = self.link_terms_value_d1(&v, beta_w)?;
             let ell1 = l_d1[0];
             if ell1 > 1e-8 {
                 let ell0 = l_val[0] - ell1 * a_rigid;
-                (marginal_eta * (1.0 + ell1 * ell1 * slope * slope).sqrt() - ell0) / ell1
+                let observed_logslope = probit_scale * ell1 * slope;
+                (marginal_eta * (1.0 + observed_logslope * observed_logslope).sqrt() / probit_scale
+                    - ell0)
+                    / ell1
             } else {
                 a_rigid
             }
@@ -2217,16 +2269,15 @@ impl BernoulliMarginalSlopeFamily {
         let marginal_eta = block_states[0].eta[row];
         // The log-slope block now parameterizes the signed slope directly.
         let slope = block_states[1].eta[row];
-        let beta_w = self.link_beta(block_states)?;
+        let beta_h = self.effective_score_beta(block_states)?;
+        let beta_w = self.effective_link_beta(block_states)?;
         let (intercept, m_a) = if self.flex_active() {
-            self.solve_row_intercept_base(
-                marginal_eta,
-                slope,
-                self.score_beta(block_states)?,
-                beta_w,
-            )?
+            self.solve_row_intercept_base(marginal_eta, slope, beta_h, beta_w)?
         } else {
-            (marginal_eta * (1.0 + slope * slope).sqrt(), f64::NAN)
+            (
+                rigid_intercept_from_marginal(marginal_eta, slope, self.probit_frailty_scale()),
+                f64::NAN,
+            )
         };
         Ok(BernoulliMarginalSlopeRowExactContext { intercept, m_a })
     }
@@ -2668,40 +2719,29 @@ impl BernoulliMarginalSlopeFamily {
             )?;
             return Ok((neglog, scratch.grad, scratch.hess));
         }
-        // Rigid path: closed-form eta = q*c(g) + g*z.
+        // Rigid path: closed-form observed eta with probit frailty scaling.
         // primary.total == 2 (q at 0, g at 1), no h/w blocks.
         let q = block_states[0].eta[row];
         let g = block_states[1].eta[row];
-        let yi = self.y[row];
-        let wi = self.weights[row];
-        let zi = self.z[row];
-        let s = 2.0 * yi - 1.0;
-
-        let g2 = g * g;
-        let c = (1.0 + g2).sqrt();
-        let c1 = g / c;
-        let c2 = 1.0 / (c * c * c);
-        let eta = q * c + g * zi;
-        let m = s * eta;
-
-        let (logcdf, lambda) = signed_probit_logcdf_and_mills_ratio(m);
-        let neglog = -wi * logcdf;
-
-        let u1 = -wi * s * lambda;
-        let u2 = wi * lambda * (m + lambda);
-
-        let deta_dq = c;
-        let deta_dg = q * c1 + zi;
-
+        let kern = RigidProbitKernel::new(
+            q,
+            g,
+            self.z[row],
+            self.y[row],
+            self.weights[row],
+            self.probit_frailty_scale(),
+        );
+        let neglog = -self.weights[row] * kern.logcdf;
         let mut grad = Array1::<f64>::zeros(2);
-        grad[0] = u1 * deta_dq;
-        grad[1] = u1 * deta_dg;
+        grad[0] = -kern.u1 * kern.eta_q;
+        grad[1] = -kern.u1 * kern.eta_g;
 
+        let h = kern.primary_hessian(q);
         let mut hess = Array2::<f64>::zeros((2, 2));
-        hess[[0, 0]] = u2 * deta_dq * deta_dq;
-        hess[[0, 1]] = u2 * deta_dq * deta_dg;
-        hess[[1, 0]] = hess[[0, 1]];
-        hess[[1, 1]] = u2 * deta_dg * deta_dg + u1 * q * c2;
+        hess[[0, 0]] = h[0][0];
+        hess[[0, 1]] = h[0][1];
+        hess[[1, 0]] = h[1][0];
+        hess[[1, 1]] = h[1][1];
 
         Ok((neglog, grad, hess))
     }
@@ -2717,8 +2757,8 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<f64, String> {
         let q = block_states[0].eta[row];
         let b = block_states[1].eta[row];
-        let beta_h = self.score_beta(block_states)?;
-        let beta_w = self.link_beta(block_states)?;
+        let beta_h = self.effective_score_beta(block_states)?;
+        let beta_w = self.effective_link_beta(block_states)?;
         self.compute_row_analytic_flex_from_parts_into(
             row,
             primary,
@@ -2773,7 +2813,7 @@ impl BernoulliMarginalSlopeFamily {
         let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
         for partition_cell in cells {
             let cell = partition_cell.cell;
-            let z_mid = 0.5 * (cell.left + cell.right);
+            let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
             let state = exact::evaluate_cell_moments(cell, if need_hessian { 9 } else { 3 })?;
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
@@ -3066,16 +3106,16 @@ impl BernoulliMarginalSlopeFamily {
 
         let scale = self.probit_frailty_scale();
         let zero_score_span = exact::LocalSpanCubic {
-            left: -8.0,
-            right: 8.0,
+            left: 0.0,
+            right: 1.0,
             c0: 0.0,
             c1: 0.0,
             c2: 0.0,
             c3: 0.0,
         };
         let zero_link_span = exact::LocalSpanCubic {
-            left: a - 8.0 * (1.0 + b.abs()),
-            right: a + 8.0 * (1.0 + b.abs()),
+            left: 0.0,
+            right: 1.0,
             c0: 0.0,
             c1: 0.0,
             c2: 0.0,
@@ -3125,8 +3165,8 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Third-derivative tensor contracted with direction `dir`:
     ///   out[k,l] = sum_m f_{klm} dir[m]
-    /// Rigid path uses the closed-form kernel. The flexible exact de-nested
-    /// path contracts the exact cell-moment kernel analytically.
+    /// Rigid path uses the closed-form kernel. The flexible de-nested
+    /// transport path contracts the cell-moment kernel analytically.
     fn row_primary_third_contracted_recompute(
         &self,
         row: usize,
@@ -3138,7 +3178,14 @@ impl BernoulliMarginalSlopeFamily {
         if !self.flex_active() {
             let q = block_states[0].eta[row];
             let g = block_states[1].eta[row];
-            let kern = RigidProbitKernel::new(q, g, self.z[row], self.y[row], self.weights[row]);
+            let kern = RigidProbitKernel::new(
+                q,
+                g,
+                self.z[row],
+                self.y[row],
+                self.weights[row],
+                self.probit_frailty_scale(),
+            );
             let t = kern.third_contracted(q, dir[0], dir[1]);
             let mut out = Array2::<f64>::zeros((2, 2));
             out[[0, 0]] = t[0][0];
@@ -3189,7 +3236,7 @@ impl BernoulliMarginalSlopeFamily {
         let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
         for partition_cell in cells {
             let cell = partition_cell.cell;
-            let z_mid = 0.5 * (cell.left + cell.right);
+            let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
             let state = exact::evaluate_cell_moments(cell, 15)?;
 
@@ -3627,8 +3674,8 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Fourth-derivative tensor contracted with two directions dir_u, dir_v:
     ///   out[k,l] = sum_{m,n} f_{klmn} dir_u[m] dir_v[n]
-    /// Rigid path uses the closed-form kernel. The flexible exact de-nested
-    /// path contracts the exact cell-moment kernel analytically.
+    /// Rigid path uses the closed-form kernel. The flexible de-nested
+    /// transport path contracts the cell-moment kernel analytically.
     fn row_primary_fourth_contracted_recompute_ordered(
         &self,
         row: usize,
@@ -3641,7 +3688,14 @@ impl BernoulliMarginalSlopeFamily {
         if !self.flex_active() {
             let q = block_states[0].eta[row];
             let g = block_states[1].eta[row];
-            let kern = RigidProbitKernel::new(q, g, self.z[row], self.y[row], self.weights[row]);
+            let kern = RigidProbitKernel::new(
+                q,
+                g,
+                self.z[row],
+                self.y[row],
+                self.weights[row],
+                self.probit_frailty_scale(),
+            );
             let f = kern.fourth_contracted(q, dir_u[0], dir_u[1], dir_v[0], dir_v[1]);
             let mut out = Array2::<f64>::zeros((2, 2));
             out[[0, 0]] = f[0][0];
@@ -3704,7 +3758,7 @@ impl BernoulliMarginalSlopeFamily {
         let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
         for partition_cell in cells {
             let cell = partition_cell.cell;
-            let z_mid = 0.5 * (cell.left + cell.right);
+            let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
             let state = exact::evaluate_cell_moments(cell, 21)?;
 
@@ -4755,6 +4809,7 @@ impl BernoulliMarginalSlopeFamily {
                 .try_fold(
                     || Array1::<f64>::zeros(slices.total),
                     |mut chunk_out, chunk_idx| -> Result<_, String> {
+                        let probit_scale = self.probit_frailty_scale();
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
                         for row in start..end {
@@ -4766,6 +4821,7 @@ impl BernoulliMarginalSlopeFamily {
                                 self.z[row],
                                 self.y[row],
                                 self.weights[row],
+                                probit_scale,
                             );
                             let h = k.primary_hessian(q);
                             let v_q = self
@@ -4848,6 +4904,7 @@ impl BernoulliMarginalSlopeFamily {
                 .try_fold(
                     || Array1::<f64>::zeros(slices.total),
                     |mut chunk_diag, chunk_idx| -> Result<_, String> {
+                        let probit_scale = self.probit_frailty_scale();
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
                         for row in start..end {
@@ -4859,6 +4916,7 @@ impl BernoulliMarginalSlopeFamily {
                                 self.z[row],
                                 self.y[row],
                                 self.weights[row],
+                                probit_scale,
                             );
                             let h = k.primary_hessian(q);
                             {
@@ -5629,6 +5687,7 @@ impl BernoulliMarginalSlopeFamily {
                 .try_fold(
                     || BernoulliBlockHessianAccumulator::new(slices),
                     |mut acc, chunk_idx| -> Result<_, String> {
+                        let probit_scale = self.probit_frailty_scale();
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
                         for row in start..end {
@@ -5640,6 +5699,7 @@ impl BernoulliMarginalSlopeFamily {
                                 self.z[row],
                                 self.y[row],
                                 self.weights[row],
+                                probit_scale,
                             );
                             let dq = self
                                 .marginal_design
@@ -5718,6 +5778,7 @@ impl BernoulliMarginalSlopeFamily {
             let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
+                    let probit_scale = self.probit_frailty_scale();
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
@@ -5729,6 +5790,7 @@ impl BernoulliMarginalSlopeFamily {
                             self.z[row],
                             self.y[row],
                             self.weights[row],
+                            probit_scale,
                         );
                         let uq = self
                             .marginal_design
@@ -5790,27 +5852,38 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
         let slices = block_slices(self);
+        let flex_active = self.flex_active();
 
         // ── Joint-then-slice path (rigid, p < 512) ──────────────────────
         //
         // Block Hessians are principal blocks of the joint Hessian—never
         // independently derived.  The RowKernel<2> is the single source of
         // truth for gradient, Hessian, and log-likelihood.
-        if !self.flex_active() && slices.total < 512 {
+        if !flex_active && slices.total < 512 {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern)?;
             let ll = row_kernel_log_likelihood(&cache);
             let joint_gradient = -row_kernel_gradient(&kern, &cache);
             let joint_hessian = row_kernel_hessian_dense(&kern, &cache);
+            let mut block_gradients = vec![
+                joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
+                joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
+            ];
+            let mut block_ranges = vec![slices.marginal.clone(), slices.logslope.clone()];
+            if let Some(range) = slices.h.clone() {
+                block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
+                block_ranges.push(range);
+            }
+            if let Some(range) = slices.w.clone() {
+                block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
+                block_ranges.push(range);
+            }
             return Ok(FamilyEvaluation {
                 log_likelihood: ll,
                 blockworking_sets: slice_joint_into_block_working_sets(
-                    vec![
-                        joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
-                        joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
-                    ],
+                    block_gradients,
                     &joint_hessian,
-                    &[slices.marginal.clone(), slices.logslope.clone()],
+                    &block_ranges,
                 ),
             });
         }
@@ -5820,7 +5893,7 @@ impl BernoulliMarginalSlopeFamily {
         // The flex path has variable-dimension primary space (q, g, h?, w?).
         // The joint Hessian is built column-by-column via matvec.
         // Gradients are extracted from the per-row analytic flex loop.
-        if self.flex_active() && slices.total < 512 {
+        if flex_active && slices.total < 512 {
             let cache = self.build_exact_eval_cache_with_order(block_states)?;
             let primary = cache.primary.clone();
             let n = self.y.len();
@@ -5898,7 +5971,7 @@ impl BernoulliMarginalSlopeFamily {
         let cache = self.build_exact_eval_cache_with_order(block_states)?;
         let primary = cache.primary.clone();
 
-        if !self.flex_active() {
+        if !flex_active {
             let mut ll = 0.0;
             let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
             let mut grad_logslope = Array1::<f64>::zeros(slices.logslope.len());
@@ -5954,16 +6027,37 @@ impl BernoulliMarginalSlopeFamily {
 
             return Ok(FamilyEvaluation {
                 log_likelihood: ll,
-                blockworking_sets: vec![
-                    BlockWorkingSet::ExactNewton {
-                        gradient: grad_marginal,
-                        hessian: SymmetricMatrix::Dense(hess_marginal),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: grad_logslope,
-                        hessian: SymmetricMatrix::Dense(hess_logslope),
-                    },
-                ],
+                blockworking_sets: {
+                    let mut sets = vec![
+                        BlockWorkingSet::ExactNewton {
+                            gradient: grad_marginal,
+                            hessian: SymmetricMatrix::Dense(hess_marginal),
+                        },
+                        BlockWorkingSet::ExactNewton {
+                            gradient: grad_logslope,
+                            hessian: SymmetricMatrix::Dense(hess_logslope),
+                        },
+                    ];
+                    if let Some(range) = slices.h.as_ref() {
+                        sets.push(BlockWorkingSet::ExactNewton {
+                            gradient: Array1::zeros(range.len()),
+                            hessian: SymmetricMatrix::Dense(Array2::zeros((
+                                range.len(),
+                                range.len(),
+                            ))),
+                        });
+                    }
+                    if let Some(range) = slices.w.as_ref() {
+                        sets.push(BlockWorkingSet::ExactNewton {
+                            gradient: Array1::zeros(range.len()),
+                            hessian: SymmetricMatrix::Dense(Array2::zeros((
+                                range.len(),
+                                range.len(),
+                            ))),
+                        });
+                    }
+                    sets
+                },
             });
         }
         let n = self.y.len();
@@ -6135,12 +6229,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         self.validate_exact_monotonicity(block_states)?;
-        if !self.flex_active() {
+        let flex_active = self.flex_active();
+        if !flex_active {
             // Rigid probit: vectorized closed-form.
-            // η_i = q_i·c_i + b_i·z_i  where c_i = √(1+b_i²)
+            // η_i = q_i·c_i + s_f b_i·z_i  where c_i = √(1+(s_f b_i)²)
             // ll = Σ w_i · log Φ((2y_i−1)·η_i)
             let q = &block_states[0].eta;
             let b = &block_states[1].eta;
+            let probit_scale = self.probit_frailty_scale();
             let n = self.y.len();
             return (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
@@ -6150,8 +6246,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
                         for i in start..end {
-                            let c_i = (1.0 + b[i] * b[i]).sqrt();
-                            let eta_i = q[i] * c_i + b[i] * self.z[i];
+                            let eta_i = rigid_observed_eta(q[i], b[i], self.z[i], probit_scale);
                             let signed = (2.0 * self.y[i] - 1.0) * eta_i;
                             let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
                             ll += self.weights[i] * log_cdf;
@@ -6164,8 +6259,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     |left, right| -> Result<_, String> { Ok(left + right) },
                 );
         }
-        let beta_h = self.score_beta(block_states)?;
-        let beta_w = self.link_beta(block_states)?;
+        let beta_h = self.effective_score_beta(block_states)?;
+        let beta_w = self.effective_link_beta(block_states)?;
         let n = self.y.len();
         (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
@@ -6397,7 +6492,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         {
             return Err("unreachable bernoulli marginal-slope constraint state".to_string());
         }
-        // The exact de-nested cubic path does not expose the old endpoint-only
+        // The de-nested cubic transport path does not expose the old endpoint-only
         // linearized derivative constraints. Monotonicity is enforced by the
         // exact cubic feasibility runtime and step-size limiter instead.
         Ok(None)
@@ -6624,7 +6719,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     validate_spec(data, &spec)?;
-    let baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
+    let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
+    let probit_scale = probit_frailty_scale(fixed_gaussian_shift_sigma(&spec.frailty));
+    let baseline = (pilot_baseline.0, pilot_baseline.1 / probit_scale);
     let mut joint_designs = build_term_collection_designs_joint(
         data,
         &[spec.marginalspec.clone(), spec.logslopespec.clone()],
@@ -6652,8 +6749,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // knot placement for the deviation basis, so we use the closed-form
     // pooled-intercept probit solution instead of a full rigid pilot solve
     // (which would double total work at biobank scale):
-    //   q0 ≈ a0 · √(1 + b0²) + b0 · z[i]
-    // where (a0, b0) = pooled_probit_baseline.
+    //   q0 ≈ a0 · √(1 + (s_f b0)²) + s_f b0 · z[i]
+    // where b0 is the frailty-adjusted rigid logslope seed.
     let link_dev_prepared = spec
         .link_dev
         .as_ref()
@@ -6661,8 +6758,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let q0_seed = Array1::from_iter((0..spec.z.len()).map(|row| {
                 let a0 = baseline.0 + spec.marginal_offset[row];
                 let b0 = baseline.1 + spec.logslope_offset[row];
-                let scale = (1.0 + b0 * b0).sqrt();
-                a0 * scale + b0 * spec.z[row]
+                rigid_observed_eta(a0, b0, spec.z[row], probit_scale)
             }));
             // Pad with a conservative envelope so the basis support covers
             // the domain reached during flexible joint optimization, not just
@@ -7407,6 +7503,8 @@ mod tests {
         let dim = prepared.block.design.ncols();
         let beta = Array1::from_iter((0..dim).map(|idx| 0.025 * (idx as f64 + 1.0)));
         let n_spans = prepared.runtime.breakpoints().len().saturating_sub(1);
+        let support_left = prepared.runtime.support_left();
+        let support_right = prepared.runtime.support_right();
 
         for span_idx in 0..n_spans {
             let cubic = prepared
@@ -7446,17 +7544,24 @@ mod tests {
                     .runtime
                     .local_cubic_at(&beta, x)
                     .expect("lookup cubic at x");
-                let expected_span_idx = if i + 1 == x_eval.len() && span_idx + 1 < n_spans {
-                    span_idx + 1
+                if x <= support_left || x >= support_right {
+                    assert!(selected.c1.abs() < 1e-12);
+                    assert!(selected.c2.abs() < 1e-12);
+                    assert!(selected.c3.abs() < 1e-12);
+                    assert!((selected.evaluate(x) - expected[i]).abs() < 1e-10);
                 } else {
-                    span_idx
-                };
-                let expected_cubic = prepared
-                    .runtime
-                    .local_cubic_on_span(&beta, expected_span_idx)
-                    .expect("expected lookup cubic on span");
-                assert_eq!(selected.left, expected_cubic.left);
-                assert_eq!(selected.right, expected_cubic.right);
+                    let expected_span_idx = if i + 1 == x_eval.len() && span_idx + 1 < n_spans {
+                        span_idx + 1
+                    } else {
+                        span_idx
+                    };
+                    let expected_cubic = prepared
+                        .runtime
+                        .local_cubic_on_span(&beta, expected_span_idx)
+                        .expect("expected lookup cubic on span");
+                    assert_eq!(selected.left, expected_cubic.left);
+                    assert_eq!(selected.right, expected_cubic.right);
+                }
             }
         }
     }
@@ -7473,6 +7578,8 @@ mod tests {
         )
         .expect("build deviation block");
         let basis_idx = 0usize;
+        let support_left = prepared.runtime.support_left();
+        let support_right = prepared.runtime.support_right();
         let cubic = prepared
             .runtime
             .basis_span_cubic(0, basis_idx)
@@ -7491,14 +7598,68 @@ mod tests {
                 .runtime
                 .basis_cubic_at(basis_idx, x)
                 .expect("basis cubic at x");
-            let expected_span_idx = if i + 1 == x_eval.len() { 1 } else { 0 };
-            let expected_cubic = prepared
-                .runtime
-                .basis_span_cubic(expected_span_idx, basis_idx)
-                .expect("expected basis span cubic");
-            assert_eq!(selected.left, expected_cubic.left);
-            assert_eq!(selected.right, expected_cubic.right);
+            if x <= support_left || x >= support_right {
+                assert!(selected.c1.abs() < 1e-12);
+                assert!(selected.c2.abs() < 1e-12);
+                assert!(selected.c3.abs() < 1e-12);
+                assert!((selected.evaluate(x) - design[[i, basis_idx]]).abs() < 1e-10);
+            } else {
+                let expected_span_idx = if i + 1 == x_eval.len() { 1 } else { 0 };
+                let expected_cubic = prepared
+                    .runtime
+                    .basis_span_cubic(expected_span_idx, basis_idx)
+                    .expect("expected basis span cubic");
+                assert_eq!(selected.left, expected_cubic.left);
+                assert_eq!(selected.right, expected_cubic.right);
+            }
         }
+    }
+
+    #[test]
+    fn deviation_runtime_saturates_outside_support() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build deviation block");
+        let dim = prepared.block.design.ncols();
+        let beta = Array1::from_iter((0..dim).map(|idx| 0.02 * (idx as f64 + 1.0)));
+        let left = prepared.runtime.support_left();
+        let right = prepared.runtime.support_right();
+
+        let left_tail_near = prepared
+            .runtime
+            .local_cubic_at(&beta, left - 0.25)
+            .expect("left tail");
+        let left_tail_far = prepared
+            .runtime
+            .local_cubic_at(&beta, left - 3.0)
+            .expect("left far tail");
+        let right_tail_near = prepared
+            .runtime
+            .local_cubic_at(&beta, right + 0.25)
+            .expect("right tail");
+        let right_tail_far = prepared
+            .runtime
+            .local_cubic_at(&beta, right + 3.0)
+            .expect("right far tail");
+
+        for cubic in [
+            left_tail_near,
+            left_tail_far,
+            right_tail_near,
+            right_tail_far,
+        ] {
+            assert!(cubic.c1.abs() < 1e-12);
+            assert!(cubic.c2.abs() < 1e-12);
+            assert!(cubic.c3.abs() < 1e-12);
+        }
+        assert!((left_tail_near.c0 - left_tail_far.c0).abs() < 1e-12);
+        assert!((right_tail_near.c0 - right_tail_far.c0).abs() < 1e-12);
     }
 
     #[test]
@@ -7601,6 +7762,8 @@ mod tests {
                 .all(|w| (w[0].cell.right - w[1].cell.left).abs() <= 1e-12),
             "microcells should tile the partition contiguously"
         );
+        assert!(exact_cells_a0.first().unwrap().cell.left.is_infinite());
+        assert!(exact_cells_a0.last().unwrap().cell.right.is_infinite());
         assert!(
             exact_cells_a0
                 .iter()

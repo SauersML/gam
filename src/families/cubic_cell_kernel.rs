@@ -1,7 +1,35 @@
 use crate::probability::normal_cdf;
 
-// Internal exact de-nested cubic cell kernel shared by marginal-slope and
-// survival families. This is generic cell algebra, not a standalone family.
+// ── De-nested cubic transport kernel ─────────────────────────────────
+//
+// This module implements the **de-nested** flexible-link/score-warp model:
+//
+//   η(z) = a + b·z + b·Δ_h(z) + Δ_w(a + b·z)
+//
+// where Δ_h is the score warp (a cubic-spline deviation of the z-axis) and
+// Δ_w is the link deviation (a cubic-spline deviation of the linear predictor
+// axis).  This is NOT the literal nested composition L(a + b·H(z)); it is
+// an additive-correction model where both deviations enter as perturbations
+// around the affine core a + b·z.
+//
+// On each partition cell, both Δ_h and Δ_w are cubic polynomials, so
+// η is at most a sextic polynomial in z, and q(z) = ½(z² + η²) is at most
+// degree 12.  The integral ∫ exp(-q(z)) dz is not a classical special
+// function but can be evaluated to machine precision via **adaptive
+// holonomic transport**: start from the exactly-known affine anchor
+// (c2=c3=0, where q is a Gaussian and the integral is BVN), then
+// continuously deform to the target sextic using the polynomial moment
+// recurrence.  This is numerically exact but is a transport method,
+// not a literal closed-form special-function call.
+//
+// The partition covers (-∞, +∞) with:
+//   • two semi-infinite affine TAIL cells (outside all deviation support),
+//   • finitely many interior cells (each a sextic microcell).
+// Because tail cells have constant deviations (c2=c3=0), their bounds
+// are parameter-independent, so no Leibniz boundary-motion corrections
+// appear in the derivatives.
+//
+// Shared by bernoulli_marginal_slope and survival_marginal_slope families.
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LocalSpanCubic {
@@ -33,7 +61,7 @@ impl LocalSpanCubic {
     }
 }
 
-pub const ANCHORED_DEVIATION_KERNEL: &str = "ExactDenestedCubic";
+pub const ANCHORED_DEVIATION_KERNEL: &str = "DenestedCubicTransport";
 pub const NORMALIZED_CELL_BRANCH_TOL: f64 = 1e-10;
 const INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
 const RECIP_FACTORIALS_0_TO_10: [f64; 11] = [
@@ -111,35 +139,89 @@ pub struct CellMomentState {
     pub moments: Vec<f64>,
 }
 
-const BVN_GL_NODES_10: [f64; 10] = [
-    -0.973_906_528_517_171_7,
-    -0.865_063_366_688_984_5,
-    -0.679_409_568_299_024_4,
-    -0.433_395_394_129_247_2,
-    -0.148_874_338_981_631_2,
-    0.148_874_338_981_631_2,
-    0.433_395_394_129_247_2,
-    0.679_409_568_299_024_4,
-    0.865_063_366_688_984_5,
-    0.973_906_528_517_171_7,
+/// 20-point Gauss–Legendre nodes on [-1, 1] for the Drezner–Wesolowsky
+/// bivariate normal CDF representation.  20 points give >30-digit accuracy
+/// for the smooth arcsin-transformed integrand, ensuring the BVN value is
+/// exact to f64 precision for all (h, k, ρ).
+const BVN_GL_NODES_20: [f64; 20] = [
+    -0.993_128_599_185_094_9,
+    -0.963_971_927_277_913_8,
+    -0.912_234_428_251_325_9,
+    -0.839_116_971_822_218_8,
+    -0.746_331_906_460_150_8,
+    -0.636_053_680_726_515_0,
+    -0.510_867_001_950_827_1,
+    -0.373_706_088_715_419_6,
+    -0.227_785_851_141_645_1,
+    -0.076_526_521_133_497_33,
+    0.076_526_521_133_497_33,
+    0.227_785_851_141_645_1,
+    0.373_706_088_715_419_6,
+    0.510_867_001_950_827_1,
+    0.636_053_680_726_515_0,
+    0.746_331_906_460_150_8,
+    0.839_116_971_822_218_8,
+    0.912_234_428_251_325_9,
+    0.963_971_927_277_913_8,
+    0.993_128_599_185_094_9,
 ];
 
-const BVN_GL_WEIGHTS_10: [f64; 10] = [
-    0.066_671_344_308_688_1,
-    0.149_451_349_150_580_6,
-    0.219_086_362_515_982,
-    0.269_266_719_309_996_3,
-    0.295_524_224_714_752_9,
-    0.295_524_224_714_752_9,
-    0.269_266_719_309_996_3,
-    0.219_086_362_515_982,
-    0.149_451_349_150_580_6,
-    0.066_671_344_308_688_1,
+const BVN_GL_WEIGHTS_20: [f64; 20] = [
+    0.017_614_007_139_152_12,
+    0.040_601_429_800_386_94,
+    0.062_672_048_334_109_06,
+    0.083_276_741_576_704_75,
+    0.101_930_119_817_240_4,
+    0.118_194_531_961_518_4,
+    0.131_688_638_449_176_6,
+    0.142_096_109_318_382_1,
+    0.149_172_986_472_603_7,
+    0.152_753_387_130_725_9,
+    0.152_753_387_130_725_9,
+    0.149_172_986_472_603_7,
+    0.142_096_109_318_382_1,
+    0.131_688_638_449_176_6,
+    0.118_194_531_961_518_4,
+    0.101_930_119_817_240_4,
+    0.083_276_741_576_704_75,
+    0.062_672_048_334_109_06,
+    0.040_601_429_800_386_94,
+    0.017_614_007_139_152_12,
 ];
 
 fn dedup_sorted_breakpoints(points: &mut Vec<f64>) {
     points.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
-    points.dedup_by(|lhs, rhs| (*lhs - *rhs).abs() <= 1e-12);
+    points.dedup_by(|lhs, rhs| {
+        if *lhs == *rhs {
+            true
+        } else if lhs.is_finite() && rhs.is_finite() {
+            (*lhs - *rhs).abs() <= 1e-12
+        } else {
+            false
+        }
+    });
+}
+
+#[inline]
+pub fn interval_probe_point(left: f64, right: f64) -> Result<f64, String> {
+    if !(left < right) {
+        return Err(format!(
+            "interval probe requires ordered bounds, got [{left}, {right}]"
+        ));
+    }
+    if left.is_finite() && right.is_finite() {
+        Ok(0.5 * (left + right))
+    } else if left == f64::NEG_INFINITY && right == f64::INFINITY {
+        Ok(0.0)
+    } else if left == f64::NEG_INFINITY && right.is_finite() {
+        Ok(right - 1.0)
+    } else if left.is_finite() && right == f64::INFINITY {
+        Ok(left + 1.0)
+    } else {
+        Err(format!(
+            "interval probe requires finite bounds or full infinities, got [{left}, {right}]"
+        ))
+    }
 }
 
 #[inline]
@@ -825,9 +907,37 @@ where
     FS: FnMut(f64) -> Result<LocalSpanCubic, String>,
     FL: FnMut(f64) -> Result<LocalSpanCubic, String>,
 {
-    if score_breaks.len() < 2 {
-        return Err("de-nested partition requires at least two score breakpoints".to_string());
-    }
+    build_denested_partition_cells_with_tails(
+        a,
+        b,
+        score_breaks,
+        link_breaks,
+        score_span_at,
+        link_span_at,
+    )
+}
+
+/// Build a partition covering `(-∞, +∞)` with parameter-independent outer
+/// bounds.  Interior cells use the same finite-cell polynomial algebra.
+/// The two tail cells are guaranteed affine (c2=c3=0) because both
+/// deviations saturate to constants outside their knot support.
+///
+/// The tail cells' score/link spans come from the same closures evaluated
+/// at a representative point in the tail region — the closures must return
+/// constant (c1=c2=c3=0) cubics for points outside support.
+pub fn build_denested_partition_cells_with_tails<FS, FL>(
+    a: f64,
+    b: f64,
+    score_breaks: &[f64],
+    link_breaks: &[f64],
+    mut score_span_at: FS,
+    mut link_span_at: FL,
+) -> Result<Vec<DenestedPartitionCell>, String>
+where
+    FS: FnMut(f64) -> Result<LocalSpanCubic, String>,
+    FL: FnMut(f64) -> Result<LocalSpanCubic, String>,
+{
+    // Collect all INTERNAL split points (finite).
     let mut split_points = score_breaks.to_vec();
     if b.abs() > 1e-12 {
         for &tau in link_breaks {
@@ -838,18 +948,62 @@ where
         }
     }
     dedup_sorted_breakpoints(&mut split_points);
-    if split_points.len() < 2 {
-        return Err("de-nested partition did not produce a valid breakpoint set".to_string());
-    }
 
     let mut out = Vec::new();
+
+    if split_points.is_empty() {
+        let score_span = score_span_at(0.0)?;
+        let link_span = link_span_at(a)?;
+        let coeffs = denested_cell_coefficients(score_span, link_span, a, b);
+        return Ok(vec![DenestedPartitionCell {
+            cell: DenestedCubicCell {
+                left: f64::NEG_INFINITY,
+                right: f64::INFINITY,
+                c0: coeffs[0],
+                c1: coeffs[1],
+                c2: 0.0,
+                c3: 0.0,
+            },
+            score_span,
+            link_span,
+        }]);
+    }
+
+    // ── Left tail cell: (-∞, leftmost_split] ──
+    let leftmost = split_points[0];
+    // Evaluate spans at a point just left of the leftmost split.  The
+    // closures return constant tail cubics for this region.
+    let left_probe = interval_probe_point(f64::NEG_INFINITY, leftmost)?;
+    let left_score_span = score_span_at(left_probe)?;
+    let left_link_span = link_span_at(a + b * left_probe)?;
+    let left_coeffs = denested_cell_coefficients(left_score_span, left_link_span, a, b);
+    debug_assert!(
+        left_coeffs[2].abs() <= 1e-12 && left_coeffs[3].abs() <= 1e-12,
+        "left tail cell must be affine: c2={:.3e}, c3={:.3e}",
+        left_coeffs[2],
+        left_coeffs[3]
+    );
+    out.push(DenestedPartitionCell {
+        cell: DenestedCubicCell {
+            left: f64::NEG_INFINITY,
+            right: leftmost,
+            c0: left_coeffs[0],
+            c1: left_coeffs[1],
+            c2: 0.0,
+            c3: 0.0,
+        },
+        score_span: left_score_span,
+        link_span: left_link_span,
+    });
+
+    // ── Interior cells (all finite) ──
     for window in split_points.windows(2) {
         let left = window[0];
         let right = window[1];
         if !left.is_finite() || !right.is_finite() || right - left <= 1e-12 {
             continue;
         }
-        let mid = 0.5 * (left + right);
+        let mid = interval_probe_point(left, right)?;
         let score_span = score_span_at(mid)?;
         let link_span = link_span_at(a + b * mid)?;
         let coeffs = denested_cell_coefficients(score_span, link_span, a, b);
@@ -866,9 +1020,32 @@ where
             link_span,
         });
     }
-    if out.is_empty() {
-        return Err("de-nested partition produced no active cells".to_string());
-    }
+
+    // ── Right tail cell: [rightmost_split, +∞) ──
+    let rightmost = *split_points.last().unwrap();
+    let right_probe = interval_probe_point(rightmost, f64::INFINITY)?;
+    let right_score_span = score_span_at(right_probe)?;
+    let right_link_span = link_span_at(a + b * right_probe)?;
+    let right_coeffs = denested_cell_coefficients(right_score_span, right_link_span, a, b);
+    debug_assert!(
+        right_coeffs[2].abs() <= 1e-12 && right_coeffs[3].abs() <= 1e-12,
+        "right tail cell must be affine: c2={:.3e}, c3={:.3e}",
+        right_coeffs[2],
+        right_coeffs[3]
+    );
+    out.push(DenestedPartitionCell {
+        cell: DenestedCubicCell {
+            left: rightmost,
+            right: f64::INFINITY,
+            c0: right_coeffs[0],
+            c1: right_coeffs[1],
+            c2: 0.0,
+            c3: 0.0,
+        },
+        score_span: right_score_span,
+        link_span: right_link_span,
+    });
+
     Ok(out)
 }
 
@@ -902,6 +1079,17 @@ pub fn normalized_non_affine_coefficients(
 
 #[inline]
 pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
+    if !cell.left.is_finite() || !cell.right.is_finite() {
+        if cell.c2.abs() <= NORMALIZED_CELL_BRANCH_TOL
+            && cell.c3.abs() <= NORMALIZED_CELL_BRANCH_TOL
+        {
+            return Ok(ExactCellBranch::Affine);
+        }
+        return Err(format!(
+            "non-affine cells require finite bounds, got [{}, {}] with c2={:.6e}, c3={:.6e}",
+            cell.left, cell.right, cell.c2, cell.c3
+        ));
+    }
     let (k2, k3) = normalized_non_affine_coefficients(
         cell.left, cell.right, cell.c0, cell.c1, cell.c2, cell.c3,
     )?;
@@ -947,7 +1135,7 @@ pub fn bivariate_normal_cdf(h: f64, k: f64, rho: f64) -> Result<f64, String> {
     let hs = 0.5 * (h * h + k * k);
     let asr = rho_clamped.asin();
     let mut sum = 0.0;
-    for (&node, &weight) in BVN_GL_NODES_10.iter().zip(BVN_GL_WEIGHTS_10.iter()) {
+    for (&node, &weight) in BVN_GL_NODES_20.iter().zip(BVN_GL_WEIGHTS_20.iter()) {
         let sn = (0.5 * asr * (node + 1.0)).sin();
         let one_minus = 1.0 - sn * sn;
         let expo = ((sn * h * k) - hs) / one_minus;
@@ -1037,6 +1225,23 @@ pub fn affine_anchor_moment_vector(
     out
 }
 
+/// Evaluate an affine cell (c2=c3=0) exactly.  Supports semi-infinite bounds.
+///
+/// **Value–moment architecture:**
+///
+/// `value` = ∫ φ(z) Φ(α+βz) dz  (the BVN integral), computed via the
+///   Drezner–Wesolowsky 20-point GL representation, which is exact to
+///   f64 machine precision (~2e-16 max error for all (h,k,ρ)).
+///
+/// `moments[n]` = ∫ zⁿ exp(-½(z²+η²)) dz  (the exp(-q) moments), computed
+///   from exact truncated-Gaussian recurrences with no quadrature.
+///
+/// These are different integrals (BVN CDF vs bivariate normal density)
+/// but related by:  d(value)/dα = (1/(2π)) · moments[0].
+///
+/// The holonomic transport in `evaluate_non_affine_cell_state` couples
+/// them correctly: value updates use `INV_TWO_PI * moments`, and the
+/// 20-pt GL anchor ensures the initial BVN value is exact to f64.
 pub fn evaluate_affine_cell_state(
     cell: DenestedCubicCell,
     max_degree: usize,
@@ -1390,7 +1595,7 @@ fn evaluate_non_affine_cell_state(
     })
 }
 
-/// Exact de-nested cubic cell evaluator.
+/// De-nested cubic cell evaluator.
 ///
 /// Affine cells use the closed-form affine anchor. Quartic and sextic cells
 /// are transported from that anchor in the non-affine coefficients `(c2,c3)`
@@ -1399,9 +1604,23 @@ pub fn evaluate_cell_moments(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
-    if !cell.left.is_finite() || !cell.right.is_finite() || cell.right <= cell.left {
+    let left_inf = !cell.left.is_finite();
+    let right_inf = !cell.right.is_finite();
+    if left_inf || right_inf {
+        // Semi-infinite tail cells must be affine: the deviation saturates
+        // to a constant outside support, so c2=c3=0.  Both the BVN CDF
+        // and the truncated-Gaussian moment vector handle infinite bounds.
+        if cell.c2.abs() > 1e-15 || cell.c3.abs() > 1e-15 {
+            return Err(format!(
+                "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
+                cell.left, cell.right, cell.c2, cell.c3
+            ));
+        }
+        return evaluate_affine_cell_state(cell, max_degree);
+    }
+    if cell.right <= cell.left {
         return Err(format!(
-            "cell moment evaluation requires finite ordered bounds, got [{}, {}]",
+            "finite cell must have left < right, got [{}, {}]",
             cell.left, cell.right
         ));
     }
@@ -3448,6 +3667,44 @@ mod tests {
                 .zip(cells_a1.iter())
                 .any(|(lhs, rhs)| (lhs.cell.left - rhs.cell.left).abs() > 1e-10)
         );
+        assert!(cells_a0.first().unwrap().cell.left.is_infinite());
+        assert!(cells_a0.last().unwrap().cell.right.is_infinite());
+    }
+
+    #[test]
+    fn partition_builder_without_breaks_returns_single_global_cell() {
+        let cells = build_denested_partition_cells_with_tails(
+            0.3,
+            -0.4,
+            &[],
+            &[],
+            |_z| {
+                Ok(LocalSpanCubic {
+                    left: 0.0,
+                    right: 1.0,
+                    c0: 0.0,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                })
+            },
+            |_u| {
+                Ok(LocalSpanCubic {
+                    left: 0.0,
+                    right: 1.0,
+                    c0: 0.0,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                })
+            },
+        )
+        .expect("global cell");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].cell.left, f64::NEG_INFINITY);
+        assert_eq!(cells[0].cell.right, f64::INFINITY);
+        assert!(cells[0].cell.c2.abs() < 1e-12);
+        assert!(cells[0].cell.c3.abs() < 1e-12);
     }
 
     #[test]

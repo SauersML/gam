@@ -2,6 +2,9 @@ use crate::basis::BasisFamily;
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::bernoulli_marginal_slope::anchored_deviation_basis_with_transform;
+use crate::families::bernoulli_marginal_slope::deviation_runtime::{
+    local_cubic_from_uniform_span_samples, sampled_span_points,
+};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
@@ -644,21 +647,10 @@ impl SavedAnchoredDeviationRuntime {
         }
         let left = points[span_idx];
         let right = points[span_idx + 1];
-        let left_point = Array1::from_vec(vec![left]);
-        let mid_point = Array1::from_vec(vec![0.5 * (left + right)]);
-        let value = self.design(&left_point)?.row(0).dot(beta);
-        let d1 = self.first_derivative_design(&left_point)?.row(0).dot(beta);
-        let d2 = self.second_derivative_design(&left_point)?.row(0).dot(beta);
-        let d3 = self.third_derivative_design(&mid_point)?.row(0).dot(beta);
-        Ok(
-            crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                left,
-                right,
-                c0: value,
-                c1: d1,
-                c2: 0.5 * d2,
-                c3: d3 / 6.0,
-            },
+        let span_points = sampled_span_points(left, right);
+        let values = self.design(&span_points)?.dot(beta);
+        local_cubic_from_uniform_span_samples(
+            left, right, values[0], values[1], values[2], values[3],
         )
     }
 
@@ -686,6 +678,40 @@ impl SavedAnchoredDeviationRuntime {
         value: f64,
     ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
     {
+        self.validate_exact_replay_contract()?;
+        if basis_idx >= self.basis_dim {
+            return Err(format!(
+                "saved anchored deviation basis index {} out of range for {} coefficients",
+                basis_idx, self.basis_dim
+            ));
+        }
+        let (left_ep, right_ep) = self.support_interval()?;
+        if value < left_ep {
+            let left_value = self.design(&Array1::from_vec(vec![left_ep]))?[[0, basis_idx]];
+            return Ok(
+                crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                    left: left_ep,
+                    right: left_ep + 1.0,
+                    c0: left_value,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                },
+            );
+        }
+        if value > right_ep {
+            let right_value = self.design(&Array1::from_vec(vec![right_ep]))?[[0, basis_idx]];
+            return Ok(
+                crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                    left: right_ep,
+                    right: right_ep + 1.0,
+                    c0: right_value,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                },
+            );
+        }
         let span_idx = self.span_index_for(value)?;
         self.basis_span_cubic(span_idx, basis_idx)
     }
@@ -696,8 +722,49 @@ impl SavedAnchoredDeviationRuntime {
         value: f64,
     ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
     {
+        let (left_ep, right_ep) = self.support_interval()?;
+        if value < left_ep {
+            let left_value = self
+                .design(&Array1::from_vec(vec![left_ep]))?
+                .row(0)
+                .dot(beta);
+            return Ok(
+                crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                    left: left_ep,
+                    right: left_ep + 1.0,
+                    c0: left_value,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                },
+            );
+        }
+        if value > right_ep {
+            let right_value = self
+                .design(&Array1::from_vec(vec![right_ep]))?
+                .row(0)
+                .dot(beta);
+            return Ok(
+                crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                    left: right_ep,
+                    right: right_ep + 1.0,
+                    c0: right_value,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                },
+            );
+        }
         let span_idx = self.span_index_for(value)?;
         self.local_cubic_on_span(beta, span_idx)
+    }
+
+    fn support_interval(&self) -> Result<(f64, f64), String> {
+        let points = self.breakpoints()?;
+        match (points.first(), points.last()) {
+            (Some(&left), Some(&right)) => Ok((left, right)),
+            _ => Err("saved anchored deviation runtime is missing support breakpoints".to_string()),
+        }
     }
 
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {

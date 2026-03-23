@@ -246,6 +246,11 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
+fn coefficients_exactly_zero(beta: &Array1<f64>) -> bool {
+    beta.iter().all(|value| *value == 0.0)
+}
+
+#[inline]
 fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
     match frailty {
         FrailtySpec::None => None,
@@ -1011,24 +1016,44 @@ impl HyperOperator for BlockHessianOperator {
 //
 //   ℓ_i = w_i [ (1-d)·neglogΦ(-η₁) + logΦ(-η₀) − d·logφ(η₁) − d·log(a'₁) ]
 //
-// with η₀ = q₀c + gz, η₁ = q₁c + gz, a'₁ = qd₁·c, c = √(1+g²).
+// with η₀ = q₀c + s_f g z, η₁ = q₁c + s_f g z, a'₁ = qd₁·c,
+// c = √(1 + (s_f g)²), s_f = 1/√(1+σ²).
 //
 // All derivatives w.r.t. the 4 primary scalars (q₀, q₁, qd₁, g) are
 // closed-form scalar formulas. No jets, no per-row heap allocation.
 
-/// Derivatives of c(g) = √(1+g²) up to 4th order.
 #[inline]
-fn c_derivatives(g: f64) -> (f64, f64, f64, f64, f64) {
-    let g2 = g * g;
+fn rigid_observed_logslope(g: f64, probit_scale: f64) -> f64 {
+    probit_scale * g
+}
+
+#[inline]
+fn rigid_observed_scale(g: f64, probit_scale: f64) -> f64 {
+    let observed_g = rigid_observed_logslope(g, probit_scale);
+    (1.0 + observed_g * observed_g).sqrt()
+}
+
+#[inline]
+fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f64 {
+    q * rigid_observed_scale(g, probit_scale) + rigid_observed_logslope(g, probit_scale) * z
+}
+
+/// Derivatives of c(g) = √(1 + (s_f g)^2) up to 4th order in the raw slope g.
+#[inline]
+fn c_derivatives(g: f64, probit_scale: f64) -> (f64, f64, f64, f64, f64) {
+    let observed_g = rigid_observed_logslope(g, probit_scale);
+    let g2 = observed_g * observed_g;
+    let s2 = probit_scale * probit_scale;
+    let s4 = s2 * s2;
     let c = (1.0 + g2).sqrt();
     let c2 = c * c;
     let c3 = c2 * c;
     let c5 = c3 * c2;
     let c7 = c5 * c2;
-    let c1 = g / c;
-    let c2d = 1.0 / c3;
-    let c3d = -3.0 * g / c5;
-    let c4d = (12.0 * g2 - 3.0) / c7;
+    let c1 = s2 * g / c;
+    let c2d = s2 / c3;
+    let c3d = -3.0 * s4 * g / c5;
+    let c4d = s4 * (12.0 * g2 - 3.0) / c7;
     (c, c1, c2d, c3d, c4d)
 }
 
@@ -1055,12 +1080,14 @@ fn row_primary_closed_form(
     w: f64,
     d: f64,
     derivative_guard: f64,
+    probit_scale: f64,
 ) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
-    let (c, c1, c2, ..) = c_derivatives(g);
+    let (c, c1, c2, ..) = c_derivatives(g, probit_scale);
+    let observed_g = rigid_observed_logslope(g, probit_scale);
 
     // Linear predictors
-    let eta0 = q0 * c + g * z;
-    let eta1 = q1 * c + g * z;
+    let eta0 = q0 * c + observed_g * z;
+    let eta1 = q1 * c + observed_g * z;
     let ad1 = qd1 * c;
 
     if qd1 < derivative_guard {
@@ -1100,13 +1127,13 @@ fn row_primary_closed_form(
     let td_u2 = w * d * nl_u2;
 
     // ── Chain rule to primary space ──
-    // η₀ depends on (q₀, g): ∂η₀/∂q₀ = c, ∂η₀/∂g = q₀c₁ + z
-    // η₁ depends on (q₁, g): ∂η₁/∂q₁ = c, ∂η₁/∂g = q₁c₁ + z
+    // η₀ depends on (q₀, g): ∂η₀/∂q₀ = c, ∂η₀/∂g = q₀c₁ + s_f z
+    // η₁ depends on (q₁, g): ∂η₁/∂q₁ = c, ∂η₁/∂g = q₁c₁ + s_f z
     // ad1 depends on (qd1, g): ∂ad1/∂qd1 = c, ∂ad1/∂g = qd1·c₁
     let deta0_dq0 = c;
-    let deta0_dg = q0 * c1 + z;
+    let deta0_dg = q0 * c1 + probit_scale * z;
     let deta1_dq1 = c;
-    let deta1_dg = q1 * c1 + z;
+    let deta1_dg = q1 * c1 + probit_scale * z;
     let dad1_dqd1 = c;
     let dad1_dg = qd1 * c1;
 
@@ -1426,9 +1453,7 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     fn flex_active(&self) -> bool {
-        self.score_warp.is_some()
-            || self.link_dev.is_some()
-            || self.gaussian_frailty_sd.unwrap_or(0.0) > 0.0
+        self.score_warp.is_some() || self.link_dev.is_some()
     }
 
     fn flex_score_beta<'a>(
@@ -1442,6 +1467,15 @@ impl SurvivalMarginalSlopeFamily {
             .get(3)
             .map(|state| Some(&state.beta))
             .ok_or_else(|| "missing survival score-warp block state".to_string())
+    }
+
+    fn effective_flex_score_beta<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<Option<&'a Array1<f64>>, String> {
+        Ok(self
+            .flex_score_beta(block_states)?
+            .filter(|beta| !coefficients_exactly_zero(beta)))
     }
 
     fn flex_link_beta<'a>(
@@ -1458,6 +1492,15 @@ impl SurvivalMarginalSlopeFamily {
             .ok_or_else(|| "missing survival link-deviation block state".to_string())
     }
 
+    fn effective_flex_link_beta<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<Option<&'a Array1<f64>>, String> {
+        Ok(self
+            .flex_link_beta(block_states)?
+            .filter(|beta| !coefficients_exactly_zero(beta)))
+    }
+
     fn denested_partition_cells(
         &self,
         a: f64,
@@ -1465,33 +1508,24 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
-        let score_tail = 8.0;
-        let mut score_breaks = if let Some(runtime) = self.score_warp.as_ref() {
-            runtime.breakpoints().to_vec()
+        let score_breaks = if beta_h.is_some() {
+            self.score_warp
+                .as_ref()
+                .map(|runtime| runtime.breakpoints().to_vec())
+                .unwrap_or_default()
         } else {
-            vec![-score_tail, score_tail]
+            Vec::new()
         };
-        if score_breaks.first().copied().unwrap_or(score_tail) > -score_tail {
-            score_breaks.insert(0, -score_tail);
-        }
-        if score_breaks.last().copied().unwrap_or(-score_tail) < score_tail {
-            score_breaks.push(score_tail);
-        }
-
-        let link_tail = 8.0 * (1.0 + b.abs());
-        let mut link_breaks = if let Some(runtime) = self.link_dev.as_ref() {
-            runtime.breakpoints().to_vec()
+        let link_breaks = if beta_w.is_some() {
+            self.link_dev
+                .as_ref()
+                .map(|runtime| runtime.breakpoints().to_vec())
+                .unwrap_or_default()
         } else {
-            vec![a - link_tail, a + link_tail]
+            Vec::new()
         };
-        if link_breaks.first().copied().unwrap_or(a + link_tail) > a - link_tail {
-            link_breaks.insert(0, a - link_tail);
-        }
-        if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
-            link_breaks.push(a + link_tail);
-        }
 
-        let mut cells = exact_kernel::build_denested_partition_cells(
+        let mut cells = exact_kernel::build_denested_partition_cells_with_tails(
             a,
             b,
             &score_breaks,
@@ -1501,8 +1535,8 @@ impl SurvivalMarginalSlopeFamily {
                     runtime.local_cubic_at(beta, z)
                 } else {
                     Ok(exact_kernel::LocalSpanCubic {
-                        left: -score_tail,
-                        right: score_tail,
+                        left: 0.0,
+                        right: 1.0,
                         c0: 0.0,
                         c1: 0.0,
                         c2: 0.0,
@@ -1515,8 +1549,8 @@ impl SurvivalMarginalSlopeFamily {
                     runtime.local_cubic_at(beta, u)
                 } else {
                     Ok(exact_kernel::LocalSpanCubic {
-                        left: a - link_tail,
-                        right: a + link_tail,
+                        left: 0.0,
+                        right: 1.0,
                         c0: 0.0,
                         c1: 0.0,
                         c2: 0.0,
@@ -1683,16 +1717,16 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<ObservedDenestedCellPartials, String> {
         let scale = self.probit_frailty_scale();
         let zero_score_span = exact_kernel::LocalSpanCubic {
-            left: -8.0,
-            right: 8.0,
+            left: 0.0,
+            right: 1.0,
             c0: 0.0,
             c1: 0.0,
             c2: 0.0,
             c3: 0.0,
         };
         let zero_link_span = exact_kernel::LocalSpanCubic {
-            left: a - 8.0 * (1.0 + b.abs()),
-            right: a + 8.0 * (1.0 + b.abs()),
+            left: 0.0,
+            right: 1.0,
             c0: 0.0,
             c1: 0.0,
             c2: 0.0,
@@ -1937,8 +1971,8 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<f64, String> {
         let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
         let g = block_states[2].eta[row];
-        let beta_h = self.flex_score_beta(block_states)?;
-        let beta_w = self.flex_link_beta(block_states)?;
+        let beta_h = self.effective_flex_score_beta(block_states)?;
+        let beta_w = self.effective_flex_link_beta(block_states)?;
         self.row_neglog_flex_value_from_parts(
             row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w,
         )
@@ -2020,7 +2054,7 @@ impl SurvivalMarginalSlopeFamily {
                 c2: -cell.c2,
                 c3: -cell.c3,
             };
-            let z_mid = 0.5 * (cell.left + cell.right);
+            let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
             let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
             let fixed = self.denested_cell_primary_fixed_partials(
@@ -2104,7 +2138,7 @@ impl SurvivalMarginalSlopeFamily {
         let mut d_u = Array1::<f64>::zeros(p);
         for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
             let cell = partition_cell.cell;
-            let z_mid = 0.5 * (cell.left + cell.right);
+            let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
             let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
             let fixed = self.denested_cell_primary_fixed_partials(
@@ -2231,7 +2265,7 @@ impl SurvivalMarginalSlopeFamily {
         if need_d_uv {
             for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
                 let cell = partition_cell.cell;
-                let z_mid = 0.5 * (cell.left + cell.right);
+                let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
                 let u_mid = a + b * z_mid;
                 let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
                 let fixed = self.denested_cell_primary_fixed_partials(
@@ -2354,8 +2388,8 @@ impl SurvivalMarginalSlopeFamily {
         let q1 = q_geom.q1;
         let qd1 = q_geom.qd1;
         let g = block_states[2].eta[row];
-        let beta_h = self.flex_score_beta(block_states)?;
-        let beta_w = self.flex_link_beta(block_states)?;
+        let beta_h = self.effective_flex_score_beta(block_states)?;
+        let beta_w = self.effective_flex_link_beta(block_states)?;
 
         if qd1 < self.derivative_guard {
             return Err(format!(
@@ -3437,6 +3471,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
             self.family.weights[row],
             self.family.event[row],
             self.family.derivative_guard,
+            self.family.probit_frailty_scale(),
         )
     }
 
@@ -3998,20 +4033,36 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets: vec![
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_time,
-                    hessian: SymmetricMatrix::Dense(hess_time),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_marginal,
-                    hessian: SymmetricMatrix::Dense(hess_marginal),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_logslope,
-                    hessian: SymmetricMatrix::Dense(hess_logslope),
-                },
-            ],
+            blockworking_sets: {
+                let slices = block_slices(self, block_states);
+                let mut sets = vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_time,
+                        hessian: SymmetricMatrix::Dense(hess_time),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_marginal,
+                        hessian: SymmetricMatrix::Dense(hess_marginal),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_logslope,
+                        hessian: SymmetricMatrix::Dense(hess_logslope),
+                    },
+                ];
+                if let Some(range) = slices.score_warp.as_ref() {
+                    sets.push(BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(range.len()),
+                        hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+                    });
+                }
+                if let Some(range) = slices.link_dev.as_ref() {
+                    sets.push(BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(range.len()),
+                        hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+                    });
+                }
+                sets
+            },
         })
     }
 
@@ -4307,20 +4358,36 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets: vec![
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_time,
-                    hessian: hess_time.into_symmetric(),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_marginal,
-                    hessian: hess_marginal.into_symmetric(),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_logslope,
-                    hessian: hess_logslope.into_symmetric(),
-                },
-            ],
+            blockworking_sets: {
+                let slices = block_slices(self, block_states);
+                let mut sets = vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_time,
+                        hessian: hess_time.into_symmetric(),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_marginal,
+                        hessian: hess_marginal.into_symmetric(),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_logslope,
+                        hessian: hess_logslope.into_symmetric(),
+                    },
+                ];
+                if let Some(range) = slices.score_warp.as_ref() {
+                    sets.push(BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(range.len()),
+                        hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+                    });
+                }
+                if let Some(range) = slices.link_dev.as_ref() {
+                    sets.push(BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(range.len()),
+                        hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+                    });
+                }
+                sets
+            },
         })
     }
 
@@ -4350,16 +4417,30 @@ impl SurvivalMarginalSlopeFamily {
         // Slice principal diagonal blocks — block Hessians are views of the
         // joint Hessian, never independently derived.
         let slices = block_slices(self, block_states);
+        let mut block_gradients = vec![
+            joint_gradient.slice(s![slices.time.clone()]).to_owned(),
+            joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
+            joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
+        ];
+        let mut block_ranges = vec![
+            slices.time.clone(),
+            slices.marginal.clone(),
+            slices.logslope.clone(),
+        ];
+        if let Some(range) = slices.score_warp.clone() {
+            block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
+            block_ranges.push(range);
+        }
+        if let Some(range) = slices.link_dev.clone() {
+            block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
+            block_ranges.push(range);
+        }
         Ok(FamilyEvaluation {
             log_likelihood: ll,
             blockworking_sets: slice_joint_into_block_working_sets(
-                vec![
-                    joint_gradient.slice(s![slices.time.clone()]).to_owned(),
-                    joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
-                    joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
-                ],
+                block_gradients,
                 &joint_hessian,
-                &[slices.time, slices.marginal, slices.logslope],
+                &block_ranges,
             ),
         })
     }
@@ -4558,20 +4639,36 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets: vec![
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_time,
-                    hessian: SymmetricMatrix::Sparse(acc_time.into_sparse_col_mat()),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_marginal,
-                    hessian: SymmetricMatrix::Sparse(acc_marginal.into_sparse_col_mat()),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_logslope,
-                    hessian: SymmetricMatrix::Sparse(acc_logslope.into_sparse_col_mat()),
-                },
-            ],
+            blockworking_sets: {
+                let slices = block_slices(self, block_states);
+                let mut sets = vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_time,
+                        hessian: SymmetricMatrix::Sparse(acc_time.into_sparse_col_mat()),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_marginal,
+                        hessian: SymmetricMatrix::Sparse(acc_marginal.into_sparse_col_mat()),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: grad_logslope,
+                        hessian: SymmetricMatrix::Sparse(acc_logslope.into_sparse_col_mat()),
+                    },
+                ];
+                if let Some(range) = slices.score_warp.as_ref() {
+                    sets.push(BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(range.len()),
+                        hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+                    });
+                }
+                if let Some(range) = slices.link_dev.as_ref() {
+                    sets.push(BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(range.len()),
+                        hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+                    });
+                }
+                sets
+            },
         })
     }
 }
@@ -6508,7 +6605,7 @@ mod tests {
         assert!(matches!(
             &eval.blockworking_sets[1],
             BlockWorkingSet::ExactNewton {
-                hessian: SymmetricMatrix::Sparse(_),
+                hessian: SymmetricMatrix::Dense(_) | SymmetricMatrix::Sparse(_),
                 ..
             }
         ));

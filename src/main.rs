@@ -1383,7 +1383,7 @@ fn run_fit_bernoulli_marginal_slope(
         );
     } else {
         inference_notes.push(
-            "bernoulli marginal-slope flexible score/link mode uses the calibrated de-nested cubic cell-partition kernel: exact affine cells plus transported quartic/sextic non-affine cells with analytic gradients and Hessians"
+            "bernoulli marginal-slope flexible score/link mode uses a calibrated de-nested cubic transport kernel: closed-form affine cells plus transported quartic/sextic non-affine cells with analytic gradients and Hessians"
                 .to_string(),
         );
     }
@@ -2676,6 +2676,14 @@ fn run_predict_survival(
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
+    if saved_likelihood_mode == SurvivalLikelihoodMode::Latent {
+        return Err(
+            "prediction is not implemented for saved latent-survival models; \
+             the latent frailty likelihood requires specialized prediction \
+             machinery that is not yet wired"
+                .to_string(),
+        );
+    }
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
@@ -2695,7 +2703,7 @@ fn run_predict_survival(
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
-    let baseline_cfg = survival_baseline_config_from_model(model)?;
+    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
     let mut eta_offset_entry = Array1::<f64>::zeros(n);
     let mut eta_offset_exit = Array1::<f64>::zeros(n);
     let mut derivative_offset_exit = Array1::<f64>::zeros(n);
@@ -3100,9 +3108,14 @@ fn run_predict_survival(
                 beta_link.as_ref().map(|(_, beta)| *beta),
             )?
         } else {
-            let c = slope.mapv(|b| (1.0 + b * b).sqrt());
+            // Rigid closed-form under probit Gaussian frailty (matches
+            // BernoulliMarginalSlopePredictor):
+            //   η_obs = q·√(1 + (s b)²) + s b·z,  s = 1/√(1+σ²).
+            // Scale folds into slope BEFORE the sqrt, not outside.
             let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
-            let eta = (&q_exit * &c + &(&slope * &z)).mapv(|v| scale * v);
+            let sb = slope.mapv(|b| scale * b);
+            let c = sb.mapv(|sb| (1.0 + sb * sb).sqrt());
+            let eta = &q_exit * &c + &sb * &z;
             let deterministic_mean = eta.mapv(|v| normal_cdf(-v));
             (eta, deterministic_mean)
         };
@@ -3114,8 +3127,10 @@ fn run_predict_survival(
             );
         }
         let posterior_mean = if need_uncertainty {
-            let c = slope.mapv(|b| (1.0 + b * b).sqrt());
+            // Correct frailty-scaled quantities (must match the eta formula above).
             let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let sb = slope.mapv(|b| scale * b);
+            let c = sb.mapv(|sb_i| (1.0 + sb_i * sb_i).sqrt());
             let backend = prediction_backend_from_model(model, args.covariance_mode)?;
             let p_t = beta_time.len();
             let p_m = beta_marginal.len();
@@ -3134,30 +3149,35 @@ fn run_predict_survival(
                 let cs = end - start;
                 let mut jac = Array2::<f64>::zeros((cs, p_total));
                 {
+                    // ∂η/∂θ_time = c_i · x_time,  where c = √(1+(sb)²).
                     let x_t = time_build.x_exit_time.row_chunk(start..end);
                     let mut dst = jac.slice_mut(s![.., ..p_t]);
                     dst.assign(&x_t);
                     for i in 0..cs {
-                        let ci = scale * c[start + i];
+                        let ci = c[start + i];
                         dst.row_mut(i).mapv_inplace(|v| v * ci);
                     }
                 }
                 {
+                    // ∂η/∂θ_marginal = c_i · x_marginal.
                     let x_m = cov_design.design.row_chunk(start..end);
                     let mut dst = jac.slice_mut(s![.., p_t..p_t + p_m]);
                     dst.assign(&x_m);
                     for i in 0..cs {
-                        let ci = scale * c[start + i];
+                        let ci = c[start + i];
                         dst.row_mut(i).mapv_inplace(|v| v * ci);
                     }
                 }
                 {
+                    // ∂η/∂θ_slope = (q·s²·b/c + s·z) · x_slope.
                     let x_s = logslope_design.design.row_chunk(start..end);
                     let mut dst = jac.slice_mut(s![.., p_t + p_m..]);
                     dst.assign(&x_s);
                     for i in 0..cs {
-                        let gi = scale
-                            * (q_exit[start + i] * slope[start + i] / c[start + i] + z[start + i]);
+                        let b_i = slope[start + i];
+                        let c_i = c[start + i];
+                        let gi =
+                            q_exit[start + i] * scale * scale * b_i / c_i + scale * z[start + i];
                         dst.row_mut(i).mapv_inplace(|v| v * gi);
                     }
                 }
@@ -4488,6 +4508,22 @@ fn build_survival_time_initial_beta(
     )
 }
 
+fn fitted_weibull_baseline_from_linear_time_beta(beta: &Array1<f64>) -> Option<(f64, f64)> {
+    if beta.len() < 2 {
+        return None;
+    }
+    let shape = beta[1];
+    if !shape.is_finite() || shape <= 0.0 {
+        return None;
+    }
+    let log_scale = -beta[0] / shape;
+    let scale = log_scale.exp();
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    Some((scale, shape))
+}
+
 fn prepare_survival_time_stack(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
@@ -4562,6 +4598,17 @@ fn prepare_survival_time_stack(
 
 fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
     model.has_baseline_time_wiggle()
+}
+
+fn saved_survival_runtime_baseline_config(
+    model: &SavedModel,
+    likelihood_mode: SurvivalLikelihoodMode,
+) -> Result<SurvivalBaselineConfig, String> {
+    if likelihood_mode == SurvivalLikelihoodMode::Weibull && !baseline_timewiggle_is_present(model)
+    {
+        return parse_survival_baseline_config("linear", None, None, None, None);
+    }
+    survival_baseline_config_from_model(model)
 }
 
 fn saved_baseline_timewiggle_spec(
@@ -4837,17 +4884,23 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     parse_survival_distribution(&effective_survival_distribution)?;
     let survival_inverse_link = parse_survival_inverse_link(&effective_args)?;
-    if likelihood_mode == SurvivalLikelihoodMode::Weibull {
-        let baseline_args_requested = !effective_args
-            .baseline_target
-            .eq_ignore_ascii_case("linear")
-            || effective_args.baseline_scale.is_some()
-            || effective_args.baseline_shape.is_some()
-            || effective_args.baseline_rate.is_some()
-            || effective_args.baseline_makeham.is_some();
-        if baseline_args_requested && !learn_timewiggle {
+    if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
+        if !matches!(
+            effective_args
+                .baseline_target
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "linear" | "weibull"
+        ) {
             return Err(
-                "--survival-likelihood weibull uses the built-in parametric baseline; do not set --baseline-target/--baseline-scale/--baseline-shape/--baseline-rate/--baseline-makeham"
+                "--survival-likelihood weibull supports only --baseline-target=linear or --baseline-target=weibull without --learn-timewiggle"
+                    .to_string(),
+            );
+        }
+        if effective_args.baseline_rate.is_some() || effective_args.baseline_makeham.is_some() {
+            return Err(
+                "--survival-likelihood weibull does not use --baseline-rate or --baseline-makeham"
                     .to_string(),
             );
         }
@@ -4933,6 +4986,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         effective_args.baseline_makeham,
         &age_exit,
     )?;
+    let weibull_builtin_beta_seed =
+        if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
+            let scale = effective_args
+                .baseline_scale
+                .unwrap_or_else(|| positive_survival_time_seed(&age_exit));
+            let shape = effective_args.baseline_shape.unwrap_or(1.0);
+            Some(array![-shape * scale.ln(), shape])
+        } else {
+            None
+        };
     if learn_timewiggle && baseline_cfg.target == SurvivalBaselineTarget::Linear {
         return Err(
             "timewiggle(...) requires a non-linear scalar survival baseline target; use --baseline-target weibull|gompertz|gompertz-makeham, or combine it with --survival-likelihood weibull"
@@ -5370,7 +5433,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
         } else {
             inference_notes.push(
-                "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic cells with exact value evaluation and calibrated survival normalization"
+                "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic transport cells with analytic value evaluation and calibrated survival normalization"
                     .to_string(),
             );
         }
@@ -5588,9 +5651,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let build_rows = |prepared: &PreparedSurvivalTimeStack| {
             let mut rows = Vec::with_capacity(n);
             for i in 0..n {
-                let h0_exit = prepared.eta_offset_exit[i].exp();
-                let h0_entry = prepared.eta_offset_entry[i].exp();
-                let mass_exit_val = h0_exit - h0_entry;
+                // Standard delayed-entry frailty semantics: keep H_0(entry)
+                // and H_0(exit/event) as separate cumulative masses so the
+                // likelihood conditions on survival to study entry.
+                let cumulative_mass_exit = prepared.eta_offset_exit[i].exp();
+                let cumulative_mass_entry = prepared.eta_offset_entry[i].exp();
                 let ev = event_target[i];
                 let event_type = if ev >= 1 {
                     gam::families::lognormal_kernel::LatentSurvivalEventType::ExactEvent
@@ -5602,18 +5667,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 } else {
                     0.0
                 };
-                rows.push(gam::families::lognormal_kernel::LatentSurvivalRow {
-                    event_type,
-                    mass_entry: 0.0,
-                    mass_exit: mass_exit_val,
-                    mass_left: 0.0,
-                    mass_right: 0.0,
-                    log_baseline_hazard,
-                    mass_unloaded_entry: 0.0,
-                    mass_unloaded_exit: 0.0,
-                    hazard_loaded: 0.0,
-                    hazard_unloaded: 0.0,
-                });
+                rows.push(
+                    gam::families::lognormal_kernel::LatentSurvivalRow::from_full_loading_cumulative_mass(
+                        event_type,
+                        cumulative_mass_entry,
+                        cumulative_mass_exit,
+                        log_baseline_hazard,
+                    ),
+                );
             }
             rows
         };
@@ -5832,6 +5893,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
         }
         let mut beta0 = Array1::<f64>::zeros(p);
+        if let Some(seed) = weibull_builtin_beta_seed.as_ref() {
+            if p_time_total < seed.len() {
+                return Err(format!(
+                    "weibull built-in time basis has {} columns but needs at least {} to seed scale/shape",
+                    p_time_total,
+                    seed.len()
+                ));
+            }
+            beta0.slice_mut(s![..seed.len()]).assign(seed);
+        }
         let structural_lower_bounds =
             if likelihood_mode != SurvivalLikelihoodMode::Weibull && p_time_total > 0 {
                 let mut lb = Array1::from_elem(p, f64::NEG_INFINITY);
@@ -6034,7 +6105,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 beta_norm,
                 survival_likelihood_modename(likelihood_mode),
                 effectivespec,
-                survival_baseline_targetname(baseline_cfg.target),
+                if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
+                    survival_baseline_targetname(SurvivalBaselineTarget::Weibull)
+                } else {
+                    survival_baseline_targetname(baseline_cfg.target)
+                },
                 time_build.basisname,
                 constraint_mode,
                 n,
@@ -6049,12 +6124,31 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
     }
 
+    let fitted_baseline_cfg =
+        if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
+            let time_beta = beta.slice(s![..p_time_total]).to_owned();
+            let (scale, shape) = fitted_weibull_baseline_from_linear_time_beta(&time_beta)
+                .ok_or_else(|| {
+                    "failed to recover fitted Weibull scale/shape from the linear time coefficients"
+                        .to_string()
+                })?;
+            SurvivalBaselineConfig {
+                target: SurvivalBaselineTarget::Weibull,
+                scale: Some(scale),
+                shape: Some(shape),
+                rate: None,
+                makeham: None,
+            }
+        } else {
+            baseline_cfg.clone()
+        };
+
     println!();
     println!(
         "survival config | likelihood={} | time_basis={} | baseline_target={}",
         survival_likelihood_modename(likelihood_mode),
         time_build.basisname,
-        survival_baseline_targetname(baseline_cfg.target)
+        survival_baseline_targetname(fitted_baseline_cfg.target)
     );
 
     progress.advance_workflow(3);
@@ -6101,11 +6195,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survival_event = Some(args.event);
         payload.survivalspec = Some(effectivespec);
         payload.survival_baseline_target =
-            Some(survival_baseline_targetname(baseline_cfg.target).to_string());
-        payload.survival_baseline_scale = baseline_cfg.scale;
-        payload.survival_baseline_shape = baseline_cfg.shape;
-        payload.survival_baseline_rate = baseline_cfg.rate;
-        payload.survival_baseline_makeham = baseline_cfg.makeham;
+            Some(survival_baseline_targetname(fitted_baseline_cfg.target).to_string());
+        payload.survival_baseline_scale = fitted_baseline_cfg.scale;
+        payload.survival_baseline_shape = fitted_baseline_cfg.shape;
+        payload.survival_baseline_rate = fitted_baseline_cfg.rate;
+        payload.survival_baseline_makeham = fitted_baseline_cfg.makeham;
         payload.survival_time_basis = Some(time_build.basisname.clone());
         payload.survival_time_degree = time_build.degree;
         payload.survival_time_knots = time_build.knots.clone();
@@ -6394,7 +6488,7 @@ fn run_sample_survival(
             &time_anchor_row,
         )?;
     }
-    let baseline_cfg = survival_baseline_config_from_model(model)?;
+    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
     let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
