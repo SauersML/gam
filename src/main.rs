@@ -8420,7 +8420,8 @@ fn solve_saved_survival_intercept(
         )?;
         Ok((f, f_a, 0.0))
     };
-    let a_init = q * (1.0 + slope * slope).sqrt();
+    let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+    let a_init = q * (1.0 + (scale * slope) * (scale * slope)).sqrt();
     let (root, _) = gam::families::monotone_root::solve_monotone_root(
         eval,
         a_init,

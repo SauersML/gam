@@ -1,26 +1,20 @@
 use crate::probability::normal_cdf;
 
-// ── De-nested cubic transport kernel ─────────────────────────────────
+// De-nested cubic transport kernel.
 //
-// This module implements the **de-nested** flexible-link/score-warp model:
+// This module implements the de-nested flexible-link/score-warp model
 //
-//   η(z) = a + b·z + b·Δ_h(z) + Δ_w(a + b·z)
+//   eta(z) = a + b*z + b*delta_h(z) + delta_w(a + b*z)
 //
-// where Δ_h is the score warp (a cubic-spline deviation of the z-axis) and
-// Δ_w is the link deviation (a cubic-spline deviation of the linear predictor
-// axis).  This is NOT the literal nested composition L(a + b·H(z)); it is
-// an additive-correction model where both deviations enter as perturbations
-// around the affine core a + b·z.
+// where delta_h is the score warp and delta_w is the link deviation.
+// This is not the literal nested composition L(a + b*H(z)); it is an
+// additive-correction model around the affine core a + b*z.
 //
-// On each partition cell, both Δ_h and Δ_w are cubic polynomials, so
-// η is at most a sextic polynomial in z, and q(z) = ½(z² + η²) is at most
-// degree 12.  The integral ∫ exp(-q(z)) dz is not a classical special
-// function but can be evaluated to machine precision via **adaptive
-// holonomic transport**: start from the exactly-known affine anchor
-// (c2=c3=0, where q is a Gaussian and the integral is BVN), then
-// continuously deform to the target sextic using the polynomial moment
-// recurrence.  This is numerically exact but is a transport method,
-// not a literal closed-form special-function call.
+// On each partition cell, both deviations are cubic polynomials, so eta is
+// at most sextic in z and q(z) = 0.5*(z^2 + eta^2) is at most degree 12.
+// The integral of exp(-q(z)) is evaluated by transporting from the affine
+// anchor (c2=c3=0, where q is Gaussian and the integral reduces to BVN)
+// to the target non-affine cell via the polynomial moment recurrence.
 //
 // The partition covers (-∞, +∞) with:
 //   • two semi-infinite affine TAIL cells (outside all deviation support),
@@ -930,8 +924,8 @@ pub fn build_denested_partition_cells_with_tails<FS, FL>(
     b: f64,
     score_breaks: &[f64],
     link_breaks: &[f64],
-    mut score_span_at: FS,
-    mut link_span_at: FL,
+    score_span_at: FS,
+    link_span_at: FL,
 ) -> Result<Vec<DenestedPartitionCell>, String>
 where
     FS: FnMut(f64) -> Result<LocalSpanCubic, String>,
@@ -977,12 +971,12 @@ where
     let left_score_span = score_span_at(left_probe)?;
     let left_link_span = link_span_at(a + b * left_probe)?;
     let left_coeffs = denested_cell_coefficients(left_score_span, left_link_span, a, b);
-    debug_assert!(
-        left_coeffs[2].abs() <= 1e-12 && left_coeffs[3].abs() <= 1e-12,
-        "left tail cell must be affine: c2={:.3e}, c3={:.3e}",
-        left_coeffs[2],
-        left_coeffs[3]
-    );
+    if left_coeffs[2].abs() > 1e-12 || left_coeffs[3].abs() > 1e-12 {
+        return Err(format!(
+            "left tail cell must be affine, got c2={:.3e}, c3={:.3e}",
+            left_coeffs[2], left_coeffs[3]
+        ));
+    }
     out.push(DenestedPartitionCell {
         cell: DenestedCubicCell {
             left: f64::NEG_INFINITY,
@@ -1027,12 +1021,12 @@ where
     let right_score_span = score_span_at(right_probe)?;
     let right_link_span = link_span_at(a + b * right_probe)?;
     let right_coeffs = denested_cell_coefficients(right_score_span, right_link_span, a, b);
-    debug_assert!(
-        right_coeffs[2].abs() <= 1e-12 && right_coeffs[3].abs() <= 1e-12,
-        "right tail cell must be affine: c2={:.3e}, c3={:.3e}",
-        right_coeffs[2],
-        right_coeffs[3]
-    );
+    if right_coeffs[2].abs() > 1e-12 || right_coeffs[3].abs() > 1e-12 {
+        return Err(format!(
+            "right tail cell must be affine, got c2={:.3e}, c3={:.3e}",
+            right_coeffs[2], right_coeffs[3]
+        ));
+    }
     out.push(DenestedPartitionCell {
         cell: DenestedCubicCell {
             left: rightmost,
@@ -3678,7 +3672,10 @@ mod tests {
             -0.4,
             &[],
             &[],
-            |_z| {
+            |z| {
+                if z.is_nan() {
+                    return Err("probe z is NaN".to_string());
+                }
                 Ok(LocalSpanCubic {
                     left: 0.0,
                     right: 1.0,
@@ -3688,7 +3685,10 @@ mod tests {
                     c3: 0.0,
                 })
             },
-            |_u| {
+            |u| {
+                if u.is_nan() {
+                    return Err("probe u is NaN".to_string());
+                }
                 Ok(LocalSpanCubic {
                     left: 0.0,
                     right: 1.0,

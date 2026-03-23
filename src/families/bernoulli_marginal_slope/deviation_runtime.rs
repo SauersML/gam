@@ -595,6 +595,14 @@ impl DeviationRuntime {
         self.right_boundary_value_row.dot(beta)
     }
 
+    pub(crate) fn support_left(&self) -> f64 {
+        self.endpoint_points[0]
+    }
+
+    pub(crate) fn support_right(&self) -> f64 {
+        self.endpoint_points[self.endpoint_points.len() - 1]
+    }
+
     // ── monotonicity enforcement ──
 
     fn support_interval(&self) -> Result<(f64, f64), String> {

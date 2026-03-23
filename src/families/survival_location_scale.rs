@@ -9279,7 +9279,7 @@ mod tests {
         beta_link_wiggle: Option<Array1<f64>>,
     ) -> UnifiedFitResult {
         let lambdas_linkwiggle = beta_link_wiggle.as_ref().map(|_| Array1::zeros(0));
-        let link_wiggle_knots = beta_link_wiggle.as_ref().map(|_| array![-1.0, 0.0, 1.0]);
+        let link_wiggle_knots = beta_link_wiggle.as_ref().map(|_| array![-1.0, 1.0]);
         let link_wiggle_degree = beta_link_wiggle.as_ref().map(|_| 2usize);
         survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
             beta_time,

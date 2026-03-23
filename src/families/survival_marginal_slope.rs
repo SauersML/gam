@@ -1632,7 +1632,7 @@ impl SurvivalMarginalSlopeFamily {
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
             self.evaluate_denested_survival_calibration(a, q, slope, beta_h, beta_w)
         };
-        let a_init = q * (1.0 + slope * slope).sqrt();
+        let a_init = q * rigid_observed_scale(slope, self.probit_frailty_scale());
         super::monotone_root::solve_monotone_root(eval, a_init, "survival intercept", 1e-12, 64, 64)
     }
 
@@ -2632,6 +2632,7 @@ impl SurvivalMarginalSlopeFamily {
             self.weights[row],
             self.event[row],
             self.derivative_guard,
+            self.probit_frailty_scale(),
         )?;
         // Convert stack arrays to ndarray types at the boundary.
         let grad = Array1::from_vec(grad_arr.to_vec());
@@ -3676,14 +3677,11 @@ impl SurvivalMarginalSlopeFamily {
     /// Blockwise exact-Newton for the flexible (score-warp / link-deviation)
     /// model.
     ///
-    /// The flex path has an extended primary space (q0, q1, qd1, g, h?, w?)
-    /// whose pullback into β-space is not yet wired through the
-    /// `add_pullback_primary_hessian` infrastructure that the standard
-    /// RowKernel<4> path uses.  Until that extension lands, the flex path
-    /// assembles block Hessians independently.  This is the one remaining
-    /// place where blockwise and joint Hessians are not structurally
-    /// identical; extending the pullback to the flex primary indices will
-    /// close this gap.
+    /// Builds the **full joint Hessian** including all cross-block terms
+    /// (time-marginal, time-logslope, time-score, time-link, etc.), then
+    /// slices into per-block working sets.  The extended primary space
+    /// (q0, q1, qd1, g, h?, w?) is mapped to beta-space via the full
+    /// Jacobian pullback J^T f_pipi J + Sigma f_pi d^2pi/dbeta^2.
     fn evaluate_blockwise_exact_newton_flexible_dense(
         &self,
         block_states: &[ParameterBlockState],
@@ -3694,52 +3692,15 @@ impl SurvivalMarginalSlopeFamily {
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
-        let p_h = slices.score_warp.as_ref().map_or(0, std::ops::Range::len);
-        let p_w = slices.link_dev.as_ref().map_or(0, std::ops::Range::len);
+        let p_total = slices.total;
 
-        type Acc = (
-            f64,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            Option<Array1<f64>>,
-            Option<Array1<f64>>,
-            Array2<f64>,
-            Array2<f64>,
-            Array2<f64>,
-            Option<Array2<f64>>,
-            Option<Array2<f64>>,
-        );
+        type Acc = (f64, Array1<f64>, Array2<f64>);
 
         let make_acc = || -> Acc {
-            (
-                0.0,
-                Array1::zeros(p_t),
-                Array1::zeros(p_m),
-                Array1::zeros(p_g),
-                (p_h > 0).then(|| Array1::zeros(p_h)),
-                (p_w > 0).then(|| Array1::zeros(p_w)),
-                Array2::zeros((p_t, p_t)),
-                Array2::zeros((p_m, p_m)),
-                Array2::zeros((p_g, p_g)),
-                (p_h > 0).then(|| Array2::zeros((p_h, p_h))),
-                (p_w > 0).then(|| Array2::zeros((p_w, p_w))),
-            )
+            (0.0, Array1::zeros(p_total), Array2::zeros((p_total, p_total)))
         };
 
-        let (
-            ll,
-            grad_time,
-            grad_marginal,
-            grad_logslope,
-            grad_score,
-            grad_link,
-            hess_time,
-            hess_marginal,
-            hess_logslope,
-            hess_score,
-            hess_link,
-        ) = (0..self.n)
+        let (ll, joint_gradient, joint_hessian) = (0..self.n)
             .into_par_iter()
             .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
                 let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
@@ -3752,169 +3713,323 @@ impl SurvivalMarginalSlopeFamily {
                     )?;
                 acc.0 -= row_nll;
 
-                acc.1 -= &(f_pi[primary.q0] * &q_geom.dq0_time
-                    + f_pi[primary.q1] * &q_geom.dq1_time
-                    + f_pi[primary.qd1] * &q_geom.dqd1_time);
-                if p_m > 0 {
-                    acc.2 -= &(f_pi[primary.q0] * &q_geom.dq0_marginal
-                        + f_pi[primary.q1] * &q_geom.dq1_marginal
-                        + f_pi[primary.qd1] * &q_geom.dqd1_marginal);
+                // -- Gradient pullback ------------------------------------
+                let q_indices = [primary.q0, primary.q1, primary.qd1];
+                let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+                let dq_marginal = [
+                    &q_geom.dq0_marginal,
+                    &q_geom.dq1_marginal,
+                    &q_geom.dqd1_marginal,
+                ];
+
+                for (ui, &qi) in q_indices.iter().enumerate() {
+                    for a in 0..p_t {
+                        acc.1[slices.time.start + a] -= f_pi[qi] * dq_time[ui][a];
+                    }
+                }
+                for (ui, &qi) in q_indices.iter().enumerate() {
+                    for a in 0..p_m {
+                        acc.1[slices.marginal.start + a] -= f_pi[qi] * dq_marginal[ui][a];
+                    }
                 }
                 self.logslope_design
-                    .axpy_row_into(row, -f_pi[primary.g], &mut acc.3.view_mut())
-                    .expect("survival logslope block axpy should match block dimensions");
-
-                if let (Some(range), Some(grad)) = (primary.h.as_ref(), acc.4.as_mut()) {
-                    for local in 0..range.len() {
-                        grad[local] -= f_pi[range.start + local];
+                    .axpy_row_into(
+                        row,
+                        -f_pi[primary.g],
+                        &mut acc.1.slice_mut(s![slices.logslope.clone()]),
+                    )
+                    .expect("survival logslope block axpy");
+                if let Some(range_h) = primary.h.as_ref() {
+                    if let Some(block_h) = slices.score_warp.as_ref() {
+                        for local in 0..range_h.len() {
+                            acc.1[block_h.start + local] -= f_pi[range_h.start + local];
+                        }
                     }
                 }
-                if let (Some(range), Some(grad)) = (primary.w.as_ref(), acc.5.as_mut()) {
-                    for local in 0..range.len() {
-                        grad[local] -= f_pi[range.start + local];
+                if let Some(range_w) = primary.w.as_ref() {
+                    if let Some(block_w) = slices.link_dev.as_ref() {
+                        for local in 0..range_w.len() {
+                            acc.1[block_w.start + local] -= f_pi[range_w.start + local];
+                        }
                     }
                 }
 
+                // -- Hessian pullback: J^T f_pipi J + f_pi d^2pi/dbeta^2 -
+
+                let d2q_time_time = [
+                    &q_geom.d2q0_time_time,
+                    &q_geom.d2q1_time_time,
+                    &q_geom.d2qd1_time_time,
+                ];
+                let d2q_marginal_marginal = [
+                    &q_geom.d2q0_marginal_marginal,
+                    &q_geom.d2q1_marginal_marginal,
+                    &q_geom.d2qd1_marginal_marginal,
+                ];
+                let d2q_time_marginal = [
+                    &q_geom.d2q0_time_marginal,
+                    &q_geom.d2q1_time_marginal,
+                    &q_geom.d2qd1_time_marginal,
+                ];
+
+                // time-time block
                 for a in 0..p_t {
                     for b in 0..p_t {
-                        acc.6[[a, b]] += f_pipi[[primary.q0, primary.q0]]
-                            * q_geom.dq0_time[a]
-                            * q_geom.dq0_time[b]
-                            + f_pipi[[primary.q0, primary.q1]]
-                                * q_geom.dq0_time[a]
-                                * q_geom.dq1_time[b]
-                            + f_pipi[[primary.q0, primary.qd1]]
-                                * q_geom.dq0_time[a]
-                                * q_geom.dqd1_time[b]
-                            + f_pipi[[primary.q1, primary.q0]]
-                                * q_geom.dq1_time[a]
-                                * q_geom.dq0_time[b]
-                            + f_pipi[[primary.q1, primary.q1]]
-                                * q_geom.dq1_time[a]
-                                * q_geom.dq1_time[b]
-                            + f_pipi[[primary.q1, primary.qd1]]
-                                * q_geom.dq1_time[a]
-                                * q_geom.dqd1_time[b]
-                            + f_pipi[[primary.qd1, primary.q0]]
-                                * q_geom.dqd1_time[a]
-                                * q_geom.dq0_time[b]
-                            + f_pipi[[primary.qd1, primary.q1]]
-                                * q_geom.dqd1_time[a]
-                                * q_geom.dq1_time[b]
-                            + f_pipi[[primary.qd1, primary.qd1]]
-                                * q_geom.dqd1_time[a]
-                                * q_geom.dqd1_time[b]
-                            + f_pi[primary.q0] * q_geom.d2q0_time_time[[a, b]]
-                            + f_pi[primary.q1] * q_geom.d2q1_time_time[[a, b]]
-                            + f_pi[primary.qd1] * q_geom.d2qd1_time_time[[a, b]];
+                        let mut val = 0.0;
+                        for (ui, &qu) in q_indices.iter().enumerate() {
+                            for (vi, &qv) in q_indices.iter().enumerate() {
+                                val += f_pipi[[qu, qv]] * dq_time[ui][a] * dq_time[vi][b];
+                            }
+                            val += f_pi[qu] * d2q_time_time[ui][[a, b]];
+                        }
+                        acc.2[[slices.time.start + a, slices.time.start + b]] += val;
                     }
                 }
+
+                // marginal-marginal block
                 for a in 0..p_m {
                     for b in 0..p_m {
-                        acc.7[[a, b]] += f_pipi[[primary.q0, primary.q0]]
-                            * q_geom.dq0_marginal[a]
-                            * q_geom.dq0_marginal[b]
-                            + f_pipi[[primary.q0, primary.q1]]
-                                * q_geom.dq0_marginal[a]
-                                * q_geom.dq1_marginal[b]
-                            + f_pipi[[primary.q0, primary.qd1]]
-                                * q_geom.dq0_marginal[a]
-                                * q_geom.dqd1_marginal[b]
-                            + f_pipi[[primary.q1, primary.q0]]
-                                * q_geom.dq1_marginal[a]
-                                * q_geom.dq0_marginal[b]
-                            + f_pipi[[primary.q1, primary.q1]]
-                                * q_geom.dq1_marginal[a]
-                                * q_geom.dq1_marginal[b]
-                            + f_pipi[[primary.q1, primary.qd1]]
-                                * q_geom.dq1_marginal[a]
-                                * q_geom.dqd1_marginal[b]
-                            + f_pipi[[primary.qd1, primary.q0]]
-                                * q_geom.dqd1_marginal[a]
-                                * q_geom.dq0_marginal[b]
-                            + f_pipi[[primary.qd1, primary.q1]]
-                                * q_geom.dqd1_marginal[a]
-                                * q_geom.dq1_marginal[b]
-                            + f_pipi[[primary.qd1, primary.qd1]]
-                                * q_geom.dqd1_marginal[a]
-                                * q_geom.dqd1_marginal[b]
-                            + f_pi[primary.q0] * q_geom.d2q0_marginal_marginal[[a, b]]
-                            + f_pi[primary.q1] * q_geom.d2q1_marginal_marginal[[a, b]]
-                            + f_pi[primary.qd1] * q_geom.d2qd1_marginal_marginal[[a, b]];
+                        let mut val = 0.0;
+                        for (ui, &qu) in q_indices.iter().enumerate() {
+                            for (vi, &qv) in q_indices.iter().enumerate() {
+                                val += f_pipi[[qu, qv]] * dq_marginal[ui][a] * dq_marginal[vi][b];
+                            }
+                            val += f_pi[qu] * d2q_marginal_marginal[ui][[a, b]];
+                        }
+                        acc.2[[slices.marginal.start + a, slices.marginal.start + b]] += val;
                     }
                 }
-                self.logslope_design
-                    .syr_row_into(row, f_pipi[[primary.g, primary.g]], &mut acc.8)
-                    .expect("survival logslope block syr should match block dimensions");
 
-                if let (Some(range), Some(hess)) = (primary.h.as_ref(), acc.9.as_mut()) {
-                    for a in 0..range.len() {
-                        for b in 0..range.len() {
-                            hess[[a, b]] += f_pipi[[range.start + a, range.start + b]];
+                // logslope-logslope block
+                self.logslope_design
+                    .syr_row_into_view(
+                        row,
+                        f_pipi[[primary.g, primary.g]],
+                        acc.2.slice_mut(s![
+                            slices.logslope.clone(),
+                            slices.logslope.clone()
+                        ]),
+                    )
+                    .expect("survival logslope block syr");
+
+                // score-score block
+                if let (Some(range_h), Some(block_h)) =
+                    (primary.h.as_ref(), slices.score_warp.as_ref())
+                {
+                    for a in 0..range_h.len() {
+                        for b in 0..range_h.len() {
+                            acc.2[[block_h.start + a, block_h.start + b]] +=
+                                f_pipi[[range_h.start + a, range_h.start + b]];
                         }
                     }
                 }
-                if let (Some(range), Some(hess)) = (primary.w.as_ref(), acc.10.as_mut()) {
-                    for a in 0..range.len() {
-                        for b in 0..range.len() {
-                            hess[[a, b]] += f_pipi[[range.start + a, range.start + b]];
+
+                // link-link block
+                if let (Some(range_w), Some(block_w)) =
+                    (primary.w.as_ref(), slices.link_dev.as_ref())
+                {
+                    for a in 0..range_w.len() {
+                        for b in 0..range_w.len() {
+                            acc.2[[block_w.start + a, block_w.start + b]] +=
+                                f_pipi[[range_w.start + a, range_w.start + b]];
                         }
                     }
                 }
+
+                // -- Cross-block terms ------------------------------------
+
+                // time-marginal cross
+                for a in 0..p_t {
+                    for b in 0..p_m {
+                        let mut val = 0.0;
+                        for (ui, &qu) in q_indices.iter().enumerate() {
+                            for (vi, &qv) in q_indices.iter().enumerate() {
+                                val += f_pipi[[qu, qv]] * dq_time[ui][a] * dq_marginal[vi][b];
+                            }
+                            val += f_pi[qu] * d2q_time_marginal[ui][[a, b]];
+                        }
+                        acc.2[[slices.time.start + a, slices.marginal.start + b]] += val;
+                        acc.2[[slices.marginal.start + b, slices.time.start + a]] += val;
+                    }
+                }
+
+                // time-logslope cross
+                {
+                    let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
+                    let logslope_row = logslope_chunk.row(0);
+                    for a in 0..p_t {
+                        let mut weight = 0.0;
+                        for (ui, &qu) in q_indices.iter().enumerate() {
+                            weight += f_pipi[[qu, primary.g]] * dq_time[ui][a];
+                        }
+                        for b in 0..p_g {
+                            let val = weight * logslope_row[b];
+                            acc.2[[slices.time.start + a, slices.logslope.start + b]] += val;
+                            acc.2[[slices.logslope.start + b, slices.time.start + a]] += val;
+                        }
+                    }
+
+                    // marginal-logslope cross
+                    for a in 0..p_m {
+                        let mut weight = 0.0;
+                        for (ui, &qu) in q_indices.iter().enumerate() {
+                            weight += f_pipi[[qu, primary.g]] * dq_marginal[ui][a];
+                        }
+                        for b in 0..p_g {
+                            let val = weight * logslope_row[b];
+                            acc.2[[slices.marginal.start + a, slices.logslope.start + b]] += val;
+                            acc.2[[slices.logslope.start + b, slices.marginal.start + a]] += val;
+                        }
+                    }
+                }
+
+                // time-score cross
+                if let (Some(range_h), Some(block_h)) =
+                    (primary.h.as_ref(), slices.score_warp.as_ref())
+                {
+                    for a in 0..p_t {
+                        for local in 0..range_h.len() {
+                            let mut val = 0.0;
+                            for (ui, &qu) in q_indices.iter().enumerate() {
+                                val += f_pipi[[qu, range_h.start + local]] * dq_time[ui][a];
+                            }
+                            acc.2[[slices.time.start + a, block_h.start + local]] += val;
+                            acc.2[[block_h.start + local, slices.time.start + a]] += val;
+                        }
+                    }
+                }
+
+                // time-link cross
+                if let (Some(range_w), Some(block_w)) =
+                    (primary.w.as_ref(), slices.link_dev.as_ref())
+                {
+                    for a in 0..p_t {
+                        for local in 0..range_w.len() {
+                            let mut val = 0.0;
+                            for (ui, &qu) in q_indices.iter().enumerate() {
+                                val += f_pipi[[qu, range_w.start + local]] * dq_time[ui][a];
+                            }
+                            acc.2[[slices.time.start + a, block_w.start + local]] += val;
+                            acc.2[[block_w.start + local, slices.time.start + a]] += val;
+                        }
+                    }
+                }
+
+                // marginal-score cross
+                if let (Some(range_h), Some(block_h)) =
+                    (primary.h.as_ref(), slices.score_warp.as_ref())
+                {
+                    for a in 0..p_m {
+                        for local in 0..range_h.len() {
+                            let mut val = 0.0;
+                            for (ui, &qu) in q_indices.iter().enumerate() {
+                                val += f_pipi[[qu, range_h.start + local]] * dq_marginal[ui][a];
+                            }
+                            acc.2[[slices.marginal.start + a, block_h.start + local]] += val;
+                            acc.2[[block_h.start + local, slices.marginal.start + a]] += val;
+                        }
+                    }
+                }
+
+                // marginal-link cross
+                if let (Some(range_w), Some(block_w)) =
+                    (primary.w.as_ref(), slices.link_dev.as_ref())
+                {
+                    for a in 0..p_m {
+                        for local in 0..range_w.len() {
+                            let mut val = 0.0;
+                            for (ui, &qu) in q_indices.iter().enumerate() {
+                                val += f_pipi[[qu, range_w.start + local]] * dq_marginal[ui][a];
+                            }
+                            acc.2[[slices.marginal.start + a, block_w.start + local]] += val;
+                            acc.2[[block_w.start + local, slices.marginal.start + a]] += val;
+                        }
+                    }
+                }
+
+                // logslope-score cross
+                if let (Some(range_h), Some(block_h)) =
+                    (primary.h.as_ref(), slices.score_warp.as_ref())
+                {
+                    let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
+                    let logslope_row = logslope_chunk.row(0);
+                    for local in 0..range_h.len() {
+                        let weight = f_pipi[[primary.g, range_h.start + local]];
+                        for b in 0..p_g {
+                            let val = weight * logslope_row[b];
+                            acc.2[[slices.logslope.start + b, block_h.start + local]] += val;
+                            acc.2[[block_h.start + local, slices.logslope.start + b]] += val;
+                        }
+                    }
+                }
+
+                // logslope-link cross
+                if let (Some(range_w), Some(block_w)) =
+                    (primary.w.as_ref(), slices.link_dev.as_ref())
+                {
+                    let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
+                    let logslope_row = logslope_chunk.row(0);
+                    for local in 0..range_w.len() {
+                        let weight = f_pipi[[primary.g, range_w.start + local]];
+                        for b in 0..p_g {
+                            let val = weight * logslope_row[b];
+                            acc.2[[slices.logslope.start + b, block_w.start + local]] += val;
+                            acc.2[[block_w.start + local, slices.logslope.start + b]] += val;
+                        }
+                    }
+                }
+
+                // score-link cross
+                if let (Some(range_h), Some(block_h), Some(range_w), Some(block_w)) = (
+                    primary.h.as_ref(),
+                    slices.score_warp.as_ref(),
+                    primary.w.as_ref(),
+                    slices.link_dev.as_ref(),
+                ) {
+                    for a in 0..range_h.len() {
+                        for b in 0..range_w.len() {
+                            let val = f_pipi[[range_h.start + a, range_w.start + b]];
+                            acc.2[[block_h.start + a, block_w.start + b]] += val;
+                            acc.2[[block_w.start + b, block_h.start + a]] += val;
+                        }
+                    }
+                }
+
                 Ok(acc)
             })
             .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
                 a.0 += b.0;
                 a.1 += &b.1;
                 a.2 += &b.2;
-                a.3 += &b.3;
-                if let (Some(lhs), Some(rhs)) = (a.4.as_mut(), b.4.as_ref()) {
-                    *lhs += rhs;
-                }
-                if let (Some(lhs), Some(rhs)) = (a.5.as_mut(), b.5.as_ref()) {
-                    *lhs += rhs;
-                }
-                a.6 += &b.6;
-                a.7 += &b.7;
-                a.8 += &b.8;
-                if let (Some(lhs), Some(rhs)) = (a.9.as_mut(), b.9.as_ref()) {
-                    *lhs += rhs;
-                }
-                if let (Some(lhs), Some(rhs)) = (a.10.as_mut(), b.10.as_ref()) {
-                    *lhs += rhs;
-                }
                 Ok(a)
             })?;
 
-        let mut blockworking_sets = vec![
-            BlockWorkingSet::ExactNewton {
-                gradient: grad_time,
-                hessian: SymmetricMatrix::Dense(hess_time),
-            },
-            BlockWorkingSet::ExactNewton {
-                gradient: grad_marginal,
-                hessian: SymmetricMatrix::Dense(hess_marginal),
-            },
-            BlockWorkingSet::ExactNewton {
-                gradient: grad_logslope,
-                hessian: SymmetricMatrix::Dense(hess_logslope),
-            },
+        // Slice the full joint Hessian into per-block working sets.
+        let mut block_gradients = vec![
+            joint_gradient.slice(s![slices.time.clone()]).to_owned(),
+            joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
+            joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
         ];
-        if let (Some(gradient), Some(hessian)) = (grad_score, hess_score) {
-            blockworking_sets.push(BlockWorkingSet::ExactNewton {
-                gradient,
-                hessian: SymmetricMatrix::Dense(hessian),
-            });
+        let mut block_ranges = vec![
+            slices.time.clone(),
+            slices.marginal.clone(),
+            slices.logslope.clone(),
+        ];
+        if let Some(range) = slices.score_warp.clone() {
+            block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
+            block_ranges.push(range);
         }
-        if let (Some(gradient), Some(hessian)) = (grad_link, hess_link) {
-            blockworking_sets.push(BlockWorkingSet::ExactNewton {
-                gradient,
-                hessian: SymmetricMatrix::Dense(hessian),
-            });
+        if let Some(range) = slices.link_dev.clone() {
+            block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
+            block_ranges.push(range);
         }
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets,
+            blockworking_sets: slice_joint_into_block_working_sets(
+                block_gradients,
+                &joint_hessian,
+                &block_ranges,
+            ),
         })
     }
 
@@ -4744,6 +4859,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 self.weights[i],
                 self.event[i],
                 guard,
+                self.probit_frailty_scale(),
             )?;
             ll -= nll;
         }
@@ -5362,6 +5478,7 @@ fn pooled_survival_baseline(
     q0: &Array1<f64>,
     q1: &Array1<f64>,
     qd1: &Array1<f64>,
+    probit_scale: f64,
 ) -> f64 {
     let n = event.len();
     if n == 0 {
@@ -5373,7 +5490,15 @@ fn pooled_survival_baseline(
         let mut hess = 0.0;
         for i in 0..n {
             let (row_obj, row_grad, row_hess) = row_primary_closed_form(
-                q0[i], q1[i], qd1[i], slope, z[i], weights[i], event[i], 0.0,
+                q0[i],
+                q1[i],
+                qd1[i],
+                slope,
+                z[i],
+                weights[i],
+                event[i],
+                0.0,
+                probit_scale,
             )
             .ok()?;
             obj += row_obj;
@@ -5502,6 +5627,7 @@ pub fn fit_survival_marginal_slope_terms(
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
     validate_spec(&spec)?;
     let n = spec.age_entry.len();
+    let probit_scale = probit_frailty_scale(fixed_gaussian_shift_sigma(&spec.frailty));
     let baseline_slope = pooled_survival_baseline(
         &spec.event_target,
         &spec.weights,
@@ -5509,6 +5635,7 @@ pub fn fit_survival_marginal_slope_terms(
         &spec.time_block.offset_entry,
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
+        probit_scale,
     );
 
     let marginal_design =
@@ -5533,9 +5660,9 @@ pub fn fit_survival_marginal_slope_terms(
         .as_ref()
         .map(|cfg| {
             let q0_seed = Array1::from_iter((0..n).map(|row| {
-                spec.time_block.offset_exit[row]
-                    + spec.marginal_offset[row]
-                    + spec.z[row] * (baseline_slope + spec.logslope_offset[row])
+                let q_exit = spec.time_block.offset_exit[row] + spec.marginal_offset[row];
+                let slope = baseline_slope + spec.logslope_offset[row];
+                rigid_observed_eta(q_exit, slope, spec.z[row], probit_scale)
             }));
             build_deviation_block_from_seed(&q0_seed, cfg)
         })
@@ -6063,6 +6190,7 @@ mod tests {
             family.weights[0],
             family.event[0],
             family.derivative_guard,
+            family.probit_frailty_scale(),
         )
         .expect("rigid row");
 
@@ -6141,6 +6269,7 @@ mod tests {
             family.weights[0],
             family.event[0],
             family.derivative_guard,
+            family.probit_frailty_scale(),
         )
         .expect("rigid row");
 
