@@ -403,6 +403,7 @@ struct SurvivalArgs {
     weights_column: Option<String>,
     offset_column: Option<String>,
     noise_offset_column: Option<String>,
+    latent_sd: Option<f64>,
 }
 
 #[derive(Args, Debug)]
@@ -649,6 +650,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             weights_column: args.weights_column.clone(),
             offset_column: args.offset_column.clone(),
             noise_offset_column: args.noise_offset_column.clone(),
+            latent_sd: args.latent_sd,
         };
         return run_survival(surv_args);
     }
@@ -982,11 +984,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     };
     let latent_cloglog_state = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
         Some(
-            gam::types::LatentCLogLogState::new(
-                args.latent_sd.ok_or_else(|| {
-                    "--latent-sd is required for --family latent-cloglog-binomial".to_string()
-                })?,
-            )
+            gam::types::LatentCLogLogState::new(args.latent_sd.ok_or_else(|| {
+                "--latent-sd is required for --family latent-cloglog-binomial".to_string()
+            })?)
             .expect("invalid latent_sd for latent-cloglog-binomial"),
         )
     } else {
@@ -1177,11 +1177,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if let Some(out) = args.out {
         progress.set_stage("fit", "writing fitted model");
         let latent_cloglog_state = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
-            Some(
-                saved_latent_cloglog_state_from_fit(&saved_fit).expect(
-                    "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
-                ),
-            )
+            Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
+                "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
+            ))
         } else {
             saved_latent_cloglog_state_from_fit(&saved_fit)
         };
@@ -2894,7 +2892,8 @@ fn run_predict_survival(
     }
 
     if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-        let gaussian_frailty_sd = fixed_gaussian_shift_sigma_from_saved_family(&model.family_state)?;
+        let gaussian_frailty_sd =
+            fixed_gaussian_shift_sigma_from_saved_family(&model.family_state)?;
         let has_saved_timewiggle = model.baseline_timewiggle_knots.is_some()
             || model.baseline_timewiggle_degree.is_some()
             || model.baseline_timewiggle_penalty_orders.is_some()
@@ -3062,7 +3061,9 @@ fn run_predict_survival(
             + noise_offset;
         let (eta, deterministic_mean) = if has_saved_deviations {
             predict_saved_survival_marginal_slope_flex_exit(
-                &q_exit, &slope, &z,
+                &q_exit,
+                &slope,
+                &z,
                 gaussian_frailty_sd,
                 beta_score.as_ref().map(|(runtime, _)| *runtime),
                 beta_score.as_ref().map(|(_, beta)| *beta),
@@ -3126,8 +3127,8 @@ fn run_predict_survival(
                     let mut dst = jac.slice_mut(s![.., p_t + p_m..]);
                     dst.assign(&x_s);
                     for i in 0..cs {
-                        let gi =
-                            scale * (q_exit[start + i] * slope[start + i] / c[start + i] + z[start + i]);
+                        let gi = scale
+                            * (q_exit[start + i] * slope[start + i] / c[start + i] + z[start + i]);
                         dst.row_mut(i).mapv_inplace(|v| v * gi);
                     }
                 }
@@ -5157,9 +5158,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
     if likelihood_mode == SurvivalLikelihoodMode::Latent {
         if parsed.linkspec.is_some() {
-            return Err(
-                "link(...) is not implemented for the survival latent family".to_string(),
-            );
+            return Err("link(...) is not implemented for the survival latent family".to_string());
         }
         let latent_sd = args.latent_sd.ok_or_else(|| {
             "--latent-sd is required with --survival-likelihood latent".to_string()
@@ -5205,8 +5204,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             });
         }
 
-        let frailty = gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+        let frailty = gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
             sigma_fixed: Some(latent_sd),
+            loading: gam::families::lognormal_kernel::HazardLoading::Full,
         };
         let options = gam::families::custom_family::BlockwiseFitOptions {
             compute_covariance: true,
@@ -5251,7 +5251,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
-                    survival_distribution: Some("probit".to_string()),
+                    survival_distribution: None,
                     frailty,
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
@@ -5817,6 +5817,9 @@ fn run_sample_survival(
             .as_deref()
             .unwrap_or("transformation"),
     )?;
+    if saved_likelihood_mode == SurvivalLikelihoodMode::Latent {
+        return Err("saved latent-survival prediction is not implemented".to_string());
+    }
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         return Err(
             "sample for survival-likelihood=location-scale is not implemented yet".to_string(),
@@ -7979,15 +7982,16 @@ fn fixed_gaussian_shift_sigma_from_saved_family(
         Some(gam::families::lognormal_kernel::FrailtySpec::None) => Ok(None),
         Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
             sigma_fixed: Some(sigma),
-        }) => Ok(Some(sigma)),
-        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
-            sigma_fixed: None,
-        }) => Err(
-            "saved probit marginal-slope model requires a fixed GaussianShift sigma".to_string(),
-        ),
-        Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. }) => Err(
-            "saved probit marginal-slope model cannot use HazardMultiplier frailty".to_string(),
-        ),
+        }) => Ok(Some(*sigma)),
+        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None }) => {
+            Err(
+                "saved probit marginal-slope model requires a fixed GaussianShift sigma"
+                    .to_string(),
+            )
+        }
+        Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. }) => {
+            Err("saved probit marginal-slope model cannot use HazardMultiplier frailty".to_string())
+        }
     }
 }
 
@@ -8869,6 +8873,7 @@ fn family_from_arg(arg: FamilyArg) -> Option<LikelihoodFamily> {
         FamilyArg::BinomialLogit => Some(LikelihoodFamily::BinomialLogit),
         FamilyArg::BinomialProbit => Some(LikelihoodFamily::BinomialProbit),
         FamilyArg::BinomialCloglog => Some(LikelihoodFamily::BinomialCLogLog),
+        FamilyArg::LatentCloglogBinomial => Some(LikelihoodFamily::BinomialLatentCLogLog),
         FamilyArg::PoissonLog => Some(LikelihoodFamily::PoissonLog),
         FamilyArg::GammaLog => Some(LikelihoodFamily::GammaLog),
         FamilyArg::RoystonParmar => Some(LikelihoodFamily::RoystonParmar),
@@ -12058,6 +12063,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         let cfg = parse_survival_time_basis_config(
             &args.time_basis,
@@ -12107,6 +12113,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         let err = parse_survival_time_basis_config(
             &args.time_basis,
@@ -12683,6 +12690,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("sas".to_string());
         args.sas_init = Some("0.15,-0.70".to_string());
@@ -12734,6 +12742,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("sas".to_string());
         args.beta_logistic_init = Some("0.1,0.2".to_string());
@@ -12779,6 +12788,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("logit".to_string());
         args.sas_init = Some("0.1,0.2".to_string());
@@ -12824,6 +12834,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("beta-logistic".to_string());
         args.beta_logistic_init = Some("0.25,0.80".to_string());
@@ -12875,6 +12886,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("beta-logistic".to_string());
         args.sas_init = Some("0.1,0.2".to_string());
@@ -12920,6 +12932,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("logit".to_string());
         args.beta_logistic_init = Some("0.1,0.2".to_string());
@@ -12965,6 +12978,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         let link = parse_survival_inverse_link(&args).expect("loglog survival link");
         match link {
@@ -13038,6 +13052,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("flexible(logit)".to_string());
         let link = parse_survival_inverse_link(&args).expect("flexible survival link");
@@ -13082,6 +13097,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("flexible(blended(logit,probit))".to_string());
         args.mixture_rho = Some("0.2".to_string());
@@ -13128,6 +13144,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         args.link = Some("bogus".to_string());
         let err =
@@ -13521,6 +13538,7 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            latent_sd: None,
         };
         let result = super::run_survival(args);
         assert!(

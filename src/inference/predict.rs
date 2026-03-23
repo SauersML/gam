@@ -1511,8 +1511,8 @@ impl BernoulliMarginalSlopePredictor {
         } else {
             Array1::zeros(n)
         };
-        let final_eta = (&eta_base + &(&logslope_eta * &score_dev_obs) + &link_dev_obs)
-            .mapv(|v| scale * v);
+        let final_eta =
+            (&eta_base + &(&logslope_eta * &score_dev_obs) + &link_dev_obs).mapv(|v| scale * v);
 
         if !need_gradient {
             return Ok((final_eta, None));
@@ -3685,8 +3685,16 @@ mod tests {
                 assert!((cubic.evaluate(x) - expected[i]).abs() < 1e-10);
                 assert!((cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10);
                 let selected = runtime.local_cubic_at(&beta, x).expect("local cubic at x");
-                assert_eq!(selected.left, cubic.left);
-                assert_eq!(selected.right, cubic.right);
+                let expected_span_idx = if i + 1 == x_eval.len() && span_idx + 1 < n_spans {
+                    span_idx + 1
+                } else {
+                    span_idx
+                };
+                let expected_cubic = runtime
+                    .local_cubic_on_span(&beta, expected_span_idx)
+                    .expect("expected local cubic on span");
+                assert_eq!(selected.left, expected_cubic.left);
+                assert_eq!(selected.right, expected_cubic.right);
             }
         }
     }
@@ -3712,8 +3720,12 @@ mod tests {
             assert!((cubic.evaluate(x) - design[[i, 1]]).abs() < 1e-10);
             assert!((cubic.first_derivative(x) - d1[[i, 1]]).abs() < 1e-10);
             let selected = runtime.basis_cubic_at(1, x).expect("basis cubic at x");
-            assert_eq!(selected.left, cubic.left);
-            assert_eq!(selected.right, cubic.right);
+            let expected_span_idx = if i + 1 == x_eval.len() { 1 } else { 0 };
+            let expected_cubic = runtime
+                .basis_span_cubic(expected_span_idx, 1)
+                .expect("expected basis span cubic");
+            assert_eq!(selected.left, expected_cubic.left);
+            assert_eq!(selected.right, expected_cubic.right);
         }
     }
 

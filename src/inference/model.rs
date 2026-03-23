@@ -14,9 +14,10 @@ use crate::inference::predict::{
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
+use crate::span::span_index_for_breakpoints;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState,
-    SasLinkSpec, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec,
+    SasLinkState,
 };
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -581,28 +582,8 @@ impl SavedAnchoredDeviationRuntime {
     }
 
     pub fn span_index_for(&self, value: f64) -> Result<usize, String> {
-        if !value.is_finite() {
-            return Err(format!(
-                "saved anchored deviation span lookup requires finite value, got {value}"
-            ));
-        }
         let points = self.breakpoints()?;
-        let n = points.len() - 1;
-        if value <= points[0] {
-            return Ok(0);
-        }
-        if value >= points[n] {
-            return Ok(n - 1);
-        }
-        for idx in 0..n {
-            if value >= points[idx] && value <= points[idx + 1] {
-                return Ok(idx);
-            }
-        }
-        Err(format!(
-            "saved anchored deviation span lookup failed for value {value}; support is [{:.6}, {:.6}]",
-            points[0], points[n]
-        ))
+        span_index_for_breakpoints(&points, value, "saved anchored deviation span lookup")
     }
 
     pub fn local_cubic_on_span(
@@ -1398,7 +1379,10 @@ impl FittedModel {
                 );
             }
             match self.family_state.frailty() {
-                Some(FrailtySpec::None) | Some(FrailtySpec::GaussianShift { sigma_fixed: Some(_) }) => {}
+                Some(FrailtySpec::None)
+                | Some(FrailtySpec::GaussianShift {
+                    sigma_fixed: Some(_),
+                }) => {}
                 Some(FrailtySpec::GaussianShift { sigma_fixed: None }) => {
                     return Err(
                         "marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
@@ -1428,7 +1412,10 @@ impl FittedModel {
         {
             if survival_likelihood.as_deref() == Some("marginal-slope") {
                 match frailty {
-                    FrailtySpec::None | FrailtySpec::GaussianShift { sigma_fixed: Some(_) } => {}
+                    FrailtySpec::None
+                    | FrailtySpec::GaussianShift {
+                        sigma_fixed: Some(_),
+                    } => {}
                     FrailtySpec::GaussianShift { sigma_fixed: None } => {
                         return Err(
                             "survival marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
@@ -1438,6 +1425,35 @@ impl FittedModel {
                     FrailtySpec::HazardMultiplier { .. } => {
                         return Err(
                             "survival marginal-slope model does not support HazardMultiplier frailty"
+                            .to_string(),
+                        );
+                    }
+                }
+            } else if survival_likelihood.as_deref() == Some("latent") {
+                match frailty {
+                    FrailtySpec::HazardMultiplier {
+                        sigma_fixed: Some(_),
+                        loading: crate::families::lognormal_kernel::HazardLoading::Full,
+                    } => {}
+                    FrailtySpec::HazardMultiplier {
+                        sigma_fixed: Some(_),
+                        loading,
+                    } => {
+                        return Err(format!(
+                            "latent survival model requires HazardLoading::Full in family_state.frailty, got {loading:?}"
+                        ));
+                    }
+                    FrailtySpec::HazardMultiplier {
+                        sigma_fixed: None, ..
+                    } => {
+                        return Err(
+                            "latent survival model requires a fixed HazardMultiplier sigma in family_state.frailty"
+                                .to_string(),
+                        );
+                    }
+                    FrailtySpec::GaussianShift { .. } | FrailtySpec::None => {
+                        return Err(
+                            "latent survival model requires a fixed HazardMultiplier frailty specification"
                                 .to_string(),
                         );
                     }
