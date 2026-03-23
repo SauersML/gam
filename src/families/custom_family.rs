@@ -1163,6 +1163,9 @@ pub struct BlockwiseFitOptions {
     ///   -loglik + penalty + 0.5(log|H| - log|S|_+)
     /// where H is blockwise working curvature and S is blockwise penalty.
     pub use_remlobjective: bool,
+    /// If false, the outer smoothing optimizer uses exact gradients but does
+    /// not request an analytic outer Hessian from the family.
+    pub use_outer_hessian: bool,
     /// If false, skip post-fit joint covariance assembly.
     pub compute_covariance: bool,
 }
@@ -1178,6 +1181,7 @@ impl Default for BlockwiseFitOptions {
             ridge_floor: 1e-12,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: true,
+            use_outer_hessian: false,
             compute_covariance: false,
         }
     }
@@ -4342,7 +4346,7 @@ fn solve_quadraticwith_linear_constraints(
         }
     }
     for i in 0..m {
-        if slack[i] <= tol_active && !is_active[i] {
+        if slack[i] < -tol_active && !is_active[i] {
             active.push(i);
             is_active[i] = true;
         }
@@ -4351,9 +4355,11 @@ fn solve_quadraticwith_linear_constraints(
         is_active[idx] = true;
     }
     validate_active_constraint_ids(&active, m)?;
+    prune_active_to_independent(&mut active, &mut is_active, constraints, &x);
 
     let max_iterations = ((p + m + 8) * (active.len().max(1) + 8)).max((p + m + 8) * 8);
     for _ in 0..max_iterations {
+        prune_active_to_independent(&mut active, &mut is_active, constraints, &x);
         let gradient = hessian.dot(&x) - rhs;
         let compressed = compress_active_constraint_set(constraints, &active)?;
         let mut residualw = Array1::<f64>::zeros(compressed.constraints.a.nrows());
@@ -4421,9 +4427,11 @@ fn solve_quadraticwith_linear_constraints(
         {
             active.push(idx);
             is_active[idx] = true;
+            prune_active_to_independent(&mut active, &mut is_active, constraints, &x);
         }
     }
 
+    prune_active_to_independent(&mut active, &mut is_active, constraints, &x);
     let gradient = hessian.dot(&x) - rhs;
     let compressed = compress_active_constraint_set(constraints, &active)?;
     let mut residualw = Array1::<f64>::zeros(compressed.constraints.a.nrows());
@@ -5240,7 +5248,10 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     } else {
         Derivative::FiniteDifference
     };
-    let hessian = if include_exact_newton_logdet_h(family, options) && order.has_hessian() {
+    let hessian = if options.use_outer_hessian
+        && include_exact_newton_logdet_h(family, options)
+        && order.has_hessian()
+    {
         Derivative::Analytic
     } else {
         Derivative::Unavailable
@@ -5314,9 +5325,16 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &spec.nullspace_dims,
                         )
                     } else {
+                        let eval_buffer;
+                        let eval_slice = if let Some(slice) = evals.as_slice() {
+                            slice
+                        } else {
+                            eval_buffer = evals.iter().copied().collect::<Vec<_>>();
+                            &eval_buffer
+                        };
                         let threshold =
                             crate::estimate::reml::unified::positive_eigenvalue_threshold(
-                                evals.as_slice().unwrap(),
+                                eval_slice,
                             );
                         evals.iter().filter(|&&e| e <= threshold).count()
                     };
@@ -6425,7 +6443,7 @@ fn unified_joint_cost_gradient(
 
     let ext_dim = ext_coords.len();
 
-    let result = InnerAssembly {
+    let evaluator = InnerAssembly {
         log_likelihood: inner.log_likelihood,
         penalty_quadratic: inner.penalty_value,
         beta: beta_flat.clone(),
@@ -6450,8 +6468,11 @@ fn unified_joint_cost_gradient(
         ext_coord_pair_fn,
         rho_ext_pair_fn,
         fixed_drift_deriv,
-    }
-    .evaluate(rho.as_slice().unwrap(), eval_mode, None)?;
+    };
+    let rho_slice = rho
+        .as_slice()
+        .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
+    let result = evaluator.evaluate(rho_slice, eval_mode, None)?;
 
     let cost = result.cost;
     let gradient = result
@@ -7603,13 +7624,16 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                 None
             };
 
+        let rho_slice = rho_current
+            .as_slice()
+            .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
         let psi_coords = build_psi_hyper_coords(
             family,
             synced_joint_states.as_ref(),
             specs,
             derivative_blocks,
             &beta_flat,
-            rho_current.as_slice().unwrap(),
+            rho_slice,
             &penalty_counts,
             s_logdet_blocks.as_deref(),
             hessian_beta_independent,
@@ -7623,7 +7647,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                 specs,
                 derivative_blocks,
                 &beta_flat,
-                rho_current.as_slice().unwrap(),
+                rho_slice,
                 &penalty_counts,
                 s_logdet_blocks.as_deref(),
                 psi_workspace.clone(),
@@ -8305,32 +8329,72 @@ fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
     states: &[ParameterBlockState],
     per_block_log_lambdas: &[Array1<f64>],
 ) -> Option<FitGeometry> {
-    let eval = family.evaluate(states).ok()?;
-    if specs.len() != 1 || per_block_log_lambdas.len() != 1 {
+    if specs.len() != per_block_log_lambdas.len() {
         return None;
     }
-    // FitGeometry is a single row-wise working system. Multi-block families
-    // need an explicit blockwise representation instead of a stacked vector.
-    let [
-        BlockWorkingSet::Diagonal {
-            working_response,
-            working_weights,
-        },
-    ] = eval.blockworking_sets.as_slice()
-    else {
-        return None;
-    };
-    let spec = &specs[0];
-    let lambdas = per_block_log_lambdas[0].mapv(f64::exp);
-    let mut h = spec.design.diag_xtw_x(working_weights).ok()?;
-    for (k, s) in spec.penalties.iter().enumerate() {
-        let s_dense = s.as_dense_cow();
-        h.scaled_add(lambdas[k], &*s_dense);
+    if specs.len() == 1 {
+        let eval = family.evaluate(states).ok()?;
+        let [
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            },
+        ] = eval.blockworking_sets.as_slice()
+        else {
+            return None;
+        };
+        let spec = &specs[0];
+        let lambdas = per_block_log_lambdas[0].mapv(f64::exp);
+        let mut h = spec.design.diag_xtw_x(working_weights).ok()?;
+        for (k, s) in spec.penalties.iter().enumerate() {
+            let s_dense = s.as_dense_cow();
+            h.scaled_add(lambdas[k], &*s_dense);
+        }
+        return Some(FitGeometry {
+            penalized_hessian: h,
+            working_weights: working_weights.clone(),
+            working_response: working_response.clone(),
+        });
     }
+
+    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let mut h = exact_newton_joint_hessian_symmetrized(
+        family,
+        states,
+        specs,
+        total_p,
+        "compute_joint_geometry",
+    )
+    .ok()??;
+    let ranges = block_param_ranges(specs);
+    for (block_idx, spec) in specs.iter().enumerate() {
+        let lambdas = per_block_log_lambdas.get(block_idx)?.mapv(f64::exp);
+        if lambdas.len() != spec.penalties.len() {
+            return None;
+        }
+        let (start, end) = ranges[block_idx];
+        let block_dim = end - start;
+        for (penalty_idx, penalty) in spec.penalties.iter().enumerate() {
+            let scale = lambdas[penalty_idx];
+            if scale == 0.0 {
+                continue;
+            }
+            let dense = penalty.as_dense_cow();
+            if dense.nrows() == block_dim && dense.ncols() == block_dim {
+                h.slice_mut(ndarray::s![start..end, start..end])
+                    .scaled_add(scale, &*dense);
+            } else if dense.nrows() == total_p && dense.ncols() == total_p {
+                h.scaled_add(scale, &*dense);
+            } else {
+                return None;
+            }
+        }
+    }
+    let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
     Some(FitGeometry {
         penalized_hessian: h,
-        working_weights: working_weights.clone(),
-        working_response: working_response.clone(),
+        working_weights: Array1::zeros(working_len),
+        working_response: Array1::zeros(working_len),
     })
 }
 
@@ -9415,6 +9479,7 @@ mod tests {
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: false,
             compute_covariance: false,
+            use_outer_hessian: false,
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -9452,6 +9517,7 @@ mod tests {
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: false,
             compute_covariance: false,
+            use_outer_hessian: false,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)

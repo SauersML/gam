@@ -1204,6 +1204,7 @@ fn binomial_location_scalewarm_start(
         ridge_policy: BlockwiseFitOptions::default().ridge_policy,
         use_remlobjective: false,
         compute_covariance: false,
+        use_outer_hessian: false,
     };
     let warm_fit = fit_custom_family(&warm_family, &warm_blocks, &warm_options)?;
     let beta_threshold = warm_fit

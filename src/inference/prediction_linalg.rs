@@ -56,7 +56,7 @@ impl<'a> PredictionCovarianceBackend<'a> {
         }
     }
 
-    pub(crate) fn apply_columns(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+    pub fn apply_columns(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
         if rhs.nrows() != self.nrows() {
             return Err(format!(
                 "prediction covariance backend column mismatch: rhs has {} rows, expected {}",

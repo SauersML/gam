@@ -251,6 +251,19 @@ fn posterior_mean_backend_or_warn<'a>(
     None
 }
 
+fn require_posterior_mean_backend<'a>(
+    fit: &'a UnifiedFitResult,
+    fallback: Option<&'a Array2<f64>>,
+    expected_dim: usize,
+    label: &str,
+) -> Result<PredictionCovarianceBackend<'a>, EstimationError> {
+    posterior_mean_backend_or_warn(fit, fallback, expected_dim, label).ok_or_else(|| {
+        EstimationError::InvalidInput(format!(
+            "{label} requires covariance or penalized Hessian for posterior-mean prediction"
+        ))
+    })
+}
+
 fn project_two_block_linear_predictor_covariance(
     design_first: &DesignMatrix,
     design_second: &DesignMatrix,
@@ -1615,15 +1628,12 @@ impl BernoulliMarginalSlopePredictor {
         fit: &UnifiedFitResult,
     ) -> Result<Array1<f64>, EstimationError> {
         let theta = self.theta();
-        let backend = posterior_mean_backend_or_warn(
+        let backend = require_posterior_mean_backend(
             fit,
             self.covariance.as_ref(),
             theta.len(),
             "bernoulli marginal-slope posterior mean",
-        );
-        let Some(backend) = backend else {
-            return Ok(Array1::zeros(input.design.nrows()));
-        };
+        )?;
         linear_predictor_se_from_backend(&backend, input.design.nrows(), |rows| {
             let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
             let (_, grad) = self
@@ -1793,17 +1803,14 @@ impl GaussianLocationScalePredictor {
         fit: &UnifiedFitResult,
         eta_len: usize,
     ) -> Result<Array1<f64>, EstimationError> {
-        let backend = posterior_mean_backend_or_warn(
+        let backend = require_posterior_mean_backend(
             fit,
             self.covariance.as_ref(),
             self.beta_mu.len()
                 + self.beta_noise.len()
                 + self.link_wiggle.as_ref().map_or(0, |w| w.beta.len()),
             "gaussian location-scale posterior mean",
-        );
-        let Some(backend) = backend else {
-            return Ok(Array1::zeros(eta_len));
-        };
+        )?;
         let p_mu = self.beta_mu.len();
         let p_sigma = self.beta_noise.len();
         let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
@@ -2176,119 +2183,103 @@ impl PredictableModel for BinomialLocationScalePredictor {
             .as_ref()
             .map_or_else(|| Array1::zeros(design_noise.nrows()), |o| o.clone());
         let eta_s = design_noise.dot(&self.beta_noise) + &offset_noise;
-        let (eta, point_prob) = self.apply_link(&q0_base)?;
+        let (eta, _point_prob) = self.apply_link(&q0_base)?;
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_noise.len();
         let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
         let p_total = p_t + p_s + p_w;
-        let backend = posterior_mean_backend_or_warn(
+        let backend = require_posterior_mean_backend(
             fit,
             self.covariance.as_ref(),
             p_total,
             "binomial location-scale posterior mean",
-        );
+        )?;
 
-        let eta_se = if let Some(backend_ref) = backend.as_ref() {
-            linear_predictor_se_from_backend(backend_ref, eta_t.len(), |rows| {
-                let x_t = design_row_chunk(&input.design, rows.clone())?;
-                let x_s = design_row_chunk(design_noise, rows.clone())?;
-                let eta_chunk = eta.slice(ndarray::s![rows.clone()]).to_owned();
-                let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
-                let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]).to_owned();
-                let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]).to_owned();
-                let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
-                    Some(runtime.design(&q0_chunk)?)
-                } else {
-                    None
-                };
-                let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
-                    runtime.derivative_q0(&q0_chunk)?
-                } else {
-                    Array1::ones(q0_chunk.len())
-                };
-                let rows_in_chunk = q0_chunk.len();
-                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-                for i in 0..rows_in_chunk {
-                    let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                        &self.inverse_link,
-                        eta_chunk[i],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let dphi = jet.d1;
-                    let scale = dq_dq0[i];
-                    let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
-                    let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
-                    for j in 0..p_t {
-                        grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
-                    }
-                    for j in 0..p_s {
-                        grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
-                    }
-                    if let Some(wd) = wiggle_design.as_ref() {
-                        for j in 0..p_w {
-                            grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
-                        }
+        let eta_se = linear_predictor_se_from_backend(&backend, eta_t.len(), |rows| {
+            let x_t = design_row_chunk(&input.design, rows.clone())?;
+            let x_s = design_row_chunk(design_noise, rows.clone())?;
+            let eta_chunk = eta.slice(ndarray::s![rows.clone()]).to_owned();
+            let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
+            let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]).to_owned();
+            let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]).to_owned();
+            let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
+                Some(runtime.design(&q0_chunk)?)
+            } else {
+                None
+            };
+            let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
+                runtime.derivative_q0(&q0_chunk)?
+            } else {
+                Array1::ones(q0_chunk.len())
+            };
+            let rows_in_chunk = q0_chunk.len();
+            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+            for i in 0..rows_in_chunk {
+                let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                    &self.inverse_link,
+                    eta_chunk[i],
+                )
+                .map_err(|e| e.to_string())?;
+                let dphi = jet.d1;
+                let scale = dq_dq0[i];
+                let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
+                let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
+                for j in 0..p_t {
+                    grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
+                }
+                for j in 0..p_s {
+                    grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
+                }
+                if let Some(wd) = wiggle_design.as_ref() {
+                    for j in 0..p_w {
+                        grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
                     }
                 }
-                Ok(vec![grad])
-            })?
-        } else {
-            Array1::zeros(eta_t.len())
-        };
+            }
+            Ok(vec![grad])
+        })?;
 
         let mean = if self.link_wiggle.is_none() {
-            if let Some(backend_ref) = backend.as_ref() {
-                match project_two_block_linear_predictor_covariance(
-                    &input.design,
-                    design_noise,
-                    backend_ref,
-                    p_t,
-                    p_s,
-                    "binomial location-scale posterior mean",
-                ) {
-                    Ok((var_t, var_s, cov_ts)) => {
-                        let quadctx = crate::quadrature::QuadratureContext::new();
-                        Array1::from_vec(
-                        (0..eta_t.len())
-                            .map(|i| {
-                                projected_bivariate_posterior_mean_result(
-                                    &quadctx,
-                                    [eta_t[i], eta_s[i]],
-                                    [
-                                        [var_t[i].max(0.0), cov_ts[i]],
-                                        [cov_ts[i], var_s[i].max(0.0)],
-                                    ],
-                                    |eta_threshold, eta_log_sigma| {
-                                        let q0 = -eta_threshold * (-eta_log_sigma).exp();
-                                        let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                                            &self.inverse_link,
-                                            q0,
-                                        )?;
-                                        Ok(jet.mu.clamp(0.0, 1.0))
-                                    },
-                                )
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "binomial location-scale posterior mean: failed to project covariance into (eta_threshold, eta_log_sigma): {err}; falling back to plug-in point prediction"
-                        );
-                        point_prob.clone()
-                    }
-                }
-            } else {
-                point_prob.clone()
-            }
-        } else if let Some(backend_ref) = backend.as_ref() {
+            let (var_t, var_s, cov_ts) = project_two_block_linear_predictor_covariance(
+                &input.design,
+                design_noise,
+                &backend,
+                p_t,
+                p_s,
+                "binomial location-scale posterior mean",
+            )?;
+            let quadctx = crate::quadrature::QuadratureContext::new();
+            Array1::from_vec(
+                (0..eta_t.len())
+                    .map(|i| {
+                        projected_bivariate_posterior_mean_result(
+                            &quadctx,
+                            [eta_t[i], eta_s[i]],
+                            [
+                                [var_t[i].max(0.0), cov_ts[i]],
+                                [cov_ts[i], var_s[i].max(0.0)],
+                            ],
+                            |eta_threshold, eta_log_sigma| {
+                                let q0 = -eta_threshold * (-eta_log_sigma).exp();
+                                let jet =
+                                    crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                                        &self.inverse_link,
+                                        q0,
+                                    )?;
+                                Ok(jet.mu.clamp(0.0, 1.0))
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
             let runtime = self.link_wiggle.as_ref().expect("checked above");
             let betaw = Array1::from_vec(runtime.beta.clone());
             let mut wiggle_basis_rhs = Array2::<f64>::zeros((p_total, p_w));
             for j in 0..p_w {
                 wiggle_basis_rhs[[p_t + p_s + j, j]] = 1.0;
             }
-            let covww = backend_ref
+            let covww = backend
                 .apply_columns(&wiggle_basis_rhs)
                 .map_err(EstimationError::InvalidInput)?
                 .slice(ndarray::s![p_t + p_s..p_total, ..])
@@ -2312,7 +2303,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                     rhs.slice_mut(ndarray::s![p_t..p_t + p_s, rows_in_chunk + local_row])
                         .assign(&x_ls.row(local_row).t());
                 }
-                let solved = backend_ref
+                let solved = backend
                     .apply_columns(&rhs)
                     .map_err(EstimationError::InvalidInput)?;
                 for local_row in 0..rows_in_chunk {
@@ -2389,8 +2380,6 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 start = end;
             }
             out
-        } else {
-            point_prob.clone()
         };
         // Binomial location-scale eta_se is response-scale (dprob/dθ chain
         // rule), so bounds are mean ± z·se clamped to [0, 1].
@@ -2660,67 +2649,49 @@ impl PredictableModel for SurvivalPredictor {
             )
         })?;
         let eta_log_sigma = design_noise.dot(&self.beta_log_sigma) + offset_noise;
-        let point_mean = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_log_sigma.len();
         let p_total = p_t + p_s;
-        let backend = posterior_mean_backend_or_warn(
+        let backend = require_posterior_mean_backend(
             fit,
             self.covariance.as_ref(),
             p_total,
             "survival posterior mean",
-        );
+        )?;
 
-        let eta_se = if let Some(backend_ref) = backend.as_ref() {
-            eta_standard_errors_from_backend(&input.design, backend_ref)?
-        } else {
-            Array1::zeros(eta_threshold.len())
-        };
-
-        let mean = if let Some(backend_ref) = backend.as_ref() {
-            match project_two_block_linear_predictor_covariance(
-                &input.design,
-                design_noise,
-                backend_ref,
-                p_t,
-                p_s,
-                "survival posterior mean",
-            ) {
-                Ok((var_t, var_s, cov_ts)) => {
-                    let quadctx = crate::quadrature::QuadratureContext::new();
-                    Array1::from_vec(
-                        (0..eta_threshold.len())
-                            .map(|i| {
-                                projected_bivariate_posterior_mean_result(
-                                    &quadctx,
-                                    [eta_threshold[i], eta_log_sigma[i]],
-                                    [
-                                        [var_t[i].max(0.0), cov_ts[i]],
-                                        [cov_ts[i], var_s[i].max(0.0)],
-                                    ],
-                                    |threshold, log_sigma| {
-                                        let survival_eta = threshold * (-log_sigma).exp();
-                                        let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                                            &self.inverse_link,
-                                            survival_eta,
-                                        )?;
-                                        Ok(jet.mu.clamp(0.0, 1.0))
-                                    },
-                                )
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
+        let eta_se = eta_standard_errors_from_backend(&input.design, &backend)?;
+        let (var_t, var_s, cov_ts) = project_two_block_linear_predictor_covariance(
+            &input.design,
+            design_noise,
+            &backend,
+            p_t,
+            p_s,
+            "survival posterior mean",
+        )?;
+        let quadctx = crate::quadrature::QuadratureContext::new();
+        let mean = Array1::from_vec(
+            (0..eta_threshold.len())
+                .map(|i| {
+                    projected_bivariate_posterior_mean_result(
+                        &quadctx,
+                        [eta_threshold[i], eta_log_sigma[i]],
+                        [
+                            [var_t[i].max(0.0), cov_ts[i]],
+                            [cov_ts[i], var_s[i].max(0.0)],
+                        ],
+                        |threshold, log_sigma| {
+                            let survival_eta = threshold * (-log_sigma).exp();
+                            let jet =
+                                crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                                    &self.inverse_link,
+                                    survival_eta,
+                                )?;
+                            Ok(jet.mu.clamp(0.0, 1.0))
+                        },
                     )
-                }
-                Err(err) => {
-                    log::warn!(
-                        "survival posterior mean: failed to project covariance into (eta_threshold, eta_log_sigma): {err}; falling back to plug-in point prediction"
-                    );
-                    point_mean.clone()
-                }
-            }
-        } else {
-            point_mean.clone()
-        };
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
             let z = crate::probability::standard_normal_quantile(0.5 + 0.5 * level).unwrap_or(1.96);
             let lo = (&mean - &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
@@ -3113,6 +3084,28 @@ where
         &backend,
         &strategy,
         "predict_gam_posterior_mean",
+    )
+}
+
+pub fn predict_gam_posterior_meanwith_backend<X>(
+    x: X,
+    beta: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    family: crate::types::LikelihoodFamily,
+    backend: &PredictionCovarianceBackend<'_>,
+) -> Result<PredictPosteriorMeanResult, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    let strategy = strategy_for_family(family, None);
+    predict_gam_posterior_mean_from_backend(
+        x,
+        beta,
+        offset,
+        backend,
+        &strategy,
+        "predict_gam_posterior_meanwith_backend",
     )
 }
 

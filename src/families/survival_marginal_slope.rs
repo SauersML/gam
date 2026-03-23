@@ -77,6 +77,16 @@ pub struct SurvivalMarginalSlopeTermSpec {
 
 pub const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
 
+#[inline]
+fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f64) -> f64 {
+    256.0 * f64::EPSILON * (1.0 + qd1.abs().max(derivative_guard.abs()))
+}
+
+#[inline]
+fn survival_derivative_guard_violated(qd1: f64, derivative_guard: f64) -> bool {
+    qd1 + survival_derivative_guard_tolerance(qd1, derivative_guard) < derivative_guard
+}
+
 pub struct SurvivalMarginalSlopeFitResult {
     pub fit: UnifiedFitResult,
     pub marginalspec_resolved: TermCollectionSpec,
@@ -2627,7 +2637,7 @@ fn row_primary_closed_form(
     let eta1 = q1 * c + observed_g * z;
     let ad1 = qd1 * c;
 
-    if qd1 < derivative_guard {
+    if survival_derivative_guard_violated(qd1, derivative_guard) {
         return Err(format!(
             "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
         ));
@@ -3646,7 +3656,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<f64, String> {
-        if qd1 < self.derivative_guard {
+        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
             return Err(format!(
                 "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
                 self.derivative_guard
@@ -4070,7 +4080,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
         primary: &FlexPrimarySlices,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        if qd1 < self.derivative_guard {
+        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
             return Err(format!(
                 "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
                 self.derivative_guard
@@ -4266,7 +4276,7 @@ impl SurvivalMarginalSlopeFamily {
         let qd1_lower = self.time_derivative_lower_bound();
         let qd1_val = qd1_jet.coeff(0);
         let ad1_val = ad1_jet.coeff(0);
-        if qd1_val < qd1_lower {
+        if survival_derivative_guard_violated(qd1_val, qd1_lower) {
             return Err(format!(
                 "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
             ));
@@ -6956,7 +6966,7 @@ impl SurvivalMarginalSlopeFamily {
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
 
-        if qd1 < self.derivative_guard {
+        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
             return Err(format!(
                 "survival third contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
             ));
@@ -7111,7 +7121,7 @@ impl SurvivalMarginalSlopeFamily {
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
 
-        if qd1 < self.derivative_guard {
+        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
             return Err(format!(
                 "survival fourth contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
             ));
@@ -11581,13 +11591,12 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     match &spec.frailty {
         FrailtySpec::None => {}
         FrailtySpec::GaussianShift { sigma_fixed } => {
-            let sigma = sigma_fixed.ok_or_else(|| {
-                "survival-marginal-slope currently requires FrailtySpec::GaussianShift with a fixed sigma".to_string()
-            })?;
-            if !sigma.is_finite() || sigma < 0.0 {
-                return Err(format!(
-                    "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                ));
+            if let Some(sigma) = sigma_fixed {
+                if !sigma.is_finite() || *sigma < 0.0 {
+                    return Err(format!(
+                        "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                    ));
+                }
             }
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
