@@ -15,7 +15,7 @@
 use crate::estimate::EstimationError;
 use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
-    latent_cloglog_inverse_link_jet5_controlled,
+    latent_cloglog_inverse_link_jet5_controlled, validate_latent_cloglog_inputs,
     lognormal_laplace_term_shared,
 };
 use serde::{Deserialize, Serialize};
@@ -240,6 +240,7 @@ pub fn latent_cloglog_jet5(
     eta: f64,
     sigma: f64,
 ) -> Result<LatentCLogLogJet5, EstimationError> {
+    validate_latent_cloglog_inputs(eta, sigma)?;
     // Authoritative latent cloglog backend:
     //
     // - mean / score come from the shared controlled scalar evaluator in
@@ -247,7 +248,7 @@ pub fn latent_cloglog_jet5(
     // - curvature through fifth derivative are supplied by the same backend's
     //   direct integrated eta-derivative jet, not by differencing
     //   lognormal-Laplace kernel terms
-    let jet = latent_cloglog_inverse_link_jet5_controlled(quadctx, eta, sigma.max(0.0));
+    let jet = latent_cloglog_inverse_link_jet5_controlled(quadctx, eta, sigma);
     Ok(LatentCLogLogJet5 {
         mean: jet.mean,
         d1: jet.d1,

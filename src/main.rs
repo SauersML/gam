@@ -7622,8 +7622,6 @@ fn build_location_scale_saved_model(
 
 fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
     SavedAnchoredDeviationRuntime {
-        schema_version:
-            gam::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
         kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
         knots: runtime.knots().to_vec(),
         degree: runtime.degree(),
@@ -12338,8 +12336,6 @@ mod tests {
             "survival",
         );
         payload.score_warp_runtime = Some(SavedAnchoredDeviationRuntime {
-            schema_version:
-                gam::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
             kernel: "BadKernel".to_string(),
             knots: vec![-1.0, -1.0, 1.0, 1.0],
             degree: 3,
@@ -12373,8 +12369,6 @@ mod tests {
         .expect("score-warp basis")
         .ncols();
         let saved_runtime = SavedAnchoredDeviationRuntime {
-            schema_version:
-                gam::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
             kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
             knots,
             degree,

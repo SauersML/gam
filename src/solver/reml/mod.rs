@@ -2415,11 +2415,11 @@ pub(crate) struct FirthDenseOperator {
     observation_weight_sqrt: Option<Array1<f64>>,
     // I_r^{-1}
     k_reduced: Array2<f64>,
-    // S_r^{-1} with S_r = X_rᵀ X_r. In the current canonical reduced basis
-    // this is diagonal, because Q diagonalizes the design Gram. It is used to
-    // remove the reduced-coordinate basis term from Phi_tau when the design
-    // moves.
-    x_metric_reduced_inv: Array2<f64>,
+    // diag(S_r^{-1}) with S_r = X_rᵀ X_r. In the current canonical reduced
+    // basis this completely characterizes the metric inverse, because Q
+    // diagonalizes the design Gram. It is used to remove the reduced-coordinate
+    // basis term from Phi_tau when the design moves.
+    x_metric_reduced_inv_diag: Array1<f64>,
     // 0.5 (log|I_r| - log|S_r|) at the current eta.
     half_log_det: f64,
     // h = diag(M), M = X_r K_r X_r'

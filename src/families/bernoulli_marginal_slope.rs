@@ -7,16 +7,16 @@ use crate::custom_family::{
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
     cost_gated_outer_order, custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
     first_psi_linear_map, fit_custom_family, second_psi_linear_map,
+    slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
-use crate::families::gamlss::{
-    ParameterBlockInput, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
-    select_wiggle_basis_from_seed,
-};
+use crate::families::gamlss::{ParameterBlockInput, WiggleBlockConfig, select_wiggle_basis_from_seed};
 use crate::families::lognormal_kernel::FrailtySpec;
-use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
-use crate::linalg::utils::matrix_inversewith_regularization;
+use crate::families::row_kernel::{
+    RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
+    row_kernel_hessian_dense, row_kernel_log_likelihood,
+};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
@@ -35,10 +35,9 @@ use std::sync::Arc;
 pub(crate) mod exact_kernel;
 mod deviation_runtime;
 pub use deviation_runtime::DeviationRuntime;
-pub(crate) use deviation_runtime::anchored_deviation_basis_with_transform;
-
-pub(crate) const ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION: u32 = 2;
-
+pub(crate) use deviation_runtime::{
+    anchored_deviation_basis_with_transform, derive_deviation_basis_transform,
+};
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -61,7 +60,6 @@ impl Default for DeviationBlockConfig {
         }
     }
 }
-
 
 #[derive(Clone)]
 pub(crate) struct DeviationPrepared {
@@ -126,57 +124,6 @@ struct ThetaHints {
     link_dev_beta: Option<Array1<f64>>,
 }
 
-fn max_abs_matrix_diff(lhs: &Array2<f64>, rhs: &Array2<f64>) -> f64 {
-    if lhs.dim() != rhs.dim() {
-        return f64::INFINITY;
-    }
-    let mut max_diff = 0.0_f64;
-    for i in 0..lhs.nrows() {
-        for j in 0..lhs.ncols() {
-            max_diff = max_diff.max((lhs[[i, j]] - rhs[[i, j]]).abs());
-        }
-    }
-    max_diff
-}
-
-fn derive_deviation_basis_transform(
-    seed: &Array1<f64>,
-    knots: &Array1<f64>,
-    degree: usize,
-    constrained_design: &DesignMatrix,
-) -> Result<Array2<f64>, String> {
-    let raw_design = monotone_wiggle_basis_with_derivative_order(seed.view(), knots, degree, 0)?;
-    let constrained_dense = constrained_design.to_dense();
-    if raw_design.nrows() != constrained_dense.nrows() {
-        return Err(format!(
-            "anchored deviation design row mismatch while deriving replay transform: raw rows={}, constrained rows={}",
-            raw_design.nrows(),
-            constrained_dense.nrows()
-        ));
-    }
-    if raw_design.ncols() == constrained_dense.ncols()
-        && max_abs_matrix_diff(&raw_design, &constrained_dense) <= 1e-12
-    {
-        return Ok(Array2::<f64>::eye(raw_design.ncols()));
-    }
-
-    let gram = raw_design.t().dot(&raw_design);
-    let rhs = raw_design.t().dot(&constrained_dense);
-    let gram_inv = matrix_inversewith_regularization(&gram, "anchored deviation basis replay")
-        .ok_or_else(|| {
-            "failed to derive anchored deviation replay transform from training design".to_string()
-        })?;
-    let basis_transform = gram_inv.dot(&rhs);
-    let replayed = raw_design.dot(&basis_transform);
-    let replay_error = max_abs_matrix_diff(&replayed, &constrained_dense);
-    if !replay_error.is_finite() || replay_error > 1e-8 {
-        return Err(format!(
-            "anchored deviation replay transform does not exactly reproduce the training design (max abs error {replay_error:.3e})"
-        ));
-    }
-    Ok(basis_transform)
-}
-
 pub(crate) fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
@@ -191,17 +138,18 @@ pub(crate) fn build_deviation_block_from_seed(
         },
         &cfg.penalty_orders,
     )?;
+    let structure = selected.structure;
     let block = selected.block;
     let dim = block.design.ncols();
     let knots = selected.knots;
     let degree = selected.degree;
     let basis_transform = derive_deviation_basis_transform(seed, &knots, degree, &block.design)?;
 
-    // Cubic-invariant enforcement + span derivation all inside try_new.
+    // Structural exact-runtime validation + span derivation all inside try_new.
     let runtime = DeviationRuntime::try_new(
         knots,
         degree,
-        &selected.structure,
+        &structure,
         dim,
         cfg.monotonicity_eps,
         basis_transform,
@@ -1289,6 +1237,16 @@ struct CoeffSupport {
     include_w: bool,
 }
 
+impl CoeffSupport {
+    #[inline]
+    fn without_b(self) -> Self {
+        Self {
+            include_b: false,
+            ..self
+        }
+    }
+}
+
 const COEFF_SUPPORT_BHW: CoeffSupport = CoeffSupport {
     include_b: true,
     include_h: true,
@@ -1305,6 +1263,11 @@ const COEFF_SUPPORT_W: CoeffSupport = CoeffSupport {
     include_w: true,
 };
 
+// Sparse coefficient jet for the flexible primary coordinates `(q, b, h, w)`.
+// Only the `b` axis couples to other primary blocks:
+//   - score-warp coefficients are affine in `b`
+//   - link-deviation coefficients are cubic in `(a, b)`
+// so there are no `hh`, `hw`, or `ww` families to maintain by hand.
 struct SparsePrimaryCoeffJetView<'a> {
     b_index: usize,
     h_range: Option<std::ops::Range<usize>>,
@@ -1322,7 +1285,6 @@ struct SparsePrimaryCoeffJetView<'a> {
 }
 
 impl<'a> SparsePrimaryCoeffJetView<'a> {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         h_range: Option<&std::ops::Range<usize>>,
         w_range: Option<&std::ops::Range<usize>>,
@@ -1452,13 +1414,7 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
         if param == self.b_index {
             return self.directional_family(family, dir, support);
         }
-        if self.param_supported(
-            param,
-            CoeffSupport {
-                include_b: false,
-                ..support
-            },
-        ) {
+        if self.param_supported(param, support.without_b()) {
             let mut out = [0.0; 4];
             add_scaled_coeff4(&mut out, &family[param], dir[self.b_index]);
             return out;
@@ -1477,13 +1433,7 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
         if param == self.b_index {
             return self.mixed_directional_from_b_family(family, dir_u, dir_v, support);
         }
-        if self.param_supported(
-            param,
-            CoeffSupport {
-                include_b: false,
-                ..support
-            },
-        ) {
+        if self.param_supported(param, support.without_b()) {
             let mut out = [0.0; 4];
             add_scaled_coeff4(
                 &mut out,
@@ -1508,26 +1458,10 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
             }
             return [0.0; 4];
         }
-        if u == self.b_index
-            && self.param_supported(
-                v,
-                CoeffSupport {
-                    include_b: false,
-                    ..support
-                },
-            )
-        {
+        if u == self.b_index && self.param_supported(v, support.without_b()) {
             return family[v];
         }
-        if v == self.b_index
-            && self.param_supported(
-                u,
-                CoeffSupport {
-                    include_b: false,
-                    ..support
-                },
-            )
-        {
+        if v == self.b_index && self.param_supported(u, support.without_b()) {
             return family[u];
         }
         [0.0; 4]
@@ -1544,28 +1478,12 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
         if u == self.b_index && v == self.b_index {
             return self.directional_family(family, dir, support);
         }
-        if u == self.b_index
-            && self.param_supported(
-                v,
-                CoeffSupport {
-                    include_b: false,
-                    ..support
-                },
-            )
-        {
+        if u == self.b_index && self.param_supported(v, support.without_b()) {
             let mut out = [0.0; 4];
             add_scaled_coeff4(&mut out, &family[v], dir[self.b_index]);
             return out;
         }
-        if v == self.b_index
-            && self.param_supported(
-                u,
-                CoeffSupport {
-                    include_b: false,
-                    ..support
-                },
-            )
-        {
+        if v == self.b_index && self.param_supported(u, support.without_b()) {
             let mut out = [0.0; 4];
             add_scaled_coeff4(&mut out, &family[u], dir[self.b_index]);
             return out;
@@ -1585,15 +1503,7 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
         if u == self.b_index && v == self.b_index {
             return self.mixed_directional_from_b_family(family, dir_u, dir_v, support);
         }
-        if u == self.b_index
-            && self.param_supported(
-                v,
-                CoeffSupport {
-                    include_b: false,
-                    ..support
-                },
-            )
-        {
+        if u == self.b_index && self.param_supported(v, support.without_b()) {
             let mut out = [0.0; 4];
             add_scaled_coeff4(
                 &mut out,
@@ -1602,15 +1512,7 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
             );
             return out;
         }
-        if v == self.b_index
-            && self.param_supported(
-                u,
-                CoeffSupport {
-                    include_b: false,
-                    ..support
-                },
-            )
-        {
+        if v == self.b_index && self.param_supported(u, support.without_b()) {
             let mut out = [0.0; 4];
             add_scaled_coeff4(
                 &mut out,
@@ -2852,6 +2754,7 @@ impl BernoulliMarginalSlopeFamily {
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();
         let scale = self.probit_frailty_scale();
+        let zero_family = vec![[0.0; 4]; r];
 
         let f_u = &mut scratch.m_u;
         let f_au = &mut scratch.m_au;
@@ -2944,19 +2847,28 @@ impl BernoulliMarginalSlopeFamily {
             }
 
             if need_hessian {
+                let coeff_jet = SparsePrimaryCoeffJetView::new(
+                    h_range,
+                    w_range,
+                    &coeff_u,
+                    &coeff_au,
+                    &coeff_bu,
+                    &zero_family,
+                    &zero_family,
+                    &zero_family,
+                    &zero_family,
+                    &zero_family,
+                    &zero_family,
+                    &zero_family,
+                );
                 for u in 1..r {
                     for v in u..r {
-                        let second_coeff = if u == 1 {
-                            coeff_bu[v]
-                        } else if v == 1 {
-                            coeff_bu[u]
-                        } else {
-                            [0.0; 4]
-                        };
+                        let second_coeff =
+                            coeff_jet.pair_from_b_family(coeff_jet.b_first, u, v, COEFF_SUPPORT_BHW);
                         let val = exact::cell_second_derivative_from_moments(
                             cell,
-                            &coeff_u[u],
-                            &coeff_u[v],
+                            &coeff_jet.first[u],
+                            &coeff_jet.first[v],
                             &second_coeff,
                             &state.moments,
                         )?;
@@ -3000,36 +2912,56 @@ impl BernoulliMarginalSlopeFamily {
         let eta_aa_obs = eval_coeff4_at(&obs.dc_daa, z_obs);
         let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
 
-        let rho = &mut scratch.rho;
-        let tau = &mut scratch.tau;
-        rho.fill(0.0);
-        tau.fill(0.0);
-        rho[1] = eval_coeff4_at(&obs.dc_db, z_obs);
-        tau[1] = eval_coeff4_at(&obs.dc_dab, z_obs);
+        let mut g_u_fixed = vec![[0.0; 4]; r];
+        let mut g_au_fixed = vec![[0.0; 4]; r];
+        let mut g_bu_fixed = vec![[0.0; 4]; r];
+        g_u_fixed[1] = obs.dc_db;
+        g_au_fixed[1] = obs.dc_dab;
+        g_bu_fixed[1] = obs.dc_dbb;
         if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
             for local_idx in 0..h_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
-                rho[h_range.start + local_idx] = eval_coeff4_at(
-                    &scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale),
-                    z_obs,
-                );
+                let idx = h_range.start + local_idx;
+                g_u_fixed[idx] =
+                    scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
+                g_bu_fixed[idx] =
+                    scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
             }
         }
         if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
             for local_idx in 0..w_range.len() {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                rho[w_range.start + local_idx] = eval_coeff4_at(
-                    &scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale),
-                    z_obs,
-                );
-                tau[w_range.start + local_idx] = eval_coeff4_at(
-                    &scale_coeff4(
-                        exact::link_basis_cell_coefficient_partials(basis_span, a, b).0,
-                        scale,
-                    ),
-                    z_obs,
-                );
+                let idx = w_range.start + local_idx;
+                g_u_fixed[idx] =
+                    scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
+                let (dc_aw_raw, dc_bw_raw) =
+                    exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
+                g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
             }
+        }
+        let g_jet = SparsePrimaryCoeffJetView::new(
+            h_range,
+            w_range,
+            &g_u_fixed,
+            &g_au_fixed,
+            &g_bu_fixed,
+            &zero_family,
+            &zero_family,
+            &zero_family,
+            &zero_family,
+            &zero_family,
+            &zero_family,
+            &zero_family,
+        );
+
+        let rho = &mut scratch.rho;
+        let tau = &mut scratch.tau;
+        rho.fill(0.0);
+        tau.fill(0.0);
+        for u in 1..r {
+            rho[u] = eval_coeff4_at(&g_jet.first[u], z_obs);
+            tau[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs);
         }
 
         let eta_u = &mut scratch.grad;
@@ -3048,78 +2980,10 @@ impl BernoulliMarginalSlopeFamily {
             hess.fill(0.0);
             for u in 0..r {
                 for v in u..r {
-                    let mut r_uv = 0.0;
-                    if u == 1 && v == 1 {
-                        r_uv = eval_coeff4_at(&obs.dc_dbb, z_obs);
-                    } else if u == 1 {
-                        if let Some(h_range) = h_range {
-                            if v >= h_range.start && v < h_range.end {
-                                let local_idx = v - h_range.start;
-                                let runtime = score_runtime
-                                    .ok_or_else(|| "missing score-warp runtime".to_string())?;
-                                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
-                                r_uv = eval_coeff4_at(
-                                    &scale_coeff4(
-                                        exact::score_basis_cell_coefficients(basis_span, 1.0),
-                                        scale,
-                                    ),
-                                    z_obs,
-                                );
-                            }
-                        }
-                        if let Some(w_range) = w_range {
-                            if v >= w_range.start && v < w_range.end {
-                                let local_idx = v - w_range.start;
-                                let runtime = link_runtime
-                                    .ok_or_else(|| "missing link runtime".to_string())?;
-                                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                                r_uv = eval_coeff4_at(
-                                    &scale_coeff4(
-                                        exact::link_basis_cell_coefficient_partials(
-                                            basis_span, a, b,
-                                        )
-                                        .1,
-                                        scale,
-                                    ),
-                                    z_obs,
-                                );
-                            }
-                        }
-                    } else if v == 1 {
-                        if let Some(h_range) = h_range {
-                            if u >= h_range.start && u < h_range.end {
-                                let local_idx = u - h_range.start;
-                                let runtime = score_runtime
-                                    .ok_or_else(|| "missing score-warp runtime".to_string())?;
-                                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
-                                r_uv = eval_coeff4_at(
-                                    &scale_coeff4(
-                                        exact::score_basis_cell_coefficients(basis_span, 1.0),
-                                        scale,
-                                    ),
-                                    z_obs,
-                                );
-                            }
-                        }
-                        if let Some(w_range) = w_range {
-                            if u >= w_range.start && u < w_range.end {
-                                let local_idx = u - w_range.start;
-                                let runtime = link_runtime
-                                    .ok_or_else(|| "missing link runtime".to_string())?;
-                                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                                r_uv = eval_coeff4_at(
-                                    &scale_coeff4(
-                                        exact::link_basis_cell_coefficient_partials(
-                                            basis_span, a, b,
-                                        )
-                                        .1,
-                                        scale,
-                                    ),
-                                    z_obs,
-                                );
-                            }
-                        }
-                    }
+                    let r_uv = eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW),
+                        z_obs,
+                    );
                     let eta_uv = chi_obs * a_uv[[u, v]]
                         + eta_aa_obs * a_u[u] * a_u[v]
                         + tau[u] * a_u[v]
@@ -3652,6 +3516,7 @@ impl BernoulliMarginalSlopeFamily {
         let g_dir_fixed = g_jet.directional_family(g_jet.first, dir, COEFF_SUPPORT_BHW);
         let g_a_dir_fixed = g_jet.directional_family(g_jet.a_first, dir, COEFF_SUPPORT_BW);
         let g_aa_dir_fixed = g_jet.directional_family(g_jet.aa_first, dir, COEFF_SUPPORT_BW);
+        let g_dir = eval_coeff4_at(&g_dir_fixed, z_obs);
         let g_a_dir = eval_coeff4_at(&g_a_dir_fixed, z_obs);
         let g_aa_dir = eval_coeff4_at(&g_aa_dir_fixed, z_obs);
 
@@ -3703,7 +3568,7 @@ impl BernoulliMarginalSlopeFamily {
                 eta_uv[[v, u]] = val;
             }
         }
-        let eta_dir = eta_u.dot(dir);
+        let eta_dir = g_a * a_dir + g_dir;
         let eta_u_dir = eta_uv.dot(dir);
         let dg_a_dir = g_aa * a_dir + g_a_dir;
         let dg_aa_dir = g_aaa * a_dir + g_aa_dir;
@@ -3764,7 +3629,7 @@ impl BernoulliMarginalSlopeFamily {
     ///   out[k,l] = sum_{m,n} f_{klmn} dir_u[m] dir_v[n]
     /// Rigid path uses the closed-form kernel. The flexible exact de-nested
     /// path contracts the exact cell-moment kernel analytically.
-    fn row_primary_fourth_contracted_recompute(
+    fn row_primary_fourth_contracted_recompute_ordered(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -4445,6 +4310,9 @@ impl BernoulliMarginalSlopeFamily {
         let g_aa_dir_uv_fixed =
             g_jet.mixed_directional_from_b_family(g_jet.aab_first, dir_u, dir_v, COEFF_SUPPORT_W);
 
+        let g_dir_u = eval_coeff4_at(&g_dir_u_fixed, z_obs);
+        let g_dir_v = eval_coeff4_at(&g_dir_v_fixed, z_obs);
+        let g_dir_uv = eval_coeff4_at(&g_dir_uv_fixed, z_obs);
         let g_a_u_fixed = eval_coeff4_at(&g_a_dir_u_fixed, z_obs);
         let g_a_v_fixed = eval_coeff4_at(&g_a_dir_v_fixed, z_obs);
         let g_aa_u_fixed = eval_coeff4_at(&g_aa_dir_u_fixed, z_obs);
@@ -4609,8 +4477,11 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let a_dir_uv = a_u_dir_u.dot(dir_v);
-        let g_a_uv =
-            g_aa * a_dir_uv + g_aa_u_fixed * a_dir_v + g_aa_v_fixed * a_dir_u + g_a_uv_fixed;
+        let g_a_uv = g_aaa * a_dir_u * a_dir_v
+            + g_aa * a_dir_uv
+            + g_aa_u_fixed * a_dir_v
+            + g_aa_v_fixed * a_dir_u
+            + g_a_uv_fixed;
         let g_aa_uv = g_aaau.dot(dir_u) * a_dir_v
             + g_aaau.dot(dir_v) * a_dir_u
             + g_aaa * a_dir_uv
@@ -4666,11 +4537,11 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
-        let eta_dir_u = eta_u.dot(dir_u);
-        let eta_dir_v = eta_u.dot(dir_v);
+        let eta_dir_u = g_a * a_dir_u + g_dir_u;
+        let eta_dir_v = g_a * a_dir_v + g_dir_v;
         let eta_u_dir_u = eta_uv.dot(dir_u);
         let eta_u_dir_v = eta_uv.dot(dir_v);
-        let eta_dir_uv = eta_u_dir_u.dot(dir_v);
+        let eta_dir_uv = g_a_v * a_dir_u + g_a * a_dir_uv + g_dir_uv;
         let eta_u_uv = eta_uv_u.dot(dir_v);
 
         let y_i = self.y[row];
@@ -4710,6 +4581,44 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         Ok(out)
+    }
+
+    fn row_primary_fourth_contracted_recompute(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let ordered = self.row_primary_fourth_contracted_recompute_ordered(
+            row,
+            block_states,
+            cache,
+            row_ctx,
+            dir_u,
+            dir_v,
+        )?;
+        if !self.flex_active() {
+            return Ok(ordered);
+        }
+
+        let swapped = self.row_primary_fourth_contracted_recompute_ordered(
+            row,
+            block_states,
+            cache,
+            row_ctx,
+            dir_v,
+            dir_u,
+        )?;
+        let mut sym = ordered;
+        for i in 0..sym.nrows() {
+            for j in 0..sym.ncols() {
+                sym[[i, j]] = 0.5 * (sym[[i, j]] + swapped[[i, j]]);
+            }
+        }
+        Ok(sym)
     }
 
     /// Like `add_pullback_primary_hessian` but only accumulates the h/w
@@ -5893,13 +5802,117 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
+        let slices = block_slices(self);
+
+        // ── Joint-then-slice path (rigid, p < 512) ──────────────────────
+        //
+        // Block Hessians are principal blocks of the joint Hessian—never
+        // independently derived.  The RowKernel<2> is the single source of
+        // truth for gradient, Hessian, and log-likelihood.
+        if !self.flex_active() && slices.total < 512 {
+            let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+            let cache = build_row_kernel_cache(&kern)?;
+            let ll = row_kernel_log_likelihood(&cache);
+            let joint_gradient = -row_kernel_gradient(&kern, &cache);
+            let joint_hessian = row_kernel_hessian_dense(&kern, &cache);
+            return Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                blockworking_sets: slice_joint_into_block_working_sets(
+                    vec![
+                        joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
+                        joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
+                    ],
+                    &joint_hessian,
+                    &[slices.marginal.clone(), slices.logslope.clone()],
+                ),
+            });
+        }
+
+        // ── Joint-then-slice path (flex, p < 512) ───────────────────────
+        //
+        // The flex path has variable-dimension primary space (q, g, h?, w?).
+        // The joint Hessian is built column-by-column via matvec.
+        // Gradients are extracted from the per-row analytic flex loop.
+        if self.flex_active() && slices.total < 512 {
+            let cache = self.build_exact_eval_cache_with_order(block_states)?;
+            let primary = cache.primary.clone();
+            let n = self.y.len();
+
+            // Gradient-only accumulation (no Hessian).
+            let mut ll = 0.0;
+            let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
+            let mut grad_logslope = Array1::<f64>::zeros(slices.logslope.len());
+            let mut grad_h: Option<Array1<f64>> =
+                slices.h.as_ref().map(|r| Array1::zeros(r.len()));
+            let mut grad_w: Option<Array1<f64>> =
+                slices.w.as_ref().map(|r| Array1::zeros(r.len()));
+            let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+            for row in 0..n {
+                let row_ctx = Self::row_ctx(&cache, row);
+                let row_neglog = self.compute_row_analytic_flex_into(
+                    row,
+                    block_states,
+                    &primary,
+                    row_ctx,
+                    true,
+                    &mut scratch,
+                )?;
+                ll -= row_neglog;
+                {
+                    let mut m = grad_marginal.view_mut();
+                    self.marginal_design
+                        .axpy_row_into(row, -scratch.grad[0], &mut m)?;
+                }
+                {
+                    let mut g = grad_logslope.view_mut();
+                    self.logslope_design
+                        .axpy_row_into(row, -scratch.grad[1], &mut g)?;
+                }
+                if let (Some(ph), Some(gh)) = (primary.h.as_ref(), grad_h.as_mut()) {
+                    for idx in 0..ph.len() {
+                        gh[idx] -= scratch.grad[ph.start + idx];
+                    }
+                }
+                if let (Some(pw), Some(gw)) = (primary.w.as_ref(), grad_w.as_mut()) {
+                    for idx in 0..pw.len() {
+                        gw[idx] -= scratch.grad[pw.start + idx];
+                    }
+                }
+            }
+
+            let joint = self
+                .exact_newton_joint_hessian(block_states)?
+                .ok_or("BernoulliMarginalSlopeFamily flex: joint hessian unavailable")?;
+            let mut block_gradients = vec![grad_marginal, grad_logslope];
+            let mut block_ranges = vec![slices.marginal.clone(), slices.logslope.clone()];
+            if let (Some(range), Some(gradient)) = (slices.h.clone(), grad_h) {
+                block_ranges.push(range);
+                block_gradients.push(gradient);
+            }
+            if let (Some(range), Some(gradient)) = (slices.w.clone(), grad_w) {
+                block_ranges.push(range);
+                block_gradients.push(gradient);
+            }
+            return Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                blockworking_sets: slice_joint_into_block_working_sets(
+                    block_gradients,
+                    &joint,
+                    &block_ranges,
+                ),
+            });
+        }
+
+        // ── Blockwise fallback (p >= 512) ───────────────────────────────
+        //
+        // The joint dense Hessian is too large to materialise.  Block
+        // Hessians are assembled independently via the same per-row
+        // kernel, so the algebra is correct but not structurally guaranteed
+        // identical to the joint object.  This path should only be reached
+        // for very large models where memory is the binding constraint.
         let cache = self.build_exact_eval_cache_with_order(block_states)?;
-        let slices = cache.slices.clone();
         let primary = cache.primary.clone();
 
-        // Fast path: rigid model (no score-warp, no link-deviation).
-        // Use closed-form scalar kernel: η = q·c + g·z, ℓ = -w·logΦ(s·η).
-        // No jets, no intercept solve, no quadrature.
         if !self.flex_active() {
             let mut ll = 0.0;
             let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
@@ -5918,7 +5931,6 @@ impl BernoulliMarginalSlopeFamily {
 
                 let g2 = g * g;
                 let c = (1.0 + g2).sqrt();
-                // c(g) = sqrt(1+g²), c'(g) = g/c, c''(g) = 1/c³
                 let c1 = g / c;
                 let c2 = 1.0 / (c * c * c);
                 let eta = q * c + g * zi;
@@ -6210,6 +6222,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_idx: usize,
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
+        self.validate_exact_block_state_shapes(block_states)?;
         if self.score_block_index().is_some_and(|idx| block_idx == idx) {
             if let (Some(runtime), Some(score)) =
                 (&self.score_warp, self.score_block_state(block_states)?)
@@ -6414,6 +6427,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         _: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        self.validate_exact_block_state_shapes(block_states)?;
         if block_idx >= block_states.len() {
             return Err(format!(
                 "post-update block index {} out of range for {} blocks",
@@ -7354,6 +7368,30 @@ mod tests {
     }
 
     #[test]
+    fn deviation_runtime_replays_exact_training_design() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build deviation block");
+        let replayed = prepared.runtime.design(&seed).expect("replayed design");
+        let trained = prepared.block.design.to_dense();
+        assert_eq!(replayed.dim(), trained.dim());
+        for i in 0..replayed.nrows() {
+            for j in 0..replayed.ncols() {
+                assert!(
+                    (replayed[[i, j]] - trained[[i, j]]).abs() <= 1e-10,
+                    "training-basis replay mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn exact_monotonicity_rejects_deviation_basis_with_nonzero_fourth_derivative() {
         let seed = array![-1.0, 0.0, 1.0];
         let err = match build_deviation_block_from_seed(
@@ -7382,7 +7420,7 @@ mod tests {
         .expect("build deviation block");
         let dim = prepared.block.design.ncols();
         let beta = Array1::from_iter((0..dim).map(|idx| 0.025 * (idx as f64 + 1.0)));
-        let n_spans = prepared.runtime.span_count();
+        let n_spans = prepared.runtime.breakpoints().len().saturating_sub(1);
 
         for span_idx in 0..n_spans {
             let cubic = prepared
@@ -7568,7 +7606,7 @@ mod tests {
         .expect("exact module microcells for a=0.55");
 
         assert!(
-            exact_cells_a0.len() >= score_prepared.runtime.span_count(),
+            exact_cells_a0.len() >= score_prepared.runtime.breakpoints().len().saturating_sub(1),
             "microcell partition should refine the score spans"
         );
         assert!(

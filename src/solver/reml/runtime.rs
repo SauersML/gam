@@ -1933,7 +1933,8 @@ impl<'a> RemlState<'a> {
 }
 
 impl<'a> RemlState<'a> {
-    /// Compute the objective function for BFGS optimization.
+    /// Compute the scalar outer objective value used by the planner-selected
+    /// outer optimizer.
     ///
     /// Full objective reference.
     /// This function returns the scalar outer cost minimized over ρ.
@@ -2202,7 +2203,9 @@ impl<'a> RemlState<'a> {
     ///   The code uses fixed-rank/stabilized conventions for log|S|_+ to keep objective
     ///   derivatives smooth and consistent with the transformed penalty basis used by PIRLS.
     ///
-    /// This is the core of the outer optimization loop and provides the search direction for the BFGS algorithm.
+    /// This is the core gradient evaluator for outer optimization. The
+    /// centralized planner may feed it to ARC, Newton trust-region, or BFGS,
+    /// depending on available curvature information.
     /// The calculation differs significantly between the Gaussian (REML) and non-Gaussian (LAML) cases.
     ///
     /// # Mathematical Basis (Gaussian/REML Case)
@@ -2241,7 +2244,8 @@ impl<'a> RemlState<'a> {
     ///
     /// - The inner loop (P-IRLS) finds coefficients β̂ that maximize the penalized log-likelihood
     ///   for a fixed set of smoothing parameters ρ.
-    /// - The outer loop (BFGS) finds smoothing parameters ρ that maximize the marginal likelihood.
+    /// - The outer loop finds smoothing parameters ρ that maximize the
+    ///   marginal likelihood using the centralized outer-strategy planner.
     ///
     /// Since β̂ is an implicit function of ρ, the total derivative is:
     ///

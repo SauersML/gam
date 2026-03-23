@@ -25,7 +25,7 @@ use crate::families::sigma_link::{
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::linalg::utils::solve_spd_pcg_with_info;
-use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
+use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
 };
@@ -461,14 +461,10 @@ fn initialize_monotone_wiggle_knots_from_seed(
 
 #[inline]
 fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, String> {
-    // Public wiggle degree is the polynomial degree of the deviation
-    // function itself. This basis layer's I-spline constructor is one order
-    // higher than that public convention, so a cubic wiggle (degree=3) must
-    // use internal_degree=2 here to stay piecewise cubic.
-    //
-    // The low-level I-spline builder requires internal_degree >= 1, so the
-    // smallest supported public monotone-wiggle degree is 2 (piecewise
-    // quadratic).
+    // Public monotone-wiggle degree refers to the value basis. The low-level
+    // I-spline builder integrates a degree-`internal_degree` specification
+    // into a degree-`internal_degree + 1` value basis, so we subtract one here
+    // to keep the public degree and the per-span value degree aligned.
     degree
         .checked_sub(1)
         .filter(|&internal_degree| internal_degree >= 1)
@@ -3022,9 +3018,9 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // for all inverse links via the shared jet formulas plus the generic
     // exact-Newton D_βH / D²_βH closures routed through
     // evaluate_custom_family_joint_hyper -> joint_outer_evaluate ->
-    // BorrowedJointDerivProvider. This enables exact Newton for the outer
-    // REML optimization, eliminating the BFGS fallback that was previously
-    // required.
+    // BorrowedJointDerivProvider. This enables the analytic-Hessian outer
+    // plan for REML optimization instead of the downgraded gradient-only
+    // outer strategies.
     //
     // Note: auxiliary coords are NOT design-moving (psi_dim=0). The seed
     // config still needs num_auxiliary_trailing for proper multi-start seeding.
@@ -3694,12 +3690,6 @@ fn mirror_upper_to_lower(target: &mut Array2<f64>) {
     }
 }
 
-struct BinomialLocationScaleExactGeometry<'a> {
-    threshold_design: &'a DesignMatrix,
-    log_sigma_design: &'a DesignMatrix,
-    wiggle_design: Option<&'a Array2<f64>>,
-    d2q_dq02: Option<&'a Array1<f64>>,
-}
 
 struct BinomialLocationScaleCore {
     sigma: Array1<f64>,
@@ -4037,144 +4027,6 @@ fn binomial_location_scale_core(
         d3mu_dq3,
         log_likelihood: ll,
     })
-}
-
-fn binomial_location_scale_working_sets(
-    y: &Array1<f64>,
-    weights: &Array1<f64>,
-    eta_t: &Array1<f64>,
-    etawiggle: Option<&Array1<f64>>,
-    dq_dq0: Option<&Array1<f64>>,
-    exact_geometry: BinomialLocationScaleExactGeometry<'_>,
-    core: &BinomialLocationScaleCore,
-) -> Result<(BlockWorkingSet, BlockWorkingSet, Option<BlockWorkingSet>), String> {
-    let n = y.len();
-    let geom = exact_geometry;
-    // Use uninit — every element is written in the loop below.
-    let (mut grad_eta_t, mut h_eta_t, mut grad_eta_ls, mut h_eta_ls);
-    unsafe {
-        grad_eta_t = Array1::<f64>::uninit(n).assume_init();
-        h_eta_t = Array1::<f64>::uninit(n).assume_init();
-        grad_eta_ls = Array1::<f64>::uninit(n).assume_init();
-        h_eta_ls = Array1::<f64>::uninit(n).assume_init();
-    }
-    let mut grad_q = etawiggle.map(|_| unsafe { Array1::<f64>::uninit(n).assume_init() });
-    let mut h_q_psd = etawiggle.map(|_| unsafe { Array1::<f64>::uninit(n).assume_init() });
-
-    for i in 0..n {
-        let (score_q, curvature_q, _) = binomial_score_curvaturethird_from_jet(
-            y[i],
-            weights[i],
-            core.mu[i],
-            core.dmu_dq[i],
-            core.d2mu_dq2[i],
-            core.d3mu_dq3[i],
-        );
-        let a_i = dq_dq0.map_or(1.0, |v| v[i]);
-        let c_i = geom.d2q_dq02.map_or(0.0, |v| v[i]);
-        let q0 = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
-        // Full rowwise chain rule for the exact wiggle geometry.
-        //
-        // For one observation we work with
-        //
-        //   q0(t, l) = -t / sigma(l),
-        //   q(t, l)  = q0 + w(q0),
-        //   F(q)     = -ell(q),
-        //
-        // where t = eta_t, l = eta_log_sigma, sigma(l) = safe_exp(l), and
-        //
-        //   a_i = dq/dq0 = 1 + w'(q0),
-        //   c_i = d^2 q / d q0^2 = w''(q0).
-        //
-        // On the smooth interior branch, the non-wiggle derivatives returned
-        // by `nonwiggle_q_derivs` reduce to
-        //
-        //   q0_t  = -exp(-eta_ls),
-        //   q0_l  = -q0,
-        //   q0_tt = 0,
-        //   q0_tl = exp(-eta_ls),
-        //   q0_ll = q0.
-        //
-        // The wiggle-composed scalar q = h(q0) with h'(q0)=a_i and
-        // h''(q0)=c_i then satisfies
-        //
-        //   q_t  = a_i * q0_t,
-        //   q_l  = a_i * q0_l,
-        //   q_tt = c_i * q0_t^2 + a_i * q0_tt,
-        //   q_tl = c_i * q0_t q0_l + a_i * q0_tl,
-        //   q_ll = c_i * q0_l^2 + a_i * q0_ll.
-        //
-        // Because q0_tt = 0, the threshold curvature reduces to
-        //
-        //   q_tt = c_i * q0_t^2.
-        //
-        // This is the term the old code was missing. The exact negative
-        // log-likelihood Hessian in (t, l) coordinates is
-        //
-        //   F_ab = m2 * q_a q_b + m1 * q_ab,
-        //
-        // where (m1, m2) are the first and second derivatives of F with
-        // respect to the scalar q. In particular,
-        //
-        //   F_tt = m2 * q_t^2 + m1 * q_tt,
-        //   F_ll = m2 * q_l^2 + m1 * q_ll.
-        //
-        // So once the wiggle is nonlinear (c_i != 0), dropping q_tt from
-        // the threshold block is mathematically wrong even though q0 itself
-        // is linear in eta_t. The spatial wiggle failure that triggered this
-        // patch was exactly that omission surfacing inside the exact-Newton
-        // path.
-        let q_t = a_i * q0.q_t;
-        let q_ls = a_i * q0.q_ls;
-        let q_tt = c_i * q0.q_t * q0.q_t;
-        let q_ll = c_i * q0.q_ls * q0.q_ls + a_i * q0.q_ll;
-        let (m1, m2, _) = binomial_neglog_q_derivatives_from_jet(
-            y[i],
-            weights[i],
-            core.mu[i],
-            core.dmu_dq[i],
-            core.d2mu_dq2[i],
-            core.d3mu_dq3[i],
-        );
-
-        grad_eta_t[i] = score_q * q_t;
-        grad_eta_ls[i] = score_q * q_ls;
-        h_eta_t[i] = hessian_coeff_fromobjective_q_terms(m1, m2, q_t, q_t, q_tt);
-        h_eta_ls[i] = hessian_coeff_fromobjective_q_terms(m1, m2, q_ls, q_ls, q_ll);
-
-        if let Some(grad_q) = grad_q.as_mut() {
-            grad_q[i] = score_q;
-        }
-        if let Some(h_q_psd) = h_q_psd.as_mut() {
-            h_q_psd[i] = curvature_q.max(0.0);
-        }
-    }
-
-    let grad_t = geom.threshold_design.transpose_vector_multiply(&grad_eta_t);
-    let hess_t = xt_diag_x_symmetric(geom.threshold_design, &h_eta_t)?.to_dense();
-    let grad_ls = geom
-        .log_sigma_design
-        .transpose_vector_multiply(&grad_eta_ls);
-    let hess_ls = xt_diag_x_symmetric(geom.log_sigma_design, &h_eta_ls)?.to_dense();
-    let wws = match (geom.wiggle_design, grad_q, h_q_psd) {
-        (Some(wiggle_design), Some(grad_q), Some(h_q_psd)) => Some(BlockWorkingSet::ExactNewton {
-            gradient: fast_atv(wiggle_design, &grad_q),
-            hessian: SymmetricMatrix::Dense(xt_diag_x_dense(wiggle_design, &h_q_psd)?),
-        }),
-        _ => None,
-    };
-
-    Ok((
-        BlockWorkingSet::ExactNewton {
-            gradient: grad_t,
-            hessian: SymmetricMatrix::Dense(hess_t),
-        },
-        BlockWorkingSet::ExactNewton {
-            gradient: grad_ls,
-            hessian: SymmetricMatrix::Dense(hess_ls),
-        },
-        wws,
-    ))
 }
 
 /// Built-in Gaussian location-scale family:
@@ -18748,6 +18600,21 @@ mod tests {
             domain_max >= 2.9,
             "unexpected right fallback boundary: {domain_max}"
         );
+    }
+
+    #[test]
+    fn monotone_wiggle_structure_encodes_value_span_degree() {
+        let quadratic = monotone_wiggle_structure(2).expect("quadratic wiggle structure");
+        assert_eq!(quadratic.value_span_degree, 2);
+        assert!(quadratic.fourth_derivative_is_structurally_zero());
+
+        let cubic = monotone_wiggle_structure(3).expect("cubic wiggle structure");
+        assert_eq!(cubic.value_span_degree, 3);
+        assert!(cubic.fourth_derivative_is_structurally_zero());
+
+        let quartic = monotone_wiggle_structure(4).expect("quartic wiggle structure");
+        assert_eq!(quartic.value_span_degree, 4);
+        assert!(!quartic.fourth_derivative_is_structurally_zero());
     }
 
     #[test]

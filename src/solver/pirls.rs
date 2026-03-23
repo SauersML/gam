@@ -1416,8 +1416,8 @@ impl<'a> GamWorkingModel<'a> {
                 // Next call will reallocate (same cost as the existing zero-fill).
                 Ok(std::mem::take(&mut workspace.hessian_buf))
             }
-            _ => design
-                .diag_xtw_x(weights)
+            _ => crate::matrix::xt_diag_x_symmetric(design, weights)
+                .map(|h| h.to_dense())
                 .map_err(EstimationError::InvalidInput),
         }
     }
@@ -1776,21 +1776,29 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         gradient += &s_beta;
         let (hessian_weights, hessian_c, hessian_d, hessian_curvature) =
             self.hessian_curvature_arrays(requested_curvature)?;
+        // Store the exact (un-floored) statistical weights for the REML outer
+        // objective.  The floor for solver conditioning is applied below only
+        // when assembling the penalized Hessian for the linear solve.
         self.lasthessian_weights.assign(&hessian_weights);
         self.lasthessian_c.assign(&hessian_c);
         self.lasthessian_d.assign(&hessian_d);
         self.lasthessian_curvature = hessian_curvature;
+
+        // Build solver-side weights: apply a per-observation SPD floor so the
+        // Newton linear system is well-conditioned, without contaminating the
+        // model weights stored in `lasthessian_weights`.
+        let solver_weights = solver_hessian_weights(&hessian_weights, &self.lastweights);
 
         let (penalized_hessian, sparsehessian, ridge_used) = if matches!(
             self.coordinate_design,
             WorkingCoordinateDesign::OriginalSparseNative
         ) {
             let (h_sparse, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
-                self.sparse_penalized_hessian(&hessian_weights, ridge)
+                self.sparse_penalized_hessian(&solver_weights, ridge)
             })?;
             (Array2::zeros((0, 0)), Some(h_sparse), ridge_used)
         } else {
-            let mut penalized_hessian = self.penalized_hessian(&hessian_weights)?;
+            let mut penalized_hessian = self.penalized_hessian(&solver_weights)?;
             #[cfg(debug_assertions)]
             debug_assert_symmetric_tol(&penalized_hessian, "PIRLS penalized Hessian", 1e-8);
             let ridge_used = ensure_positive_definitewithridge(
@@ -5607,13 +5615,10 @@ fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
         .map(DesignMatrix::from)
 }
 
-#[inline]
-fn logit_clampzero_enabled() -> bool {
-    // Auto-correct behavior: when logit geometry enters hard-clamped/nonsmooth
-    // regions, force c/d to zero to keep IRLS updates stable and consistent with
-    // piecewise-smooth objective behavior.
-    true
-}
+// When logit geometry enters hard-clamped or otherwise nonsmooth regions, keep
+// the statistical weight exact but freeze the higher eta-derivatives so PIRLS
+// and outer derivative code differentiate the same piecewise-smooth surface.
+const LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH: bool = true;
 
 #[inline]
 fn standard_inverse_link_jet(
@@ -5845,7 +5850,7 @@ pub fn update_glmvectors(
                 y[i],
                 priorweights[i],
                 jet,
-                logit_clampzero_enabled(),
+                LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH,
             );
             mu[i] = geom.mu;
             weights[i] = geom.weight;
@@ -5869,7 +5874,8 @@ pub fn update_glmvectors(
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
             let zero_on_nonsmooth =
-                matches!(link, LinkFunction::Logit) && logit_clampzero_enabled();
+                matches!(link, LinkFunction::Logit)
+                    && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
             let mut derivatives = derivatives;
             for i in 0..n {
                 let eta_used = match link {
@@ -6182,7 +6188,8 @@ pub fn update_glmvectors_integrated_by_family(
 }
 
 /// Compute first/second eta derivatives of the PIRLS working curvature W(eta),
-/// consistent with the clamping/flooring used by `update_glmvectors`.
+/// consistent with the clamped working-geometry rules used by
+/// `update_glmvectors`.
 ///
 /// Math note:
 /// - In the smooth interior (no clamps/floors active), `c[i]` and `d[i]` are
@@ -6257,7 +6264,8 @@ fn computeworkingweight_derivatives_from_eta(
         | GlmLikelihoodFamily::BinomialMixture => {
             let link = inverse_link.link_function();
             let zero_on_nonsmooth =
-                matches!(link, LinkFunction::Logit) && logit_clampzero_enabled();
+                matches!(link, LinkFunction::Logit)
+                    && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
             for i in 0..n {
                 let eta_used = match link {
                     LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
@@ -6471,9 +6479,29 @@ fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
 }
 
 #[inline]
-fn observed_hessian_weight_floor(fisher_weight: f64) -> f64 {
-    (fisher_weight.max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR) * OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC)
+fn solver_hessian_weight_floor(fisher_weight: f64) -> f64 {
+    (fisher_weight.max(0.0) * OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC)
         .max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR)
+}
+
+/// Build solver-conditioned weights from the exact hessian weights.
+///
+/// The returned array applies a solver-only floor per observation so the
+/// Newton linear system X'W X + S stays numerically usable. This floor is
+/// purely a linear-algebra concern: the exact statistical weights stored in
+/// `lasthessian_weights` / `finalweights` are not affected.
+fn solver_hessian_weights(
+    hessian_weights: &Array1<f64>,
+    fisher_weights: &Array1<f64>,
+) -> Array1<f64> {
+    let n = hessian_weights.len();
+    let mut out = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let w = hessian_weights[i];
+        let floor = solver_hessian_weight_floor(fisher_weights[i]);
+        out[i] = if w.is_finite() && w > floor { w } else { floor };
+    }
+    out
 }
 
 /// Compute vectorised observed-information curvature arrays (w_obs, c_obs, d_obs)
@@ -6486,7 +6514,7 @@ fn observed_hessian_weight_floor(fisher_weight: f64) -> f64 {
 /// and other flexible links.
 ///
 /// The output arrays are:
-/// - `hessian_weights`: W_obs per observation (floored to maintain SPD).
+/// - `hessian_weights`: W_obs per observation (exact; solver floor applied separately).
 /// - `hessian_c`: c_obs = dW_obs/deta per observation (for outer gradient C[v]).
 /// - `hessian_d`: d_obs = d^2W_obs/deta^2 per observation (for outer Hessian Q[v_k,v_l]).
 ///
@@ -6539,17 +6567,22 @@ fn compute_observed_hessian_curvature_arrays(
             jet,
             h4,
         );
-        let fisher_floor = observed_hessian_weight_floor(fisher_weights[i]);
-        // Keep the Newton system SPD when the observed correction turns the
-        // local curvature non-positive. On clamped rows we freeze the
-        // higher-order drift terms too, so exact outer derivatives continue
-        // to differentiate the same accepted Hessian surface.
-        if w_obs.is_finite() && w_obs > fisher_floor {
+        let fisher_weight = fisher_weights[i].max(0.0);
+        // Store the exact observed-information weight.  The SPD floor for
+        // solver conditioning is applied separately when assembling the
+        // penalized Hessian for the linear solve (see `solver_hessian_weights`),
+        // so `lasthessian_weights` / `finalweights` always carry the true
+        // curvature that the REML outer objective should differentiate.
+        //
+        // Only fall back to the Fisher weight when the observed correction
+        // makes the weight non-positive or non-finite — that is a validity
+        // issue, not a conditioning one.
+        if w_obs.is_finite() && w_obs > 0.0 {
             hessian_weights[i] = w_obs;
             hessian_c[i] = if c_obs.is_finite() { c_obs } else { 0.0 };
             hessian_d[i] = if d_obs.is_finite() { d_obs } else { 0.0 };
         } else {
-            hessian_weights[i] = fisher_floor;
+            hessian_weights[i] = fisher_weight;
             hessian_c[i] = 0.0;
             hessian_d[i] = 0.0;
         }
@@ -7388,7 +7421,7 @@ mod tests {
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet,
         calculate_deviance, compress_activeworking_set, compute_constraint_kkt_diagnostics,
         compute_observed_hessian_curvature_arrays, default_beta_guess_external,
-        fit_model_for_fixed_rho, logit_clampzero_enabled, should_log_pirls_decision_summary,
+        fit_model_for_fixed_rho, should_log_pirls_decision_summary,
         should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
         solve_newton_directionwith_lower_bounds, update_glmvectors,
         working_set_kkt_diagnostics_frommultipliers,

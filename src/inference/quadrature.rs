@@ -251,6 +251,19 @@ impl IntegratedInverseLinkJet5 {
     }
 }
 
+#[inline]
+pub(crate) fn validate_latent_cloglog_inputs(
+    eta: f64,
+    sigma: f64,
+) -> Result<(), EstimationError> {
+    if !eta.is_finite() || !sigma.is_finite() || sigma < 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent cloglog jet requires finite eta and sigma >= 0, got eta={eta}, sigma={sigma}"
+        )));
+    }
+    Ok(())
+}
+
 /// Typed integrated moments/derivative jet used by solver integration paths.
 ///
 /// `variance` is the observation-model variance at the integrated mean for the
@@ -1465,38 +1478,64 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     // The explicit derivatives below are written in terms of exp(mu) and
     // exp(-exp(mu)) so the PIRLS derivative uses the same approximation order
     // as the mean.
-    let z = mu.clamp(-30.0, 30.0);
-    let clamp_active = z != mu;
+    const CLOGLOG_NEGATIVE_TAIL_SWITCH: f64 = -30.0;
+
+    // Degenerate sigma: the Taylor corrections vanish and E[f(mu+sigma*Z)]
+    // collapses to f(mu).  Return the exact pointwise evaluation, which
+    // handles all mu (including far negative tail) without the negative-tail
+    // MGF approximation exp(mu + sigma^2/2) that would otherwise be used.
+    if sigma <= CLOGLOG_SIGMA_DEGENERATE {
+        return IntegratedMeanDerivative {
+            mean: cloglog_mean_exact(mu),
+            dmean_dmu: gumbel_survival_d1(mu),
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        };
+    }
+
+    let ex = mu.exp();
+    if !ex.is_finite() {
+        return IntegratedMeanDerivative {
+            mean: 1.0,
+            dmean_dmu: 0.0,
+            mode: IntegratedExpectationMode::ControlledAsymptotic,
+        };
+    }
+
+    let negative_tail = mu < CLOGLOG_NEGATIVE_TAIL_SWITCH;
     let s2 = sigma * sigma;
     let s4 = s2 * s2;
-    let ex = z.exp();
     let e2x = ex * ex;
     let e3x = e2x * ex;
     let e4x = e3x * ex;
     let e5x = e4x * ex;
     let surv = (-ex).exp();
-    let f0 = 1.0 - surv;
+    if surv == 0.0 {
+        return IntegratedMeanDerivative {
+            mean: 1.0,
+            dmean_dmu: 0.0,
+            mode: IntegratedExpectationMode::ControlledAsymptotic,
+        };
+    }
+    // Use expm1 for f0 to avoid catastrophic cancellation in 1.0 − surv
+    // when ex ≈ 0 (i.e. mu ≪ 0, surv ≈ 1).  At mu = −30 the naive
+    // subtraction loses ~14 of 16 significant digits.
+    let f0 = -(-ex).exp_m1();
     let f1 = ex * surv;
     let f2 = surv * (ex - e2x);
     let f3 = surv * (ex - 3.0 * e2x + e3x);
     let f4 = surv * (ex - 7.0 * e2x + 6.0 * e3x - e4x);
     let f5 = surv * (ex - 15.0 * e2x + 25.0 * e3x - 10.0 * e4x + e5x);
     IntegratedMeanDerivative {
-        mean: if clamp_active && mu < -30.0 {
+        mean: if negative_tail {
             // Negative tail with small sigma: E[μ(η+σZ)] ≈ E[exp(η+σZ)]
             // = exp(η + σ²/2) via the Gaussian moment-generating function.
             cloglog_negative_tail_integrated_mean(mu, sigma)
         } else {
             f0 + 0.5 * s2 * f2 + (s4 / 24.0) * f4
         },
-        dmean_dmu: if clamp_active {
-            if mu < -30.0 {
-                // Negative tail: d/dμ E[μ(η+σZ)] ≈ exp(μ + σ²/2).
-                cloglog_negative_tail_integrated_derivative(mu, sigma)
-            } else {
-                // Positive tail: genuinely negligible (double-exponential decay).
-                0.0
-            }
+        dmean_dmu: if negative_tail {
+            // Negative tail: d/dμ E[μ(η+σZ)] ≈ exp(μ + σ²/2).
+            cloglog_negative_tail_integrated_derivative(mu, sigma)
         } else {
             (f1 + 0.5 * s2 * f3 + (s4 / 24.0) * f5).max(0.0)
         },
@@ -1511,6 +1550,13 @@ fn cloglog_posterior_meanwith_deriv_ghq(
     mu: f64,
     sigma: f64,
 ) -> IntegratedMeanDerivative {
+    if sigma < 1e-10 {
+        return IntegratedMeanDerivative {
+            mean: cloglog_mean_exact(mu),
+            dmean_dmu: gumbel_survival_d1(mu),
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        };
+    }
     let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
     let dmean_dmu =
         integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| gumbel_survival_d1(x)).max(0.0);
@@ -2415,8 +2461,10 @@ pub fn integrated_inverse_link_jet(
             |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
             |x| component_point_jet(LinkComponent::Logit, x),
         ),
-        LinkFunction::CLogLog => Ok(latent_cloglog_inverse_link_jet5_controlled(quadctx, mu, sigma)
-            .into_jet3()),
+        LinkFunction::CLogLog => {
+            validate_latent_cloglog_inputs(mu, sigma)?;
+            Ok(latent_cloglog_inverse_link_jet5_controlled(quadctx, mu, sigma).into_jet3())
+        }
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
         )),
@@ -2483,7 +2531,9 @@ fn integrated_mixture_component_jet(
         )
         .unwrap_or_else(|_| integrated_logit_jet_ghq(ctx, mu, sigma)),
         LinkComponent::Probit => integrated_probit_jet(mu, sigma),
-        LinkComponent::CLogLog => latent_cloglog_inverse_link_jet5_controlled(ctx, mu, sigma).into_jet3(),
+        LinkComponent::CLogLog => {
+            latent_cloglog_inverse_link_jet5_controlled(ctx, mu, sigma).into_jet3()
+        }
         LinkComponent::LogLog | LinkComponent::Cauchit => {
             let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
                 component_point_jet(component, x)
@@ -2873,7 +2923,7 @@ pub fn logit_posterior_mean_batch(
     Ok(out)
 }
 
-trait GhqValue: Sized {
+pub(crate) trait GhqValue: Sized {
     fn zero() -> Self;
     fn addweighted(&mut self, weight: f64, value: Self);
     fn scale(self, factor: f64) -> Self;
@@ -3041,7 +3091,6 @@ fn integrated_logit_jet_ghq(
 }
 
 #[inline]
-#[inline]
 fn integrated_cloglog_eta_jet_ghq(
     ctx: &QuadratureContext,
     mu: f64,
@@ -3069,26 +3118,61 @@ pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet5 {
-    // Latent cloglog now has a single authoritative backend:
+    // Latent cloglog backend with consistent derivative tower:
     //
-    // - value / score use the existing validated scalar production route
+    // - mean / d1 come from the validated scalar production route
     //   (`cloglog_posterior_meanwith_deriv_controlled`), preserving the exact /
     //   special-function / asymptotic regime dispatch and its mode semantics.
-    // - curvature and higher eta-derivatives are integrated directly from the
-    //   exact pointwise cloglog derivative tower, using the same adaptive GHQ
-    //   operator everywhere instead of differencing lognormal-Laplace kernel
-    //   terms. That removes the cancellation that was good enough for value and
-    //   score but not for observed curvature.
+    //
+    // - d2 / d3 are obtained by finite-differencing the scalar backend's d1
+    //   (dmean_dmu) with a fourth-order symmetric stencil.  This guarantees
+    //   that d2 is the true curvature of the *same* function whose value is
+    //   `mean` and whose slope is `d1`, avoiding the consistency gap that
+    //   arose when d2 came from a separate GHQ integrator that could disagree
+    //   with the scalar backend by O(GHQ truncation error).
+    //
+    // - d4 / d5 use the direct GHQ eta-derivative jet, which is accurate
+    //   enough for the Firth and higher-order corrections that consume them.
     //
     // The public `mode` continues to report the value/score evaluator, which is
     // what downstream callers already interpret today.
+    // For degenerate sigma the pointwise jet is exact — skip FD overhead.
+    if sigma <= 1e-10 {
+        let ghq = integrated_cloglog_eta_jet_ghq(ctx, mu, sigma);
+        return IntegratedInverseLinkJet5 {
+            mean: ghq.mean,
+            d1: ghq.d1,
+            d2: ghq.d2,
+            d3: ghq.d3,
+            d4: ghq.d4,
+            d5: ghq.d5,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        };
+    }
+
     let scalar = cloglog_posterior_meanwith_deriv_controlled(ctx, mu, sigma);
     let ghq = integrated_cloglog_eta_jet_ghq(ctx, mu, sigma);
+
+    // d2, d3 via fourth-order central differences of the scalar backend's d1.
+    // This guarantees consistency with mean/d1 — see comment above.
+    let h = integrated_jet_fd_step(sigma);
+    let sm1 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu - h, sigma);
+    let sp1 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu + h, sigma);
+    let sm2 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu - 2.0 * h, sigma);
+    let sp2 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu + 2.0 * h, sigma);
+
+    let d2 = (sm2.dmean_dmu - 8.0 * sm1.dmean_dmu + 8.0 * sp1.dmean_dmu - sp2.dmean_dmu)
+        / (12.0 * h);
+    let d3 = (-sp2.dmean_dmu + 16.0 * sp1.dmean_dmu - 30.0 * scalar.dmean_dmu
+        + 16.0 * sm1.dmean_dmu
+        - sm2.dmean_dmu)
+        / (12.0 * h * h);
+
     IntegratedInverseLinkJet5 {
         mean: scalar.mean,
         d1: scalar.dmean_dmu.max(0.0),
-        d2: ghq.d2,
-        d3: ghq.d3,
+        d2,
+        d3,
         d4: ghq.d4,
         d5: ghq.d5,
         mode: scalar.mode,
@@ -3392,17 +3476,18 @@ where
 }
 
 /// Fallible adaptive N-dimensional GHQ expectation for correlated Gaussian latents.
-pub fn normal_expectation_nd_adaptive_result<const D: usize, F, E>(
+pub fn normal_expectation_nd_adaptive_result<const D: usize, F, R, E>(
     ctx: &QuadratureContext,
     mu: [f64; D],
     cov: [[f64; D]; D],
     max_n: usize,
     f: F,
-) -> Result<f64, E>
+) -> Result<R, E>
 where
-    F: Fn([f64; D]) -> Result<f64, E>,
+    F: Fn([f64; D]) -> Result<R, E>,
+    R: GhqValue,
 {
-    match ghq_nd_integrate_result::<D, _, f64, E>(ctx, mu, cov, max_n, &f)? {
+    match ghq_nd_integrate_result::<D, _, R, E>(ctx, mu, cov, max_n, &f)? {
         Some(v) => Ok(v),
         None => f(mu),
     }
@@ -3418,7 +3503,7 @@ pub fn normal_expectation_2d_adaptive_result<F, E>(
 where
     F: Fn(f64, f64) -> Result<f64, E>,
 {
-    normal_expectation_nd_adaptive_result::<2, _, E>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
+    normal_expectation_nd_adaptive_result::<2, _, _, E>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
 }
 
 /// Adaptive 3D GHQ expectation for correlated Gaussian latents.
@@ -4716,7 +4801,7 @@ mod tests {
 
     #[test]
     fn test_degenerate_cloglog_component_jet_preserves_smooth_negative_tail() {
-        let eta = -40.0;
+        let eta: f64 = -40.0;
         let t = eta.exp();
         let s = (-t).exp();
         let cloglog = component_point_jet(LinkComponent::CLogLog, eta);
@@ -4751,37 +4836,38 @@ mod tests {
     }
 
     #[test]
-    fn test_cloglog_controlled_matches_ghq_small_sigma() {
+    fn test_cloglog_controlled_matches_mathematical_target_on_small_sigma_grid() {
         let ctx = QuadratureContext::new();
-        let approx = cloglog_posterior_meanwith_deriv_controlled(&ctx, 0.4, 0.1);
-        let exact = cloglog_posterior_meanwith_deriv_ghq(&ctx, 0.4, 0.1);
-        assert_relative_eq!(approx.mean, exact.mean, epsilon = 2e-4, max_relative = 2e-4);
-        assert_relative_eq!(
-            approx.dmean_dmu,
-            exact.dmean_dmu,
-            epsilon = 2e-3,
-            max_relative = 2e-3
-        );
-    }
+        // Cover the entire small-sigma routing region with negative-tail,
+        // central, and saturated-positive cases. The reference is the
+        // mathematical Gaussian expectation, not another evaluator.
+        let cases = [
+            (-30.0, 1e-10),
+            (-30.0, 0.1),
+            (-10.0, 0.24),
+            (-3.0, 0.2),
+            (0.0, 0.05),
+            (0.4, 0.1),
+            (3.0, 0.24),
+            (10.0, 0.1),
+            (30.0, 0.24),
+        ];
 
-    #[test]
-    fn test_cloglog_controlled_matches_ghq_on_small_sigma_grid() {
-        let ctx = QuadratureContext::new();
-        let mus = [-30.0, -10.0, -3.0, 0.0, 3.0, 10.0, 30.0];
-        let sigmas = [1e-10, 1e-8, 0.01, 0.05, 0.1, 0.2, 0.24];
-
-        for &mu in &mus {
-            for &sigma in &sigmas {
-                let approx = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
-                let ghq = cloglog_posterior_meanwith_deriv_ghq(&ctx, mu, sigma);
-                assert_relative_eq!(approx.mean, ghq.mean, epsilon = 2e-3, max_relative = 2e-3);
-                assert_relative_eq!(
-                    approx.dmean_dmu,
-                    ghq.dmean_dmu,
-                    epsilon = 4e-3,
-                    max_relative = 4e-3
-                );
-            }
+        for &(mu, sigma) in &cases {
+            let approx = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
+            let (expected_mean, expected_deriv) = cloglog_reference_mean_and_derivative(mu, sigma);
+            assert_relative_eq!(
+                approx.mean,
+                expected_mean,
+                epsilon = 1e-12,
+                max_relative = 2e-3
+            );
+            assert_relative_eq!(
+                approx.dmean_dmu,
+                expected_deriv,
+                epsilon = 1e-12,
+                max_relative = 4e-3
+            );
         }
     }
 
@@ -4836,9 +4922,8 @@ mod tests {
             let u2 = ((rng_state as f64) / (u64::MAX as f64)).clamp(1e-12, 1.0 - 1e-12);
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
             let eta = mu + sigma * z;
-            let ez = eta.clamp(-30.0, 30.0).exp();
-            mean_mc += 1.0 - (-ez).exp();
-            deriv_mc += ez * (-ez).exp();
+            mean_mc += cloglog_mean_exact(eta);
+            deriv_mc += gumbel_survival_d1(eta);
         }
         mean_mc /= n_samples as f64;
         deriv_mc /= n_samples as f64;
@@ -5210,9 +5295,10 @@ mod tests {
     // ── Cloglog negative-tail asymptotic tests ──────────────────────────
 
     #[test]
-    fn cloglog_negative_tail_mean_matches_exact_near_boundary() {
+    fn cloglog_negative_tail_mean_matches_exact_near_transition() {
         // At η = −30 the exact cloglog mean is 1 − exp(−exp(−30)).
-        // Our tail helper should agree to high relative accuracy.
+        // Our tail helper should agree to high relative accuracy where the
+        // implementation transitions into the negative-tail approximation.
         let eta: f64 = -30.0;
         let exact = {
             let ex = eta.exp();
@@ -5226,7 +5312,7 @@ mod tests {
     }
 
     #[test]
-    fn cloglog_negative_tail_derivative_matches_exact_near_boundary() {
+    fn cloglog_negative_tail_derivative_matches_exact_near_transition() {
         // At η = −30: dμ/dη = exp(η)·exp(−exp(η)).
         let eta: f64 = -30.0;
         let ex = eta.exp();

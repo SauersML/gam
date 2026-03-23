@@ -326,7 +326,7 @@ where
         return integrand(mu[0], mu[1]);
     }
     if var0 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
-        return crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, EstimationError>(
+        return crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
             quadctx,
             [mu[1]],
             [[var1]],
@@ -335,7 +335,7 @@ where
         );
     }
     if var1 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
-        return crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, EstimationError>(
+        return crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
             quadctx,
             [mu[0]],
             [[var0]],
@@ -964,80 +964,14 @@ impl BernoulliMarginalSlopePredictor {
             }
         };
         if let Some(runtime) = score_warp_runtime.as_ref() {
-            if runtime.schema_version
-                != crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
-            {
-                return Err(format!(
-                    "bernoulli marginal-slope score-warp runtime uses unsupported schema_version {}; expected {}",
-                    runtime.schema_version,
-                    crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
-                ));
-            }
-            if runtime.kernel.is_empty() {
-                return Err(
-                    "bernoulli marginal-slope score-warp runtime is missing exact kernel metadata"
-                        .to_string(),
-                );
-            }
-            if runtime.kernel
-                != crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-            {
-                return Err(format!(
-                    "bernoulli marginal-slope score-warp runtime uses unsupported kernel '{}'; expected {}",
-                    runtime.kernel,
-                    crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                ));
-            }
-            if runtime.degree != 3 {
-                return Err(format!(
-                    "bernoulli marginal-slope score-warp runtime must be cubic (degree=3), got degree={}",
-                    runtime.degree
-                ));
-            }
-            if runtime.value_span_degree >= 4 {
-                return Err(format!(
-                    "bernoulli marginal-slope score-warp runtime requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {}",
-                    runtime.value_span_degree
-                ));
-            }
+            runtime.validate_exact_replay_contract().map_err(|e| {
+                format!("bernoulli marginal-slope score-warp runtime is invalid: {e}")
+            })?;
         }
         if let Some(runtime) = link_deviation_runtime.as_ref() {
-            if runtime.schema_version
-                != crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
-            {
-                return Err(format!(
-                    "bernoulli marginal-slope link-deviation runtime uses unsupported schema_version {}; expected {}",
-                    runtime.schema_version,
-                    crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
-                ));
-            }
-            if runtime.kernel.is_empty() {
-                return Err(
-                    "bernoulli marginal-slope link-deviation runtime is missing exact kernel metadata"
-                        .to_string(),
-                );
-            }
-            if runtime.kernel
-                != crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-            {
-                return Err(format!(
-                    "bernoulli marginal-slope link-deviation runtime uses unsupported kernel '{}'; expected {}",
-                    runtime.kernel,
-                    crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                ));
-            }
-            if runtime.degree != 3 {
-                return Err(format!(
-                    "bernoulli marginal-slope link-deviation runtime must be cubic (degree=3), got degree={}",
-                    runtime.degree
-                ));
-            }
-            if runtime.value_span_degree >= 4 {
-                return Err(format!(
-                    "bernoulli marginal-slope link-deviation runtime requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {}",
-                    runtime.value_span_degree
-                ));
-            }
+            runtime.validate_exact_replay_contract().map_err(|e| {
+                format!("bernoulli marginal-slope link-deviation runtime is invalid: {e}")
+            })?;
         }
         let blocks = &unified.blocks;
         let expected_blocks = 2
@@ -3676,8 +3610,6 @@ mod tests {
             baseline_logslope: 0.0,
             covariance: None,
             score_warp_runtime: Some(SavedAnchoredDeviationRuntime {
-                schema_version:
-                    crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
                 kernel: "OldQuadrature".to_string(),
                 knots: vec![-10.0, -10.0, 10.0, 10.0],
                 degree: 1,
@@ -3696,9 +3628,19 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("ExactDenestedCubic"));
 
+        let quadratic = SavedAnchoredDeviationRuntime {
+            kernel:
+                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
+                    .to_string(),
+            knots: vec![-10.0, -10.0, -10.0, -10.0, 10.0, 10.0, 10.0, 10.0],
+            degree: 2,
+            value_span_degree: 2,
+            basis_dim: 2,
+            basis_transform: nested_identity(2),
+        };
+        assert!(quadratic.design(&array![0.0]).is_ok());
+
         let structurally_invalid = SavedAnchoredDeviationRuntime {
-            schema_version:
-                crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
             kernel:
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                     .to_string(),
@@ -3714,8 +3656,6 @@ mod tests {
         assert!(err.contains("piecewise degree 4"));
 
         let cubic = SavedAnchoredDeviationRuntime {
-            schema_version:
-                crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
             kernel:
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                     .to_string(),
@@ -3740,8 +3680,6 @@ mod tests {
         .expect("raw basis")
         .ncols();
         let runtime = SavedAnchoredDeviationRuntime {
-            schema_version:
-                crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
             kernel:
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                     .to_string(),
@@ -3795,8 +3733,6 @@ mod tests {
         .expect("raw basis")
         .ncols();
         let runtime = SavedAnchoredDeviationRuntime {
-            schema_version:
-                crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
             kernel:
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                     .to_string(),

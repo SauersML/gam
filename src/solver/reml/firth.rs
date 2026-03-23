@@ -283,6 +283,13 @@ impl FirthDenseOperator {
         Ok((q_basis, metric_spectrum))
     }
 
+    #[inline]
+    fn trace_diag_product(diag: &Array1<f64>, matrix: &Array2<f64>) -> f64 {
+        debug_assert_eq!(diag.len(), matrix.nrows());
+        debug_assert_eq!(matrix.nrows(), matrix.ncols());
+        kahan_sum((0..diag.len()).map(|i| diag[i] * matrix[[i, i]]))
+    }
+
     pub(crate) fn build(
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
@@ -460,7 +467,7 @@ impl FirthDenseOperator {
         }
 
         let mut k_reduced = Array2::<f64>::zeros((r, r));
-        let mut x_metric_reduced_inv = Array2::<f64>::zeros((r, r));
+        let mut x_metric_reduced_inv_diag = Array1::<f64>::zeros(r);
         let mut half_log_det = 0.0_f64;
         if r > 0 {
             // The fixed-Q identifiable-space value is the generalized
@@ -512,7 +519,7 @@ impl FirthDenseOperator {
             for col in 0..r {
                 let metric_eig = metric_spectrum[col];
                 half_log_det -= 0.5 * metric_eig.ln();
-                x_metric_reduced_inv[[col, col]] = metric_eig.recip();
+                x_metric_reduced_inv_diag[col] = metric_eig.recip();
             }
         }
         // Reduced design enters M = Z K_r Z' and P = M⊙M.
@@ -536,7 +543,7 @@ impl FirthDenseOperator {
             z_reduced,
             observation_weight_sqrt,
             k_reduced,
-            x_metric_reduced_inv,
+            x_metric_reduced_inv_diag,
             half_log_det,
             h_diag,
             w,
@@ -907,8 +914,9 @@ impl FirthDenseOperator {
         // Closed forms (reduced Fisher, fixed active subspace):
         //   Phi = 0.5 log|I_r| - 0.5 log|S_r|,
         //   I_r = X_r' W X_r, K_r = I_r^{-1},
-        //   S_r = X_r' X_r,   G_r = S_r^{-1},
+        //   S_r = X_r' X_r,   diag(G_r) = diag(S_r^{-1}),
         //   Phi_tau|beta = 0.5 tr(K_r I_{r,tau}) - 0.5 tr(G_r S_{r,tau}).
+        // In the canonical reduced basis used here, G_r is diagonal.
         //
         //   (gphi)_tau = Phi_beta,tau
         //               = 0.5 X_tau' (w1 .* h)
@@ -934,7 +942,7 @@ impl FirthDenseOperator {
         let second = 0.5 * self.x_dense.t().dot(&secondvec);
         let gphi_tau = first + second;
         let phi_tau_partial = 0.5 * RemlState::trace_product(&self.k_reduced, &dot_i_partial)
-            - 0.5 * RemlState::trace_product(&self.x_metric_reduced_inv, &dot_s_partial);
+            - 0.5 * Self::trace_diag_product(&self.x_metric_reduced_inv_diag, &dot_s_partial);
 
         let tau_kernel = if include_hphi_tau_kernel {
             Some(self.hphi_tau_partial_prepare_from_partials(
@@ -1260,7 +1268,7 @@ mod tests {
         let basis = array![[1.4, -0.3], [0.6, 1.1]];
         let x_reparameterized = x.dot(&basis);
         let beta = array![0.25, -0.5];
-        let basis_det = basis[[0, 0]] * basis[[1, 1]] - basis[[0, 1]] * basis[[1, 0]];
+        let basis_det: f64 = basis[[0, 0]] * basis[[1, 1]] - basis[[0, 1]] * basis[[1, 0]];
         assert!(
             basis_det.abs() > 1e-12,
             "basis transform must be invertible"

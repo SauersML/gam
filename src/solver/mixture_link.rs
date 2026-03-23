@@ -263,7 +263,7 @@ fn chain_inverse_link_jet(base: InverseLinkJet, z1: f64, z2: f64, z3: f64) -> In
 }
 
 #[inline]
-pub(crate) fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64) -> f64 {
+fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64) -> f64 {
     match component {
         LinkComponent::Probit => probit_pdfthird_derivative(eta),
         LinkComponent::Logit => logit_inverse_link_jet5(eta).d4,
@@ -329,7 +329,7 @@ pub(crate) fn component_inverse_link_pdfthird_derivative(component: LinkComponen
 /// Fifth derivative of a component inverse-link CDF (= fourth derivative of PDF).
 /// Extends `component_inverse_link_pdfthird_derivative` by one derivative order.
 #[inline]
-pub(crate) fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f64) -> f64 {
+fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f64) -> f64 {
     match component {
         LinkComponent::Probit => probit_pdffourth_derivative(eta),
         LinkComponent::Logit => logit_inverse_link_jet5(eta).d5,
