@@ -226,6 +226,10 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             solver: S::Arc,
             hessian_source: H::Analytic,
         },
+        (Analytic, FiniteDifference) => OuterPlan {
+            solver: S::NewtonTrustRegion,
+            hessian_source: H::FiniteDifference,
+        },
 
         // EFS: all penalty-like coords, no analytic Hessian, many params.
         // Multiplicative fixed-point needs only traces — no gradient evals.

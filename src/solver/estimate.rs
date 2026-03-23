@@ -779,14 +779,15 @@ impl RemlConfig {
             likelihood,
             link_kind: InverseLink::Standard(likelihood.link_function()),
             convergence_tolerance: reml_tol,
-            max_iterations: 100,
+            max_iterations: 0,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
             objective_consistentfdgradient: false,
         }
+        .with_max_iterations(100)
     }
 
-    fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+    pub(crate) fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
     }

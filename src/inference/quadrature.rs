@@ -1543,7 +1543,6 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     }
 }
 
-#[cfg(test)]
 #[inline]
 fn cloglog_posterior_meanwith_deriv_ghq(
     ctx: &QuadratureContext,
@@ -2353,13 +2352,14 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
 
     let ((survival, mode), (shifted_survival, shifted_mode)) =
         cloglog_survival_pair_controlled(ctx, mu, sigma);
-    let mean = cloglog_mean_from_survival(survival);
-    let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
-    let mode = if matches!(mode, IntegratedExpectationMode::QuadratureFallback)
+    if matches!(mode, IntegratedExpectationMode::QuadratureFallback)
         || matches!(shifted_mode, IntegratedExpectationMode::QuadratureFallback)
     {
-        IntegratedExpectationMode::QuadratureFallback
-    } else if matches!(mode, IntegratedExpectationMode::ControlledAsymptotic)
+        return cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
+    }
+    let mean = cloglog_mean_from_survival(survival);
+    let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
+    let mode = if matches!(mode, IntegratedExpectationMode::ControlledAsymptotic)
         || matches!(
             shifted_mode,
             IntegratedExpectationMode::ControlledAsymptotic
@@ -2923,7 +2923,7 @@ pub fn logit_posterior_mean_batch(
     Ok(out)
 }
 
-pub(crate) trait GhqValue: Sized {
+pub trait GhqValue: Sized {
     fn zero() -> Self;
     fn addweighted(&mut self, weight: f64, value: Self);
     fn scale(self, factor: f64) -> Self;
