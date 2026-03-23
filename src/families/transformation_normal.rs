@@ -29,7 +29,9 @@ use crate::families::custom_family::{
     PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper, fit_custom_family,
 };
-use crate::families::gamlss::initializewiggle_knots_from_seed;
+use crate::families::gamlss::{
+    initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
+};
 use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
@@ -81,6 +83,7 @@ impl Default for TransformationNormalConfig {
 /// letting the response basis stay at its default size when the covariate side
 /// is already wide creates cubic blowups on small datasets.
 const MAX_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+const STANDARD_NORMAL_LOG_ABS_MEAN: f64 = -0.635_181_422_730_739_1;
 
 /// Optional warm-start for the transformation model: per-observation location and
 /// scale values from a prior mean/SD normalizer.
@@ -1893,6 +1896,9 @@ pub fn fit_transformation_normal(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
+    let mut options = options.clone();
+    options.use_outer_hessian = true;
+
     // 1. Build a bootstrap covariate design first so the response basis can
     // adapt to the tensor width instead of always using the global default.
     let boot_design = build_term_collection_design(covariate_data, covariate_spec)
@@ -1937,7 +1943,7 @@ pub fn fit_transformation_normal(
             warm_start,
         )?;
         let blocks = vec![family.block_spec()];
-        let fit = fit_custom_family(&family, &blocks, options)
+        let fit = fit_custom_family(&family, &blocks, &options)
             .map_err(|e| format!("transformation fit failed: {e}"))?;
 
         return Ok(TransformationNormalFitResult {
@@ -1993,7 +1999,7 @@ pub fn fit_transformation_normal(
     )?;
     let probe_blocks = vec![probe_family.block_spec()];
     let (cap_gradient, cap_hessian) =
-        custom_family_outer_derivatives(&probe_family, &probe_blocks, options);
+        custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
     let analytic_gradient = analytic_psi_available
         && matches!(
             cap_gradient,
@@ -2069,7 +2075,7 @@ pub fn fit_transformation_normal(
         |_, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let family = make_family(&designs[0])?;
             let blocks = make_blocks(&family);
-            let fit = fit_custom_family(&family, &blocks, options)
+            let fit = fit_custom_family(&family, &blocks, &options)
                 .map_err(|e| format!("transformation fit_fn: {e}"))?;
             // Update warm start hints.
             if let Some(block) = fit.block_states.first() {
@@ -2098,7 +2104,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper(
                 &family,
                 &blocks,
-                options,
+                &options,
                 rho,
                 &derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
