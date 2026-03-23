@@ -3742,6 +3742,52 @@ mod tests {
     }
 
     #[test]
+    fn bernoulli_marginal_slope_rigid_gaussian_frailty_uses_scaled_closed_form() {
+        let predictor = BernoulliMarginalSlopePredictor {
+            beta_marginal: array![0.7],
+            beta_logslope: array![-0.4],
+            beta_score_warp: None,
+            beta_link_dev: None,
+            z_column: "z".to_string(),
+            baseline_marginal: 0.1,
+            baseline_logslope: -0.2,
+            covariance: None,
+            score_warp_runtime: None,
+            link_deviation_runtime: None,
+            gaussian_frailty_sd: Some(0.8),
+        };
+        let theta = predictor.theta();
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0], [1.0]]),
+            offset: array![0.0, 0.05],
+            design_noise: Some(DesignMatrix::from(array![[1.0], [1.0]])),
+            offset_noise: Some(array![0.0, -0.1]),
+            auxiliary_scalar: Some(array![-0.3, 1.2]),
+        };
+
+        let (eta, grad) = predictor
+            .final_eta_and_gradient_from_theta(&input, &theta, true)
+            .expect("rigid frailty path should evaluate");
+
+        let scale = predictor.probit_frailty_scale();
+        let marginal_eta = array![0.8, 0.85];
+        let logslope_eta = array![-0.6, -0.7];
+        let z = array![-0.3, 1.2];
+        for i in 0..eta.len() {
+            let sb = scale * logslope_eta[i];
+            let c = (1.0 + sb * sb).sqrt();
+            let expected_eta = marginal_eta[i] * c + sb * z[i];
+            assert!((eta[i] - expected_eta).abs() <= 1e-12);
+            let expected_d_marginal = c;
+            let expected_d_logslope =
+                marginal_eta[i] * scale * scale * logslope_eta[i] / c + scale * z[i];
+            let grad = grad.as_ref().expect("gradient should be returned");
+            assert!((grad[[i, 0]] - expected_d_marginal).abs() <= 1e-12);
+            assert!((grad[[i, 1]] - expected_d_logslope).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
     fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
         let prepared = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(

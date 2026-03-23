@@ -6213,6 +6213,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
             payload.survival_baseline_makeham = baseline_cfg.makeham;
+            payload.survival_likelihood = Some(
+                if likelihood_mode == SurvivalLikelihoodMode::Latent {
+                    "latent"
+                } else {
+                    "latent-binary"
+                }
+                .to_string(),
+            );
             payload.survival_time_basis = Some(time_build.basisname.clone());
             payload.survival_time_degree = time_build.degree;
             payload.survival_time_knots = time_build.knots.clone();
@@ -6489,6 +6497,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_time_knots = time_build.knots.clone();
             payload.survival_time_keep_cols = time_build.keep_cols.clone();
             payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+            payload.survival_likelihood = Some(
+                if likelihood_mode == SurvivalLikelihoodMode::Latent {
+                    "latent"
+                } else {
+                    "latent-binary"
+                }
+                .to_string(),
+            );
             payload.survival_time_anchor = Some(time_anchor);
             payload.survival_beta_time = Some(fit.beta_time().to_vec());
             set_saved_offset_columns(
@@ -11660,9 +11676,9 @@ mod tests {
         parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
         required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
-        saved_linkwiggle_design, summarizewiggle_domain,
-        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
-        write_survival_binary_prediction_csv, write_survival_prediction_csv,
+        saved_linkwiggle_design, summarizewiggle_domain, validate_cli_firth_configuration,
+        write_gaussian_location_scale_prediction_csv, write_survival_binary_prediction_csv,
+        write_survival_prediction_csv,
     };
     use super::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
     use csv::StringRecord;
@@ -13824,6 +13840,36 @@ mod tests {
     }
 
     #[test]
+    fn saved_survival_flex_exit_helper_matches_gaussian_frailty_rigid_formula() {
+        let q_exit = array![-0.8, 0.4];
+        let slope = array![0.3, -1.1];
+        let z = array![0.2, -0.7];
+        let gaussian_frailty_sd = Some(0.9);
+
+        let (eta, mean) = super::predict_saved_survival_marginal_slope_flex_exit(
+            &q_exit,
+            &slope,
+            &z,
+            gaussian_frailty_sd,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("rigid frailty path should predict");
+
+        let scale = super::probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+        for i in 0..q_exit.len() {
+            let sb = scale * slope[i];
+            let c = (1.0 + sb * sb).sqrt();
+            let expected_eta = q_exit[i] * c + sb * z[i];
+            let expected_mean = super::normal_cdf(-expected_eta);
+            assert!((eta[i] - expected_eta).abs() <= 1e-10);
+            assert!((mean[i] - expected_mean).abs() <= 1e-10);
+        }
+    }
+
+    #[test]
     fn saved_baseline_timewiggle_components_return_none_without_metadata() {
         let eta = array![0.1, 0.2];
         let deriv = array![0.3, 0.4];
@@ -14078,6 +14124,25 @@ mod tests {
         let mode =
             super::require_saved_survival_likelihood_mode(&model).expect("latent-binary mode");
         assert_eq!(mode, SurvivalLikelihoodMode::LatentBinary);
+    }
+
+    #[test]
+    fn explicit_latent_survival_family_requires_matching_saved_likelihood_metadata() {
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ 1",
+            ModelKind::Survival,
+            FittedFamily::LatentSurvival {
+                frailty: gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                    sigma_fixed: Some(0.3),
+                    loading: gam::families::lognormal_kernel::HazardLoading::Full,
+                },
+            },
+            "latent-survival",
+        );
+        payload.survival_likelihood = Some("latent".to_string());
+        let model = SavedModel::from_payload(payload);
+        let mode = super::require_saved_survival_likelihood_mode(&model).expect("latent mode");
+        assert_eq!(mode, SurvivalLikelihoodMode::Latent);
     }
 
     #[test]
