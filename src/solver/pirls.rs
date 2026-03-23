@@ -5642,13 +5642,17 @@ fn bernoulli_logit_geometry_from_jet(
     WorkingBernoulliGeometry {
         mu: jet.mu,
         weight: priorweight * fisher,
-        z: bernoulli_working_response(eta_used, y, jet.mu, jet.d1),
+        z: bernoulli_exact_working_response(eta_used, y, jet.mu, jet.d1),
         c,
         d,
     }
 }
 
 /// Compute working IRLS geometry for a single Bernoulli observation.
+///
+/// This helper returns the exact statistical working state. It does not floor
+/// the Fisher mass or the working response for solver conditioning; doing so
+/// would change the model rather than just the Newton system.
 ///
 /// The weight returned is the **Fisher** (expected information) weight
 /// W_F = h'(η)² / V(μ). The c and d fields are likewise the Fisher
@@ -5670,16 +5674,14 @@ fn bernoulli_geometry_from_jet(
     y: f64,
     priorweight: f64,
     jet: MixtureInverseLinkJet,
-    zero_on_nonsmooth: bool,
 ) -> WorkingBernoulliGeometry {
-    const PROB_EPS: f64 = 1e-8;
-
     let mu = jet.mu;
-    let v = (mu * (1.0 - mu)).max(PROB_EPS);
+    let v = mu * (1.0 - mu);
     let n0 = jet.d1 * jet.d1;
-    let fisher = n0 / v;
-    let nonsmooth = eta_raw != eta_used || !fisher.is_finite() || fisher < 0.0;
-    let (c, d) = if nonsmooth && zero_on_nonsmooth {
+    let fisher = if v.is_finite() && v > 0.0 { n0 / v } else { 0.0 };
+    let nonsmooth =
+        eta_raw != eta_used || !v.is_finite() || v <= 0.0 || !fisher.is_finite() || fisher < 0.0;
+    let (c, d) = if nonsmooth {
         (0.0, 0.0)
     } else {
         let v1 = jet.d1 * (1.0 - 2.0 * mu);
@@ -5694,14 +5696,17 @@ fn bernoulli_geometry_from_jet(
     WorkingBernoulliGeometry {
         mu,
         weight: priorweight * fisher,
-        z: bernoulli_working_response(eta_used, y, mu, jet.d1),
+        z: bernoulli_exact_working_response(eta_used, y, mu, jet.d1),
         c,
         d,
     }
 }
 
 #[inline]
-fn bernoulli_working_response(eta: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
+fn bernoulli_exact_working_response(eta: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
+    // Preserve the exact IRLS score carrier W(z-eta) = y-mu whenever the link
+    // jet is finite. Numerical conditioning belongs in the linear solve, not in
+    // the Bernoulli likelihood geometry.
     if dmu_deta.is_finite() && dmu_deta > 0.0 {
         let delta = (y - mu) / dmu_deta;
         if delta.is_finite() {
@@ -5876,35 +5881,45 @@ pub fn update_glmvectors(
                     LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
                     LinkFunction::Identity => eta[i],
                 };
-                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                let geom = if matches!(link, LinkFunction::Logit) {
-                    bernoulli_logit_geometry_from_jet(
-                        eta[i],
-                        eta_used,
-                        y[i],
-                        priorweights[i],
-                        logit_inverse_link_jet5(eta_used),
-                        zero_on_nonsmooth,
-                    )
-                } else {
-                    bernoulli_geometry_from_jet(
+                if matches!(link, LinkFunction::Logit) {
+                    let jet = logit_inverse_link_jet5(eta_used);
+                    let geom = bernoulli_logit_geometry_from_jet(
                         eta[i],
                         eta_used,
                         y[i],
                         priorweights[i],
                         jet,
                         zero_on_nonsmooth,
-                    )
-                };
-                mu[i] = geom.mu;
-                weights[i] = geom.weight;
-                z[i] = geom.z;
-                if let Some(derivs) = derivatives.as_mut() {
-                    derivs.c[i] = geom.c;
-                    derivs.d[i] = geom.d;
-                    derivs.dmu_deta[i] = jet.d1;
-                    derivs.d2mu_deta2[i] = jet.d2;
-                    derivs.d3mu_deta3[i] = jet.d3;
+                    );
+                    mu[i] = geom.mu;
+                    weights[i] = geom.weight;
+                    z[i] = geom.z;
+                    if let Some(derivs) = derivatives.as_mut() {
+                        derivs.c[i] = geom.c;
+                        derivs.d[i] = geom.d;
+                        derivs.dmu_deta[i] = jet.d1;
+                        derivs.d2mu_deta2[i] = jet.d2;
+                        derivs.d3mu_deta3[i] = jet.d3;
+                    }
+                } else {
+                    let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                    let geom = bernoulli_geometry_from_jet(
+                        eta[i],
+                        eta_used,
+                        y[i],
+                        priorweights[i],
+                        jet,
+                    );
+                    mu[i] = geom.mu;
+                    weights[i] = geom.weight;
+                    z[i] = geom.z;
+                    if let Some(derivs) = derivatives.as_mut() {
+                        derivs.c[i] = geom.c;
+                        derivs.d[i] = geom.d;
+                        derivs.dmu_deta[i] = jet.d1;
+                        derivs.d2mu_deta2[i] = jet.d2;
+                        derivs.d3mu_deta3[i] = jet.d3;
+                    }
                 }
             }
             Ok(())
@@ -6063,7 +6078,6 @@ pub fn update_glmvectors_integrated_for_link(
         )));
     }
     let n = eta.len();
-    let zero_on_nonsmooth = matches!(link, LinkFunction::Logit) && logit_clampzero_enabled();
     let mut derivatives = derivatives;
     for i in 0..n {
         let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
@@ -6095,7 +6109,6 @@ pub fn update_glmvectors_integrated_for_link(
             y[i],
             priorweights[i],
             local_jet,
-            zero_on_nonsmooth,
         );
         mu[i] = geom.mu;
         weights[i] = geom.weight;
@@ -6180,11 +6193,10 @@ pub fn update_glmvectors_integrated_by_family(
 ///   through the working-curvature map W(η).
 /// - They are load-bearing in exact outer derivatives:
 ///   `c` enters dH/dρ (outer gradient), and `d` enters d²H/dρ² (outer Hessian).
-/// - When clamps/floors activate (e.g. η saturation, μ near {0,1}, tiny weights),
-///   the update map is piecewise and no longer C². Setting c_i=d_i=0 is a
-///   practical subgradient-like choice to avoid unstable explosive derivatives.
-///   In that regime analytic and central-FD gradients can diverge because FD may
-///   straddle a kink.
+/// - When hard clamps activate, the update map is piecewise and no longer C².
+///   Setting c_i=d_i=0 is a practical subgradient-like choice to avoid unstable
+///   explosive derivatives. In that regime analytic and central-FD gradients can
+///   diverge because FD may straddle a kink.
 fn computeworkingweight_derivatives_from_eta(
     likelihood: GlmLikelihoodSpec,
     inverse_link: &InverseLink,
@@ -6256,20 +6268,36 @@ fn computeworkingweight_derivatives_from_eta(
                     LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
                     LinkFunction::Identity => eta[i],
                 };
-                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                let geom = bernoulli_geometry_from_jet(
-                    eta[i],
-                    eta_used,
-                    jet.mu,
-                    priorweights[i],
-                    jet,
-                    zero_on_nonsmooth,
-                );
-                c[i] = geom.c;
-                d[i] = geom.d;
-                dmu_deta[i] = jet.d1;
-                d2mu_deta2[i] = jet.d2;
-                d3mu_deta3[i] = jet.d3;
+                if matches!(link, LinkFunction::Logit) {
+                    let jet = logit_inverse_link_jet5(eta_used);
+                    let geom = bernoulli_logit_geometry_from_jet(
+                        eta[i],
+                        eta_used,
+                        jet.mu,
+                        priorweights[i],
+                        jet,
+                        zero_on_nonsmooth,
+                    );
+                    c[i] = geom.c;
+                    d[i] = geom.d;
+                    dmu_deta[i] = jet.d1;
+                    d2mu_deta2[i] = jet.d2;
+                    d3mu_deta3[i] = jet.d3;
+                } else {
+                    let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                    let geom = bernoulli_geometry_from_jet(
+                        eta[i],
+                        eta_used,
+                        jet.mu,
+                        priorweights[i],
+                        jet,
+                    );
+                    c[i] = geom.c;
+                    d[i] = geom.d;
+                    dmu_deta[i] = jet.d1;
+                    d2mu_deta2[i] = jet.d2;
+                    d3mu_deta3[i] = jet.d3;
+                }
             }
         }
     }
@@ -7777,8 +7805,6 @@ mod tests {
                     d2: jet.d2,
                     d3: jet.d3,
                 },
-                false,
-                logit_clampzero_enabled(),
             );
             assert_relative_eq!(
                 fit.solve_dmu_deta[i],

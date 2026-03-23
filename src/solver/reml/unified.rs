@@ -4891,9 +4891,22 @@ fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
 /// Returns a strictly positive value for any real `sigma`. For large positive
 /// `sigma` this is approximately `sigma`; near zero it smoothly floors at `epsilon`.
 #[inline]
-fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
+pub(crate) fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
     let four_eps_sq = 4.0 * epsilon * epsilon;
     0.5 * (sigma + (sigma * sigma + four_eps_sq).sqrt())
+}
+
+/// Compute the spectral regularization scale for a set of eigenvalues.
+///
+/// `ε = √(machine_eps) × max(|σ_max|, 1)` — identical to the scale used by
+/// [`DenseSpectralOperator::from_symmetric`].
+#[inline]
+pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
+    let max_ev = eigenvalues
+        .iter()
+        .copied()
+        .fold(0.0_f64, |a: f64, b: f64| a.max(b.abs()));
+    f64::EPSILON.sqrt() * max_ev.max(1.0)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4949,15 +4962,7 @@ impl DenseSpectralOperator {
             .eigh(Side::Lower)
             .map_err(|e| format!("Eigendecomposition failed: {e}"))?;
 
-        // Regularization scale: ε = √(machine_eps) × max(|eigenvalues|, 1)
-        // This is O(√eps) × spectral scale — small enough to be transparent
-        // for well-conditioned eigenvalues, large enough to smoothly handle
-        // near-zero or negative eigenvalues.
-        let max_ev = eigenvalues
-            .iter()
-            .copied()
-            .fold(0.0_f64, |a: f64, b: f64| a.max(b.abs()));
-        let epsilon = f64::EPSILON.sqrt() * max_ev.max(1.0);
+        let epsilon = spectral_epsilon(eigenvalues.as_slice().unwrap());
 
         // Apply smooth regularization to all eigenvalues
         let reg_eigenvalues: Vec<f64> = eigenvalues

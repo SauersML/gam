@@ -364,6 +364,42 @@ pub enum BlockWorkingSet {
     },
 }
 
+/// Slice a joint Hessian's principal diagonal blocks and pair them with
+/// pre-computed per-block gradients to form `ExactNewton` working sets.
+///
+/// `block_gradients[k]` is the gradient for block k.
+/// `block_ranges[k]` gives the coefficient index range for block k in
+/// the flat joint parameter vector.
+/// The Hessian for each block is the principal diagonal block
+/// `joint_hessian[range, range]`.
+///
+/// This is the single authoritative way to derive block Hessians: they are
+/// always views of the joint Hessian, never independently computed.
+pub fn slice_joint_into_block_working_sets(
+    block_gradients: Vec<Array1<f64>>,
+    joint_hessian: &Array2<f64>,
+    block_ranges: &[std::ops::Range<usize>],
+) -> Vec<BlockWorkingSet> {
+    assert_eq!(
+        block_gradients.len(),
+        block_ranges.len(),
+        "slice_joint_into_block_working_sets: gradient/range count mismatch"
+    );
+    block_gradients
+        .into_iter()
+        .zip(block_ranges.iter())
+        .map(|(gradient, range)| {
+            let hessian = joint_hessian
+                .slice(s![range.clone(), range.clone()])
+                .to_owned();
+            BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(hessian),
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExactNewtonOuterObjective {
     RidgedQuadraticReml,

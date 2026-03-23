@@ -224,7 +224,7 @@ fn build_weighted_primary_design(
     wx
 }
 
-fn rrqr_rank_tolerance(leading_diag: f64, major_dim: usize) -> f64 {
+fn scale_projection_rank_tolerance(leading_diag: f64, major_dim: usize) -> f64 {
     default_rrqr_rank_alpha() * f64::EPSILON * (major_dim.max(1) as f64) * leading_diag.max(1.0)
 }
 
@@ -248,11 +248,13 @@ fn solve_scale_projection(
     let sqrtw = weights.mapv(f64::sqrt);
     let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows);
     let wx_faer = FaerArrayView::new(&wx);
+    // Keep one explicit RRQR factorization and one explicit rank policy for all
+    // projection coefficients so dense and operator-backed paths reuse the same solve.
     let qr = wx_faer.as_ref().col_piv_qr();
     let r = qr.thin_R();
     let diag_len = r.nrows().min(r.ncols());
     let leading_diag = if diag_len > 0 { r[(0, 0)].abs() } else { 0.0 };
-    let tol = rrqr_rank_tolerance(leading_diag, n.max(p_primary));
+    let tol = scale_projection_rank_tolerance(leading_diag, n.max(p_primary));
     let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
     let (perm_fwd, _) = qr.P().arrays();
     let perm_fwd: Vec<usize> = perm_fwd.iter().map(|idx| idx.unbound()).collect();
@@ -321,7 +323,7 @@ fn apply_projection_chunk(
     if first_active >= projection_coef.ncols() {
         Array2::<f64>::zeros((x_chunk.nrows(), 0))
     } else {
-        x_chunk.dot(&projection_coef.slice(s![.., first_active..]))
+        fast_ab(x_chunk, &projection_coef.slice(s![.., first_active..]))
     }
 }
 
@@ -490,8 +492,12 @@ fn apply_scale_deviation_reparam_chunk(
 fn scale_deviation_reparam_matrix(transform: &ScaleDeviationTransform) -> Arc<Array2<f64>> {
     let p_noise = transform.projection_coef.ncols();
     let p_primary = transform.projection_coef.nrows();
+    let first_active = transform.non_intercept_start.min(p_noise);
     let mut q = Array2::<f64>::zeros((p_noise + p_primary + 1, p_noise));
-    for j in 0..p_noise {
+    for j in 0..first_active {
+        q[[j, j]] = 1.0;
+    }
+    for j in first_active..p_noise {
         let scale = transform.rescale[j];
         q[[j, j]] = scale;
         q[[p_noise + p_primary, j]] = -transform.weighted_column_mean[j] * scale;

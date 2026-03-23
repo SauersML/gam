@@ -223,6 +223,66 @@ impl<'a> RemlState<'a> {
 }
 
 impl FirthDenseOperator {
+    fn canonicalize_basis_column_signs(q_basis: &mut Array2<f64>) {
+        for col in 0..q_basis.ncols() {
+            let mut pivot_row = 0usize;
+            let mut pivot_abs = 0.0_f64;
+            for row in 0..q_basis.nrows() {
+                let value = q_basis[[row, col]];
+                let abs_value = value.abs();
+                if abs_value > pivot_abs {
+                    pivot_abs = abs_value;
+                    pivot_row = row;
+                }
+            }
+            if pivot_abs > 0.0 && q_basis[[pivot_row, col]] < 0.0 {
+                q_basis.column_mut(col).mapv_inplace(|v| -v);
+            }
+        }
+    }
+
+    fn identifiable_subspace_basis_from_gram(
+        gram: &Array2<f64>,
+    ) -> Result<(Array2<f64>, Array1<f64>), EstimationError> {
+        let p = gram.nrows();
+        debug_assert_eq!(p, gram.ncols());
+        if p == 0 {
+            return Ok((Array2::<f64>::eye(0), Array1::<f64>::zeros(0)));
+        }
+
+        let (evals, evecs) = gram
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let max_eval = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+        let tol = (p.max(1) as f64) * f64::EPSILON * max_eval;
+        let mut keep: Vec<usize> = evals
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &value)| if value > tol { Some(i) } else { None })
+            .collect();
+        if keep.is_empty() {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+
+        // Use one orthonormal identifiable basis for both the full-rank and
+        // rank-deficient cases. Sorting retained modes by descending design
+        // energy makes the representation deterministic up to eigenspace
+        // degeneracy; fixing the column signs removes the remaining trivial
+        // sign ambiguity.
+        keep.sort_by(|&lhs, &rhs| evals[rhs].total_cmp(&evals[lhs]));
+        let r = keep.len();
+        let mut q_basis = Array2::<f64>::zeros((p, r));
+        let mut metric_spectrum = Array1::<f64>::zeros(r);
+        for (col_idx, eig_idx) in keep.into_iter().enumerate() {
+            q_basis.column_mut(col_idx).assign(&evecs.column(eig_idx));
+            metric_spectrum[col_idx] = evals[eig_idx];
+        }
+        Self::canonicalize_basis_column_signs(&mut q_basis);
+        Ok((q_basis, metric_spectrum))
+    }
+
     pub(crate) fn build(
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
@@ -329,7 +389,6 @@ impl FirthDenseOperator {
         } else {
             None
         };
-        let p = x_dense.ncols();
         let mut w = Array1::<f64>::zeros(n);
         let mut w1 = Array1::<f64>::zeros(n);
         let mut w2 = Array1::<f64>::zeros(n);
@@ -350,45 +409,24 @@ impl FirthDenseOperator {
             x_dense.clone()
         };
 
-        // Build a fixed identifiable basis Q for Col(Xᵀ) or, with fixed case
-        // weights a_i, Col(Xᵀ diag(a_i)^{1/2}).
+        // Build one orthonormal coefficient-space basis Q for the identifiable
+        // subspace of A^{1/2} X (A = I without fixed case weights).
         //
-        // Exact fast path: if the basis Gram is already SPD, then the weighted
-        // identifiable design has full column rank and the identifiable subspace
-        // is the whole coefficient space. In that case we can set Q = I exactly
-        // and skip the expensive eigendecomposition for the coefficient-space
-        // projector. The scalar Jeffreys value is still basis-invariant because
-        // it is normalized by S_r = X_rᵀ X_r below.
+        // This must happen even when the weighted design is full rank. The old
+        // Q = I shortcut left full-rank designs in raw coordinates while the
+        // singular branch switched to an orthonormal identifiable basis, so the
+        // reduced Fisher determinant depended on which branch we took rather
+        // than only on the identifiable subspace itself.
         //
-        // We only fall back to the spectral route when X is rank-deficient.
+        // Using the retained eigenspace of X̃ᵀ X̃ for every design keeps both
+        // branches on one representation:
+        //   X̃ = A^{1/2} X,
+        //   Qᵀ Q = I,
+        //   X_r = X̃ Q,
+        //   S_r = X_rᵀ X_r = diag(positive spectrum of X̃ᵀ X̃).
         let gram = fast_atb(&basis_design, &basis_design);
-        let (q_basis, x_reduced) = if gram.cholesky(Side::Lower).is_ok() {
-            (Array2::<f64>::eye(p), basis_design.clone())
-        } else {
-            let (evals, evecs) = gram
-                .eigh(Side::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            let max_eval = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-            let tol = (p.max(1) as f64) * f64::EPSILON * max_eval;
-            let keep: Vec<usize> = evals
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &v)| if v > tol { Some(i) } else { None })
-                .collect();
-            let r = keep.len();
-            if r == 0 {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                });
-            }
-
-            let mut q_basis = Array2::<f64>::zeros((p, r));
-            for (col_idx, &eig_idx) in keep.iter().enumerate() {
-                q_basis.column_mut(col_idx).assign(&evecs.column(eig_idx));
-            }
-            let x_reduced = fast_ab(&basis_design, &q_basis);
-            (q_basis, x_reduced)
-        };
+        let (q_basis, metric_spectrum) = Self::identifiable_subspace_basis_from_gram(&gram)?;
+        let x_reduced = fast_ab(&basis_design, &q_basis);
         let r = q_basis.ncols();
 
         // Reduced Fisher on the identifiable subspace:
@@ -396,7 +434,6 @@ impl FirthDenseOperator {
         // Under finite-logit eta, W has strictly positive diagonal entries and
         // X_r has full column rank by construction, so I_r is SPD.
         let fisher_reduced = crate::faer_ndarray::fast_xt_diag_x(&x_reduced, &w);
-        let metric_reduced = fast_atb(&x_reduced, &x_reduced);
         // Smooth-regime diagnostic:
         // for exact pseudodet derivatives we require I_r to stay SPD on the
         // fixed identifiable subspace. Emit a warning when I_r appears close
@@ -429,6 +466,10 @@ impl FirthDenseOperator {
             // The fixed-Q identifiable-space value is the generalized
             // determinant 0.5(log|I_r| - log|S_r|), which is equivalent to
             // evaluating W on the orthonormalized design U = X_r S_r^{-1/2}.
+            //
+            // Because Q diagonalizes X̃ᵀ X̃ by construction, S_r is exactly the
+            // retained positive spectrum of that Gram matrix in these reduced
+            // coordinates, so its inverse/logdet are diagonal operations here.
             // Prefer the fast SPD path for I_r, but when I_r is only
             // numerically semidefinite after projection, keep the exact
             // positive eigenspace instead of failing outright.
@@ -468,42 +509,10 @@ impl FirthDenseOperator {
                     }
                 }
             }
-
-            if let Ok(chol_metric) = metric_reduced.cholesky(Side::Lower) {
-                half_log_det -= chol_metric.diag().iter().map(|d| d.ln()).sum::<f64>();
-                for col in 0..r {
-                    let mut e_col = Array1::<f64>::zeros(r);
-                    e_col[col] = 1.0;
-                    let solved = chol_metric.solvevec(&e_col);
-                    x_metric_reduced_inv.column_mut(col).assign(&solved);
-                }
-            } else {
-                let (evals_sr, evecs_sr) = metric_reduced
-                    .eigh(Side::Lower)
-                    .map_err(EstimationError::EigendecompositionFailed)?;
-                let max_eval = evals_sr.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-                let tol = (r.max(1) as f64) * f64::EPSILON * max_eval;
-                let keep: Vec<usize> = evals_sr
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &v)| if v > tol { Some(i) } else { None })
-                    .collect();
-                if keep.len() != r {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
-                    });
-                }
-                for &eig_idx in &keep {
-                    let eig = evals_sr[eig_idx];
-                    half_log_det -= 0.5 * eig.ln();
-                    let inv = eig.recip();
-                    let vec = evecs_sr.column(eig_idx).to_owned();
-                    for row in 0..r {
-                        for col in 0..r {
-                            x_metric_reduced_inv[[row, col]] += inv * vec[row] * vec[col];
-                        }
-                    }
-                }
+            for col in 0..r {
+                let metric_eig = metric_spectrum[col];
+                half_log_det -= 0.5 * metric_eig.ln();
+                x_metric_reduced_inv[[col, col]] = metric_eig.recip();
             }
         }
         // Reduced design enters M = Z K_r Z' and P = M⊙M.
@@ -1252,7 +1261,10 @@ mod tests {
         let x_reparameterized = x.dot(&basis);
         let beta = array![0.25, -0.5];
         let basis_det = basis[[0, 0]] * basis[[1, 1]] - basis[[0, 1]] * basis[[1, 0]];
-        assert!(basis_det.abs() > 1e-12, "basis transform must be invertible");
+        assert!(
+            basis_det.abs() > 1e-12,
+            "basis transform must be invertible"
+        );
         let basis_inv = array![
             [basis[[1, 1]] / basis_det, -basis[[0, 1]] / basis_det],
             [-basis[[1, 0]] / basis_det, basis[[0, 0]] / basis_det],
@@ -1300,6 +1312,40 @@ mod tests {
                 hat[i],
                 hat_reparameterized[i]
             );
+        }
+    }
+
+    #[test]
+    fn full_rank_identifiable_basis_diagonalizes_design_metric() {
+        let x = array![
+            [1.0, -1.2],
+            [1.0, -0.4],
+            [1.0, 0.1],
+            [1.0, 0.7],
+            [1.0, 1.3],
+        ];
+        let beta = array![0.25, -0.5];
+        let eta = x.dot(&beta);
+        let observation_weights = array![1.0, 0.5, 1.75, 0.9, 1.2];
+        let op = FirthDenseOperator::build_with_observation_weights(
+            &x,
+            &eta,
+            observation_weights.view(),
+        )
+        .expect("firth operator");
+
+        let reduced_metric = fast_atb(&op.x_reduced, &op.x_reduced);
+        for i in 0..reduced_metric.nrows() {
+            for j in 0..reduced_metric.ncols() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    reduced_metric[[i, j]].abs() < 1e-10,
+                    "full-rank identifiable basis should diagonalize X_r'X_r: metric[{i},{j}]={}",
+                    reduced_metric[[i, j]]
+                );
+            }
         }
     }
 

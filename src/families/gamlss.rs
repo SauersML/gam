@@ -12,7 +12,7 @@ use crate::custom_family::{
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
     evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
-    shared_dense_arc, weighted_crossprod_psi_maps,
+    shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -11686,63 +11686,59 @@ impl CustomFamily for BinomialLocationScaleFamily {
             None,
             &self.link_kind,
         )?;
-        if self.exact_joint_supported() {
-            // Exact-joint path for the 2-block non-wiggle family.
-            //
-            // Model:
-            //   t_i     = x_i^T beta_t
-            //   s_i     = z_i^T beta_s
-            //   sigma_i = exp(s_i)
-            //   q_i     = -t_i / sigma_i
-            //   mu_i    = Phi(q_i)
-            //
-            // For one observation the negative log-likelihood is
-            //
-            //   F_i(q) = -w_i [ y_i log Phi(q) + (1-y_i) log(1-Phi(q)) ].
-            //
-            // The exact-Newton working objects used by the inner solve are the
-            // coefficient-space score and Hessian of the unpenalized objective
-            // sum_i F_i(q_i(beta_t, beta_s)).
-            //
-            // In the non-wiggle family there is no dynamic basis, but there is
-            // still nontrivial predictor geometry because q depends jointly on
-            // both linear predictors through the exact quotient
-            // -t / exp(s). The
-            // helper `binomial_location_scale_working_sets(..., exact_geometry)`
-            // already assembles those exact blockwise score/Hessian
-            // objects from the rowwise eta-space chain rule. Entering that path
-            // here is what makes the family consistent with the exact joint
-            // outer-Hessian callbacks implemented below.
-            let (_, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
-            let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
-                "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
-            })?;
-            let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-                "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
-            })?;
-            let (tws, lsws, _) = binomial_location_scale_working_sets(
-                &self.y,
-                &self.weights,
-                eta_t,
-                None,
-                None,
-                BinomialLocationScaleExactGeometry {
-                    threshold_design,
-                    log_sigma_design,
-                    wiggle_design: None,
-                    d2q_dq02: None,
-                },
-                &core,
-            )?;
-            return Ok(FamilyEvaluation {
-                log_likelihood: core.log_likelihood,
-                blockworking_sets: vec![tws, lsws],
-            });
+        if !self.exact_joint_supported() {
+            return Err(
+                "BinomialLocationScaleFamily requires exact curvature designs; diagonal fallback has been removed"
+                    .to_string(),
+            );
         }
-        Err(
-            "BinomialLocationScaleFamily requires exact curvature designs; diagonal fallback has been removed"
-                .to_string(),
-        )
+        let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
+            "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
+        })?;
+        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
+            "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
+        })?;
+
+        // Per-block gradients from the eta-space score.
+        //
+        //   score_q = -m1   (m1 = dF/dq, F = -ℓ)
+        //   grad_eta_t[i]  = score_q * q_t
+        //   grad_eta_ls[i] = score_q * q_ls
+        let mut grad_eta_t = Array1::<f64>::zeros(n);
+        let mut grad_eta_ls = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let (m1, _, _) = binomial_neglog_q_derivatives_dispatch(
+                self.y[i],
+                self.weights[i],
+                core.q0[i],
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+                &self.link_kind,
+            );
+            let q0d = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
+            grad_eta_t[i] = -m1 * q0d.q_t;
+            grad_eta_ls[i] = -m1 * q0d.q_ls;
+        }
+        let grad_t = threshold_design.transpose_vector_multiply(&grad_eta_t);
+        let grad_ls = log_sigma_design.transpose_vector_multiply(&grad_eta_ls);
+
+        // Block Hessians are principal diagonal blocks of the joint Hessian
+        // (single source of truth — no separate blockwise Hessian derivation).
+        let joint = self
+            .exact_newton_joint_hessian(block_states)?
+            .ok_or("BinomialLocationScaleFamily: joint hessian unavailable")?;
+        let pt = block_states[Self::BLOCK_T].beta.len();
+        let pls = block_states[Self::BLOCK_LOG_SIGMA].beta.len();
+        Ok(FamilyEvaluation {
+            log_likelihood: core.log_likelihood,
+            blockworking_sets: slice_joint_into_block_working_sets(
+                vec![grad_t, grad_ls],
+                &joint,
+                &[0..pt, pt..pt + pls],
+            ),
+        })
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
@@ -14333,8 +14329,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let wiggle_design = self.wiggle_design(core.q0.view())?;
         let dq_dq0 =
             self.wiggle_dq_dq0(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
-        let d2q_dq02 =
-            self.wiggle_d2q_dq02(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleWiggleFamily exact-newton path is missing threshold design"
                 .to_string()
@@ -14343,25 +14337,54 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             "BinomialLocationScaleWiggleFamily exact-newton path is missing log-sigma design"
                 .to_string()
         })?;
-        let (tws, lsws, wws) = binomial_location_scale_working_sets(
-            &self.y,
-            &self.weights,
-            eta_t,
-            Some(etaw),
-            Some(&dq_dq0),
-            BinomialLocationScaleExactGeometry {
-                threshold_design,
-                log_sigma_design,
-                wiggle_design: Some(&wiggle_design),
-                d2q_dq02: Some(&d2q_dq02),
-            },
-            &core,
-        )?;
-        let wws = wws.ok_or_else(|| "wiggle working set missing".to_string())?;
 
+        // Per-block gradients from the eta-space score.
+        //
+        //   q = q0 + w(q0), a = dq/dq0
+        //   score_q = -m1   (m1 = dF/dq, F = -ℓ)
+        //   grad_eta_t[i]  = score_q * a * q0_t
+        //   grad_eta_ls[i] = score_q * a * q0_ls
+        //   grad_q[i]      = score_q          (wiggle basis acts on q)
+        let mut grad_eta_t = Array1::<f64>::zeros(n);
+        let mut grad_eta_ls = Array1::<f64>::zeros(n);
+        let mut grad_q = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q_i = core.q0[i] + etaw[i];
+            let (m1, _, _) = binomial_neglog_q_derivatives_dispatch(
+                self.y[i],
+                self.weights[i],
+                q_i,
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+                &self.link_kind,
+            );
+            let score_q = -m1;
+            let q0d = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
+            grad_eta_t[i] = score_q * dq_dq0[i] * q0d.q_t;
+            grad_eta_ls[i] = score_q * dq_dq0[i] * q0d.q_ls;
+            grad_q[i] = score_q;
+        }
+        let grad_t = threshold_design.transpose_vector_multiply(&grad_eta_t);
+        let grad_ls = log_sigma_design.transpose_vector_multiply(&grad_eta_ls);
+        let grad_w = fast_atv(&wiggle_design, &grad_q);
+
+        // Block Hessians are principal diagonal blocks of the joint Hessian
+        // (single source of truth — no separate blockwise Hessian derivation).
+        let joint = self
+            .exact_newton_joint_hessian(block_states)?
+            .ok_or("BinomialLocationScaleWiggleFamily: joint hessian unavailable")?;
+        let pt = block_states[Self::BLOCK_T].beta.len();
+        let pls = block_states[Self::BLOCK_LOG_SIGMA].beta.len();
+        let pw = block_states[Self::BLOCK_WIGGLE].beta.len();
         Ok(FamilyEvaluation {
             log_likelihood: core.log_likelihood,
-            blockworking_sets: vec![tws, lsws, wws],
+            blockworking_sets: slice_joint_into_block_working_sets(
+                vec![grad_t, grad_ls, grad_w],
+                &joint,
+                &[0..pt, pt..pt + pls, pt + pls..pt + pls + pw],
+            ),
         })
     }
 

@@ -964,6 +964,15 @@ impl BernoulliMarginalSlopePredictor {
             }
         };
         if let Some(runtime) = score_warp_runtime.as_ref() {
+            if runtime.schema_version
+                != crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
+            {
+                return Err(format!(
+                    "bernoulli marginal-slope score-warp runtime uses unsupported schema_version {}; expected {}",
+                    runtime.schema_version,
+                    crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
+                ));
+            }
             if runtime.kernel.is_empty() {
                 return Err(
                     "bernoulli marginal-slope score-warp runtime is missing exact kernel metadata"
@@ -979,6 +988,12 @@ impl BernoulliMarginalSlopePredictor {
                     crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 ));
             }
+            if runtime.degree != 3 {
+                return Err(format!(
+                    "bernoulli marginal-slope score-warp runtime must be cubic (degree=3), got degree={}",
+                    runtime.degree
+                ));
+            }
             if runtime.value_span_degree >= 4 {
                 return Err(format!(
                     "bernoulli marginal-slope score-warp runtime requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {}",
@@ -987,6 +1002,15 @@ impl BernoulliMarginalSlopePredictor {
             }
         }
         if let Some(runtime) = link_deviation_runtime.as_ref() {
+            if runtime.schema_version
+                != crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
+            {
+                return Err(format!(
+                    "bernoulli marginal-slope link-deviation runtime uses unsupported schema_version {}; expected {}",
+                    runtime.schema_version,
+                    crate::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
+                ));
+            }
             if runtime.kernel.is_empty() {
                 return Err(
                     "bernoulli marginal-slope link-deviation runtime is missing exact kernel metadata"
@@ -1000,6 +1024,12 @@ impl BernoulliMarginalSlopePredictor {
                     "bernoulli marginal-slope link-deviation runtime uses unsupported kernel '{}'; expected {}",
                     runtime.kernel,
                     crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
+                ));
+            }
+            if runtime.degree != 3 {
+                return Err(format!(
+                    "bernoulli marginal-slope link-deviation runtime must be cubic (degree=3), got degree={}",
+                    runtime.degree
                 ));
             }
             if runtime.value_span_degree >= 4 {

@@ -9,7 +9,8 @@ use crate::custom_family::{
     PenaltyMatrix, build_embedded_dense_psi_operator, build_rowwise_kronecker_psi_operator,
     evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
-    shared_dense_arc, should_materialize_custom_family_psi_dense, weighted_crossprod_psi_maps,
+    shared_dense_arc, should_materialize_custom_family_psi_dense,
+    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
     wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::fast_xt_diag_x;
@@ -6683,21 +6684,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let mut ll = 0.0;
 
+        // Per-row derivative collection — used for gradient only.
         let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
         let mut grad_time_eta_h1 = Array1::<f64>::zeros(n);
         let mut grad_time_eta_d = Array1::<f64>::zeros(n);
-        let mut h_time_h0 = Array1::<f64>::zeros(n);
-        let mut h_time_h1 = Array1::<f64>::zeros(n);
-        let mut h_time_d = Array1::<f64>::zeros(n);
-
-        let mut d1_q = Array1::<f64>::zeros(n);
-        let mut d2_q = Array1::<f64>::zeros(n);
         let mut d1_q0 = Array1::<f64>::zeros(n);
-        let mut d2_q0 = Array1::<f64>::zeros(n);
         let mut d1_q1 = Array1::<f64>::zeros(n);
-        let mut d2_q1 = Array1::<f64>::zeros(n);
         let mut d1_qdot = Array1::<f64>::zeros(n);
-        let mut d2_qdot = Array1::<f64>::zeros(n);
 
         for i in 0..n {
             let state = self.row_predictor_state(
@@ -6712,210 +6705,56 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 continue;
             };
             ll += row.ll;
-            d1_q[i] = row.d1_q;
-            d2_q[i] = row.d2_q;
             d1_q0[i] = row.d1_q0;
-            d2_q0[i] = row.d2_q0;
             d1_q1[i] = row.d1_q1;
-            d2_q1[i] = row.d2_q1;
             d1_qdot[i] = row.d1_qdot1;
-            d2_qdot[i] = row.d2_qdot1;
             grad_time_eta_h0[i] = row.grad_time_eta_h0;
             grad_time_eta_h1[i] = row.grad_time_eta_h1;
             grad_time_eta_d[i] = row.grad_time_eta_d;
-            h_time_h0[i] = row.h_time_h0;
-            h_time_h1[i] = row.h_time_h1;
-            h_time_d[i] = row.h_time_d;
         }
 
-        // Block 0: exact beta-space gradient/Hessian
+        // Per-block gradients (O(n·p_k) each, no Hessian algebra).
         let grad_time = dynamic.time_jac_entry.t().dot(&grad_time_eta_h0)
             + dynamic.time_jac_exit.t().dot(&grad_time_eta_h1)
             + dynamic.time_jac_deriv.t().dot(&grad_time_eta_d);
-        let mut hess_time = weighted_crossprod_dense(
-            &dynamic.time_jac_entry,
-            &(-&h_time_h0),
-            &dynamic.time_jac_entry,
-        )? + &weighted_crossprod_dense(
-            &dynamic.time_jac_exit,
-            &(-&h_time_h1),
-            &dynamic.time_jac_exit,
-        )? + &weighted_crossprod_dense(
-            &dynamic.time_jac_deriv,
-            &h_time_d,
-            &dynamic.time_jac_deriv,
-        )?;
-        let time_tail = self.time_wiggle_range();
-        let time_p = self.x_time_exit.ncols();
-        if let (
-            Some(d2_entry),
-            Some(d2_exit),
-            Some(d3_exit),
-            Some(b1_entry),
-            Some(b1_exit),
-            Some(b2_exit),
-        ) = (
-            dynamic.time_wiggle_d2_entry.as_ref(),
-            dynamic.time_wiggle_d2_exit.as_ref(),
-            dynamic.time_wiggle_d3_exit.as_ref(),
-            dynamic.time_wiggle_basis_d1_entry.as_ref(),
-            dynamic.time_wiggle_basis_d1_exit.as_ref(),
-            dynamic.time_wiggle_basis_d2_exit.as_ref(),
-        ) {
-            hess_time += &weighted_crossprod_dense(
-                self.x_time_entry.as_ref(),
-                &(-(&grad_time_eta_h0 * d2_entry)),
-                self.x_time_entry.as_ref(),
-            )?;
-            hess_time += &weighted_crossprod_dense(
-                self.x_time_entry.as_ref(),
-                &(-&grad_time_eta_h0),
-                &embed_tail_columns(b1_entry, time_p, time_tail.clone())?,
-            )?;
-            hess_time += &weighted_crossprod_dense(
-                self.x_time_exit.as_ref(),
-                &(-(&grad_time_eta_h1 * d2_exit)
-                    + &(&grad_time_eta_d * &(&dynamic.time_base_derivative_exit * d3_exit))),
-                self.x_time_exit.as_ref(),
-            )?;
-            hess_time += &weighted_crossprod_dense(
-                self.x_time_exit.as_ref(),
-                &(-&grad_time_eta_h1),
-                &embed_tail_columns(b1_exit, time_p, time_tail.clone())?,
-            )?;
-            hess_time += &weighted_crossprod_dense(
-                self.x_time_exit.as_ref(),
-                &(-&grad_time_eta_d),
-                &embed_tail_columns(
-                    &scale_dense_rows(b2_exit, &dynamic.time_base_derivative_exit)?,
-                    time_p,
-                    time_tail.clone(),
-                )?,
-            )?;
-            hess_time += &weighted_crossprod_dense(
-                self.x_time_deriv.as_ref(),
-                &(-&grad_time_eta_d),
-                &embed_tail_columns(b1_exit, time_p, time_tail.clone())?,
-            )?;
-            hess_time += &weighted_crossprod_dense(
-                self.x_time_exit.as_ref(),
-                &(-&grad_time_eta_d * d2_exit),
-                self.x_time_deriv.as_ref(),
-            )?;
-            hess_time += &weighted_crossprod_dense(
-                self.x_time_deriv.as_ref(),
-                &(-&grad_time_eta_d * d2_exit),
-                self.x_time_exit.as_ref(),
-            )?;
-        }
-        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
-        let x_threshold_exit = &*x_threshold_exit_cow;
-        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
-        let x_log_sigma_exit = &*x_log_sigma_exit_cow;
 
-        let (grad_t, hess_t) = if let (Some(x_t_entry), Some(x_t_deriv)) = (
+        let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
             self.x_threshold_entry.as_ref(),
             self.x_threshold_deriv.as_ref(),
         ) {
-            let x_t_entry_cow = x_t_entry.as_dense_cow();
-            let x_t_entry_dense = &*x_t_entry_cow;
-            let x_t_deriv_cow = x_t_deriv.as_dense_cow();
-            let x_t_deriv_dense = &*x_t_deriv_cow;
             let grad_exit = &d1_q1 * &dynamic.dq_t_exit + &d1_qdot * &dynamic.dqdot_t;
             let grad_entry = &d1_q0 * &dynamic.dq_t_entry;
             let grad_deriv = &d1_qdot * &dynamic.dqdot_td;
-            let h_exit = -(&d2_q1 * &dynamic.dq_t_exit.mapv(|v| v * v)
-                + &d2_qdot * &dynamic.dqdot_t.mapv(|v| v * v)
-                + &d1_qdot * &dynamic.d2qdot_tt);
-            let h_entry = -(&d2_q0 * &dynamic.dq_t_entry.mapv(|v| v * v));
-            let h_deriv = -(&d2_qdot * &dynamic.dqdot_td.mapv(|v| v * v));
-            let h_exit_deriv = -(&d2_qdot * &(&dynamic.dqdot_t * &dynamic.dqdot_td)
-                + &d1_qdot * &dynamic.d2qdot_ttd);
-            let grad = self.x_threshold.transpose_vector_multiply(&grad_exit)
+            self.x_threshold.transpose_vector_multiply(&grad_exit)
                 + x_t_entry.transpose_vector_multiply(&grad_entry)
-                + x_t_deriv.transpose_vector_multiply(&grad_deriv);
-            let mut hess = weighted_crossprod_dense(x_threshold_exit, &h_exit, x_threshold_exit)?
-                + weighted_crossprod_dense(x_t_entry_dense, &h_entry, x_t_entry_dense)?
-                + weighted_crossprod_dense(x_t_deriv_dense, &h_deriv, x_t_deriv_dense)?;
-            let cross = weighted_crossprod_dense(x_threshold_exit, &h_exit_deriv, x_t_deriv_dense)?;
-            hess += &cross;
-            hess += &cross.t().to_owned();
-            (grad, SymmetricMatrix::Dense(hess))
+                + x_t_deriv.transpose_vector_multiply(&grad_deriv)
         } else {
-            let grad = self.x_threshold.transpose_vector_multiply(
+            self.x_threshold.transpose_vector_multiply(
                 &(&d1_q1 * &dynamic.dq_t_exit
                     + &d1_q0 * &dynamic.dq_t_entry
                     + &d1_qdot * &dynamic.dqdot_t),
-            );
-            let h = -(&d2_q1 * &dynamic.dq_t_exit.mapv(|v| v * v)
-                + &d2_q0 * &dynamic.dq_t_entry.mapv(|v| v * v)
-                + &d2_qdot * &dynamic.dqdot_t.mapv(|v| v * v)
-                + &d1_qdot * &dynamic.d2qdot_tt);
-            let hess = xt_diag_x_symmetric(&self.x_threshold, &h)?;
-            (grad, hess)
+            )
         };
 
-        let (grad_ls, hess_ls) = if let (Some(x_ls_entry), Some(x_ls_deriv)) = (
+        let grad_ls = if let (Some(x_ls_entry), Some(x_ls_deriv)) = (
             self.x_log_sigma_entry.as_ref(),
             self.x_log_sigma_deriv.as_ref(),
         ) {
-            let x_ls_entry_cow = x_ls_entry.as_dense_cow();
-            let x_ls_entry_dense = &*x_ls_entry_cow;
-            let x_ls_deriv_cow = x_ls_deriv.as_dense_cow();
-            let x_ls_deriv_dense = &*x_ls_deriv_cow;
             let grad_exit = &d1_q1 * &dynamic.dq_ls_exit + &d1_qdot * &dynamic.dqdot_ls;
             let grad_entry = &d1_q0 * &dynamic.dq_ls_entry;
             let grad_deriv = &d1_qdot * &dynamic.dqdot_lsd;
-            let h_exit = -(&d2_q1 * &dynamic.dq_ls_exit.mapv(|v| v * v)
-                + &d1_q1 * &dynamic.d2q_ls_exit
-                + &d2_qdot * &dynamic.dqdot_ls.mapv(|v| v * v)
-                + &d1_qdot * &dynamic.d2qdot_ls);
-            let h_entry =
-                -(&d2_q0 * &dynamic.dq_ls_entry.mapv(|v| v * v) + &d1_q0 * &dynamic.d2q_ls_entry);
-            let h_deriv = -(&d2_qdot * &dynamic.dqdot_lsd.mapv(|v| v * v));
-            let h_exit_deriv = -(&d2_qdot * &(&dynamic.dqdot_ls * &dynamic.dqdot_lsd)
-                + &d1_qdot * &dynamic.d2qdot_lslsd);
-            let grad = self.x_log_sigma.transpose_vector_multiply(&grad_exit)
+            self.x_log_sigma.transpose_vector_multiply(&grad_exit)
                 + x_ls_entry.transpose_vector_multiply(&grad_entry)
-                + x_ls_deriv.transpose_vector_multiply(&grad_deriv);
-            let mut hess = weighted_crossprod_dense(x_log_sigma_exit, &h_exit, x_log_sigma_exit)?
-                + weighted_crossprod_dense(x_ls_entry_dense, &h_entry, x_ls_entry_dense)?
-                + weighted_crossprod_dense(x_ls_deriv_dense, &h_deriv, x_ls_deriv_dense)?;
-            let cross =
-                weighted_crossprod_dense(x_log_sigma_exit, &h_exit_deriv, x_ls_deriv_dense)?;
-            hess += &cross;
-            hess += &cross.t().to_owned();
-            (grad, SymmetricMatrix::Dense(hess))
+                + x_ls_deriv.transpose_vector_multiply(&grad_deriv)
         } else {
-            let grad = self.x_log_sigma.transpose_vector_multiply(
+            self.x_log_sigma.transpose_vector_multiply(
                 &(&d1_q1 * &dynamic.dq_ls_exit
                     + &d1_q0 * &dynamic.dq_ls_entry
                     + &d1_qdot * &dynamic.dqdot_ls),
-            );
-            let h = -(&d2_q1 * &dynamic.dq_ls_exit.mapv(|v| v * v)
-                + &d1_q1 * &dynamic.d2q_ls_exit
-                + &d2_q0 * &dynamic.dq_ls_entry.mapv(|v| v * v)
-                + &d1_q0 * &dynamic.d2q_ls_entry
-                + &d2_qdot * &dynamic.dqdot_ls.mapv(|v| v * v)
-                + &d1_qdot * &dynamic.d2qdot_ls);
-            let hess = xt_diag_x_symmetric(&self.x_log_sigma, &h)?;
-            (grad, hess)
+            )
         };
 
-        let mut blockworking_sets = vec![
-            BlockWorkingSet::ExactNewton {
-                gradient: grad_time,
-                hessian: SymmetricMatrix::Dense(hess_time),
-            },
-            BlockWorkingSet::ExactNewton {
-                gradient: grad_t,
-                hessian: hess_t,
-            },
-            BlockWorkingSet::ExactNewton {
-                gradient: grad_ls,
-                hessian: hess_ls,
-            },
-        ];
+        let mut block_gradients = vec![grad_time, grad_t, grad_ls];
         if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
             dynamic.wiggle_basis_exit.as_ref(),
             dynamic.wiggle_basis_entry.as_ref(),
@@ -6923,18 +6762,25 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         ) {
             let gradw =
                 xw_exit.t().dot(&d1_q1) + xw_entry.t().dot(&d1_q0) + xw_qdot.t().dot(&d1_qdot);
-            let hessw = weighted_crossprod_dense(xw_exit, &(-&d2_q1), xw_exit)?
-                + weighted_crossprod_dense(xw_entry, &(-&d2_q0), xw_entry)?
-                + weighted_crossprod_dense(xw_qdot, &(-&d2_qdot), xw_qdot)?;
-            blockworking_sets.push(BlockWorkingSet::ExactNewton {
-                gradient: gradw,
-                hessian: SymmetricMatrix::Dense(hessw),
-            });
+            block_gradients.push(gradw);
         }
 
+        // Block Hessians are principal diagonal blocks of the joint Hessian
+        // (single source of truth — no separate blockwise Hessian derivation).
+        let joint = self
+            .exact_newton_joint_hessian(block_states)?
+            .ok_or("SurvivalLocationScaleFamily: joint hessian unavailable")?;
+        let offsets = self.joint_block_offsets();
+        let block_ranges: Vec<std::ops::Range<usize>> = (0..block_gradients.len())
+            .map(|k| offsets[k]..offsets[k + 1])
+            .collect();
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets,
+            blockworking_sets: slice_joint_into_block_working_sets(
+                block_gradients,
+                &joint,
+                &block_ranges,
+            ),
         })
     }
 

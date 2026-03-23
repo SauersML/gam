@@ -1,11 +1,6 @@
-pub(crate) fn span_index_for_breakpoints(
-    breakpoints: &[f64],
-    value: f64,
-    label: &str,
-) -> Result<usize, String> {
-    if !value.is_finite() {
-        return Err(format!("{label} requires finite value, got {value}"));
-    }
+/// Require a breakpoint sequence suitable for span lookup: finite, strictly
+/// increasing, and long enough to define at least one span.
+pub(crate) fn validate_breakpoints(breakpoints: &[f64], label: &str) -> Result<(), String> {
     if breakpoints.len() < 2 {
         return Err(format!("{label} requires at least two breakpoints"));
     }
@@ -18,6 +13,22 @@ pub(crate) fn span_index_for_breakpoints(
             idx + 1,
             window[1]
         ));
+    }
+    Ok(())
+}
+
+/// Select the span containing `value`, using `[left, right)` for every span
+/// except the final span, which is right-closed.
+pub(crate) fn span_index_for_breakpoints(
+    breakpoints: &[f64],
+    value: f64,
+    label: &str,
+) -> Result<usize, String> {
+    if !value.is_finite() {
+        return Err(format!("{label} requires finite value, got {value}"));
+    }
+    if breakpoints.len() < 2 {
+        return Err(format!("{label} requires at least two breakpoints"));
     }
     let last_idx = breakpoints.len() - 1;
     if value <= breakpoints[0] {

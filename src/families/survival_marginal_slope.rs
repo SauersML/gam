@@ -15,7 +15,9 @@ use crate::families::bernoulli_marginal_slope::{
     unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
+use crate::families::gamlss::{
+    monotone_wiggle_basis_with_derivative_order, monotone_wiggle_structure,
+};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
 use crate::families::survival_location_scale::{
@@ -152,12 +154,12 @@ fn block_slices(
     let logslope = marginal.end..marginal.end + block_states[2].beta.len();
     let mut cursor = logslope.end;
     let score_warp = family.score_warp.as_ref().map(|runtime| {
-        let range = cursor..cursor + runtime.basis_dim;
+        let range = cursor..cursor + runtime.basis_dim();
         cursor = range.end;
         range
     });
     let link_dev = family.link_dev.as_ref().map(|runtime| {
-        let range = cursor..cursor + runtime.basis_dim;
+        let range = cursor..cursor + runtime.basis_dim();
         cursor = range.end;
         range
     });
@@ -195,12 +197,12 @@ fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlice
     let g = 3usize;
     let mut cursor = 4usize;
     let h = family.score_warp.as_ref().map(|runtime| {
-        let range = cursor..cursor + runtime.basis_dim;
+        let range = cursor..cursor + runtime.basis_dim();
         cursor = range.end;
         range
     });
     let w = family.link_dev.as_ref().map(|runtime| {
-        let range = cursor..cursor + runtime.basis_dim;
+        let range = cursor..cursor + runtime.basis_dim();
         cursor = range.end;
         range
     });
@@ -5293,17 +5295,21 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         }
     }
     if let Some(cfg) = spec.score_warp.as_ref() {
-        if cfg.degree != 3 {
+        let structure = monotone_wiggle_structure(cfg.degree)?;
+        if !structure.fourth_derivative_is_structurally_zero() {
             return Err(format!(
-                "survival-marginal-slope score-warp requires cubic degree=3, got {}",
+                "survival-marginal-slope score-warp requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {} from public degree={}",
+                structure.value_span_degree,
                 cfg.degree
             ));
         }
     }
     if let Some(cfg) = spec.link_dev.as_ref() {
-        if cfg.degree != 3 {
+        let structure = monotone_wiggle_structure(cfg.degree)?;
+        if !structure.fourth_derivative_is_structurally_zero() {
             return Err(format!(
-                "survival-marginal-slope link deviation requires cubic degree=3, got {}",
+                "survival-marginal-slope link deviation requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {} from public degree={}",
+                structure.value_span_degree,
                 cfg.degree
             ));
         }
@@ -5956,7 +5962,7 @@ mod tests {
                 eta: Array1::zeros(1),
             },
             ParameterBlockState {
-                beta: Array1::zeros(link_runtime.basis_dim),
+                beta: Array1::zeros(link_runtime.basis_dim()),
                 eta: Array1::zeros(1),
             },
         ];
@@ -5965,9 +5971,9 @@ mod tests {
         assert!(slices.score_warp.is_none());
         assert_eq!(
             slices.link_dev.as_ref().expect("link-only slice").len(),
-            link_runtime.basis_dim
+            link_runtime.basis_dim()
         );
-        assert_eq!(slices.total, 1 + 2 + 3 + link_runtime.basis_dim);
+        assert_eq!(slices.total, 1 + 2 + 3 + link_runtime.basis_dim());
     }
 
     #[test]
@@ -6078,11 +6084,11 @@ mod tests {
                 eta: array![0.45],
             },
             ParameterBlockState {
-                beta: Array1::zeros(score_runtime.basis_dim),
+                beta: Array1::zeros(score_runtime.basis_dim()),
                 eta: Array1::zeros(1),
             },
             ParameterBlockState {
-                beta: Array1::zeros(link_runtime.basis_dim),
+                beta: Array1::zeros(link_runtime.basis_dim()),
                 eta: Array1::zeros(1),
             },
         ];

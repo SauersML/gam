@@ -17,7 +17,7 @@ use crate::inference::predict::{
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
-use crate::span::span_index_for_breakpoints;
+use crate::span::{span_index_for_breakpoints, validate_breakpoints};
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec,
     SasLinkState,
@@ -534,6 +534,12 @@ impl SavedAnchoredDeviationRuntime {
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
             ));
         }
+        if self.degree != 3 {
+            return Err(format!(
+                "saved anchored deviation runtime must be cubic (degree=3), got degree={}",
+                self.degree
+            ));
+        }
         if self.value_span_degree >= 4 {
             return Err(format!(
                 "saved anchored deviation runtime requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {}",
@@ -620,12 +626,7 @@ impl SavedAnchoredDeviationRuntime {
                 points.push(knot);
             }
         }
-        if points.len() < 2 {
-            return Err(
-                "saved anchored deviation runtime requires at least two distinct breakpoints"
-                    .to_string(),
-            );
-        }
+        validate_breakpoints(&points, "saved anchored deviation runtime breakpoints")?;
         Ok(points)
     }
 

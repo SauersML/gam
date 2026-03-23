@@ -622,7 +622,8 @@ mod tests {
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-10,
             true,
-        );
+        )
+        .with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let rho = array![0.0];
         let psi = array![0.7, -0.4];
@@ -762,7 +763,8 @@ mod tests {
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-10,
             true,
-        );
+        )
+        .with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let rho = array![0.0];
         let psi = array![0.0, 0.0];
@@ -2372,7 +2374,8 @@ pub(crate) struct FirthDenseOperator {
     //
     // Let X in R^{n×p} potentially be rank-deficient with rank r.
     // With optional fixed observation weights a_i >= 0 we define A = diag(a),
-    // choose Q for the identifiable subspace of A^{1/2} X, and set:
+    // choose an orthonormal coefficient-space basis Q for the identifiable
+    // subspace of A^{1/2} X, and set:
     //   X_r := A^{1/2} X Q          (A = I when no fixed observation weights),
     //   W   := diag(w), with w_i = mu_i (1 - mu_i), 0 < w_i <= 1/4 for finite logit eta,
     //   I_r := X_rᵀ W X_r,
@@ -2395,6 +2398,8 @@ pub(crate) struct FirthDenseOperator {
     // without materializing dense n×n matrices M = X K Xᵀ or P = M⊙M.
     x_dense: Array2<f64>,
     x_dense_t: Array2<f64>,
+    // Orthonormal coefficient-space basis for the identifiable subspace,
+    // built from the retained eigenspace of (A^{1/2} X)ᵀ(A^{1/2} X).
     q_basis: Array2<f64>,
     // Reduced identifiable design. With fixed observation weights a_i this is
     // diag(sqrt(a_i)) X Q; otherwise it is X Q.
@@ -2410,8 +2415,10 @@ pub(crate) struct FirthDenseOperator {
     observation_weight_sqrt: Option<Array1<f64>>,
     // I_r^{-1}
     k_reduced: Array2<f64>,
-    // S_r^{-1} with S_r = X_rᵀ X_r. Used to remove the reduced-coordinate
-    // basis term from Phi_tau when the design moves.
+    // S_r^{-1} with S_r = X_rᵀ X_r. In the current canonical reduced basis
+    // this is diagonal, because Q diagonalizes the design Gram. It is used to
+    // remove the reduced-coordinate basis term from Phi_tau when the design
+    // moves.
     x_metric_reduced_inv: Array2<f64>,
     // 0.5 (log|I_r| - log|S_r|) at the current eta.
     half_log_det: f64,
