@@ -26,6 +26,7 @@ use crate::smooth::{
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
+use crate::span::span_index_for_breakpoints;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
@@ -206,33 +207,13 @@ impl DeviationRuntime {
     }
 
     fn span_index_for(&self, value: f64) -> Result<usize, String> {
-        if !value.is_finite() {
-            return Err(format!(
-                "deviation span lookup requires finite value, got {value}"
-            ));
-        }
-        let n = self.span_count();
-        if n == 0 {
-            return Err("deviation runtime has no active spans".to_string());
-        }
-        if value <= self.span_left_points[0] {
-            return Ok(0);
-        }
-        if value >= self.span_right_points[n - 1] {
-            return Ok(n - 1);
-        }
-        for span_idx in 0..n {
-            let left = self.span_left_points[span_idx];
-            let right = self.span_right_points[span_idx];
-            if value >= left && value <= right {
-                return Ok(span_idx);
-            }
-        }
-        Err(format!(
-            "deviation span lookup failed for value {value}; support is [{:.6}, {:.6}]",
-            self.span_left_points[0],
-            self.span_right_points[n - 1]
-        ))
+        span_index_for_breakpoints(
+            self.endpoint_points
+                .as_slice()
+                .ok_or_else(|| "deviation runtime breakpoints are not contiguous".to_string())?,
+            value,
+            "deviation span lookup",
+        )
     }
 
     fn local_cubic_on_span(
@@ -1585,10 +1566,7 @@ fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
 }
 
 fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
-    crate::families::lognormal_kernel::ProbitFrailtyScale::new(
-        gaussian_frailty_sd.unwrap_or(0.0),
-    )
-    .s
+    crate::families::lognormal_kernel::ProbitFrailtyScale::new(gaussian_frailty_sd.unwrap_or(0.0)).s
 }
 
 #[inline]
@@ -3337,10 +3315,8 @@ impl BernoulliMarginalSlopeFamily {
                     let idx = h_range.start + local_idx;
                     coeff_u[idx] =
                         scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    coeff_bu[idx] = scale_coeff4(
-                        exact::score_basis_cell_coefficients(basis_span, 1.0),
-                        scale,
-                    );
+                    coeff_bu[idx] =
+                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
                 }
             }
 
@@ -3596,10 +3572,8 @@ impl BernoulliMarginalSlopeFamily {
                 let idx = h_range.start + local_idx;
                 g_u_fixed[idx] =
                     scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                g_bu_fixed[idx] = scale_coeff4(
-                    exact::score_basis_cell_coefficients(basis_span, 1.0),
-                    scale,
-                );
+                g_bu_fixed[idx] =
+                    scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
             }
         }
 
@@ -3985,10 +3959,8 @@ impl BernoulliMarginalSlopeFamily {
                     let idx = h_range.start + local_idx;
                     coeff_u[idx] =
                         scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    coeff_bu[idx] = scale_coeff4(
-                        exact::score_basis_cell_coefficients(basis_span, 1.0),
-                        scale,
-                    );
+                    coeff_bu[idx] =
+                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
                 }
             }
 
@@ -4569,10 +4541,8 @@ impl BernoulliMarginalSlopeFamily {
                 let idx = h_range.start + local_idx;
                 g_u_fixed[idx] =
                     scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                g_bu_fixed[idx] = scale_coeff4(
-                    exact::score_basis_cell_coefficients(basis_span, 1.0),
-                    scale,
-                );
+                g_bu_fixed[idx] =
+                    scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
             }
         }
         if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
@@ -7747,8 +7717,9 @@ mod tests {
         .expect("build deviation block");
         let dim = prepared.block.design.ncols();
         let beta = Array1::from_iter((0..dim).map(|idx| 0.025 * (idx as f64 + 1.0)));
+        let n_spans = prepared.runtime.span_count();
 
-        for span_idx in 0..prepared.runtime.span_count() {
+        for span_idx in 0..n_spans {
             let cubic = prepared
                 .runtime
                 .local_cubic_on_span(&beta, span_idx)
@@ -7786,8 +7757,17 @@ mod tests {
                     .runtime
                     .local_cubic_at(&beta, x)
                     .expect("lookup cubic at x");
-                assert_eq!(selected.left, cubic.left);
-                assert_eq!(selected.right, cubic.right);
+                let expected_span_idx = if i + 1 == x_eval.len() && span_idx + 1 < n_spans {
+                    span_idx + 1
+                } else {
+                    span_idx
+                };
+                let expected_cubic = prepared
+                    .runtime
+                    .local_cubic_on_span(&beta, expected_span_idx)
+                    .expect("expected lookup cubic on span");
+                assert_eq!(selected.left, expected_cubic.left);
+                assert_eq!(selected.right, expected_cubic.right);
             }
         }
     }
@@ -8149,7 +8129,7 @@ mod tests {
                 y: Arc::new(array![0.0, 1.0, 1.0]),
                 weights: Arc::new(array![1.0, 0.7, 1.3]),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -8277,7 +8257,7 @@ mod tests {
                 y: Arc::new(array![0.0, 1.0, 0.0]),
                 weights: Arc::new(Array1::ones(3)),
                 z: Arc::new(seed.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9083,7 +9063,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9229,7 +9209,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9478,7 +9458,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9559,7 +9539,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9662,7 +9642,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -9784,7 +9764,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -10333,7 +10313,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -10455,7 +10435,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -10564,7 +10544,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -10671,7 +10651,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -11010,7 +10990,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -11731,7 +11711,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -11837,7 +11817,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -11952,7 +11932,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -12092,7 +12072,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -12218,7 +12198,7 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-            gaussian_frailty_sd: None,
+                gaussian_frailty_sd: None,
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
