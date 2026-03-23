@@ -28,7 +28,7 @@ use gam::families::scale_design::{
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
     append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
-    split_wiggle_penalty_orders,
+    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
 };
 use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 use gam::hmc::{
@@ -568,7 +568,7 @@ fn blockwise_options_from_fit_args(
     _: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
-    options.compute_covariance = true;
+    options.compute_covariance = false;
     Ok(options)
 }
 
@@ -3469,35 +3469,6 @@ fn run_predict_survival(
     }
 
     if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-        let gaussian_frailty_sd =
-            fixed_gaussian_shift_sigma_from_saved_family(&model.family_state)?;
-        let has_saved_timewiggle = model.baseline_timewiggle_knots.is_some()
-            || model.baseline_timewiggle_degree.is_some()
-            || model.baseline_timewiggle_penalty_orders.is_some()
-            || model.baseline_timewiggle_double_penalty.is_some()
-            || model.beta_baseline_timewiggle.is_some();
-        let has_saved_linkwiggle = model.linkwiggle_knots.is_some()
-            || model.linkwiggle_degree.is_some()
-            || model.beta_link_wiggle.is_some();
-        if has_saved_linkwiggle {
-            return Err(
-                "saved survival marginal-slope model contains legacy linkwiggle metadata; refit with the anchored link-deviation runtime"
-                    .to_string(),
-            );
-        }
-        let saved_score_runtime = model.score_warp_runtime.as_ref();
-        let saved_link_runtime = model.link_deviation_runtime.as_ref();
-        let has_saved_deviations = saved_score_runtime.is_some() || saved_link_runtime.is_some();
-        if let Some(runtime) = saved_score_runtime {
-            runtime.breakpoints().map_err(|err| {
-                format!("saved survival marginal-slope score-warp runtime is invalid: {err}")
-            })?;
-        }
-        if let Some(runtime) = saved_link_runtime {
-            runtime.breakpoints().map_err(|err| {
-                format!("saved survival marginal-slope link-deviation runtime is invalid: {err}")
-            })?;
-        }
         let z_name = model
             .z_column
             .as_ref()
@@ -3515,293 +3486,101 @@ fn run_predict_survival(
         let logslope_design = build_term_collection_design(data, &logslopespec)
             .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
         let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-        let blocks = &fit_saved.blocks;
-        let expected_blocks = 3
-            + usize::from(saved_score_runtime.is_some())
-            + usize::from(saved_link_runtime.is_some());
-        if blocks.len() != expected_blocks {
-            return Err(format!(
-                "saved survival marginal-slope model requires {} blocks [time, marginal, slope{}{}], got {}",
-                expected_blocks,
-                if saved_score_runtime.is_some() {
-                    ", score-warp"
-                } else {
-                    ""
-                },
-                if saved_link_runtime.is_some() {
-                    ", link-deviation"
-                } else {
-                    ""
-                },
-                blocks.len(),
-            ));
-        }
-        let beta_time = &blocks[0].beta;
-        let beta_marginal = &blocks[1].beta;
-        let beta_slope = &blocks[2].beta;
-        let beta_score = saved_score_runtime.map(|runtime| {
-            let block = &blocks[3].beta;
-            (runtime, block)
-        });
-        let beta_link = saved_link_runtime.map(|runtime| {
-            let idx = 3 + usize::from(saved_score_runtime.is_some());
-            let block = &blocks[idx].beta;
-            (runtime, block)
-        });
-        if let Some((runtime, beta)) = beta_score.as_ref() {
-            if beta.len() != runtime.basis_dim {
-                return Err(format!(
-                    "saved survival marginal-slope score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
-                    beta.len(),
-                    runtime.basis_dim
-                ));
-            }
-        }
-        if let Some((runtime, beta)) = beta_link.as_ref() {
-            if beta.len() != runtime.basis_dim {
-                return Err(format!(
-                    "saved survival marginal-slope link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
-                    beta.len(),
-                    runtime.basis_dim
-                ));
-            }
-        }
-        let baseline_slope = model.logslope_baseline.unwrap_or(0.0);
-        let p_time_base = time_build.x_exit_time.ncols();
-        let p_timewiggle = model
-            .beta_baseline_timewiggle
-            .as_ref()
-            .map_or(0, |beta| beta.len());
-        if beta_time.len() != p_time_base + p_timewiggle {
-            return Err(format!(
-                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
-                beta_time.len(),
-                p_time_base,
-                p_timewiggle
-            ));
-        }
-        if beta_marginal.len() != cov_design.design.ncols() {
-            return Err(format!(
-                "saved survival marginal-slope marginal coefficient mismatch: beta has {} entries but baseline design has {} columns",
-                beta_marginal.len(),
-                cov_design.design.ncols()
-            ));
-        }
-        if beta_slope.len() != logslope_design.design.ncols() {
-            return Err(format!(
-                "saved survival marginal-slope slope coefficient mismatch: beta has {} entries but slope design has {} columns",
-                beta_slope.len(),
-                logslope_design.design.ncols()
-            ));
-        }
-        let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
-        let q_entry_base = time_build.x_entry_time.dot(&beta_time_base)
-            + cov_design.design.dot(beta_marginal)
-            + &eta_offset_entry
-            + primary_offset;
-        let q_exit_base = time_build.x_exit_time.dot(&beta_time_base)
-            + cov_design.design.dot(beta_marginal)
-            + &eta_offset_exit
-            + primary_offset;
-        let qd_exit_base =
-            time_build.x_derivative_time.dot(&beta_time_base) + &derivative_offset_exit;
-        let q_exit = if has_saved_timewiggle {
-            if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
-                return Err(
-                    "saved survival marginal-slope posterior uncertainty is not implemented for dynamic timewiggle models"
-                        .to_string(),
+        let (predictor, pred_input, predictor_fit) = build_saved_survival_marginal_slope_predictor(
+            model,
+            &fit_saved,
+            z_name,
+            &z,
+            &cov_design.design,
+            &logslope_design.design,
+            &time_build,
+            &eta_offset_entry,
+            &eta_offset_exit,
+            &derivative_offset_exit,
+            &primary_offset,
+            &noise_offset,
+        )?;
+
+        let (eta, mean, eta_se_opt, mean_lo, mean_hi) =
+            if args.mode == PredictModeArg::PosteriorMean {
+                let pred = predictor
+                    .predict_posterior_mean(
+                        &pred_input,
+                        &predictor_fit,
+                        if args.uncertainty {
+                            Some(args.level)
+                        } else {
+                            None
+                        },
+                    )
+                    .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
+                let eta = pred.eta;
+                let eta_se = pred.eta_standard_error;
+                let mean = Array1::from_iter(
+                    eta.iter()
+                        .zip(eta_se.iter())
+                        .map(|(&mu, &se)| normal_cdf(-mu / (1.0 + se * se).sqrt())),
                 );
-            }
-            let (_, exit_w, _) = saved_baseline_timewiggle_components(
-                &q_entry_base,
-                &q_exit_base,
-                &qd_exit_base,
-                model,
-            )?
-            .ok_or_else(|| {
-                "saved survival marginal-slope model is missing baseline-timewiggle runtime metadata"
-                    .to_string()
-            })?;
-            let beta_w =
-                Array1::from_vec(model.beta_baseline_timewiggle.clone().ok_or_else(|| {
-                    "saved survival marginal-slope model is missing beta_baseline_timewiggle"
-                        .to_string()
-                })?);
-            &q_exit_base + &exit_w.dot(&beta_w)
-        } else {
-            q_exit_base
-        };
-        let slope = logslope_design
-            .design
-            .dot(beta_slope)
-            .mapv(|v| v + baseline_slope)
-            + noise_offset;
-        let (eta, deterministic_mean) = if has_saved_deviations {
-            predict_saved_survival_marginal_slope_flex_exit(
-                &q_exit,
-                &slope,
-                &z,
-                gaussian_frailty_sd,
-                beta_score.as_ref().map(|(runtime, _)| *runtime),
-                beta_score.as_ref().map(|(_, beta)| *beta),
-                beta_link.as_ref().map(|(runtime, _)| *runtime),
-                beta_link.as_ref().map(|(_, beta)| *beta),
-            )?
-        } else {
-            // Rigid closed-form under probit Gaussian frailty (matches
-            // BernoulliMarginalSlopePredictor):
-            //   η_obs = q·√(1 + (s b)²) + s b·z,  s = 1/√(1+σ²).
-            // Scale folds into slope BEFORE the sqrt, not outside.
-            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
-            let sb = slope.mapv(|b| scale * b);
-            let c = sb.mapv(|sb_i| (1.0 + sb_i * sb_i).sqrt());
-            let eta = &q_exit * &c + &sb * &z;
-            let deterministic_mean = eta.mapv(|v| normal_cdf(-v));
-            (eta, deterministic_mean)
-        };
-        let need_uncertainty = args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
-        if has_saved_deviations && need_uncertainty {
-            return Err(
-                "saved survival marginal-slope posterior uncertainty is not implemented for anchored score/link deviation models"
-                    .to_string(),
-            );
-        }
-        let posterior_mean = if need_uncertainty {
-            // Correct frailty-scaled quantities (must match the eta formula above).
-            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
-            let sb = slope.mapv(|b| scale * b);
-            let c = sb.mapv(|sb_i| (1.0 + sb_i * sb_i).sqrt());
-            let backend = prediction_backend_from_model(model, args.covariance_mode)?;
-            let p_t = beta_time.len();
-            let p_m = beta_marginal.len();
-            let p_s = beta_slope.len();
-            let p_total = p_t + p_m + p_s;
-            if backend.nrows() != p_total {
-                return Err(format!(
-                    "saved survival marginal-slope covariance/backend mismatch: got dimension {}, expected {}",
-                    backend.nrows(),
-                    p_total
-                ));
-            }
-            let local_covariances = rowwise_local_covariances(&backend, n, 1, |rows| {
-                let start = rows.start;
-                let end = rows.end;
-                let cs = end - start;
-                let mut jac = Array2::<f64>::zeros((cs, p_total));
-                {
-                    // ∂η/∂θ_time = c_i · x_time,  where c = √(1+(sb)²).
-                    let x_t = time_build.x_exit_time.row_chunk(start..end);
-                    let mut dst = jac.slice_mut(s![.., ..p_t]);
-                    dst.assign(&x_t);
-                    for i in 0..cs {
-                        let ci = c[start + i];
-                        dst.row_mut(i).mapv_inplace(|v| v * ci);
+                let (mean_lo, mean_hi) = if args.uncertainty {
+                    if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                        return Err(format!("--level must be in (0,1), got {}", args.level));
                     }
-                }
-                {
-                    // ∂η/∂θ_marginal = c_i · x_marginal.
-                    let x_m = cov_design.design.row_chunk(start..end);
-                    let mut dst = jac.slice_mut(s![.., p_t..p_t + p_m]);
-                    dst.assign(&x_m);
-                    for i in 0..cs {
-                        let ci = c[start + i];
-                        dst.row_mut(i).mapv_inplace(|v| v * ci);
-                    }
-                }
-                {
-                    // ∂η/∂θ_slope = (q·s²·b/c + s·z) · x_slope.
-                    let x_s = logslope_design.design.row_chunk(start..end);
-                    let mut dst = jac.slice_mut(s![.., p_t + p_m..]);
-                    dst.assign(&x_s);
-                    for i in 0..cs {
-                        let b_i = slope[start + i];
-                        let c_i = c[start + i];
-                        let gi =
-                            q_exit[start + i] * scale * scale * b_i / c_i + scale * z[start + i];
-                        dst.row_mut(i).mapv_inplace(|v| v * gi);
-                    }
-                }
-                Ok(vec![jac])
-            })
-            .map_err(|e| {
-                format!(
-                    "saved survival marginal-slope posterior covariance application failed: {e}"
-                )
-            })?;
-            let eta_var = local_covariances
-                .into_iter()
-                .next()
-                .and_then(|row| row.into_iter().next())
-                .ok_or_else(|| {
-                    "saved survival marginal-slope posterior covariance application returned no local variances"
-                        .to_string()
-                })?
-                .mapv(|v| v.max(0.0));
-            let eta_se = eta_var.mapv(f64::sqrt);
-            let posterior = Array1::from_iter(
-                eta.iter()
-                    .zip(eta_var.iter())
-                    .map(|(&mu, &var)| normal_cdf(-mu / (1.0 + var).sqrt())),
-            );
-            let mean = if args.mode == PredictModeArg::PosteriorMean {
-                posterior.clone()
-            } else {
-                deterministic_mean.clone()
-            };
-            if args.uncertainty {
+                    let z_alpha = standard_normal_quantile(0.5 + args.level * 0.5)?;
+                    let eta_lo = &eta - &(eta_se.mapv(|value| z_alpha * value));
+                    let eta_hi = &eta + &(eta_se.mapv(|value| z_alpha * value));
+                    (
+                        Some(eta_hi.mapv(|value| normal_cdf(-value))),
+                        Some(eta_lo.mapv(|value| normal_cdf(-value))),
+                    )
+                } else {
+                    (None, None)
+                };
+                (eta, mean, Some(eta_se), mean_lo, mean_hi)
+            } else if args.uncertainty {
                 if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
                     return Err(format!("--level must be in (0,1), got {}", args.level));
                 }
-                let z_alpha = standard_normal_quantile(0.5 + args.level * 0.5)?;
-                let eta_lo = &eta - &(eta_se.mapv(|v| z_alpha * v));
-                let eta_hi = &eta + &(eta_se.mapv(|v| z_alpha * v));
-                let mean_lo = eta_hi.mapv(|v| normal_cdf(-v));
-                let mean_hi = eta_lo.mapv(|v| normal_cdf(-v));
-                progress.advance_workflow(4);
-                progress.set_stage("predict", "writing survival predictions");
-                write_survival_prediction_csv(
-                    &args.out,
-                    eta.view(),
-                    mean.view(),
-                    Some(eta_se.view()),
-                    Some(mean_lo.view()),
-                    Some(mean_hi.view()),
-                )?;
+                let pred = predictor
+                    .predict_full_uncertainty(
+                        &pred_input,
+                        &predictor_fit,
+                        &gam::estimate::PredictUncertaintyOptions {
+                            confidence_level: args.level,
+                            covariance_mode: infer_covariance_mode(args.covariance_mode),
+                            mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
+                            includeobservation_interval: false,
+                        },
+                    )
+                    .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
+                (
+                    pred.eta.clone(),
+                    pred.eta.mapv(|value| normal_cdf(-value)),
+                    Some(pred.eta_standard_error),
+                    Some(pred.eta_upper.mapv(|value| normal_cdf(-value))),
+                    Some(pred.eta_lower.mapv(|value| normal_cdf(-value))),
+                )
             } else {
-                progress.advance_workflow(4);
-                progress.set_stage("predict", "writing survival predictions");
-                write_survival_prediction_csv(
-                    &args.out,
-                    eta.view(),
-                    mean.view(),
-                    Some(eta_se.view()),
-                    None,
-                    None,
-                )?;
-            }
-            println!(
-                "wrote predictions: {} (rows={})",
-                args.out.display(),
-                mean.len()
-            );
-            return Ok(());
-        } else {
-            deterministic_mean
-        };
+                let eta = predictor
+                    .predict_linear_predictor(&pred_input)
+                    .map_err(|e| format!("predict_linear_predictor failed: {e}"))?;
+                let mean = eta.mapv(|value| normal_cdf(-value));
+                (eta, mean, None, None, None)
+            };
+
         progress.advance_workflow(4);
         progress.set_stage("predict", "writing survival predictions");
         write_survival_prediction_csv(
             &args.out,
             eta.view(),
-            posterior_mean.view(),
-            None,
-            None,
-            None,
+            mean.view(),
+            eta_se_opt.as_ref().map(|values| values.view()),
+            mean_lo.as_ref().map(|values| values.view()),
+            mean_hi.as_ref().map(|values| values.view()),
         )?;
         println!(
             "wrote predictions: {} (rows={})",
             args.out.display(),
-            posterior_mean.len()
+            mean.len()
         );
         return Ok(());
     }
@@ -5343,6 +5122,7 @@ fn saved_baseline_timewiggle_components(
         }
     }
 }
+
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     let survival_total_steps = if args.out.is_some() { 5 } else { 4 };
@@ -5893,14 +5673,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
             payload.survival_baseline_makeham = baseline_cfg.makeham;
-            payload.survival_likelihood = Some(
-                if likelihood_mode == SurvivalLikelihoodMode::Latent {
-                    "latent"
-                } else {
-                    "latent-binary"
-                }
-                .to_string(),
-            );
             payload.survival_time_basis = Some(time_build.basisname.clone());
             payload.survival_time_degree = time_build.degree;
             payload.survival_time_knots = time_build.knots.clone();
@@ -6068,7 +5840,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             opts
         };
         let options = gam::families::custom_family::BlockwiseFitOptions {
-            compute_covariance: true,
+            compute_covariance: false,
             ..Default::default()
         };
         let buildspec = |prepared: &PreparedSurvivalTimeStack| SurvivalMarginalSlopeTermSpec {
@@ -6213,14 +5985,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
             payload.survival_baseline_makeham = baseline_cfg.makeham;
-            payload.survival_likelihood = Some(
-                if likelihood_mode == SurvivalLikelihoodMode::Latent {
-                    "latent"
-                } else {
-                    "latent-binary"
-                }
-                .to_string(),
-            );
             payload.survival_time_basis = Some(time_build.basisname.clone());
             payload.survival_time_degree = time_build.degree;
             payload.survival_time_knots = time_build.knots.clone();
@@ -8969,251 +8733,6 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
     }
 }
 
-fn saved_survival_default_score_span() -> exact_kernel::LocalSpanCubic {
-    exact_kernel::LocalSpanCubic {
-        left: 0.0,
-        right: 1.0,
-        c0: 0.0,
-        c1: 0.0,
-        c2: 0.0,
-        c3: 0.0,
-    }
-}
-
-fn saved_survival_default_link_span() -> exact_kernel::LocalSpanCubic {
-    exact_kernel::LocalSpanCubic {
-        left: 0.0,
-        right: 1.0,
-        c0: 0.0,
-        c1: 0.0,
-        c2: 0.0,
-        c3: 0.0,
-    }
-}
-
-fn saved_survival_observed_spans(
-    z_obs: f64,
-    a: f64,
-    b: f64,
-    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    score_beta: Option<&Array1<f64>>,
-    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    link_beta: Option<&Array1<f64>>,
-) -> Result<(exact_kernel::LocalSpanCubic, exact_kernel::LocalSpanCubic), String> {
-    let score_span = if let (Some(runtime), Some(beta)) = (score_runtime, score_beta) {
-        runtime.local_cubic_at(beta, z_obs)?
-    } else {
-        saved_survival_default_score_span()
-    };
-    let u_obs = a + b * z_obs;
-    let link_span = if let (Some(runtime), Some(beta)) = (link_runtime, link_beta) {
-        runtime.local_cubic_at(beta, u_obs)?
-    } else {
-        saved_survival_default_link_span()
-    };
-    Ok((score_span, link_span))
-}
-
-fn saved_survival_denested_partition_cells(
-    a: f64,
-    b: f64,
-    gaussian_frailty_sd: Option<f64>,
-    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    score_beta: Option<&Array1<f64>>,
-    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    link_beta: Option<&Array1<f64>>,
-) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
-    let score_breaks = if let Some(runtime) = score_runtime {
-        runtime.breakpoints()?
-    } else {
-        Vec::new()
-    };
-
-    let link_breaks = if let Some(runtime) = link_runtime {
-        runtime.breakpoints()?
-    } else {
-        Vec::new()
-    };
-
-    let mut cells = exact_kernel::build_denested_partition_cells_with_tails(
-        a,
-        b,
-        &score_breaks,
-        &link_breaks,
-        |z| {
-            if let (Some(runtime), Some(beta)) = (score_runtime, score_beta) {
-                runtime.local_cubic_at(beta, z)
-            } else {
-                Ok(saved_survival_default_score_span())
-            }
-        },
-        |u| {
-            if let (Some(runtime), Some(beta)) = (link_runtime, link_beta) {
-                runtime.local_cubic_at(beta, u)
-            } else {
-                Ok(saved_survival_default_link_span())
-            }
-        },
-    )?;
-    let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
-    if scale != 1.0 {
-        for partition_cell in &mut cells {
-            partition_cell.cell.c0 *= scale;
-            partition_cell.cell.c1 *= scale;
-            partition_cell.cell.c2 *= scale;
-            partition_cell.cell.c3 *= scale;
-        }
-    }
-    Ok(cells)
-}
-
-fn evaluate_saved_survival_calibration(
-    a: f64,
-    q: f64,
-    slope: f64,
-    gaussian_frailty_sd: Option<f64>,
-    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    score_beta: Option<&Array1<f64>>,
-    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    link_beta: Option<&Array1<f64>>,
-) -> Result<(f64, f64), String> {
-    let cells = saved_survival_denested_partition_cells(
-        a,
-        slope,
-        gaussian_frailty_sd,
-        score_runtime,
-        score_beta,
-        link_runtime,
-        link_beta,
-    )?;
-    let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
-    let mut f = -gam::probability::normal_cdf(-q);
-    let mut f_a = 0.0;
-    for partition_cell in cells {
-        let pos_cell = partition_cell.cell;
-        let neg_cell = exact_kernel::DenestedCubicCell {
-            left: pos_cell.left,
-            right: pos_cell.right,
-            c0: -pos_cell.c0,
-            c1: -pos_cell.c1,
-            c2: -pos_cell.c2,
-            c3: -pos_cell.c3,
-        };
-        let state = exact_kernel::evaluate_cell_moments(neg_cell, 3)?;
-        f += state.value;
-        let (dc_da_pos, _) = exact_kernel::denested_cell_coefficient_partials(
-            partition_cell.score_span,
-            partition_cell.link_span,
-            a,
-            slope,
-        );
-        let dc_da = scale_coeff4(dc_da_pos, -scale);
-        f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
-    }
-    Ok((f, f_a))
-}
-
-fn solve_saved_survival_intercept(
-    q: f64,
-    slope: f64,
-    gaussian_frailty_sd: Option<f64>,
-    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    score_beta: Option<&Array1<f64>>,
-    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    link_beta: Option<&Array1<f64>>,
-) -> Result<f64, String> {
-    let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-        let (f, f_a) = evaluate_saved_survival_calibration(
-            a,
-            q,
-            slope,
-            gaussian_frailty_sd,
-            score_runtime,
-            score_beta,
-            link_runtime,
-            link_beta,
-        )?;
-        Ok((f, f_a, 0.0))
-    };
-    let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
-    let a_init = q * (1.0 + (scale * slope) * (scale * slope)).sqrt();
-    let (root, _) = gam::families::monotone_root::solve_monotone_root(
-        eval,
-        a_init,
-        "saved survival intercept",
-        1e-12,
-        64,
-        64,
-    )?;
-    Ok(root)
-}
-
-fn saved_survival_observed_eta(
-    z_obs: f64,
-    a: f64,
-    b: f64,
-    gaussian_frailty_sd: Option<f64>,
-    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    score_beta: Option<&Array1<f64>>,
-    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    link_beta: Option<&Array1<f64>>,
-) -> Result<f64, String> {
-    let (score_span, link_span) = saved_survival_observed_spans(
-        z_obs,
-        a,
-        b,
-        score_runtime,
-        score_beta,
-        link_runtime,
-        link_beta,
-    )?;
-    let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
-    let coeff = scale_coeff4(
-        exact_kernel::denested_cell_coefficients(score_span, link_span, a, b),
-        scale,
-    );
-    Ok(((coeff[3] * z_obs + coeff[2]) * z_obs + coeff[1]) * z_obs + coeff[0])
-}
-
-fn predict_saved_survival_marginal_slope_flex_exit(
-    q_exit: &Array1<f64>,
-    slope: &Array1<f64>,
-    z: &Array1<f64>,
-    gaussian_frailty_sd: Option<f64>,
-    score_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    score_beta: Option<&Array1<f64>>,
-    link_runtime: Option<&SavedAnchoredDeviationRuntime>,
-    link_beta: Option<&Array1<f64>>,
-) -> Result<(Array1<f64>, Array1<f64>), String> {
-    let n = q_exit.len();
-    let mut eta = Array1::<f64>::zeros(n);
-    let mut mean = Array1::<f64>::zeros(n);
-    for row in 0..n {
-        let a = solve_saved_survival_intercept(
-            q_exit[row],
-            slope[row],
-            gaussian_frailty_sd,
-            score_runtime,
-            score_beta,
-            link_runtime,
-            link_beta,
-        )?;
-        let eta_row = saved_survival_observed_eta(
-            z[row],
-            a,
-            slope[row],
-            gaussian_frailty_sd,
-            score_runtime,
-            score_beta,
-            link_runtime,
-            link_beta,
-        )?;
-        eta[row] = eta_row;
-        mean[row] = normal_cdf(-eta_row);
-    }
-    Ok((eta, mean))
-}
-
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
 ) -> DeviationBlockConfig {
@@ -9379,27 +8898,6 @@ fn fixed_gaussian_shift_frailty_from_spec(
     }
 }
 
-fn fixed_gaussian_shift_sigma_from_saved_family(
-    family: &FittedFamily,
-) -> Result<Option<f64>, String> {
-    match family.frailty() {
-        None => Ok(None),
-        Some(gam::families::lognormal_kernel::FrailtySpec::None) => Ok(None),
-        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
-            sigma_fixed: Some(sigma),
-        }) => Ok(Some(*sigma)),
-        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None }) => {
-            Err(
-                "saved probit marginal-slope model requires a fixed GaussianShift sigma"
-                    .to_string(),
-            )
-        }
-        Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. }) => {
-            Err("saved probit marginal-slope model cannot use HazardMultiplier frailty".to_string())
-        }
-    }
-}
-
 fn fixed_hazard_multiplier_from_saved_family(
     family: &FittedFamily,
 ) -> Result<(f64, gam::families::lognormal_kernel::HazardLoading), String> {
@@ -9421,17 +8919,237 @@ fn fixed_hazard_multiplier_from_saved_family(
     }
 }
 
-fn probit_frailty_scale_from_sigma(sigma: Option<f64>) -> f64 {
-    gam::families::lognormal_kernel::ProbitFrailtyScale::new(sigma.unwrap_or(0.0)).s
+fn concat_array1_refs(parts: &[&Array1<f64>]) -> Array1<f64> {
+    let total: usize = parts.iter().map(|part| part.len()).sum();
+    let mut out = Array1::<f64>::zeros(total);
+    let mut offset = 0usize;
+    for part in parts {
+        let width = part.len();
+        out.slice_mut(s![offset..offset + width]).assign(part);
+        offset += width;
+    }
+    out
 }
 
-fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
-    [
-        scale * coefficients[0],
-        scale * coefficients[1],
-        scale * coefficients[2],
-        scale * coefficients[3],
-    ]
+fn build_saved_survival_marginal_slope_predictor(
+    model: &SavedModel,
+    fit_saved: &UnifiedFitResult,
+    z_name: &str,
+    z: &Array1<f64>,
+    cov_design: &DesignMatrix,
+    logslope_design: &DesignMatrix,
+    time_build: &SurvivalTimeBuildOutput,
+    eta_offset_entry: &Array1<f64>,
+    eta_offset_exit: &Array1<f64>,
+    derivative_offset_exit: &Array1<f64>,
+    primary_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+) -> Result<
+    (
+        gam::predict::BernoulliMarginalSlopePredictor,
+        PredictInput,
+        UnifiedFitResult,
+    ),
+    String,
+> {
+    let saved_runtime = model.saved_prediction_runtime()?;
+    if saved_runtime.link_wiggle.is_some() {
+        return Err(
+            "saved survival marginal-slope model contains legacy linkwiggle metadata; refit with the anchored link-deviation runtime"
+                .to_string(),
+        );
+    }
+
+    let saved_score_runtime = saved_runtime.score_warp;
+    let saved_link_runtime = saved_runtime.link_deviation;
+    let blocks = &fit_saved.blocks;
+    let expected_blocks =
+        3 + usize::from(saved_score_runtime.is_some()) + usize::from(saved_link_runtime.is_some());
+    if blocks.len() != expected_blocks {
+        return Err(format!(
+            "saved survival marginal-slope model requires {} blocks [time, marginal, slope{}{}], got {}",
+            expected_blocks,
+            if saved_score_runtime.is_some() {
+                ", score-warp"
+            } else {
+                ""
+            },
+            if saved_link_runtime.is_some() {
+                ", link-deviation"
+            } else {
+                ""
+            },
+            blocks.len(),
+        ));
+    }
+
+    let beta_time = &blocks[0].beta;
+    let beta_marginal = &blocks[1].beta;
+    let beta_logslope = &blocks[2].beta;
+    if let Some(runtime) = saved_score_runtime.as_ref() {
+        let beta = &blocks[3].beta;
+        if beta.len() != runtime.basis_dim {
+            return Err(format!(
+                "saved survival marginal-slope score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
+                beta.len(),
+                runtime.basis_dim
+            ));
+        }
+    }
+    if let Some(runtime) = saved_link_runtime.as_ref() {
+        let idx = 3 + usize::from(saved_score_runtime.is_some());
+        let beta = &blocks[idx].beta;
+        if beta.len() != runtime.basis_dim {
+            return Err(format!(
+                "saved survival marginal-slope link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
+                beta.len(),
+                runtime.basis_dim
+            ));
+        }
+    }
+
+    let dense_cov = cov_design.to_dense();
+    let dense_logslope = logslope_design.to_dense();
+    if beta_marginal.len() != dense_cov.ncols() {
+        return Err(format!(
+            "saved survival marginal-slope marginal coefficient mismatch: beta has {} entries but baseline design has {} columns",
+            beta_marginal.len(),
+            dense_cov.ncols()
+        ));
+    }
+    if beta_logslope.len() != dense_logslope.ncols() {
+        return Err(format!(
+            "saved survival marginal-slope slope coefficient mismatch: beta has {} entries but slope design has {} columns",
+            beta_logslope.len(),
+            dense_logslope.ncols()
+        ));
+    }
+
+    let p_time_base = time_build.x_exit_time.ncols();
+    let saved_timewiggle = saved_runtime.baseline_time_wiggle;
+    let p_timewiggle = saved_timewiggle
+        .as_ref()
+        .map_or(0, |runtime| runtime.beta.len());
+    if beta_time.len() != p_time_base + p_timewiggle {
+        return Err(format!(
+            "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
+            beta_time.len(),
+            p_time_base,
+            p_timewiggle
+        ));
+    }
+
+    let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
+    let q_entry_base = time_build.x_entry_time.dot(&beta_time_base)
+        + dense_cov.dot(beta_marginal)
+        + eta_offset_entry
+        + primary_offset;
+    let q_exit_base = time_build.x_exit_time.dot(&beta_time_base)
+        + dense_cov.dot(beta_marginal)
+        + eta_offset_exit
+        + primary_offset;
+    let qd_exit_base = time_build.x_derivative_time.dot(&beta_time_base) + derivative_offset_exit;
+
+    let x_exit_time_base = time_build.x_exit_time.to_dense();
+    let x_exit_time_full = if saved_timewiggle.is_some() {
+        let (_, exit_w, _) = saved_baseline_timewiggle_components(
+            &q_entry_base,
+            &q_exit_base,
+            &qd_exit_base,
+            model,
+        )?
+        .ok_or_else(|| {
+            "saved survival marginal-slope model is missing baseline-timewiggle runtime metadata"
+                .to_string()
+        })?;
+        if exit_w.ncols() != p_timewiggle {
+            return Err(format!(
+                "saved survival marginal-slope timewiggle design mismatch: rebuilt {} columns but runtime expects {}",
+                exit_w.ncols(),
+                p_timewiggle
+            ));
+        }
+        let mut full = Array2::<f64>::zeros((x_exit_time_base.nrows(), p_time_base + p_timewiggle));
+        full.slice_mut(s![.., ..p_time_base])
+            .assign(&x_exit_time_base);
+        full.slice_mut(s![.., p_time_base..]).assign(&exit_w);
+        full
+    } else {
+        x_exit_time_base
+    };
+
+    let p_q = beta_time.len() + beta_marginal.len();
+    let mut q_design = Array2::<f64>::zeros((x_exit_time_full.nrows(), p_q));
+    q_design
+        .slice_mut(s![.., ..beta_time.len()])
+        .assign(&x_exit_time_full);
+    q_design
+        .slice_mut(s![.., beta_time.len()..])
+        .assign(&dense_cov);
+
+    let combined_q_beta = concat_array1_refs(&[beta_time, beta_marginal]);
+    let combined_q_lambdas = concat_array1_refs(&[&blocks[0].lambdas, &blocks[1].lambdas]);
+    let mut predictor_blocks = Vec::with_capacity(
+        2 + usize::from(saved_score_runtime.is_some()) + usize::from(saved_link_runtime.is_some()),
+    );
+    predictor_blocks.push(gam::estimate::FittedBlock {
+        beta: combined_q_beta.clone(),
+        role: BlockRole::Mean,
+        edf: blocks[0].edf + blocks[1].edf,
+        lambdas: combined_q_lambdas,
+    });
+    predictor_blocks.push(gam::estimate::FittedBlock {
+        beta: beta_logslope.clone(),
+        role: BlockRole::Scale,
+        edf: blocks[2].edf,
+        lambdas: blocks[2].lambdas.clone(),
+    });
+    if saved_score_runtime.is_some() {
+        let mut block = blocks[3].clone();
+        block.role = BlockRole::Mean;
+        predictor_blocks.push(block);
+    }
+    if saved_link_runtime.is_some() {
+        let idx = 3 + usize::from(saved_score_runtime.is_some());
+        let mut block = blocks[idx].clone();
+        block.role = BlockRole::LinkWiggle;
+        predictor_blocks.push(block);
+    }
+
+    let mut predictor_fit = fit_saved.clone();
+    predictor_fit.blocks = predictor_blocks;
+    predictor_fit.beta = concat_array1_refs(
+        &predictor_fit
+            .blocks
+            .iter()
+            .map(|block| &block.beta)
+            .collect::<Vec<_>>(),
+    );
+    predictor_fit.block_states.clear();
+
+    let predictor = gam::predict::BernoulliMarginalSlopePredictor::from_unified(
+        &predictor_fit,
+        z_name.to_string(),
+        0.0,
+        model.logslope_baseline.unwrap_or(0.0),
+        model
+            .family_state
+            .frailty()
+            .cloned()
+            .unwrap_or(gam::families::lognormal_kernel::FrailtySpec::None),
+        saved_score_runtime,
+        saved_link_runtime,
+    )?;
+
+    let pred_input = PredictInput {
+        design: DesignMatrix::from(q_design),
+        offset: eta_offset_exit + primary_offset,
+        design_noise: Some(logslope_design.clone()),
+        offset_noise: Some(noise_offset.clone()),
+        auxiliary_scalar: Some(z.clone()),
+    };
+
+    Ok((predictor, pred_input, predictor_fit))
 }
 
 fn build_bernoulli_marginal_slope_saved_model(
@@ -11133,24 +10851,24 @@ fn prediction_backend_from_model<'a>(
     let fit = model.fit_result.as_ref().ok_or_else(|| {
         "model is missing canonical fit_result payload; refit with current CLI".to_string()
     })?;
-    if mode == CovarianceModeArg::Conditional
-        && let Some(hessian) = fit.penalized_hessian()
-    {
+    let covariance = match mode {
+        CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
+        CovarianceModeArg::Conditional => fit.beta_covariance(),
+    };
+    if let Some(covariance) = covariance {
+        return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
+    }
+    if let Some(hessian) = fit.penalized_hessian() {
         if let Ok(backend) = PredictionCovarianceBackend::from_factorized_hessian(
             SymmetricMatrix::Dense(hessian.clone()),
         ) {
             return Ok(backend);
         }
     }
-    let covariance = match mode {
-        CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
-        CovarianceModeArg::Conditional => fit.beta_covariance(),
-    }
-    .ok_or_else(|| {
+    Err(
         "nonlinear posterior-mean prediction requires covariance; refit model with current CLI"
-            .to_string()
-    })?;
-    Ok(PredictionCovarianceBackend::from_dense(covariance.view()))
+            .to_string(),
+    )
 }
 
 fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCovarianceMode {
@@ -11737,6 +11455,292 @@ mod tests {
             stable_penalty_term: 0.0,
             max_abs_eta: 0.0,
             reml_score: 0.0,
+        }
+    }
+
+    mod saved_survival_marginal_slope_test_support {
+        use super::{Array1, SavedAnchoredDeviationRuntime};
+        use super::super::exact_kernel;
+        use gam::probability::normal_cdf;
+
+        fn probit_frailty_scale_from_sigma(sigma: Option<f64>) -> f64 {
+            gam::families::lognormal_kernel::ProbitFrailtyScale::new(sigma.unwrap_or(0.0)).s
+        }
+
+        fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
+            [
+                scale * coefficients[0],
+                scale * coefficients[1],
+                scale * coefficients[2],
+                scale * coefficients[3],
+            ]
+        }
+
+        fn saved_survival_default_score_span() -> exact_kernel::LocalSpanCubic {
+            exact_kernel::LocalSpanCubic {
+                left: 0.0,
+                right: 1.0,
+                c0: 0.0,
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            }
+        }
+
+        fn saved_survival_default_link_span() -> exact_kernel::LocalSpanCubic {
+            exact_kernel::LocalSpanCubic {
+                left: 0.0,
+                right: 1.0,
+                c0: 0.0,
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            }
+        }
+
+        fn saved_survival_denested_partition_cells(
+            a: f64,
+            b: f64,
+            gaussian_frailty_sd: Option<f64>,
+            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_beta: Option<&Array1<f64>>,
+            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_beta: Option<&Array1<f64>>,
+        ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
+            let score_breaks = if let Some(runtime) = score_runtime {
+                runtime.breakpoints()?
+            } else {
+                Vec::new()
+            };
+            let link_breaks = if let Some(runtime) = link_runtime {
+                runtime.breakpoints()?
+            } else {
+                Vec::new()
+            };
+            let mut cells = exact_kernel::build_denested_partition_cells_with_tails(
+                a,
+                b,
+                &score_breaks,
+                &link_breaks,
+                |z| {
+                    if let (Some(runtime), Some(beta)) = (score_runtime, score_beta) {
+                        runtime.local_cubic_at(beta, z)
+                    } else {
+                        Ok(saved_survival_default_score_span())
+                    }
+                },
+                |u| {
+                    if let (Some(runtime), Some(beta)) = (link_runtime, link_beta) {
+                        runtime.local_cubic_at(beta, u)
+                    } else {
+                        Ok(saved_survival_default_link_span())
+                    }
+                },
+            )?;
+            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            if scale != 1.0 {
+                for partition_cell in &mut cells {
+                    partition_cell.cell.c0 *= scale;
+                    partition_cell.cell.c1 *= scale;
+                    partition_cell.cell.c2 *= scale;
+                    partition_cell.cell.c3 *= scale;
+                }
+            }
+            Ok(cells)
+        }
+
+        fn evaluate_saved_survival_calibration(
+            a: f64,
+            q: f64,
+            slope: f64,
+            gaussian_frailty_sd: Option<f64>,
+            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_beta: Option<&Array1<f64>>,
+            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_beta: Option<&Array1<f64>>,
+        ) -> Result<(f64, f64), String> {
+            let cells = saved_survival_denested_partition_cells(
+                a,
+                slope,
+                gaussian_frailty_sd,
+                score_runtime,
+                score_beta,
+                link_runtime,
+                link_beta,
+            )?;
+            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let mut f = -gam::probability::normal_cdf(-q);
+            let mut f_a = 0.0;
+            for partition_cell in cells {
+                let pos_cell = partition_cell.cell;
+                let neg_cell = exact_kernel::DenestedCubicCell {
+                    left: pos_cell.left,
+                    right: pos_cell.right,
+                    c0: -pos_cell.c0,
+                    c1: -pos_cell.c1,
+                    c2: -pos_cell.c2,
+                    c3: -pos_cell.c3,
+                };
+                let state = exact_kernel::evaluate_cell_moments(neg_cell, 3)?;
+                f += state.value;
+                let (dc_da_pos, _) = exact_kernel::denested_cell_coefficient_partials(
+                    partition_cell.score_span,
+                    partition_cell.link_span,
+                    a,
+                    slope,
+                );
+                let dc_da = scale_coeff4(dc_da_pos, -scale);
+                f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+            }
+            Ok((f, f_a))
+        }
+
+        fn solve_saved_survival_intercept(
+            q: f64,
+            slope: f64,
+            gaussian_frailty_sd: Option<f64>,
+            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_beta: Option<&Array1<f64>>,
+            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_beta: Option<&Array1<f64>>,
+        ) -> Result<f64, String> {
+            let eval = |a: f64| -> Result<(f64, f64, f64), String> {
+                let (f, f_a) = evaluate_saved_survival_calibration(
+                    a,
+                    q,
+                    slope,
+                    gaussian_frailty_sd,
+                    score_runtime,
+                    score_beta,
+                    link_runtime,
+                    link_beta,
+                )?;
+                Ok((f, f_a, 0.0))
+            };
+            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let a_init = q * (1.0 + (scale * slope) * (scale * slope)).sqrt();
+            let (root, _) = gam::families::monotone_root::solve_monotone_root(
+                eval,
+                a_init,
+                "saved survival intercept",
+                1e-12,
+                64,
+                64,
+            )?;
+            Ok(root)
+        }
+
+        struct SavedSurvivalMarginalSlopeEtaTransport {
+            eta: Array1<f64>,
+            mean: Array1<f64>,
+        }
+
+        fn saved_survival_marginal_slope_eta_transport(
+            q_exit: &Array1<f64>,
+            slope: &Array1<f64>,
+            z: &Array1<f64>,
+            gaussian_frailty_sd: Option<f64>,
+            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_beta: Option<&Array1<f64>>,
+            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_beta: Option<&Array1<f64>>,
+        ) -> Result<SavedSurvivalMarginalSlopeEtaTransport, String> {
+            let n = q_exit.len();
+            if slope.len() != n || z.len() != n {
+                return Err(format!(
+                    "saved survival marginal-slope transport length mismatch: q={} slope={} z={}",
+                    n,
+                    slope.len(),
+                    z.len()
+                ));
+            }
+            if score_runtime.is_some() != score_beta.is_some() {
+                return Err(
+                    "saved survival marginal-slope score-warp runtime/coefficients are inconsistent"
+                        .to_string(),
+                );
+            }
+            if link_runtime.is_some() != link_beta.is_some() {
+                return Err(
+                    "saved survival marginal-slope link-deviation runtime/coefficients are inconsistent"
+                        .to_string(),
+                );
+            }
+            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let flex_active = score_runtime.is_some() || link_runtime.is_some();
+            if !flex_active {
+                let sb = slope.mapv(|value| scale * value);
+                let c = sb.mapv(|value| (1.0 + value * value).sqrt());
+                let eta = q_exit * &c + &sb * z;
+                let mean = eta.mapv(|value| normal_cdf(-value));
+                return Ok(SavedSurvivalMarginalSlopeEtaTransport { eta, mean });
+            }
+
+            let score_obs_design = if let Some(runtime) = score_runtime {
+                Some(runtime.design(z).map_err(|err| {
+                    format!("saved survival marginal-slope score-warp design failed: {err}")
+                })?)
+            } else {
+                None
+            };
+            let score_dev_obs =
+                if let (Some(design), Some(beta)) = (score_obs_design.as_ref(), score_beta) {
+                    design.dot(beta)
+                } else {
+                    Array1::zeros(n)
+                };
+
+            let mut intercepts = Array1::<f64>::zeros(n);
+            for row in 0..n {
+                intercepts[row] = solve_saved_survival_intercept(
+                    q_exit[row],
+                    slope[row],
+                    gaussian_frailty_sd,
+                    score_runtime,
+                    score_beta,
+                    link_runtime,
+                    link_beta,
+                )?;
+            }
+
+            let eta_base = &intercepts + &(slope * z);
+            let link_dev_obs = if let (Some(runtime), Some(beta)) = (link_runtime, link_beta) {
+                runtime
+                    .design(&eta_base)
+                    .map_err(|err| {
+                        format!("saved survival marginal-slope link-deviation design failed: {err}")
+                    })?
+                    .dot(beta)
+            } else {
+                Array1::zeros(n)
+            };
+            let eta =
+                (&eta_base + &(slope * &score_dev_obs) + &link_dev_obs).mapv(|value| scale * value);
+            let mean = eta.mapv(|value| normal_cdf(-value));
+            Ok(SavedSurvivalMarginalSlopeEtaTransport { eta, mean })
+        }
+
+        pub(super) fn predict_saved_survival_marginal_slope_flex_exit(
+            q_exit: &Array1<f64>,
+            slope: &Array1<f64>,
+            z: &Array1<f64>,
+            gaussian_frailty_sd: Option<f64>,
+            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_beta: Option<&Array1<f64>>,
+            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_beta: Option<&Array1<f64>>,
+        ) -> Result<(Array1<f64>, Array1<f64>), String> {
+            let transport = saved_survival_marginal_slope_eta_transport(
+                q_exit,
+                slope,
+                z,
+                gaussian_frailty_sd,
+                score_runtime,
+                score_beta,
+                link_runtime,
+                link_beta,
+            )?;
+            Ok((transport.eta, transport.mean))
         }
     }
 
@@ -13744,7 +13748,8 @@ mod tests {
         let slope = array![-0.7, 0.0, 0.9];
         let z = array![-1.0, 0.5, 1.3];
 
-        let (eta, mean) = super::predict_saved_survival_marginal_slope_flex_exit(
+        let (eta, mean) =
+            saved_survival_marginal_slope_test_support::predict_saved_survival_marginal_slope_flex_exit(
             &q_exit, &slope, &z, None, None, None, None, None,
         )
         .expect("flex exit helper should reduce to rigid model");
@@ -13816,7 +13821,8 @@ mod tests {
         let slope = array![0.3, -1.1];
         let z = array![0.2, -0.7];
 
-        let (eta, mean) = super::predict_saved_survival_marginal_slope_flex_exit(
+        let (eta, mean) =
+            saved_survival_marginal_slope_test_support::predict_saved_survival_marginal_slope_flex_exit(
             &q_exit,
             &slope,
             &z,
@@ -13844,7 +13850,8 @@ mod tests {
         let z = array![0.2, -0.7];
         let gaussian_frailty_sd = Some(0.9);
 
-        let (eta, mean) = super::predict_saved_survival_marginal_slope_flex_exit(
+        let (eta, mean) =
+            saved_survival_marginal_slope_test_support::predict_saved_survival_marginal_slope_flex_exit(
             &q_exit,
             &slope,
             &z,
@@ -13856,7 +13863,8 @@ mod tests {
         )
         .expect("rigid frailty path should predict");
 
-        let scale = super::probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+        let scale =
+            gam::families::lognormal_kernel::ProbitFrailtyScale::new(gaussian_frailty_sd.unwrap_or(0.0)).s;
         for i in 0..q_exit.len() {
             let sb = scale * slope[i];
             let c = (1.0 + sb * sb).sqrt();
