@@ -2183,7 +2183,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
             .as_ref()
             .map_or_else(|| Array1::zeros(design_noise.nrows()), |o| o.clone());
         let eta_s = design_noise.dot(&self.beta_noise) + &offset_noise;
-        let (eta, _point_prob) = self.apply_link(&q0_base)?;
+        let (eta, _) = self.apply_link(&q0_base)?;
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_noise.len();
         let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());

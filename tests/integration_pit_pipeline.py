@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Fast end-to-end PIT pipeline.
+"""End-to-end PIT pipeline: transformation-normal fit -> predict z -> marginal-slope fits.
 
-This test exercises:
-1. Gaussian location-scale fitting on a reference panel.
-2. Prediction on a study cohort.
-3. PIT-style latent score construction with explicit empirical standardization.
-4. Downstream Bernoulli marginal-slope fitting.
-
-The formulas are intentionally rigid and low-dimensional so this stays fast in
-CI while still covering the PIT -> marginal-slope integration path.
+Duchon smooths throughout, linkwiggle, timewiggle, score warp — no linear terms.
+PIT is done entirely by the gam binary via --transformation-normal.
 """
 
 import csv
@@ -19,7 +13,6 @@ import subprocess
 import sys
 import tempfile
 import time
-
 
 GAM_BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "gam")
 
@@ -33,20 +26,18 @@ def generate_reference(n=40, seed=1):
         mu = 0.3 * pc[0] - 0.2 * pc[1] + 0.1 * pc[2]
         sigma = math.exp(0.15 * pc[0] + 0.1 * pc[3] - 0.5)
         pgs = mu + sigma * rng.gauss(0, 1)
-        rows.append(
-            {
-                "pc1": f"{pc[0]:.9f}",
-                "pc2": f"{pc[1]:.9f}",
-                "pc3": f"{pc[2]:.9f}",
-                "pc4": f"{pc[3]:.9f}",
-                "pgs": f"{pgs:.12f}",
-            }
-        )
+        rows.append({
+            "pc1": f"{pc[0]:.9f}",
+            "pc2": f"{pc[1]:.9f}",
+            "pc3": f"{pc[2]:.9f}",
+            "pc4": f"{pc[3]:.9f}",
+            "pgs": f"{pgs:.12f}",
+        })
     return rows
 
 
 def generate_study(n=40, seed=2):
-    """Study cohort with downstream binary outcome."""
+    """Study cohort with binary + survival outcomes."""
     rng = random.Random(seed)
     rows = []
     for _ in range(n):
@@ -60,16 +51,30 @@ def generate_study(n=40, seed=2):
         p_case = 1.0 / (1.0 + math.exp(-eta_case))
         case = 1 if rng.random() < p_case else 0
 
-        rows.append(
-            {
-                "pc1": f"{pc[0]:.9f}",
-                "pc2": f"{pc[1]:.9f}",
-                "pc3": f"{pc[2]:.9f}",
-                "pc4": f"{pc[3]:.9f}",
-                "pgs": f"{pgs:.12f}",
-                "case": str(case),
-            }
-        )
+        age0 = 40 + rng.random() * 10
+        hazard = 0.02 * math.exp(0.05 * (age0 - 45) + 0.4 * latent_z)
+        follow = 3 + rng.random() * 7
+        cum = hazard * follow
+        p_event = 1 - math.exp(-cum)
+        event = 1 if rng.random() < p_event else 0
+        if event:
+            u = rng.random()
+            t = -math.log(1 - u * p_event) / max(hazard, 1e-12)
+            age1 = age0 + max(min(t, follow - 0.01), 0.01)
+        else:
+            age1 = age0 + follow
+
+        rows.append({
+            "pc1": f"{pc[0]:.9f}",
+            "pc2": f"{pc[1]:.9f}",
+            "pc3": f"{pc[2]:.9f}",
+            "pc4": f"{pc[3]:.9f}",
+            "pgs": f"{pgs:.12f}",
+            "case": str(case),
+            "age0": f"{age0:.4f}",
+            "age1": f"{age1:.4f}",
+            "event": str(event),
+        })
     return rows
 
 
@@ -85,34 +90,20 @@ def read_csv(path):
         return list(csv.DictReader(f))
 
 
-def pit_transform(study_rows, pred_rows):
-    if len(study_rows) != len(pred_rows):
-        raise ValueError(
-            f"row count mismatch: study={len(study_rows)} predictions={len(pred_rows)}"
-        )
-
-    raw_z = []
-    merged = []
-    for row, pred in zip(study_rows, pred_rows):
-        mean = float(pred["mean"])
-        sigma = max(float(pred["sigma"]), 1e-12)
-        z = (float(row["pgs"]) - mean) / sigma
-        raw_z.append(z)
-        merged.append((dict(row), mean, sigma, z))
-
-    z_mean = sum(raw_z) / len(raw_z)
-    z_var = sum((z - z_mean) ** 2 for z in raw_z) / len(raw_z)
-    z_sd = max(math.sqrt(z_var), 1e-12)
-
-    transformed = []
-    for row, _mean, _sigma, z in merged:
-        row["z"] = repr((z - z_mean) / z_sd)
-        transformed.append(row)
-
-    return transformed
+def merge_z_into_study(study_csv, pred_csv, out_csv):
+    """Read predict output (eta column = PIT z), merge as 'z' into study data."""
+    study = read_csv(study_csv)
+    preds = read_csv(pred_csv)
+    for s, p in zip(study, preds):
+        s["z"] = p["eta"]
+    write_csv(study, out_csv)
+    zs = [float(p["eta"]) for p in preds]
+    z_mean = sum(zs) / len(zs)
+    z_sd = (sum((z - z_mean) ** 2 for z in zs) / len(zs)) ** 0.5
+    print(f"  PIT z: n={len(zs)}, mean={z_mean:.4f}, sd={z_sd:.4f}, range=[{min(zs):.3f}, {max(zs):.3f}]")
 
 
-def run(args, label, timeout=30):
+def run(args, label, timeout=300):
     cmd = [GAM_BIN] + args
     print(f"\n{'=' * 70}\n{label}\n{'=' * 70}")
     print(f"  cmd: gam {' '.join(args)}")
@@ -155,67 +146,70 @@ def main():
     write_csv(study_rows, study_csv)
 
     n_case = sum(int(row["case"]) for row in study_rows)
+    n_event = sum(int(row["event"]) for row in study_rows)
     n_study = len(study_rows)
     print(f"Reference: {len(ref_rows)} rows")
-    print(f"Study: {n_study} rows, {n_case} cases ({100.0 * n_case / n_study:.1f}%)")
+    print(f"Study: {n_study} rows, {n_case} cases ({100.0 * n_case / n_study:.1f}%), {n_event} events ({100.0 * n_event / n_study:.1f}%)")
 
     timings = {}
     results = {}
 
-    fit1_model = os.path.join(tmpdir, "pgs_dist.json")
-    ok, elapsed = run(
-        [
-            "fit",
-            ref_csv,
-            "pgs ~ pc1 + pc2 + pc3 + pc4",
-            "--predict-noise",
-            "pc1 + pc4",
-            "--out",
-            fit1_model,
-        ],
-        "Fit 1: Gaussian location-scale reference model",
-    )
-    results["fit1_locsca"] = ok
-    timings["fit1_locsca"] = elapsed
+    # ── Fit 1: PIT via transformation-normal (Duchon on PCs) ─────────
+    fit1_model = os.path.join(tmpdir, "pgs_pit.json")
+    ok, elapsed = run([
+        "fit", ref_csv,
+        "pgs ~ duchon(pc1, pc2, pc3, pc4, centers=20)",
+        "--transformation-normal",
+        "--scale-dimensions",
+        "--out", fit1_model,
+    ], "Fit 1: Transformation-normal PIT")
+    results["fit1_pit"] = ok
+    timings["fit1_pit"] = elapsed
 
+    # ── Predict: PIT z-scores on study data ──────────────────────────
     fit1_pred_csv = os.path.join(tmpdir, "fit1_pred.csv")
-    ok, elapsed = run(
-        ["predict", fit1_model, study_csv, "--out", fit1_pred_csv],
-        "Predict: reference model on study cohort",
-    )
-    results["pred_fit1"] = ok
-    timings["pred_fit1"] = elapsed
+    ok, elapsed = run([
+        "predict", fit1_model, study_csv,
+        "--out", fit1_pred_csv,
+    ], "Predict: PIT z-scores on study data")
+    results["pred_pit"] = ok
+    timings["pred_pit"] = elapsed
 
-    if results["fit1_locsca"] and results["pred_fit1"]:
-        study_with_z = pit_transform(study_rows, read_csv(fit1_pred_csv))
-        z_values = [float(row["z"]) for row in study_with_z]
-        z_mean = sum(z_values) / len(z_values)
-        z_sd = math.sqrt(sum((z - z_mean) ** 2 for z in z_values) / len(z_values))
-        if abs(z_mean) > 1e-12 or abs(z_sd - 1.0) > 1e-12:
-            raise RuntimeError(f"PIT z standardization drifted: mean={z_mean}, sd={z_sd}")
-        print(f"PIT z summary: mean={z_mean:.3e}, sd={z_sd:.12f}")
-        study_with_z_csv = os.path.join(tmpdir, "study_with_z.csv")
-        write_csv(study_with_z, study_with_z_csv)
-    else:
-        study_with_z_csv = study_csv
+    # ── Merge z into study CSV ───────────────────────────────────────
+    enriched_csv = os.path.join(tmpdir, "study_with_z.csv")
+    merge_z_into_study(study_csv, fit1_pred_csv, enriched_csv)
 
-    ok, elapsed = run(
-        [
-            "fit",
-            study_with_z_csv,
-            "case ~ 1",
-            "--logslope-formula",
-            "1",
-            "--z-column",
-            "z",
-            "--disable-score-warp",
-            "--disable-link-dev",
-        ],
-        "Fit 2: Bernoulli marginal-slope",
-    )
+    # ── Fit 2: Bernoulli marginal-slope (Duchon + linkwiggle) ────────
+    fit2_model = os.path.join(tmpdir, "bernoulli.json")
+    ok, elapsed = run([
+        "fit", enriched_csv,
+        "case ~ duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
+        "--logslope-formula",
+        "duchon(pc1, pc2, pc3, pc4, centers=20)",
+        "--z-column", "z",
+        "--scale-dimensions",
+        "--out", fit2_model,
+    ], "Fit 2: Bernoulli marginal-slope")
     results["fit2_bern_ms"] = ok
     timings["fit2_bern_ms"] = elapsed
 
+    # ── Fit 4: Survival marginal-slope (Duchon + linkwiggle + timewiggle)
+    fit4_model = os.path.join(tmpdir, "survival.json")
+    ok, elapsed = run([
+        "fit", enriched_csv,
+        "Surv(age0, age1, event) ~ duchon(pc1, pc2, pc3, pc4, centers=20) + survmodel(spec=net, distribution=gaussian) + linkwiggle(knots=8) + timewiggle(knots=8)",
+        "--survival-likelihood", "marginal-slope",
+        "--baseline-target", "gompertz-makeham",
+        "--logslope-formula",
+        "duchon(pc1, pc2, pc3, pc4, centers=20)",
+        "--z-column", "z",
+        "--scale-dimensions",
+        "--out", fit4_model,
+    ], "Fit 4: Survival marginal-slope (Gompertz-Makeham + timewiggle)")
+    results["fit4_surv_ms"] = ok
+    timings["fit4_surv_ms"] = elapsed
+
+    # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 70}\nSUMMARY\n{'=' * 70}")
     total = 0.0
     for name in results:

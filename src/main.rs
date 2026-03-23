@@ -11,7 +11,6 @@ use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
     ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
     compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
-    predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
 use gam::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime,
@@ -57,7 +56,9 @@ use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
     state_fromspec,
 };
-use gam::predict::PredictableModel;
+use gam::predict::{
+    PredictableModel, predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
+};
 use gam::probability::{normal_cdf, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
@@ -2368,7 +2369,7 @@ fn run_predict_unified(
     args: &PredictArgs,
     model: &SavedModel,
     pred_input: &PredictInput,
-    predictor: &dyn gam::predict::PredictableModel,
+    predictor: &dyn PredictableModel,
 ) -> Result<(), String> {
     let fit_for_predict = fit_result_from_saved_model_for_prediction(model)?;
     let model_class = model.predict_model_class();
@@ -8985,9 +8986,9 @@ fn fixed_gaussian_shift_frailty_from_spec(
                 sigma_fixed: Some(*sigma),
             },
         ),
-        gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None } => Ok(
-            gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
-        ),
+        gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None } => {
+            Ok(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None })
+        }
         gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. } => Err(format!(
             "{context} requires --frailty-kind gaussian-shift or no frailty"
         )),
