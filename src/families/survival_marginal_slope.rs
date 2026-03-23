@@ -2625,7 +2625,8 @@ impl SurvivalMarginalSlopeFamily {
             .ok_or_else(|| "missing exit timewiggle geometry for marginal psi lift".to_string())?;
 
         let mu = psi_row.dot(beta_marginal);
-        let mut dir = Array1::<f64>::zeros(primary_layout.map_or(N_PRIMARY, |primary| primary.total));
+        let mut dir =
+            Array1::<f64>::zeros(primary_layout.map_or(N_PRIMARY, |primary| primary.total));
         let q0_idx = primary_layout.map_or(0, |primary| primary.q0);
         let q1_idx = primary_layout.map_or(1, |primary| primary.q1);
         let qd1_idx = primary_layout.map_or(2, |primary| primary.qd1);
@@ -4361,11 +4362,14 @@ impl SurvivalMarginalSlopeFamily {
         if u == primary.g && v == primary.g {
             let dc_dbbb_val = {
                 let zero_span = exact_kernel::LocalSpanCubic {
-                    left: 0.0, right: 1.0, c0: 0.0, c1: 0.0, c2: 0.0, c3: 0.0,
+                    left: 0.0,
+                    right: 1.0,
+                    c0: 0.0,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
                 };
-                let link_span_obs = if let (Some(rt), Some(bw)) =
-                    (self.link_dev.as_ref(), beta_w)
-                {
+                let link_span_obs = if let (Some(rt), Some(bw)) = (self.link_dev.as_ref(), beta_w) {
                     rt.local_cubic_at(bw, u_obs)?
                 } else {
                     zero_span
@@ -4374,9 +4378,7 @@ impl SurvivalMarginalSlopeFamily {
                     exact_kernel::denested_cell_third_partials(link_span_obs);
                 eval_coeff4_at(&scale_coeff4(dc_dbbb_raw, scale), z_obs)
             };
-            return Ok(
-                eval_coeff4_at(&obs.dc_dabb, z_obs) * a_dir + dc_dbbb_val * dir[primary.g],
-            );
+            return Ok(eval_coeff4_at(&obs.dc_dabb, z_obs) * a_dir + dc_dbbb_val * dir[primary.g]);
         }
         if u == primary.g || v == primary.g {
             let other = if u == primary.g { v } else { u };
@@ -4388,16 +4390,15 @@ impl SurvivalMarginalSlopeFamily {
             if let Some(w_range) = primary.w.as_ref() {
                 if other >= w_range.start && other < w_range.end {
                     let local_idx = other - w_range.start;
-                    let runtime = self.link_dev.as_ref()
+                    let runtime = self
+                        .link_dev
+                        .as_ref()
                         .ok_or_else(|| "missing link runtime".to_string())?;
                     let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                     let (_, dc_abw, dc_bbw) =
                         exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                    return Ok(
-                        eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * a_dir
-                            + eval_coeff4_at(&scale_coeff4(dc_bbw, scale), z_obs)
-                                * dir[primary.g],
-                    );
+                    return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * a_dir
+                        + eval_coeff4_at(&scale_coeff4(dc_bbw, scale), z_obs) * dir[primary.g]);
                 }
             }
         }
@@ -4427,16 +4428,15 @@ impl SurvivalMarginalSlopeFamily {
             if let Some(w_range) = primary.w.as_ref() {
                 if other >= w_range.start && other < w_range.end {
                     let local_idx = other - w_range.start;
-                    let runtime = self.link_dev.as_ref()
+                    let runtime = self
+                        .link_dev
+                        .as_ref()
                         .ok_or_else(|| "missing link runtime".to_string())?;
                     let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                     let (_, dc_aabw, dc_abbw, _) =
                         exact_kernel::link_basis_cell_third_partials(basis_span);
-                    return Ok(
-                        eval_coeff4_at(&scale_coeff4(dc_aabw, scale), z_obs) * a_dir
-                            + eval_coeff4_at(&scale_coeff4(dc_abbw, scale), z_obs)
-                                * dir[primary.g],
-                    );
+                    return Ok(eval_coeff4_at(&scale_coeff4(dc_aabw, scale), z_obs) * a_dir
+                        + eval_coeff4_at(&scale_coeff4(dc_abbw, scale), z_obs) * dir[primary.g]);
                 }
             }
         }
@@ -4483,18 +4483,22 @@ impl SurvivalMarginalSlopeFamily {
             let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
             let neg_dc_daa: [f64; 4] = fixed.dc_daa.map(|v| -v);
 
-            f_a += exact_kernel::cell_first_derivative_from_moments(
-                &neg_dc_da, &state.moments,
-            )?;
+            f_a += exact_kernel::cell_first_derivative_from_moments(&neg_dc_da, &state.moments)?;
             f_aa += exact_kernel::cell_second_derivative_from_moments(
-                neg_cell, &neg_dc_da, &neg_dc_da, &neg_dc_daa, &state.moments,
+                neg_cell,
+                &neg_dc_da,
+                &neg_dc_da,
+                &neg_dc_daa,
+                &state.moments,
             )?;
 
             let mut neg_coeff_dir = [0.0; 4];
             let mut neg_coeff_a_dir = [0.0; 4];
             let mut neg_coeff_aa_dir = [0.0; 4];
             for c in 0..p {
-                if dir[c] == 0.0 { continue; }
+                if dir[c] == 0.0 {
+                    continue;
+                }
                 for k in 0..4 {
                     neg_coeff_dir[k] -= fixed.coeff_u[c][k] * dir[c];
                     neg_coeff_a_dir[k] -= fixed.coeff_au[c][k] * dir[c];
@@ -4503,11 +4507,21 @@ impl SurvivalMarginalSlopeFamily {
             }
 
             f_a_dir += exact_kernel::cell_second_derivative_from_moments(
-                neg_cell, &neg_dc_da, &neg_coeff_dir, &neg_coeff_a_dir, &state.moments,
+                neg_cell,
+                &neg_dc_da,
+                &neg_coeff_dir,
+                &neg_coeff_a_dir,
+                &state.moments,
             )?;
             f_aa_dir += exact_kernel::cell_third_derivative_from_moments(
-                neg_cell, &neg_dc_da, &neg_dc_da, &neg_coeff_dir,
-                &neg_dc_daa, &neg_coeff_a_dir, &neg_coeff_a_dir, &neg_coeff_aa_dir,
+                neg_cell,
+                &neg_dc_da,
+                &neg_dc_da,
+                &neg_coeff_dir,
+                &neg_dc_daa,
+                &neg_coeff_a_dir,
+                &neg_coeff_a_dir,
+                &neg_coeff_aa_dir,
                 &state.moments,
             )?;
 
@@ -4515,17 +4529,22 @@ impl SurvivalMarginalSlopeFamily {
                 let neg_coeff_u = fixed.coeff_u[u].map(|v| -v);
                 let neg_coeff_au = fixed.coeff_au[u].map(|v| -v);
 
-                f_u[u] += exact_kernel::cell_first_derivative_from_moments(
-                    &neg_coeff_u, &state.moments,
-                )?;
+                f_u[u] +=
+                    exact_kernel::cell_first_derivative_from_moments(&neg_coeff_u, &state.moments)?;
                 f_au[u] += exact_kernel::cell_second_derivative_from_moments(
-                    neg_cell, &neg_dc_da, &neg_coeff_u, &neg_coeff_au, &state.moments,
+                    neg_cell,
+                    &neg_dc_da,
+                    &neg_coeff_u,
+                    &neg_coeff_au,
+                    &state.moments,
                 )?;
 
                 let mut neg_coeff_u_dir = [0.0; 4];
                 let mut neg_coeff_au_dir = [0.0; 4];
                 for c in 0..p {
-                    if dir[c] == 0.0 { continue; }
+                    if dir[c] == 0.0 {
+                        continue;
+                    }
                     let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
                     let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
                     for k in 0..4 {
@@ -4535,8 +4554,14 @@ impl SurvivalMarginalSlopeFamily {
                 }
 
                 f_au_dir[u] += exact_kernel::cell_third_derivative_from_moments(
-                    neg_cell, &neg_dc_da, &neg_coeff_u, &neg_coeff_dir,
-                    &neg_coeff_au, &neg_coeff_a_dir, &neg_coeff_u_dir, &neg_coeff_au_dir,
+                    neg_cell,
+                    &neg_dc_da,
+                    &neg_coeff_u,
+                    &neg_coeff_dir,
+                    &neg_coeff_au,
+                    &neg_coeff_a_dir,
+                    &neg_coeff_u_dir,
+                    &neg_coeff_au_dir,
                     &state.moments,
                 )?;
             }
@@ -4549,15 +4574,23 @@ impl SurvivalMarginalSlopeFamily {
                     let neg_sc_uv = sc_uv.map(|val| -val);
 
                     let base_val = exact_kernel::cell_second_derivative_from_moments(
-                        neg_cell, &neg_coeff_u, &neg_coeff_v, &neg_sc_uv, &state.moments,
+                        neg_cell,
+                        &neg_coeff_u,
+                        &neg_coeff_v,
+                        &neg_sc_uv,
+                        &state.moments,
                     )?;
                     f_uv[[u, v]] += base_val;
-                    if u != v { f_uv[[v, u]] += base_val; }
+                    if u != v {
+                        f_uv[[v, u]] += base_val;
+                    }
 
                     let mut neg_coeff_u_dir = [0.0; 4];
                     let mut neg_coeff_v_dir = [0.0; 4];
                     for c in 0..p {
-                        if dir[c] == 0.0 { continue; }
+                        if dir[c] == 0.0 {
+                            continue;
+                        }
                         let sc_uc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
                         let sc_vc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
                         for k in 0..4 {
@@ -4567,13 +4600,20 @@ impl SurvivalMarginalSlopeFamily {
                     }
 
                     let dir_val = exact_kernel::cell_third_derivative_from_moments(
-                        neg_cell, &neg_coeff_u, &neg_coeff_v, &neg_coeff_dir,
-                        &neg_sc_uv, &neg_coeff_u_dir, &neg_coeff_v_dir,
+                        neg_cell,
+                        &neg_coeff_u,
+                        &neg_coeff_v,
+                        &neg_coeff_dir,
+                        &neg_sc_uv,
+                        &neg_coeff_u_dir,
+                        &neg_coeff_v_dir,
                         &[0.0; 4], // third cross vanishes for cubic cells
                         &state.moments,
                     )?;
                     f_uv_dir[[u, v]] += dir_val;
-                    if u != v { f_uv_dir[[v, u]] += dir_val; }
+                    if u != v {
+                        f_uv_dir[[v, u]] += dir_val;
+                    }
                 }
             }
         }
@@ -4585,13 +4625,15 @@ impl SurvivalMarginalSlopeFamily {
 
         let inv_f_a = 1.0 / f_a;
         let mut a_u = Array1::<f64>::zeros(p);
-        for u in 0..p { a_u[u] = -f_u[u] * inv_f_a; }
+        for u in 0..p {
+            a_u[u] = -f_u[u] * inv_f_a;
+        }
         let mut a_uv = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
-                let val = -(f_uv[[u, v]]
-                    + f_au[u] * a_u[v] + f_au[v] * a_u[u]
-                    + f_aa * a_u[u] * a_u[v]) * inv_f_a;
+                let val =
+                    -(f_uv[[u, v]] + f_au[u] * a_u[v] + f_au[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
+                        * inv_f_a;
                 a_uv[[u, v]] = val;
                 a_uv[[v, u]] = val;
             }
@@ -4602,8 +4644,10 @@ impl SurvivalMarginalSlopeFamily {
         for u in 0..p {
             for v in u..p {
                 let n_dir = f_uv_dir[[u, v]]
-                    + f_au_dir[u] * a_u[v] + f_au[u] * a_u_dir[v]
-                    + f_au_dir[v] * a_u[u] + f_au[v] * a_u_dir[u]
+                    + f_au_dir[u] * a_u[v]
+                    + f_au[u] * a_u_dir[v]
+                    + f_au_dir[v] * a_u[u]
+                    + f_au[v] * a_u_dir[u]
                     + f_aa_dir * a_u[u] * a_u[v]
                     + f_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]);
                 let val = -(n_dir + f_a_dir * a_uv[[u, v]]) * inv_f_a;
@@ -4639,15 +4683,13 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         let chi_dir = eta_aa * a_dir + tau.dot(dir);
-        let eta_aa_dir = eta_aaa * a_dir
-            + eval_coeff4_at(&obs.dc_daab, z_obs) * dir[primary.g];
+        let eta_aa_dir = eta_aaa * a_dir + eval_coeff4_at(&obs.dc_daab, z_obs) * dir[primary.g];
         // eta_aaa_dir and tau_a_dir: 4th-order cell partials vanish for cubic
         let eta_aaa_dir = 0.0;
         let tau_a_dir = Array1::<f64>::zeros(p);
 
         let mut tau_dir = Array1::<f64>::zeros(p);
-        tau_dir[primary.g] =
-            eval_coeff4_at(&obs.dc_daab, z_obs) * a_dir
+        tau_dir[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs) * a_dir
             + eval_coeff4_at(&obs.dc_dabb, z_obs) * dir[primary.g];
         if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
             for local_idx in 0..w_range.len() {
@@ -4655,8 +4697,7 @@ impl SurvivalMarginalSlopeFamily {
                 let idx = w_range.start + local_idx;
                 let (dc_aaw, dc_abw, _) =
                     exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                tau_dir[idx] =
-                    eval_coeff4_at(&scale_coeff4(dc_aaw, scale), z_obs) * a_dir
+                tau_dir[idx] = eval_coeff4_at(&scale_coeff4(dc_aaw, scale), z_obs) * a_dir
                     + eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * dir[primary.g];
             }
         }
@@ -4676,8 +4717,10 @@ impl SurvivalMarginalSlopeFamily {
                     + chi_val * a_uv_dir[[u, v]]
                     + eta_aa_dir * a_u[u] * a_u[v]
                     + eta_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
-                    + tau_dir[u] * a_u[v] + tau[u] * a_u_dir[v]
-                    + tau_dir[v] * a_u[u] + tau[v] * a_u_dir[u]
+                    + tau_dir[u] * a_u[v]
+                    + tau[u] * a_u_dir[v]
+                    + tau_dir[v] * a_u[u]
+                    + tau[v] * a_u_dir[u]
                     + r_uv_dir;
                 eta_uv_dir[[u, v]] = eta_val;
                 eta_uv_dir[[v, u]] = eta_val;
@@ -4686,8 +4729,10 @@ impl SurvivalMarginalSlopeFamily {
                     + eta_aa * a_uv_dir[[u, v]]
                     + eta_aaa_dir * a_u[u] * a_u[v]
                     + eta_aaa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
-                    + tau_a_dir[u] * a_u[v] + tau_a[u] * a_u_dir[v]
-                    + tau_a_dir[v] * a_u[u] + tau_a[v] * a_u_dir[u]
+                    + tau_a_dir[u] * a_u[v]
+                    + tau_a[u] * a_u_dir[v]
+                    + tau_a_dir[v] * a_u[u]
+                    + tau_a[v] * a_u_dir[u]
                     + chi_uv_fixed_dir;
                 chi_uv_dir[[u, v]] = chi_v;
                 chi_uv_dir[[v, u]] = chi_v;
@@ -4707,32 +4752,34 @@ impl SurvivalMarginalSlopeFamily {
             let mut eta_u_poly = vec![Vec::new(); p];
             let mut chi_u_poly = vec![Vec::new(); p];
             for u in 0..p {
-                eta_u_poly[u] = poly_add(
-                    &poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec(),
-                );
+                eta_u_poly[u] =
+                    poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec());
                 chi_u_poly[u] = poly_add(
-                    &poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u].to_vec(),
+                    &poly_scale(&eta_aa_poly, a_u[u]),
+                    &fixed.coeff_au[u].to_vec(),
                 );
             }
 
             let mut coeff_dir_poly = vec![0.0; 4];
             let mut coeff_a_dir_poly = vec![0.0; 4];
             for c in 0..p {
-                if dir[c] == 0.0 { continue; }
+                if dir[c] == 0.0 {
+                    continue;
+                }
                 for k in 0..4 {
                     coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
                     coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
                 }
             }
-            let eta_dir_poly = poly_add(
-                &poly_scale(&chi_poly, a_dir), &coeff_dir_poly,
-            );
+            let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
 
             for u in 0..p {
                 let mut eta_u_dir_fixed = vec![0.0; 4];
                 let mut chi_u_dir_fixed = vec![0.0; 4];
                 for c in 0..p {
-                    if dir[c] == 0.0 { continue; }
+                    if dir[c] == 0.0 {
+                        continue;
+                    }
                     let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
                     let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
                     for k in 0..4 {
@@ -4779,7 +4826,8 @@ impl SurvivalMarginalSlopeFamily {
                 );
 
                 d_u_dir[u] += exact_kernel::cell_polynomial_integral_from_moments(
-                    &full_integrand, &state_ref.moments,
+                    &full_integrand,
+                    &state_ref.moments,
                     "survival D_t first derivative directional",
                 )?;
             }
@@ -4800,28 +4848,26 @@ impl SurvivalMarginalSlopeFamily {
                 let mut eta_u_poly = vec![Vec::new(); p];
                 let mut chi_u_poly = vec![Vec::new(); p];
                 for u in 0..p {
-                    eta_u_poly[u] = poly_add(
-                        &poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec(),
-                    );
+                    eta_u_poly[u] =
+                        poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec());
                     chi_u_poly[u] = poly_add(
-                        &poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u].to_vec(),
+                        &poly_scale(&eta_aa_poly, a_u[u]),
+                        &fixed.coeff_au[u].to_vec(),
                     );
                 }
                 let mut coeff_dir_poly = vec![0.0; 4];
                 let mut coeff_a_dir_poly = vec![0.0; 4];
                 for c in 0..p {
-                    if dir[c] == 0.0 { continue; }
+                    if dir[c] == 0.0 {
+                        continue;
+                    }
                     for k in 0..4 {
                         coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
                         coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
                     }
                 }
-                let eta_dir_poly = poly_add(
-                    &poly_scale(&chi_poly, a_dir), &coeff_dir_poly,
-                );
-                let chi_dir_poly = poly_add(
-                    &poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly,
-                );
+                let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
+                let chi_dir_poly = poly_add(&poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly);
 
                 for u in 0..p {
                     for v in u..p {
@@ -4868,10 +4914,12 @@ impl SurvivalMarginalSlopeFamily {
                             ),
                         );
                         let t2 = poly_scale(
-                            &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]), -1.0,
+                            &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]),
+                            -1.0,
                         );
                         let t3 = poly_scale(
-                            &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]), -1.0,
+                            &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]),
+                            -1.0,
                         );
                         let t4 = poly_scale(
                             &poly_mul(
@@ -4890,10 +4938,8 @@ impl SurvivalMarginalSlopeFamily {
                                 &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
                             ),
                         );
-                        let i_base = poly_add(
-                            &poly_add(&poly_add(&t1, &t2), &t3),
-                            &poly_add(&t4, &t5),
-                        );
+                        let i_base =
+                            poly_add(&poly_add(&poly_add(&t1, &t2), &t3), &poly_add(&t4, &t5));
 
                         // Polynomial dir-derivatives of per-u quantities
                         let mut eu_dir_fixed_u = vec![0.0; 4];
@@ -4901,11 +4947,15 @@ impl SurvivalMarginalSlopeFamily {
                         let mut cu_dir_fixed_u = vec![0.0; 4];
                         let mut cu_dir_fixed_v = vec![0.0; 4];
                         for c in 0..p {
-                            if dir[c] == 0.0 { continue; }
+                            if dir[c] == 0.0 {
+                                continue;
+                            }
                             let sc_u = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
                             let sc_v = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
-                            let sca_u = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
-                            let sca_v = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
+                            let sca_u =
+                                self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                            let sca_v =
+                                self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
                             for k in 0..4 {
                                 eu_dir_fixed_u[k] += sc_u[k] * dir[c];
                                 eu_dir_fixed_v[k] += sc_v[k] * dir[c];
@@ -4944,9 +4994,12 @@ impl SurvivalMarginalSlopeFamily {
                         let eta_uv_dir_poly = poly_add(
                             &poly_add(
                                 &poly_scale(&chi_poly, a_uv_dir[[u, v]]),
-                                &poly_scale(&eta_aa_poly,
-                                    a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]
-                                    + a_uv[[u, v]] * a_dir),
+                                &poly_scale(
+                                    &eta_aa_poly,
+                                    a_u_dir[u] * a_u[v]
+                                        + a_u[u] * a_u_dir[v]
+                                        + a_uv[[u, v]] * a_dir,
+                                ),
                             ),
                             &poly_add(
                                 &poly_add(
@@ -4956,9 +5009,21 @@ impl SurvivalMarginalSlopeFamily {
                                 &{
                                     let mut fp = vec![0.0; 4];
                                     for c in 0..p {
-                                        if dir[c] == 0.0 { continue; }
-                                        let sca_u = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
-                                        let sca_v = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
+                                        if dir[c] == 0.0 {
+                                            continue;
+                                        }
+                                        let sca_u = self.cell_pair_third_coeff_a(
+                                            primary,
+                                            &fixed.coeff_abu,
+                                            u,
+                                            c,
+                                        );
+                                        let sca_v = self.cell_pair_third_coeff_a(
+                                            primary,
+                                            &fixed.coeff_abu,
+                                            v,
+                                            c,
+                                        );
                                         for k in 0..4 {
                                             fp[k] += sca_u[k] * dir[c] * a_u[v]
                                                 + sca_v[k] * dir[c] * a_u[u];
@@ -4973,8 +5038,12 @@ impl SurvivalMarginalSlopeFamily {
                         let t1_dir = poly_add(
                             &poly_add(
                                 &poly_scale(&eta_aa_poly, a_uv_dir[[u, v]]),
-                                &poly_scale(&eta_aaa_poly,
-                                    a_u_dir[u]*a_u[v] + a_u[u]*a_u_dir[v] + a_uv[[u,v]]*a_dir),
+                                &poly_scale(
+                                    &eta_aaa_poly,
+                                    a_u_dir[u] * a_u[v]
+                                        + a_u[u] * a_u_dir[v]
+                                        + a_uv[[u, v]] * a_dir,
+                                ),
                             ),
                             &poly_add(
                                 &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u_dir[v]),
@@ -4984,8 +5053,14 @@ impl SurvivalMarginalSlopeFamily {
                         let t2_dir = poly_scale(
                             &poly_add(
                                 &poly_add(
-                                    &poly_mul(&poly_mul(&chi_u_dir_poly_v, &eta_poly), &eta_u_poly[u]),
-                                    &poly_mul(&poly_mul(&chi_u_poly[v], &eta_dir_poly), &eta_u_poly[u]),
+                                    &poly_mul(
+                                        &poly_mul(&chi_u_dir_poly_v, &eta_poly),
+                                        &eta_u_poly[u],
+                                    ),
+                                    &poly_mul(
+                                        &poly_mul(&chi_u_poly[v], &eta_dir_poly),
+                                        &eta_u_poly[u],
+                                    ),
                                 ),
                                 &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_dir_poly_u),
                             ),
@@ -4994,8 +5069,14 @@ impl SurvivalMarginalSlopeFamily {
                         let t3_dir = poly_scale(
                             &poly_add(
                                 &poly_add(
-                                    &poly_mul(&poly_mul(&chi_u_dir_poly_u, &eta_poly), &eta_u_poly[v]),
-                                    &poly_mul(&poly_mul(&chi_u_poly[u], &eta_dir_poly), &eta_u_poly[v]),
+                                    &poly_mul(
+                                        &poly_mul(&chi_u_dir_poly_u, &eta_poly),
+                                        &eta_u_poly[v],
+                                    ),
+                                    &poly_mul(
+                                        &poly_mul(&chi_u_poly[u], &eta_dir_poly),
+                                        &eta_u_poly[v],
+                                    ),
                                 ),
                                 &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_dir_poly_v),
                             ),
@@ -5062,7 +5143,8 @@ impl SurvivalMarginalSlopeFamily {
                         );
 
                         let value = exact_kernel::cell_polynomial_integral_from_moments(
-                            &full_integrand, &state_ref.moments,
+                            &full_integrand,
+                            &state_ref.moments,
                             "survival D_t second derivative directional",
                         )?;
                         d_uv_dir[[u, v]] += value;
@@ -5126,17 +5208,16 @@ impl SurvivalMarginalSlopeFamily {
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
             return Err(format!(
-                "survival third contracted row {row}: non-positive chi1={:.3e}", exit.chi,
+                "survival third contracted row {row}: non-positive chi1={:.3e}",
+                exit.chi,
             ));
         }
 
         let entry_ext = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
-            &entry, dir, false,
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, &entry, dir, false,
         )?;
         let exit_ext = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w,
-            &exit, dir, true,
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, &exit, dir, true,
         )?;
 
         let wi = self.weights[row];
@@ -5181,42 +5262,42 @@ impl SurvivalMarginalSlopeFamily {
 
                 // Entry probit
                 val += entry_u3 * entry_eta_dir * entry.eta_u[u] * entry.eta_u[v];
-                val += entry_u2 * (entry_eta_u_dir[u] * entry.eta_u[v]
-                    + entry.eta_u[u] * entry_eta_u_dir[v]);
+                val += entry_u2
+                    * (entry_eta_u_dir[u] * entry.eta_u[v] + entry.eta_u[u] * entry_eta_u_dir[v]);
                 val += entry_u2 * entry_eta_dir * entry.eta_uv[[u, v]];
                 val += entry_u1 * entry_ext.eta_uv_dir[[u, v]];
 
                 // Exit probit survival
                 val += exit_u3 * exit_eta_dir * exit.eta_u[u] * exit.eta_u[v];
-                val += exit_u2 * (exit_eta_u_dir[u] * exit.eta_u[v]
-                    + exit.eta_u[u] * exit_eta_u_dir[v]);
+                val += exit_u2
+                    * (exit_eta_u_dir[u] * exit.eta_u[v] + exit.eta_u[u] * exit_eta_u_dir[v]);
                 val += exit_u2 * exit_eta_dir * exit.eta_uv[[u, v]];
                 val += exit_u1 * exit_ext.eta_uv_dir[[u, v]];
 
                 // Event density
-                val += wi * di * (exit_eta_u_dir[u] * exit.eta_u[v]
-                    + exit.eta_u[u] * exit_eta_u_dir[v]
-                    + exit_eta_dir * exit.eta_uv[[u, v]]
-                    + exit.eta * exit_ext.eta_uv_dir[[u, v]]);
+                val += wi
+                    * di
+                    * (exit_eta_u_dir[u] * exit.eta_u[v]
+                        + exit.eta_u[u] * exit_eta_u_dir[v]
+                        + exit_eta_dir * exit.eta_uv[[u, v]]
+                        + exit.eta * exit_ext.eta_uv_dir[[u, v]]);
 
                 // Event chi
-                let chi_uv_over_chi_dir =
-                    (exit_ext.chi_uv_dir[[u, v]] * chi - exit.chi_uv[[u, v]] * exit_chi_dir)
-                        * chi_inv2;
-                let chi_u_chi_v_over_chi2_dir =
-                    (exit_chi_u_dir[u] * exit.chi_u[v] + exit.chi_u[u] * exit_chi_u_dir[v])
-                        * chi_inv2
+                let chi_uv_over_chi_dir = (exit_ext.chi_uv_dir[[u, v]] * chi
+                    - exit.chi_uv[[u, v]] * exit_chi_dir)
+                    * chi_inv2;
+                let chi_u_chi_v_over_chi2_dir = (exit_chi_u_dir[u] * exit.chi_u[v]
+                    + exit.chi_u[u] * exit_chi_u_dir[v])
+                    * chi_inv2
                     - 2.0 * exit.chi_u[u] * exit.chi_u[v] * exit_chi_dir * chi_inv3;
                 val -= wi * di * (chi_uv_over_chi_dir - chi_u_chi_v_over_chi2_dir);
 
                 // Event D
                 let d_uv_over_d_dir =
-                    (exit_ext.d_uv_dir[[u, v]] * d_val - exit.d_uv[[u, v]] * exit_d_dir)
-                        * d_inv2;
+                    (exit_ext.d_uv_dir[[u, v]] * d_val - exit.d_uv[[u, v]] * exit_d_dir) * d_inv2;
                 let d_u_d_v_over_d2_dir =
-                    (exit_d_u_dir[u] * exit.d_u[v] + exit.d_u[u] * exit_d_u_dir[v])
-                        * d_inv2
-                    - 2.0 * exit.d_u[u] * exit.d_u[v] * exit_d_dir * d_inv3;
+                    (exit_d_u_dir[u] * exit.d_u[v] + exit.d_u[u] * exit_d_u_dir[v]) * d_inv2
+                        - 2.0 * exit.d_u[u] * exit.d_u[v] * exit_d_dir * d_inv3;
                 val += wi * di * (d_uv_over_d_dir - d_u_d_v_over_d2_dir);
 
                 // qd1 term
@@ -5240,12 +5321,18 @@ impl SurvivalMarginalSlopeFamily {
         dir_u: &Array1<f64>,
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        let _ = (row, block_states, dir_u, dir_v);
+        return Err(
+            "survival flexible fourth contracted derivative is not implemented"
+                .to_string(),
+        );
         let primary = flex_primary_slices(self);
         let p = primary.total;
         if dir_u.len() != p || dir_v.len() != p {
             return Err(format!(
                 "survival fourth contracted: dir lengths ({},{}) != {p}",
-                dir_u.len(), dir_v.len(),
+                dir_u.len(),
+                dir_v.len(),
             ));
         }
         if dir_u.iter().all(|v| v.abs() == 0.0) || dir_v.iter().all(|v| v.abs() == 0.0) {
@@ -5278,36 +5365,71 @@ impl SurvivalMarginalSlopeFamily {
 
         if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
             return Err(format!(
-                "survival fourth contracted row {row}: non-positive chi1={:.3e}", exit_base.chi,
+                "survival fourth contracted row {row}: non-positive chi1={:.3e}",
+                exit_base.chi,
             ));
         }
 
         let entry_ext_u = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
-            &entry_base, dir_u, false,
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            d0,
+            beta_h,
+            beta_w,
+            &entry_base,
+            dir_u,
+            false,
         )?;
         let entry_ext_v = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
-            &entry_base, dir_v, false,
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            d0,
+            beta_h,
+            beta_w,
+            &entry_base,
+            dir_v,
+            false,
         )?;
         let exit_ext_u = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w,
-            &exit_base, dir_u, true,
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, &exit_base, dir_u, true,
         )?;
         let exit_ext_v = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w,
-            &exit_base, dir_v, true,
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, &exit_base, dir_v, true,
         )?;
 
         let ordered_uv = self.compute_survival_fourth_contracted_ordered(
-            row, &primary, qd1, &entry_base, &exit_base,
-            &entry_ext_u, &entry_ext_v, &exit_ext_u, &exit_ext_v,
-            dir_u, dir_v,
+            row,
+            &primary,
+            qd1,
+            &entry_base,
+            &exit_base,
+            &entry_ext_u,
+            &entry_ext_v,
+            &exit_ext_u,
+            &exit_ext_v,
+            dir_u,
+            dir_v,
         )?;
         let ordered_vu = self.compute_survival_fourth_contracted_ordered(
-            row, &primary, qd1, &entry_base, &exit_base,
-            &entry_ext_v, &entry_ext_u, &exit_ext_v, &exit_ext_u,
-            dir_v, dir_u,
+            row,
+            &primary,
+            qd1,
+            &entry_base,
+            &exit_base,
+            &entry_ext_v,
+            &entry_ext_u,
+            &exit_ext_v,
+            &exit_ext_u,
+            dir_v,
+            dir_u,
         )?;
 
         let mut out = Array2::<f64>::zeros((p, p));
@@ -5376,13 +5498,21 @@ impl SurvivalMarginalSlopeFamily {
         let exit_d_d12 = exit_d_u_d2.dot(dir1);
 
         let entry_eta_u_d12: Array1<f64> = (0..p)
-            .map(|u| entry_ext2.eta_uv_dir.row(u).dot(dir1)).collect::<Vec<_>>().into();
+            .map(|u| entry_ext2.eta_uv_dir.row(u).dot(dir1))
+            .collect::<Vec<_>>()
+            .into();
         let exit_eta_u_d12: Array1<f64> = (0..p)
-            .map(|u| exit_ext2.eta_uv_dir.row(u).dot(dir1)).collect::<Vec<_>>().into();
+            .map(|u| exit_ext2.eta_uv_dir.row(u).dot(dir1))
+            .collect::<Vec<_>>()
+            .into();
         let exit_chi_u_d12: Array1<f64> = (0..p)
-            .map(|u| exit_ext2.chi_uv_dir.row(u).dot(dir1)).collect::<Vec<_>>().into();
+            .map(|u| exit_ext2.chi_uv_dir.row(u).dot(dir1))
+            .collect::<Vec<_>>()
+            .into();
         let exit_d_u_d12: Array1<f64> = (0..p)
-            .map(|u| exit_ext2.d_uv_dir.row(u).dot(dir1)).collect::<Vec<_>>().into();
+            .map(|u| exit_ext2.d_uv_dir.row(u).dot(dir1))
+            .collect::<Vec<_>>()
+            .into();
 
         // For eta_uv_d12, chi_uv_d12, d_uv_d12: these require the mixed second
         // directional extension which is extremely expensive. For the probit and
@@ -5445,9 +5575,8 @@ impl SurvivalMarginalSlopeFamily {
                     + xu[u] * xu[v] * exit_eta_d12;
                 let xb = exit_ext1.eta_uv_dir[[u, v]];
                 let xb_d2 = exit_eta_uv_d12[[u, v]];
-                let xc = exit_eta_u_d1[u] * xu[v]
-                    + xu[u] * exit_eta_u_d1[v]
-                    + exit_eta_d1 * xuv[[u, v]];
+                let xc =
+                    exit_eta_u_d1[u] * xu[v] + xu[u] * exit_eta_u_d1[v] + exit_eta_d1 * xuv[[u, v]];
                 let xc_d2 = exit_eta_u_d12[u] * xu[v]
                     + exit_eta_u_d1[u] * exit_eta_u_d2[v]
                     + exit_eta_u_d2[u] * exit_eta_u_d1[v]
@@ -5463,16 +5592,16 @@ impl SurvivalMarginalSlopeFamily {
                     + exit_u1 * xb_d2;
 
                 // Event density
-                val += wi * di * (
-                    exit_eta_u_d12[u] * xu[v]
-                    + exit_eta_u_d1[u] * exit_eta_u_d2[v]
-                    + exit_eta_u_d2[u] * exit_eta_u_d1[v]
-                    + xu[u] * exit_eta_u_d12[v]
-                    + exit_eta_d12 * xuv[[u, v]]
-                    + exit_eta_d1 * exit_ext2.eta_uv_dir[[u, v]]
-                    + exit_eta_d2 * exit_ext1.eta_uv_dir[[u, v]]
-                    + exit_base.eta * exit_eta_uv_d12[[u, v]]
-                );
+                val += wi
+                    * di
+                    * (exit_eta_u_d12[u] * xu[v]
+                        + exit_eta_u_d1[u] * exit_eta_u_d2[v]
+                        + exit_eta_u_d2[u] * exit_eta_u_d1[v]
+                        + xu[u] * exit_eta_u_d12[v]
+                        + exit_eta_d12 * xuv[[u, v]]
+                        + exit_eta_d1 * exit_ext2.eta_uv_dir[[u, v]]
+                        + exit_eta_d2 * exit_ext1.eta_uv_dir[[u, v]]
+                        + exit_base.eta * exit_eta_uv_d12[[u, v]]);
 
                 // Event chi
                 let chi_uv_val = exit_base.chi_uv[[u, v]];
@@ -5493,12 +5622,13 @@ impl SurvivalMarginalSlopeFamily {
                     - chi_uv_val * exit_chi_d12 * chi_inv2
                     + 2.0 * chi_uv_val * exit_chi_d1 * exit_chi_d2 * chi_inv3;
 
-                let d2_s_chi = (chi_u_d12v * chi_v_val + chi_u_d1 * chi_v_d2
-                    + chi_u_d2 * chi_v_d1 + chi_u_val * chi_v_d12v) * chi_inv2
-                    - 2.0 * (chi_u_d1 * chi_v_val + chi_u_val * chi_v_d1)
-                        * exit_chi_d2 * chi_inv3
-                    - 2.0 * (chi_u_d2 * chi_v_val + chi_u_val * chi_v_d2)
-                        * exit_chi_d1 * chi_inv3
+                let d2_s_chi = (chi_u_d12v * chi_v_val
+                    + chi_u_d1 * chi_v_d2
+                    + chi_u_d2 * chi_v_d1
+                    + chi_u_val * chi_v_d12v)
+                    * chi_inv2
+                    - 2.0 * (chi_u_d1 * chi_v_val + chi_u_val * chi_v_d1) * exit_chi_d2 * chi_inv3
+                    - 2.0 * (chi_u_d2 * chi_v_val + chi_u_val * chi_v_d2) * exit_chi_d1 * chi_inv3
                     - 2.0 * chi_u_val * chi_v_val * exit_chi_d12 * chi_inv3
                     + 6.0 * chi_u_val * chi_v_val * exit_chi_d1 * exit_chi_d2 * chi_inv4;
                 val -= wi * di * (d2_r_chi - d2_s_chi);
@@ -5522,14 +5652,13 @@ impl SurvivalMarginalSlopeFamily {
                     - d_uv_val * exit_d_d12 * d_inv2
                     + 2.0 * d_uv_val * exit_d_d1 * exit_d_d2 * d_inv3;
 
-                let d2_s_d = (d_u_d12v * d_v_val + d_u_d1 * d_v_d2
-                    + d_u_d2 * d_v_d1 + d_u_val * d_v_d12v) * d_inv2
-                    - 2.0 * (d_u_d1 * d_v_val + d_u_val * d_v_d1)
-                        * exit_d_d2 * d_inv3
-                    - 2.0 * (d_u_d2 * d_v_val + d_u_val * d_v_d2)
-                        * exit_d_d1 * d_inv3
-                    - 2.0 * d_u_val * d_v_val * exit_d_d12 * d_inv3
-                    + 6.0 * d_u_val * d_v_val * exit_d_d1 * exit_d_d2 * d_inv4;
+                let d2_s_d =
+                    (d_u_d12v * d_v_val + d_u_d1 * d_v_d2 + d_u_d2 * d_v_d1 + d_u_val * d_v_d12v)
+                        * d_inv2
+                        - 2.0 * (d_u_d1 * d_v_val + d_u_val * d_v_d1) * exit_d_d2 * d_inv3
+                        - 2.0 * (d_u_d2 * d_v_val + d_u_val * d_v_d2) * exit_d_d1 * d_inv3
+                        - 2.0 * d_u_val * d_v_val * exit_d_d12 * d_inv3
+                        + 6.0 * d_u_val * d_v_val * exit_d_d1 * exit_d_d2 * d_inv4;
                 val += wi * di * (d2_r_d - d2_s_d);
 
                 // qd1 term
@@ -5543,7 +5672,6 @@ impl SurvivalMarginalSlopeFamily {
         }
         Ok(out)
     }
-
 
     fn row_primary_third_contracted_general(
         &self,
@@ -6241,6 +6369,12 @@ impl SurvivalMarginalSlopeFamily {
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
+        if flex_active && self.flex_timewiggle_active() {
+            return Err(
+                "survival exact second-order psi terms are not implemented for simultaneous timewiggle and flexible score/link warps"
+                    .to_string(),
+            );
+        }
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
         let Some((block_idx_i, local_idx_i, p_psi_i, label_i)) =
@@ -6378,7 +6512,11 @@ impl SurvivalMarginalSlopeFamily {
                 } else {
                     (
                         None,
-                        Array1::<f64>::zeros(flex_primary.as_ref().map_or(N_PRIMARY, |primary| primary.total)),
+                        Array1::<f64>::zeros(
+                            flex_primary
+                                .as_ref()
+                                .map_or(N_PRIMARY, |primary| primary.total),
+                        ),
                     )
                 };
                 let has_ij = psi_row_ij
@@ -6611,12 +6749,13 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
-        if flex_active {
+        if flex_active && self.flex_timewiggle_active() {
             return Err(
-                "survival marginal-slope exact flexible psi-Hessian directional derivatives are disabled until analytic row-primary third/fourth contractions are implemented"
+                "survival exact psi-Hessian directional derivatives are not implemented for simultaneous timewiggle and flexible score/link warps"
                     .to_string(),
             );
         }
+        let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
         let Some((block_idx, local_idx, p_psi, psi_label)) =
             self.psi_block_info(derivative_blocks, psi_index)?
@@ -6624,7 +6763,11 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
         let deriv = &derivative_blocks[block_idx][local_idx];
-        let loading = spatial_block_primary_loading(block_idx)?;
+        let loading = if let Some(primary) = flex_primary.as_ref() {
+            spatial_block_primary_loading_flex(primary, block_idx)?
+        } else {
+            spatial_block_primary_loading(block_idx)?
+        };
         let beta_psi = match block_idx {
             1 => &block_states[1].beta,
             _ => &block_states[2].beta,
@@ -6661,6 +6804,7 @@ impl SurvivalMarginalSlopeFamily {
                         Some(self.timewiggle_marginal_psi_row_lift(
                             row,
                             block_states,
+                            flex_primary.as_ref(),
                             &psi_row,
                             beta_psi,
                         )?)
@@ -6670,6 +6814,8 @@ impl SurvivalMarginalSlopeFamily {
 
                     let psi_dir = if let Some(lift) = psi_lift.as_ref() {
                         lift.dir.clone()
+                    } else if let Some(primary) = flex_primary.as_ref() {
+                        primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
                     } else {
                         primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
                     };
@@ -6678,10 +6824,18 @@ impl SurvivalMarginalSlopeFamily {
                             row,
                             block_states,
                             &slices,
+                            flex_primary.as_ref(),
                             &psi_row,
                             beta_psi,
                             d_beta_flat,
                         )?
+                    } else if let Some(primary) = flex_primary.as_ref() {
+                        primary_psi_action_from_psi_row_flex(
+                            primary,
+                            block_idx,
+                            &psi_row,
+                            d_beta_block,
+                        )
                     } else {
                         primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
                     };
@@ -6691,8 +6845,26 @@ impl SurvivalMarginalSlopeFamily {
                         &slices,
                         d_beta_flat,
                     )?;
-                    let (_, _, h_pi) =
-                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    let q_geom_lazy;
+                    let h_pi = if let Some(primary) = flex_primary.as_ref() {
+                        let q_ref = match q_geom.as_ref() {
+                            Some(q) => q,
+                            None => {
+                                q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
+                                &q_geom_lazy
+                            }
+                        };
+                        self.compute_row_flex_primary_gradient_hessian_exact(
+                            row,
+                            block_states,
+                            q_ref,
+                            primary,
+                        )?
+                        .2
+                    } else {
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                            .2
+                    };
                     let third_beta =
                         self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
                     let fourth = self.row_primary_fourth_contracted_general(
@@ -7949,6 +8121,119 @@ impl SurvivalMarginalSlopeFamily {
         Ok(result)
     }
 
+    /// Exact first directional derivative for flex without timewiggle.
+    /// J is constant (no wiggle), so DH[d] = J^T T[u^d] J + Σ (Hu^d)_r K_r.
+    fn exact_newton_joint_hessian_directional_derivative_flex_no_wiggle(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_total = slices.total;
+        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+        let result = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |mut acc, row| -> Result<Array2<f64>, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let (_, _, h_pi) = self.compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        &primary,
+                    )?;
+                    let u_d = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_beta_flat,
+                    )?;
+                    let t_ud =
+                        self.row_flex_primary_third_contracted_exact(row, block_states, &u_d)?;
+                    let h_ud = h_pi.dot(&u_d);
+                    self.accumulate_dynamic_q_joint_row(
+                        row,
+                        &slices,
+                        &q_geom,
+                        h_ud.view(),
+                        t_ud.view(),
+                        &identity_blocks,
+                        &mut Array1::zeros(p_total),
+                        &mut acc,
+                    )?;
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |mut a, b| -> Result<_, String> {
+                    a += &b;
+                    Ok(a)
+                },
+            )?;
+        Ok(result)
+    }
+
+    /// Exact second directional derivative for flex without timewiggle.
+    /// J constant ⇒ D²H[d,e] = J^T Q[u^d,u^e] J + Σ (T_d·u^e)_r K_r.
+    fn exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_u: &Array1<f64>,
+        d_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_total = slices.total;
+        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+        let result = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |mut acc, row| -> Result<Array2<f64>, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let ud = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_u,
+                    )?;
+                    let ue = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_v,
+                    )?;
+                    let q_de =
+                        self.row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
+                    let t_d =
+                        self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
+                    let gamma = t_d.dot(&ue);
+                    self.accumulate_dynamic_q_joint_row(
+                        row,
+                        &slices,
+                        &q_geom,
+                        gamma.view(),
+                        q_de.view(),
+                        &identity_blocks,
+                        &mut Array1::zeros(p_total),
+                        &mut acc,
+                    )?;
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |mut a, b| -> Result<_, String> {
+                    a += &b;
+                    Ok(a)
+                },
+            )?;
+        Ok(result)
+    }
+
     fn evaluate_blockwise_exact_newton(
         &self,
         block_states: &[ParameterBlockState],
@@ -8689,8 +8974,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        if self.flex_active() {
-            return ExactOuterDerivativeOrder::Zeroth;
+        if self.flex_active() && self.flex_timewiggle_active() {
+            return ExactOuterDerivativeOrder::First;
         }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
@@ -8790,10 +9075,18 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.effective_flex_active(block_states)? {
-            return Err(
-                "survival marginal-slope exact flexible beta-Hessian directional derivatives are disabled until analytic row-primary third/fourth contractions are implemented"
-                    .to_string(),
-            );
+            return if self.flex_timewiggle_active() {
+                Err(
+                    "survival marginal-slope exact beta-Hessian directional derivatives are not implemented for simultaneous timewiggle and flexible score/link warps"
+                        .to_string(),
+                )
+            } else {
+                self.exact_newton_joint_hessian_directional_derivative_flex_no_wiggle(
+                    block_states,
+                    d_beta_flat,
+                )
+            }
+            .map(Some);
         }
         if self.flex_timewiggle_active() {
             return self
@@ -8815,10 +9108,19 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.effective_flex_active(block_states)? {
-            return Err(
-                "survival marginal-slope exact flexible beta-Hessian second directional derivatives are disabled until analytic row-primary third/fourth contractions are implemented"
-                    .to_string(),
-            );
+            return if self.flex_timewiggle_active() {
+                Err(
+                    "survival marginal-slope exact beta-Hessian second directional derivatives are not implemented for simultaneous timewiggle and flexible score/link warps"
+                        .to_string(),
+                )
+            } else {
+                self.exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle(
+                    block_states,
+                    d_beta_u_flat,
+                    d_beta_v_flat,
+                )
+            }
+            .map(Some);
         }
         if self.flex_timewiggle_active() {
             return self
@@ -10153,7 +10455,7 @@ mod tests {
     }
 
     #[test]
-    fn flex_capable_family_disables_exact_outer_path_until_analytic_transport_lands() {
+    fn flex_capable_family_exposes_exact_outer_path() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let family = SurvivalMarginalSlopeFamily {
@@ -10187,12 +10489,49 @@ mod tests {
         ];
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::Zeroth
+            ExactOuterDerivativeOrder::Second
         );
     }
 
     #[test]
-    fn flex_marginal_psi_terms_require_analytic_row_primary_transport() {
+    fn timewiggle_flex_family_limits_exact_outer_path_to_first_order() {
+        let score_runtime = test_deviation_runtime();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 5))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 5))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 5))),
+            offset_entry: Arc::new(Array1::zeros(1)),
+            offset_exit: Arc::new(Array1::zeros(1)),
+            derivative_offset_exit: Arc::new(Array1::ones(1)),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+            time_wiggle_degree: Some(3),
+            time_wiggle_ncols: 4,
+        };
+        let specs = vec![
+            dummy_blockspec(5),
+            dummy_blockspec(0),
+            dummy_blockspec(0),
+            dummy_blockspec(score_runtime.basis_dim()),
+        ];
+        assert_eq!(
+            family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
+            ExactOuterDerivativeOrder::First
+        );
+    }
+
+    #[test]
+    fn flex_marginal_psi_terms_return_finite_joint_terms() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
@@ -10258,15 +10597,19 @@ mod tests {
             Vec::new(),
         ];
 
-        let err = family
+        let slices = block_slices(&family, &block_states);
+        let terms = family
             .psi_terms(&block_states, &derivative_blocks, 0)
-            .err()
-            .expect("flex psi terms should reject non-analytic transport");
-        assert!(err.contains("analytic row-primary third/fourth contractions"));
+            .expect("flex psi terms should evaluate")
+            .expect("psi terms should exist");
+        assert!(terms.objective_psi.is_finite());
+        assert_eq!(terms.score_psi.len(), slices.total);
+        assert!(terms.score_psi.iter().all(|value| value.is_finite()));
+        assert!(terms.hessian_psi_operator.is_some());
     }
 
     #[test]
-    fn timewiggle_marginal_psi_terms_require_analytic_row_primary_transport() {
+    fn timewiggle_marginal_psi_terms_return_finite_joint_terms() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -10325,15 +10668,19 @@ mod tests {
             Vec::new(),
         ];
 
-        let err = family
+        let slices = block_slices(&family, &block_states);
+        let terms = family
             .psi_terms(&block_states, &derivative_blocks, 0)
-            .err()
-            .expect("timewiggle psi terms should reject non-analytic transport");
-        assert!(err.contains("analytic row-primary third/fourth contractions"));
+            .expect("timewiggle psi terms should evaluate")
+            .expect("psi terms should exist");
+        assert!(terms.objective_psi.is_finite());
+        assert_eq!(terms.score_psi.len(), slices.total);
+        assert!(terms.score_psi.iter().all(|value| value.is_finite()));
+        assert!(terms.hessian_psi_operator.is_some());
     }
 
     #[test]
-    fn timewiggle_marginal_logslope_psi_second_order_requires_analytic_row_primary_transport() {
+    fn timewiggle_marginal_logslope_psi_second_order_is_rejected_until_mixed_transport_lands() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -10404,13 +10751,17 @@ mod tests {
 
         let err = family
             .psi_second_order_terms(&block_states, &derivative_blocks, 0, 1)
-            .err()
-            .expect("timewiggle psi second-order terms should reject non-analytic transport");
-        assert!(err.contains("analytic row-primary third/fourth contractions"));
+            .expect_err("timewiggle flex psi second-order terms should be rejected");
+        assert!(
+            err.contains(
+                "not implemented for simultaneous timewiggle and flexible score/link warps"
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn timewiggle_marginal_psi_hessian_directional_requires_analytic_row_primary_transport() {
+    fn timewiggle_marginal_psi_hessian_directional_is_rejected_until_mixed_transport_lands() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -10480,11 +10831,13 @@ mod tests {
 
         let err = family
             .psi_hessian_directional_derivative(&block_states, &derivative_blocks, 0, &d_beta_flat)
-            .err()
-            .expect(
-                "timewiggle psi-Hessian directional derivatives should reject non-analytic transport",
-            );
-        assert!(err.contains("analytic row-primary third/fourth contractions"));
+            .expect_err("timewiggle flex psi-Hessian directional derivative should be rejected");
+        assert!(
+            err.contains(
+                "not implemented for simultaneous timewiggle and flexible score/link warps"
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
