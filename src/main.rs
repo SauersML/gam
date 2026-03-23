@@ -205,29 +205,6 @@ fn classify_cli_error(message: String) -> CliError {
     CliError::Message { message, advice }
 }
 
-fn standardize_latent_scores_in_place(values: &mut Array1<f64>) {
-    let n = values.len();
-    if n <= 1 {
-        return;
-    }
-    let mean = values.iter().copied().sum::<f64>() / n as f64;
-    let var = values
-        .iter()
-        .map(|&value| {
-            let centered = value - mean;
-            centered * centered
-        })
-        .sum::<f64>()
-        / n as f64;
-    let sd = var.sqrt();
-    if !mean.is_finite() || !sd.is_finite() || sd <= 0.0 {
-        return;
-    }
-    for value in values.iter_mut() {
-        *value = (*value - mean) / sd;
-    }
-}
-
 #[derive(Parser, Debug)]
 #[command(name = "gam")]
 #[command(about = "Formula-first GAM CLI", long_about = None)]
@@ -2270,8 +2247,6 @@ fn build_predict_input_for_model(
                 }
                 h[i] = val;
             }
-            standardize_latent_scores_in_place(&mut h);
-
             Ok(PredictInput {
                 design: DesignMatrix::from(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
                 offset: h + offset,
