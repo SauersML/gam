@@ -307,7 +307,12 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
-    crate::families::lognormal_kernel::ProbitFrailtyScale::new(gaussian_frailty_sd.unwrap_or(0.0)).s
+    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
+    if sigma <= 0.0 {
+        1.0
+    } else {
+        crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln()).s
+    }
 }
 
 struct ObservedDenestedCellPartials {
