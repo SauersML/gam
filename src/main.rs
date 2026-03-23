@@ -4209,7 +4209,6 @@ fn add_survival_time_derivative_guard_offset(
     Ok(())
 }
 
-#[derive(Clone)]
 struct PreparedSurvivalTimeStack {
     eta_offset_entry: Array1<f64>,
     eta_offset_exit: Array1<f64>,
@@ -4401,7 +4400,7 @@ fn survival_baseline_config_from_theta(
 fn optimize_survival_baseline_config<F>(
     initial: &SurvivalBaselineConfig,
     context: &str,
-    mut objective: F,
+    objective: F,
 ) -> Result<SurvivalBaselineConfig, String>
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<f64, String>,
@@ -5109,7 +5108,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &time_build,
             effective_timewiggle.as_ref(),
         )?;
-        let timewiggle_build = prepared.timewiggle_build.clone();
         let time_design_exit = prepared.time_design_exit.clone();
         progress.set_stage("fit", "running survival location-scale optimization");
         let fit = match fit_model(FitRequest::SurvivalLocationScale(
@@ -5195,14 +5193,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.linkwiggle_degree = fit.wiggle_degree;
             payload.beta_link_wiggle = fit.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
             payload.linkwiggle_knots = fit.wiggle_knots.as_ref().map(|k| k.to_vec());
-            payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
-            payload.baseline_timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
+            payload.baseline_timewiggle_degree =
+                prepared.timewiggle_build.as_ref().map(|w| w.degree);
+            payload.baseline_timewiggle_knots =
+                prepared.timewiggle_build.as_ref().map(|w| w.knots.to_vec());
             payload.baseline_timewiggle_penalty_orders = effective_timewiggle
                 .as_ref()
                 .map(|cfg| cfg.penalty_orders.clone());
             payload.baseline_timewiggle_double_penalty =
                 effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
-            payload.beta_baseline_timewiggle = timewiggle_build.as_ref().map(|_| {
+            payload.beta_baseline_timewiggle = prepared.timewiggle_build.as_ref().map(|_| {
                 fit.fit
                     .fit
                     .beta_time()
@@ -5230,14 +5230,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 args.offset_column.clone(),
                 args.noise_offset_column.clone(),
             );
-            payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
-            payload.baseline_timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
+            payload.baseline_timewiggle_degree =
+                prepared.timewiggle_build.as_ref().map(|w| w.degree);
+            payload.baseline_timewiggle_knots =
+                prepared.timewiggle_build.as_ref().map(|w| w.knots.to_vec());
             payload.baseline_timewiggle_penalty_orders = effective_timewiggle
                 .as_ref()
                 .map(|cfg| cfg.penalty_orders.clone());
             payload.baseline_timewiggle_double_penalty =
                 effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
-            payload.beta_baseline_timewiggle = timewiggle_build.as_ref().map(|_| {
+            payload.beta_baseline_timewiggle = prepared.timewiggle_build.as_ref().map(|_| {
                 fit.fit
                     .fit
                     .block_states
@@ -5906,7 +5908,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let (prepared, penalty_blocks, p_time_total, beta0, structural_lower_bounds, model) =
         build_working_model(&baseline_cfg)?;
     let beta0_norm = beta0.dot(&beta0).sqrt();
-    let timewiggle_build = prepared.timewiggle_build.clone();
     progress.set_stage("fit", "running survival pirls");
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
@@ -6110,14 +6111,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survival_time_knots = time_build.knots.clone();
         payload.survival_time_keep_cols = time_build.keep_cols.clone();
         payload.survival_time_smooth_lambda = time_build.smooth_lambda;
-        payload.baseline_timewiggle_degree = timewiggle_build.as_ref().map(|w| w.degree);
-        payload.baseline_timewiggle_knots = timewiggle_build.as_ref().map(|w| w.knots.to_vec());
+        payload.baseline_timewiggle_degree = prepared.timewiggle_build.as_ref().map(|w| w.degree);
+        payload.baseline_timewiggle_knots =
+            prepared.timewiggle_build.as_ref().map(|w| w.knots.to_vec());
         payload.baseline_timewiggle_penalty_orders = effective_timewiggle
             .as_ref()
             .map(|cfg| cfg.penalty_orders.clone());
         payload.baseline_timewiggle_double_penalty =
             effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
-        payload.beta_baseline_timewiggle = timewiggle_build.as_ref().map(|w| {
+        payload.beta_baseline_timewiggle = prepared.timewiggle_build.as_ref().map(|w| {
             let start = time_build.x_exit_time.ncols();
             let end = start + w.ncols;
             beta.slice(s![start..end]).to_vec()
