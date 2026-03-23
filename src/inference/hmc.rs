@@ -984,6 +984,42 @@ mod tests {
     }
 
     #[test]
+    fn gamma_log_logp_and_grad_uses_fitted_shape() {
+        let x = array![[1.0_f64], [1.0_f64]];
+        let y = array![1.5_f64, 2.5_f64];
+        let weights = array![1.0_f64, 2.0_f64];
+        let eta = array![0.2_f64, 0.4_f64];
+        let shape = 3.5_f64;
+        let data = SharedData {
+            x: Arc::new(x.clone()),
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            penalty: Arc::new(Array2::zeros((1, 1))),
+            mode: Arc::new(Array1::zeros(1)),
+            gamma_shape: shape,
+            n_samples: x.nrows(),
+            dim: x.ncols(),
+        };
+
+        let (ll, grad) = super::gamma_log_logp_and_grad(&data, &eta);
+
+        let mut expected_ll = 0.0;
+        let mut expected_score = 0.0;
+        for i in 0..eta.len() {
+            let mu = eta[i].exp();
+            expected_ll += weights[i]
+                * (shape * shape.ln() - statrs::function::gamma::ln_gamma(shape) - shape * eta[i]
+                    + (shape - 1.0) * y[i].ln()
+                    - shape * y[i] / mu);
+            expected_score += weights[i] * shape * (y[i] / mu - 1.0);
+        }
+
+        assert!((ll - expected_ll).abs() < 1e-12);
+        assert_eq!(grad.len(), 1);
+        assert!((grad[0] - expected_score).abs() < 1e-12);
+    }
+
+    #[test]
     fn firth_jeffreys_logit_is_finite_for_rank_deficient_design() {
         let x = array![
             [1.0, -0.5, 1.0],
@@ -1181,6 +1217,7 @@ mod tests {
             weights: w.view(),
             likelihood_family: LikelihoodFamily::PoissonLog,
             inverse_link: InverseLink::Standard(LinkFunction::Log),
+            gamma_shape: None,
             mode: mode.view(),
             hessian: hessian.view(),
             penalty_roots: vec![CanonicalPenalty::from_dense_root(
