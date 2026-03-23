@@ -206,12 +206,8 @@ pub fn parse_survival_baseline_config(
             })
         }
         SurvivalBaselineTarget::Gompertz => {
-            let rate = rate.ok_or_else(|| {
-                "--baseline-target gompertz requires --baseline-rate > 0".to_string()
-            })?;
-            let shape = shape.ok_or_else(|| {
-                "--baseline-target gompertz requires --baseline-shape".to_string()
-            })?;
+            let rate = rate.unwrap_or(1.0);
+            let shape = shape.unwrap_or(0.01);
             if !rate.is_finite() || rate <= 0.0 || !shape.is_finite() {
                 return Err(
                     "gompertz baseline requires finite --baseline-shape and positive --baseline-rate"
@@ -227,15 +223,9 @@ pub fn parse_survival_baseline_config(
             })
         }
         SurvivalBaselineTarget::GompertzMakeham => {
-            let rate = rate.ok_or_else(|| {
-                "--baseline-target gompertz-makeham requires --baseline-rate > 0".to_string()
-            })?;
-            let shape = shape.ok_or_else(|| {
-                "--baseline-target gompertz-makeham requires --baseline-shape".to_string()
-            })?;
-            let makeham = makeham.ok_or_else(|| {
-                "--baseline-target gompertz-makeham requires --baseline-makeham > 0".to_string()
-            })?;
+            let rate = rate.unwrap_or(0.5);
+            let shape = shape.unwrap_or(0.01);
+            let makeham = makeham.unwrap_or(0.5);
             if !rate.is_finite()
                 || rate <= 0.0
                 || !shape.is_finite()

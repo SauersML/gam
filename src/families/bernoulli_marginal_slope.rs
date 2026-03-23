@@ -102,6 +102,8 @@ pub struct BernoulliMarginalSlopeFitResult {
     pub baseline_logslope: f64,
     pub score_warp_runtime: Option<DeviationRuntime>,
     pub link_dev_runtime: Option<DeviationRuntime>,
+    /// Learned or fixed Gaussian-shift frailty SD.  `None` = no frailty.
+    pub gaussian_frailty_sd: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -201,13 +203,12 @@ fn validate_spec(
     match &spec.frailty {
         FrailtySpec::None => {}
         FrailtySpec::GaussianShift { sigma_fixed } => {
-            let sigma = sigma_fixed.ok_or_else(|| {
-                "bernoulli-marginal-slope currently requires FrailtySpec::GaussianShift with a fixed sigma".to_string()
-            })?;
-            if !sigma.is_finite() || sigma < 0.0 {
-                return Err(format!(
-                    "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                ));
+            if let Some(sigma) = sigma_fixed {
+                if !sigma.is_finite() || *sigma < 0.0 {
+                    return Err(format!(
+                        "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                    ));
+                }
             }
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
@@ -1637,34 +1638,41 @@ struct BernoulliMarginalSlopeExactEvalCache {
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
 }
 
-/// Maximum row-loop work proxy before downgrading to first-order:
-///   n × K_pairs × primary²
-const EXACT_OUTER_MAX_ROW_WORK: u64 = 2_000_000;
+/// Maximum exact outer-Hessian row work proxy before downgrading to
+/// first-order. The rho-only exact Hessian path pays for repeated
+/// coefficient-space pullbacks, first-order rho drifts, and second-order
+/// rho/rho directional derivatives, so the gate needs to account for more
+/// than just primary-space width.
+const EXACT_OUTER_MAX_ROW_WORK: u64 = 1_000_000;
 
 /// Row-loop gate for Bernoulli marginal-slope.  The memory gate is handled
 /// by [`cost_gated_outer_order`] at the call site.
 fn bernoulli_row_work_order(
+    specs: &[ParameterBlockSpec],
     n_rows: usize,
     score_warp_dim: usize,
     link_dev_dim: usize,
-    k_smoothing: usize,
 ) -> ExactOuterDerivativeOrder {
     let n = n_rows as u64;
-    let k = k_smoothing as u64;
+    let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
     let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
+    let k_directional = k.saturating_add(k_pairs).saturating_add(k_pairs);
+    let total_coeffs: u64 = specs.iter().map(|s| s.design.ncols() as u64).sum();
     let primary_total = 2u64
         .saturating_add(score_warp_dim as u64)
         .saturating_add(link_dev_dim as u64);
-    // Rigid models (primary=2) use RigidProbitKernel for 3rd/4th
-    // derivatives: O(1) closed-form scalars per row, not O(primary^2 Q).
-    // Use a much higher threshold for this case.
+    // Rigid models still need dense coefficient-space pullbacks for each
+    // rho-directional derivative; the cheap part is only the per-row primary
+    // derivatives. Flexible models pay both coefficient-space and
+    // primary-space tensor work.
     let effective_primary_cost = if score_warp_dim == 0 && link_dev_dim == 0 {
-        1u64 // rigid: negligible per-row cost
+        1u64
     } else {
         primary_total.saturating_mul(primary_total)
     };
     let row_work = n
-        .saturating_mul(k_pairs)
+        .saturating_mul(total_coeffs.saturating_mul(total_coeffs))
+        .saturating_mul(k_directional)
         .saturating_mul(effective_primary_cost);
     if row_work > EXACT_OUTER_MAX_ROW_WORK {
         ExactOuterDerivativeOrder::First
@@ -6228,21 +6236,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        // Rigid Bernoulli marginal-slope already has an analytic outer
-        // gradient, and its full outer Hessian path is disproportionately
-        // expensive because every rho/rho derivative still rebuilds dense
-        // joint-curvature algebra over the realized coefficient space.
-        // Prefer first-order outer optimization here.
-        if self.score_warp.is_none() && self.link_dev.is_none() {
-            return ExactOuterDerivativeOrder::First;
-        }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
         }
         // Family-specific row-loop gate.
-        let k_smoothing: usize = specs.iter().map(|s| s.penalties.len()).sum();
         bernoulli_row_work_order(
+            specs,
             self.y.len(),
             self.score_warp
                 .as_ref()
@@ -6252,7 +6252,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 .as_ref()
                 .map(DeviationRuntime::basis_dim)
                 .unwrap_or(0),
-            k_smoothing,
         )
     }
 
@@ -6758,7 +6757,17 @@ pub fn fit_bernoulli_marginal_slope_terms(
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     validate_spec(data, &spec)?;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
-    let probit_scale = probit_frailty_scale(fixed_gaussian_shift_sigma(&spec.frailty));
+    let sigma_learnable = matches!(
+        &spec.frailty,
+        FrailtySpec::GaussianShift { sigma_fixed: None }
+    );
+    let initial_sigma = match &spec.frailty {
+        FrailtySpec::GaussianShift { sigma_fixed: Some(s) } => Some(*s),
+        FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
+        FrailtySpec::None => None,
+        _ => None,
+    };
+    let probit_scale = probit_frailty_scale(initial_sigma);
     let baseline = (pilot_baseline.0, pilot_baseline.1 / probit_scale);
     let mut joint_designs = build_term_collection_designs_joint(
         data,
@@ -6845,6 +6854,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let hints = RefCell::new(ThetaHints::default());
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
+    let current_sigma = std::cell::Cell::new(initial_sigma);
 
     let build_blocks = |rho: &Array1<f64>,
                         marginal_design: &TermCollectionDesign,
@@ -6905,13 +6915,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
     };
 
     let make_family = |marginal_design: &TermCollectionDesign,
-                       logslope_design: &TermCollectionDesign|
+                       logslope_design: &TermCollectionDesign,
+                       sigma: Option<f64>|
      -> BernoulliMarginalSlopeFamily {
         BernoulliMarginalSlopeFamily {
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
-            gaussian_frailty_sd: fixed_gaussian_shift_sigma(&spec.frailty),
+            gaussian_frailty_sd: sigma,
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
             score_warp: score_warp_runtime.clone(),
@@ -6946,7 +6957,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     }
     let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
-    let initial_family = make_family(&marginal_design, &logslope_design);
+    let initial_family = make_family(&marginal_design, &logslope_design, current_sigma.get());
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
@@ -6962,95 +6973,172 @@ pub fn fit_bernoulli_marginal_slope_terms(
 
     let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
     let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
-    let solved = optimize_spatial_length_scale_exact_joint(
-        data,
-        &[marginalspec_boot.clone(), logslopespec_boot.clone()],
-        &[marginal_terms, logslope_terms],
-        kappa_options,
-        &setup,
-        crate::seeding::SeedRiskProfile::GeneralizedLinear,
-        analytic_joint_gradient_available,
-        analytic_joint_hessian_available,
-        |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let blocks = build_blocks(rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1]);
-            let fit = inner_fit(&family, &blocks, options)?;
-            let mut hints_mut = hints.borrow_mut();
-            let mut bidx = 0usize;
-            if let Some(block) = fit.block_states.get(bidx) {
-                hints_mut.marginal_beta = Some(block.beta.clone());
-            }
-            bidx += 1;
-            if let Some(block) = fit.block_states.get(bidx) {
-                hints_mut.logslope_beta = Some(block.beta.clone());
-            }
-            bidx += 1;
-            if score_warp_prepared.is_some() {
+
+    // ── Run a single [ρ,ψ] optimization at the current sigma ──────────
+    let run_at_sigma = |sigma: Option<f64>| -> Result<SpatialLengthScaleOptimizationResult<UnifiedFitResult>, String> {
+        current_sigma.set(sigma);
+        // Reset warm start so each sigma evaluation is self-contained.
+        exact_warm_start.replace(None);
+        optimize_spatial_length_scale_exact_joint(
+            data,
+            &[marginalspec_boot.clone(), logslopespec_boot.clone()],
+            &[marginal_terms.clone(), logslope_terms.clone()],
+            kappa_options,
+            &setup,
+            crate::seeding::SeedRiskProfile::GeneralizedLinear,
+            analytic_joint_gradient_available,
+            analytic_joint_hessian_available,
+            |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+                let family = make_family(&designs[0], &designs[1], current_sigma.get());
+                let fit = inner_fit(&family, &blocks, options)?;
+                let mut hints_mut = hints.borrow_mut();
+                let mut bidx = 0usize;
                 if let Some(block) = fit.block_states.get(bidx) {
-                    hints_mut.score_warp_beta = Some(block.beta.clone());
+                    hints_mut.marginal_beta = Some(block.beta.clone());
                 }
                 bidx += 1;
-            }
-            if link_dev_prepared.is_some() {
                 if let Some(block) = fit.block_states.get(bidx) {
-                    hints_mut.link_dev_beta = Some(block.beta.clone());
+                    hints_mut.logslope_beta = Some(block.beta.clone());
+                }
+                bidx += 1;
+                if score_warp_prepared.is_some() {
+                    if let Some(block) = fit.block_states.get(bidx) {
+                        hints_mut.score_warp_beta = Some(block.beta.clone());
+                    }
+                    bidx += 1;
+                }
+                if link_dev_prepared.is_some() {
+                    if let Some(block) = fit.block_states.get(bidx) {
+                        hints_mut.link_dev_beta = Some(block.beta.clone());
+                    }
+                }
+                Ok(fit)
+            },
+            |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
+                let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+                let family = make_family(&designs[0], &designs[1], current_sigma.get());
+                let marginal_psi_derivs = if marginal_has_spatial {
+                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
+                        || {
+                            "bernoulli marginal-slope: marginal block has spatial terms \
+                             but spatial psi derivatives are unavailable"
+                                .to_string()
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let logslope_psi_derivs = if logslope_has_spatial {
+                    build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
+                        || {
+                            "bernoulli marginal-slope: logslope block has spatial terms \
+                             but spatial psi derivatives are unavailable"
+                                .to_string()
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let mut derivative_blocks = vec![marginal_psi_derivs, logslope_psi_derivs];
+                if family.score_warp.is_some() {
+                    derivative_blocks.push(Vec::new());
+                }
+                if family.link_dev.is_some() {
+                    derivative_blocks.push(Vec::new());
+                }
+                let eval = evaluate_custom_family_joint_hyper(
+                    &family,
+                    &blocks,
+                    options,
+                    rho,
+                    &derivative_blocks,
+                    exact_warm_start.borrow().as_ref(),
+                    need_hessian,
+                )?;
+                exact_warm_start.replace(Some(eval.warm_start));
+                if need_hessian && eval.outer_hessian.is_none() {
+                    return Err(
+                        "exact bernoulli marginal-slope joint [rho, psi] objective did not return an outer Hessian"
+                            .to_string(),
+                    );
+                }
+                Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            },
+        )
+    };
+
+    // ── Profile optimization over sigma ───────────────────────────────
+    let (solved, final_sigma) = if sigma_learnable {
+        // Grid search: evaluate REML objective at candidate sigma values,
+        // then refine with golden-section search.
+        let candidates = [0.1, 0.3, 0.5, 0.8, 1.2];
+        let mut best_cost = f64::INFINITY;
+        let mut best_sigma = 0.5_f64;
+        let mut best_result = None;
+        for &sigma_try in &candidates {
+            match run_at_sigma(Some(sigma_try)) {
+                Ok(res) => {
+                    let cost = res.fit.reml_score;
+                    log::debug!(
+                        "bernoulli marginal-slope sigma profile: sigma={sigma_try:.3}, REML={cost:.6}"
+                    );
+                    if cost < best_cost {
+                        best_cost = cost;
+                        best_sigma = sigma_try;
+                        best_result = Some(res);
+                    }
+                }
+                Err(e) => {
+                    log::debug!(
+                        "bernoulli marginal-slope sigma profile: sigma={sigma_try:.3} failed: {e}"
+                    );
                 }
             }
-            Ok(fit)
-        },
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
-            let blocks = build_blocks(rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1]);
-            // For blocks with spatial terms, require derivatives (error if missing).
-            // For non-spatial blocks, use an empty vec (zero psi contribution).
-            let marginal_psi_derivs = if marginal_has_spatial {
-                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
-                    || {
-                        "bernoulli marginal-slope: marginal block has spatial terms \
-                         but spatial psi derivatives are unavailable"
-                            .to_string()
-                    },
-                )?
+        }
+
+        // Golden-section refinement around the best grid point.
+        const PHI: f64 = 0.6180339887498949; // (√5 - 1) / 2
+        let mut lo = (best_sigma * 0.3).max(0.01);
+        let mut hi = (best_sigma * 3.0).min(5.0);
+        for _ in 0..8 {
+            if (hi - lo) < 0.02 * best_sigma.max(0.05) {
+                break;
+            }
+            let m1 = hi - PHI * (hi - lo);
+            let m2 = lo + PHI * (hi - lo);
+            let c1 = run_at_sigma(Some(m1))
+                .map(|r| r.fit.reml_score)
+                .unwrap_or(f64::INFINITY);
+            let c2 = run_at_sigma(Some(m2))
+                .map(|r| r.fit.reml_score)
+                .unwrap_or(f64::INFINITY);
+            if c1 < c2 {
+                hi = m2;
             } else {
-                Vec::new()
-            };
-            let logslope_psi_derivs = if logslope_has_spatial {
-                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
-                    || {
-                        "bernoulli marginal-slope: logslope block has spatial terms \
-                         but spatial psi derivatives are unavailable"
-                            .to_string()
-                    },
-                )?
-            } else {
-                Vec::new()
-            };
-            let mut derivative_blocks = vec![marginal_psi_derivs, logslope_psi_derivs];
-            if family.score_warp.is_some() {
-                derivative_blocks.push(Vec::new());
+                lo = m1;
             }
-            if family.link_dev.is_some() {
-                derivative_blocks.push(Vec::new());
-            }
-            let eval = evaluate_custom_family_joint_hyper(
-                &family,
-                &blocks,
-                options,
-                rho,
-                &derivative_blocks,
-                exact_warm_start.borrow().as_ref(),
-                need_hessian,
-            )?;
-            exact_warm_start.replace(Some(eval.warm_start));
-            if need_hessian && eval.outer_hessian.is_none() {
-                return Err(
-                    "exact bernoulli marginal-slope joint [rho, psi] objective did not return an outer Hessian"
-                        .to_string(),
-                );
-            }
-            Ok((eval.objective, eval.gradient, eval.outer_hessian))
-        },
-    )?;
+        }
+        let refined_sigma = 0.5 * (lo + hi);
+
+        // Final fit at the refined sigma.
+        let final_result = run_at_sigma(Some(refined_sigma))?;
+        let final_cost = final_result.fit.reml_score;
+        if final_cost <= best_cost {
+            (final_result, Some(refined_sigma))
+        } else {
+            // Grid winner was better — use it.
+            (
+                best_result.ok_or_else(|| {
+                    "bernoulli marginal-slope sigma profile: no valid grid point".to_string()
+                })?,
+                Some(best_sigma),
+            )
+        }
+    } else {
+        let solved = run_at_sigma(initial_sigma)?;
+        (solved, initial_sigma)
+    };
 
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
@@ -7064,13 +7152,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
         baseline_logslope: baseline.1,
         score_warp_runtime,
         link_dev_runtime,
+        gaussian_frailty_sd: final_sigma,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::CustomFamily;
+    use crate::custom_family::{CustomFamily, PenaltyMatrix};
     use crate::families::bernoulli_marginal_slope::exact_kernel::{
         DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
         LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
@@ -7098,6 +7187,27 @@ mod tests {
             penalties: vec![],
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(Array1::zeros(p)),
+        }
+    }
+
+    fn dummy_penalized_blockspec(
+        p: usize,
+        n_rows: usize,
+        n_penalties: usize,
+    ) -> ParameterBlockSpec {
+        let identity = Array2::from_diag(&Array1::ones(p));
+        ParameterBlockSpec {
+            name: "dummy".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::zeros((n_rows, p)),
+            )),
+            offset: Array1::zeros(n_rows),
+            penalties: (0..n_penalties)
+                .map(|_| PenaltyMatrix::Dense(identity.clone()))
+                .collect(),
+            nullspace_dims: vec![0; n_penalties],
+            initial_log_lambdas: Array1::zeros(n_penalties),
             initial_beta: Some(Array1::zeros(p)),
         }
     }
@@ -8142,26 +8252,49 @@ mod tests {
     }
 
     #[test]
-    fn row_work_order_keeps_small_primary_models_second_order() {
-        // Small n, no auxiliary primaries, K=2.
-        // n=100_000 × k_pairs=3 × primary²=4 = 1_200_000 < 2M.
+    fn row_work_order_keeps_small_models_second_order() {
+        let rigid_specs = vec![
+            dummy_penalized_blockspec(2, 8, 1),
+            dummy_penalized_blockspec(1, 8, 1),
+        ];
+        // n=2_000 × p²=9 × directional terms=8 = 144_000 < 1M.
         assert_eq!(
-            bernoulli_row_work_order(100_000, 0, 0, 2),
+            bernoulli_row_work_order(&rigid_specs, 2_000, 0, 0),
             ExactOuterDerivativeOrder::Second
         );
-        // Moderate n with rich primaries, K=1.
-        // n=4000 × k_pairs=1 × primary²=256 = 1_024_000 < 2M.
+
+        let flex_specs = vec![
+            dummy_penalized_blockspec(3, 8, 1),
+            dummy_penalized_blockspec(1, 8, 0),
+            dummy_penalized_blockspec(2, 8, 0),
+        ];
+        // n=200 × p²=36 × directional terms=3 × primary²=16 = 345_600 < 1M.
         assert_eq!(
-            bernoulli_row_work_order(4_000, 8, 6, 1),
+            bernoulli_row_work_order(&flex_specs, 200, 2, 0),
             ExactOuterDerivativeOrder::Second
         );
     }
 
     #[test]
-    fn row_work_order_downgrades_large_rich_models_to_first_order() {
-        // n=10_000 × k_pairs=6 × primary²=256 = 15_360_000 > 2M.
+    fn row_work_order_downgrades_large_models_to_first_order() {
+        let rigid_specs = vec![
+            dummy_penalized_blockspec(24, 8, 1),
+            dummy_penalized_blockspec(1, 8, 1),
+        ];
+        // n=300 × p²=625 × directional terms=8 = 1_500_000 > 1M.
         assert_eq!(
-            bernoulli_row_work_order(10_000, 8, 6, 3),
+            bernoulli_row_work_order(&rigid_specs, 300, 0, 0),
+            ExactOuterDerivativeOrder::First
+        );
+
+        let rich_specs = vec![
+            dummy_penalized_blockspec(6, 8, 1),
+            dummy_penalized_blockspec(4, 8, 1),
+            dummy_penalized_blockspec(8, 8, 1),
+        ];
+        // n=1_000 × p²=324 × directional terms=15 × primary²=100 = 486M > 1M.
+        assert_eq!(
+            bernoulli_row_work_order(&rich_specs, 1_000, 8, 0),
             ExactOuterDerivativeOrder::First
         );
     }

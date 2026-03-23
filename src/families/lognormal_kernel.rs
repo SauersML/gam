@@ -122,6 +122,49 @@ impl ProbitFrailtyScale {
     }
 }
 
+/// Probit frailty scaling factor **with** t-derivatives (t = log σ).
+///
+/// Provides exact closed-form derivatives of s = 1/√(1+σ²) with respect to
+/// t = log(σ) for learnable Gaussian-shift frailty in the marginal-slope
+/// families.  All formulas follow from the recurrence documented on
+/// [`ProbitFrailtyScale`]; the auxiliary quantity α = σ²/(1+σ²) keeps each
+/// expression compact.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbitFrailtyScaleJet {
+    /// s = 1/√(1+σ²)
+    pub s: f64,
+    /// α = σ²/(1+σ²)  — shared auxiliary for all derivative levels.
+    pub alpha: f64,
+    /// ∂_t s = -α·s
+    pub ds: f64,
+    /// ∂_{tt} s = α(3α−2)·s
+    pub d2s: f64,
+}
+
+impl ProbitFrailtyScaleJet {
+    /// Build the jet from σ (not from t = log σ).
+    ///
+    /// At σ = 0 the jet degenerates to (s=1, α=0, ds=0, d2s=0), which is
+    /// correct: zero frailty means s ≡ 1 independent of t.
+    pub fn new(sigma: f64) -> Self {
+        let sigma2 = sigma * sigma;
+        let one_plus_sigma2 = 1.0 + sigma2;
+        let s = 1.0 / one_plus_sigma2.sqrt();
+        let alpha = sigma2 / one_plus_sigma2;
+        Self {
+            s,
+            alpha,
+            ds: -alpha * s,
+            d2s: alpha * (3.0 * alpha - 2.0) * s,
+        }
+    }
+
+    /// Build from t = log(σ) directly.
+    pub fn from_log_sigma(log_sigma: f64) -> Self {
+        Self::new(log_sigma.exp())
+    }
+}
+
 #[inline]
 fn mode_rank(mode: IntegratedExpectationMode) -> u8 {
     match mode {

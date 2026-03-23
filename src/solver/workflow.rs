@@ -859,14 +859,15 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
 
 use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
-    SurvivalBaselineTarget, SurvivalLikelihoodMode, append_zero_tail_columns,
-    build_latent_survival_baseline_offsets, build_survival_baseline_offsets,
-    build_survival_time_basis, build_survival_timewiggle_from_baseline,
-    build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
-    evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
-    normalize_survival_time_pair, optimize_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
+    SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
+    append_zero_tail_columns, build_latent_survival_baseline_offsets,
+    build_survival_baseline_offsets, build_survival_time_basis,
+    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
+    initial_survival_baseline_config_for_fit, normalize_survival_time_pair,
+    optimize_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
+    parse_survival_time_basis_config, require_structural_survival_time_basis,
+    resolve_survival_time_anchor_value,
 };
 use crate::families::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, TimeBlockInput, TimeWiggleBlockInput,
@@ -1489,12 +1490,19 @@ fn materialize_survival<'a>(
                 .to_string(),
         );
     }
-    let time_cfg = parse_survival_time_basis_config(
-        &config.time_basis,
-        config.time_degree,
-        config.time_num_internal_knots,
-        config.time_smooth_lambda,
-    )?;
+    let effective_timewiggle = parsed.timewiggle.clone();
+    let time_cfg = if effective_timewiggle.is_some() {
+        // Match the CLI path: the parametric baseline plus timewiggle supplies
+        // the time structure, so the base time basis is disabled.
+        SurvivalTimeBasisConfig::None
+    } else {
+        parse_survival_time_basis_config(
+            &config.time_basis,
+            config.time_degree,
+            config.time_num_internal_knots,
+            config.time_smooth_lambda,
+        )?
+    };
     let time_anchor = resolve_survival_time_anchor_value(&age_entry, None)?;
     let exact_derivative_guard = match survival_mode {
         SurvivalLikelihoodMode::LocationScale
@@ -1511,7 +1519,7 @@ fn materialize_survival<'a>(
         time_cfg.clone(),
         Some((config.time_num_internal_knots, config.time_smooth_lambda)),
     )?;
-    if survival_mode != SurvivalLikelihoodMode::Weibull {
+    if survival_mode != SurvivalLikelihoodMode::Weibull && effective_timewiggle.is_none() {
         require_structural_survival_time_basis(&time_build.basisname, "workflow survival fitting")?;
     }
     let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &time_cfg)?;
@@ -1520,8 +1528,6 @@ fn materialize_survival<'a>(
         &mut time_build.x_exit_time,
         &time_anchor_row,
     )?;
-
-    let effective_timewiggle = parsed.timewiggle.clone();
     if effective_timewiggle.is_some() && baseline_cfg.target == SurvivalBaselineTarget::Linear {
         return Err(
             "timewiggle requires a non-linear scalar survival baseline target; \
