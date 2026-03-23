@@ -15,7 +15,7 @@
 use crate::estimate::EstimationError;
 use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
-    cloglog_ghq_jet5_adaptive, cloglog_point_jet5, cloglog_posterior_meanwith_deriv_controlled,
+    latent_cloglog_inverse_link_jet5_controlled,
     lognormal_laplace_term_shared,
 };
 use serde::{Deserialize, Serialize};
@@ -240,30 +240,22 @@ pub fn latent_cloglog_jet5(
     eta: f64,
     sigma: f64,
 ) -> Result<LatentCLogLogJet5, EstimationError> {
-    let sigma = sigma.max(0.0);
-    if sigma <= 1e-10 {
-        let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(eta);
-        return Ok(LatentCLogLogJet5 {
-            mean,
-            d1,
-            d2,
-            d3,
-            d4,
-            d5,
-            mode: IntegratedExpectationMode::ExactClosedForm,
-        });
-    }
-
-    let base = cloglog_posterior_meanwith_deriv_controlled(quadctx, eta, sigma);
-    let (_, _, d2, d3, d4, d5) = cloglog_ghq_jet5_adaptive(quadctx, eta, sigma);
+    // Authoritative latent cloglog backend:
+    //
+    // - mean / score come from the shared controlled scalar evaluator in
+    //   `quadrature.rs`
+    // - curvature through fifth derivative are supplied by the same backend's
+    //   direct integrated eta-derivative jet, not by differencing
+    //   lognormal-Laplace kernel terms
+    let jet = latent_cloglog_inverse_link_jet5_controlled(quadctx, eta, sigma.max(0.0));
     Ok(LatentCLogLogJet5 {
-        mean: base.mean,
-        d1: base.dmean_dmu.max(0.0),
-        d2,
-        d3,
-        d4,
-        d5,
-        mode: base.mode,
+        mean: jet.mean,
+        d1: jet.d1,
+        d2: jet.d2,
+        d3: jet.d3,
+        d4: jet.d4,
+        d5: jet.d5,
+        mode: jet.mode,
     })
 }
 

@@ -2779,16 +2779,13 @@ mod tests {
 
         let h_dense = state.hessian.to_dense();
         let logdet_h: f64 = {
+            use crate::estimate::reml::unified::{spectral_epsilon, spectral_regularize};
             use crate::faer_ndarray::FaerEigh;
             let (evals, _) = h_dense.eigh(faer::Side::Lower).expect("eigh");
-            let max_ev = evals.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs()));
-            let eps = f64::EPSILON.sqrt() * max_ev.max(1.0);
+            let eps = spectral_epsilon(evals.as_slice().unwrap());
             evals
                 .iter()
-                .map(|&sigma| {
-                    let r = 0.5 * (sigma + (sigma * sigma + 4.0 * eps * eps).sqrt());
-                    r.ln()
-                })
+                .map(|&sigma| spectral_regularize(sigma, eps).ln())
                 .sum()
         };
         let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;

@@ -5849,33 +5849,9 @@ fn duchon_kernel_radial_triplet(
         coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
         &coeffs_local
     };
-    let r_eval = r.max(DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8));
-    let mut first = 0.0;
-    let mut second = 0.0;
-
-    for (m, coeff) in coeffs_ref.a.iter().enumerate().skip(1) {
-        if *coeff == 0.0 {
-            continue;
-        }
-        let (_, dm, d2m) = polyharmonic_kernel_triplet(r_eval, m, k_dim)?;
-        first += coeff * dm;
-        second += coeff * d2m;
-    }
-    for (n, coeff) in coeffs_ref.b.iter().enumerate().skip(1) {
-        if *coeff == 0.0 {
-            continue;
-        }
-        let (_, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
-        first += coeff * dn;
-        second += coeff * d2n;
-    }
-
-    if r == 0.0 {
-        first = 0.0;
-        let (phi_rr, _, _) =
-            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs_ref)?;
-        second = phi_rr;
-    }
+    let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, coeffs_ref)?;
+    let first = jets.phi_r;
+    let second = jets.phi_rr;
     if !first.is_finite() || !second.is_finite() {
         return Err(BasisError::InvalidInput(format!(
             "non-finite Duchon radial derivatives at r={r}, length_scale={length_scale:?}, p={p_order}, s={s_order}, dim={k_dim}"
@@ -9481,6 +9457,40 @@ fn duchon_collision_operator_core_fromphi_rr(
     )
 }
 
+#[inline(always)]
+fn duchon_operator_jets_from_phi_derivatives(
+    phi_r: f64,
+    phi_rr: f64,
+    phi_rrr: f64,
+    phi_rrrr: f64,
+    r: f64,
+    d: f64,
+) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64) {
+    // Canonical radial identities for one exact differentiable scalar family:
+    //   q       = phi_r / r
+    //   phi_rr  = q + r q_r
+    //   q_rr    = (phi_rrr - 2 q_r) / r
+    //   lap     = phi_rr + (d - 1) q = d q + r^2 t
+    //   t       = (phi_rr - q) / r^2 = q_r / r
+    //   t_r     = (q_rr - t) / r
+    //   t_rr    = (lap_rr + 2 t - (d + 4) q_rr) / r^2
+    let q = phi_r / r;
+    let q_r = (phi_rr - q) / r;
+    let q_rr = (phi_rrr - 2.0 * q_r) / r;
+    let lap = phi_rr + (d - 1.0) * q;
+    let lap_r = phi_rrr + (d - 1.0) * q_r;
+    let lap_rr = phi_rrrr + (d - 1.0) * q_rr;
+    let t = q_r / r;
+    let t_r = (q_rr - t) / r;
+    let t_rr = (lap_rr + 2.0 * t - (d + 4.0) * q_rr) / (r * r);
+
+    debug_assert!(((phi_rr - (q + r * q_r)).abs()) <= 1e-10 * phi_rr.abs().max(1.0));
+    debug_assert!(((t - (phi_rr - q) / (r * r)).abs()) <= 1e-10 * t.abs().max(1.0));
+    debug_assert!(((lap - (d * q + r * r * t)).abs()) <= 1e-10 * lap.abs().max(1.0));
+
+    (q, q_r, q_rr, lap, lap_r, lap_rr, t, t_r, t_rr)
+}
+
 fn duchon_radial_jets(
     r: f64,
     length_scale: f64,
@@ -9533,22 +9543,26 @@ fn duchon_radial_jets(
         phi_rrrr += coeff * duchon_matern_block_radial_derivative(r_eval, kappa, n, k_dim, 4)?;
     }
 
-    // Derive all radial operator scalars from the same phi-derivative family:
-    //   q = phi_r / r
-    //   q_r = (phi_rr - q) / r
-    //   q_rr = phi_rrr / r - 2 q_r / r
-    //   Delta phi = phi_rr + (d - 1) q
-    //   t = q_r / r
-    // This keeps {phi, q, lap, t} inside one exact differentiable family.
-    out.q = out.phi_r / r_eval;
-    out.q_r = (out.phi_rr - out.q) / r_eval;
-    out.q_rr = (phi_rrr - 2.0 * out.q_r) / r_eval;
-    out.lap = out.phi_rr + (d - 1.0) * out.q;
-    out.lap_r = phi_rrr + (d - 1.0) * out.q_r;
-    out.lap_rr = phi_rrrr + (d - 1.0) * out.q_rr;
-    out.t = out.q_r / r_eval;
-    out.t_r = (out.q_rr - out.t) / r_eval;
-    out.t_rr = (out.lap_rr + 2.0 * out.t - (d + 4.0) * out.q_rr) / (r_eval * r_eval);
+    // Derive every non-phi radial scalar from the same off-origin phi jets so
+    // the Duchon identities cannot drift across independently assembled paths.
+    (
+        out.q,
+        out.q_r,
+        out.q_rr,
+        out.lap,
+        out.lap_r,
+        out.lap_rr,
+        out.t,
+        out.t_r,
+        out.t_rr,
+    ) = duchon_operator_jets_from_phi_derivatives(
+        out.phi_r,
+        out.phi_rr,
+        phi_rrr,
+        phi_rrrr,
+        r_eval,
+        d,
+    );
 
     if r < r_floor {
         // When r is below the derivative evaluation floor the generic formulas
@@ -9592,30 +9606,49 @@ fn duchon_radial_jets(
         //
         // which imply
         //
-        //   phi_r  = phi_rr(0) r + 0.5 t(0) r^3 + (1/8) t_rr(0) r^5 + ...
-        //   phi_rr = phi_rr(0) + 1.5 t(0) r^2 + (5/8) t_rr(0) r^4 + ...
-        //   q      = phi_r / r = phi_rr(0) + 0.5 t(0) r^2 + (1/8) t_rr(0) r^4 + ...
-        //   q_r    = t(0) r + 0.5 t_rr(0) r^3 + ...
-        //   q_rr   = t(0) + 1.5 t_rr(0) r^2 + ...
-        //   lap    = d q + r^2 t
-        //          = d phi_rr(0)
-        //            + 0.5 (d + 2) t(0) r^2
-        //            + (1/8) (d + 4) t_rr(0) r^4 + ...
-        //   lap_r  = (d + 2) t(0) r + 0.5 (d + 4) t_rr(0) r^3 + ...
-        //   lap_rr = (d + 2) t(0) + 1.5 (d + 4) t_rr(0) r^2 + ...
+        //   phi_r    = phi_rr(0) r + 0.5 t(0) r^3 + (1/8) t_rr(0) r^5 + ...
+        //   phi_rr   = phi_rr(0) + 1.5 t(0) r^2 + (5/8) t_rr(0) r^4 + ...
+        //   phi_rrr  = 3 t(0) r + (5/2) t_rr(0) r^3 + ...
+        //   phi_rrrr = 3 t(0) + (15/2) t_rr(0) r^2 + ...
+        //
+        // Feed these Taylor phi-jets back through the same radial-identity
+        // helper used off-origin so the small-r branch stays in the same
+        // differentiable family instead of re-encoding q/lap/t separately.
         out.phi_r = phi_rr * r + 0.5 * t_collision * r3 + 0.125 * t_rr_collision * r5;
         out.phi_rr = phi_rr + 1.5 * t_collision * r2 + 0.625 * t_rr_collision * r4;
-        out.q = phi_rr + 0.5 * t_collision * r2 + 0.125 * t_rr_collision * r4;
-        out.q_r = t_collision * r + 0.5 * t_rr_collision * r3;
-        out.q_rr = t_collision + 1.5 * t_rr_collision * r2;
-        out.t = t_collision + 0.5 * t_rr_collision * r2;
-        out.t_r = t_rr_collision * r;
-        out.t_rr = t_rr_collision;
-        out.lap = d * phi_rr
-            + 0.5 * (d + 2.0) * t_collision * r2
-            + 0.125 * (d + 4.0) * t_rr_collision * r4;
-        out.lap_r = (d + 2.0) * t_collision * r + 0.5 * (d + 4.0) * t_rr_collision * r3;
-        out.lap_rr = (d + 2.0) * t_collision + 1.5 * (d + 4.0) * t_rr_collision * r2;
+        phi_rrr = 3.0 * t_collision * r + 2.5 * t_rr_collision * r3;
+        phi_rrrr = 3.0 * t_collision + 7.5 * t_rr_collision * r2;
+
+        if r > 0.0 {
+            (
+                out.q,
+                out.q_r,
+                out.q_rr,
+                out.lap,
+                out.lap_r,
+                out.lap_rr,
+                out.t,
+                out.t_r,
+                out.t_rr,
+            ) = duchon_operator_jets_from_phi_derivatives(
+                out.phi_r,
+                out.phi_rr,
+                phi_rrr,
+                phi_rrrr,
+                r,
+                d,
+            );
+        } else {
+            out.q = phi_rr;
+            out.q_r = 0.0;
+            out.q_rr = t_collision;
+            out.t = t_collision;
+            out.t_r = 0.0;
+            out.t_rr = t_rr_collision;
+            out.lap = d * phi_rr;
+            out.lap_r = 0.0;
+            out.lap_rr = (d + 2.0) * t_collision;
+        }
     }
     if !out.phi_r.is_finite()
         || !out.phi_rr.is_finite()

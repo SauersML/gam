@@ -254,12 +254,15 @@ struct FitArgs {
     /// Optional additive offset column for the noise/log-scale predictor.
     #[arg(long = "noise-offset-column")]
     noise_offset_column: Option<String>,
-    /// Fixed latent standard deviation for latent-variable families.
-    /// For latent-cloglog-binomial: lognormal hazard multiplier SD.
-    /// For marginal-slope (probit): Gaussian shift on the final index,
-    /// scaling by 1/sqrt(1 + latent_sd^2).
-    #[arg(long = "latent-sd")]
-    latent_sd: Option<f64>,
+    /// Exact frailty modifier family.
+    #[arg(long = "frailty-kind", value_enum)]
+    frailty_kind: Option<FrailtyKindArg>,
+    /// Fixed frailty standard deviation.
+    #[arg(long = "frailty-sd")]
+    frailty_sd: Option<f64>,
+    /// Hazard loading for `hazard-multiplier` frailty.
+    #[arg(long = "hazard-loading", value_enum)]
+    hazard_loading: Option<HazardLoadingArg>,
     #[arg(long = "disable-score-warp", default_value_t = false)]
     disable_score_warp: bool,
     #[arg(long = "disable-link-dev", default_value_t = false)]
@@ -403,7 +406,9 @@ struct SurvivalArgs {
     weights_column: Option<String>,
     offset_column: Option<String>,
     noise_offset_column: Option<String>,
-    latent_sd: Option<f64>,
+    frailty_kind: Option<FrailtyKindArg>,
+    frailty_sd: Option<f64>,
+    hazard_loading: Option<HazardLoadingArg>,
 }
 
 #[derive(Args, Debug)]
@@ -457,6 +462,18 @@ enum FamilyArg {
     GammaLog,
     RoystonParmar,
     TransformationNormal,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
+enum FrailtyKindArg {
+    GaussianShift,
+    HazardMultiplier,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
+enum HazardLoadingArg {
+    Full,
+    LoadedVsUnloaded,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
@@ -650,7 +667,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             weights_column: args.weights_column.clone(),
             offset_column: args.offset_column.clone(),
             noise_offset_column: args.noise_offset_column.clone(),
-            latent_sd: args.latent_sd,
+            frailty_kind: args.frailty_kind,
+            frailty_sd: args.frailty_sd,
+            hazard_loading: args.hazard_loading,
         };
         return run_survival(surv_args);
     }
@@ -952,6 +971,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let fit_tol = 1e-6f64;
     let weights = resolve_weight_column(&ds, &col_map, args.weights_column.as_deref())?;
     let offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
+    let frailty = fit_frailty_spec_from_args(args, "fit")?;
     if let Some(choice) = link_choice.as_ref() {
         if matches!(choice.mode, LinkMode::Flexible) {
             if choice.mixture_components.is_some() {
@@ -983,13 +1003,17 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         None
     };
     let latent_cloglog_state = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
-        Some(
-            gam::types::LatentCLogLogState::new(args.latent_sd.ok_or_else(|| {
-                "--latent-sd is required for --family latent-cloglog-binomial".to_string()
-            })?)
-            .expect("invalid latent_sd for latent-cloglog-binomial"),
-        )
+        Some(latent_cloglog_state_from_frailty_spec(
+            &frailty,
+            "latent-cloglog-binomial",
+        )?)
     } else {
+        if !matches!(frailty, gam::families::lognormal_kernel::FrailtySpec::None) {
+            return Err(
+                "frailty is only supported here for --family latent-cloglog-binomial; use the frailty-aware marginal-slope or survival paths instead"
+                    .to_string(),
+            );
+        }
         None
     };
     let base_fit_options = FitOptions {
@@ -1334,6 +1358,10 @@ fn run_fit_bernoulli_marginal_slope(
     let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
     let marginal_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
     let logslope_offset = resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
+    let frailty = fixed_gaussian_shift_frailty_from_spec(
+        &fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?,
+        "bernoulli marginal-slope",
+    )?;
     let routed_link_dev = match parsed.linkwiggle.as_ref() {
         Some(wiggle) => Some(deviation_block_config_from_formula_linkwiggle(wiggle)),
         None if args.disable_link_dev => None,
@@ -1376,7 +1404,7 @@ fn run_fit_bernoulli_marginal_slope(
                 logslopespec: logslopespec.clone(),
                 marginal_offset,
                 logslope_offset,
-                frailty: fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd),
+                frailty: frailty.clone(),
                 score_warp: if args.disable_score_warp {
                     None
                 } else {
@@ -1432,7 +1460,7 @@ fn run_fit_bernoulli_marginal_slope(
             solved.baseline_logslope,
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
-            fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd),
+            frailty,
         );
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
@@ -7596,13 +7624,13 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
     SavedAnchoredDeviationRuntime {
         schema_version:
             gam::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
-        kernel: "ExactDenestedCubic".to_string(),
-        knots: runtime.knots.to_vec(),
-        degree: runtime.degree,
-        value_span_degree: runtime.value_span_degree,
-        basis_dim: runtime.basis_dim,
+        kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
+        knots: runtime.knots().to_vec(),
+        degree: runtime.degree(),
+        value_span_degree: runtime.value_span_degree(),
+        basis_dim: runtime.basis_dim(),
         basis_transform: runtime
-            .basis_transform
+            .basis_transform()
             .rows()
             .into_iter()
             .map(|row| row.to_vec())
@@ -7897,14 +7925,139 @@ fn deviation_block_config_from_formula_linkwiggle(
     }
 }
 
-fn fixed_gaussian_shift_frailty_from_latent_sd(
-    latent_sd: Option<f64>,
-) -> gam::families::lognormal_kernel::FrailtySpec {
-    match latent_sd {
-        Some(sd) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
-            sigma_fixed: Some(sd),
-        },
-        None => gam::families::lognormal_kernel::FrailtySpec::None,
+fn hazard_loading_from_arg(
+    loading: HazardLoadingArg,
+) -> gam::families::lognormal_kernel::HazardLoading {
+    match loading {
+        HazardLoadingArg::Full => gam::families::lognormal_kernel::HazardLoading::Full,
+        HazardLoadingArg::LoadedVsUnloaded => {
+            gam::families::lognormal_kernel::HazardLoading::LoadedVsUnloaded
+        }
+    }
+}
+
+fn fixed_frailty_spec_from_cli(
+    frailty_kind: Option<FrailtyKindArg>,
+    frailty_sd: Option<f64>,
+    hazard_loading: Option<HazardLoadingArg>,
+    context: &str,
+) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
+    let require_sigma = || -> Result<f64, String> {
+        let sigma = frailty_sd
+            .ok_or_else(|| format!("{context} requires --frailty-sd when --frailty-kind is set"))?;
+        if !sigma.is_finite() || sigma < 0.0 {
+            return Err(format!(
+                "{context} requires a finite --frailty-sd >= 0, got {sigma}"
+            ));
+        }
+        Ok(sigma)
+    };
+
+    match frailty_kind {
+        None => {
+            if frailty_sd.is_some() || hazard_loading.is_some() {
+                return Err(format!(
+                    "{context} requires --frailty-kind when --frailty-sd or --hazard-loading is provided"
+                ));
+            }
+            Ok(gam::families::lognormal_kernel::FrailtySpec::None)
+        }
+        Some(FrailtyKindArg::GaussianShift) => {
+            if hazard_loading.is_some() {
+                return Err(format!(
+                    "{context} does not accept --hazard-loading with --frailty-kind gaussian-shift"
+                ));
+            }
+            Ok(gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+                sigma_fixed: Some(require_sigma()?),
+            })
+        }
+        Some(FrailtyKindArg::HazardMultiplier) => Ok(
+            gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                sigma_fixed: Some(require_sigma()?),
+                loading: hazard_loading.map(hazard_loading_from_arg).ok_or_else(|| {
+                    format!(
+                        "{context} requires --hazard-loading with --frailty-kind hazard-multiplier"
+                    )
+                })?,
+            },
+        ),
+    }
+}
+
+fn latent_cloglog_state_from_frailty_spec(
+    frailty: &gam::families::lognormal_kernel::FrailtySpec,
+    context: &str,
+) -> Result<gam::types::LatentCLogLogState, String> {
+    let sigma = match frailty {
+        gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(sigma),
+            loading: gam::families::lognormal_kernel::HazardLoading::Full,
+        } => *sigma,
+        gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(_),
+            loading,
+        } => {
+            return Err(format!(
+                "{context} requires --hazard-loading full, got {loading:?}"
+            ));
+        }
+        gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            sigma_fixed: None,
+            ..
+        } => {
+            return Err(format!(
+                "{context} currently requires a fixed --frailty-sd"
+            ));
+        }
+        gam::families::lognormal_kernel::FrailtySpec::GaussianShift { .. } => {
+            return Err(format!(
+                "{context} requires --frailty-kind hazard-multiplier"
+            ));
+        }
+        gam::families::lognormal_kernel::FrailtySpec::None => {
+            return Err(format!(
+                "{context} requires an explicit frailty specification"
+            ));
+        }
+    };
+    gam::types::LatentCLogLogState::new(sigma)
+        .map_err(|e| format!("invalid latent-cloglog frailty sigma: {e}"))
+}
+
+fn fit_frailty_spec_from_args(
+    args: &FitArgs,
+    context: &str,
+) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
+    fixed_frailty_spec_from_cli(args.frailty_kind, args.frailty_sd, args.hazard_loading, context)
+}
+
+fn fit_frailty_spec_from_survival_args(
+    args: &SurvivalArgs,
+    context: &str,
+) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
+    fixed_frailty_spec_from_cli(args.frailty_kind, args.frailty_sd, args.hazard_loading, context)
+}
+
+fn fixed_gaussian_shift_frailty_from_spec(
+    frailty: &gam::families::lognormal_kernel::FrailtySpec,
+    context: &str,
+) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
+    match frailty {
+        gam::families::lognormal_kernel::FrailtySpec::None => {
+            Ok(gam::families::lognormal_kernel::FrailtySpec::None)
+        }
+        gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: Some(sigma),
+        } => Ok(gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: Some(*sigma),
+        }),
+        gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None } => Err(
+            format!("{context} currently requires a fixed GaussianShift sigma"),
+        ),
+        gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. } => Err(format!(
+            "{context} requires --frailty-kind gaussian-shift or no frailty"
+        )),
     }
 }
 

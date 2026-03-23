@@ -199,6 +199,44 @@ pub fn row_kernel_hessian_diagonal<const K: usize>(
     Array1::from_vec(out)
 }
 
+/// Gradient assembly: g = Σ_i Jᵢᵀ gᵢ.
+///
+/// Uses cached row gradients and the family's sparse-aware adjoint.
+/// The returned gradient is the negative log-likelihood gradient
+/// (same sign convention as the cached `gradients`).
+pub fn row_kernel_gradient<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    cache: &RowKernelCache<K>,
+) -> Array1<f64> {
+    let p = cache.p;
+    let out = (0..cache.n)
+        .into_par_iter()
+        .fold(
+            || vec![0.0_f64; p],
+            |mut acc, row| {
+                kern.jacobian_transpose_action(row, &cache.gradients[row], &mut acc);
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0; p],
+            |mut a, b| {
+                for i in 0..a.len() {
+                    a[i] += b[i];
+                }
+                a
+            },
+        );
+    Array1::from_vec(out)
+}
+
+/// Log-likelihood from cached row kernels: ℓ = -Σ_i nll_i.
+pub fn row_kernel_log_likelihood<const K: usize>(
+    cache: &RowKernelCache<K>,
+) -> f64 {
+    -cache.nll.iter().sum::<f64>()
+}
+
 /// Dense Hessian assembly: H = Σ_i Jᵢᵀ Hᵢ Jᵢ.
 ///
 /// Uses cached row Hessians and the family's sparse-aware pullback.
