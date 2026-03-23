@@ -894,8 +894,8 @@ pub fn build_denested_partition_cells<FS, FL>(
     b: f64,
     score_breaks: &[f64],
     link_breaks: &[f64],
-    mut score_span_at: FS,
-    mut link_span_at: FL,
+    score_span_at: FS,
+    link_span_at: FL,
 ) -> Result<Vec<DenestedPartitionCell>, String>
 where
     FS: FnMut(f64) -> Result<LocalSpanCubic, String>,
@@ -924,8 +924,8 @@ pub fn build_denested_partition_cells_with_tails<FS, FL>(
     b: f64,
     score_breaks: &[f64],
     link_breaks: &[f64],
-    score_span_at: FS,
-    link_span_at: FL,
+    mut score_span_at: FS,
+    mut link_span_at: FL,
 ) -> Result<Vec<DenestedPartitionCell>, String>
 where
     FS: FnMut(f64) -> Result<LocalSpanCubic, String>,
@@ -971,9 +971,12 @@ where
     let left_score_span = score_span_at(left_probe)?;
     let left_link_span = link_span_at(a + b * left_probe)?;
     let left_coeffs = denested_cell_coefficients(left_score_span, left_link_span, a, b);
-    if left_coeffs[2].abs() > 1e-12 || left_coeffs[3].abs() > 1e-12 {
+    if left_coeffs[2].abs() > NORMALIZED_CELL_BRANCH_TOL
+        || left_coeffs[3].abs() > NORMALIZED_CELL_BRANCH_TOL
+    {
         return Err(format!(
-            "left tail cell must be affine, got c2={:.3e}, c3={:.3e}",
+            "left tail cell must be affine (deviations constant outside support), \
+             got c2={:.3e}, c3={:.3e}",
             left_coeffs[2], left_coeffs[3]
         ));
     }
@@ -1021,9 +1024,12 @@ where
     let right_score_span = score_span_at(right_probe)?;
     let right_link_span = link_span_at(a + b * right_probe)?;
     let right_coeffs = denested_cell_coefficients(right_score_span, right_link_span, a, b);
-    if right_coeffs[2].abs() > 1e-12 || right_coeffs[3].abs() > 1e-12 {
+    if right_coeffs[2].abs() > NORMALIZED_CELL_BRANCH_TOL
+        || right_coeffs[3].abs() > NORMALIZED_CELL_BRANCH_TOL
+    {
         return Err(format!(
-            "right tail cell must be affine, got c2={:.3e}, c3={:.3e}",
+            "right tail cell must be affine (deviations constant outside support), \
+             got c2={:.3e}, c3={:.3e}",
             right_coeffs[2], right_coeffs[3]
         ));
     }
@@ -1151,7 +1157,11 @@ fn truncated_gaussian_moment_raw(a: f64, b: f64, order: usize) -> f64 {
         0 => {
             let cdf = |x: f64| {
                 if x.is_infinite() {
-                    if x.is_sign_positive() { 1.0 } else { 0.0 }
+                    if x.is_sign_positive() {
+                        1.0
+                    } else {
+                        0.0
+                    }
                 } else {
                     0.5 * (1.0 + statrs::function::erf::erf(x / std::f64::consts::SQRT_2))
                 }
@@ -1604,7 +1614,7 @@ pub fn evaluate_cell_moments(
         // Semi-infinite tail cells must be affine: the deviation saturates
         // to a constant outside support, so c2=c3=0.  Both the BVN CDF
         // and the truncated-Gaussian moment vector handle infinite bounds.
-        if cell.c2.abs() > 1e-15 || cell.c3.abs() > 1e-15 {
+        if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL {
             return Err(format!(
                 "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
                 cell.left, cell.right, cell.c2, cell.c3
@@ -3650,17 +3660,13 @@ mod tests {
         )
         .expect("cells a1");
         assert!(cells_a0.len() >= score_breaks.len() - 1);
-        assert!(
-            cells_a0
-                .windows(2)
-                .all(|w| (w[0].cell.right - w[1].cell.left).abs() <= 1e-12)
-        );
-        assert!(
-            cells_a0
-                .iter()
-                .zip(cells_a1.iter())
-                .any(|(lhs, rhs)| (lhs.cell.left - rhs.cell.left).abs() > 1e-10)
-        );
+        assert!(cells_a0
+            .windows(2)
+            .all(|w| (w[0].cell.right - w[1].cell.left).abs() <= 1e-12));
+        assert!(cells_a0
+            .iter()
+            .zip(cells_a1.iter())
+            .any(|(lhs, rhs)| (lhs.cell.left - rhs.cell.left).abs() > 1e-10));
         assert!(cells_a0.first().unwrap().cell.left.is_infinite());
         assert!(cells_a0.last().unwrap().cell.right.is_infinite());
     }

@@ -3,7 +3,7 @@
 //! The kernel object `K_{k,m}(μ, σ) := E[exp(k·U − m·exp(U))]`, where
 //! `U ~ N(μ, σ²)`, is the only special function required by all latent families.
 //!
-//! It satisfies exact μ-recurrences (see [`kernel_mu_jet`]) and heat-equation
+//! It satisfies exact μ-recurrences (see [`kernel_ratio_jet`]) and heat-equation
 //! σ-identities, so the full derivative calculus for PIRLS,
 //! LAML outer, and learnable σ reduces to evaluating kernel bundles at shifted
 //! arguments.
@@ -123,24 +123,6 @@ impl ProbitFrailtyScale {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct LognormalKernelBundle {
-    values: Vec<f64>,
-    pub mode: IntegratedExpectationMode,
-}
-
-impl LognormalKernelBundle {
-    #[inline]
-    pub fn get(&self, k: usize) -> f64 {
-        self.values[k]
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-}
-
 #[inline]
 fn mode_rank(mode: IntegratedExpectationMode) -> u8 {
     match mode {
@@ -159,83 +141,16 @@ fn worst_mode(
     if mode_rank(a) >= mode_rank(b) { a } else { b }
 }
 
-#[inline]
-pub fn kernel_term(
-    quadctx: &QuadratureContext,
-    k: usize,
-    m: f64,
-    mu: f64,
-    sigma: f64,
-) -> Result<(f64, IntegratedExpectationMode), EstimationError> {
-    if !m.is_finite() || m < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
-            "lognormal kernel requires finite m >= 0, got {m}"
-        )));
-    }
-    if !mu.is_finite() || !sigma.is_finite() || sigma < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
-            "lognormal kernel requires finite mu and sigma >= 0, got mu={mu}, sigma={sigma}"
-        )));
-    }
-    if m == 0.0 {
-        let kf = k as f64;
-        let log_value = kf * mu + 0.5 * kf * kf * sigma * sigma;
-        return Ok((
-            if log_value > 709.0 {
-                f64::INFINITY
-            } else {
-                log_value.exp()
-            },
-            IntegratedExpectationMode::ExactClosedForm,
-        ));
-    }
-
-    let kf = k as f64;
-    let shifted_mu = mu + kf * sigma * sigma;
-    let (laplace, mode) = lognormal_laplace_term_shared(quadctx, m, shifted_mu, sigma);
-    if laplace <= 0.0 {
-        return Ok((0.0, mode));
-    }
-    let log_value = kf * mu + 0.5 * kf * kf * sigma * sigma + laplace.ln();
-    Ok((
-        if log_value > 709.0 {
-            f64::INFINITY
-        } else {
-            log_value.exp()
-        },
-        mode,
-    ))
-}
-
-pub fn kernel_bundle(
-    quadctx: &QuadratureContext,
-    m: f64,
-    mu: f64,
-    sigma: f64,
-    max_k: usize,
-) -> Result<LognormalKernelBundle, EstimationError> {
-    let mut values = Vec::with_capacity(max_k + 1);
-    let mut mode = IntegratedExpectationMode::ExactClosedForm;
-    for k in 0..=max_k {
-        let (value, value_mode) = kernel_term(quadctx, k, m, mu, sigma)?;
-        values.push(value);
-        mode = worst_mode(mode, value_mode);
-    }
-    Ok(LognormalKernelBundle { values, mode })
-}
-
 // ─── Log-space kernel infrastructure ──────────────────────────────────────────
 //
-// The value-space `kernel_term` / `kernel_bundle` overflow when the log-kernel
-// value exceeds ~709 and underflow when it is very negative.  The log-space
-// variants below avoid exponentiation entirely, keeping everything in
-// log-space until the final ratios are formed.
+// The runtime kernel path stays in log-space until the final ratios are formed,
+// avoiding the overflow/underflow and cancellation problems that come from
+// exponentiating individual terms too early.
 
 /// Returns `log K_{k,m}(μ,σ)` directly, without exponentiation.
 ///
-/// This is the log-space analog of [`kernel_term`].  The value is always
-/// finite (or `NEG_INFINITY` when the kernel is zero), so it cannot
-/// overflow or underflow.
+/// The value is always finite (or `NEG_INFINITY` when the kernel is zero), so
+/// it cannot overflow or underflow.
 #[inline]
 pub fn log_kernel_term(
     quadctx: &QuadratureContext,
@@ -268,9 +183,6 @@ pub fn log_kernel_term(
 }
 
 /// Kernel bundle storing `log K_{k,m}` values instead of `K_{k,m}`.
-///
-/// Avoids the value-space overflow/underflow that affects
-/// [`LognormalKernelBundle`].
 #[derive(Clone, Debug)]
 pub struct LogLognormalKernelBundle {
     pub log_values: Vec<f64>,
@@ -314,10 +226,9 @@ pub fn log_kernel_bundle(
 /// Returns `[1, K'/K, K''/K, K'''/K, K''''/K]` where only the first
 /// `order + 1` entries are valid.
 ///
-/// The recurrences are identical to [`kernel_mu_jet`], but each ratio
-/// `K_{k+r}/K_k` is computed as `exp(log K_{k+r} − log K_k)`, which
-/// remains finite even when the individual kernel values overflow or
-/// underflow.
+/// The recurrences are applied in ratio form, with each `K_{k+r}/K_k`
+/// computed as `exp(log K_{k+r} − log K_k)`, which remains finite even when
+/// the individual kernel values would overflow or underflow.
 pub fn kernel_ratio_jet(
     log_bundle: &LogLognormalKernelBundle,
     k: usize,
@@ -326,31 +237,35 @@ pub fn kernel_ratio_jet(
 ) -> [f64; 5] {
     let kf = k as f64;
     let log_k0 = log_bundle.get(k);
-    // Ratio K_{k+r} / K_k in log-space.
-    let rk = |r: usize| -> f64 {
+
+    // Precompute ratios K_{k+r}/K_k for r = 1..=order, each from a single
+    // log-difference.  This avoids redundant exp() calls when the same ratio
+    // appears in multiple derivative orders.
+    let mut rk = [0.0f64; 5]; // rk[0] unused; rk[r] = K_{k+r}/K_k
+    for r in 1..=order.min(4) {
         let delta = log_bundle.get(k + r) - log_k0;
-        if delta.is_finite() {
+        rk[r] = if delta.is_finite() {
             delta.exp()
         } else if delta > 0.0 {
             f64::INFINITY
         } else {
             0.0
-        }
-    };
+        };
+    }
 
     let mut jet = [0.0; 5];
     jet[0] = 1.0;
 
     if order >= 1 {
-        jet[1] = kf - m * rk(1);
+        jet[1] = kf - m * rk[1];
     }
     if order >= 2 {
-        jet[2] = kf * kf - (2.0 * kf + 1.0) * m * rk(1) + m * m * rk(2);
+        jet[2] = kf * kf - (2.0 * kf + 1.0) * m * rk[1] + m * m * rk[2];
     }
     if order >= 3 {
-        jet[3] = kf * kf * kf - (3.0 * kf * kf + 3.0 * kf + 1.0) * m * rk(1)
-            + 3.0 * (kf + 1.0) * m * m * rk(2)
-            - m * m * m * rk(3);
+        jet[3] = kf * kf * kf - (3.0 * kf * kf + 3.0 * kf + 1.0) * m * rk[1]
+            + 3.0 * (kf + 1.0) * m * m * rk[2]
+            - m * m * m * rk[3];
     }
     if order >= 4 {
         let k2 = kf * kf;
@@ -359,10 +274,10 @@ pub fn kernel_ratio_jet(
         let m2 = m * m;
         let m3 = m2 * m;
         let m4 = m3 * m;
-        jet[4] = k4 - (4.0 * k3 + 6.0 * k2 + 4.0 * kf + 1.0) * m * rk(1)
-            + (6.0 * k2 + 12.0 * kf + 7.0) * m2 * rk(2)
-            - (4.0 * kf + 6.0) * m3 * rk(3)
-            + m4 * rk(4);
+        jet[4] = k4 - (4.0 * k3 + 6.0 * k2 + 4.0 * kf + 1.0) * m * rk[1]
+            + (6.0 * k2 + 12.0 * kf + 7.0) * m2 * rk[2]
+            - (4.0 * kf + 6.0) * m3 * rk[3]
+            + m4 * rk[4];
     }
 
     jet
@@ -376,9 +291,12 @@ pub fn kernel_ratio_jet(
 fn log1mexp(a: f64) -> f64 {
     debug_assert!(a >= 0.0);
     if a > core::f64::consts::LN_2 {
-        (-a).exp().neg().ln_1p()
+        // exp(-a) < 0.5, so 1 - exp(-a) > 0.5: safe for ln_1p.
+        (-(-a).exp()).ln_1p()
     } else if a > 0.0 {
-        (-a).exp_m1().neg().ln()
+        // exp(-a) close to 1: use expm1 for precision.
+        // expm1(-a) = exp(-a) - 1, negate to get 1 - exp(-a).
+        (-(-a).exp_m1()).ln()
     } else {
         f64::NEG_INFINITY
     }
@@ -403,12 +321,10 @@ pub fn latent_cloglog_jet5(
     validate_latent_cloglog_inputs(eta, sigma)?;
     // Authoritative latent cloglog backend via `quadrature.rs`:
     //
-    // - mean / d1 come from the shared controlled scalar evaluator.
-    // - d2 / d3 are obtained by fourth-order finite differencing of d1
-    //   (NOT direct analytic derivatives — see `quadrature.rs` for why
-    //   this guarantees consistency with the scalar mean/d1 path).
-    // - d4 / d5 come from the GHQ eta-derivative jet, which is accurate
-    //   enough for the Firth and higher-order corrections that consume them.
+    // - mean through d5 are all derived from the same lognormal-Laplace kernel
+    //   terms K_{k,1}(eta, sigma),
+    // - there is no finite-difference bridge for d2 / d3,
+    // - and the entire jet stays on one exact/control stack.
     let jet = latent_cloglog_inverse_link_jet5_controlled(quadctx, eta, sigma);
     Ok(LatentCLogLogJet5 {
         mean: jet.mean,
@@ -435,54 +351,6 @@ pub fn latent_cloglog_inverse_link_jet(
         d3: jet.d3,
         mode: jet.mode,
     })
-}
-
-// ─── μ-derivative jet from kernel recurrences ────────────────────────────────
-
-/// Exact μ-derivatives of `K_{k,m}` up to the specified order, computed from
-/// the recurrence relations.
-///
-/// Returns `[K, ∂_μ K, ∂_{μμ} K, ∂_{μμμ} K, ∂_{μμμμ} K]` for the base order k.
-/// Only `order + 1` entries are valid.
-///
-/// Recurrences:
-///   ∂_μ K_{k,m} = k·K_{k,m} − m·K_{k+1,m}
-///   ∂_{μμ} K_{k,m} = k²·K_{k,m} − (2k+1)·m·K_{k+1,m} + m²·K_{k+2,m}
-///   ∂_{μμμ} K_{k,m} = k³·K − (3k²+3k+1)·m·K_{k+1} + 3(k+1)·m²·K_{k+2} − m³·K_{k+3}
-///   ∂_{μμμμ} K_{k,m} = k⁴·K − (4k³+6k²+4k+1)·m·K_{k+1} + (6k²+12k+7)·m²·K_{k+2}
-///                        − (4k+6)·m³·K_{k+3} + m⁴·K_{k+4}
-pub fn kernel_mu_jet(bundle: &LognormalKernelBundle, k: usize, m: f64, order: usize) -> [f64; 5] {
-    let kf = k as f64;
-    let a = |r: usize| -> f64 { bundle.get(k + r) };
-
-    let mut jet = [0.0; 5];
-    jet[0] = a(0);
-
-    if order >= 1 {
-        jet[1] = kf * a(0) - m * a(1);
-    }
-    if order >= 2 {
-        jet[2] = kf * kf * a(0) - (2.0 * kf + 1.0) * m * a(1) + m * m * a(2);
-    }
-    if order >= 3 {
-        jet[3] = kf * kf * kf * a(0) - (3.0 * kf * kf + 3.0 * kf + 1.0) * m * a(1)
-            + 3.0 * (kf + 1.0) * m * m * a(2)
-            - m * m * m * a(3);
-    }
-    if order >= 4 {
-        let k2 = kf * kf;
-        let k3 = k2 * kf;
-        let k4 = k3 * kf;
-        let m2 = m * m;
-        let m3 = m2 * m;
-        let m4 = m3 * m;
-        jet[4] = k4 * a(0) - (4.0 * k3 + 6.0 * k2 + 4.0 * kf + 1.0) * m * a(1)
-            + (6.0 * k2 + 12.0 * kf + 7.0) * m2 * a(2)
-            - (4.0 * kf + 6.0) * m3 * a(3)
-            + m4 * a(4);
-    }
-
-    jet
 }
 
 // ─── LogKernelSumJet: log-sum derivatives (log-space stable) ─────────────────
@@ -572,9 +440,21 @@ impl LogKernelSumJet {
         // Fast path for single term.
         if terms.len() == 1 {
             let t = &terms[0];
+            if t.coeff <= 0.0 {
+                // Negative or zero coefficient: the sum is non-positive, so
+                // log(sum) is undefined.  Return −∞ (impossible observation),
+                // matching the general path's sign_s ≤ 0 branch.
+                return Ok(Self {
+                    value: f64::NEG_INFINITY,
+                    d1: 0.0,
+                    d2: 0.0,
+                    d3: 0.0,
+                    mode: IntegratedExpectationMode::ExactClosedForm,
+                });
+            }
             let jet = Self::single_term(quadctx, t.k, t.m, mu, sigma)?;
             return Ok(Self {
-                value: t.coeff.abs().ln() + jet.value,
+                value: t.coeff.ln() + jet.value,
                 d1: jet.d1,
                 d2: jet.d2,
                 d3: jet.d3,
@@ -633,7 +513,7 @@ impl LogKernelSumJet {
         let mut wr1 = 0.0;
         let mut wr2 = 0.0;
         let mut wr3 = 0.0;
-        for (i, _term) in terms.iter().enumerate() {
+        for i in 0..terms.len() {
             let w = sign_s * signs[i] * (log_mags[i] - log_s).exp();
             wr1 += w * ratios[i][1];
             wr2 += w * ratios[i][2];
@@ -1077,12 +957,12 @@ fn single_term_d4_log(log_bundle: &LogLognormalKernelBundle, k: usize, m: f64) -
 /// log-space with importance weights (mirrors [`LogKernelSumJet::evaluate`]).
 fn multi_term_d4_log(
     terms: &[KernelSumTerm],
-    log_bundles: &[(&f64, &LogLognormalKernelBundle)],
+    log_bundles: &[(f64, &LogLognormalKernelBundle)],
 ) -> f64 {
     let get_lb = |m: f64| -> &LogLognormalKernelBundle {
         log_bundles
             .iter()
-            .find(|(bm, _)| (**bm - m).abs() < 1e-300)
+            .find(|(bm, _)| (*bm - m).abs() < 1e-300)
             .unwrap()
             .1
     };
@@ -1103,7 +983,7 @@ fn multi_term_d4_log(
     }
 
     let mut wr = [0.0f64; 5];
-    for (i, _) in terms.iter().enumerate() {
+    for i in 0..terms.len() {
         let w = sign_s * signs_vec[i] * (log_mags[i] - log_s).exp();
         for r in 1..5 {
             wr[r] += w * ratios[i][r];
@@ -1150,7 +1030,7 @@ fn survival_row_d4_ll(
                         m: row.mass_exit,
                     },
                 ];
-                multi_term_d4_log(&terms, &[(&row.mass_exit, &lb)])
+                multi_term_d4_log(&terms, &[(row.mass_exit, &lb)])
             } else {
                 // Full-loading: single-term K_{1,M}.
                 single_term_d4_log(&lb, 1, row.mass_exit)
@@ -1178,7 +1058,7 @@ fn survival_row_d4_ll(
             ];
             let mut d4 = multi_term_d4_log(
                 &terms,
-                &[(&row.mass_left, &lbl), (&row.mass_right, &lbr)],
+                &[(row.mass_left, &lbl), (row.mass_right, &lbr)],
             );
             if row.mass_entry > 1e-300 {
                 let lbe = log_kernel_bundle(quadctx, row.mass_entry, mu, sigma, max_k)?;
@@ -1208,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_mu_jet_d1_fd_check() {
+    fn kernel_ratio_jet_d1_fd_check() {
         let ctx = QuadratureContext::new();
         let mu = 0.3;
         let sigma = 0.5;
@@ -1216,24 +1096,25 @@ mod tests {
         let k = 0usize;
         let h = 1e-5;
 
-        let bundle = kernel_bundle(&ctx, m, mu, sigma, 6).unwrap();
-        let jet = kernel_mu_jet(&bundle, k, m, 2);
+        let bundle = log_kernel_bundle(&ctx, m, mu, sigma, k + 4).unwrap();
+        let log_k = bundle.get(k);
+        let ratios = kernel_ratio_jet(&bundle, k, m, 2);
+        let kc = log_k.exp();
+        let d1 = kc * ratios[1];
+        let d2 = kc * ratios[2];
 
-        let kp = kernel_term(&ctx, k, m, mu + h, sigma).unwrap().0;
-        let km = kernel_term(&ctx, k, m, mu - h, sigma).unwrap().0;
+        let kp = log_kernel_term(&ctx, k, m, mu + h, sigma).unwrap().0.exp();
+        let km = log_kernel_term(&ctx, k, m, mu - h, sigma).unwrap().0.exp();
         let fd_d1 = (kp - km) / (2.0 * h);
         assert!(
-            (jet[1] - fd_d1).abs() / fd_d1.abs().max(1e-15) < 1e-4,
-            "d1: jet={}, fd={fd_d1}",
-            jet[1]
+            (d1 - fd_d1).abs() / fd_d1.abs().max(1e-15) < 1e-4,
+            "d1: jet={d1}, fd={fd_d1}",
         );
 
-        let kc = kernel_term(&ctx, k, m, mu, sigma).unwrap().0;
         let fd_d2 = (kp - 2.0 * kc + km) / (h * h);
         assert!(
-            (jet[2] - fd_d2).abs() / fd_d2.abs().max(1e-15) < 1e-3,
-            "d2: jet={}, fd={fd_d2}",
-            jet[2]
+            (d2 - fd_d2).abs() / fd_d2.abs().max(1e-15) < 1e-3,
+            "d2: jet={d2}, fd={fd_d2}",
         );
     }
 
@@ -1346,8 +1227,8 @@ mod tests {
         let h = 1e-6;
 
         let jet = LogKernelSumJet::single_term(&ctx, k, m, mu, sigma).unwrap();
-        let val_p = kernel_term(&ctx, k, m, mu + h, sigma).unwrap().0.ln();
-        let val_m = kernel_term(&ctx, k, m, mu - h, sigma).unwrap().0.ln();
+        let val_p = log_kernel_term(&ctx, k, m, mu + h, sigma).unwrap().0;
+        let val_m = log_kernel_term(&ctx, k, m, mu - h, sigma).unwrap().0;
         let fd_d1 = (val_p - val_m) / (2.0 * h);
         assert!(
             (jet.d1 - fd_d1).abs() / fd_d1.abs().max(1e-15) < 1e-3,
@@ -1376,63 +1257,33 @@ mod tests {
     }
 
     #[test]
-    fn latent_cloglog_jet_curvature_envelope_matches_scalar_backend_differences() {
-        const CURVATURE_ABS_EPS: f64 = 2e-5;
-        const CURVATURE_REL_EPS: f64 = 2e-3;
-        const THIRD_ABS_EPS: f64 = 8e-5;
-        const THIRD_REL_EPS: f64 = 8e-3;
-
+    fn latent_cloglog_jet_matches_exact_kernel_recurrence() {
         let ctx = QuadratureContext::new();
         let cases = [(-4.0, 0.15), (-1.2, 0.35), (0.4, 0.6), (1.3, 0.9)];
-        let h = 2e-4;
 
         for (eta, sigma) in cases {
             let jet = latent_cloglog_jet5(&ctx, eta, sigma).expect("latent jet");
-            let dm2 = crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(
-                &ctx,
-                eta - 2.0 * h,
-                sigma,
-            );
-            let dm1 = crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(
-                &ctx,
-                eta - h,
-                sigma,
-            );
-            let d0 =
-                crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(&ctx, eta, sigma);
-            let dp1 = crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(
-                &ctx,
-                eta + h,
-                sigma,
-            );
-            let dp2 = crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(
-                &ctx,
-                eta + 2.0 * h,
-                sigma,
-            );
+            let bundle = log_kernel_bundle(&ctx, 1.0, eta, sigma, 5).expect("kernel bundle");
+            let k0 = bundle.get(0);
+            let k1 = bundle.get(1).exp();
+            let k2 = bundle.get(2).exp();
+            let k3 = bundle.get(3).exp();
+            let k4 = bundle.get(4).exp();
+            let k5 = bundle.get(5).exp();
 
-            let d2fd = (dm2.dmean_dmu - 8.0 * dm1.dmean_dmu + 8.0 * dp1.dmean_dmu - dp2.dmean_dmu)
-                / (12.0 * h);
-            let d3fd = (-dp2.dmean_dmu + 16.0 * dp1.dmean_dmu - 30.0 * d0.dmean_dmu
-                + 16.0 * dm1.dmean_dmu
-                - dm2.dmean_dmu)
-                / (12.0 * h * h);
+            let mean = if k0.is_finite() { -k0.exp_m1() } else { 1.0 };
+            let d1 = k1;
+            let d2 = k1 - k2;
+            let d3 = k1 - 3.0 * k2 + k3;
+            let d4 = k1 - 7.0 * k2 + 6.0 * k3 - k4;
+            let d5 = k1 - 15.0 * k2 + 25.0 * k3 - 10.0 * k4 + k5;
 
-            let d2_err = (jet.d2 - d2fd).abs();
-            let d3_err = (jet.d3 - d3fd).abs();
-
-            assert!(
-                d2_err <= CURVATURE_ABS_EPS.max(CURVATURE_REL_EPS * d2fd.abs()),
-                "latent cloglog curvature envelope failed at eta={eta}, sigma={sigma}: analytic={} fd={}",
-                jet.d2,
-                d2fd
-            );
-            assert!(
-                d3_err <= THIRD_ABS_EPS.max(THIRD_REL_EPS * d3fd.abs()),
-                "latent cloglog third-derivative envelope failed at eta={eta}, sigma={sigma}: analytic={} fd={}",
-                jet.d3,
-                d3fd
-            );
+            assert!((jet.mean - mean).abs() < 1e-12);
+            assert!((jet.d1 - d1).abs() < 1e-12);
+            assert!((jet.d2 - d2).abs() < 1e-12);
+            assert!((jet.d3 - d3).abs() < 1e-12);
+            assert!((jet.d4 - d4).abs() < 1e-12);
+            assert!((jet.d5 - d5).abs() < 1e-12);
         }
     }
 

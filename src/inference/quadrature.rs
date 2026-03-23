@@ -238,19 +238,6 @@ pub(crate) struct IntegratedInverseLinkJet5 {
     pub mode: IntegratedExpectationMode,
 }
 
-impl IntegratedInverseLinkJet5 {
-    #[inline]
-    pub(crate) fn into_jet3(self) -> IntegratedInverseLinkJet {
-        IntegratedInverseLinkJet {
-            mean: self.mean,
-            d1: self.d1,
-            d2: self.d2,
-            d3: self.d3,
-            mode: self.mode,
-        }
-    }
-}
-
 #[inline]
 pub(crate) fn validate_latent_cloglog_inputs(eta: f64, sigma: f64) -> Result<(), EstimationError> {
     if !eta.is_finite() || !sigma.is_finite() || sigma < 0.0 {
@@ -2464,7 +2451,7 @@ pub fn integrated_inverse_link_jet(
         }
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
         LinkFunction::Logit => {
-            let candidate = integrate_inverse_link_jet_from_scalar_backend(
+            let candidate = integrate_logit_inverse_link_jet_from_scalar_backend(
                 mu,
                 sigma,
                 |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
@@ -2479,7 +2466,9 @@ pub fn integrated_inverse_link_jet(
         }
         LinkFunction::CLogLog => {
             validate_latent_cloglog_inputs(mu, sigma)?;
-            Ok(latent_cloglog_inverse_link_jet5_controlled(quadctx, mu, sigma).into_jet3())
+            Ok(integrated_cloglog_inverse_link_jet_controlled(
+                quadctx, mu, sigma,
+            ))
         }
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
@@ -2516,6 +2505,18 @@ fn integrated_expectation_mode_rank(mode: IntegratedExpectationMode) -> u8 {
         IntegratedExpectationMode::ExactSpecialFunction => 1,
         IntegratedExpectationMode::ControlledAsymptotic => 2,
         IntegratedExpectationMode::QuadratureFallback => 3,
+    }
+}
+
+#[inline]
+fn worse_integrated_expectation_mode(
+    lhs: IntegratedExpectationMode,
+    rhs: IntegratedExpectationMode,
+) -> IntegratedExpectationMode {
+    if integrated_expectation_mode_rank(lhs) >= integrated_expectation_mode_rank(rhs) {
+        lhs
+    } else {
+        rhs
     }
 }
 
@@ -2583,10 +2584,11 @@ fn integrated_mixture_component_jet(
     // produces identical d2, d3 regardless of whether it enters as a
     // standalone link or as a mixture component.
     match component {
-        LinkComponent::Logit => integrated_logit_jet_ghq(ctx, mu, sigma),
+        LinkComponent::Logit => integrated_inverse_link_jet(ctx, LinkFunction::Logit, mu, sigma)
+            .unwrap_or_else(|_| integrated_logit_jet_ghq(ctx, mu, sigma)),
         LinkComponent::Probit => integrated_probit_jet(mu, sigma),
         LinkComponent::CLogLog => {
-            latent_cloglog_inverse_link_jet5_controlled(ctx, mu, sigma).into_jet3()
+            integrated_cloglog_inverse_link_jet_controlled(ctx, mu, sigma)
         }
         LinkComponent::LogLog | LinkComponent::Cauchit => {
             let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
@@ -3145,97 +3147,123 @@ fn integrated_logit_jet_ghq(
 }
 
 #[inline]
-fn integrated_cloglog_eta_jet_ghq(
-    ctx: &QuadratureContext,
-    mu: f64,
-    sigma: f64,
-) -> IntegratedInverseLinkJet5 {
-    let (mean, d1, d2, d3, d4, d5) = cloglog_ghq_jet5_adaptive(ctx, mu, sigma);
-    IntegratedInverseLinkJet5 {
-        mean,
-        d1: d1.max(0.0),
-        d2,
-        d3,
-        d4,
-        d5,
-        mode: if sigma <= 1e-10 {
-            IntegratedExpectationMode::ExactClosedForm
-        } else {
-            IntegratedExpectationMode::QuadratureFallback
-        },
-    }
-}
-
-#[inline]
 pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet5 {
-    // Latent cloglog backend with consistent derivative tower:
+    // Exact latent-cloglog derivative tower via the shared lognormal-Laplace
+    // kernel terms
     //
-    // - mean / d1 come from the validated scalar production route
-    //   (`cloglog_posterior_meanwith_deriv_controlled`), preserving the exact /
-    //   special-function / asymptotic regime dispatch and its mode semantics.
+    //   K_k(mu, sigma) := E[exp(k eta - exp(eta))],   eta ~ N(mu, sigma^2).
     //
-    // - d2 / d3 are obtained by finite-differencing the scalar backend's d1
-    //   (dmean_dmu) with a fourth-order symmetric stencil.  This guarantees
-    //   that d2 is the true curvature of the *same* function whose value is
-    //   `mean` and whose slope is `d1`, avoiding the consistency gap that
-    //   arose when d2 came from a separate GHQ integrator that could disagree
-    //   with the scalar backend by O(GHQ truncation error).
+    // Since
     //
-    // - d4 / d5 use the direct GHQ eta-derivative jet, which is accurate
-    //   enough for the Firth and higher-order corrections that consume them.
+    //   E[1 - exp(-exp(eta))] = 1 - K_0,
     //
-    // The public `mode` continues to report the value/score evaluator, which is
-    // what downstream callers already interpret today.
-    // For degenerate sigma the pointwise jet is exact — skip FD overhead.
+    // every eta-derivative is a fixed linear combination of K_1..K_5:
+    //
+    //   d1 = K1
+    //   d2 = K1 - K2
+    //   d3 = K1 - 3 K2 + K3
+    //   d4 = K1 - 7 K2 + 6 K3 - K4
+    //   d5 = K1 - 15 K2 + 25 K3 - 10 K4 + K5.
+    //
+    // Each K_k is evaluated through the same shared lognormal-Laplace backend
+    // used elsewhere in the cloglog/survival stack, so there is no finite-
+    // difference bridge in the latent jet anymore.
     if sigma <= 1e-10 {
-        let ghq = integrated_cloglog_eta_jet_ghq(ctx, mu, sigma);
+        let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(mu);
         return IntegratedInverseLinkJet5 {
-            mean: ghq.mean,
-            d1: ghq.d1,
-            d2: ghq.d2,
-            d3: ghq.d3,
-            d4: ghq.d4,
-            d5: ghq.d5,
+            mean,
+            d1,
+            d2,
+            d3,
+            d4,
+            d5,
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
 
-    let scalar = cloglog_posterior_meanwith_deriv_controlled(ctx, mu, sigma);
-    let ghq = integrated_cloglog_eta_jet_ghq(ctx, mu, sigma);
-    if integrated_scalar_drift_exceeds(scalar.mean, ghq.mean, 5e-11, 5e-8)
-        || integrated_scalar_drift_exceeds(scalar.dmean_dmu, ghq.d1, 5e-11, 5e-7)
-    {
-        return ghq;
-    }
-
-    // d2, d3 via fourth-order central differences of the scalar backend's d1.
-    // This guarantees consistency with mean/d1 — see comment above.
-    let h = integrated_jet_fd_step(sigma);
-    let sm1 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu - h, sigma);
-    let sp1 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu + h, sigma);
-    let sm2 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu - 2.0 * h, sigma);
-    let sp2 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu + 2.0 * h, sigma);
-
-    let d2 =
-        (sm2.dmean_dmu - 8.0 * sm1.dmean_dmu + 8.0 * sp1.dmean_dmu - sp2.dmean_dmu) / (12.0 * h);
-    let d3 = (-sp2.dmean_dmu + 16.0 * sp1.dmean_dmu - 30.0 * scalar.dmean_dmu
-        + 16.0 * sm1.dmean_dmu
-        - sm2.dmean_dmu)
-        / (12.0 * h * h);
+    let (k, log_k0, mode) = latent_cloglog_kernel_terms(ctx, mu, sigma, 5);
 
     IntegratedInverseLinkJet5 {
-        mean: scalar.mean,
-        d1: scalar.dmean_dmu.max(0.0),
-        d2,
-        d3,
-        d4: ghq.d4,
-        d5: ghq.d5,
-        mode: scalar.mode,
+        mean: if log_k0.is_finite() {
+            -log_k0.exp_m1()
+        } else {
+            1.0
+        },
+        d1: k[1].max(0.0),
+        d2: k[1] - k[2],
+        d3: k[1] - 3.0 * k[2] + k[3],
+        d4: k[1] - 7.0 * k[2] + 6.0 * k[3] - k[4],
+        d5: k[1] - 15.0 * k[2] + 25.0 * k[3] - 10.0 * k[4] + k[5],
+        mode,
     }
+}
+
+#[inline]
+fn integrated_cloglog_inverse_link_jet_controlled(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedInverseLinkJet {
+    if sigma <= 1e-10 {
+        let (mean, d1, d2, d3, _, _) = cloglog_point_jet5(mu);
+        return IntegratedInverseLinkJet {
+            mean,
+            d1,
+            d2,
+            d3,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        };
+    }
+
+    let (k, log_k0, mode) = latent_cloglog_kernel_terms(ctx, mu, sigma, 3);
+    IntegratedInverseLinkJet {
+        mean: if log_k0.is_finite() {
+            -log_k0.exp_m1()
+        } else {
+            1.0
+        },
+        d1: k[1].max(0.0),
+        d2: k[1] - k[2],
+        d3: k[1] - 3.0 * k[2] + k[3],
+        mode,
+    }
+}
+
+#[inline]
+fn latent_cloglog_kernel_terms(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+    max_order: usize,
+) -> ([f64; 6], f64, IntegratedExpectationMode) {
+    let sigma2 = sigma * sigma;
+    let mut k = [0.0; 6];
+    let mut log_k0 = f64::NEG_INFINITY;
+    let mut mode = IntegratedExpectationMode::ExactClosedForm;
+
+    for (order, out) in k.iter_mut().enumerate().take(max_order + 1) {
+        let kf = order as f64;
+        let shifted_mu = mu + kf * sigma2;
+        let (survival, term_mode) = lognormal_laplace_term_shared(ctx, 1.0, shifted_mu, sigma);
+        mode = worse_integrated_expectation_mode(mode, term_mode);
+
+        if survival <= 0.0 {
+            *out = 0.0;
+            continue;
+        }
+
+        let log_value = kf * mu + 0.5 * kf * kf * sigma2 + survival.ln();
+        if order == 0 {
+            log_k0 = log_value;
+        }
+        *out = log_value.exp();
+    }
+
+    (k, log_k0, mode)
 }
 
 #[inline]
@@ -3244,7 +3272,7 @@ fn integrated_jet_fd_step(sigma: f64) -> f64 {
 }
 
 #[inline]
-fn integrate_inverse_link_jet_from_scalar_backend(
+fn integrate_logit_inverse_link_jet_from_scalar_backend(
     mu: f64,
     sigma: f64,
     eval: impl Fn(f64, f64) -> Result<IntegratedMeanDerivative, EstimationError>,
@@ -3261,12 +3289,10 @@ fn integrate_inverse_link_jet_from_scalar_backend(
         });
     }
 
-    // Solver-facing non-GHQ jet reconstruction.
-    //
-    // The analytic logit/cloglog backends currently expose the integrated mean
-    // and its first mu-derivative exactly or via controlled asymptotics. PIRLS
-    // also consumes d2 and d3, so we differentiate that same scalar backend in
-    // mu with a fourth-order symmetric stencil rather than re-enter GHQ.
+    // Solver-facing non-GHQ jet reconstruction for the controlled logit
+    // backend. The scalar route exposes mean and d/dmu; PIRLS also consumes
+    // d2 and d3, so we differentiate that same scalar backend in mu with a
+    // fourth-order symmetric stencil rather than re-enter GHQ.
     let h = integrated_jet_fd_step(sigma);
     let c0 = eval(mu, sigma)?;
     let cm1 = eval(mu - h, sigma)?;
@@ -3992,28 +4018,6 @@ fn cloglog_g_derivatives(t: f64) -> (f64, f64, f64, f64, f64) {
     (g, g1, g2, g3, g4)
 }
 
-#[inline]
-pub(crate) fn cloglog_ghq_jet5_adaptive(
-    ctx: &QuadratureContext,
-    mu: f64,
-    sigma: f64,
-) -> (f64, f64, f64, f64, f64, f64) {
-    // Integrates the exact pointwise cloglog eta-jet directly. This is the
-    // curvature-safe carrier used by the latent-cloglog backend for d2+.
-    if sigma.abs() < 1e-10 {
-        return cloglog_point_jet5(mu);
-    }
-    let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
-    let scale = SQRT_2 * sigma;
-    with_gh_nodesweights(ctx, 31, |nodes, weights| {
-        let mut sum = <(f64, f64, f64, f64, f64, f64) as GhqValue>::zero();
-        for i in 0..nodes.len() {
-            sum.addweighted(weights[i], cloglog_point_jet5(mu + scale * nodes[i]));
-        }
-        sum.scale(inv_sqrt_pi)
-    })
-}
-
 /// Compute `L(μ,σ) = E[g(μ + σZ)]` via Gauss-Hermite quadrature.
 ///
 /// The number of GHQ nodes is determined by the `QuadratureContext` cache;
@@ -4693,7 +4697,6 @@ mod tests {
         let h = 1e-4;
         let out = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu, sigma)
             .expect("cloglog integrated inverse-link jet should evaluate");
-        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
         let plus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu + h, sigma)
             .expect("cloglog integrated inverse-link jet should evaluate");
         let minus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu - h, sigma)
@@ -5165,12 +5168,13 @@ mod tests {
             None,
         )
         .expect("pure logit mixture integrated moments should evaluate");
-        let exact = integrated_logit_jet_ghq(&ctx, 1.1, 0.8);
+        let exact = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, 1.1, 0.8)
+            .expect("canonical integrated logit jet");
         assert_relative_eq!(out.mean, exact.mean, epsilon = 1e-12);
         assert_relative_eq!(out.d1, exact.d1, epsilon = 1e-12);
         assert_relative_eq!(out.d2, exact.d2, epsilon = 1e-12);
         assert_relative_eq!(out.d3, exact.d3, epsilon = 1e-12);
-        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+        assert_eq!(out.mode, exact.mode);
     }
 
     #[test]

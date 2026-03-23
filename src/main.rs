@@ -2612,6 +2612,234 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     result
 }
 
+fn latent_survival_plugin_survival(
+    quadctx: &gam::quadrature::QuadratureContext,
+    cumulative_mass_entry: f64,
+    cumulative_mass_exit: f64,
+    mu: f64,
+    sigma: f64,
+) -> Result<(f64, f64), String> {
+    let row =
+        gam::families::lognormal_kernel::LatentSurvivalRow::from_full_loading_cumulative_mass(
+            gam::families::lognormal_kernel::LatentSurvivalEventType::RightCensored,
+            cumulative_mass_entry,
+            cumulative_mass_exit,
+            0.0,
+        );
+    let jet = gam::families::lognormal_kernel::LatentSurvivalRowJet::evaluate(
+        quadctx, &row, mu, sigma,
+    )
+    .map_err(|e| format!("latent survival prediction failed: {e}"))?;
+    Ok((jet.log_lik.exp().clamp(0.0, 1.0), jet.score))
+}
+
+fn latent_survival_eta_variance(
+    design: &DesignMatrix,
+    backend: &PredictionCovarianceBackend<'_>,
+) -> Result<Array1<f64>, String> {
+    let local_covariances = rowwise_local_covariances(backend, design.nrows(), 1, |rows| {
+        Ok(vec![design.row_chunk(rows)])
+    })
+    .map_err(|e| format!("saved latent-survival covariance application failed: {e}"))?;
+    local_covariances
+        .into_iter()
+        .next()
+        .and_then(|row| row.into_iter().next())
+        .map(|v| v.mapv(|x| x.max(0.0)))
+        .ok_or_else(|| {
+            "saved latent-survival covariance application returned no local variances".to_string()
+        })
+}
+
+fn run_predict_saved_latent_survival(
+    progress: &mut gam::visualizer::VisualizerSession,
+    args: &PredictArgs,
+    model: &SavedModel,
+    cov_design: &DesignMatrix,
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    primary_offset: &Array1<f64>,
+) -> Result<(), String> {
+    let sigma = fixed_hazard_multiplier_sigma_from_saved_family(&model.family_state)?;
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let beta_block = fit_saved
+        .block_by_role(BlockRole::Mean)
+        .or_else(|| (fit_saved.blocks.len() == 1).then_some(&fit_saved.blocks[0]))
+        .ok_or_else(|| {
+            "saved latent-survival model is missing its single mean coefficient block".to_string()
+        })?;
+    let beta = &beta_block.beta;
+    if beta.len() != cov_design.ncols() {
+        return Err(format!(
+            "saved latent-survival model/design mismatch: beta has {} coefficients but design has {} columns",
+            beta.len(),
+            cov_design.ncols()
+        ));
+    }
+
+    // Latent survival currently stores only the covariate block. The time part
+    // is carried entirely by the saved scalar baseline metadata, matching the
+    // fitting path used to compile the latent rows.
+    let baseline_cfg =
+        saved_survival_runtime_baseline_config(model, SurvivalLikelihoodMode::Latent)?;
+    let n = age_entry.len();
+    let mut cumulative_mass_entry = Array1::<f64>::zeros(n);
+    let mut cumulative_mass_exit = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        cumulative_mass_entry[i] = evaluate_survival_baseline(age_entry[i], &baseline_cfg)?.0.exp();
+        cumulative_mass_exit[i] = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?.0.exp();
+    }
+
+    let eta = cov_design.dot(beta) + primary_offset;
+    let quadctx = gam::quadrature::QuadratureContext::new();
+    let plugin_mean = Array1::from_vec(
+        (0..n)
+            .map(|i| {
+                latent_survival_plugin_survival(
+                    &quadctx,
+                    cumulative_mass_entry[i],
+                    cumulative_mass_exit[i],
+                    eta[i],
+                    sigma,
+                )
+                .map(|(surv, _)| surv)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
+    let need_covariance = args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
+    let eta_se = if need_covariance {
+        let backend = prediction_backend_from_model(model, args.covariance_mode)?;
+        if backend.nrows() != beta.len() {
+            return Err(format!(
+                "saved latent-survival covariance/backend mismatch: got dimension {}, expected {}",
+                backend.nrows(),
+                beta.len()
+            ));
+        }
+        Some(latent_survival_eta_variance(cov_design, &backend)?.mapv(f64::sqrt))
+    } else {
+        None
+    };
+
+    let mut mean = plugin_mean.clone();
+    let mut mean_lo = None;
+    let mut mean_hi = None;
+    if args.mode == PredictModeArg::PosteriorMean {
+        let eta_se_ref = eta_se.as_ref().ok_or_else(|| {
+            "internal error: latent survival posterior mean requires eta SE".to_string()
+        })?;
+        let mut posterior_mean = Array1::<f64>::zeros(n);
+        let mut response_sd = if args.uncertainty {
+            Some(Array1::<f64>::zeros(n))
+        } else {
+            None
+        };
+        for i in 0..n {
+            let (m1, m2) =
+                gam::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
+                    &quadctx,
+                    [eta[i]],
+                    [[eta_se_ref[i] * eta_se_ref[i]]],
+                    21,
+                    |x| {
+                        latent_survival_plugin_survival(
+                            &quadctx,
+                            cumulative_mass_entry[i],
+                            cumulative_mass_exit[i],
+                            x[0],
+                            sigma,
+                        )
+                        .map(|(surv, _)| (surv, surv * surv))
+                    },
+                )?;
+            posterior_mean[i] = m1.clamp(0.0, 1.0);
+            if let Some(sd) = response_sd.as_mut() {
+                sd[i] = (m2 - m1 * m1).max(0.0).sqrt();
+            }
+        }
+        mean = posterior_mean;
+        if args.uncertainty {
+            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                return Err(format!("--level must be in (0,1), got {}", args.level));
+            }
+            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+            let (lo, hi) = response_interval_from_mean_sd(
+                mean.view(),
+                response_sd
+                    .as_ref()
+                    .ok_or_else(|| "internal error: latent survival response SD missing".to_string())?
+                    .view(),
+                z,
+                0.0,
+                1.0,
+            );
+            mean_lo = Some(lo);
+            mean_hi = Some(hi);
+        }
+    } else if args.uncertainty {
+        if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+            return Err(format!("--level must be in (0,1), got {}", args.level));
+        }
+        let eta_se_ref = eta_se.as_ref().ok_or_else(|| {
+            "internal error: latent survival uncertainty requires eta SE".to_string()
+        })?;
+        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+        let eta_lo = &eta - &eta_se_ref.mapv(|v| z * v);
+        let eta_hi = &eta + &eta_se_ref.mapv(|v| z * v);
+        let lower = Array1::from_vec(
+            (0..n)
+                .map(|i| {
+                    latent_survival_plugin_survival(
+                        &quadctx,
+                        cumulative_mass_entry[i],
+                        cumulative_mass_exit[i],
+                        eta_hi[i],
+                        sigma,
+                    )
+                    .map(|(surv, _)| surv)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let upper = Array1::from_vec(
+            (0..n)
+                .map(|i| {
+                    latent_survival_plugin_survival(
+                        &quadctx,
+                        cumulative_mass_entry[i],
+                        cumulative_mass_exit[i],
+                        eta_lo[i],
+                        sigma,
+                    )
+                    .map(|(surv, _)| surv)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        mean_lo = Some(lower);
+        mean_hi = Some(upper);
+    }
+
+    progress.advance_workflow(4);
+    progress.set_stage("predict", "writing survival predictions");
+    write_survival_prediction_csv(
+        &args.out,
+        eta.view(),
+        mean.view(),
+        eta_se
+            .as_ref()
+            .filter(|_| args.uncertainty)
+            .map(|a| a.view()),
+        mean_lo.as_ref().map(|a| a.view()),
+        mean_hi.as_ref().map(|a| a.view()),
+    )?;
+    println!(
+        "wrote predictions: {} (rows={})",
+        args.out.display(),
+        mean.len()
+    );
+    Ok(())
+}
+
 /// Special-case survival prediction.
 ///
 /// This handles the full survival prediction pipeline which cannot go through
@@ -2673,17 +2901,20 @@ fn run_predict_survival(
         age_entry[i] = t0;
         age_exit[i] = t1;
     }
-    let time_cfg = load_survival_time_basis_config_from_model(model)?;
-    let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::Latent {
-        return Err(
-            "prediction is not implemented for saved latent-survival models; \
-             the latent frailty likelihood requires specialized prediction \
-             machinery that is not yet wired"
-                .to_string(),
+        return run_predict_saved_latent_survival(
+            progress,
+            args,
+            model,
+            &cov_design.design,
+            &age_entry,
+            &age_exit,
+            primary_offset,
         );
     }
+    let time_cfg = load_survival_time_basis_config_from_model(model)?;
+    let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
@@ -4919,8 +5150,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let time_basis_cfg = match likelihood_mode {
         SurvivalLikelihoodMode::Transformation
         | SurvivalLikelihoodMode::LocationScale
-        | SurvivalLikelihoodMode::MarginalSlope
-        | SurvivalLikelihoodMode::Latent => {
+        | SurvivalLikelihoodMode::MarginalSlope => {
             if learn_timewiggle {
                 SurvivalTimeBasisConfig::None
             } else {
@@ -4932,6 +5162,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 )?
             }
         }
+        SurvivalLikelihoodMode::Latent => SurvivalTimeBasisConfig::None,
         SurvivalLikelihoodMode::Weibull => {
             if learn_timewiggle {
                 SurvivalTimeBasisConfig::None
@@ -4986,6 +5217,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         effective_args.baseline_makeham,
         &age_exit,
     )?;
+    if likelihood_mode == SurvivalLikelihoodMode::Latent
+        && baseline_cfg.target == SurvivalBaselineTarget::Linear
+    {
+        return Err(
+            "latent survival requires a non-linear scalar baseline target; use --baseline-target weibull, gompertz, or gompertz-makeham"
+                .to_string(),
+        );
+    }
     let weibull_builtin_beta_seed =
         if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
             let scale = effective_args
@@ -5697,6 +5936,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                             data: ds.values.view(),
                             rows: build_rows(&prepared),
                             weights: weights.clone(),
+                            offset: threshold_offset.clone(),
                             spec: termspec.clone(),
                             frailty: frailty.clone(),
                             options: options.clone(),
@@ -5729,6 +5969,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             data: ds.values.view(),
             rows: build_rows(&prepared),
             weights: weights.clone(),
+            offset: threshold_offset.clone(),
             spec: termspec.clone(),
             frailty: frailty.clone(),
             options,
@@ -5781,12 +6022,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
             payload.survival_baseline_makeham = baseline_cfg.makeham;
-            payload.survival_time_basis = Some(time_build.basisname.clone());
-            payload.survival_time_degree = time_build.degree;
-            payload.survival_time_knots = time_build.knots.clone();
-            payload.survival_time_keep_cols = time_build.keep_cols.clone();
-            payload.survival_time_smooth_lambda = time_build.smooth_lambda;
-            payload.survival_time_anchor = Some(time_anchor);
             set_saved_offset_columns(
                 &mut payload,
                 args.offset_column.clone(),
@@ -8682,6 +8917,33 @@ fn fixed_gaussian_shift_sigma_from_saved_family(
         Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. }) => {
             Err("saved probit marginal-slope model cannot use HazardMultiplier frailty".to_string())
         }
+    }
+}
+
+fn fixed_hazard_multiplier_sigma_from_saved_family(family: &FittedFamily) -> Result<f64, String> {
+    match family.frailty() {
+        Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(sigma),
+            loading: gam::families::lognormal_kernel::HazardLoading::Full,
+        }) => Ok(*sigma),
+        Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(_),
+            loading,
+        }) => Err(format!(
+            "saved latent-survival model requires HazardLoading::Full, got {loading:?}"
+        )),
+        Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            sigma_fixed: None,
+            ..
+        }) => Err(
+            "saved latent-survival model requires a fixed HazardMultiplier sigma".to_string(),
+        ),
+        Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { .. })
+        | Some(gam::families::lognormal_kernel::FrailtySpec::None)
+        | None => Err(
+            "saved latent-survival model requires a fixed HazardMultiplier frailty specification"
+                .to_string(),
+        ),
     }
 }
 

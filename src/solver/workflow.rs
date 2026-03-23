@@ -119,6 +119,7 @@ pub struct LatentSurvivalFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub rows: Vec<LatentSurvivalRow>,
     pub weights: Array1<f64>,
+    pub offset: Array1<f64>,
     pub spec: TermCollectionSpec,
     pub frailty: FrailtySpec,
     pub options: BlockwiseFitOptions,
@@ -747,6 +748,7 @@ fn fit_latent_survival_model(
         request.data,
         request.rows,
         request.weights,
+        request.offset,
         request.spec,
         request.frailty,
         &request.options,
@@ -1268,12 +1270,24 @@ fn materialize_survival<'a>(
         config.baseline_makeham,
         &age_exit,
     )?;
-    let time_cfg = parse_survival_time_basis_config(
-        &config.time_basis,
-        config.time_degree,
-        config.time_num_internal_knots,
-        config.time_smooth_lambda,
-    )?;
+    if survival_mode == SurvivalLikelihoodMode::Latent
+        && baseline_cfg.target == SurvivalBaselineTarget::Linear
+    {
+        return Err(
+            "latent survival requires a non-linear scalar baseline target; use baseline_target weibull, gompertz, or gompertz-makeham"
+                .to_string(),
+        );
+    }
+    let time_cfg = if survival_mode == SurvivalLikelihoodMode::Latent {
+        SurvivalTimeBasisConfig::None
+    } else {
+        parse_survival_time_basis_config(
+            &config.time_basis,
+            config.time_degree,
+            config.time_num_internal_knots,
+            config.time_smooth_lambda,
+        )?
+    };
 
     // Build time basis
     let time_build = build_survival_time_basis(
@@ -1518,6 +1532,7 @@ fn materialize_survival<'a>(
                 data: data.values.view(),
                 rows,
                 weights: weights.clone(),
+                offset: threshold_offset.clone(),
                 spec: termspec.clone(),
                 frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
                 options: BlockwiseFitOptions::default(),
