@@ -11878,7 +11878,9 @@ pub fn fit_survival_marginal_slope_terms(
         FrailtySpec::GaussianShift { sigma_fixed: None }
     );
     let initial_sigma = match &spec.frailty {
-        FrailtySpec::GaussianShift { sigma_fixed: Some(s) } => Some(*s),
+        FrailtySpec::GaussianShift {
+            sigma_fixed: Some(s),
+        } => Some(*s),
         FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
         FrailtySpec::None => None,
         _ => None,
@@ -12150,7 +12152,10 @@ pub fn fit_survival_marginal_slope_terms(
     let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
 
     // ── Run a single [ρ,ψ] optimization at the current sigma ──────────
-    let run_at_sigma = |sigma: Option<f64>| -> Result<SpatialLengthScaleOptimizationResult<UnifiedFitResult>, String> {
+    let run_at_sigma = |sigma: Option<f64>| -> Result<
+        SpatialLengthScaleOptimizationResult<UnifiedFitResult>,
+        String,
+    > {
         current_sigma.set(sigma);
         exact_warm_start.replace(None);
         optimize_spatial_length_scale_exact_joint(
