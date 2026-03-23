@@ -614,6 +614,17 @@ fn finite_outer_eval_or_error(
     Ok(eval)
 }
 
+fn finite_outer_eval_for_seed(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    context: &str,
+) -> Result<(), ObjectiveEvalError> {
+    let eval = obj
+        .eval(rho)
+        .map_err(|err| into_objective_error(context, err))?;
+    finite_outer_eval_or_error(context, eval).map(|_| ())
+}
+
 struct OuterCostBridge<'a> {
     obj: &'a mut dyn OuterObjective,
 }
@@ -1244,8 +1255,8 @@ fn run_outer_with_plan(
     // Use cheap partial-PIRLS (capped inner iterations) when available.
     let budget = config.seed_config.screening_budget.max(1);
     let screen_max = config.seed_config.screen_max_inner_iterations;
-    let screened = if seeds.len() <= budget {
-        seeds
+    let screened_indices: Vec<usize> = if seeds.len() <= budget {
+        (0..seeds.len()).collect()
     } else {
         log::info!(
             "[OUTER] {context}: screening {}/{} seeds (budget={budget}, pirls_cap={screen_max})",
@@ -1295,7 +1306,7 @@ fn run_outer_with_plan(
                 "[OUTER] {context}: seed screening produced no finite costs; trying all {} seeds without pruning.",
                 seeds.len()
             );
-            seeds
+            (0..seeds.len()).collect()
         } else {
             // Keep the best finite seeds first, then backfill with the original
             // heuristic order so capped screening cannot prune away every
@@ -1318,8 +1329,60 @@ fn run_outer_with_plan(
                     }
                 }
             }
-            selected.into_iter().map(|i| seeds[i].clone()).collect()
+            selected
         }
+    };
+    let mut attempted = vec![false; seeds.len()];
+    let mut verified_indices = Vec::with_capacity(screened_indices.len().min(budget));
+    for &idx in &screened_indices {
+        attempted[idx] = true;
+        obj.reset();
+        match finite_outer_eval_for_seed(
+            obj,
+            &seeds[idx],
+            "outer seed verification failed",
+        ) {
+            Ok(()) => verified_indices.push(idx),
+            Err(err) => {
+                log::warn!("[OUTER] {context}: rejecting screened seed after full verification: {err}");
+            }
+        }
+    }
+    if verified_indices.len() < budget {
+        for idx in 0..seeds.len() {
+            if attempted[idx] {
+                continue;
+            }
+            obj.reset();
+            match finite_outer_eval_for_seed(
+                obj,
+                &seeds[idx],
+                "outer seed verification failed",
+            ) {
+                Ok(()) => {
+                    verified_indices.push(idx);
+                    if verified_indices.len() == budget {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[OUTER] {context}: rejecting fallback seed after full verification: {err}"
+                    );
+                }
+            }
+        }
+    }
+    obj.reset();
+    let screened = if verified_indices.is_empty() {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "all candidate seeds failed full outer verification ({context})"
+        )));
+    } else {
+        verified_indices
+            .into_iter()
+            .map(|idx| seeds[idx].clone())
+            .collect()
     };
 
     let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {

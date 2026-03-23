@@ -230,6 +230,49 @@ fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlice
     }
 }
 
+fn exact_newton_block_ranges(slices: &BlockSlices) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = vec![
+        slices.time.clone(),
+        slices.marginal.clone(),
+        slices.logslope.clone(),
+    ];
+    if let Some(range) = slices.score_warp.clone() {
+        ranges.push(range);
+    }
+    if let Some(range) = slices.link_dev.clone() {
+        ranges.push(range);
+    }
+    ranges
+}
+
+fn exact_newton_block_gradients(
+    joint_gradient: &Array1<f64>,
+    block_ranges: &[std::ops::Range<usize>],
+) -> Vec<Array1<f64>> {
+    block_ranges
+        .iter()
+        .map(|range| joint_gradient.slice(s![range.clone()]).to_owned())
+        .collect()
+}
+
+fn flex_identity_block_pairs(
+    primary: &FlexPrimarySlices,
+    slices: &BlockSlices,
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let mut pairs = Vec::with_capacity(2);
+    if let (Some(primary_range), Some(block_range)) =
+        (primary.h.as_ref(), slices.score_warp.as_ref())
+    {
+        pairs.push((primary_range.clone(), block_range.clone()));
+    }
+    if let (Some(primary_range), Some(block_range)) =
+        (primary.w.as_ref(), slices.link_dev.as_ref())
+    {
+        pairs.push((primary_range.clone(), block_range.clone()));
+    }
+    pairs
+}
+
 #[inline]
 fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
     ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
@@ -246,10 +289,6 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
-fn coefficients_exactly_zero(beta: &Array1<f64>) -> bool {
-    beta.iter().all(|value| *value == 0.0)
-}
-
 #[inline]
 fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
     match frailty {
@@ -284,6 +323,22 @@ struct DenestedCellPrimaryFixedPartials {
     coeff_bu: Vec<[f64; 4]>,
     coeff_aau: Vec<[f64; 4]>,
     coeff_abu: Vec<[f64; 4]>,
+}
+
+/// Pre-computed partition cell data for a single timepoint evaluation.
+/// Built once per (a, b, β_h, β_w) and reused across the three passes
+/// (F, D, D_uv) that previously each rebuilt partition cells independently.
+struct CachedPartitionCells {
+    cells: Vec<CachedCellEntry>,
+}
+
+struct CachedCellEntry {
+    partition_cell: exact_kernel::DenestedPartitionCell,
+    neg_cell: exact_kernel::DenestedCubicCell,
+    z_mid: f64,
+    u_mid: f64,
+    state: exact_kernel::CellMomentState,
+    fixed: DenestedCellPrimaryFixedPartials,
 }
 
 struct SurvivalFlexTimepointExact {
@@ -336,6 +391,12 @@ fn unit_primary_direction(idx: usize) -> Array1<f64> {
     out
 }
 
+fn unit_flex_primary_direction(primary: &FlexPrimarySlices, idx: usize) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(primary.total);
+    out[idx] = 1.0;
+    out
+}
+
 fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
     let mut out = vec![0.0; lhs.len() + rhs.len() - 1];
     for (i, &lv) in lhs.iter().enumerate() {
@@ -380,6 +441,28 @@ fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String
             "survival marginal-slope spatial psi loading requested for unsupported block {block_idx}"
         )),
     }
+}
+
+fn spatial_block_primary_loading_flex(
+    primary: &FlexPrimarySlices,
+    block_idx: usize,
+) -> Result<Array1<f64>, String> {
+    let mut loading = Array1::<f64>::zeros(primary.total);
+    match block_idx {
+        1 => {
+            loading[primary.q0] = 1.0;
+            loading[primary.q1] = 1.0;
+        }
+        2 => {
+            loading[primary.g] = 1.0;
+        }
+        _ => {
+            return Err(format!(
+                "survival marginal-slope spatial psi loading requested for unsupported block {block_idx}"
+            ));
+        }
+    }
+    Ok(loading)
 }
 
 fn jet_subset_partitions(mask: usize) -> Vec<Vec<usize>> {
@@ -518,6 +601,27 @@ fn primary_direction_from_psi_row(
     out
 }
 
+fn primary_direction_from_psi_row_flex(
+    primary: &FlexPrimarySlices,
+    block_idx: usize,
+    psi_row: &Array1<f64>,
+    beta_block: &Array1<f64>,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(primary.total);
+    let value = psi_row.dot(beta_block);
+    match block_idx {
+        1 => {
+            out[primary.q0] = value;
+            out[primary.q1] = value;
+        }
+        2 => {
+            out[primary.g] = value;
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Derive a primary-space psi action on a direction from a precomputed psi design row.
 fn primary_psi_action_from_psi_row(
     block_idx: usize,
@@ -539,6 +643,27 @@ fn primary_psi_action_from_psi_row(
     out
 }
 
+fn primary_psi_action_from_psi_row_flex(
+    primary: &FlexPrimarySlices,
+    block_idx: usize,
+    psi_row: &Array1<f64>,
+    d_beta_block: ndarray::ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(primary.total);
+    let value = psi_row.dot(&d_beta_block);
+    match block_idx {
+        1 => {
+            out[primary.q0] = value;
+            out[primary.q1] = value;
+        }
+        2 => {
+            out[primary.g] = value;
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Derive a primary-space second-order direction from a precomputed second psi design row.
 fn primary_second_direction_from_psi_row(
     block_idx: usize,
@@ -546,6 +671,15 @@ fn primary_second_direction_from_psi_row(
     beta_block: &Array1<f64>,
 ) -> Array1<f64> {
     primary_direction_from_psi_row(block_idx, psi_second_row, beta_block)
+}
+
+fn primary_second_direction_from_psi_row_flex(
+    primary: &FlexPrimarySlices,
+    block_idx: usize,
+    psi_second_row: &Array1<f64>,
+    beta_block: &Array1<f64>,
+) -> Array1<f64> {
+    primary_direction_from_psi_row_flex(primary, block_idx, psi_second_row, beta_block)
 }
 
 // ── Block-local Hessian accumulator ────────────────────────────────────
@@ -1456,6 +1590,15 @@ impl SurvivalMarginalSlopeFamily {
         self.score_warp.is_some() || self.link_dev.is_some()
     }
 
+    fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
+        Ok(self
+            .flex_score_beta(block_states)?
+            .is_some_and(|beta| beta.iter().any(|value| *value != 0.0))
+            || self
+                .flex_link_beta(block_states)?
+                .is_some_and(|beta| beta.iter().any(|value| *value != 0.0)))
+    }
+
     fn flex_score_beta<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
@@ -1467,15 +1610,6 @@ impl SurvivalMarginalSlopeFamily {
             .get(3)
             .map(|state| Some(&state.beta))
             .ok_or_else(|| "missing survival score-warp block state".to_string())
-    }
-
-    fn effective_flex_score_beta<'a>(
-        &self,
-        block_states: &'a [ParameterBlockState],
-    ) -> Result<Option<&'a Array1<f64>>, String> {
-        Ok(self
-            .flex_score_beta(block_states)?
-            .filter(|beta| !coefficients_exactly_zero(beta)))
     }
 
     fn flex_link_beta<'a>(
@@ -1492,15 +1626,6 @@ impl SurvivalMarginalSlopeFamily {
             .ok_or_else(|| "missing survival link-deviation block state".to_string())
     }
 
-    fn effective_flex_link_beta<'a>(
-        &self,
-        block_states: &'a [ParameterBlockState],
-    ) -> Result<Option<&'a Array1<f64>>, String> {
-        Ok(self
-            .flex_link_beta(block_states)?
-            .filter(|beta| !coefficients_exactly_zero(beta)))
-    }
-
     fn denested_partition_cells(
         &self,
         a: f64,
@@ -1508,21 +1633,34 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
-        let score_breaks = if beta_h.is_some() {
-            self.score_warp
-                .as_ref()
-                .map(|runtime| runtime.breakpoints().to_vec())
-                .unwrap_or_default()
+        // Fixed score-z breakpoints: always include ±SCORE_TAIL as minimum
+        // partition (needed even for frailty-only), plus runtime breakpoints.
+        const SCORE_TAIL: f64 = 8.0;
+        let mut score_breaks = vec![-SCORE_TAIL, SCORE_TAIL];
+        if let Some(runtime) = self.score_warp.as_ref() {
+            for &bp in runtime.breakpoints().iter() {
+                if bp > -SCORE_TAIL && bp < SCORE_TAIL {
+                    score_breaks.push(bp);
+                }
+            }
+            score_breaks.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap());
+            score_breaks.dedup_by(|lhs, rhs| (*lhs - *rhs).abs() <= 1e-12);
+        }
+        // Fixed link-u breakpoints: runtime support + fixed padding.
+        const LINK_PAD: f64 = 8.0;
+        let link_breaks = if let Some(runtime) = self.link_dev.as_ref() {
+            let left_ep = runtime.support_left();
+            let right_ep = runtime.support_right();
+            let mut bk = runtime.breakpoints().to_vec();
+            if bk.first().copied().unwrap_or(right_ep) > left_ep - LINK_PAD {
+                bk.insert(0, left_ep - LINK_PAD);
+            }
+            if bk.last().copied().unwrap_or(left_ep) < right_ep + LINK_PAD {
+                bk.push(right_ep + LINK_PAD);
+            }
+            bk
         } else {
-            Vec::new()
-        };
-        let link_breaks = if beta_w.is_some() {
-            self.link_dev
-                .as_ref()
-                .map(|runtime| runtime.breakpoints().to_vec())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+            vec![-SCORE_TAIL, SCORE_TAIL]
         };
 
         let mut cells = exact_kernel::build_denested_partition_cells_with_tails(
@@ -1535,8 +1673,8 @@ impl SurvivalMarginalSlopeFamily {
                     runtime.local_cubic_at(beta, z)
                 } else {
                     Ok(exact_kernel::LocalSpanCubic {
-                        left: 0.0,
-                        right: 1.0,
+                        left: -SCORE_TAIL,
+                        right: SCORE_TAIL,
                         c0: 0.0,
                         c1: 0.0,
                         c2: 0.0,
@@ -1549,8 +1687,8 @@ impl SurvivalMarginalSlopeFamily {
                     runtime.local_cubic_at(beta, u)
                 } else {
                     Ok(exact_kernel::LocalSpanCubic {
-                        left: 0.0,
-                        right: 1.0,
+                        left: -SCORE_TAIL,
+                        right: SCORE_TAIL,
                         c0: 0.0,
                         c1: 0.0,
                         c2: 0.0,
@@ -1971,8 +2109,8 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<f64, String> {
         let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
         let g = block_states[2].eta[row];
-        let beta_h = self.effective_flex_score_beta(block_states)?;
-        let beta_w = self.effective_flex_link_beta(block_states)?;
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
         self.row_neglog_flex_value_from_parts(
             row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w,
         )
@@ -2025,26 +2163,20 @@ impl SurvivalMarginalSlopeFamily {
                 - di * qd1.ln()))
     }
 
-    fn compute_survival_timepoint_exact(
+    /// Build a cached partition: cells + moment states + fixed partials,
+    /// computed once per (a, b, β_h, β_w) and reused across the three
+    /// integration passes (F, D, D_uv).
+    fn build_cached_partition(
         &self,
-        row: usize,
         primary: &FlexPrimarySlices,
-        q: f64,
-        q_index: usize,
         a: f64,
         b: f64,
-        d_calibration: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
-        need_d_uv: bool,
-    ) -> Result<SurvivalFlexTimepointExact, String> {
-        let p = primary.total;
-        let mut f_u = Array1::<f64>::zeros(p);
-        let mut f_au = Array1::<f64>::zeros(p);
-        let mut f_uv = Array2::<f64>::zeros((p, p));
-        let mut f_aa = 0.0;
-
-        for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
+    ) -> Result<CachedPartitionCells, String> {
+        let raw_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+        let mut cells = Vec::with_capacity(raw_cells.len());
+        for partition_cell in raw_cells {
             let cell = partition_cell.cell;
             let neg_cell = exact_kernel::DenestedCubicCell {
                 left: cell.left,
@@ -2066,6 +2198,44 @@ impl SurvivalMarginalSlopeFamily {
                 z_mid,
                 u_mid,
             )?;
+            cells.push(CachedCellEntry {
+                partition_cell,
+                neg_cell,
+                z_mid,
+                u_mid,
+                state,
+                fixed,
+            });
+        }
+        Ok(CachedPartitionCells { cells })
+    }
+
+    fn compute_survival_timepoint_exact(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        d_calibration: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        need_d_uv: bool,
+    ) -> Result<SurvivalFlexTimepointExact, String> {
+        let p = primary.total;
+        let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
+
+        let mut f_u = Array1::<f64>::zeros(p);
+        let mut f_au = Array1::<f64>::zeros(p);
+        let mut f_uv = Array2::<f64>::zeros((p, p));
+        let mut f_aa = 0.0;
+
+        for entry in &cached.cells {
+            let cell = entry.partition_cell.cell;
+            let neg_cell = entry.neg_cell;
+            let state = &entry.state;
+            let fixed = &entry.fixed;
             let neg_dc_da = fixed.dc_da.map(|value| -value);
             let neg_dc_daa = fixed.dc_daa.map(|value| -value);
             f_aa += exact_kernel::cell_second_derivative_from_moments(
@@ -2136,20 +2306,10 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         let mut d_u = Array1::<f64>::zeros(p);
-        for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
-            let cell = partition_cell.cell;
-            let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
-            let u_mid = a + b * z_mid;
-            let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
-            let fixed = self.denested_cell_primary_fixed_partials(
-                primary,
-                a,
-                b,
-                partition_cell.score_span,
-                partition_cell.link_span,
-                z_mid,
-                u_mid,
-            )?;
+        for entry in &cached.cells {
+            let cell = entry.partition_cell.cell;
+            let state = &entry.state;
+            let fixed = &entry.fixed;
             let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
             let chi_poly = fixed.dc_da.to_vec();
             for u in 0..p {
@@ -2263,20 +2423,10 @@ impl SurvivalMarginalSlopeFamily {
 
         let mut d_uv = Array2::<f64>::zeros((p, p));
         if need_d_uv {
-            for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
-                let cell = partition_cell.cell;
-                let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
-                let u_mid = a + b * z_mid;
-                let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
-                let fixed = self.denested_cell_primary_fixed_partials(
-                    primary,
-                    a,
-                    b,
-                    partition_cell.score_span,
-                    partition_cell.link_span,
-                    z_mid,
-                    u_mid,
-                )?;
+            for entry in &cached.cells {
+                let cell = entry.partition_cell.cell;
+                let state = &entry.state;
+                let fixed = &entry.fixed;
                 let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
                 let chi_poly = fixed.dc_da.to_vec();
                 let eta_aa_poly = fixed.dc_daa.to_vec();
@@ -2384,13 +2534,25 @@ impl SurvivalMarginalSlopeFamily {
         q_geom: &SurvivalMarginalSlopeDynamicRow,
         primary: &FlexPrimarySlices,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let q0 = q_geom.q0;
-        let q1 = q_geom.q1;
-        let qd1 = q_geom.qd1;
         let g = block_states[2].eta[row];
-        let beta_h = self.effective_flex_score_beta(block_states)?;
-        let beta_w = self.effective_flex_link_beta(block_states)?;
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+        self.compute_row_flex_primary_gradient_hessian_from_parts(
+            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w, primary,
+        )
+    }
 
+    fn compute_row_flex_primary_gradient_hessian_from_parts(
+        &self,
+        row: usize,
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        g: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        primary: &FlexPrimarySlices,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         if qd1 < self.derivative_guard {
             return Err(format!(
                 "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
@@ -2665,6 +2827,410 @@ impl SurvivalMarginalSlopeFamily {
         (&base.gradient, &base.hessian)
     }
 
+    fn row_flex_primary_point(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &FlexPrimarySlices,
+    ) -> Result<Array1<f64>, String> {
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let mut point = Array1::<f64>::zeros(primary.total);
+        point[primary.q0] = q_geom.q0;
+        point[primary.q1] = q_geom.q1;
+        point[primary.qd1] = q_geom.qd1;
+        point[primary.g] = block_states[2].eta[row];
+        if let (Some(range), Some(beta)) = (primary.h.as_ref(), self.flex_score_beta(block_states)?) {
+            point.slice_mut(s![range.clone()]).assign(beta);
+        }
+        if let (Some(range), Some(beta)) = (primary.w.as_ref(), self.flex_link_beta(block_states)?) {
+            point.slice_mut(s![range.clone()]).assign(beta);
+        }
+        Ok(point)
+    }
+
+    fn row_flex_primary_hessian_at_point(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        point: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        if point.len() != primary.total {
+            return Err(format!(
+                "survival flex primary point length mismatch: got {}, expected {}",
+                point.len(),
+                primary.total
+            ));
+        }
+        let beta_h = primary
+            .h
+            .as_ref()
+            .map(|range| point.slice(s![range.clone()]).to_owned());
+        let beta_w = primary
+            .w
+            .as_ref()
+            .map(|range| point.slice(s![range.clone()]).to_owned());
+        let (_, _, hess) = self.compute_row_flex_primary_gradient_hessian_from_parts(
+            row,
+            point[primary.q0],
+            point[primary.q1],
+            point[primary.qd1],
+            point[primary.g],
+            beta_h.as_ref(),
+            beta_w.as_ref(),
+            primary,
+        )?;
+        Ok(hess)
+    }
+
+    fn finalize_dense_joint_working_sets(
+        &self,
+        slices: &BlockSlices,
+        log_likelihood: f64,
+        joint_gradient: Array1<f64>,
+        joint_hessian: Array2<f64>,
+    ) -> FamilyEvaluation {
+        let block_ranges = exact_newton_block_ranges(slices);
+        let block_gradients = exact_newton_block_gradients(&joint_gradient, &block_ranges);
+        FamilyEvaluation {
+            log_likelihood,
+            blockworking_sets: slice_joint_into_block_working_sets(
+                block_gradients,
+                &joint_hessian,
+                &block_ranges,
+            ),
+        }
+    }
+
+    fn accumulate_dynamic_q_core_gradient(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        joint_gradient: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [&q_geom.dq0_marginal, &q_geom.dq1_marginal, &q_geom.dqd1_marginal];
+
+        for (q_idx, dq) in dq_time.iter().enumerate() {
+            for coeff_idx in 0..dq.len() {
+                joint_gradient[slices.time.start + coeff_idx] -= primary_gradient[q_idx] * dq[coeff_idx];
+            }
+        }
+        for (q_idx, dq) in dq_marginal.iter().enumerate() {
+            for coeff_idx in 0..dq.len() {
+                joint_gradient[slices.marginal.start + coeff_idx] -=
+                    primary_gradient[q_idx] * dq[coeff_idx];
+            }
+        }
+        self.logslope_design.axpy_row_into(
+            row,
+            -primary_gradient[3],
+            &mut joint_gradient.slice_mut(s![slices.logslope.clone()]),
+        )?;
+        Ok(())
+    }
+
+    fn accumulate_dynamic_q_core_hessian(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+        joint_hessian: &mut Array2<f64>,
+    ) {
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [&q_geom.dq0_marginal, &q_geom.dq1_marginal, &q_geom.dqd1_marginal];
+        let d2q_time_time = [
+            &q_geom.d2q0_time_time,
+            &q_geom.d2q1_time_time,
+            &q_geom.d2qd1_time_time,
+        ];
+        let d2q_marginal_marginal = [
+            &q_geom.d2q0_marginal_marginal,
+            &q_geom.d2q1_marginal_marginal,
+            &q_geom.d2qd1_marginal_marginal,
+        ];
+        let d2q_time_marginal = [
+            &q_geom.d2q0_time_marginal,
+            &q_geom.d2q1_time_marginal,
+            &q_geom.d2qd1_time_marginal,
+        ];
+
+        for a in 0..p_t {
+            for b in 0..p_t {
+                let mut value = 0.0;
+                for q_u in 0..3 {
+                    for q_v in 0..3 {
+                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_time[q_v][b];
+                    }
+                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
+                }
+                joint_hessian[[slices.time.start + a, slices.time.start + b]] += value;
+            }
+        }
+
+        for a in 0..p_m {
+            for b in 0..p_m {
+                let mut value = 0.0;
+                for q_u in 0..3 {
+                    for q_v in 0..3 {
+                        value += primary_hessian[[q_u, q_v]] * dq_marginal[q_u][a] * dq_marginal[q_v][b];
+                    }
+                    value += primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
+                }
+                joint_hessian[[slices.marginal.start + a, slices.marginal.start + b]] += value;
+            }
+        }
+
+        self.logslope_design
+            .syr_row_into_view(
+                row,
+                primary_hessian[[3, 3]],
+                joint_hessian.slice_mut(s![slices.logslope.clone(), slices.logslope.clone()]),
+            )
+            .expect("survival logslope block syr");
+
+        for a in 0..p_t {
+            for b in 0..p_m {
+                let mut value = 0.0;
+                for q_u in 0..3 {
+                    for q_v in 0..3 {
+                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_marginal[q_v][b];
+                    }
+                    value += primary_gradient[q_u] * d2q_time_marginal[q_u][[a, b]];
+                }
+                joint_hessian[[slices.time.start + a, slices.marginal.start + b]] += value;
+                joint_hessian[[slices.marginal.start + b, slices.time.start + a]] += value;
+            }
+        }
+
+        let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
+        let logslope_row = logslope_chunk.row(0);
+        for a in 0..p_t {
+            let mut weight = 0.0;
+            for q_u in 0..3 {
+                weight += primary_hessian[[q_u, 3]] * dq_time[q_u][a];
+            }
+            for b in 0..p_g {
+                let value = weight * logslope_row[b];
+                joint_hessian[[slices.time.start + a, slices.logslope.start + b]] += value;
+                joint_hessian[[slices.logslope.start + b, slices.time.start + a]] += value;
+            }
+        }
+
+        for a in 0..p_m {
+            let mut weight = 0.0;
+            for q_u in 0..3 {
+                weight += primary_hessian[[q_u, 3]] * dq_marginal[q_u][a];
+            }
+            for b in 0..p_g {
+                let value = weight * logslope_row[b];
+                joint_hessian[[slices.marginal.start + a, slices.logslope.start + b]] += value;
+                joint_hessian[[slices.logslope.start + b, slices.marginal.start + a]] += value;
+            }
+        }
+    }
+
+    fn accumulate_identity_primary_cross_hessian(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        core_hessian_column: ndarray::ArrayView1<'_, f64>,
+        joint_block: &std::ops::Range<usize>,
+        joint_local: usize,
+        joint_hessian: &mut Array2<f64>,
+    ) {
+        let joint_idx = joint_block.start + joint_local;
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [&q_geom.dq0_marginal, &q_geom.dq1_marginal, &q_geom.dqd1_marginal];
+
+        for coeff_idx in 0..slices.time.len() {
+            let mut value = 0.0;
+            for q_idx in 0..3 {
+                value += core_hessian_column[q_idx] * dq_time[q_idx][coeff_idx];
+            }
+            joint_hessian[[slices.time.start + coeff_idx, joint_idx]] += value;
+            joint_hessian[[joint_idx, slices.time.start + coeff_idx]] += value;
+        }
+        for coeff_idx in 0..slices.marginal.len() {
+            let mut value = 0.0;
+            for q_idx in 0..3 {
+                value += core_hessian_column[q_idx] * dq_marginal[q_idx][coeff_idx];
+            }
+            joint_hessian[[slices.marginal.start + coeff_idx, joint_idx]] += value;
+            joint_hessian[[joint_idx, slices.marginal.start + coeff_idx]] += value;
+        }
+        let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
+        let logslope_row = logslope_chunk.row(0);
+        let logslope_weight = core_hessian_column[3];
+        if logslope_weight != 0.0 {
+            for coeff_idx in 0..slices.logslope.len() {
+                let value = logslope_weight * logslope_row[coeff_idx];
+                joint_hessian[[slices.logslope.start + coeff_idx, joint_idx]] += value;
+                joint_hessian[[joint_idx, slices.logslope.start + coeff_idx]] += value;
+            }
+        }
+    }
+
+    fn add_dense_submatrix(
+        &self,
+        joint_hessian: &mut Array2<f64>,
+        target_rows: &std::ops::Range<usize>,
+        target_cols: &std::ops::Range<usize>,
+        source: ArrayView2<'_, f64>,
+    ) {
+        for row_local in 0..target_rows.len() {
+            for col_local in 0..target_cols.len() {
+                joint_hessian[[
+                    target_rows.start + row_local,
+                    target_cols.start + col_local,
+                ]] += source[[row_local, col_local]];
+            }
+        }
+    }
+
+    fn add_dense_symmetric_cross_submatrix(
+        &self,
+        joint_hessian: &mut Array2<f64>,
+        left_range: &std::ops::Range<usize>,
+        right_range: &std::ops::Range<usize>,
+        source: ArrayView2<'_, f64>,
+    ) {
+        for left_local in 0..left_range.len() {
+            for right_local in 0..right_range.len() {
+                let value = source[[left_local, right_local]];
+                joint_hessian[[left_range.start + left_local, right_range.start + right_local]] +=
+                    value;
+                joint_hessian[[right_range.start + right_local, left_range.start + left_local]] +=
+                    value;
+            }
+        }
+    }
+
+    fn accumulate_dynamic_q_joint_row(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+        joint_gradient: &mut Array1<f64>,
+        joint_hessian: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        self.accumulate_dynamic_q_core_gradient(
+            row,
+            slices,
+            q_geom,
+            primary_gradient.slice(s![0..N_PRIMARY]),
+            joint_gradient,
+        )?;
+        self.accumulate_dynamic_q_core_hessian(
+            row,
+            slices,
+            q_geom,
+            primary_gradient.slice(s![0..N_PRIMARY]),
+            primary_hessian.slice(s![0..N_PRIMARY, 0..N_PRIMARY]),
+            joint_hessian,
+        );
+
+        for (primary_range, joint_range) in identity_blocks {
+            for local in 0..primary_range.len() {
+                joint_gradient[joint_range.start + local] -=
+                    primary_gradient[primary_range.start + local];
+                self.accumulate_identity_primary_cross_hessian(
+                    row,
+                    slices,
+                    q_geom,
+                    primary_hessian.slice(s![0..N_PRIMARY, primary_range.start + local]),
+                    joint_range,
+                    local,
+                    joint_hessian,
+                );
+            }
+            self.add_dense_submatrix(
+                joint_hessian,
+                joint_range,
+                joint_range,
+                primary_hessian.slice(s![primary_range.clone(), primary_range.clone()]),
+            );
+        }
+
+        for left_idx in 0..identity_blocks.len() {
+            for right_idx in left_idx + 1..identity_blocks.len() {
+                let (left_primary, left_joint) = &identity_blocks[left_idx];
+                let (right_primary, right_joint) = &identity_blocks[right_idx];
+                self.add_dense_symmetric_cross_submatrix(
+                    joint_hessian,
+                    left_joint,
+                    right_joint,
+                    primary_hessian.slice(s![left_primary.clone(), right_primary.clone()]),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn evaluate_blockwise_exact_newton_dynamic_q_dense<RowTerms>(
+        &self,
+        block_states: &[ParameterBlockState],
+        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+        row_terms: RowTerms,
+    ) -> Result<FamilyEvaluation, String>
+    where
+        RowTerms: Fn(
+                usize,
+                &SurvivalMarginalSlopeDynamicRow,
+            ) -> Result<(f64, Array1<f64>, Array2<f64>), String>
+            + Sync,
+    {
+        let slices = block_slices(self, block_states);
+        let p_total = slices.total;
+        type Acc = (f64, Array1<f64>, Array2<f64>);
+        let make_acc = || -> Acc {
+            (0.0, Array1::zeros(p_total), Array2::zeros((p_total, p_total)))
+        };
+
+        let (log_likelihood, joint_gradient, joint_hessian) = (0..self.n)
+            .into_par_iter()
+            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let (row_nll, primary_gradient, primary_hessian) = row_terms(row, &q_geom)?;
+                acc.0 -= row_nll;
+                self.accumulate_dynamic_q_joint_row(
+                    row,
+                    &slices,
+                    &q_geom,
+                    primary_gradient.view(),
+                    primary_hessian.view(),
+                    identity_blocks,
+                    &mut acc.1,
+                    &mut acc.2,
+                )?;
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
+                a.0 += b.0;
+                a.1 += &b.1;
+                a.2 += &b.2;
+                Ok(a)
+            })?;
+
+        Ok(self.finalize_dense_joint_working_sets(
+            &slices,
+            log_likelihood,
+            joint_gradient,
+            joint_hessian,
+        ))
+    }
+
     fn row_primary_third_contracted(
         &self,
         row: usize,
@@ -2686,6 +3252,43 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         Ok(out)
+    }
+
+    fn row_flex_primary_third_contracted_fd(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let primary = flex_primary_slices(self);
+        if dir.len() != primary.total {
+            return Err(format!(
+                "survival flex third-contracted direction length mismatch: got {}, expected {}",
+                dir.len(),
+                primary.total
+            ));
+        }
+        let base = self.row_flex_primary_point(row, block_states, &primary)?;
+        let norm = dir.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        let step = (1e-6 / norm.max(1.0)).max(1e-8);
+        let plus = &base + &(dir * step);
+        let minus = &base - &(dir * step);
+        let h_plus = self.row_flex_primary_hessian_at_point(row, &primary, &plus)?;
+        let h_minus = self.row_flex_primary_hessian_at_point(row, &primary, &minus)?;
+        Ok((h_plus - h_minus) / (2.0 * step))
+    }
+
+    fn row_primary_third_contracted_general(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        if self.flex_active() {
+            self.row_flex_primary_third_contracted_fd(row, block_states, dir)
+        } else {
+            self.row_primary_third_contracted(row, block_states, dir)
+        }
     }
 
     fn row_primary_fourth_contracted(
@@ -2710,6 +3313,52 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         Ok(out)
+    }
+
+    fn row_flex_primary_fourth_contracted_fd(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let primary = flex_primary_slices(self);
+        if dir_u.len() != primary.total || dir_v.len() != primary.total {
+            return Err(format!(
+                "survival flex fourth-contracted direction length mismatch: u={}, v={}, expected {}",
+                dir_u.len(),
+                dir_v.len(),
+                primary.total
+            ));
+        }
+        let base = self.row_flex_primary_point(row, block_states, &primary)?;
+        let norm_u = dir_u.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        let norm_v = dir_v.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        let step_u = (1e-5 / norm_u.max(1.0)).max(1e-7);
+        let step_v = (1e-5 / norm_v.max(1.0)).max(1e-7);
+        let pp = &(&base + &(dir_u * step_u)) + &(dir_v * step_v);
+        let pm = &(&base + &(dir_u * step_u)) - &(dir_v * step_v);
+        let mp = &(&base - &(dir_u * step_u)) + &(dir_v * step_v);
+        let mm = &(&base - &(dir_u * step_u)) - &(dir_v * step_v);
+        let h_pp = self.row_flex_primary_hessian_at_point(row, &primary, &pp)?;
+        let h_pm = self.row_flex_primary_hessian_at_point(row, &primary, &pm)?;
+        let h_mp = self.row_flex_primary_hessian_at_point(row, &primary, &mp)?;
+        let h_mm = self.row_flex_primary_hessian_at_point(row, &primary, &mm)?;
+        Ok((h_pp - h_pm - h_mp + h_mm) / (4.0 * step_u * step_v))
+    }
+
+    fn row_primary_fourth_contracted_general(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        if self.flex_active() {
+            self.row_flex_primary_fourth_contracted_fd(row, block_states, dir_u, dir_v)
+        } else {
+            self.row_primary_fourth_contracted(row, block_states, dir_u, dir_v)
+        }
     }
 
     // ── Pullback through design matrices ──────────────────────────────
@@ -2864,6 +3513,36 @@ impl SurvivalMarginalSlopeFamily {
         out
     }
 
+    fn row_primary_direction_from_flat_general(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        d_beta_flat: &Array1<f64>,
+    ) -> Array1<f64> {
+        if !self.flex_active() {
+            return self.row_primary_direction_from_flat(row, slices, d_beta_flat);
+        }
+        let primary = flex_primary_slices(self);
+        let mut out = Array1::<f64>::zeros(primary.total);
+        let d_time = d_beta_flat.slice(s![slices.time.clone()]);
+        out[primary.q0] = self.design_entry.dot_row_view(row, d_time)
+            + self
+                .marginal_design
+                .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
+        out[primary.q1] = self.design_exit.dot_row_view(row, d_time)
+            + self
+                .marginal_design
+                .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
+        out[primary.qd1] = self.design_derivative_exit.dot_row_view(row, d_time);
+        out[primary.g] = self
+            .logslope_design
+            .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
+        for (primary_range, block_range) in flex_identity_block_pairs(&primary, slices) {
+            out.slice_mut(s![primary_range]).assign(&d_beta_flat.slice(s![block_range]));
+        }
+        out
+    }
+
     // ── Psi (spatial length-scale) derivatives ────────────────────────
 
     fn resolve_psi_location(
@@ -3007,7 +3686,11 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
         let deriv = &derivative_blocks[block_idx][local_idx];
-        let loading = spatial_block_primary_loading(block_idx)?;
+        let loading = if self.flex_active() {
+            spatial_block_primary_loading_flex(&flex_primary_slices(self), block_idx)?
+        } else {
+            spatial_block_primary_loading(block_idx)?
+        };
         let beta_psi = match block_idx {
             1 => &block_states[1].beta,
             _ => &block_states[2].beta,
@@ -3040,9 +3723,27 @@ impl SurvivalMarginalSlopeFamily {
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 // Compute psi design row once; derive direction from it.
                 let psi_row = self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-                let dir = primary_direction_from_psi_row(block_idx, &psi_row, beta_psi);
+                let dir = if self.flex_active() {
+                    primary_direction_from_psi_row_flex(
+                        &flex_primary_slices(self),
+                        block_idx,
+                        &psi_row,
+                        beta_psi,
+                    )
+                } else {
+                    primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
+                };
 
-                let (f_pi, f_pipi) = if let Some(c) = cache {
+                let (f_pi, f_pipi) = if self.flex_active() {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        &flex_primary_slices(self),
+                    )?;
+                    (g, h)
+                } else if let Some(c) = cache {
                     let (g, h) = self.row_primary_gradient_hessian(row, c);
                     (g.clone(), h.clone())
                 } else {
@@ -3050,7 +3751,7 @@ impl SurvivalMarginalSlopeFamily {
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                     (g, h)
                 };
-                let third = self.row_primary_third_contracted(row, block_states, &dir)?;
+                let third = self.row_primary_third_contracted_general(row, block_states, &dir)?;
 
                 a.0 += f_pi.dot(&dir);
 
@@ -3131,8 +3832,16 @@ impl SurvivalMarginalSlopeFamily {
         };
         let deriv_i = &derivative_blocks[block_idx_i][local_idx_i];
         let deriv_j = &derivative_blocks[block_idx_j][local_idx_j];
-        let loading_i = spatial_block_primary_loading(block_idx_i)?;
-        let loading_j = spatial_block_primary_loading(block_idx_j)?;
+        let loading_i = if self.flex_active() {
+            spatial_block_primary_loading_flex(&flex_primary_slices(self), block_idx_i)?
+        } else {
+            spatial_block_primary_loading(block_idx_i)?
+        };
+        let loading_j = if self.flex_active() {
+            spatial_block_primary_loading_flex(&flex_primary_slices(self), block_idx_j)?
+        } else {
+            spatial_block_primary_loading(block_idx_j)?
+        };
         let beta_i = match block_idx_i {
             1 => &block_states[1].beta,
             _ => &block_states[2].beta,
@@ -3172,8 +3881,26 @@ impl SurvivalMarginalSlopeFamily {
                     self.psi_design_row_vector(row, deriv_i, self.n, p_psi_i, label_i)?;
                 let psi_row_j =
                     self.psi_design_row_vector(row, deriv_j, self.n, p_psi_j, label_j)?;
-                let dir_i = primary_direction_from_psi_row(block_idx_i, &psi_row_i, beta_i);
-                let dir_j = primary_direction_from_psi_row(block_idx_j, &psi_row_j, beta_j);
+                let dir_i = if self.flex_active() {
+                    primary_direction_from_psi_row_flex(
+                        &flex_primary_slices(self),
+                        block_idx_i,
+                        &psi_row_i,
+                        beta_i,
+                    )
+                } else {
+                    primary_direction_from_psi_row(block_idx_i, &psi_row_i, beta_i)
+                };
+                let dir_j = if self.flex_active() {
+                    primary_direction_from_psi_row_flex(
+                        &flex_primary_slices(self),
+                        block_idx_j,
+                        &psi_row_j,
+                        beta_j,
+                    )
+                } else {
+                    primary_direction_from_psi_row(block_idx_j, &psi_row_j, beta_j)
+                };
 
                 let (psi_row_ij, dir_ij) = if same_block {
                     let r = self.psi_second_design_row_vector(
@@ -3185,16 +3912,41 @@ impl SurvivalMarginalSlopeFamily {
                         p_psi_i,
                         label_i,
                     )?;
-                    let d = primary_second_direction_from_psi_row(block_idx_i, &r, beta_i);
+                    let d = if self.flex_active() {
+                        primary_second_direction_from_psi_row_flex(
+                            &flex_primary_slices(self),
+                            block_idx_i,
+                            &r,
+                            beta_i,
+                        )
+                    } else {
+                        primary_second_direction_from_psi_row(block_idx_i, &r, beta_i)
+                    };
                     (Some(r), d)
                 } else {
-                    (None, Array1::<f64>::zeros(N_PRIMARY))
+                    (
+                        None,
+                        Array1::<f64>::zeros(if self.flex_active() {
+                            flex_primary_slices(self).total
+                        } else {
+                            N_PRIMARY
+                        }),
+                    )
                 };
                 let has_ij = psi_row_ij
                     .as_ref()
                     .is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
 
-                let (f_pi, f_pipi) = if let Some(c) = cache {
+                let (f_pi, f_pipi) = if self.flex_active() {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        &flex_primary_slices(self),
+                    )?;
+                    (g, h)
+                } else if let Some(c) = cache {
                     let (g, h) = self.row_primary_gradient_hessian(row, c);
                     (g.clone(), h.clone())
                 } else {
@@ -3202,10 +3954,12 @@ impl SurvivalMarginalSlopeFamily {
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                     (g, h)
                 };
-                let third_i = self.row_primary_third_contracted(row, block_states, &dir_i)?;
-                let third_j = self.row_primary_third_contracted(row, block_states, &dir_j)?;
+                let third_i =
+                    self.row_primary_third_contracted_general(row, block_states, &dir_i)?;
+                let third_j =
+                    self.row_primary_third_contracted_general(row, block_states, &dir_j)?;
                 let fourth =
-                    self.row_primary_fourth_contracted(row, block_states, &dir_i, &dir_j)?;
+                    self.row_primary_fourth_contracted_general(row, block_states, &dir_i, &dir_j)?;
 
                 a.0 += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
 
@@ -3251,7 +4005,8 @@ impl SurvivalMarginalSlopeFamily {
                 let rp_j = third_i.t().dot(&loading_j);
                 a.4.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j);
                 a.4.add_pullback(self, row, &fourth);
-                let third_ij = self.row_primary_third_contracted(row, block_states, &dir_ij)?;
+                let third_ij =
+                    self.row_primary_third_contracted_general(row, block_states, &dir_ij)?;
                 a.4.add_pullback(self, row, &third_ij);
 
                 Ok(a)
@@ -3308,7 +4063,11 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
         let deriv = &derivative_blocks[block_idx][local_idx];
-        let loading = spatial_block_primary_loading(block_idx)?;
+        let loading = if self.flex_active() {
+            spatial_block_primary_loading_flex(&flex_primary_slices(self), block_idx)?
+        } else {
+            spatial_block_primary_loading(block_idx)?
+        };
         let beta_psi = match block_idx {
             1 => &block_states[1].beta,
             _ => &block_states[2].beta,
@@ -3329,20 +4088,43 @@ impl SurvivalMarginalSlopeFamily {
                 |mut acc, row| -> Result<BlockHessianAccumulator, String> {
                     let psi_row =
                         self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-                    let psi_dir = primary_direction_from_psi_row(block_idx, &psi_row, beta_psi);
-                    let psi_action =
-                        primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block);
-                    let row_dir = self.row_primary_direction_from_flat(row, &slices, d_beta_flat);
+                    let psi_dir = if self.flex_active() {
+                        primary_direction_from_psi_row_flex(
+                            &flex_primary_slices(self),
+                            block_idx,
+                            &psi_row,
+                            beta_psi,
+                        )
+                    } else {
+                        primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
+                    };
+                    let psi_action = if self.flex_active() {
+                        primary_psi_action_from_psi_row_flex(
+                            &flex_primary_slices(self),
+                            block_idx,
+                            &psi_row,
+                            d_beta_block,
+                        )
+                    } else {
+                        primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
+                    };
+                    let row_dir =
+                        self.row_primary_direction_from_flat_general(row, &slices, d_beta_flat);
                     let third_beta =
-                        self.row_primary_third_contracted(row, block_states, &row_dir)?;
+                        self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
                     let fourth =
-                        self.row_primary_fourth_contracted(row, block_states, &row_dir, &psi_dir)?;
+                        self.row_primary_fourth_contracted_general(
+                            row,
+                            block_states,
+                            &row_dir,
+                            &psi_dir,
+                        )?;
 
                     let right_primary = third_beta.t().dot(&loading);
                     acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
                     acc.add_pullback(self, row, &fourth);
                     let third_action =
-                        self.row_primary_third_contracted(row, block_states, &psi_action)?;
+                        self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
                     acc.add_pullback(self, row, &third_action);
                     Ok(acc)
                 },
@@ -3365,7 +4147,59 @@ struct SurvivalMarginalSlopePsiWorkspace {
     family: SurvivalMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
     derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
-    cache: EvalCache,
+    cache: Option<EvalCache>,
+}
+
+struct SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
+    family: SurvivalMarginalSlopeFamily,
+    block_states: Vec<ParameterBlockState>,
+    joint_hessian: Array2<f64>,
+}
+
+impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn new(
+        family: SurvivalMarginalSlopeFamily,
+        block_states: Vec<ParameterBlockState>,
+    ) -> Result<Self, String> {
+        let joint_hessian = family
+            .evaluate_exact_newton_joint_dense(&block_states)?
+            .2;
+        Ok(Self {
+            family,
+            block_states,
+            joint_hessian,
+        })
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        Ok(Some(self.joint_hessian.dot(beta_flat)))
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        Ok(Some(self.joint_hessian.diag().to_owned()))
+    }
+
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
+    }
+
+    fn second_directional_derivative(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family.exact_newton_joint_hessiansecond_directional_derivative(
+            &self.block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+    }
 }
 
 impl SurvivalMarginalSlopePsiWorkspace {
@@ -3374,7 +4208,11 @@ impl SurvivalMarginalSlopePsiWorkspace {
         block_states: Vec<ParameterBlockState>,
         derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
-        let cache = family.build_eval_cache(&block_states)?;
+        let cache = if family.effective_flex_active(&block_states)? {
+            None
+        } else {
+            Some(family.build_eval_cache(&block_states)?)
+        };
         Ok(Self {
             family,
             block_states,
@@ -3393,7 +4231,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
             &self.block_states,
             &self.derivative_blocks,
             psi_index,
-            Some(&self.cache),
+            self.cache.as_ref(),
         )
     }
 
@@ -3407,7 +4245,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
             &self.derivative_blocks,
             psi_i,
             psi_j,
-            Some(&self.cache),
+            self.cache.as_ref(),
         )
     }
 
@@ -3608,6 +4446,204 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
 }
 
 impl SurvivalMarginalSlopeFamily {
+    fn evaluate_exact_newton_joint_flexible_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        self.validate_exact_monotonicity(block_states)?;
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_total = slices.total;
+        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+
+        type Acc = (f64, Array1<f64>, Array2<f64>);
+        let make_acc = || -> Acc {
+            (0.0, Array1::zeros(p_total), Array2::zeros((p_total, p_total)))
+        };
+
+        (0..self.n)
+            .into_par_iter()
+            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let (row_nll, f_pi, f_pipi) = self.compute_row_flex_primary_gradient_hessian_exact(
+                    row,
+                    block_states,
+                    &q_geom,
+                    &primary,
+                )?;
+                acc.0 -= row_nll;
+                self.accumulate_dynamic_q_joint_row(
+                    row,
+                    &slices,
+                    &q_geom,
+                    f_pi.view(),
+                    f_pipi.view(),
+                    &identity_blocks,
+                    &mut acc.1,
+                    &mut acc.2,
+                )?;
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                left.0 += right.0;
+                left.1 += &right.1;
+                left.2 += &right.2;
+                Ok(left)
+            })
+    }
+
+    fn evaluate_exact_newton_joint_timewiggle_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let slices = block_slices(self, block_states);
+        let p_total = slices.total;
+
+        type Acc = (f64, Array1<f64>, Array2<f64>);
+        let make_acc = || -> Acc {
+            (0.0, Array1::zeros(p_total), Array2::zeros((p_total, p_total)))
+        };
+
+        (0..self.n)
+            .into_par_iter()
+            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let (row_nll, f_pi, f_pipi) =
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                acc.0 -= row_nll;
+                self.accumulate_dynamic_q_joint_row(
+                    row,
+                    &slices,
+                    &q_geom,
+                    f_pi.view(),
+                    f_pipi.view(),
+                    &[],
+                    &mut acc.1,
+                    &mut acc.2,
+                )?;
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                left.0 += right.0;
+                left.1 += &right.1;
+                left.2 += &right.2;
+                Ok(left)
+            })
+    }
+
+    fn evaluate_exact_newton_joint_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        if self.flex_active() {
+            self.evaluate_exact_newton_joint_flexible_dense(block_states)
+        } else if self.flex_timewiggle_active() {
+            self.evaluate_exact_newton_joint_timewiggle_dense(block_states)
+        } else {
+            let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+            let cache = build_row_kernel_cache(&kern)?;
+            Ok((
+                row_kernel_log_likelihood(&cache),
+                -row_kernel_gradient(&kern, &cache),
+                row_kernel_hessian_dense(&kern, &cache),
+            ))
+        }
+    }
+
+    fn perturb_block_states_along_direction(
+        &self,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
+        step: f64,
+    ) -> Result<Vec<ParameterBlockState>, String> {
+        let slices = block_slices(self, block_states);
+        if direction.len() != slices.total {
+            return Err(format!(
+                "survival joint-direction length mismatch: got {}, expected {}",
+                direction.len(),
+                slices.total
+            ));
+        }
+        let mut out = block_states.to_vec();
+        let time_delta = direction.slice(s![slices.time.clone()]).to_owned() * step;
+        out[0].beta += &time_delta;
+        out[0].eta += &(self.design_exit.dot(&time_delta));
+        let marginal_delta = direction.slice(s![slices.marginal.clone()]).to_owned() * step;
+        out[1].beta += &marginal_delta;
+        out[1].eta += &(self.marginal_design.dot(&marginal_delta));
+        let logslope_delta = direction.slice(s![slices.logslope.clone()]).to_owned() * step;
+        out[2].beta += &logslope_delta;
+        out[2].eta += &(self.logslope_design.dot(&logslope_delta));
+        if let Some(range) = slices.score_warp.as_ref() {
+            out[3].beta += &(direction.slice(s![range.clone()]).to_owned() * step);
+        }
+        if let Some(range) = slices.link_dev.as_ref() {
+            let block_idx = 3 + usize::from(self.score_warp.is_some());
+            out[block_idx].beta += &(direction.slice(s![range.clone()]).to_owned() * step);
+        }
+        Ok(out)
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_fd(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let norm = d_beta_flat
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let step = (1e-6 / norm.max(1.0)).max(1e-8);
+        let plus = self.perturb_block_states_along_direction(block_states, d_beta_flat, step)?;
+        let minus = self.perturb_block_states_along_direction(block_states, d_beta_flat, -step)?;
+        let h_plus = self.evaluate_exact_newton_joint_dense(&plus)?.2;
+        let h_minus = self.evaluate_exact_newton_joint_dense(&minus)?.2;
+        Ok((h_plus - h_minus) / (2.0 * step))
+    }
+
+    fn exact_newton_joint_hessiansecond_directional_derivative_fd(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let norm_u = d_beta_u_flat
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let norm_v = d_beta_v_flat
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let step_u = (1e-5 / norm_u.max(1.0)).max(1e-7);
+        let step_v = (1e-5 / norm_v.max(1.0)).max(1e-7);
+        let pp = self.perturb_block_states_along_direction(
+            &self.perturb_block_states_along_direction(block_states, d_beta_u_flat, step_u)?,
+            d_beta_v_flat,
+            step_v,
+        )?;
+        let pm = self.perturb_block_states_along_direction(
+            &self.perturb_block_states_along_direction(block_states, d_beta_u_flat, step_u)?,
+            d_beta_v_flat,
+            -step_v,
+        )?;
+        let mp = self.perturb_block_states_along_direction(
+            &self.perturb_block_states_along_direction(block_states, d_beta_u_flat, -step_u)?,
+            d_beta_v_flat,
+            step_v,
+        )?;
+        let mm = self.perturb_block_states_along_direction(
+            &self.perturb_block_states_along_direction(block_states, d_beta_u_flat, -step_u)?,
+            d_beta_v_flat,
+            -step_v,
+        )?;
+        let h_pp = self.evaluate_exact_newton_joint_dense(&pp)?.2;
+        let h_pm = self.evaluate_exact_newton_joint_dense(&pm)?.2;
+        let h_mp = self.evaluate_exact_newton_joint_dense(&mp)?.2;
+        let h_mm = self.evaluate_exact_newton_joint_dense(&mm)?.2;
+        Ok((h_pp - h_pm - h_mp + h_mm) / (4.0 * step_u * step_v))
+    }
+
     fn evaluate_blockwise_exact_newton(
         &self,
         block_states: &[ParameterBlockState],
@@ -3689,496 +4725,42 @@ impl SurvivalMarginalSlopeFamily {
         self.validate_exact_monotonicity(block_states)?;
         let slices = block_slices(self, block_states);
         let primary = flex_primary_slices(self);
-        let p_t = slices.time.len();
-        let p_m = slices.marginal.len();
-        let p_g = slices.logslope.len();
-        let p_total = slices.total;
-
-        type Acc = (f64, Array1<f64>, Array2<f64>);
-
-        let make_acc = || -> Acc {
-            (0.0, Array1::zeros(p_total), Array2::zeros((p_total, p_total)))
-        };
-
-        let (ll, joint_gradient, joint_hessian) = (0..self.n)
-            .into_par_iter()
-            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                let (row_nll, f_pi, f_pipi) = self
-                    .compute_row_flex_primary_gradient_hessian_exact(
-                        row,
-                        block_states,
-                        &q_geom,
-                        &primary,
-                    )?;
-                acc.0 -= row_nll;
-
-                // -- Gradient pullback ------------------------------------
-                let q_indices = [primary.q0, primary.q1, primary.qd1];
-                let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
-                let dq_marginal = [
-                    &q_geom.dq0_marginal,
-                    &q_geom.dq1_marginal,
-                    &q_geom.dqd1_marginal,
-                ];
-
-                for (ui, &qi) in q_indices.iter().enumerate() {
-                    for a in 0..p_t {
-                        acc.1[slices.time.start + a] -= f_pi[qi] * dq_time[ui][a];
-                    }
-                }
-                for (ui, &qi) in q_indices.iter().enumerate() {
-                    for a in 0..p_m {
-                        acc.1[slices.marginal.start + a] -= f_pi[qi] * dq_marginal[ui][a];
-                    }
-                }
-                self.logslope_design
-                    .axpy_row_into(
-                        row,
-                        -f_pi[primary.g],
-                        &mut acc.1.slice_mut(s![slices.logslope.clone()]),
-                    )
-                    .expect("survival logslope block axpy");
-                if let Some(range_h) = primary.h.as_ref() {
-                    if let Some(block_h) = slices.score_warp.as_ref() {
-                        for local in 0..range_h.len() {
-                            acc.1[block_h.start + local] -= f_pi[range_h.start + local];
-                        }
-                    }
-                }
-                if let Some(range_w) = primary.w.as_ref() {
-                    if let Some(block_w) = slices.link_dev.as_ref() {
-                        for local in 0..range_w.len() {
-                            acc.1[block_w.start + local] -= f_pi[range_w.start + local];
-                        }
-                    }
-                }
-
-                // -- Hessian pullback: J^T f_pipi J + f_pi d^2pi/dbeta^2 -
-
-                let d2q_time_time = [
-                    &q_geom.d2q0_time_time,
-                    &q_geom.d2q1_time_time,
-                    &q_geom.d2qd1_time_time,
-                ];
-                let d2q_marginal_marginal = [
-                    &q_geom.d2q0_marginal_marginal,
-                    &q_geom.d2q1_marginal_marginal,
-                    &q_geom.d2qd1_marginal_marginal,
-                ];
-                let d2q_time_marginal = [
-                    &q_geom.d2q0_time_marginal,
-                    &q_geom.d2q1_time_marginal,
-                    &q_geom.d2qd1_time_marginal,
-                ];
-
-                // time-time block
-                for a in 0..p_t {
-                    for b in 0..p_t {
-                        let mut val = 0.0;
-                        for (ui, &qu) in q_indices.iter().enumerate() {
-                            for (vi, &qv) in q_indices.iter().enumerate() {
-                                val += f_pipi[[qu, qv]] * dq_time[ui][a] * dq_time[vi][b];
-                            }
-                            val += f_pi[qu] * d2q_time_time[ui][[a, b]];
-                        }
-                        acc.2[[slices.time.start + a, slices.time.start + b]] += val;
-                    }
-                }
-
-                // marginal-marginal block
-                for a in 0..p_m {
-                    for b in 0..p_m {
-                        let mut val = 0.0;
-                        for (ui, &qu) in q_indices.iter().enumerate() {
-                            for (vi, &qv) in q_indices.iter().enumerate() {
-                                val += f_pipi[[qu, qv]] * dq_marginal[ui][a] * dq_marginal[vi][b];
-                            }
-                            val += f_pi[qu] * d2q_marginal_marginal[ui][[a, b]];
-                        }
-                        acc.2[[slices.marginal.start + a, slices.marginal.start + b]] += val;
-                    }
-                }
-
-                // logslope-logslope block
-                self.logslope_design
-                    .syr_row_into_view(
-                        row,
-                        f_pipi[[primary.g, primary.g]],
-                        acc.2.slice_mut(s![
-                            slices.logslope.clone(),
-                            slices.logslope.clone()
-                        ]),
-                    )
-                    .expect("survival logslope block syr");
-
-                // score-score block
-                if let (Some(range_h), Some(block_h)) =
-                    (primary.h.as_ref(), slices.score_warp.as_ref())
-                {
-                    for a in 0..range_h.len() {
-                        for b in 0..range_h.len() {
-                            acc.2[[block_h.start + a, block_h.start + b]] +=
-                                f_pipi[[range_h.start + a, range_h.start + b]];
-                        }
-                    }
-                }
-
-                // link-link block
-                if let (Some(range_w), Some(block_w)) =
-                    (primary.w.as_ref(), slices.link_dev.as_ref())
-                {
-                    for a in 0..range_w.len() {
-                        for b in 0..range_w.len() {
-                            acc.2[[block_w.start + a, block_w.start + b]] +=
-                                f_pipi[[range_w.start + a, range_w.start + b]];
-                        }
-                    }
-                }
-
-                // -- Cross-block terms ------------------------------------
-
-                // time-marginal cross
-                for a in 0..p_t {
-                    for b in 0..p_m {
-                        let mut val = 0.0;
-                        for (ui, &qu) in q_indices.iter().enumerate() {
-                            for (vi, &qv) in q_indices.iter().enumerate() {
-                                val += f_pipi[[qu, qv]] * dq_time[ui][a] * dq_marginal[vi][b];
-                            }
-                            val += f_pi[qu] * d2q_time_marginal[ui][[a, b]];
-                        }
-                        acc.2[[slices.time.start + a, slices.marginal.start + b]] += val;
-                        acc.2[[slices.marginal.start + b, slices.time.start + a]] += val;
-                    }
-                }
-
-                // time-logslope cross
-                {
-                    let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
-                    let logslope_row = logslope_chunk.row(0);
-                    for a in 0..p_t {
-                        let mut weight = 0.0;
-                        for (ui, &qu) in q_indices.iter().enumerate() {
-                            weight += f_pipi[[qu, primary.g]] * dq_time[ui][a];
-                        }
-                        for b in 0..p_g {
-                            let val = weight * logslope_row[b];
-                            acc.2[[slices.time.start + a, slices.logslope.start + b]] += val;
-                            acc.2[[slices.logslope.start + b, slices.time.start + a]] += val;
-                        }
-                    }
-
-                    // marginal-logslope cross
-                    for a in 0..p_m {
-                        let mut weight = 0.0;
-                        for (ui, &qu) in q_indices.iter().enumerate() {
-                            weight += f_pipi[[qu, primary.g]] * dq_marginal[ui][a];
-                        }
-                        for b in 0..p_g {
-                            let val = weight * logslope_row[b];
-                            acc.2[[slices.marginal.start + a, slices.logslope.start + b]] += val;
-                            acc.2[[slices.logslope.start + b, slices.marginal.start + a]] += val;
-                        }
-                    }
-                }
-
-                // time-score cross
-                if let (Some(range_h), Some(block_h)) =
-                    (primary.h.as_ref(), slices.score_warp.as_ref())
-                {
-                    for a in 0..p_t {
-                        for local in 0..range_h.len() {
-                            let mut val = 0.0;
-                            for (ui, &qu) in q_indices.iter().enumerate() {
-                                val += f_pipi[[qu, range_h.start + local]] * dq_time[ui][a];
-                            }
-                            acc.2[[slices.time.start + a, block_h.start + local]] += val;
-                            acc.2[[block_h.start + local, slices.time.start + a]] += val;
-                        }
-                    }
-                }
-
-                // time-link cross
-                if let (Some(range_w), Some(block_w)) =
-                    (primary.w.as_ref(), slices.link_dev.as_ref())
-                {
-                    for a in 0..p_t {
-                        for local in 0..range_w.len() {
-                            let mut val = 0.0;
-                            for (ui, &qu) in q_indices.iter().enumerate() {
-                                val += f_pipi[[qu, range_w.start + local]] * dq_time[ui][a];
-                            }
-                            acc.2[[slices.time.start + a, block_w.start + local]] += val;
-                            acc.2[[block_w.start + local, slices.time.start + a]] += val;
-                        }
-                    }
-                }
-
-                // marginal-score cross
-                if let (Some(range_h), Some(block_h)) =
-                    (primary.h.as_ref(), slices.score_warp.as_ref())
-                {
-                    for a in 0..p_m {
-                        for local in 0..range_h.len() {
-                            let mut val = 0.0;
-                            for (ui, &qu) in q_indices.iter().enumerate() {
-                                val += f_pipi[[qu, range_h.start + local]] * dq_marginal[ui][a];
-                            }
-                            acc.2[[slices.marginal.start + a, block_h.start + local]] += val;
-                            acc.2[[block_h.start + local, slices.marginal.start + a]] += val;
-                        }
-                    }
-                }
-
-                // marginal-link cross
-                if let (Some(range_w), Some(block_w)) =
-                    (primary.w.as_ref(), slices.link_dev.as_ref())
-                {
-                    for a in 0..p_m {
-                        for local in 0..range_w.len() {
-                            let mut val = 0.0;
-                            for (ui, &qu) in q_indices.iter().enumerate() {
-                                val += f_pipi[[qu, range_w.start + local]] * dq_marginal[ui][a];
-                            }
-                            acc.2[[slices.marginal.start + a, block_w.start + local]] += val;
-                            acc.2[[block_w.start + local, slices.marginal.start + a]] += val;
-                        }
-                    }
-                }
-
-                // logslope-score cross
-                if let (Some(range_h), Some(block_h)) =
-                    (primary.h.as_ref(), slices.score_warp.as_ref())
-                {
-                    let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
-                    let logslope_row = logslope_chunk.row(0);
-                    for local in 0..range_h.len() {
-                        let weight = f_pipi[[primary.g, range_h.start + local]];
-                        for b in 0..p_g {
-                            let val = weight * logslope_row[b];
-                            acc.2[[slices.logslope.start + b, block_h.start + local]] += val;
-                            acc.2[[block_h.start + local, slices.logslope.start + b]] += val;
-                        }
-                    }
-                }
-
-                // logslope-link cross
-                if let (Some(range_w), Some(block_w)) =
-                    (primary.w.as_ref(), slices.link_dev.as_ref())
-                {
-                    let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
-                    let logslope_row = logslope_chunk.row(0);
-                    for local in 0..range_w.len() {
-                        let weight = f_pipi[[primary.g, range_w.start + local]];
-                        for b in 0..p_g {
-                            let val = weight * logslope_row[b];
-                            acc.2[[slices.logslope.start + b, block_w.start + local]] += val;
-                            acc.2[[block_w.start + local, slices.logslope.start + b]] += val;
-                        }
-                    }
-                }
-
-                // score-link cross
-                if let (Some(range_h), Some(block_h), Some(range_w), Some(block_w)) = (
-                    primary.h.as_ref(),
-                    slices.score_warp.as_ref(),
-                    primary.w.as_ref(),
-                    slices.link_dev.as_ref(),
-                ) {
-                    for a in 0..range_h.len() {
-                        for b in 0..range_w.len() {
-                            let val = f_pipi[[range_h.start + a, range_w.start + b]];
-                            acc.2[[block_h.start + a, block_w.start + b]] += val;
-                            acc.2[[block_w.start + b, block_h.start + a]] += val;
-                        }
-                    }
-                }
-
-                Ok(acc)
-            })
-            .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
-                a.0 += b.0;
-                a.1 += &b.1;
-                a.2 += &b.2;
-                Ok(a)
-            })?;
-
-        // Slice the full joint Hessian into per-block working sets.
-        let mut block_gradients = vec![
-            joint_gradient.slice(s![slices.time.clone()]).to_owned(),
-            joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
-            joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
-        ];
-        let mut block_ranges = vec![
-            slices.time.clone(),
-            slices.marginal.clone(),
-            slices.logslope.clone(),
-        ];
-        if let Some(range) = slices.score_warp.clone() {
-            block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
-            block_ranges.push(range);
-        }
-        if let Some(range) = slices.link_dev.clone() {
-            block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
-            block_ranges.push(range);
-        }
-        Ok(FamilyEvaluation {
-            log_likelihood: ll,
-            blockworking_sets: slice_joint_into_block_working_sets(
-                block_gradients,
-                &joint_hessian,
-                &block_ranges,
-            ),
-        })
+        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+        self.evaluate_blockwise_exact_newton_dynamic_q_dense(
+            block_states,
+            &identity_blocks,
+            |row, q_geom| {
+                self.compute_row_flex_primary_gradient_hessian_exact(
+                    row,
+                    block_states,
+                    q_geom,
+                    &primary,
+                )
+            },
+        )
     }
 
     /// Blockwise exact-Newton for the time-wiggle model.
     ///
-    /// Same structural limitation as the flexible path: the time-wiggle
-    /// q-geometry (dynamic dq0/dtime, d²q0/dtime²) generates an
-    /// extended Jacobian that `add_pullback_primary_hessian` does not
-    /// yet cover.  Block Hessians are assembled independently until the
-    /// RowKernel<4> pullback is generalised to the time-wiggle Jacobian.
+    /// Builds the full joint Hessian over all parameter blocks (time,
+    /// marginal, logslope) using the pullback formula
+    /// `J^T f_pipi J + f_pi d²π/dβ²`, then slices into per-block
+    /// working sets via `slice_joint_into_block_working_sets`.
+    ///
+    /// The 4×4 primary space has indices 0=q0, 1=q1, 2=qd1, 3=g.
+    /// The q-geometry Jacobians map time/marginal coefficients into
+    /// the first three primary coordinates; the logslope design maps
+    /// into the fourth.  All cross-block terms (time-marginal,
+    /// time-logslope, marginal-logslope) are included.
     fn evaluate_blockwise_exact_newton_timewiggle_dense(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
-        let slices = block_slices(self, block_states);
-        let p_t = slices.time.len();
-        let p_m = slices.marginal.len();
-        let p_g = slices.logslope.len();
-
-        type Acc = (
-            f64,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            Array2<f64>,
-            Array2<f64>,
-            Array2<f64>,
-        );
-
-        let make_acc = || -> Acc {
-            (
-                0.0,
-                Array1::zeros(p_t),
-                Array1::zeros(p_m),
-                Array1::zeros(p_g),
-                Array2::zeros((p_t, p_t)),
-                Array2::zeros((p_m, p_m)),
-                Array2::zeros((p_g, p_g)),
-            )
-        };
-
-        let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope) =
-            (0..self.n)
-                .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    let (row_nll, f_pi, f_pipi) =
-                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                    acc.0 -= row_nll;
-
-                    acc.1 -= &(f_pi[0] * &q_geom.dq0_time
-                        + f_pi[1] * &q_geom.dq1_time
-                        + f_pi[2] * &q_geom.dqd1_time);
-                    if p_m > 0 {
-                        acc.2 -= &(f_pi[0] * &q_geom.dq0_marginal
-                            + f_pi[1] * &q_geom.dq1_marginal
-                            + f_pi[2] * &q_geom.dqd1_marginal);
-                    }
-                    self.logslope_design
-                        .axpy_row_into(row, -f_pi[3], &mut acc.3.view_mut())
-                        .expect("survival logslope block axpy should match block dimensions");
-
-                    for a in 0..p_t {
-                        for b in 0..p_t {
-                            acc.4[[a, b]] +=
-                                f_pipi[[0, 0]] * q_geom.dq0_time[a] * q_geom.dq0_time[b]
-                                    + f_pipi[[0, 1]] * q_geom.dq0_time[a] * q_geom.dq1_time[b]
-                                    + f_pipi[[0, 2]] * q_geom.dq0_time[a] * q_geom.dqd1_time[b]
-                                    + f_pipi[[1, 0]] * q_geom.dq1_time[a] * q_geom.dq0_time[b]
-                                    + f_pipi[[1, 1]] * q_geom.dq1_time[a] * q_geom.dq1_time[b]
-                                    + f_pipi[[1, 2]] * q_geom.dq1_time[a] * q_geom.dqd1_time[b]
-                                    + f_pipi[[2, 0]] * q_geom.dqd1_time[a] * q_geom.dq0_time[b]
-                                    + f_pipi[[2, 1]] * q_geom.dqd1_time[a] * q_geom.dq1_time[b]
-                                    + f_pipi[[2, 2]] * q_geom.dqd1_time[a] * q_geom.dqd1_time[b]
-                                    + f_pi[0] * q_geom.d2q0_time_time[[a, b]]
-                                    + f_pi[1] * q_geom.d2q1_time_time[[a, b]]
-                                    + f_pi[2] * q_geom.d2qd1_time_time[[a, b]];
-                        }
-                    }
-                    for a in 0..p_m {
-                        for b in 0..p_m {
-                            acc.5[[a, b]] += f_pipi[[0, 0]]
-                                * q_geom.dq0_marginal[a]
-                                * q_geom.dq0_marginal[b]
-                                + f_pipi[[0, 1]] * q_geom.dq0_marginal[a] * q_geom.dq1_marginal[b]
-                                + f_pipi[[0, 2]] * q_geom.dq0_marginal[a] * q_geom.dqd1_marginal[b]
-                                + f_pipi[[1, 0]] * q_geom.dq1_marginal[a] * q_geom.dq0_marginal[b]
-                                + f_pipi[[1, 1]] * q_geom.dq1_marginal[a] * q_geom.dq1_marginal[b]
-                                + f_pipi[[1, 2]] * q_geom.dq1_marginal[a] * q_geom.dqd1_marginal[b]
-                                + f_pipi[[2, 0]] * q_geom.dqd1_marginal[a] * q_geom.dq0_marginal[b]
-                                + f_pipi[[2, 1]] * q_geom.dqd1_marginal[a] * q_geom.dq1_marginal[b]
-                                + f_pipi[[2, 2]]
-                                    * q_geom.dqd1_marginal[a]
-                                    * q_geom.dqd1_marginal[b]
-                                + f_pi[0] * q_geom.d2q0_marginal_marginal[[a, b]]
-                                + f_pi[1] * q_geom.d2q1_marginal_marginal[[a, b]]
-                                + f_pi[2] * q_geom.d2qd1_marginal_marginal[[a, b]];
-                        }
-                    }
-                    self.logslope_design
-                        .syr_row_into(row, f_pipi[[3, 3]], &mut acc.6)
-                        .expect("survival logslope block syr should match block dimensions");
-
-                    Ok(acc)
-                })
-                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
-                    a.0 += b.0;
-                    a.1 += &b.1;
-                    a.2 += &b.2;
-                    a.3 += &b.3;
-                    a.4 += &b.4;
-                    a.5 += &b.5;
-                    a.6 += &b.6;
-                    Ok(a)
-                })?;
-
-        Ok(FamilyEvaluation {
-            log_likelihood: ll,
-            blockworking_sets: {
-                let slices = block_slices(self, block_states);
-                let mut sets = vec![
-                    BlockWorkingSet::ExactNewton {
-                        gradient: grad_time,
-                        hessian: SymmetricMatrix::Dense(hess_time),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: grad_marginal,
-                        hessian: SymmetricMatrix::Dense(hess_marginal),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: grad_logslope,
-                        hessian: SymmetricMatrix::Dense(hess_logslope),
-                    },
-                ];
-                if let Some(range) = slices.score_warp.as_ref() {
-                    sets.push(BlockWorkingSet::ExactNewton {
-                        gradient: Array1::zeros(range.len()),
-                        hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
-                    });
-                }
-                if let Some(range) = slices.link_dev.as_ref() {
-                    sets.push(BlockWorkingSet::ExactNewton {
-                        gradient: Array1::zeros(range.len()),
-                        hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
-                    });
-                }
-                sets
-            },
-        })
+        self.evaluate_blockwise_exact_newton_dynamic_q_dense(
+            block_states,
+            &[],
+            |row, _| self.compute_row_primary_gradient_hessian_uncached(row, block_states),
+        )
     }
 
     fn evaluate_blockwise_exact_newton_mixed(
@@ -4804,16 +5386,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            // Flexible survival now has exact row value/gradient/Hessian, but
-            // the higher-order outer derivative hooks remain disabled.
-            return ExactOuterDerivativeOrder::Zeroth;
+        if self.flex_active() {
+            return ExactOuterDerivativeOrder::First;
         }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
         }
-        // Family-specific row-loop gate.
+        // Family-specific row-loop gate for the rigid/timewiggle primary size.
         let n = self.n as u64;
         let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
         let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
@@ -4827,8 +5407,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
-        // Flexible survival does not yet expose the exact psi workspace path.
-        !(self.flex_timewiggle_active() || self.flex_active())
+        true
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -4836,7 +5415,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        if self.flex_active() {
+        let flex_active = self.effective_flex_active(block_states)?;
+        if flex_active {
             self.validate_exact_monotonicity(block_states)?;
             let mut ll = 0.0;
             for i in 0..self.n {
@@ -4870,27 +5450,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            if block_states.len() == usize::MAX {
-                return Err("unreachable survival hessian state".to_string());
-            }
-            return Ok(None);
-        }
-        let slices = block_slices(self, block_states);
-        if slices.total >= 512 {
-            return Ok(None);
-        }
-        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-        let cache = build_row_kernel_cache(&kern)?;
-        Ok(Some(crate::families::row_kernel::row_kernel_hessian_dense(
-            &kern, &cache,
-        )))
+        Ok(Some(self.evaluate_exact_newton_joint_dense(block_states)?.2))
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            return false;
-        }
         true
     }
 
@@ -4899,14 +5462,16 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            if block_states.len() == usize::MAX {
-                return Err("unreachable survival workspace state".to_string());
-            }
-            return Ok(None);
+        if !self.flex_active() && !self.flex_timewiggle_active() {
+            let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+            return Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)));
         }
-        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
-        Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)))
+        Ok(Some(Arc::new(
+            SurvivalMarginalSlopeExactNewtonJointHessianWorkspace::new(
+                self.clone(),
+                block_states.to_vec(),
+            )?,
+        )))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -4914,11 +5479,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            if block_states.len() == usize::MAX || d_beta_flat.len() == usize::MAX {
-                return Err("unreachable survival directional state".to_string());
-            }
-            return Ok(None);
+        if self.flex_active() || self.flex_timewiggle_active() {
+            return self
+                .exact_newton_joint_hessian_directional_derivative_fd(block_states, d_beta_flat)
+                .map(Some);
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
@@ -4931,14 +5495,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            if block_states.len() == usize::MAX
-                || d_beta_u_flat.len() == usize::MAX
-                || d_beta_v_flat.len() == usize::MAX
-            {
-                return Err("unreachable survival second directional state".to_string());
-            }
-            return Ok(None);
+        if self.flex_active() || self.flex_timewiggle_active() {
+            return self
+                .exact_newton_joint_hessiansecond_directional_derivative_fd(
+                    block_states,
+                    d_beta_u_flat,
+                    d_beta_v_flat,
+                )
+                .map(Some);
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
         let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
@@ -4954,15 +5518,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            if block_states.len() == usize::MAX
-                || derivative_blocks.len() == usize::MAX
-                || psi_index == usize::MAX
-            {
-                return Err("unreachable survival psi state".to_string());
-            }
-            return Ok(None);
-        }
         self.psi_terms(block_states, derivative_blocks, psi_index)
     }
 
@@ -4974,16 +5529,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            if block_states.len() == usize::MAX
-                || derivative_blocks.len() == usize::MAX
-                || psi_i == usize::MAX
-                || psi_j == usize::MAX
-            {
-                return Err("unreachable survival psi second-order state".to_string());
-            }
-            return Ok(None);
-        }
         self.psi_second_order_terms(block_states, derivative_blocks, psi_i, psi_j)
     }
 
@@ -4995,16 +5540,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            if block_states.len() == usize::MAX
-                || derivative_blocks.len() == usize::MAX
-                || psi_index == usize::MAX
-                || d_beta_flat.len() == usize::MAX
-            {
-                return Err("unreachable survival psi directional state".to_string());
-            }
-            return Ok(None);
-        }
         self.psi_hessian_directional_derivative(
             block_states,
             derivative_blocks,
@@ -5019,12 +5554,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        if self.flex_timewiggle_active() || self.flex_active() {
-            if block_states.len() == usize::MAX || derivative_blocks.len() == usize::MAX {
-                return Err("unreachable survival psi workspace state".to_string());
-            }
-            return Ok(None);
-        }
         Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),

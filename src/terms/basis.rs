@@ -9535,7 +9535,17 @@ fn duchon_radial_jets(
         out.phi_r, out.phi_rr, phi_rrr, phi_rrrr, r_eval, d,
     );
 
-    if r < r_floor {
+    // Smoothness check: the collision Taylor expansion requires analytic
+    // collision limits (t(0) = φ''''(0)/3, etc.) which only exist when the
+    // kernel is sufficiently smooth at the origin: 2(p+s) > d + 2j.
+    // For the borderline case (2(p+s) == d+4), φ''''(0) diverges
+    // logarithmically and the Taylor carrier cannot represent t(r) accurately.
+    // In that regime, keep the generic-path values at r_eval = r_floor.
+    let smoothness_order = 2 * (p_order + s_order);
+    let collision_t_exists = smoothness_order > k_dim + 4;
+    let collision_t_rr_exists = smoothness_order > k_dim + 6;
+
+    if r < r_floor && collision_t_exists {
         // When r is below the derivative evaluation floor the generic formulas
         // were evaluated at the clamped r_eval = r_floor, not at the true r.
         // Rather than trusting those surrogate values we switch entirely to the
@@ -9561,8 +9571,13 @@ fn duchon_radial_jets(
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
         let analytic_t_collision =
             duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 3.0;
-        let analytic_t_rr_collision =
-            duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 15.0;
+        let analytic_t_rr_collision = if collision_t_rr_exists {
+            duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 15.0
+        } else {
+            // t_rr(0) does not exist as a finite limit for this smoothness
+            // order.  Use the generic-path value at r_floor instead.
+            out.t_rr
+        };
         let collision_limit_disagrees = |analytic: f64, nearby: f64| {
             !analytic.is_finite()
                 || !nearby.is_finite()

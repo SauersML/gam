@@ -45,11 +45,12 @@ pub fn fit_latent_survival_terms(
     data: ArrayView2<'_, f64>,
     rows: Vec<LatentSurvivalRow>,
     weights: Array1<f64>,
+    offset: Array1<f64>,
     spec: TermCollectionSpec,
     frailty: FrailtySpec,
     options: &BlockwiseFitOptions,
 ) -> Result<LatentSurvivalTermFitResult, String> {
-    let latent_sd = validate_latent_survival_inputs(data, &rows, &weights, &frailty)?;
+    let latent_sd = validate_latent_survival_inputs(data, &rows, &weights, &offset, &frailty)?;
     let design = build_term_collection_design(data, &spec).map_err(|e| e.to_string())?;
     let resolvedspec =
         freeze_term_collection_from_design(&spec, &design).map_err(|e| e.to_string())?;
@@ -59,7 +60,7 @@ pub fn fit_latent_survival_terms(
         latent_sd,
         quadctx: Arc::new(QuadratureContext::new()),
     };
-    let block = build_eta_blockspec(&design, data.nrows());
+    let block = build_eta_blockspec(&design, offset);
     let fit = fit_custom_family(&family, &[block], options).map_err(|e| e.to_string())?;
     Ok(LatentSurvivalTermFitResult {
         fit,
@@ -72,17 +73,20 @@ fn validate_latent_survival_inputs(
     data: ArrayView2<'_, f64>,
     rows: &[LatentSurvivalRow],
     weights: &Array1<f64>,
+    offset: &Array1<f64>,
     frailty: &FrailtySpec,
 ) -> Result<f64, String> {
     if data.nrows() == 0 {
         return Err("latent-survival requires a non-empty dataset".to_string());
     }
-    if rows.len() != data.nrows() || weights.len() != data.nrows() {
+    if rows.len() != data.nrows() || weights.len() != data.nrows() || offset.len() != data.nrows()
+    {
         return Err(format!(
-            "latent-survival size mismatch: data has {} rows, rows has {}, weights has {}",
+            "latent-survival size mismatch: data has {} rows, rows has {}, weights has {}, offset has {}",
             data.nrows(),
             rows.len(),
-            weights.len()
+            weights.len(),
+            offset.len()
         ));
     }
     match frailty {
@@ -114,11 +118,11 @@ fn validate_latent_survival_inputs(
     }
 }
 
-fn build_eta_blockspec(design: &TermCollectionDesign, n_rows: usize) -> ParameterBlockSpec {
+fn build_eta_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "eta".to_string(),
         design: design.design.clone(),
-        offset: Array1::zeros(n_rows),
+        offset,
         penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: Array1::zeros(design.penalties.len()),
