@@ -940,7 +940,7 @@ fn compose_theta_from_hints(
     theta
 }
 
-fn solve_penalizedweighted_projection(
+pub(crate) fn solve_penalizedweighted_projection(
     design: &DesignMatrix,
     offset: &Array1<f64>,
     target_eta: &Array1<f64>,
