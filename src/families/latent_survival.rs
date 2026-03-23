@@ -217,6 +217,36 @@ impl CustomFamily for LatentSurvivalFamily {
 
         Ok(ll)
     }
+
+    fn diagonalworking_weights_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block: usize,
+        d_eta: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        if block != 0 {
+            return Ok(None);
+        }
+        let state = expect_single_block(block_states, "LatentSurvivalFamily")?;
+        let eta = &state.eta;
+        let n = self.rows.len();
+        let sigma = self.latent_sd;
+        let mut dw = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            if self.weights[i] == 0.0 {
+                continue;
+            }
+            let jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &self.rows[i], eta[i], sigma)
+                .map_err(|e| format!("LatentSurvivalFamily dW row {i}: {e}"))?;
+            // w_i = prior_weight_i * neg_hessian_i
+            // dw_i/d(eta_i) = prior_weight_i * d(neg_hessian_i)/d(eta_i)
+            // neg_hessian = -d²ℓ/dμ², so d(neg_hessian)/dμ = -d³ℓ/dμ³ = -d3
+            if jet.neg_hessian > 0.0 {
+                dw[i] = self.weights[i] * (-jet.d3) * d_eta[i];
+            }
+        }
+        Ok(Some(dw))
+    }
 }
 
 // ─── Learnable-σ variant ─────────────────────────────────────────────────────

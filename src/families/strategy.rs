@@ -334,7 +334,8 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | LikelihoodFamily::BinomialMixture => Ok(NoiseModel::Bernoulli),
             LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
             LikelihoodFamily::GammaLog => {
-                // Default shape=1 (exponential) when not specified.
+                // Callers should pass the fitted Gamma shape; default to 1 only
+                // when older metadata does not expose it.
                 Ok(NoiseModel::Gamma {
                     shape: gaussian_scale.unwrap_or(1.0).max(1e-6),
                 })

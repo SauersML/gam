@@ -4187,7 +4187,7 @@ pub enum PirlsStatus {
 ///    - Gaussian identity: weighted residual sum of squares.
 ///    - Binomial families: binomial deviance.
 ///    - Poisson log: Poisson deviance.
-///    - Gamma log: Gamma unit deviance for the fixed shape-1 model.
+///    - Gamma log: Gamma unit deviance scaled by the fitted Gamma shape.
 /// * `finalweights`: The final Hessian-side working weights at convergence.
 /// * `solveweights`: The final score-side Fisher weights used in
 ///   `X'W(z-eta) - S beta`.
@@ -8063,6 +8063,76 @@ mod tests {
             assert_relative_eq!(c_obs[i], -expected_w, epsilon = 1e-12, max_relative = 1e-12);
             assert_relative_eq!(d_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
         }
+    }
+
+    #[test]
+    fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
+        let x = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
+        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+        let w = Array1::ones(y.len());
+        let offset = Array1::zeros(y.len());
+        let rho = array![0.0];
+        let rs = vec![array![[0.0]]];
+        let canonical: Vec<crate::construction::CanonicalPenalty> = rs
+            .iter()
+            .map(|r| {
+                let local = r.t().dot(r);
+                crate::construction::CanonicalPenalty {
+                    root: r.clone(),
+                    col_range: 0..r.ncols(),
+                    total_dim: r.ncols(),
+                    nullity: 0,
+                    local,
+                    positive_eigenvalues: Vec::new(),
+                }
+            })
+            .collect();
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GammaLog),
+            link_kind: InverseLink::Standard(LinkFunction::Log),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+        };
+
+        let (result, _) = fit_model_for_fixed_rho(
+            LogSmoothingParamsView::new(rho.view()),
+            PirlsProblem {
+                x: x.view(),
+                offset: offset.view(),
+                y: y.view(),
+                priorweights: w.view(),
+                covariate_se: None,
+            },
+            PenaltyConfig {
+                canonical_penalties: &canonical,
+                balanced_penalty_root: None,
+                reparam_invariant: None,
+                p: 1,
+                coefficient_lower_bounds: None,
+                linear_constraints_original: None,
+                penalty_shrinkage_floor: None,
+                kronecker_factored: None,
+            },
+            &config,
+            None,
+        )
+        .expect("gamma PIRLS fit");
+
+        let fitted_shape = result
+            .likelihood
+            .gamma_shape()
+            .expect("gamma fit should expose fitted shape");
+        let profiled_shape =
+            super::estimate_gamma_shape_from_eta(y.view(), &result.final_eta, w.view());
+
+        assert!(fitted_shape > 1.0, "shape should not stay fixed at one");
+        assert_relative_eq!(
+            fitted_shape,
+            profiled_shape,
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
     }
 
     #[test]

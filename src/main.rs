@@ -5866,7 +5866,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     coefficient_lower_bounds: None,
                     linear_constraints: None,
                 };
-                let (summary, beta, state) = if likelihood_mode == SurvivalLikelihoodMode::Weibull {
+                let state = if likelihood_mode == SurvivalLikelihoodMode::Weibull {
                     let summary = gam::pirls::runworking_model_pirls(
                         &mut model,
                         gam::types::Coefficients::new(beta0.clone()),
@@ -5880,7 +5880,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                             "failed to evaluate survival optimum in coefficient coordinates: {e}"
                         )
                     })?;
-                    (summary, beta, state)
+                    state
                 } else {
                     let constrained_opts = gam::pirls::WorkingModelPirlsOptions {
                         coefficient_lower_bounds: structural_lower_bounds,
@@ -5897,10 +5897,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     let state = model.update_state(&beta).map_err(|e| {
                         format!("failed to evaluate structural survival optimum in spline coordinates: {e}")
                     })?;
-                    (summary, beta, state)
+                    state
                 };
-                drop(summary);
-                drop(beta);
                 Ok(survival_working_reml_score(&state))
             },
         )?;

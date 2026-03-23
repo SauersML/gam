@@ -796,10 +796,6 @@ impl RemlConfig {
         self.link_kind.link_function()
     }
 
-    fn likelihood(&self) -> GlmLikelihoodSpec {
-        self.likelihood
-    }
-
     fn as_pirls_config(&self) -> pirls::PirlsConfig {
         pirls::PirlsConfig {
             likelihood: self.likelihood,
