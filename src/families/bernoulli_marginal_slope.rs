@@ -23,10 +23,10 @@ use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_joint,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
+    TermCollectionSpec, build_term_collection_designs_joint, freeze_term_collection_from_design,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};

@@ -1448,6 +1448,16 @@ fn run_fit_bernoulli_marginal_slope(
 
     if let Some(out) = args.out.as_ref() {
         progress.set_stage("fit", "writing bernoulli marginal-slope model");
+        // Bake learned sigma into the frailty spec for the saved model.
+        let save_frailty = match (&frailty, solved.gaussian_frailty_sd) {
+            (
+                gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
+                Some(learned),
+            ) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+                sigma_fixed: Some(learned),
+            },
+            _ => frailty,
+        };
         let mut model = build_bernoulli_marginal_slope_saved_model(
             formula_text.to_string(),
             ds.schema.clone(),
@@ -1461,7 +1471,7 @@ fn run_fit_bernoulli_marginal_slope(
             solved.baseline_logslope,
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
-            frailty,
+            save_frailty,
         );
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
@@ -6023,6 +6033,18 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         progress.advance_workflow(3);
         if let Some(out) = args.out {
             progress.set_stage("fit", "writing survival marginal-slope model");
+            // Bake learned sigma into the frailty spec for the saved model.
+            let save_frailty = match (&frailty, fit.gaussian_frailty_sd) {
+                (
+                    gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+                        sigma_fixed: None,
+                    },
+                    Some(learned),
+                ) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+                    sigma_fixed: Some(learned),
+                },
+                _ => frailty,
+            };
             let mut payload = FittedModelPayload::new(
                 MODEL_VERSION,
                 formula,
@@ -6033,7 +6055,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
                     survival_distribution: Some("probit".to_string()),
-                    frailty: frailty,
+                    frailty: save_frailty,
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             );
@@ -8963,8 +8985,8 @@ fn fixed_gaussian_shift_frailty_from_spec(
                 sigma_fixed: Some(*sigma),
             },
         ),
-        gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None } => Err(
-            format!("{context} currently requires a fixed GaussianShift sigma"),
+        gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None } => Ok(
+            gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
         ),
         gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. } => Err(format!(
             "{context} requires --frailty-kind gaussian-shift or no frailty"
