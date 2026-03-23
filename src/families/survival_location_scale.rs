@@ -11034,10 +11034,15 @@ mod tests {
                 .zip(eta_ls.iter())
                 .map(|(&t, &ls)| -t * exp_sigma_inverse_from_eta_scalar(ls)),
         );
-        let link_wiggle_degree = 2usize;
-        let link_wiggle_knots =
-            crate::families::gamlss::initializewiggle_knots_from_seed(q0.view(), 2, 1)
-                .expect("link wiggle knots");
+        let link_wiggle_degree = fit
+            .artifacts
+            .survival_link_wiggle_degree
+            .expect("fit wiggle degree");
+        let link_wiggle_knots = fit
+            .artifacts
+            .survival_link_wiggle_knots
+            .clone()
+            .expect("fit wiggle knots");
         let xwiggle_dense = survival_wiggle_basis_with_options(
             q0.view(),
             &link_wiggle_knots,
@@ -11294,10 +11299,15 @@ mod tests {
                 .zip(eta_ls.iter())
                 .map(|(&t, &ls)| -t * exp_sigma_inverse_from_eta_scalar(ls)),
         );
-        let link_wiggle_degree = 2usize;
-        let link_wiggle_knots =
-            crate::families::gamlss::initializewiggle_knots_from_seed(q0.view(), 2, 1)
-                .expect("link wiggle knots");
+        let link_wiggle_degree = fit
+            .artifacts
+            .survival_link_wiggle_degree
+            .expect("fit wiggle degree");
+        let link_wiggle_knots = fit
+            .artifacts
+            .survival_link_wiggle_knots
+            .clone()
+            .expect("fit wiggle knots");
         let x_link_wiggle = survival_wiggle_basis_with_options(
             q0.view(),
             &link_wiggle_knots,

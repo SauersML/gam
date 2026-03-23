@@ -802,11 +802,11 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
 
 use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
-    SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeWiggleBuild,
-    append_zero_tail_columns, build_survival_baseline_offsets, build_survival_time_basis,
+    SurvivalBaselineTarget, SurvivalLikelihoodMode, append_zero_tail_columns,
+    build_survival_baseline_offsets, build_survival_time_basis,
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
     normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config, survival_baseline_targetname,
 };
 use crate::families::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, TimeBlockInput, TimeWiggleBlockInput,
@@ -1249,7 +1249,6 @@ fn materialize_survival<'a>(
         age_exit[i] = x;
     }
 
-    // Parse survival config
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
     if matches!(
         survival_mode,
@@ -1261,12 +1260,13 @@ fn materialize_survival<'a>(
             config.survival_likelihood
         ));
     }
-    let baseline_cfg = parse_survival_baseline_config(
+    let baseline_cfg = initial_survival_baseline_config_for_fit(
         &config.baseline_target,
         config.baseline_scale,
         config.baseline_shape,
         config.baseline_rate,
         config.baseline_makeham,
+        &age_exit,
     )?;
     let time_cfg = parse_survival_time_basis_config(
         &config.time_basis,
@@ -1283,11 +1283,6 @@ fn materialize_survival<'a>(
         Some((config.time_num_internal_knots, config.time_smooth_lambda)),
     )?;
 
-    // Build baseline offsets
-    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
-        build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
-
-    // Time wiggles
     let effective_timewiggle = parsed.timewiggle.clone();
     if effective_timewiggle.is_some() && baseline_cfg.target == SurvivalBaselineTarget::Linear {
         return Err(
@@ -1296,60 +1291,28 @@ fn materialize_survival<'a>(
                 .to_string(),
         );
     }
-    let mut time_design_entry = time_build.x_entry_time.clone();
-    let mut time_design_exit = time_build.x_exit_time.clone();
-    let mut time_design_derivative = time_build.x_derivative_time.clone();
-    let mut time_penalties = time_build.penalties.clone();
-    let mut time_nullspace_dims = time_build.nullspace_dims.clone();
-    let mut timewiggle_build: Option<SurvivalTimeWiggleBuild> = None;
-    let mut timewiggle_block: Option<TimeWiggleBlockInput> = None;
 
-    if let Some(tw_cfg) = effective_timewiggle.as_ref() {
-        let tw = build_survival_timewiggle_from_baseline(
-            &eta_offset_entry,
-            &eta_offset_exit,
-            &derivative_offset_exit,
-            tw_cfg,
-        )?;
-        let p_base = time_design_exit.ncols();
-        append_zero_tail_columns(
-            &mut time_design_entry,
-            &mut time_design_exit,
-            &mut time_design_derivative,
-            tw.ncols,
-        );
-        for (idx, p) in tw.penalties.iter().enumerate() {
-            let mut embedded = Array2::<f64>::zeros((p_base + tw.ncols, p_base + tw.ncols));
-            embedded
-                .slice_mut(s![p_base..p_base + tw.ncols, p_base..p_base + tw.ncols])
-                .assign(p);
-            time_penalties.push(embedded);
-            time_nullspace_dims.push(tw.nullspace_dims.get(idx).copied().unwrap_or(0));
-        }
-        timewiggle_block = Some(TimeWiggleBlockInput {
-            knots: tw.knots.clone(),
-            degree: tw.degree,
-            ncols: tw.ncols,
-        });
-        timewiggle_build = Some(tw);
-    }
-
-    // Build covariate spec
     let mut termspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
     if config.scale_dimensions {
         enable_scale_dimensions(&mut termspec);
     }
 
-    // Resolve survival link
     let residual_dist = parse_survival_distribution(&config.survival_distribution)?;
     let survival_inverse_link = residual_distribution_inverse_link(residual_dist);
-
-    // Link wiggle config
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
+    let effective_linkwiggle_cfg = effective_linkwiggle.clone().map(|cfg| LinkWiggleConfig {
+        degree: cfg.degree,
+        num_internal_knots: cfg.num_internal_knots,
+        penalty_orders: cfg.penalty_orders,
+        double_penalty: cfg.double_penalty,
+    });
 
-    // Time-varying covariate templates
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let threshold_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
+    let log_sigma_offset =
+        resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
     let threshold_template = if let Some(k) = config.threshold_time_k {
         build_time_varying_survival_covariate_template(
             &age_entry,
@@ -1372,8 +1335,6 @@ fn materialize_survival<'a>(
     } else {
         SurvivalCovariateTermBlockTemplate::Static
     };
-
-    // Build the noise spec for location-scale
     let log_sigmaspec = if let Some(noise) = config.noise_formula.as_deref() {
         let noise_parsed = parse_formula(&format!("{} ~ {noise}", parsed.response))?;
         build_termspec(&noise_parsed.terms, data, col_map, &mut inference_notes)?
@@ -1384,205 +1345,237 @@ fn materialize_survival<'a>(
             smooth_terms: vec![],
         }
     };
-
-    // Initial time lambdas
-    let time_initial_log_lambdas = if !time_penalties.is_empty() {
-        Some(Array1::from_elem(
-            time_penalties.len(),
-            config.time_smooth_lambda.ln(),
-        ))
+    let marginal_z = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        let z_col_name = config
+            .z_column
+            .as_deref()
+            .ok_or_else(|| "marginal-slope survival requires z_column in FitConfig".to_string())?;
+        let z_idx = *col_map
+            .get(z_col_name)
+            .ok_or_else(|| format!("z column '{z_col_name}' not found"))?;
+        Some(data.values.column(z_idx).to_owned())
+    } else {
+        None
+    };
+    let marginal_logslopespec = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        if let Some(ls_formula) = config.logslope_formula.as_deref() {
+            let ls_parsed = parse_formula(&format!("{} ~ {ls_formula}", parsed.response))?;
+            Some(build_termspec(
+                &ls_parsed.terms,
+                data,
+                col_map,
+                &mut inference_notes,
+            )?)
+        } else {
+            Some(termspec.clone())
+        }
     } else {
         None
     };
 
-    // Assemble the time block (shared between LocationScale and MarginalSlope)
-    let time_p =
-        time_build.x_exit_time.ncols() + timewiggle_build.as_ref().map_or(0, |tw| tw.ncols);
-    let time_block = TimeBlockInput {
-        design_entry: time_design_entry,
-        design_exit: time_design_exit,
-        design_derivative_exit: time_design_derivative.clone(),
-        offset_entry: eta_offset_entry,
-        offset_exit: eta_offset_exit,
-        derivative_offset_exit: derivative_offset_exit.clone(),
-        structural_monotonicity: true,
-        penalties: time_penalties,
-        nullspace_dims: time_nullspace_dims,
-        initial_log_lambdas: time_initial_log_lambdas,
-        initial_beta: Some(Array1::from_elem(time_p, 1e-4)),
-    };
-
-    let kappa_options = SpatialLengthScaleOptimizationOptions::default();
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
-    let threshold_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
-    let log_sigma_offset =
-        resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
-
     match survival_mode {
-        SurvivalLikelihoodMode::LocationScale => {
-            if config.frailty.is_some() {
-                return Err(
-                    "config.frailty is not implemented for survival-likelihood=location-scale"
-                        .to_string(),
-                );
-            }
+        SurvivalLikelihoodMode::LocationScale if config.frailty.is_some() => {
+            return Err(
+                "config.frailty is not implemented for survival-likelihood=location-scale"
+                    .to_string(),
+            );
+        }
+        SurvivalLikelihoodMode::MarginalSlope if effective_timewiggle.is_some() => {
+            return Err(
+                "timewiggle is only implemented for survival-likelihood=location-scale in the exact dynamic path"
+                    .to_string(),
+            );
+        }
+        SurvivalLikelihoodMode::Latent if effective_timewiggle.is_some() => {
+            return Err("timewiggle is not implemented for survival-likelihood=latent".to_string());
+        }
+        _ => {}
+    }
+
+    let build_time_block =
+        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+            let prepared = prepare_workflow_survival_time_stack(
+                &age_entry,
+                &age_exit,
+                candidate,
+                &time_build,
+                effective_timewiggle.as_ref(),
+            )?;
+            let time_p = prepared.time_design_exit.ncols();
+            let time_initial_log_lambdas = if prepared.time_penalties.is_empty() {
+                None
+            } else {
+                Some(Array1::from_elem(
+                    prepared.time_penalties.len(),
+                    config.time_smooth_lambda.ln(),
+                ))
+            };
+            let time_block = TimeBlockInput {
+                design_entry: prepared.time_design_entry.clone(),
+                design_exit: prepared.time_design_exit.clone(),
+                design_derivative_exit: prepared.time_design_derivative.clone(),
+                offset_entry: prepared.eta_offset_entry.clone(),
+                offset_exit: prepared.eta_offset_exit.clone(),
+                derivative_offset_exit: prepared.derivative_offset_exit.clone(),
+                structural_monotonicity: true,
+                penalties: prepared.time_penalties.clone(),
+                nullspace_dims: prepared.time_nullspace_dims.clone(),
+                initial_log_lambdas: time_initial_log_lambdas,
+                initial_beta: Some(Array1::from_elem(time_p, 1e-4)),
+            };
+            Ok::<_, String>((prepared, time_block))
+        };
+
+    let build_location_scale_request =
+        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+            let (prepared, time_block) = build_time_block(candidate)?;
             let spec = SurvivalLocationScaleTermSpec {
                 age_entry: age_entry.clone(),
                 age_exit: age_exit.clone(),
-                event_target: event,
+                event_target: event.clone(),
                 weights: weights.clone(),
-                inverse_link: survival_inverse_link,
+                inverse_link: survival_inverse_link.clone(),
                 derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
                 max_iter: 200,
                 tol: 1e-7,
                 time_block,
-                thresholdspec: termspec,
-                log_sigmaspec,
-                threshold_offset,
-                log_sigma_offset,
-                threshold_template,
-                log_sigma_template,
-                timewiggle_block,
+                thresholdspec: termspec.clone(),
+                log_sigmaspec: log_sigmaspec.clone(),
+                threshold_offset: threshold_offset.clone(),
+                log_sigma_offset: log_sigma_offset.clone(),
+                threshold_template: threshold_template.clone(),
+                log_sigma_template: log_sigma_template.clone(),
+                timewiggle_block: prepared.timewiggle_block,
                 linkwiggle_block: None,
             };
-
             let optimize_inverse_link =
                 survival_inverse_link_has_free_parameters(&spec.inverse_link);
-
-            Ok(MaterializedModel {
-                request: FitRequest::SurvivalLocationScale(SurvivalLocationScaleFitRequest {
-                    data: data.values.view(),
-                    spec,
-                    wiggle: effective_linkwiggle.map(|cfg| LinkWiggleConfig {
-                        degree: cfg.degree,
-                        num_internal_knots: cfg.num_internal_knots,
-                        penalty_orders: cfg.penalty_orders,
-                        double_penalty: cfg.double_penalty,
-                    }),
-                    kappa_options,
-                    optimize_inverse_link,
-                }),
-                inference_notes,
+            Ok::<_, String>(SurvivalLocationScaleFitRequest {
+                data: data.values.view(),
+                spec,
+                wiggle: effective_linkwiggle_cfg.clone(),
+                kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+                optimize_inverse_link,
             })
-        }
-        SurvivalLikelihoodMode::MarginalSlope => {
-            if timewiggle_build.is_some() {
-                return Err(
-                    "timewiggle is only implemented for survival-likelihood=location-scale in the exact dynamic path"
-                        .to_string(),
-                );
-            }
-            let z_col_name = config.z_column.as_deref().ok_or_else(|| {
-                "marginal-slope survival requires z_column in FitConfig".to_string()
-            })?;
-            let z_idx = *col_map
-                .get(z_col_name)
-                .ok_or_else(|| format!("z column '{z_col_name}' not found"))?;
-            let z = data.values.column(z_idx).to_owned();
-            let marginalspec = termspec.clone();
-            let logslopespec = if let Some(ls_formula) = config.logslope_formula.as_deref() {
-                let ls_parsed = parse_formula(&format!("{} ~ {ls_formula}", parsed.response))?;
-                build_termspec(&ls_parsed.terms, data, col_map, &mut inference_notes)?
-            } else {
-                termspec
-            };
-            let spec = SurvivalMarginalSlopeTermSpec {
-                age_entry: age_entry.clone(),
-                age_exit: age_exit.clone(),
-                event_target: event,
-                weights: weights.clone(),
-                z,
-                marginalspec,
-                marginal_offset: threshold_offset,
-                frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
-                derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-                time_block,
-                timewiggle_block: None,
-                logslopespec,
-                logslope_offset: log_sigma_offset,
-                score_warp: None,
-                link_dev: None,
-            };
+        };
 
-            Ok(MaterializedModel {
-                request: FitRequest::SurvivalMarginalSlope(SurvivalMarginalSlopeFitRequest {
-                    data: data.values.view(),
-                    spec,
-                    options: BlockwiseFitOptions::default(),
-                    kappa_options,
-                }),
-                inference_notes,
+    let build_marginal_slope_request =
+        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+            let (_, time_block) = build_time_block(candidate)?;
+            Ok::<_, String>(SurvivalMarginalSlopeFitRequest {
+                data: data.values.view(),
+                spec: SurvivalMarginalSlopeTermSpec {
+                    age_entry: age_entry.clone(),
+                    age_exit: age_exit.clone(),
+                    event_target: event.clone(),
+                    weights: weights.clone(),
+                    z: marginal_z.clone().ok_or_else(|| {
+                        "marginal-slope survival requires z_column in FitConfig".to_string()
+                    })?,
+                    marginalspec: termspec.clone(),
+                    marginal_offset: threshold_offset.clone(),
+                    frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
+                    derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+                    time_block,
+                    timewiggle_block: None,
+                    logslopespec: marginal_logslopespec.clone().ok_or_else(|| {
+                        "marginal-slope survival is missing logslope spec".to_string()
+                    })?,
+                    logslope_offset: log_sigma_offset.clone(),
+                    score_warp: None,
+                    link_dev: None,
+                },
+                options: BlockwiseFitOptions::default(),
+                kappa_options: SpatialLengthScaleOptimizationOptions::default(),
             })
-        }
-        SurvivalLikelihoodMode::Latent => {
-            if timewiggle_build.is_some() {
-                return Err(
-                    "timewiggle is not implemented for survival-likelihood=latent".to_string(),
-                );
-            }
+        };
 
-            // Compile LatentSurvivalRow for each data row from the baseline offsets.
-            // eta_offset_entry[i] = log H_0(entry_i)
-            // eta_offset_exit[i]  = log H_0(exit_i)
-            // derivative_offset_exit[i] = d/dt [log H_0(t)]|_{t=exit_i}
-            let eta_off_entry = &time_block.offset_entry;
-            let eta_off_exit = &time_block.offset_exit;
-            let deriv_off_exit = &time_block.derivative_offset_exit;
-
+    let build_latent_survival_request =
+        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+            let (prepared, _) = build_time_block(candidate)?;
             let mut rows = Vec::with_capacity(n);
             for i in 0..n {
-                let h0_exit = eta_off_exit[i].exp();
-                let h0_entry = eta_off_entry[i].exp();
-                let mass_exit = h0_exit - h0_entry;
-                let mass_entry = 0.0;
-
-                let ev = event[i];
-                let event_type = if ev >= 0.5 {
+                let cumulative_mass_entry = prepared.eta_offset_entry[i].exp();
+                let cumulative_mass_exit = prepared.eta_offset_exit[i].exp();
+                let event_type = if event[i] >= 0.5 {
                     LatentSurvivalEventType::ExactEvent
                 } else {
                     LatentSurvivalEventType::RightCensored
                 };
-
-                // log baseline hazard at exact event time:
-                // h_0(t_i) = H_0(t_i) * derivative_offset_exit[i]
-                // log(h_0) = eta_offset_exit[i] + ln(derivative_offset_exit[i])
-                let log_baseline_hazard = if ev >= 0.5 {
-                    eta_off_exit[i] + deriv_off_exit[i].ln()
+                let log_baseline_hazard = if event[i] >= 0.5 {
+                    prepared.eta_offset_exit[i] + prepared.derivative_offset_exit[i].ln()
                 } else {
                     0.0
                 };
-
-                rows.push(LatentSurvivalRow {
+                rows.push(LatentSurvivalRow::from_full_loading_cumulative_mass(
                     event_type,
-                    mass_entry,
-                    mass_exit,
-                    mass_left: 0.0,
-                    mass_right: 0.0,
+                    cumulative_mass_entry,
+                    cumulative_mass_exit,
                     log_baseline_hazard,
-                    mass_unloaded_entry: 0.0,
-                    mass_unloaded_exit: 0.0,
-                    hazard_loaded: 0.0,
-                    hazard_unloaded: 0.0,
-                });
+                ));
             }
-
-            let frailty = config.frailty.clone().unwrap_or(FrailtySpec::None);
-
-            Ok(MaterializedModel {
-                request: FitRequest::LatentSurvival(LatentSurvivalFitRequest {
-                    data: data.values.view(),
-                    rows,
-                    weights,
-                    spec: termspec,
-                    frailty,
-                    options: BlockwiseFitOptions::default(),
-                }),
-                inference_notes,
+            Ok::<_, String>(LatentSurvivalFitRequest {
+                data: data.values.view(),
+                rows,
+                weights: weights.clone(),
+                spec: termspec.clone(),
+                frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
+                options: BlockwiseFitOptions::default(),
             })
+        };
+
+    let baseline_cfg = if baseline_cfg.target != SurvivalBaselineTarget::Linear {
+        optimize_survival_baseline_config(
+            &baseline_cfg,
+            "workflow survival baseline",
+            |candidate| match survival_mode {
+                SurvivalLikelihoodMode::LocationScale => Ok(fit_survival_location_scale_model(
+                    build_location_scale_request(candidate)?,
+                )
+                .map_err(|e| format!("survival location-scale fit failed: {e}"))?
+                .fit
+                .fit
+                .reml_score),
+                SurvivalLikelihoodMode::MarginalSlope => Ok(fit_survival_marginal_slope_model(
+                    build_marginal_slope_request(candidate)?,
+                )
+                .map_err(|e| format!("survival marginal-slope fit failed: {e}"))?
+                .fit
+                .reml_score),
+                SurvivalLikelihoodMode::Latent => Ok(fit_latent_survival_model(
+                    build_latent_survival_request(candidate)?,
+                )
+                .map_err(|e| format!("latent survival fit failed: {e}"))?
+                .fit
+                .reml_score),
+                SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+                    unreachable!()
+                }
+            },
+        )?
+    } else {
+        baseline_cfg
+    };
+
+    let request = match survival_mode {
+        SurvivalLikelihoodMode::LocationScale => {
+            FitRequest::SurvivalLocationScale(build_location_scale_request(&baseline_cfg)?)
         }
-        // Transformation and Weibull are rejected earlier in this function.
-        _ => unreachable!(),
-    }
+        SurvivalLikelihoodMode::MarginalSlope => {
+            FitRequest::SurvivalMarginalSlope(build_marginal_slope_request(&baseline_cfg)?)
+        }
+        SurvivalLikelihoodMode::Latent => {
+            FitRequest::LatentSurvival(build_latent_survival_request(&baseline_cfg)?)
+        }
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+            unreachable!()
+        }
+    };
+
+    Ok(MaterializedModel {
+        request,
+        inference_notes,
+    })
 }
 
 fn materialize_location_scale<'a>(

@@ -9557,12 +9557,29 @@ fn duchon_radial_jets(
         //   lap_rr(0) = (d + 2) t(0)
         //   t_r(0)    = 0
         //   t_rr(0)   = φ⁽⁶⁾(0) / 15
-        let (phi_rr, _, _) =
+        let (analytic_phi_rr, _, _) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
-        let t_collision =
+        let analytic_t_collision =
             duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 3.0;
-        let t_rr_collision =
+        let analytic_t_rr_collision =
             duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)? / 15.0;
+        let collision_limit_disagrees = |analytic: f64, nearby: f64| {
+            !analytic.is_finite()
+                || !nearby.is_finite()
+                || (analytic - nearby).abs() > 1e3 * nearby.abs().max(1.0)
+        };
+        let (phi_rr, t_collision, t_rr_collision) = if collision_limit_disagrees(
+            analytic_t_collision,
+            out.t,
+        ) || collision_limit_disagrees(analytic_t_rr_collision, out.t_rr)
+        {
+            // Keep the origin limit on the same coherent jet family as the
+            // nearby regularized evaluation when the analytic Taylor carrier
+            // is clearly inconsistent.
+            (out.q, out.t, out.t_rr)
+        } else {
+            (analytic_phi_rr, analytic_t_collision, analytic_t_rr_collision)
+        };
 
         let r2 = r * r;
         let r3 = r2 * r;

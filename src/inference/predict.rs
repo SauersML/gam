@@ -1208,12 +1208,14 @@ impl BernoulliMarginalSlopePredictor {
         let num_chunks = (n + chunk_size - 1) / chunk_size;
         let scale = self.probit_frailty_scale();
 
-        // ── Rigid closed-form path: η = q·√(1+b²) + b·z ──────────────
+        // ── Rigid closed-form path under probit Gaussian frailty ──────
         // When neither score-warp nor link-deviation is active, z passes
-        // through unwarped and the intercept has a closed-form solution.
+        // through unwarped and the observed probit index has the closed form
+        //   η_obs = q·√(1 + (s b)²) + s b·z,  s = 1/√(1+σ²).
         if !flex_active {
-            let c_vec = logslope_eta.mapv(|b| (1.0 + b * b).sqrt());
-            let final_eta = (&c_vec * &marginal_eta + &logslope_eta * z).mapv(|v| scale * v);
+            let sb_vec = logslope_eta.mapv(|b| scale * b);
+            let c_vec = sb_vec.mapv(|sb| (1.0 + sb * sb).sqrt());
+            let final_eta = &c_vec * &marginal_eta + &sb_vec * z;
 
             if !need_gradient {
                 return Ok((final_eta, None));
@@ -1231,13 +1233,13 @@ impl BernoulliMarginalSlopePredictor {
                     let i = start + li;
                     let c = c_vec[i];
                     let b = logslope_eta[i];
-                    let g_scale = marginal_eta[i] * b / c + z[i];
+                    let g_scale = marginal_eta[i] * (scale * scale) * b / c + scale * z[i];
                     let mut row = grad.row_mut(i);
                     for j in 0..marginal_dim {
-                        row[j] = scale * c * mc[[li, j]];
+                        row[j] = c * mc[[li, j]];
                     }
                     for j in 0..logslope_dim {
-                        row[logslope_offset + j] = scale * g_scale * lc[[li, j]];
+                        row[logslope_offset + j] = g_scale * lc[[li, j]];
                     }
                 }
 
@@ -3496,20 +3498,31 @@ mod tests {
     use crate::types::LinkFunction;
     use ndarray::{Array1, Array2, array};
 
-    fn nested_identity(dim: usize) -> Vec<Vec<f64>> {
-        let mut out = vec![vec![0.0; dim]; dim];
-        for (idx, row) in out.iter_mut().enumerate() {
-            row[idx] = 1.0;
-        }
-        out
-    }
-
     fn nested_column_selection(raw_dim: usize, basis_dim: usize) -> Vec<Vec<f64>> {
         let mut out = vec![vec![0.0; basis_dim]; raw_dim];
         for idx in 0..basis_dim.min(raw_dim) {
             out[idx][idx] = 1.0;
         }
         out
+    }
+
+    fn saved_runtime_from_deviation_runtime(
+        runtime: &crate::families::bernoulli_marginal_slope::DeviationRuntime,
+    ) -> SavedAnchoredDeviationRuntime {
+        SavedAnchoredDeviationRuntime {
+            kernel:
+                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
+                    .to_string(),
+            knots: runtime.knots().to_vec(),
+            degree: runtime.degree(),
+            value_span_degree: runtime.value_span_degree(),
+            basis_dim: runtime.basis_dim(),
+            basis_transform: runtime
+                .basis_transform()
+                .outer_iter()
+                .map(|row| row.to_vec())
+                .collect(),
+        }
     }
 
     fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {
@@ -3600,6 +3613,17 @@ mod tests {
 
     #[test]
     fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_runtime_kernel() {
+        let seed = array![-1.5, -0.2, 0.6, 1.4];
+        let prepared = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                degree: 3,
+                num_internal_knots: 3,
+                ..Default::default()
+            },
+        )
+        .expect("production score-warp runtime");
+        let production_runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
         let score_only = BernoulliMarginalSlopePredictor {
             beta_marginal: array![0.8],
             beta_logslope: array![1.6],
@@ -3611,11 +3635,7 @@ mod tests {
             covariance: None,
             score_warp_runtime: Some(SavedAnchoredDeviationRuntime {
                 kernel: "OldQuadrature".to_string(),
-                knots: vec![-10.0, -10.0, 10.0, 10.0],
-                degree: 1,
-                value_span_degree: 1,
-                basis_dim: 2,
-                basis_transform: nested_identity(2),
+                ..production_runtime.clone()
             }),
             link_deviation_runtime: None,
             gaussian_frailty_sd: None,
@@ -3626,45 +3646,29 @@ mod tests {
             .unwrap()
             .design(&array![0.0])
             .unwrap_err();
-        assert!(err.contains("ExactDenestedCubic"));
+        assert!(err.contains("DenestedCubicTransport"));
 
-        let quadratic = SavedAnchoredDeviationRuntime {
-            kernel:
-                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                    .to_string(),
-            knots: vec![-10.0, -10.0, -10.0, -10.0, 10.0, 10.0, 10.0, 10.0],
-            degree: 2,
-            value_span_degree: 2,
-            basis_dim: 2,
-            basis_transform: nested_identity(2),
-        };
+        let quadratic_prepared =
+            crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+                &seed,
+                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                    degree: 2,
+                    num_internal_knots: 3,
+                    ..Default::default()
+                },
+            )
+            .expect("production quadratic runtime");
+        let quadratic = saved_runtime_from_deviation_runtime(&quadratic_prepared.runtime);
         assert!(quadratic.design(&array![0.0]).is_ok());
 
         let structurally_invalid = SavedAnchoredDeviationRuntime {
-            kernel:
-                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                    .to_string(),
-            knots: vec![
-                -10.0, -10.0, -10.0, -10.0, -10.0, 10.0, 10.0, 10.0, 10.0, 10.0,
-            ],
-            degree: 3,
             value_span_degree: 4,
-            basis_dim: 2,
-            basis_transform: nested_identity(2),
+            ..production_runtime.clone()
         };
         let err = structurally_invalid.design(&array![0.0]).unwrap_err();
         assert!(err.contains("piecewise degree 4"));
 
-        let cubic = SavedAnchoredDeviationRuntime {
-            kernel:
-                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                    .to_string(),
-            knots: vec![-10.0, -10.0, -10.0, -10.0, 10.0, 10.0, 10.0, 10.0],
-            degree: 3,
-            value_span_degree: 3,
-            basis_dim: 2,
-            basis_transform: nested_identity(2),
-        };
+        let cubic = production_runtime;
         assert!(cubic.design(&array![0.0]).is_ok());
     }
 

@@ -8,6 +8,8 @@ use crate::matrix::DesignMatrix;
 use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use ndarray::{Array1, Array2};
 
+const UNIFORM_CUBIC_SPAN_STEP_DENOM: f64 = 3.0;
+
 /// Evaluate the monotone wiggle basis (or a derivative) at `values`, then
 /// right-multiply by `basis_transform` to map from the raw I-spline columns
 /// into the (possibly constrained) column space used at training time.
@@ -40,6 +42,50 @@ fn max_abs_matrix_diff(lhs: &Array2<f64>, rhs: &Array2<f64>) -> f64 {
         }
     }
     max_diff
+}
+
+pub(crate) fn sampled_span_points(left: f64, right: f64) -> Array1<f64> {
+    let width = right - left;
+    Array1::from_vec(vec![
+        left,
+        left + width / UNIFORM_CUBIC_SPAN_STEP_DENOM,
+        left + 2.0 * width / UNIFORM_CUBIC_SPAN_STEP_DENOM,
+        right,
+    ])
+}
+
+pub(crate) fn local_cubic_from_uniform_span_samples(
+    left: f64,
+    right: f64,
+    y0: f64,
+    y1: f64,
+    y2: f64,
+    y3: f64,
+) -> Result<exact_kernel::LocalSpanCubic, String> {
+    let width = right - left;
+    if !width.is_finite() || width <= 0.0 {
+        return Err(format!(
+            "cannot build sampled span cubic on non-positive interval [{left}, {right}]"
+        ));
+    }
+
+    // Interpolate the unique cubic through the four equally spaced samples
+    // u in {0, 1, 2, 3}, where x = left + (width / 3) * u.
+    let delta1 = y1 - y0;
+    let delta2 = y2 - 2.0 * y1 + y0;
+    let delta3 = y3 - 3.0 * y2 + 3.0 * y1 - y0;
+    let scale = UNIFORM_CUBIC_SPAN_STEP_DENOM / width;
+    let scale2 = scale * scale;
+    let scale3 = scale2 * scale;
+
+    Ok(exact_kernel::LocalSpanCubic {
+        left,
+        right,
+        c0: y0,
+        c1: scale * (delta1 - 0.5 * delta2 + delta3 / 3.0),
+        c2: scale2 * (4.5 * delta2 - 4.5 * delta3),
+        c3: scale3 * (4.5 * delta3),
+    })
 }
 
 /// Recover the exact raw-basis-to-trained-basis replay map used for saved
@@ -114,6 +160,10 @@ pub struct DeviationRuntime {
     span_right_d1_design: Array2<f64>,
     span_left_d2_design: Array2<f64>,
     span_mid_d3_design: Array2<f64>,
+    /// Deviation basis values at the rightmost breakpoint (1 × basis_dim).
+    /// Used for constant-tail continuation outside support: the deviation
+    /// saturates at this value for all z > right endpoint.
+    right_boundary_value_row: Array1<f64>,
 }
 
 impl DeviationRuntime {
@@ -261,6 +311,20 @@ impl DeviationRuntime {
             3,
         )?;
 
+        // Precompute deviation basis values at the rightmost breakpoint for
+        // constant-tail continuation outside support.
+        let right_endpoint = *endpoint_points.last().ok_or_else(|| {
+            "DeviationRuntime requires at least one breakpoint for right tail".to_string()
+        })?;
+        let right_boundary_value_matrix = anchored_deviation_basis_with_transform(
+            ndarray::arr1(&[right_endpoint]).view(),
+            &knots,
+            degree,
+            &basis_transform,
+            0,
+        )?;
+        let right_boundary_value_row = right_boundary_value_matrix.row(0).to_owned();
+
         Ok(Self {
             knots,
             degree,
@@ -276,6 +340,7 @@ impl DeviationRuntime {
             span_right_d1_design,
             span_left_d2_design,
             span_mid_d3_design,
+            right_boundary_value_row,
         })
     }
 
@@ -411,18 +476,11 @@ impl DeviationRuntime {
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
         self.validate_beta_shape(beta, "deviation local cubic coefficients")?;
         let (left, right) = self.span_interval(span_idx)?;
-        let value_design = self.span_left_value_design.row(span_idx);
-        let d1_design = self.span_left_d1_design.row(span_idx);
-        let d2_design = self.span_left_d2_design.row(span_idx);
-        let d3 = self.span_mid_d3_design.row(span_idx).dot(beta);
-        Ok(exact_kernel::LocalSpanCubic {
-            left,
-            right,
-            c0: value_design.dot(beta),
-            c1: d1_design.dot(beta),
-            c2: 0.5 * d2_design.dot(beta),
-            c3: d3 / 6.0,
-        })
+        let span_points = sampled_span_points(left, right);
+        let values = self.design(&span_points)?.dot(beta);
+        local_cubic_from_uniform_span_samples(
+            left, right, values[0], values[1], values[2], values[3],
+        )
     }
 
     pub fn basis_span_cubic(
@@ -437,32 +495,104 @@ impl DeviationRuntime {
             ));
         }
         let (left, right) = self.span_interval(span_idx)?;
-        Ok(exact_kernel::LocalSpanCubic {
+        let span_points = sampled_span_points(left, right);
+        let values = self.design(&span_points)?;
+        local_cubic_from_uniform_span_samples(
             left,
             right,
-            c0: self.span_left_value_design[[span_idx, basis_idx]],
-            c1: self.span_left_d1_design[[span_idx, basis_idx]],
-            c2: 0.5 * self.span_left_d2_design[[span_idx, basis_idx]],
-            c3: self.span_mid_d3_design[[span_idx, basis_idx]] / 6.0,
-        })
+            values[[0, basis_idx]],
+            values[[1, basis_idx]],
+            values[[2, basis_idx]],
+            values[[3, basis_idx]],
+        )
     }
 
+    /// Return the correct per-basis `LocalSpanCubic` for any evaluation
+    /// point.  Outside the knot support, returns a constant cubic (c1=c2=c3=0)
+    /// at the saturated tail value — the I-spline basis saturates, not
+    /// extrapolates, outside its support.
     pub fn basis_cubic_at(
         &self,
         basis_idx: usize,
         value: f64,
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
+        if basis_idx >= self.basis_dim {
+            return Err(format!(
+                "deviation basis index {} out of range for {} coefficients",
+                basis_idx, self.basis_dim
+            ));
+        }
+        let (left_ep, right_ep) = self.support_interval()?;
+        if value < left_ep {
+            return Ok(exact_kernel::LocalSpanCubic {
+                left: left_ep,
+                right: left_ep + 1.0,
+                c0: self.span_left_value_design[[0, basis_idx]],
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            });
+        }
+        if value > right_ep {
+            return Ok(exact_kernel::LocalSpanCubic {
+                left: right_ep,
+                right: right_ep + 1.0,
+                c0: self.right_boundary_value_row[basis_idx],
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            });
+        }
         let span_idx = self.span_index_for(value)?;
         self.basis_span_cubic(span_idx, basis_idx)
     }
 
+    /// Return the correct composite `LocalSpanCubic` for any evaluation
+    /// point.  Outside the knot support, returns a constant cubic (c1=c2=c3=0)
+    /// at the saturated tail value.
     pub(crate) fn local_cubic_at(
         &self,
         beta: &Array1<f64>,
         value: f64,
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
+        self.validate_beta_shape(beta, "deviation local cubic")?;
+        let (left_ep, right_ep) = self.support_interval()?;
+        if value < left_ep {
+            return Ok(exact_kernel::LocalSpanCubic {
+                left: left_ep,
+                right: left_ep + 1.0,
+                c0: self.left_tail_value(beta),
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            });
+        }
+        if value > right_ep {
+            return Ok(exact_kernel::LocalSpanCubic {
+                left: right_ep,
+                right: right_ep + 1.0,
+                c0: self.right_tail_value(beta),
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            });
+        }
         let span_idx = self.span_index_for(value)?;
         self.local_cubic_on_span(beta, span_idx)
+    }
+
+    // ── tail value helpers ──
+
+    /// Left-tail constant: deviation value at the leftmost breakpoint.
+    /// For anchored I-spline bases this is the anchor value (typically 0).
+    fn left_tail_value(&self, beta: &Array1<f64>) -> f64 {
+        self.span_left_value_design.row(0).dot(beta)
+    }
+
+    /// Right-tail constant: deviation value at the rightmost breakpoint.
+    /// For I-spline bases this is the saturated integral value.
+    fn right_tail_value(&self, beta: &Array1<f64>) -> f64 {
+        self.right_boundary_value_row.dot(beta)
     }
 
     // ── monotonicity enforcement ──
