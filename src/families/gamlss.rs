@@ -12350,7 +12350,7 @@ impl BinomialLocationScaleWiggleFamily {
             self.wiggle_basiswith_options(base_core.q0.view(), BasisOptions::second_derivative())?;
         let d3q = self.wiggle_d3q_dq03(base_core.q0.view(), betaw.view())?;
         let m = d0.dot(betaw) + 1.0;
-        let g2 = dd0.dot(betaw);
+        let g2 = self.wiggle_d2q_dq02(base_core.q0.view(), betaw.view())?;
         let g3 = d3q;
         let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
 

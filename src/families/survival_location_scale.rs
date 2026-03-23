@@ -4313,6 +4313,67 @@ struct SurvivalDynamicGeometry {
     wiggle_qdot_basis_exit: Option<Array2<f64>>,
 }
 
+impl SurvivalDynamicGeometry {
+    fn validate_precomputed_channels(&self) -> Result<(), String> {
+        let n = self.h_exit.len();
+        if self.time_base_derivative_exit.len() != n {
+            return Err(format!(
+                "survival dynamic geometry derivative length mismatch: base_derivative={}, rows={n}",
+                self.time_base_derivative_exit.len()
+            ));
+        }
+        if let Some(basis) = self.time_wiggle_basis_d1_entry.as_ref() {
+            if basis.nrows() != n {
+                return Err(format!(
+                    "survival dynamic geometry wiggle d1 entry row mismatch: rows={}, expected {n}",
+                    basis.nrows()
+                ));
+            }
+        }
+        if let Some(basis) = self.time_wiggle_basis_d1_exit.as_ref() {
+            if basis.nrows() != n {
+                return Err(format!(
+                    "survival dynamic geometry wiggle d1 exit row mismatch: rows={}, expected {n}",
+                    basis.nrows()
+                ));
+            }
+        }
+        if let Some(basis) = self.time_wiggle_basis_d2_exit.as_ref() {
+            if basis.nrows() != n {
+                return Err(format!(
+                    "survival dynamic geometry wiggle d2 exit row mismatch: rows={}, expected {n}",
+                    basis.nrows()
+                ));
+            }
+        }
+        if let Some(values) = self.time_wiggle_d2_entry.as_ref() {
+            if values.len() != n {
+                return Err(format!(
+                    "survival dynamic geometry wiggle d2 entry length mismatch: len={}, expected {n}",
+                    values.len()
+                ));
+            }
+        }
+        if let Some(values) = self.time_wiggle_d2_exit.as_ref() {
+            if values.len() != n {
+                return Err(format!(
+                    "survival dynamic geometry wiggle d2 exit length mismatch: len={}, expected {n}",
+                    values.len()
+                ));
+            }
+        }
+        if let Some(values) = self.time_wiggle_d3_exit.as_ref() {
+            if values.len() != n {
+                return Err(format!(
+                    "survival dynamic geometry wiggle d3 exit length mismatch: len={}, expected {n}",
+                    values.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn survival_wiggle_basis_with_options(
     q0: ndarray::ArrayView1<'_, f64>,
     knots: &Array1<f64>,
@@ -4607,16 +4668,40 @@ impl SurvivalLocationScaleFamily {
                 self.x_time_exit.as_ref(),
                 &safe_hadamard_product(&wig_exit.d2q_dq02, &d_base)?,
             )? + &scale_dense_rows(self.x_time_deriv.as_ref(), &wig_exit.dq_dq0)?;
+            let wiggle_entry_full = embed_tail_columns(
+                &wig_entry.basis,
+                time_jac_entry.ncols(),
+                time_wiggle_range.clone(),
+            )?;
+            let wiggle_exit_full = embed_tail_columns(
+                &wig_exit.basis,
+                time_jac_exit.ncols(),
+                time_wiggle_range.clone(),
+            )?;
             time_jac_entry
                 .slice_mut(s![.., time_wiggle_range.start..time_wiggle_range.end])
-                .assign(&wig_entry.basis);
+                .assign(
+                    &wiggle_entry_full
+                        .slice(s![.., time_wiggle_range.start..time_wiggle_range.end]),
+                );
             time_jac_exit
                 .slice_mut(s![.., time_wiggle_range.start..time_wiggle_range.end])
-                .assign(&wig_exit.basis);
+                .assign(
+                    &wiggle_exit_full
+                        .slice(s![.., time_wiggle_range.start..time_wiggle_range.end]),
+                );
             let wiggle_qdot = scale_dense_rows(&wig_exit.basis_d1, &d_base)?;
+            let wiggle_qdot_full = embed_tail_columns(
+                &wiggle_qdot,
+                time_jac_deriv.ncols(),
+                time_wiggle_range.clone(),
+            )?;
             time_jac_deriv
                 .slice_mut(s![.., time_wiggle_range.start..time_wiggle_range.end])
-                .assign(&wiggle_qdot);
+                .assign(
+                    &wiggle_qdot_full
+                        .slice(s![.., time_wiggle_range.start..time_wiggle_range.end]),
+                );
             time_wiggle_basis_d1_entry = Some(wig_entry.basis_d1.clone());
             time_wiggle_basis_d1_exit = Some(wig_exit.basis_d1.clone());
             time_wiggle_basis_d2_exit = Some(wig_exit.basis_d2.clone());
@@ -4744,7 +4829,7 @@ impl SurvivalLocationScaleFamily {
             out
         });
 
-        Ok(SurvivalDynamicGeometry {
+        let dynamic = SurvivalDynamicGeometry {
             h_exit,
             h_entry,
             hdot_exit,
@@ -4798,7 +4883,9 @@ impl SurvivalLocationScaleFamily {
             wiggle_basis_d1_entry: wiggle_entry.as_ref().map(|w| w.basis_d1.clone()),
             wiggle_basis_d2_exit: wiggle_exit.as_ref().map(|w| w.basis_d2.clone()),
             wiggle_qdot_basis_exit,
-        })
+        };
+        dynamic.validate_precomputed_channels()?;
+        Ok(dynamic)
     }
 }
 

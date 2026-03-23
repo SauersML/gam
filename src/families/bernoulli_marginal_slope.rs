@@ -4329,6 +4329,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut g_uv_u_fixed = Array2::<f64>::zeros((r, r));
         let mut g_uv_v_fixed = Array2::<f64>::zeros((r, r));
         let mut g_uv_uv_fixed = Array2::<f64>::zeros((r, r));
+        let mut g_auv_u_fixed = Array2::<f64>::zeros((r, r));
+        let mut g_auv_v_fixed = Array2::<f64>::zeros((r, r));
 
         for u in 1..r {
             let tmp_u = g_jet.param_directional_from_b_family(
@@ -4400,6 +4402,20 @@ impl BernoulliMarginalSlopeFamily {
                     dir_v,
                     COEFF_SUPPORT_W,
                 );
+                let a_third_u = g_jet.pair_directional_from_bb_family(
+                    g_jet.abb_first,
+                    u,
+                    v,
+                    dir_u,
+                    COEFF_SUPPORT_W,
+                );
+                let a_third_v = g_jet.pair_directional_from_bb_family(
+                    g_jet.abb_first,
+                    u,
+                    v,
+                    dir_v,
+                    COEFF_SUPPORT_W,
+                );
                 let vu = eval_coeff4_at(&third_u, z_obs);
                 let vv = eval_coeff4_at(&third_v, z_obs);
                 let vuv = eval_coeff4_at(&fourth_uv, z_obs);
@@ -4409,6 +4425,12 @@ impl BernoulliMarginalSlopeFamily {
                 g_uv_u_fixed[[v, u]] = vu;
                 g_uv_v_fixed[[v, u]] = vv;
                 g_uv_uv_fixed[[v, u]] = vuv;
+                let atu = eval_coeff4_at(&a_third_u, z_obs);
+                let atv = eval_coeff4_at(&a_third_v, z_obs);
+                g_auv_u_fixed[[u, v]] = atu;
+                g_auv_v_fixed[[u, v]] = atv;
+                g_auv_u_fixed[[v, u]] = atu;
+                g_auv_v_fixed[[v, u]] = atv;
             }
         }
 
@@ -4508,8 +4530,8 @@ impl BernoulliMarginalSlopeFamily {
             for v in u..r {
                 let g_uv_uv = g_aauv[[u, v]] * a_dir_u * a_dir_v
                     + g_auv[[u, v]] * a_dir_uv
-                    + g_uv_u_fixed[[u, v]] * a_dir_v
-                    + g_uv_v_fixed[[u, v]] * a_dir_u
+                    + g_auv_u_fixed[[u, v]] * a_dir_v
+                    + g_auv_v_fixed[[u, v]] * a_dir_u
                     + g_uv_uv_fixed[[u, v]];
                 let val = g_a_uv * a_uv[[u, v]]
                     + g_a_u * a_uv_v[[u, v]]
@@ -4541,7 +4563,8 @@ impl BernoulliMarginalSlopeFamily {
         let eta_dir_v = g_a * a_dir_v + g_dir_v;
         let eta_u_dir_u = eta_uv.dot(dir_u);
         let eta_u_dir_v = eta_uv.dot(dir_v);
-        let eta_dir_uv = g_a_v * a_dir_u + g_a * a_dir_uv + g_dir_uv;
+        let eta_dir_uv =
+            g_a_v * a_dir_u + g_a_u_fixed * a_dir_v + g_a * a_dir_uv + g_dir_uv;
         let eta_u_uv = eta_uv_u.dot(dir_v);
 
         let y_i = self.y[row];
