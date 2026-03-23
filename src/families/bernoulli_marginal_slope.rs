@@ -6228,6 +6228,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
+        // Rigid Bernoulli marginal-slope already has an analytic outer
+        // gradient, and its full outer Hessian path is disproportionately
+        // expensive because every rho/rho derivative still rebuilds dense
+        // joint-curvature algebra over the realized coefficient space.
+        // Prefer first-order outer optimization here.
+        if self.score_warp.is_none() && self.link_dev.is_none() {
+            return ExactOuterDerivativeOrder::First;
+        }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;

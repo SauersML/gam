@@ -3587,7 +3587,10 @@ impl UnifiedFitResult {
 
     /// Get the penalized Hessian if available.
     pub fn penalized_hessian(&self) -> Option<&Array2<f64>> {
-        self.inference.as_ref().map(|inf| &inf.penalized_hessian)
+        self.inference
+            .as_ref()
+            .map(|inf| &inf.penalized_hessian)
+            .or_else(|| self.geometry.as_ref().map(|geom| &geom.penalized_hessian))
     }
 
     /// Get working weights if available.
