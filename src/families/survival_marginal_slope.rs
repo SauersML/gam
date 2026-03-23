@@ -12800,9 +12800,7 @@ mod tests {
             .expect("row geometry");
         let primary = flex_primary_slices(&family);
         let g = block_states[2].eta[0];
-        let beta_h = family
-            .flex_score_beta(&block_states)
-            .expect("score beta");
+        let beta_h = family.flex_score_beta(&block_states).expect("score beta");
         let beta_w = family.flex_link_beta(&block_states).expect("link beta");
         let (a1, _) = family
             .solve_row_survival_intercept(q_geom.q1, g, beta_h, beta_w)
@@ -12822,16 +12820,7 @@ mod tests {
 
         let active = family
             .compute_survival_timepoint_bidirectional_exact(
-                0,
-                &primary,
-                q_geom.q1,
-                primary.q1,
-                a1,
-                g,
-                beta_h,
-                beta_w,
-                &dir_u,
-                &dir_v,
+                0, &primary, q_geom.q1, primary.q1, a1, g, beta_h, beta_w, &dir_u, &dir_v,
             )
             .expect("active bidirectional transport");
         assert!(active.eta_uv_uv.iter().all(|value| value.is_finite()));
