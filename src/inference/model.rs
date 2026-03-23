@@ -1072,11 +1072,6 @@ impl FittedModel {
         }
     }
 
-    #[inline]
-    pub fn is_survival_model(&self) -> bool {
-        matches!(self.predict_model_class(), PredictModelClass::Survival)
-    }
-
     pub fn saved_link_wiggle(&self) -> Result<Option<SavedLinkWiggleRuntime>, String> {
         let payload = self.payload();
         let (knots, degree) = match (

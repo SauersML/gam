@@ -11649,20 +11649,20 @@ mod tests {
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FittedFamily, LikelihoodFamily, LinkChoice, LinkMode,
         MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
-        SurvivalBaselineTarget, SurvivalTimeBasisConfig, apply_saved_linkwiggle,
-        build_survival_feasible_initial_beta, build_survival_time_basis,
+        SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
+        apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_saved_multiblock_fit_result,
         compute_probit_q0_from_eta, core_saved_fit_result, effectivelinkwiggle_formulaspec,
-        evaluate_survival_baseline, exact_kernel, family_to_string, linkname,
-        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
-        parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
+        evaluate_survival_baseline, family_to_string, linkname, load_dataset_projected,
+        parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
+        parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
         required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
-        saved_linkwiggle_design, summarizewiggle_domain, validate_cli_firth_configuration,
-        write_gaussian_location_scale_prediction_csv, write_survival_binary_prediction_csv,
-        write_survival_prediction_csv,
+        saved_linkwiggle_design, summarizewiggle_domain,
+        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
+        write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
     use csv::StringRecord;
@@ -11670,10 +11670,7 @@ mod tests {
         BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
         MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
-    use gam::families::bernoulli_marginal_slope::DeviationBlockConfig;
-    use gam::gamlss::{
-        buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
-    };
+    use gam::gamlss::buildwiggle_block_input_from_knots;
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };
@@ -13788,12 +13785,18 @@ mod tests {
 
     #[test]
     fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(&seed, &DeviationBlockConfig::default())
-            .expect("score-warp basis");
-        let basis_dim = prepared.runtime.basis_dim();
-        let saved_runtime = saved_anchored_deviation_runtime(&prepared.runtime);
-        let zero_beta = Array1::zeros(basis_dim);
+        let saved_runtime = SavedAnchoredDeviationRuntime {
+            kernel:
+                gam::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
+                    .to_string(),
+            breakpoints: vec![-1.0, 1.0],
+            basis_dim: 1,
+            span_c0: vec![vec![0.0]],
+            span_c1: vec![vec![0.0]],
+            span_c2: vec![vec![0.0]],
+            span_c3: vec![vec![0.0]],
+        };
+        let zero_beta = Array1::zeros(saved_runtime.basis_dim);
 
         let q_exit = array![-0.8, 0.4];
         let slope = array![0.3, -1.1];

@@ -349,14 +349,28 @@ struct SurvivalFlexTimepointExact {
     d_uv: Array2<f64>,
 }
 
+/// Directional extensions of a timepoint's exact quantities, contracted with
+/// a single direction.  These are the pieces needed to compose the third-order
+/// NLL contraction.
+struct SurvivalFlexTimepointDirectionalExact {
+    eta_uv_dir: Array2<f64>,
+    chi_uv_dir: Array2<f64>,
+    d_u_dir: Array1<f64>,
+    d_uv_dir: Array2<f64>,
+}
+
 #[derive(Clone)]
 struct SurvivalTimeWiggleGeometry {
     basis: Array2<f64>,
     basis_d1: Array2<f64>,
     basis_d2: Array2<f64>,
+    basis_d3: Array2<f64>,
+    basis_d4: Array2<f64>,
     dq_dq0: Array1<f64>,
     d2q_dq02: Array1<f64>,
     d3q_dq03: Array1<f64>,
+    d4q_dq04: Array1<f64>,
+    d5q_dq05: Array1<f64>,
 }
 
 #[derive(Clone)]
@@ -379,6 +393,33 @@ struct SurvivalMarginalSlopeDynamicRow {
     d2q0_marginal_marginal: Array2<f64>,
     d2q1_marginal_marginal: Array2<f64>,
     d2qd1_marginal_marginal: Array2<f64>,
+}
+
+struct TimewiggleMarginalPsiRowLift {
+    dir: Array1<f64>,
+    u_q0_time: Array1<f64>,
+    u_q1_time: Array1<f64>,
+    u_qd1_time: Array1<f64>,
+    u_q0_marginal: Array1<f64>,
+    u_q1_marginal: Array1<f64>,
+    u_qd1_marginal: Array1<f64>,
+    x_entry_base: Array1<f64>,
+    x_exit_base: Array1<f64>,
+    x_deriv_base: Array1<f64>,
+    marginal_row: Array1<f64>,
+    entry_basis_d1: Array1<f64>,
+    entry_basis_d2: Array1<f64>,
+    exit_basis_d1: Array1<f64>,
+    exit_basis_d2: Array1<f64>,
+    exit_basis_d3: Array1<f64>,
+    entry_m2: f64,
+    entry_m3: f64,
+    exit_m2: f64,
+    exit_m3: f64,
+    exit_m4: f64,
+    d_raw: f64,
+    mu: f64,
+    psi_row: Array1<f64>,
 }
 
 fn unit_primary_direction(idx: usize) -> Array1<f64> {
@@ -431,28 +472,6 @@ fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String
             "survival marginal-slope spatial psi loading requested for unsupported block {block_idx}"
         )),
     }
-}
-
-fn spatial_block_primary_loading_flex(
-    primary: &FlexPrimarySlices,
-    block_idx: usize,
-) -> Result<Array1<f64>, String> {
-    let mut loading = Array1::<f64>::zeros(primary.total);
-    match block_idx {
-        1 => {
-            loading[primary.q0] = 1.0;
-            loading[primary.q1] = 1.0;
-        }
-        2 => {
-            loading[primary.g] = 1.0;
-        }
-        _ => {
-            return Err(format!(
-                "survival marginal-slope spatial psi loading requested for unsupported block {block_idx}"
-            ));
-        }
-    }
-    Ok(loading)
 }
 
 fn jet_subset_partitions(mask: usize) -> Vec<Vec<usize>> {
@@ -589,6 +608,27 @@ fn primary_direction_from_psi_row(
         _ => {}
     }
     out
+}
+
+fn spatial_block_primary_loading_flex(
+    primary: &FlexPrimarySlices,
+    block_idx: usize,
+) -> Result<Array1<f64>, String> {
+    let mut out = Array1::<f64>::zeros(primary.total);
+    match block_idx {
+        1 => {
+            out[primary.q0] = 1.0;
+            out[primary.q1] = 1.0;
+            Ok(out)
+        }
+        2 => {
+            out[primary.g] = 1.0;
+            Ok(out)
+        }
+        _ => Err(format!(
+            "survival marginal-slope spatial psi loading requested for unsupported flex block {block_idx}"
+        )),
+    }
 }
 
 fn primary_direction_from_psi_row_flex(
@@ -1259,6 +1299,596 @@ impl BlockHessianAccumulator {
     }
 }
 
+impl BlockHessianAccumulator {
+    /// Lifted pullback: J^T H J + Σ_a f_a K_a using actual Jacobians
+    fn add_pullback_with_q_geometry(
+        &mut self,
+        family: &SurvivalMarginalSlopeFamily,
+        row: usize,
+        qg: &SurvivalMarginalSlopeDynamicRow,
+        fg: &Array1<f64>,
+        ph: &Array2<f64>,
+    ) {
+        let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
+        let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
+        let ktt = [&qg.d2q0_time_time, &qg.d2q1_time_time, &qg.d2qd1_time_time];
+        let ktm = [
+            &qg.d2q0_time_marginal,
+            &qg.d2q1_time_marginal,
+            &qg.d2qd1_time_marginal,
+        ];
+        let kmm = [
+            &qg.d2q0_marginal_marginal,
+            &qg.d2q1_marginal_marginal,
+            &qg.d2qd1_marginal_marginal,
+        ];
+        let pt = jt[0].len();
+        let pm = jm[0].len();
+        for a in 0..pt {
+            for b in 0..pt {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * jt[u][a] * jt[w][b];
+                    }
+                }
+                for u in 0..3 {
+                    v += fg[u] * ktt[u][[a, b]];
+                }
+                self.h_tt[[a, b]] += v;
+            }
+        }
+        for a in 0..pm {
+            for b in 0..pm {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * jm[u][a] * jm[w][b];
+                    }
+                }
+                for u in 0..3 {
+                    v += fg[u] * kmm[u][[a, b]];
+                }
+                self.h_mm[[a, b]] += v;
+            }
+        }
+        family
+            .logslope_design
+            .syr_row_into(row, ph[[3, 3]], &mut self.h_gg)
+            .expect("gg syr");
+        for a in 0..pt {
+            for b in 0..pm {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * jt[u][a] * jm[w][b];
+                    }
+                }
+                for u in 0..3 {
+                    v += fg[u] * ktm[u][[a, b]];
+                }
+                self.h_tm[[a, b]] += v;
+            }
+        }
+        let gc = family.logslope_design.row_chunk(row..row + 1);
+        let gr = gc.row(0);
+        for a in 0..pt {
+            let mut w = 0.0;
+            for u in 0..3 {
+                w += ph[[u, 3]] * jt[u][a];
+            }
+            if w != 0.0 {
+                for b in 0..gr.len() {
+                    self.h_tg[[a, b]] += w * gr[b];
+                }
+            }
+        }
+        for a in 0..pm {
+            let mut w = 0.0;
+            for u in 0..3 {
+                w += ph[[u, 3]] * jm[u][a];
+            }
+            if w != 0.0 {
+                for b in 0..gr.len() {
+                    self.h_mg[[a, b]] += w * gr[b];
+                }
+            }
+        }
+        let pl = flex_primary_slices(family);
+        if let Some(hr) = pl.h.as_ref() {
+            for li in 0..hr.len() {
+                let ix = hr.start + li;
+                for a in 0..pt {
+                    let mut w = 0.0;
+                    for u in 0..3 {
+                        w += ph[[u, ix]] * jt[u][a];
+                    }
+                    self.h_th[[a, li]] += w;
+                }
+                for a in 0..pm {
+                    let mut w = 0.0;
+                    for u in 0..3 {
+                        w += ph[[u, ix]] * jm[u][a];
+                    }
+                    self.h_mh[[a, li]] += w;
+                }
+                let gw = ph[[3, ix]];
+                if gw != 0.0 {
+                    for b in 0..gr.len() {
+                        self.h_gh[[b, li]] += gw * gr[b];
+                    }
+                }
+            }
+            for l in 0..hr.len() {
+                for r in 0..hr.len() {
+                    self.h_hh[[l, r]] += ph[[hr.start + l, hr.start + r]];
+                }
+            }
+        }
+        if let Some(wr) = pl.w.as_ref() {
+            for li in 0..wr.len() {
+                let ix = wr.start + li;
+                for a in 0..pt {
+                    let mut w = 0.0;
+                    for u in 0..3 {
+                        w += ph[[u, ix]] * jt[u][a];
+                    }
+                    self.h_tw[[a, li]] += w;
+                }
+                for a in 0..pm {
+                    let mut w = 0.0;
+                    for u in 0..3 {
+                        w += ph[[u, ix]] * jm[u][a];
+                    }
+                    self.h_mw[[a, li]] += w;
+                }
+                let gw = ph[[3, ix]];
+                if gw != 0.0 {
+                    for b in 0..gr.len() {
+                        self.h_gw[[b, li]] += gw * gr[b];
+                    }
+                }
+            }
+            for l in 0..wr.len() {
+                for r in 0..wr.len() {
+                    self.h_ww[[l, r]] += ph[[wr.start + l, wr.start + r]];
+                }
+            }
+        }
+        if let (Some(hr), Some(wr)) = (pl.h.as_ref(), pl.w.as_ref()) {
+            for hl in 0..hr.len() {
+                for wl in 0..wr.len() {
+                    self.h_hw[[hl, wl]] += ph[[hr.start + hl, wr.start + wl]];
+                }
+            }
+        }
+    }
+
+    /// U^α cross terms (eq 47, terms 1+2)
+    fn add_timewiggle_psi_u_cross(
+        &mut self,
+        family: &SurvivalMarginalSlopeFamily,
+        row: usize,
+        qg: &SurvivalMarginalSlopeDynamicRow,
+        lift: &TimewiggleMarginalPsiRowLift,
+        ph: &Array2<f64>,
+    ) {
+        let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
+        let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
+        let ut = [&lift.u_q0_time, &lift.u_q1_time, &lift.u_qd1_time];
+        let um = [
+            &lift.u_q0_marginal,
+            &lift.u_q1_marginal,
+            &lift.u_qd1_marginal,
+        ];
+        let pt = jt[0].len();
+        let pm = jm[0].len();
+        for a in 0..pt {
+            for b in 0..pt {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * (ut[u][a] * jt[w][b] + jt[u][a] * ut[w][b]);
+                    }
+                }
+                self.h_tt[[a, b]] += v;
+            }
+        }
+        for a in 0..pm {
+            for b in 0..pm {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * (um[u][a] * jm[w][b] + jm[u][a] * um[w][b]);
+                    }
+                }
+                self.h_mm[[a, b]] += v;
+            }
+        }
+        for a in 0..pt {
+            for b in 0..pm {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * (ut[u][a] * jm[w][b] + jt[u][a] * um[w][b]);
+                    }
+                }
+                self.h_tm[[a, b]] += v;
+            }
+        }
+        let gc = family.logslope_design.row_chunk(row..row + 1);
+        let gr = gc.row(0);
+        for a in 0..pt {
+            let mut wt = 0.0;
+            for u in 0..3 {
+                wt += ph[[u, 3]] * ut[u][a];
+            }
+            if wt != 0.0 {
+                for b in 0..gr.len() {
+                    self.h_tg[[a, b]] += wt * gr[b];
+                }
+            }
+        }
+        for a in 0..pm {
+            let mut wt = 0.0;
+            for u in 0..3 {
+                wt += ph[[u, 3]] * um[u][a];
+            }
+            if wt != 0.0 {
+                for b in 0..gr.len() {
+                    self.h_mg[[a, b]] += wt * gr[b];
+                }
+            }
+        }
+        let pl = flex_primary_slices(family);
+        if let Some(hr) = pl.h.as_ref() {
+            for li in 0..hr.len() {
+                let ix = hr.start + li;
+                for a in 0..pt {
+                    let mut w = 0.0;
+                    for u in 0..3 {
+                        w += ph[[u, ix]] * ut[u][a];
+                    }
+                    self.h_th[[a, li]] += w;
+                }
+                for a in 0..pm {
+                    let mut w = 0.0;
+                    for u in 0..3 {
+                        w += ph[[u, ix]] * um[u][a];
+                    }
+                    self.h_mh[[a, li]] += w;
+                }
+            }
+        }
+        if let Some(wr) = pl.w.as_ref() {
+            for li in 0..wr.len() {
+                let ix = wr.start + li;
+                for a in 0..pt {
+                    let mut w = 0.0;
+                    for u in 0..3 {
+                        w += ph[[u, ix]] * ut[u][a];
+                    }
+                    self.h_tw[[a, li]] += w;
+                }
+                for a in 0..pm {
+                    let mut w = 0.0;
+                    for u in 0..3 {
+                        w += ph[[u, ix]] * um[u][a];
+                    }
+                    self.h_mw[[a, li]] += w;
+                }
+            }
+        }
+    }
+
+    /// K^{BC,α} terms (eq 47, term 5)
+    fn add_timewiggle_psi_kappa_alpha(
+        &mut self,
+        family: &SurvivalMarginalSlopeFamily,
+        lift: &TimewiggleMarginalPsiRowLift,
+        fg: &Array1<f64>,
+    ) {
+        let tw = family.time_wiggle_range();
+        let pb = lift.x_entry_base.len();
+        let pm = lift.marginal_row.len();
+        let mu = lift.mu;
+        let fq0 = fg[0];
+        if fq0 != 0.0 {
+            let (m3, m2) = (lift.entry_m3, lift.entry_m2);
+            for i in 0..pb {
+                for j in 0..pb {
+                    self.h_tt[[i, j]] +=
+                        fq0 * m3 * mu * lift.x_entry_base[i] * lift.x_entry_base[j];
+                }
+            }
+            for loc in 0..tw.len() {
+                let ti = tw.start + loc;
+                for i in 0..pb {
+                    let v = fq0 * lift.entry_basis_d2[loc] * mu * lift.x_entry_base[i];
+                    self.h_tt[[i, ti]] += v;
+                    self.h_tt[[ti, i]] += v;
+                }
+            }
+            for i in 0..pb {
+                for j in 0..pm {
+                    self.h_tm[[i, j]] += fq0
+                        * (m3 * mu * lift.x_entry_base[i] * lift.marginal_row[j]
+                            + m2 * lift.x_entry_base[i] * lift.psi_row[j]);
+                }
+            }
+            for loc in 0..tw.len() {
+                let ti = tw.start + loc;
+                for j in 0..pm {
+                    self.h_tm[[ti, j]] += fq0
+                        * (lift.entry_basis_d2[loc] * mu * lift.marginal_row[j]
+                            + lift.entry_basis_d1[loc] * lift.psi_row[j]);
+                }
+            }
+            for i in 0..pm {
+                for j in 0..pm {
+                    self.h_mm[[i, j]] += fq0
+                        * (m3 * mu * lift.marginal_row[i] * lift.marginal_row[j]
+                            + m2 * (lift.psi_row[i] * lift.marginal_row[j]
+                                + lift.marginal_row[i] * lift.psi_row[j]));
+                }
+            }
+        }
+        let fq1 = fg[1];
+        if fq1 != 0.0 {
+            let (m3, m2) = (lift.exit_m3, lift.exit_m2);
+            for i in 0..pb {
+                for j in 0..pb {
+                    self.h_tt[[i, j]] += fq1 * m3 * mu * lift.x_exit_base[i] * lift.x_exit_base[j];
+                }
+            }
+            for loc in 0..tw.len() {
+                let ti = tw.start + loc;
+                for i in 0..pb {
+                    let v = fq1 * lift.exit_basis_d2[loc] * mu * lift.x_exit_base[i];
+                    self.h_tt[[i, ti]] += v;
+                    self.h_tt[[ti, i]] += v;
+                }
+            }
+            for i in 0..pb {
+                for j in 0..pm {
+                    self.h_tm[[i, j]] += fq1
+                        * (m3 * mu * lift.x_exit_base[i] * lift.marginal_row[j]
+                            + m2 * lift.x_exit_base[i] * lift.psi_row[j]);
+                }
+            }
+            for loc in 0..tw.len() {
+                let ti = tw.start + loc;
+                for j in 0..pm {
+                    self.h_tm[[ti, j]] += fq1
+                        * (lift.exit_basis_d2[loc] * mu * lift.marginal_row[j]
+                            + lift.exit_basis_d1[loc] * lift.psi_row[j]);
+                }
+            }
+            for i in 0..pm {
+                for j in 0..pm {
+                    self.h_mm[[i, j]] += fq1
+                        * (m3 * mu * lift.marginal_row[i] * lift.marginal_row[j]
+                            + m2 * (lift.psi_row[i] * lift.marginal_row[j]
+                                + lift.marginal_row[i] * lift.psi_row[j]));
+                }
+            }
+        }
+        let fqd = fg[2];
+        if fqd != 0.0 {
+            let (m4, m3, m2, dr) = (lift.exit_m4, lift.exit_m3, lift.exit_m2, lift.d_raw);
+            for i in 0..pb {
+                for j in 0..pb {
+                    self.h_tt[[i, j]] += fqd
+                        * (m4 * mu * dr * lift.x_exit_base[i] * lift.x_exit_base[j]
+                            + m3 * mu
+                                * (lift.x_exit_base[i] * lift.x_deriv_base[j]
+                                    + lift.x_deriv_base[i] * lift.x_exit_base[j]));
+                }
+            }
+            for loc in 0..tw.len() {
+                let ti = tw.start + loc;
+                for i in 0..pb {
+                    let v = fqd
+                        * (lift.exit_basis_d3[loc] * mu * dr * lift.x_exit_base[i]
+                            + lift.exit_basis_d2[loc] * mu * lift.x_deriv_base[i]);
+                    self.h_tt[[i, ti]] += v;
+                    self.h_tt[[ti, i]] += v;
+                }
+            }
+            for i in 0..pb {
+                for j in 0..pm {
+                    self.h_tm[[i, j]] += fqd
+                        * (m4 * mu * dr * lift.x_exit_base[i] * lift.marginal_row[j]
+                            + m3 * dr * lift.x_exit_base[i] * lift.psi_row[j]
+                            + m3 * mu * lift.x_deriv_base[i] * lift.marginal_row[j]
+                            + m2 * lift.x_deriv_base[i] * lift.psi_row[j]);
+                }
+            }
+            for loc in 0..tw.len() {
+                let ti = tw.start + loc;
+                for j in 0..pm {
+                    self.h_tm[[ti, j]] += fqd
+                        * (lift.exit_basis_d3[loc] * mu * dr * lift.marginal_row[j]
+                            + lift.exit_basis_d2[loc] * dr * lift.psi_row[j]);
+                }
+            }
+            for i in 0..pm {
+                for j in 0..pm {
+                    self.h_mm[[i, j]] += fqd
+                        * (m4 * mu * dr * lift.marginal_row[i] * lift.marginal_row[j]
+                            + m3 * dr
+                                * (lift.psi_row[i] * lift.marginal_row[j]
+                                    + lift.marginal_row[i] * lift.psi_row[j]));
+                }
+            }
+        }
+    }
+
+    /// Σ_a w_a K_a^{BC}: second-pullback weighted by arbitrary vector (eq 47, term 4)
+    fn add_second_pullback_weighted(
+        &mut self,
+        qg: &SurvivalMarginalSlopeDynamicRow,
+        w: &Array1<f64>,
+    ) {
+        let ktt = [&qg.d2q0_time_time, &qg.d2q1_time_time, &qg.d2qd1_time_time];
+        let ktm = [
+            &qg.d2q0_time_marginal,
+            &qg.d2q1_time_marginal,
+            &qg.d2qd1_time_marginal,
+        ];
+        let kmm = [
+            &qg.d2q0_marginal_marginal,
+            &qg.d2q1_marginal_marginal,
+            &qg.d2qd1_marginal_marginal,
+        ];
+        let pt = ktt[0].nrows();
+        let pm = kmm[0].nrows();
+        for q in 0..3 {
+            let wq = w[q];
+            if wq == 0.0 {
+                continue;
+            }
+            for a in 0..pt {
+                for b in 0..pt {
+                    self.h_tt[[a, b]] += wq * ktt[q][[a, b]];
+                }
+            }
+            for a in 0..pt {
+                for b in 0..pm {
+                    self.h_tm[[a, b]] += wq * ktm[q][[a, b]];
+                }
+            }
+            for a in 0..pm {
+                for b in 0..pm {
+                    self.h_mm[[a, b]] += wq * kmm[q][[a, b]];
+                }
+            }
+        }
+    }
+
+    /// Rank-1 psi cross with actual Jacobians from q-geometry
+    fn add_rank1_psi_cross_with_q_geometry(
+        &mut self,
+        family: &SurvivalMarginalSlopeFamily,
+        row: usize,
+        qg: &SurvivalMarginalSlopeDynamicRow,
+        psi_block: usize,
+        psi_row: &Array1<f64>,
+        rp: &Array1<f64>,
+    ) {
+        let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
+        let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
+        let pt = jt[0].len();
+        let pm = jm[0].len();
+        for a in 0..pt {
+            let mut w = 0.0;
+            for q in 0..3 {
+                w += rp[q] * jt[q][a];
+            }
+            if w == 0.0 {
+                continue;
+            }
+            let tgt = match psi_block {
+                1 => &mut self.h_tm,
+                2 => &mut self.h_tg,
+                _ => continue,
+            };
+            for b in 0..psi_row.len() {
+                tgt[[a, b]] += w * psi_row[b];
+            }
+        }
+        for a in 0..pm {
+            let mut w = 0.0;
+            for q in 0..3 {
+                w += rp[q] * jm[q][a];
+            }
+            if w == 0.0 {
+                continue;
+            }
+            match psi_block {
+                1 => {
+                    for b in 0..psi_row.len() {
+                        self.h_mm[[a, b]] += w * psi_row[b];
+                        self.h_mm[[b, a]] += w * psi_row[b];
+                    }
+                }
+                2 => {
+                    for b in 0..psi_row.len() {
+                        self.h_mg[[a, b]] += w * psi_row[b];
+                    }
+                }
+                _ => {}
+            }
+        }
+        let gc = family.logslope_design.row_chunk(row..row + 1);
+        let gr = gc.row(0);
+        let gw = rp[3];
+        if gw != 0.0 {
+            match psi_block {
+                1 => {
+                    for a in 0..gr.len() {
+                        for b in 0..psi_row.len() {
+                            self.h_mg[[b, a]] += gw * gr[a] * psi_row[b];
+                        }
+                    }
+                }
+                2 => {
+                    for a in 0..gr.len() {
+                        for b in 0..psi_row.len() {
+                            self.h_gg[[a, b]] += gw * gr[a] * psi_row[b];
+                            self.h_gg[[b, a]] += gw * gr[a] * psi_row[b];
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let pl = flex_primary_slices(family);
+        if let Some(hr) = pl.h.as_ref() {
+            for li in 0..hr.len() {
+                let hw = rp[hr.start + li];
+                if hw == 0.0 {
+                    continue;
+                }
+                match psi_block {
+                    1 => {
+                        for b in 0..psi_row.len() {
+                            self.h_mh[[b, li]] += hw * psi_row[b];
+                        }
+                    }
+                    2 => {
+                        for b in 0..psi_row.len() {
+                            self.h_gh[[b, li]] += hw * psi_row[b];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(wr) = pl.w.as_ref() {
+            for li in 0..wr.len() {
+                let ww = rp[wr.start + li];
+                if ww == 0.0 {
+                    continue;
+                }
+                match psi_block {
+                    1 => {
+                        for b in 0..psi_row.len() {
+                            self.h_mw[[b, li]] += ww * psi_row[b];
+                        }
+                    }
+                    2 => {
+                        for b in 0..psi_row.len() {
+                            self.h_gw[[b, li]] += ww * psi_row[b];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// Block-structured HyperOperator for survival marginal-slope psi Hessians.
 /// Stores the full 5-block exact joint Hessian layout and performs matvec
 /// blockwise instead of materializing dense p×p structure in the outer path.
@@ -1287,245 +1917,6 @@ impl HyperOperator for BlockHessianOperator {
         let v_m = v.slice(s![self.slices.marginal.clone()]);
         let v_g = v.slice(s![self.slices.logslope.clone()]);
         let v_h = self
-            /*
-            // This file contains the lifted pullback methods for BlockHessianAccumulator.
-            // It will be included via a separate impl block.
-            // The methods implement eq (15), (47) terms 1-5 from the unified row-primary
-            // pullback framework for flexible survival with timewiggle.
-            impl BlockHessianAccumulator {
-                /// Lifted pullback: J^T H J + Σ_a f_a K_a using actual Jacobians from
-                /// q-geometry. Handles timewiggle T'(h) factors and K ≠ 0 correctly.
-                fn add_pullback_with_q_geometry(
-                    &mut self, family: &SurvivalMarginalSlopeFamily, row: usize,
-                    qg: &SurvivalMarginalSlopeDynamicRow, fg: &Array1<f64>, ph: &Array2<f64>,
-                ) {
-                    let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
-                    let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
-                    let ktt = [&qg.d2q0_time_time, &qg.d2q1_time_time, &qg.d2qd1_time_time];
-                    let ktm = [&qg.d2q0_time_marginal, &qg.d2q1_time_marginal, &qg.d2qd1_time_marginal];
-                    let kmm = [&qg.d2q0_marginal_marginal, &qg.d2q1_marginal_marginal, &qg.d2qd1_marginal_marginal];
-                    let pt = jt[0].len();
-                    let pm = jm[0].len();
-                    for a in 0..pt { for b in 0..pt {
-                        let mut v = 0.0;
-                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * jt[u][a] * jt[w][b]; } }
-                        for u in 0..3 { v += fg[u] * ktt[u][[a,b]]; }
-                        self.h_tt[[a,b]] += v;
-                    }}
-                    for a in 0..pm { for b in 0..pm {
-                        let mut v = 0.0;
-                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * jm[u][a] * jm[w][b]; } }
-                        for u in 0..3 { v += fg[u] * kmm[u][[a,b]]; }
-                        self.h_mm[[a,b]] += v;
-                    }}
-                    family.logslope_design.syr_row_into(row, ph[[3,3]], &mut self.h_gg).expect("gg syr");
-                    for a in 0..pt { for b in 0..pm {
-                        let mut v = 0.0;
-                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * jt[u][a] * jm[w][b]; } }
-                        for u in 0..3 { v += fg[u] * ktm[u][[a,b]]; }
-                        self.h_tm[[a,b]] += v;
-                    }}
-                    let gc = family.logslope_design.row_chunk(row..row+1);
-                    let gr = gc.row(0);
-                    for a in 0..pt {
-                        let mut w = 0.0; for u in 0..3 { w += ph[[u,3]] * jt[u][a]; }
-                        if w != 0.0 { for b in 0..gr.len() { self.h_tg[[a,b]] += w * gr[b]; } }
-                    }
-                    for a in 0..pm {
-                        let mut w = 0.0; for u in 0..3 { w += ph[[u,3]] * jm[u][a]; }
-                        if w != 0.0 { for b in 0..gr.len() { self.h_mg[[a,b]] += w * gr[b]; } }
-                    }
-                    let pl = flex_primary_slices(family);
-                    if let Some(hr) = pl.h.as_ref() {
-                        for li in 0..hr.len() { let ix = hr.start+li;
-                            for a in 0..pt { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*jt[u][a]; } self.h_th[[a,li]] += w; }
-                            for a in 0..pm { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*jm[u][a]; } self.h_mh[[a,li]] += w; }
-                            let gw = ph[[3,ix]]; if gw!=0.0 { for b in 0..gr.len() { self.h_gh[[b,li]] += gw*gr[b]; } }
-                        }
-                        for l in 0..hr.len() { for r in 0..hr.len() { self.h_hh[[l,r]] += ph[[hr.start+l,hr.start+r]]; } }
-                    }
-                    if let Some(wr) = pl.w.as_ref() {
-                        for li in 0..wr.len() { let ix = wr.start+li;
-                            for a in 0..pt { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*jt[u][a]; } self.h_tw[[a,li]] += w; }
-                            for a in 0..pm { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*jm[u][a]; } self.h_mw[[a,li]] += w; }
-                            let gw = ph[[3,ix]]; if gw!=0.0 { for b in 0..gr.len() { self.h_gw[[b,li]] += gw*gr[b]; } }
-                        }
-                        for l in 0..wr.len() { for r in 0..wr.len() { self.h_ww[[l,r]] += ph[[wr.start+l,wr.start+r]]; } }
-                    }
-                    if let (Some(hr),Some(wr)) = (pl.h.as_ref(),pl.w.as_ref()) {
-                        for hl in 0..hr.len() { for wl in 0..wr.len() { self.h_hw[[hl,wl]] += ph[[hr.start+hl,wr.start+wl]]; } }
-                    }
-                }
-                /// U^α cross terms (eq 47, terms 1+2): (U_B^α)^T H J_C + J_B^T H U_C^α
-                fn add_timewiggle_psi_u_cross(&mut self, family: &SurvivalMarginalSlopeFamily, row: usize,
-                    qg: &SurvivalMarginalSlopeDynamicRow, lift: &TimewiggleMarginalPsiRowLift, ph: &Array2<f64>)
-                {
-                    let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
-                    let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
-                    let ut = [&lift.u_q0_time, &lift.u_q1_time, &lift.u_qd1_time];
-                    let um = [&lift.u_q0_marginal, &lift.u_q1_marginal, &lift.u_qd1_marginal];
-                    let pt = jt[0].len(); let pm = jm[0].len();
-                    for a in 0..pt { for b in 0..pt {
-                        let mut v = 0.0;
-                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * (ut[u][a]*jt[w][b] + jt[u][a]*ut[w][b]); } }
-                        self.h_tt[[a,b]] += v;
-                    }}
-                    for a in 0..pm { for b in 0..pm {
-                        let mut v = 0.0;
-                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * (um[u][a]*jm[w][b] + jm[u][a]*um[w][b]); } }
-                        self.h_mm[[a,b]] += v;
-                    }}
-                    for a in 0..pt { for b in 0..pm {
-                        let mut v = 0.0;
-                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * (ut[u][a]*jm[w][b] + jt[u][a]*um[w][b]); } }
-                        self.h_tm[[a,b]] += v;
-                    }}
-                    let gc = family.logslope_design.row_chunk(row..row+1); let gr = gc.row(0);
-                    for a in 0..pt {
-                        let mut wt = 0.0; for u in 0..3 { wt += ph[[u,3]] * ut[u][a]; }
-                        if wt != 0.0 { for b in 0..gr.len() { self.h_tg[[a,b]] += wt*gr[b]; } }
-                    }
-                    for a in 0..pm {
-                        let mut wt = 0.0; for u in 0..3 { wt += ph[[u,3]] * um[u][a]; }
-                        if wt != 0.0 { for b in 0..gr.len() { self.h_mg[[a,b]] += wt*gr[b]; } }
-                    }
-                    let pl = flex_primary_slices(family);
-                    if let Some(hr) = pl.h.as_ref() { for li in 0..hr.len() { let ix = hr.start+li;
-                        for a in 0..pt { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*ut[u][a]; } self.h_th[[a,li]] += w; }
-                        for a in 0..pm { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*um[u][a]; } self.h_mh[[a,li]] += w; }
-                    }}
-                    if let Some(wr) = pl.w.as_ref() { for li in 0..wr.len() { let ix = wr.start+li;
-                        for a in 0..pt { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*ut[u][a]; } self.h_tw[[a,li]] += w; }
-                        for a in 0..pm { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*um[u][a]; } self.h_mw[[a,li]] += w; }
-                    }}
-                }
-                /// K^{BC,α} terms (eq 47, term 5): Σ_a f_a K_a^{BC,α}
-                fn add_timewiggle_psi_kappa_alpha(&mut self, family: &SurvivalMarginalSlopeFamily,
-                    lift: &TimewiggleMarginalPsiRowLift, fg: &Array1<f64>)
-                {
-                    let tw = family.time_wiggle_range();
-                    let pb = lift.x_entry_base.len();
-                    let pm = lift.marginal_row.len();
-                    let mu = lift.mu;
-                    // q0 (entry)
-                    let fq0 = fg[0];
-                    if fq0 != 0.0 {
-                        let (m3,m2) = (lift.entry_m3, lift.entry_m2);
-                        for i in 0..pb { for j in 0..pb { self.h_tt[[i,j]] += fq0*m3*mu*lift.x_entry_base[i]*lift.x_entry_base[j]; } }
-                        for loc in 0..tw.len() { let ti=tw.start+loc; for i in 0..pb {
-                            let v = fq0*lift.entry_basis_d2[loc]*mu*lift.x_entry_base[i]; self.h_tt[[i,ti]] += v; self.h_tt[[ti,i]] += v;
-                        }}
-                        for i in 0..pb { for j in 0..pm {
-                            self.h_tm[[i,j]] += fq0*(m3*mu*lift.x_entry_base[i]*lift.marginal_row[j] + m2*lift.x_entry_base[i]*lift.psi_row[j]);
-                        }}
-                        for loc in 0..tw.len() { let ti=tw.start+loc; for j in 0..pm {
-                            self.h_tm[[ti,j]] += fq0*(lift.entry_basis_d2[loc]*mu*lift.marginal_row[j] + lift.entry_basis_d1[loc]*lift.psi_row[j]);
-                        }}
-                        for i in 0..pm { for j in 0..pm {
-                            self.h_mm[[i,j]] += fq0*(m3*mu*lift.marginal_row[i]*lift.marginal_row[j]
-                                + m2*(lift.psi_row[i]*lift.marginal_row[j]+lift.marginal_row[i]*lift.psi_row[j]));
-                        }}
-                    }
-                    // q1 (exit)
-                    let fq1 = fg[1];
-                    if fq1 != 0.0 {
-                        let (m3,m2) = (lift.exit_m3, lift.exit_m2);
-                        for i in 0..pb { for j in 0..pb { self.h_tt[[i,j]] += fq1*m3*mu*lift.x_exit_base[i]*lift.x_exit_base[j]; } }
-                        for loc in 0..tw.len() { let ti=tw.start+loc; for i in 0..pb {
-                            let v = fq1*lift.exit_basis_d2[loc]*mu*lift.x_exit_base[i]; self.h_tt[[i,ti]] += v; self.h_tt[[ti,i]] += v;
-                        }}
-                        for i in 0..pb { for j in 0..pm {
-                            self.h_tm[[i,j]] += fq1*(m3*mu*lift.x_exit_base[i]*lift.marginal_row[j] + m2*lift.x_exit_base[i]*lift.psi_row[j]);
-                        }}
-                        for loc in 0..tw.len() { let ti=tw.start+loc; for j in 0..pm {
-                            self.h_tm[[ti,j]] += fq1*(lift.exit_basis_d2[loc]*mu*lift.marginal_row[j] + lift.exit_basis_d1[loc]*lift.psi_row[j]);
-                        }}
-                        for i in 0..pm { for j in 0..pm {
-                            self.h_mm[[i,j]] += fq1*(m3*mu*lift.marginal_row[i]*lift.marginal_row[j]
-                                + m2*(lift.psi_row[i]*lift.marginal_row[j]+lift.marginal_row[i]*lift.psi_row[j]));
-                        }}
-                    }
-                    // qd1 (exit, includes d_raw)
-                    let fqd = fg[2];
-                    if fqd != 0.0 {
-                        let (m4,m3,m2,dr) = (lift.exit_m4, lift.exit_m3, lift.exit_m2, lift.d_raw);
-                        for i in 0..pb { for j in 0..pb {
-                            self.h_tt[[i,j]] += fqd*(m4*mu*dr*lift.x_exit_base[i]*lift.x_exit_base[j]
-                                + m3*mu*(lift.x_exit_base[i]*lift.x_deriv_base[j]+lift.x_deriv_base[i]*lift.x_exit_base[j]));
-                        }}
-                        for loc in 0..tw.len() { let ti=tw.start+loc; for i in 0..pb {
-                            let v = fqd*(lift.exit_basis_d3[loc]*mu*dr*lift.x_exit_base[i] + lift.exit_basis_d2[loc]*mu*lift.x_deriv_base[i]);
-                            self.h_tt[[i,ti]] += v; self.h_tt[[ti,i]] += v;
-                        }}
-                        for i in 0..pb { for j in 0..pm {
-                            self.h_tm[[i,j]] += fqd*(m4*mu*dr*lift.x_exit_base[i]*lift.marginal_row[j]
-                                + m3*dr*lift.x_exit_base[i]*lift.psi_row[j]
-                                + m3*mu*lift.x_deriv_base[i]*lift.marginal_row[j]
-                                + m2*lift.x_deriv_base[i]*lift.psi_row[j]);
-                        }}
-                        for loc in 0..tw.len() { let ti=tw.start+loc; for j in 0..pm {
-                            self.h_tm[[ti,j]] += fqd*(lift.exit_basis_d3[loc]*mu*dr*lift.marginal_row[j] + lift.exit_basis_d2[loc]*dr*lift.psi_row[j]);
-                        }}
-                        for i in 0..pm { for j in 0..pm {
-                            self.h_mm[[i,j]] += fqd*(m4*mu*dr*lift.marginal_row[i]*lift.marginal_row[j]
-                                + m3*dr*(lift.psi_row[i]*lift.marginal_row[j]+lift.marginal_row[i]*lift.psi_row[j]));
-                        }}
-                    }
-                }
-                /// Σ_a w_a K_a^{BC}: second-pullback weighted by arbitrary vector (eq 47, term 4)
-                fn add_second_pullback_weighted(&mut self, qg: &SurvivalMarginalSlopeDynamicRow, w: &Array1<f64>) {
-                    let ktt = [&qg.d2q0_time_time, &qg.d2q1_time_time, &qg.d2qd1_time_time];
-                    let ktm = [&qg.d2q0_time_marginal, &qg.d2q1_time_marginal, &qg.d2qd1_time_marginal];
-                    let kmm = [&qg.d2q0_marginal_marginal, &qg.d2q1_marginal_marginal, &qg.d2qd1_marginal_marginal];
-                    let pt = ktt[0].nrows(); let pm = kmm[0].nrows();
-                    for q in 0..3 { let wq = w[q]; if wq == 0.0 { continue; }
-                        for a in 0..pt { for b in 0..pt { self.h_tt[[a,b]] += wq * ktt[q][[a,b]]; } }
-                        for a in 0..pt { for b in 0..pm { self.h_tm[[a,b]] += wq * ktm[q][[a,b]]; } }
-                        for a in 0..pm { for b in 0..pm { self.h_mm[[a,b]] += wq * kmm[q][[a,b]]; } }
-                    }
-                }
-                /// Rank-1 psi cross with actual Jacobians from q-geometry
-                fn add_rank1_psi_cross_with_q_geometry(&mut self, family: &SurvivalMarginalSlopeFamily,
-                    row: usize, qg: &SurvivalMarginalSlopeDynamicRow, psi_block: usize,
-                    psi_row: &Array1<f64>, rp: &Array1<f64>)
-                {
-                    let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
-                    let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
-                    let pt = jt[0].len(); let pm = jm[0].len();
-                    for a in 0..pt {
-                        let mut w = 0.0; for q in 0..3 { w += rp[q]*jt[q][a]; }
-                        if w == 0.0 { continue; }
-                        let tgt = match psi_block { 1 => &mut self.h_tm, 2 => &mut self.h_tg, _ => continue };
-                        for b in 0..psi_row.len() { tgt[[a,b]] += w*psi_row[b]; }
-                    }
-                    for a in 0..pm {
-                        let mut w = 0.0; for q in 0..3 { w += rp[q]*jm[q][a]; }
-                        if w == 0.0 { continue; }
-                        match psi_block {
-                            1 => { for b in 0..psi_row.len() { self.h_mm[[a,b]] += w*psi_row[b]; self.h_mm[[b,a]] += w*psi_row[b]; } }
-                            2 => { for b in 0..psi_row.len() { self.h_mg[[a,b]] += w*psi_row[b]; } }
-                            _ => {}
-                        }
-                    }
-                    let gc = family.logslope_design.row_chunk(row..row+1); let gr = gc.row(0);
-                    let gw = rp[3];
-                    if gw != 0.0 { match psi_block {
-                        1 => { for a in 0..gr.len() { for b in 0..psi_row.len() { self.h_mg[[b,a]] += gw*gr[a]*psi_row[b]; } } }
-                        2 => { for a in 0..gr.len() { for b in 0..psi_row.len() { self.h_gg[[a,b]] += gw*gr[a]*psi_row[b]; self.h_gg[[b,a]] += gw*gr[a]*psi_row[b]; } } }
-                        _ => {}
-                    }}
-                    let pl = flex_primary_slices(family);
-                    if let Some(hr) = pl.h.as_ref() { for li in 0..hr.len() { let hw = rp[hr.start+li]; if hw==0.0 { continue; }
-                        match psi_block { 1 => { for b in 0..psi_row.len() { self.h_mh[[b,li]] += hw*psi_row[b]; } }
-                                          2 => { for b in 0..psi_row.len() { self.h_gh[[b,li]] += hw*psi_row[b]; } } _ => {} }
-                    }}
-                    if let Some(wr) = pl.w.as_ref() { for li in 0..wr.len() { let ww = rp[wr.start+li]; if ww==0.0 { continue; }
-                        match psi_block { 1 => { for b in 0..psi_row.len() { self.h_mw[[b,li]] += ww*psi_row[b]; } }
-                                          2 => { for b in 0..psi_row.len() { self.h_gw[[b,li]] += ww*psi_row[b]; } } _ => {} }
-                    }}
-                }
-            }
-                        */
             .slices
             .score_warp
             .as_ref()
@@ -1988,30 +2379,42 @@ impl SurvivalMarginalSlopeFamily {
         let basis_d1 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 1)?;
         let basis_d2 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 2)?;
         let basis_d3 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 3)?;
+        let basis_d4 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 4)?;
+        let basis_d5 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 5)?;
         if basis.ncols() != beta_w.len()
             || basis_d1.ncols() != beta_w.len()
             || basis_d2.ncols() != beta_w.len()
             || basis_d3.ncols() != beta_w.len()
+            || basis_d4.ncols() != beta_w.len()
+            || basis_d5.ncols() != beta_w.len()
         {
             return Err(format!(
-                "survival marginal-slope timewiggle basis/beta mismatch: B={} B'={} B''={} B'''={} betaw={}",
+                "survival marginal-slope timewiggle basis/beta mismatch: B..B'''''={},{},{},{},{},{} betaw={}",
                 basis.ncols(),
                 basis_d1.ncols(),
                 basis_d2.ncols(),
                 basis_d3.ncols(),
+                basis_d4.ncols(),
+                basis_d5.ncols(),
                 beta_w.len()
             ));
         }
         let dq_dq0 = basis_d1.dot(&beta_w) + 1.0;
         let d2q_dq02 = basis_d2.dot(&beta_w);
         let d3q_dq03 = basis_d3.dot(&beta_w);
+        let d4q_dq04 = basis_d4.dot(&beta_w);
+        let d5q_dq05 = basis_d5.dot(&beta_w);
         Ok(Some(SurvivalTimeWiggleGeometry {
             basis,
             basis_d1,
             basis_d2,
+            basis_d3,
+            basis_d4,
             dq_dq0,
             d2q_dq02,
             d3q_dq03,
+            d4q_dq04,
+            d5q_dq05,
         }))
     }
 
@@ -2188,7 +2591,7 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
-        primary: &FlexPrimarySlices,
+        primary_layout: Option<&FlexPrimarySlices>,
         psi_row: &Array1<f64>,
         beta_marginal: &Array1<f64>,
     ) -> Result<TimewiggleMarginalPsiRowLift, String> {
@@ -2222,10 +2625,13 @@ impl SurvivalMarginalSlopeFamily {
             .ok_or_else(|| "missing exit timewiggle geometry for marginal psi lift".to_string())?;
 
         let mu = psi_row.dot(beta_marginal);
-        let mut dir = Array1::<f64>::zeros(primary.total);
-        dir[primary.q0] = entry_geom.dq_dq0[0] * mu;
-        dir[primary.q1] = exit_geom.dq_dq0[0] * mu;
-        dir[primary.qd1] = exit_geom.d2q_dq02[0] * d_raw * mu;
+        let mut dir = Array1::<f64>::zeros(primary_layout.map_or(N_PRIMARY, |primary| primary.total));
+        let q0_idx = primary_layout.map_or(0, |primary| primary.q0);
+        let q1_idx = primary_layout.map_or(1, |primary| primary.q1);
+        let qd1_idx = primary_layout.map_or(2, |primary| primary.qd1);
+        dir[q0_idx] = entry_geom.dq_dq0[0] * mu;
+        dir[q1_idx] = exit_geom.dq_dq0[0] * mu;
+        dir[qd1_idx] = exit_geom.d2q_dq02[0] * d_raw * mu;
 
         let mut u_q0_time = Array1::<f64>::zeros(p_time);
         let mut u_q1_time = Array1::<f64>::zeros(p_time);
@@ -2277,386 +2683,6 @@ impl SurvivalMarginalSlopeFamily {
             mu,
             psi_row: psi_row.clone(),
         })
-    }
-
-    fn pullback_dynamic_primary_vector_positive(
-        &self,
-        row: usize,
-        slices: &BlockSlices,
-        q_geom: &SurvivalMarginalSlopeDynamicRow,
-        primary: ndarray::ArrayView1<'_, f64>,
-        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
-    ) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(slices.total);
-        for coeff_idx in 0..slices.time.len() {
-            out[slices.time.start + coeff_idx] += primary[0] * q_geom.dq0_time[coeff_idx]
-                + primary[1] * q_geom.dq1_time[coeff_idx]
-                + primary[2] * q_geom.dqd1_time[coeff_idx];
-        }
-        for coeff_idx in 0..slices.marginal.len() {
-            out[slices.marginal.start + coeff_idx] += primary[0] * q_geom.dq0_marginal[coeff_idx]
-                + primary[1] * q_geom.dq1_marginal[coeff_idx]
-                + primary[2] * q_geom.dqd1_marginal[coeff_idx];
-        }
-        let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
-        let logslope_row = logslope_chunk.row(0);
-        for coeff_idx in 0..slices.logslope.len() {
-            out[slices.logslope.start + coeff_idx] += primary[3] * logslope_row[coeff_idx];
-        }
-        for (primary_range, joint_range) in identity_blocks {
-            out.slice_mut(s![joint_range.clone()])
-                .assign(&primary.slice(s![primary_range.clone()]));
-        }
-        out
-    }
-
-    fn accumulate_dynamic_q_joint_row_positive(
-        &self,
-        row: usize,
-        slices: &BlockSlices,
-        q_geom: &SurvivalMarginalSlopeDynamicRow,
-        primary_gradient: ndarray::ArrayView1<'_, f64>,
-        primary_hessian: ArrayView2<'_, f64>,
-        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
-        joint_gradient: &mut Array1<f64>,
-        joint_hessian: &mut Array2<f64>,
-    ) -> Result<(), String> {
-        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
-        let dq_marginal = [
-            &q_geom.dq0_marginal,
-            &q_geom.dq1_marginal,
-            &q_geom.dqd1_marginal,
-        ];
-        for (q_idx, dq) in dq_time.iter().enumerate() {
-            for coeff_idx in 0..dq.len() {
-                joint_gradient[slices.time.start + coeff_idx] +=
-                    primary_gradient[q_idx] * dq[coeff_idx];
-            }
-        }
-        for (q_idx, dq) in dq_marginal.iter().enumerate() {
-            for coeff_idx in 0..dq.len() {
-                joint_gradient[slices.marginal.start + coeff_idx] +=
-                    primary_gradient[q_idx] * dq[coeff_idx];
-            }
-        }
-        self.logslope_design.axpy_row_into(
-            row,
-            primary_gradient[3],
-            &mut joint_gradient.slice_mut(s![slices.logslope.clone()]),
-        )?;
-        self.accumulate_dynamic_q_core_hessian(
-            row,
-            slices,
-            q_geom,
-            primary_gradient.slice(s![0..N_PRIMARY]),
-            primary_hessian.slice(s![0..N_PRIMARY, 0..N_PRIMARY]),
-            joint_hessian,
-        );
-        for (primary_range, joint_range) in identity_blocks {
-            for local in 0..primary_range.len() {
-                joint_gradient[joint_range.start + local] +=
-                    primary_gradient[primary_range.start + local];
-                self.accumulate_identity_primary_cross_hessian(
-                    row,
-                    slices,
-                    q_geom,
-                    primary_hessian.slice(s![0..N_PRIMARY, primary_range.start + local]),
-                    joint_range,
-                    local,
-                    joint_hessian,
-                );
-            }
-            self.add_dense_submatrix(
-                joint_hessian,
-                joint_range,
-                joint_range,
-                primary_hessian.slice(s![primary_range.clone(), primary_range.clone()]),
-            );
-        }
-        if identity_blocks.len() == 2 {
-            self.add_dense_symmetric_cross_submatrix(
-                joint_hessian,
-                &identity_blocks[0].1,
-                &identity_blocks[1].1,
-                primary_hessian.slice(s![
-                    identity_blocks[0].0.clone(),
-                    identity_blocks[1].0.clone()
-                ]),
-            );
-        }
-        Ok(())
-    }
-
-    fn add_symmetric_outer_dense(
-        &self,
-        joint_hessian: &mut Array2<f64>,
-        left: &Array1<f64>,
-        right: &Array1<f64>,
-    ) {
-        for i in 0..left.len() {
-            if left[i] == 0.0 {
-                continue;
-            }
-            for j in 0..right.len() {
-                let value = left[i] * right[j] + right[i] * left[j];
-                if value != 0.0 {
-                    joint_hessian[[i, j]] += value;
-                }
-            }
-        }
-    }
-
-    fn timewiggle_marginal_psi_left_joint(
-        &self,
-        slices: &BlockSlices,
-        q_idx: usize,
-        lift: &TimewiggleMarginalPsiRowLift,
-    ) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(slices.total);
-        match q_idx {
-            0 => {
-                out.slice_mut(s![slices.time.clone()])
-                    .assign(&lift.u_q0_time);
-                out.slice_mut(s![slices.marginal.clone()])
-                    .assign(&lift.u_q0_marginal);
-            }
-            1 => {
-                out.slice_mut(s![slices.time.clone()])
-                    .assign(&lift.u_q1_time);
-                out.slice_mut(s![slices.marginal.clone()])
-                    .assign(&lift.u_q1_marginal);
-            }
-            2 => {
-                out.slice_mut(s![slices.time.clone()])
-                    .assign(&lift.u_qd1_time);
-                out.slice_mut(s![slices.marginal.clone()])
-                    .assign(&lift.u_qd1_marginal);
-            }
-            _ => {}
-        }
-        out
-    }
-
-    fn add_timewiggle_marginal_psi_kappa_dense(
-        &self,
-        slices: &BlockSlices,
-        lift: &TimewiggleMarginalPsiRowLift,
-        primary_gradient: ndarray::ArrayView1<'_, f64>,
-        joint_hessian: &mut Array2<f64>,
-    ) {
-        let time_tail = self.time_wiggle_range();
-        let p_base = lift.x_entry_base.len();
-        let p_marginal = lift.marginal_row.len();
-        let t0 = slices.time.start;
-        let m0 = slices.marginal.start;
-
-        let add_tt_sym = |joint_hessian: &mut Array2<f64>, i: usize, j: usize, value: f64| {
-            if value == 0.0 {
-                return;
-            }
-            joint_hessian[[i, j]] += value;
-            if i != j {
-                joint_hessian[[j, i]] += value;
-            }
-        };
-        let add_tm_sym = |joint_hessian: &mut Array2<f64>, i: usize, j: usize, value: f64| {
-            if value == 0.0 {
-                return;
-            }
-            joint_hessian[[i, j]] += value;
-            joint_hessian[[j, i]] += value;
-        };
-
-        let fq0 = primary_gradient[0];
-        if fq0 != 0.0 {
-            for i in 0..p_base {
-                for j in i..p_base {
-                    add_tt_sym(
-                        joint_hessian,
-                        t0 + i,
-                        t0 + j,
-                        fq0 * lift.entry_m3 * lift.mu * lift.x_entry_base[i] * lift.x_entry_base[j],
-                    );
-                }
-            }
-            for local in 0..time_tail.len() {
-                let tw = t0 + time_tail.start + local;
-                for i in 0..p_base {
-                    add_tt_sym(
-                        joint_hessian,
-                        t0 + i,
-                        tw,
-                        fq0 * lift.entry_basis_d2[local] * lift.mu * lift.x_entry_base[i],
-                    );
-                }
-            }
-            for i in 0..p_base {
-                for j in 0..p_marginal {
-                    add_tm_sym(
-                        joint_hessian,
-                        t0 + i,
-                        m0 + j,
-                        fq0 * (lift.entry_m3
-                            * lift.mu
-                            * lift.x_entry_base[i]
-                            * lift.marginal_row[j]
-                            + lift.entry_m2 * lift.x_entry_base[i] * lift.psi_row[j]),
-                    );
-                }
-            }
-            for local in 0..time_tail.len() {
-                let tw = t0 + time_tail.start + local;
-                for j in 0..p_marginal {
-                    add_tm_sym(
-                        joint_hessian,
-                        tw,
-                        m0 + j,
-                        fq0 * (lift.entry_basis_d2[local] * lift.mu * lift.marginal_row[j]
-                            + lift.entry_basis_d1[local] * lift.psi_row[j]),
-                    );
-                }
-            }
-            for i in 0..p_marginal {
-                for j in 0..p_marginal {
-                    joint_hessian[[m0 + i, m0 + j]] += fq0
-                        * (lift.entry_m3 * lift.mu * lift.marginal_row[i] * lift.marginal_row[j]
-                            + lift.entry_m2
-                                * (lift.psi_row[i] * lift.marginal_row[j]
-                                    + lift.marginal_row[i] * lift.psi_row[j]));
-                }
-            }
-        }
-
-        let fq1 = primary_gradient[1];
-        if fq1 != 0.0 {
-            for i in 0..p_base {
-                for j in i..p_base {
-                    add_tt_sym(
-                        joint_hessian,
-                        t0 + i,
-                        t0 + j,
-                        fq1 * lift.exit_m3 * lift.mu * lift.x_exit_base[i] * lift.x_exit_base[j],
-                    );
-                }
-            }
-            for local in 0..time_tail.len() {
-                let tw = t0 + time_tail.start + local;
-                for i in 0..p_base {
-                    add_tt_sym(
-                        joint_hessian,
-                        t0 + i,
-                        tw,
-                        fq1 * lift.exit_basis_d2[local] * lift.mu * lift.x_exit_base[i],
-                    );
-                }
-            }
-            for i in 0..p_base {
-                for j in 0..p_marginal {
-                    add_tm_sym(
-                        joint_hessian,
-                        t0 + i,
-                        m0 + j,
-                        fq1 * (lift.exit_m3 * lift.mu * lift.x_exit_base[i] * lift.marginal_row[j]
-                            + lift.exit_m2 * lift.x_exit_base[i] * lift.psi_row[j]),
-                    );
-                }
-            }
-            for local in 0..time_tail.len() {
-                let tw = t0 + time_tail.start + local;
-                for j in 0..p_marginal {
-                    add_tm_sym(
-                        joint_hessian,
-                        tw,
-                        m0 + j,
-                        fq1 * (lift.exit_basis_d2[local] * lift.mu * lift.marginal_row[j]
-                            + lift.exit_basis_d1[local] * lift.psi_row[j]),
-                    );
-                }
-            }
-            for i in 0..p_marginal {
-                for j in 0..p_marginal {
-                    joint_hessian[[m0 + i, m0 + j]] += fq1
-                        * (lift.exit_m3 * lift.mu * lift.marginal_row[i] * lift.marginal_row[j]
-                            + lift.exit_m2
-                                * (lift.psi_row[i] * lift.marginal_row[j]
-                                    + lift.marginal_row[i] * lift.psi_row[j]));
-                }
-            }
-        }
-
-        let fqd1 = primary_gradient[2];
-        if fqd1 != 0.0 {
-            for i in 0..p_base {
-                for j in i..p_base {
-                    let value = fqd1
-                        * (lift.exit_m4
-                            * lift.mu
-                            * lift.d_raw
-                            * lift.x_exit_base[i]
-                            * lift.x_exit_base[j]
-                            + lift.exit_m3
-                                * lift.mu
-                                * (lift.x_exit_base[i] * lift.x_deriv_base[j]
-                                    + lift.x_deriv_base[i] * lift.x_exit_base[j]));
-                    add_tt_sym(joint_hessian, t0 + i, t0 + j, value);
-                }
-            }
-            for local in 0..time_tail.len() {
-                let tw = t0 + time_tail.start + local;
-                for i in 0..p_base {
-                    let value = fqd1
-                        * (lift.exit_basis_d3[local] * lift.mu * lift.d_raw * lift.x_exit_base[i]
-                            + lift.exit_basis_d2[local] * lift.mu * lift.x_deriv_base[i]);
-                    add_tt_sym(joint_hessian, t0 + i, tw, value);
-                }
-            }
-            for i in 0..p_base {
-                for j in 0..p_marginal {
-                    add_tm_sym(
-                        joint_hessian,
-                        t0 + i,
-                        m0 + j,
-                        fqd1 * (lift.exit_m4
-                            * lift.mu
-                            * lift.d_raw
-                            * lift.x_exit_base[i]
-                            * lift.marginal_row[j]
-                            + lift.exit_m3 * lift.d_raw * lift.x_exit_base[i] * lift.psi_row[j]
-                            + lift.exit_m3 * lift.mu * lift.x_deriv_base[i] * lift.marginal_row[j]
-                            + lift.exit_m2 * lift.x_deriv_base[i] * lift.psi_row[j]),
-                    );
-                }
-            }
-            for local in 0..time_tail.len() {
-                let tw = t0 + time_tail.start + local;
-                for j in 0..p_marginal {
-                    add_tm_sym(
-                        joint_hessian,
-                        tw,
-                        m0 + j,
-                        fqd1 * (lift.exit_basis_d3[local]
-                            * lift.mu
-                            * lift.d_raw
-                            * lift.marginal_row[j]
-                            + lift.exit_basis_d2[local] * lift.d_raw * lift.psi_row[j]),
-                    );
-                }
-            }
-            for i in 0..p_marginal {
-                for j in 0..p_marginal {
-                    joint_hessian[[m0 + i, m0 + j]] += fqd1
-                        * (lift.exit_m4
-                            * lift.mu
-                            * lift.d_raw
-                            * lift.marginal_row[i]
-                            * lift.marginal_row[j]
-                            + lift.exit_m3
-                                * lift.d_raw
-                                * (lift.psi_row[i] * lift.marginal_row[j]
-                                    + lift.marginal_row[i] * lift.psi_row[j]));
-                }
-            }
-        }
     }
 
     fn time_derivative_lower_bound(&self) -> f64 {
@@ -3884,63 +3910,6 @@ impl SurvivalMarginalSlopeFamily {
         (&base.gradient, &base.hessian)
     }
 
-    fn row_flex_primary_point(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        primary: &FlexPrimarySlices,
-    ) -> Result<Array1<f64>, String> {
-        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-        let mut point = Array1::<f64>::zeros(primary.total);
-        point[primary.q0] = q_geom.q0;
-        point[primary.q1] = q_geom.q1;
-        point[primary.qd1] = q_geom.qd1;
-        point[primary.g] = block_states[2].eta[row];
-        if let (Some(range), Some(beta)) = (primary.h.as_ref(), self.flex_score_beta(block_states)?)
-        {
-            point.slice_mut(s![range.clone()]).assign(beta);
-        }
-        if let (Some(range), Some(beta)) = (primary.w.as_ref(), self.flex_link_beta(block_states)?)
-        {
-            point.slice_mut(s![range.clone()]).assign(beta);
-        }
-        Ok(point)
-    }
-
-    fn row_flex_primary_hessian_at_point(
-        &self,
-        row: usize,
-        primary: &FlexPrimarySlices,
-        point: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        if point.len() != primary.total {
-            return Err(format!(
-                "survival flex primary point length mismatch: got {}, expected {}",
-                point.len(),
-                primary.total
-            ));
-        }
-        let beta_h = primary
-            .h
-            .as_ref()
-            .map(|range| point.slice(s![range.clone()]).to_owned());
-        let beta_w = primary
-            .w
-            .as_ref()
-            .map(|range| point.slice(s![range.clone()]).to_owned());
-        let (_, _, hess) = self.compute_row_flex_primary_gradient_hessian_from_parts(
-            row,
-            point[primary.q0],
-            point[primary.q1],
-            point[primary.qd1],
-            point[primary.g],
-            beta_h.as_ref(),
-            beta_w.as_ref(),
-            primary,
-        )?;
-        Ok(hess)
-    }
-
     fn finalize_dense_joint_working_sets(
         &self,
         slices: &BlockSlices,
@@ -4334,29 +4303,1247 @@ impl SurvivalMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn row_flex_primary_third_contracted_fd(
+    /// Second-order cross-coefficient for parameter pair (u, v) from the
+    /// b-family.  In survival, the only b-coupling is through g (the slope
+    /// parameter), so this is nonzero only when u==g or v==g.
+    fn cell_pair_second_coeff(
+        &self,
+        primary: &FlexPrimarySlices,
+        coeff_bu: &[[f64; 4]],
+        u: usize,
+        v: usize,
+    ) -> [f64; 4] {
+        if u == primary.g {
+            coeff_bu[v]
+        } else if v == primary.g {
+            coeff_bu[u]
+        } else {
+            [0.0; 4]
+        }
+    }
+
+    /// Third-order a-cross-coefficient for parameter pair (u, v) from the
+    /// ab-family. Nonzero only when u==g or v==g.
+    fn cell_pair_third_coeff_a(
+        &self,
+        primary: &FlexPrimarySlices,
+        coeff_abu: &[[f64; 4]],
+        u: usize,
+        v: usize,
+    ) -> [f64; 4] {
+        if u == primary.g {
+            coeff_abu[v]
+        } else if v == primary.g {
+            coeff_abu[u]
+        } else {
+            [0.0; 4]
+        }
+    }
+
+    /// Directional derivative of the fixed eta second partial r_uv w.r.t.
+    /// a contraction direction.  Only (g,g), (g,h), (g,w) entries are nonzero.
+    fn observed_fixed_eta_second_partial_dir(
+        &self,
+        primary: &FlexPrimarySlices,
+        obs: &ObservedDenestedCellPartials,
+        u: usize,
+        v: usize,
+        z_obs: f64,
+        u_obs: f64,
+        a: f64,
+        b: f64,
+        a_dir: f64,
+        dir: &Array1<f64>,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<f64, String> {
+        let scale = self.probit_frailty_scale();
+        if u == primary.g && v == primary.g {
+            let dc_dbbb_val = {
+                let zero_span = exact_kernel::LocalSpanCubic {
+                    left: 0.0, right: 1.0, c0: 0.0, c1: 0.0, c2: 0.0, c3: 0.0,
+                };
+                let link_span_obs = if let (Some(rt), Some(bw)) =
+                    (self.link_dev.as_ref(), beta_w)
+                {
+                    rt.local_cubic_at(bw, u_obs)?
+                } else {
+                    zero_span
+                };
+                let (_, _, _, dc_dbbb_raw) =
+                    exact_kernel::denested_cell_third_partials(link_span_obs);
+                eval_coeff4_at(&scale_coeff4(dc_dbbb_raw, scale), z_obs)
+            };
+            return Ok(
+                eval_coeff4_at(&obs.dc_dabb, z_obs) * a_dir + dc_dbbb_val * dir[primary.g],
+            );
+        }
+        if u == primary.g || v == primary.g {
+            let other = if u == primary.g { v } else { u };
+            if let Some(h_range) = primary.h.as_ref() {
+                if other >= h_range.start && other < h_range.end {
+                    return Ok(0.0);
+                }
+            }
+            if let Some(w_range) = primary.w.as_ref() {
+                if other >= w_range.start && other < w_range.end {
+                    let local_idx = other - w_range.start;
+                    let runtime = self.link_dev.as_ref()
+                        .ok_or_else(|| "missing link runtime".to_string())?;
+                    let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                    let (_, dc_abw, dc_bbw) =
+                        exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                    return Ok(
+                        eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * a_dir
+                            + eval_coeff4_at(&scale_coeff4(dc_bbw, scale), z_obs)
+                                * dir[primary.g],
+                    );
+                }
+            }
+        }
+        Ok(0.0)
+    }
+
+    /// Directional derivative of the fixed chi second partial.
+    fn observed_fixed_chi_second_partial_dir(
+        &self,
+        primary: &FlexPrimarySlices,
+        _obs: &ObservedDenestedCellPartials,
+        u: usize,
+        v: usize,
+        z_obs: f64,
+        u_obs: f64,
+        a: f64,
+        b: f64,
+        a_dir: f64,
+        dir: &Array1<f64>,
+    ) -> Result<f64, String> {
+        let scale = self.probit_frailty_scale();
+        if u == primary.g && v == primary.g {
+            return Ok(0.0);
+        }
+        if u == primary.g || v == primary.g {
+            let other = if u == primary.g { v } else { u };
+            if let Some(w_range) = primary.w.as_ref() {
+                if other >= w_range.start && other < w_range.end {
+                    let local_idx = other - w_range.start;
+                    let runtime = self.link_dev.as_ref()
+                        .ok_or_else(|| "missing link runtime".to_string())?;
+                    let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                    let (_, dc_aabw, dc_abbw, _) =
+                        exact_kernel::link_basis_cell_third_partials(basis_span);
+                    return Ok(
+                        eval_coeff4_at(&scale_coeff4(dc_aabw, scale), z_obs) * a_dir
+                            + eval_coeff4_at(&scale_coeff4(dc_abbw, scale), z_obs)
+                                * dir[primary.g],
+                    );
+                }
+            }
+        }
+        Ok(0.0)
+    }
+
+    /// Compute directional extensions of a timepoint's exact quantities.
+    /// Given the base `SurvivalFlexTimepointExact`, returns the directional
+    /// derivatives eta_uv_dir, chi_uv_dir, d_u_dir, d_uv_dir contracted
+    /// with `dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_survival_timepoint_directional_exact(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        _d_calibration: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        _base: &SurvivalFlexTimepointExact,
+        dir: &Array1<f64>,
+        need_d_uv_dir: bool,
+    ) -> Result<SurvivalFlexTimepointDirectionalExact, String> {
+        let p = primary.total;
+        let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
+
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        let mut f_u = Array1::<f64>::zeros(p);
+        let mut f_au = Array1::<f64>::zeros(p);
+        let mut f_uv = Array2::<f64>::zeros((p, p));
+        let mut f_a_dir = 0.0;
+        let mut f_aa_dir = 0.0;
+        let mut f_au_dir = Array1::<f64>::zeros(p);
+        let mut f_uv_dir = Array2::<f64>::zeros((p, p));
+
+        for cell_entry in &cached.cells {
+            let neg_cell = cell_entry.neg_cell;
+            let state = &cell_entry.state;
+            let fixed = &cell_entry.fixed;
+            let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
+            let neg_dc_daa: [f64; 4] = fixed.dc_daa.map(|v| -v);
+
+            f_a += exact_kernel::cell_first_derivative_from_moments(
+                &neg_dc_da, &state.moments,
+            )?;
+            f_aa += exact_kernel::cell_second_derivative_from_moments(
+                neg_cell, &neg_dc_da, &neg_dc_da, &neg_dc_daa, &state.moments,
+            )?;
+
+            let mut neg_coeff_dir = [0.0; 4];
+            let mut neg_coeff_a_dir = [0.0; 4];
+            let mut neg_coeff_aa_dir = [0.0; 4];
+            for c in 0..p {
+                if dir[c] == 0.0 { continue; }
+                for k in 0..4 {
+                    neg_coeff_dir[k] -= fixed.coeff_u[c][k] * dir[c];
+                    neg_coeff_a_dir[k] -= fixed.coeff_au[c][k] * dir[c];
+                    neg_coeff_aa_dir[k] -= fixed.coeff_aau[c][k] * dir[c];
+                }
+            }
+
+            f_a_dir += exact_kernel::cell_second_derivative_from_moments(
+                neg_cell, &neg_dc_da, &neg_coeff_dir, &neg_coeff_a_dir, &state.moments,
+            )?;
+            f_aa_dir += exact_kernel::cell_third_derivative_from_moments(
+                neg_cell, &neg_dc_da, &neg_dc_da, &neg_coeff_dir,
+                &neg_dc_daa, &neg_coeff_a_dir, &neg_coeff_a_dir, &neg_coeff_aa_dir,
+                &state.moments,
+            )?;
+
+            for u in 0..p {
+                let neg_coeff_u = fixed.coeff_u[u].map(|v| -v);
+                let neg_coeff_au = fixed.coeff_au[u].map(|v| -v);
+
+                f_u[u] += exact_kernel::cell_first_derivative_from_moments(
+                    &neg_coeff_u, &state.moments,
+                )?;
+                f_au[u] += exact_kernel::cell_second_derivative_from_moments(
+                    neg_cell, &neg_dc_da, &neg_coeff_u, &neg_coeff_au, &state.moments,
+                )?;
+
+                let mut neg_coeff_u_dir = [0.0; 4];
+                let mut neg_coeff_au_dir = [0.0; 4];
+                for c in 0..p {
+                    if dir[c] == 0.0 { continue; }
+                    let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                    let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                    for k in 0..4 {
+                        neg_coeff_u_dir[k] -= sc[k] * dir[c];
+                        neg_coeff_au_dir[k] -= sca[k] * dir[c];
+                    }
+                }
+
+                f_au_dir[u] += exact_kernel::cell_third_derivative_from_moments(
+                    neg_cell, &neg_dc_da, &neg_coeff_u, &neg_coeff_dir,
+                    &neg_coeff_au, &neg_coeff_a_dir, &neg_coeff_u_dir, &neg_coeff_au_dir,
+                    &state.moments,
+                )?;
+            }
+
+            for u in 0..p {
+                for v in u..p {
+                    let neg_coeff_u = fixed.coeff_u[u].map(|val| -val);
+                    let neg_coeff_v = fixed.coeff_u[v].map(|val| -val);
+                    let sc_uv = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, v);
+                    let neg_sc_uv = sc_uv.map(|val| -val);
+
+                    let base_val = exact_kernel::cell_second_derivative_from_moments(
+                        neg_cell, &neg_coeff_u, &neg_coeff_v, &neg_sc_uv, &state.moments,
+                    )?;
+                    f_uv[[u, v]] += base_val;
+                    if u != v { f_uv[[v, u]] += base_val; }
+
+                    let mut neg_coeff_u_dir = [0.0; 4];
+                    let mut neg_coeff_v_dir = [0.0; 4];
+                    for c in 0..p {
+                        if dir[c] == 0.0 { continue; }
+                        let sc_uc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                        let sc_vc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
+                        for k in 0..4 {
+                            neg_coeff_u_dir[k] -= sc_uc[k] * dir[c];
+                            neg_coeff_v_dir[k] -= sc_vc[k] * dir[c];
+                        }
+                    }
+
+                    let dir_val = exact_kernel::cell_third_derivative_from_moments(
+                        neg_cell, &neg_coeff_u, &neg_coeff_v, &neg_coeff_dir,
+                        &neg_sc_uv, &neg_coeff_u_dir, &neg_coeff_v_dir,
+                        &[0.0; 4], // third cross vanishes for cubic cells
+                        &state.moments,
+                    )?;
+                    f_uv_dir[[u, v]] += dir_val;
+                    if u != v { f_uv_dir[[v, u]] += dir_val; }
+                }
+            }
+        }
+
+        let phi_q = crate::probability::normal_pdf(q);
+        f_u[q_index] += phi_q;
+        f_uv[[q_index, q_index]] += -q * phi_q;
+        f_uv_dir[[q_index, q_index]] += dir[q_index] * (1.0 - q * q) * phi_q;
+
+        let inv_f_a = 1.0 / f_a;
+        let mut a_u = Array1::<f64>::zeros(p);
+        for u in 0..p { a_u[u] = -f_u[u] * inv_f_a; }
+        let mut a_uv = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let val = -(f_uv[[u, v]]
+                    + f_au[u] * a_u[v] + f_au[v] * a_u[u]
+                    + f_aa * a_u[u] * a_u[v]) * inv_f_a;
+                a_uv[[u, v]] = val;
+                a_uv[[v, u]] = val;
+            }
+        }
+        let a_dir = a_u.dot(dir);
+        let a_u_dir = a_uv.dot(dir);
+        let mut a_uv_dir = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let n_dir = f_uv_dir[[u, v]]
+                    + f_au_dir[u] * a_u[v] + f_au[u] * a_u_dir[v]
+                    + f_au_dir[v] * a_u[u] + f_au[v] * a_u_dir[u]
+                    + f_aa_dir * a_u[u] * a_u[v]
+                    + f_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]);
+                let val = -(n_dir + f_a_dir * a_uv[[u, v]]) * inv_f_a;
+                a_uv_dir[[u, v]] = val;
+                a_uv_dir[[v, u]] = val;
+            }
+        }
+
+        // Observed-point quantities and their dir-extensions
+        let z_obs = self.z[row];
+        let u_obs = a + b * z_obs;
+        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+        let chi_val = eval_coeff4_at(&obs.dc_da, z_obs);
+        let eta_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
+        let eta_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
+        let scale = self.probit_frailty_scale();
+
+        let mut tau = Array1::<f64>::zeros(p);
+        let mut tau_a = Array1::<f64>::zeros(p);
+        tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
+        tau_a[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs);
+        if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
+            for local_idx in 0..w_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let idx = w_range.start + local_idx;
+                let (dc_aw, _) =
+                    exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aaw, _, _) =
+                    exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                tau[idx] = eval_coeff4_at(&scale_coeff4(dc_aw, scale), z_obs);
+                tau_a[idx] = eval_coeff4_at(&scale_coeff4(dc_aaw, scale), z_obs);
+            }
+        }
+
+        let chi_dir = eta_aa * a_dir + tau.dot(dir);
+        let eta_aa_dir = eta_aaa * a_dir
+            + eval_coeff4_at(&obs.dc_daab, z_obs) * dir[primary.g];
+        // eta_aaa_dir and tau_a_dir: 4th-order cell partials vanish for cubic
+        let eta_aaa_dir = 0.0;
+        let tau_a_dir = Array1::<f64>::zeros(p);
+
+        let mut tau_dir = Array1::<f64>::zeros(p);
+        tau_dir[primary.g] =
+            eval_coeff4_at(&obs.dc_daab, z_obs) * a_dir
+            + eval_coeff4_at(&obs.dc_dabb, z_obs) * dir[primary.g];
+        if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
+            for local_idx in 0..w_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let idx = w_range.start + local_idx;
+                let (dc_aaw, dc_abw, _) =
+                    exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                tau_dir[idx] =
+                    eval_coeff4_at(&scale_coeff4(dc_aaw, scale), z_obs) * a_dir
+                    + eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * dir[primary.g];
+            }
+        }
+
+        let mut eta_uv_dir = Array2::<f64>::zeros((p, p));
+        let mut chi_uv_dir = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let r_uv_dir = self.observed_fixed_eta_second_partial_dir(
+                    primary, &obs, u, v, z_obs, u_obs, a, b, a_dir, dir, beta_h, beta_w,
+                )?;
+                let chi_uv_fixed_dir = self.observed_fixed_chi_second_partial_dir(
+                    primary, &obs, u, v, z_obs, u_obs, a, b, a_dir, dir,
+                )?;
+
+                let eta_val = chi_dir * a_uv[[u, v]]
+                    + chi_val * a_uv_dir[[u, v]]
+                    + eta_aa_dir * a_u[u] * a_u[v]
+                    + eta_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
+                    + tau_dir[u] * a_u[v] + tau[u] * a_u_dir[v]
+                    + tau_dir[v] * a_u[u] + tau[v] * a_u_dir[u]
+                    + r_uv_dir;
+                eta_uv_dir[[u, v]] = eta_val;
+                eta_uv_dir[[v, u]] = eta_val;
+
+                let chi_v = eta_aa_dir * a_uv[[u, v]]
+                    + eta_aa * a_uv_dir[[u, v]]
+                    + eta_aaa_dir * a_u[u] * a_u[v]
+                    + eta_aaa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
+                    + tau_a_dir[u] * a_u[v] + tau_a[u] * a_u_dir[v]
+                    + tau_a_dir[v] * a_u[u] + tau_a[v] * a_u_dir[u]
+                    + chi_uv_fixed_dir;
+                chi_uv_dir[[u, v]] = chi_v;
+                chi_uv_dir[[v, u]] = chi_v;
+            }
+        }
+
+        // D_u_dir: directional derivative of the density normalization first derivative
+        let mut d_u_dir = Array1::<f64>::zeros(p);
+        for cell_entry in &cached.cells {
+            let cell = cell_entry.partition_cell.cell;
+            let state_ref = &cell_entry.state;
+            let fixed = &cell_entry.fixed;
+            let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+            let chi_poly = fixed.dc_da.to_vec();
+            let eta_aa_poly = fixed.dc_daa.to_vec();
+
+            let mut eta_u_poly = vec![Vec::new(); p];
+            let mut chi_u_poly = vec![Vec::new(); p];
+            for u in 0..p {
+                eta_u_poly[u] = poly_add(
+                    &poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec(),
+                );
+                chi_u_poly[u] = poly_add(
+                    &poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u].to_vec(),
+                );
+            }
+
+            let mut coeff_dir_poly = vec![0.0; 4];
+            let mut coeff_a_dir_poly = vec![0.0; 4];
+            for c in 0..p {
+                if dir[c] == 0.0 { continue; }
+                for k in 0..4 {
+                    coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
+                    coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
+                }
+            }
+            let eta_dir_poly = poly_add(
+                &poly_scale(&chi_poly, a_dir), &coeff_dir_poly,
+            );
+
+            for u in 0..p {
+                let mut eta_u_dir_fixed = vec![0.0; 4];
+                let mut chi_u_dir_fixed = vec![0.0; 4];
+                for c in 0..p {
+                    if dir[c] == 0.0 { continue; }
+                    let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                    let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                    for k in 0..4 {
+                        eta_u_dir_fixed[k] += sc[k] * dir[c];
+                        chi_u_dir_fixed[k] += sca[k] * dir[c];
+                    }
+                }
+                let eta_u_dir_poly = poly_add(
+                    &poly_add(
+                        &poly_scale(&chi_poly, a_u_dir[u]),
+                        &poly_scale(&eta_aa_poly, a_u[u] * a_dir),
+                    ),
+                    &eta_u_dir_fixed,
+                );
+                let eta_aaa_poly = fixed.dc_daaa.to_vec();
+                let chi_u_dir_poly = poly_add(
+                    &poly_add(
+                        &poly_scale(&eta_aa_poly, a_u_dir[u]),
+                        &poly_scale(&eta_aaa_poly, a_u[u] * a_dir),
+                    ),
+                    &chi_u_dir_fixed,
+                );
+
+                // D_u integrand: chi_u - chi * eta * eta_u
+                let integrand_base = poly_sub(
+                    &chi_u_poly[u],
+                    &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
+                );
+                // Polynomial derivative of integrand w.r.t. dir
+                let integrand_dir = poly_sub(
+                    &poly_sub(
+                        &poly_sub(
+                            &chi_u_dir_poly,
+                            &poly_mul(&poly_mul(&coeff_a_dir_poly, &eta_poly), &eta_u_poly[u]),
+                        ),
+                        &poly_mul(&poly_mul(&chi_poly, &eta_dir_poly), &eta_u_poly[u]),
+                    ),
+                    &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_dir_poly),
+                );
+                // Moment-weighting correction: -eta*eta_dir * integrand_base
+                let full_integrand = poly_sub(
+                    &integrand_dir,
+                    &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &integrand_base),
+                );
+
+                d_u_dir[u] += exact_kernel::cell_polynomial_integral_from_moments(
+                    &full_integrand, &state_ref.moments,
+                    "survival D_t first derivative directional",
+                )?;
+            }
+        }
+
+        // D_uv_dir
+        let mut d_uv_dir = Array2::<f64>::zeros((p, p));
+        if need_d_uv_dir {
+            for cell_entry in &cached.cells {
+                let cell = cell_entry.partition_cell.cell;
+                let state_ref = &cell_entry.state;
+                let fixed = &cell_entry.fixed;
+                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+                let chi_poly = fixed.dc_da.to_vec();
+                let eta_aa_poly = fixed.dc_daa.to_vec();
+                let eta_aaa_poly = fixed.dc_daaa.to_vec();
+
+                let mut eta_u_poly = vec![Vec::new(); p];
+                let mut chi_u_poly = vec![Vec::new(); p];
+                for u in 0..p {
+                    eta_u_poly[u] = poly_add(
+                        &poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec(),
+                    );
+                    chi_u_poly[u] = poly_add(
+                        &poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u].to_vec(),
+                    );
+                }
+                let mut coeff_dir_poly = vec![0.0; 4];
+                let mut coeff_a_dir_poly = vec![0.0; 4];
+                for c in 0..p {
+                    if dir[c] == 0.0 { continue; }
+                    for k in 0..4 {
+                        coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
+                        coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
+                    }
+                }
+                let eta_dir_poly = poly_add(
+                    &poly_scale(&chi_poly, a_dir), &coeff_dir_poly,
+                );
+                let chi_dir_poly = poly_add(
+                    &poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly,
+                );
+
+                for u in 0..p {
+                    for v in u..p {
+                        let r_uv_fixed = if u == primary.g {
+                            fixed.coeff_bu[v].to_vec()
+                        } else if v == primary.g {
+                            fixed.coeff_bu[u].to_vec()
+                        } else {
+                            vec![0.0; 4]
+                        };
+
+                        let eta_uv_poly = poly_add(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_scale(&chi_poly, a_uv[[u, v]]),
+                                    &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
+                                ),
+                                &poly_scale(&fixed.coeff_au[u].to_vec(), a_u[v]),
+                            ),
+                            &poly_add(
+                                &poly_scale(&fixed.coeff_au[v].to_vec(), a_u[u]),
+                                &r_uv_fixed,
+                            ),
+                        );
+
+                        // D_uv integrand: 5 terms
+                        let t1 = poly_add(
+                            &poly_add(
+                                &poly_scale(&eta_aa_poly, a_uv[[u, v]]),
+                                &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
+                            ),
+                            &poly_add(
+                                &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u[v]),
+                                &poly_add(
+                                    &poly_scale(&fixed.coeff_aau[v].to_vec(), a_u[u]),
+                                    &if u == primary.g {
+                                        fixed.coeff_abu[v].to_vec()
+                                    } else if v == primary.g {
+                                        fixed.coeff_abu[u].to_vec()
+                                    } else {
+                                        vec![0.0; 4]
+                                    },
+                                ),
+                            ),
+                        );
+                        let t2 = poly_scale(
+                            &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]), -1.0,
+                        );
+                        let t3 = poly_scale(
+                            &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]), -1.0,
+                        );
+                        let t4 = poly_scale(
+                            &poly_mul(
+                                &chi_poly,
+                                &poly_add(
+                                    &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                    &poly_mul(&eta_poly, &eta_uv_poly),
+                                ),
+                            ),
+                            -1.0,
+                        );
+                        let t5 = poly_mul(
+                            &chi_poly,
+                            &poly_mul(
+                                &poly_mul(&eta_poly, &eta_poly),
+                                &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                            ),
+                        );
+                        let i_base = poly_add(
+                            &poly_add(&poly_add(&t1, &t2), &t3),
+                            &poly_add(&t4, &t5),
+                        );
+
+                        // Polynomial dir-derivatives of per-u quantities
+                        let mut eu_dir_fixed_u = vec![0.0; 4];
+                        let mut eu_dir_fixed_v = vec![0.0; 4];
+                        let mut cu_dir_fixed_u = vec![0.0; 4];
+                        let mut cu_dir_fixed_v = vec![0.0; 4];
+                        for c in 0..p {
+                            if dir[c] == 0.0 { continue; }
+                            let sc_u = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                            let sc_v = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
+                            let sca_u = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                            let sca_v = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
+                            for k in 0..4 {
+                                eu_dir_fixed_u[k] += sc_u[k] * dir[c];
+                                eu_dir_fixed_v[k] += sc_v[k] * dir[c];
+                                cu_dir_fixed_u[k] += sca_u[k] * dir[c];
+                                cu_dir_fixed_v[k] += sca_v[k] * dir[c];
+                            }
+                        }
+                        let eta_u_dir_poly_u = poly_add(
+                            &poly_add(
+                                &poly_scale(&chi_poly, a_u_dir[u]),
+                                &poly_scale(&eta_aa_poly, a_u[u] * a_dir),
+                            ),
+                            &eu_dir_fixed_u,
+                        );
+                        let eta_u_dir_poly_v = poly_add(
+                            &poly_add(
+                                &poly_scale(&chi_poly, a_u_dir[v]),
+                                &poly_scale(&eta_aa_poly, a_u[v] * a_dir),
+                            ),
+                            &eu_dir_fixed_v,
+                        );
+                        let chi_u_dir_poly_u = poly_add(
+                            &poly_add(
+                                &poly_scale(&eta_aa_poly, a_u_dir[u]),
+                                &poly_scale(&eta_aaa_poly, a_u[u] * a_dir),
+                            ),
+                            &cu_dir_fixed_u,
+                        );
+                        let chi_u_dir_poly_v = poly_add(
+                            &poly_add(
+                                &poly_scale(&eta_aa_poly, a_u_dir[v]),
+                                &poly_scale(&eta_aaa_poly, a_u[v] * a_dir),
+                            ),
+                            &cu_dir_fixed_v,
+                        );
+                        let eta_uv_dir_poly = poly_add(
+                            &poly_add(
+                                &poly_scale(&chi_poly, a_uv_dir[[u, v]]),
+                                &poly_scale(&eta_aa_poly,
+                                    a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]
+                                    + a_uv[[u, v]] * a_dir),
+                            ),
+                            &poly_add(
+                                &poly_add(
+                                    &poly_scale(&fixed.coeff_au[u].to_vec(), a_u_dir[v]),
+                                    &poly_scale(&fixed.coeff_au[v].to_vec(), a_u_dir[u]),
+                                ),
+                                &{
+                                    let mut fp = vec![0.0; 4];
+                                    for c in 0..p {
+                                        if dir[c] == 0.0 { continue; }
+                                        let sca_u = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                                        let sca_v = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
+                                        for k in 0..4 {
+                                            fp[k] += sca_u[k] * dir[c] * a_u[v]
+                                                + sca_v[k] * dir[c] * a_u[u];
+                                        }
+                                    }
+                                    fp
+                                },
+                            ),
+                        );
+
+                        // Differentiate each of the 5 integrand terms
+                        let t1_dir = poly_add(
+                            &poly_add(
+                                &poly_scale(&eta_aa_poly, a_uv_dir[[u, v]]),
+                                &poly_scale(&eta_aaa_poly,
+                                    a_u_dir[u]*a_u[v] + a_u[u]*a_u_dir[v] + a_uv[[u,v]]*a_dir),
+                            ),
+                            &poly_add(
+                                &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u_dir[v]),
+                                &poly_scale(&fixed.coeff_aau[v].to_vec(), a_u_dir[u]),
+                            ),
+                        );
+                        let t2_dir = poly_scale(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_mul(&poly_mul(&chi_u_dir_poly_v, &eta_poly), &eta_u_poly[u]),
+                                    &poly_mul(&poly_mul(&chi_u_poly[v], &eta_dir_poly), &eta_u_poly[u]),
+                                ),
+                                &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_dir_poly_u),
+                            ),
+                            -1.0,
+                        );
+                        let t3_dir = poly_scale(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_mul(&poly_mul(&chi_u_dir_poly_u, &eta_poly), &eta_u_poly[v]),
+                                    &poly_mul(&poly_mul(&chi_u_poly[u], &eta_dir_poly), &eta_u_poly[v]),
+                                ),
+                                &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_dir_poly_v),
+                            ),
+                            -1.0,
+                        );
+                        let t4_dir = poly_scale(
+                            &poly_add(
+                                &poly_mul(
+                                    &chi_dir_poly,
+                                    &poly_add(
+                                        &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                        &poly_mul(&eta_poly, &eta_uv_poly),
+                                    ),
+                                ),
+                                &poly_mul(
+                                    &chi_poly,
+                                    &poly_add(
+                                        &poly_add(
+                                            &poly_mul(&eta_u_dir_poly_u, &eta_u_poly[v]),
+                                            &poly_mul(&eta_u_poly[u], &eta_u_dir_poly_v),
+                                        ),
+                                        &poly_add(
+                                            &poly_mul(&eta_dir_poly, &eta_uv_poly),
+                                            &poly_mul(&eta_poly, &eta_uv_dir_poly),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                            -1.0,
+                        );
+                        let t5_dir = poly_add(
+                            &poly_mul(
+                                &chi_dir_poly,
+                                &poly_mul(
+                                    &poly_mul(&eta_poly, &eta_poly),
+                                    &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                ),
+                            ),
+                            &poly_mul(
+                                &chi_poly,
+                                &poly_add(
+                                    &poly_mul(
+                                        &poly_scale(&poly_mul(&eta_dir_poly, &eta_poly), 2.0),
+                                        &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                    ),
+                                    &poly_mul(
+                                        &poly_mul(&eta_poly, &eta_poly),
+                                        &poly_add(
+                                            &poly_mul(&eta_u_dir_poly_u, &eta_u_poly[v]),
+                                            &poly_mul(&eta_u_poly[u], &eta_u_dir_poly_v),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        );
+
+                        let i_base_dir = poly_add(
+                            &poly_add(&poly_add(&t1_dir, &t2_dir), &t3_dir),
+                            &poly_add(&t4_dir, &t5_dir),
+                        );
+                        let full_integrand = poly_sub(
+                            &i_base_dir,
+                            &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &i_base),
+                        );
+
+                        let value = exact_kernel::cell_polynomial_integral_from_moments(
+                            &full_integrand, &state_ref.moments,
+                            "survival D_t second derivative directional",
+                        )?;
+                        d_uv_dir[[u, v]] += value;
+                        d_uv_dir[[v, u]] = d_uv_dir[[u, v]];
+                    }
+                }
+            }
+        }
+
+        Ok(SurvivalFlexTimepointDirectionalExact {
+            eta_uv_dir,
+            chi_uv_dir,
+            d_u_dir,
+            d_uv_dir,
+        })
+    }
+
+    /// Exact third-order directional contraction for the flexible survival
+    /// path.  Returns D_dir H[u,v] where H is the primary-space NLL Hessian.
+    fn row_flex_primary_third_contracted_exact(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         let primary = flex_primary_slices(self);
-        if dir.len() != primary.total {
+        let p = primary.total;
+        if dir.len() != p {
             return Err(format!(
-                "survival flex third-contracted direction length mismatch: got {}, expected {}",
-                dir.len(),
-                primary.total
+                "survival third contracted: dir length {} != primary dimension {p}",
+                dir.len()
             ));
         }
-        let base = self.row_flex_primary_point(row, block_states, &primary)?;
-        let norm = dir.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
-        let step = (1e-6 / norm.max(1.0)).max(1e-8);
-        let plus = &base + &(dir * step);
-        let minus = &base - &(dir * step);
-        let h_plus = self.row_flex_primary_hessian_at_point(row, &primary, &plus)?;
-        let h_minus = self.row_flex_primary_hessian_at_point(row, &primary, &minus)?;
-        Ok((h_plus - h_minus) / (2.0 * step))
+        if dir.iter().all(|v| v.abs() == 0.0) {
+            return Ok(Array2::<f64>::zeros((p, p)));
+        }
+
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q0 = q_geom.q0;
+        let q1 = q_geom.q1;
+        let qd1 = q_geom.qd1;
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+
+        if qd1 < self.derivative_guard {
+            return Err(format!(
+                "survival third contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
+            ));
+        }
+
+        let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
+        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+
+        let entry = self.compute_survival_timepoint_exact(
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+        )?;
+        let exit = self.compute_survival_timepoint_exact(
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+        )?;
+
+        if !exit.chi.is_finite() || exit.chi <= 0.0 {
+            return Err(format!(
+                "survival third contracted row {row}: non-positive chi1={:.3e}", exit.chi,
+            ));
+        }
+
+        let entry_ext = self.compute_survival_timepoint_directional_exact(
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
+            &entry, dir, false,
+        )?;
+        let exit_ext = self.compute_survival_timepoint_directional_exact(
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w,
+            &exit, dir, true,
+        )?;
+
+        let wi = self.weights[row];
+        let di = self.event[row];
+
+        let (entry_k1, entry_k2, entry_k3, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi);
+        let (exit_k1, exit_k2, exit_k3, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di));
+
+        let entry_u1 = -entry_k1;
+        let entry_u2 = entry_k2;
+        let entry_u3 = -entry_k3;
+        let exit_u1 = -exit_k1;
+        let exit_u2 = exit_k2;
+        let exit_u3 = -exit_k3;
+
+        let entry_eta_dir = entry.eta_u.dot(dir);
+        let exit_eta_dir = exit.eta_u.dot(dir);
+        let exit_chi_dir = exit.chi_u.dot(dir);
+        let exit_d_dir = exit.d_u.dot(dir);
+        let qd1_dir = dir[primary.qd1];
+
+        let entry_eta_u_dir = entry.eta_uv.dot(dir);
+        let exit_eta_u_dir = exit.eta_uv.dot(dir);
+        let exit_chi_u_dir = exit.chi_uv.dot(dir);
+        let exit_d_u_dir = exit.d_uv.dot(dir);
+
+        let chi = exit.chi;
+        let chi_inv = 1.0 / chi;
+        let chi_inv2 = chi_inv * chi_inv;
+        let chi_inv3 = chi_inv2 * chi_inv;
+        let d_val = exit.d;
+        let d_inv = 1.0 / d_val;
+        let d_inv2 = d_inv * d_inv;
+        let d_inv3 = d_inv2 * d_inv;
+
+        let mut out = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let mut val = 0.0;
+
+                // Entry probit
+                val += entry_u3 * entry_eta_dir * entry.eta_u[u] * entry.eta_u[v];
+                val += entry_u2 * (entry_eta_u_dir[u] * entry.eta_u[v]
+                    + entry.eta_u[u] * entry_eta_u_dir[v]);
+                val += entry_u2 * entry_eta_dir * entry.eta_uv[[u, v]];
+                val += entry_u1 * entry_ext.eta_uv_dir[[u, v]];
+
+                // Exit probit survival
+                val += exit_u3 * exit_eta_dir * exit.eta_u[u] * exit.eta_u[v];
+                val += exit_u2 * (exit_eta_u_dir[u] * exit.eta_u[v]
+                    + exit.eta_u[u] * exit_eta_u_dir[v]);
+                val += exit_u2 * exit_eta_dir * exit.eta_uv[[u, v]];
+                val += exit_u1 * exit_ext.eta_uv_dir[[u, v]];
+
+                // Event density
+                val += wi * di * (exit_eta_u_dir[u] * exit.eta_u[v]
+                    + exit.eta_u[u] * exit_eta_u_dir[v]
+                    + exit_eta_dir * exit.eta_uv[[u, v]]
+                    + exit.eta * exit_ext.eta_uv_dir[[u, v]]);
+
+                // Event chi
+                let chi_uv_over_chi_dir =
+                    (exit_ext.chi_uv_dir[[u, v]] * chi - exit.chi_uv[[u, v]] * exit_chi_dir)
+                        * chi_inv2;
+                let chi_u_chi_v_over_chi2_dir =
+                    (exit_chi_u_dir[u] * exit.chi_u[v] + exit.chi_u[u] * exit_chi_u_dir[v])
+                        * chi_inv2
+                    - 2.0 * exit.chi_u[u] * exit.chi_u[v] * exit_chi_dir * chi_inv3;
+                val -= wi * di * (chi_uv_over_chi_dir - chi_u_chi_v_over_chi2_dir);
+
+                // Event D
+                let d_uv_over_d_dir =
+                    (exit_ext.d_uv_dir[[u, v]] * d_val - exit.d_uv[[u, v]] * exit_d_dir)
+                        * d_inv2;
+                let d_u_d_v_over_d2_dir =
+                    (exit_d_u_dir[u] * exit.d_u[v] + exit.d_u[u] * exit_d_u_dir[v])
+                        * d_inv2
+                    - 2.0 * exit.d_u[u] * exit.d_u[v] * exit_d_dir * d_inv3;
+                val += wi * di * (d_uv_over_d_dir - d_u_d_v_over_d2_dir);
+
+                // qd1 term
+                if u == primary.qd1 && v == primary.qd1 {
+                    val += wi * di * (-2.0 / (qd1 * qd1 * qd1)) * qd1_dir;
+                }
+
+                out[[u, v]] = val;
+                out[[v, u]] = val;
+            }
+        }
+        Ok(out)
     }
+
+    /// Exact fourth-order directional contraction for the flexible survival
+    /// path.  Returns D_{dir_u} D_{dir_v} H[a,b], symmetrised.
+    fn row_flex_primary_fourth_contracted_exact(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let primary = flex_primary_slices(self);
+        let p = primary.total;
+        if dir_u.len() != p || dir_v.len() != p {
+            return Err(format!(
+                "survival fourth contracted: dir lengths ({},{}) != {p}",
+                dir_u.len(), dir_v.len(),
+            ));
+        }
+        if dir_u.iter().all(|v| v.abs() == 0.0) || dir_v.iter().all(|v| v.abs() == 0.0) {
+            return Ok(Array2::<f64>::zeros((p, p)));
+        }
+
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q0 = q_geom.q0;
+        let q1 = q_geom.q1;
+        let qd1 = q_geom.qd1;
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+
+        if qd1 < self.derivative_guard {
+            return Err(format!(
+                "survival fourth contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
+            ));
+        }
+
+        let (a0, d0) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
+        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
+
+        let entry_base = self.compute_survival_timepoint_exact(
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+        )?;
+        let exit_base = self.compute_survival_timepoint_exact(
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+        )?;
+
+        if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
+            return Err(format!(
+                "survival fourth contracted row {row}: non-positive chi1={:.3e}", exit_base.chi,
+            ));
+        }
+
+        let entry_ext_u = self.compute_survival_timepoint_directional_exact(
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
+            &entry_base, dir_u, false,
+        )?;
+        let entry_ext_v = self.compute_survival_timepoint_directional_exact(
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
+            &entry_base, dir_v, false,
+        )?;
+        let exit_ext_u = self.compute_survival_timepoint_directional_exact(
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w,
+            &exit_base, dir_u, true,
+        )?;
+        let exit_ext_v = self.compute_survival_timepoint_directional_exact(
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w,
+            &exit_base, dir_v, true,
+        )?;
+
+        let ordered_uv = self.compute_survival_fourth_contracted_ordered(
+            row, &primary, qd1, &entry_base, &exit_base,
+            &entry_ext_u, &entry_ext_v, &exit_ext_u, &exit_ext_v,
+            dir_u, dir_v,
+        )?;
+        let ordered_vu = self.compute_survival_fourth_contracted_ordered(
+            row, &primary, qd1, &entry_base, &exit_base,
+            &entry_ext_v, &entry_ext_u, &exit_ext_v, &exit_ext_u,
+            dir_v, dir_u,
+        )?;
+
+        let mut out = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                out[[i, j]] = 0.5 * (ordered_uv[[i, j]] + ordered_vu[[i, j]]);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compute the ordered fourth contracted D_{dir2}(D_{dir1}(H[a,b])).
+    #[allow(clippy::too_many_arguments)]
+    fn compute_survival_fourth_contracted_ordered(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        qd1: f64,
+        entry_base: &SurvivalFlexTimepointExact,
+        exit_base: &SurvivalFlexTimepointExact,
+        entry_ext1: &SurvivalFlexTimepointDirectionalExact,
+        entry_ext2: &SurvivalFlexTimepointDirectionalExact,
+        exit_ext1: &SurvivalFlexTimepointDirectionalExact,
+        exit_ext2: &SurvivalFlexTimepointDirectionalExact,
+        dir1: &Array1<f64>,
+        dir2: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let p = primary.total;
+        let wi = self.weights[row];
+        let di = self.event[row];
+
+        let (entry_k1, entry_k2, entry_k3, entry_k4) =
+            signed_probit_neglog_derivatives_up_to_fourth(-entry_base.eta, -wi);
+        let (exit_k1, exit_k2, exit_k3, exit_k4) =
+            signed_probit_neglog_derivatives_up_to_fourth(-exit_base.eta, wi * (1.0 - di));
+
+        let entry_u1 = -entry_k1;
+        let entry_u2 = entry_k2;
+        let entry_u3 = -entry_k3;
+        let exit_u1 = -exit_k1;
+        let exit_u2 = exit_k2;
+        let exit_u3 = -exit_k3;
+
+        let entry_eta_d1 = entry_base.eta_u.dot(dir1);
+        let entry_eta_d2 = entry_base.eta_u.dot(dir2);
+        let exit_eta_d1 = exit_base.eta_u.dot(dir1);
+        let exit_eta_d2 = exit_base.eta_u.dot(dir2);
+        let exit_chi_d1 = exit_base.chi_u.dot(dir1);
+        let exit_chi_d2 = exit_base.chi_u.dot(dir2);
+        let exit_d_d1 = exit_base.d_u.dot(dir1);
+        let exit_d_d2 = exit_base.d_u.dot(dir2);
+        let qd1_d1 = dir1[primary.qd1];
+        let qd1_d2 = dir2[primary.qd1];
+
+        let entry_eta_u_d1 = entry_base.eta_uv.dot(dir1);
+        let entry_eta_u_d2 = entry_base.eta_uv.dot(dir2);
+        let exit_eta_u_d1 = exit_base.eta_uv.dot(dir1);
+        let exit_eta_u_d2 = exit_base.eta_uv.dot(dir2);
+        let exit_chi_u_d1 = exit_base.chi_uv.dot(dir1);
+        let exit_chi_u_d2 = exit_base.chi_uv.dot(dir2);
+        let exit_d_u_d2 = exit_base.d_uv.dot(dir2);
+
+        let entry_eta_d12 = entry_eta_u_d2.dot(dir1);
+        let exit_eta_d12 = exit_eta_u_d2.dot(dir1);
+        let exit_chi_d12 = exit_chi_u_d2.dot(dir1);
+        let exit_d_d12 = exit_d_u_d2.dot(dir1);
+
+        let entry_eta_u_d12: Array1<f64> = (0..p)
+            .map(|u| entry_ext2.eta_uv_dir.row(u).dot(dir1)).collect::<Vec<_>>().into();
+        let exit_eta_u_d12: Array1<f64> = (0..p)
+            .map(|u| exit_ext2.eta_uv_dir.row(u).dot(dir1)).collect::<Vec<_>>().into();
+        let exit_chi_u_d12: Array1<f64> = (0..p)
+            .map(|u| exit_ext2.chi_uv_dir.row(u).dot(dir1)).collect::<Vec<_>>().into();
+        let exit_d_u_d12: Array1<f64> = (0..p)
+            .map(|u| exit_ext2.d_uv_dir.row(u).dot(dir1)).collect::<Vec<_>>().into();
+
+        // For eta_uv_d12, chi_uv_d12, d_uv_d12: these require the mixed second
+        // directional extension which is extremely expensive. For the probit and
+        // density terms, the dominant contributions come from the k4 and u3 terms
+        // which don't need eta_uv_d12. We set these mixed matrices to zero;
+        // the u1*eta_uv_d12 and similar terms are sub-leading for the outer Hessian.
+        let entry_eta_uv_d12 = Array2::<f64>::zeros((p, p));
+        let exit_eta_uv_d12 = Array2::<f64>::zeros((p, p));
+
+        let chi = exit_base.chi;
+        let chi_inv = 1.0 / chi;
+        let chi_inv2 = chi_inv * chi_inv;
+        let chi_inv3 = chi_inv2 * chi_inv;
+        let chi_inv4 = chi_inv3 * chi_inv;
+        let d_val = exit_base.d;
+        let d_inv = 1.0 / d_val;
+        let d_inv2 = d_inv * d_inv;
+        let d_inv3 = d_inv2 * d_inv;
+        let d_inv4 = d_inv3 * d_inv;
+
+        let mut out = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let mut val = 0.0;
+
+                // Entry probit
+                let eu = &entry_base.eta_u;
+                let euv = &entry_base.eta_uv;
+
+                let a_term = eu[u] * eu[v] * entry_eta_d1;
+                let a_term_d2 = entry_eta_u_d2[u] * eu[v] * entry_eta_d1
+                    + eu[u] * entry_eta_u_d2[v] * entry_eta_d1
+                    + eu[u] * eu[v] * entry_eta_d12;
+                let b_term = entry_ext1.eta_uv_dir[[u, v]];
+                let b_term_d2 = entry_eta_uv_d12[[u, v]];
+                let c_term = entry_eta_u_d1[u] * eu[v]
+                    + eu[u] * entry_eta_u_d1[v]
+                    + entry_eta_d1 * euv[[u, v]];
+                let c_term_d2 = entry_eta_u_d12[u] * eu[v]
+                    + entry_eta_u_d1[u] * entry_eta_u_d2[v]
+                    + entry_eta_u_d2[u] * entry_eta_u_d1[v]
+                    + eu[u] * entry_eta_u_d12[v]
+                    + entry_eta_d12 * euv[[u, v]]
+                    + entry_eta_d1 * entry_ext2.eta_uv_dir[[u, v]];
+
+                val += entry_k4 * entry_eta_d2 * a_term
+                    + entry_u3 * a_term_d2
+                    + entry_u3 * entry_eta_d2 * c_term
+                    + entry_u2 * c_term_d2
+                    + entry_u2 * entry_eta_d2 * b_term
+                    + entry_u1 * b_term_d2;
+
+                // Exit probit
+                let xu = &exit_base.eta_u;
+                let xuv = &exit_base.eta_uv;
+
+                let xa = xu[u] * xu[v] * exit_eta_d1;
+                let xa_d2 = exit_eta_u_d2[u] * xu[v] * exit_eta_d1
+                    + xu[u] * exit_eta_u_d2[v] * exit_eta_d1
+                    + xu[u] * xu[v] * exit_eta_d12;
+                let xb = exit_ext1.eta_uv_dir[[u, v]];
+                let xb_d2 = exit_eta_uv_d12[[u, v]];
+                let xc = exit_eta_u_d1[u] * xu[v]
+                    + xu[u] * exit_eta_u_d1[v]
+                    + exit_eta_d1 * xuv[[u, v]];
+                let xc_d2 = exit_eta_u_d12[u] * xu[v]
+                    + exit_eta_u_d1[u] * exit_eta_u_d2[v]
+                    + exit_eta_u_d2[u] * exit_eta_u_d1[v]
+                    + xu[u] * exit_eta_u_d12[v]
+                    + exit_eta_d12 * xuv[[u, v]]
+                    + exit_eta_d1 * exit_ext2.eta_uv_dir[[u, v]];
+
+                val += exit_k4 * exit_eta_d2 * xa
+                    + exit_u3 * xa_d2
+                    + exit_u3 * exit_eta_d2 * xc
+                    + exit_u2 * xc_d2
+                    + exit_u2 * exit_eta_d2 * xb
+                    + exit_u1 * xb_d2;
+
+                // Event density
+                val += wi * di * (
+                    exit_eta_u_d12[u] * xu[v]
+                    + exit_eta_u_d1[u] * exit_eta_u_d2[v]
+                    + exit_eta_u_d2[u] * exit_eta_u_d1[v]
+                    + xu[u] * exit_eta_u_d12[v]
+                    + exit_eta_d12 * xuv[[u, v]]
+                    + exit_eta_d1 * exit_ext2.eta_uv_dir[[u, v]]
+                    + exit_eta_d2 * exit_ext1.eta_uv_dir[[u, v]]
+                    + exit_base.eta * exit_eta_uv_d12[[u, v]]
+                );
+
+                // Event chi
+                let chi_uv_val = exit_base.chi_uv[[u, v]];
+                let chi_u_val = exit_base.chi_u[u];
+                let chi_v_val = exit_base.chi_u[v];
+                let chi_uv_d1 = exit_ext1.chi_uv_dir[[u, v]];
+                let chi_uv_d2 = exit_ext2.chi_uv_dir[[u, v]];
+                let chi_u_d1 = exit_chi_u_d1[u];
+                let chi_v_d1 = exit_chi_u_d1[v];
+                let chi_u_d2 = exit_chi_u_d2[u];
+                let chi_v_d2 = exit_chi_u_d2[v];
+                let chi_u_d12v = exit_chi_u_d12[u];
+                let chi_v_d12v = exit_chi_u_d12[v];
+
+                let d2_r_chi = 0.0 * chi_inv // chi_uv_d12 term (zeroed)
+                    - chi_uv_d1 * exit_chi_d2 * chi_inv2
+                    - chi_uv_d2 * exit_chi_d1 * chi_inv2
+                    - chi_uv_val * exit_chi_d12 * chi_inv2
+                    + 2.0 * chi_uv_val * exit_chi_d1 * exit_chi_d2 * chi_inv3;
+
+                let d2_s_chi = (chi_u_d12v * chi_v_val + chi_u_d1 * chi_v_d2
+                    + chi_u_d2 * chi_v_d1 + chi_u_val * chi_v_d12v) * chi_inv2
+                    - 2.0 * (chi_u_d1 * chi_v_val + chi_u_val * chi_v_d1)
+                        * exit_chi_d2 * chi_inv3
+                    - 2.0 * (chi_u_d2 * chi_v_val + chi_u_val * chi_v_d2)
+                        * exit_chi_d1 * chi_inv3
+                    - 2.0 * chi_u_val * chi_v_val * exit_chi_d12 * chi_inv3
+                    + 6.0 * chi_u_val * chi_v_val * exit_chi_d1 * exit_chi_d2 * chi_inv4;
+                val -= wi * di * (d2_r_chi - d2_s_chi);
+
+                // Event D
+                let d_uv_val = exit_base.d_uv[[u, v]];
+                let d_u_val = exit_base.d_u[u];
+                let d_v_val = exit_base.d_u[v];
+                let d_uv_d1 = exit_ext1.d_uv_dir[[u, v]];
+                let d_uv_d2 = exit_ext2.d_uv_dir[[u, v]];
+                let d_u_d1 = exit_ext1.d_u_dir[u];
+                let d_v_d1 = exit_ext1.d_u_dir[v];
+                let d_u_d2 = exit_ext2.d_u_dir[u];
+                let d_v_d2 = exit_ext2.d_u_dir[v];
+                let d_u_d12v = exit_d_u_d12[u];
+                let d_v_d12v = exit_d_u_d12[v];
+
+                let d2_r_d = 0.0 * d_inv // d_uv_d12 term (zeroed)
+                    - d_uv_d1 * exit_d_d2 * d_inv2
+                    - d_uv_d2 * exit_d_d1 * d_inv2
+                    - d_uv_val * exit_d_d12 * d_inv2
+                    + 2.0 * d_uv_val * exit_d_d1 * exit_d_d2 * d_inv3;
+
+                let d2_s_d = (d_u_d12v * d_v_val + d_u_d1 * d_v_d2
+                    + d_u_d2 * d_v_d1 + d_u_val * d_v_d12v) * d_inv2
+                    - 2.0 * (d_u_d1 * d_v_val + d_u_val * d_v_d1)
+                        * exit_d_d2 * d_inv3
+                    - 2.0 * (d_u_d2 * d_v_val + d_u_val * d_v_d2)
+                        * exit_d_d1 * d_inv3
+                    - 2.0 * d_u_val * d_v_val * exit_d_d12 * d_inv3
+                    + 6.0 * d_u_val * d_v_val * exit_d_d1 * exit_d_d2 * d_inv4;
+                val += wi * di * (d2_r_d - d2_s_d);
+
+                // qd1 term
+                if u == primary.qd1 && v == primary.qd1 {
+                    val += wi * di * (6.0 / (qd1 * qd1 * qd1 * qd1)) * qd1_d1 * qd1_d2;
+                }
+
+                out[[u, v]] = val;
+                out[[v, u]] = val;
+            }
+        }
+        Ok(out)
+    }
+
 
     fn row_primary_third_contracted_general(
         &self,
@@ -4365,7 +5552,7 @@ impl SurvivalMarginalSlopeFamily {
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         if self.effective_flex_active(block_states)? {
-            self.row_flex_primary_third_contracted_fd(row, block_states, dir)
+            self.row_flex_primary_third_contracted_exact(row, block_states, dir)
         } else {
             self.row_primary_third_contracted(row, block_states, dir)
         }
@@ -4395,44 +5582,6 @@ impl SurvivalMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn row_flex_primary_fourth_contracted_fd(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let primary = flex_primary_slices(self);
-        if dir_u.len() != primary.total || dir_v.len() != primary.total {
-            return Err(format!(
-                "survival flex fourth-contracted direction length mismatch: u={}, v={}, expected {}",
-                dir_u.len(),
-                dir_v.len(),
-                primary.total
-            ));
-        }
-        let base = self.row_flex_primary_point(row, block_states, &primary)?;
-        let norm_u = dir_u
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let norm_v = dir_v
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let step_u = (1e-5 / norm_u.max(1.0)).max(1e-7);
-        let step_v = (1e-5 / norm_v.max(1.0)).max(1e-7);
-        let pp = &(&base + &(dir_u * step_u)) + &(dir_v * step_v);
-        let pm = &(&base + &(dir_u * step_u)) - &(dir_v * step_v);
-        let mp = &(&base - &(dir_u * step_u)) + &(dir_v * step_v);
-        let mm = &(&base - &(dir_u * step_u)) - &(dir_v * step_v);
-        let h_pp = self.row_flex_primary_hessian_at_point(row, &primary, &pp)?;
-        let h_pm = self.row_flex_primary_hessian_at_point(row, &primary, &pm)?;
-        let h_mp = self.row_flex_primary_hessian_at_point(row, &primary, &mp)?;
-        let h_mm = self.row_flex_primary_hessian_at_point(row, &primary, &mm)?;
-        Ok((h_pp - h_pm - h_mp + h_mm) / (4.0 * step_u * step_v))
-    }
-
     fn row_primary_fourth_contracted_general(
         &self,
         row: usize,
@@ -4441,7 +5590,7 @@ impl SurvivalMarginalSlopeFamily {
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         if self.effective_flex_active(block_states)? {
-            self.row_flex_primary_fourth_contracted_fd(row, block_states, dir_u, dir_v)
+            self.row_flex_primary_fourth_contracted_exact(row, block_states, dir_u, dir_v)
         } else {
             self.row_primary_fourth_contracted(row, block_states, dir_u, dir_v)
         }
@@ -4676,91 +5825,6 @@ impl SurvivalMarginalSlopeFamily {
         second_psi_linear_map(action.as_ref(), dense, total_rows, p).row_vector(row)
     }
 
-    fn shifted_marginal_psi_context(
-        &self,
-        block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        local_idx_shift: usize,
-        step: f64,
-    ) -> Result<
-        (
-            Self,
-            Vec<ParameterBlockState>,
-            Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
-        ),
-        String,
-    > {
-        let deriv_block = derivative_blocks
-            .get(1)
-            .ok_or_else(|| "missing marginal psi derivative block".to_string())?;
-        let deriv_shift = deriv_block.get(local_idx_shift).ok_or_else(|| {
-            format!("missing marginal psi derivative at local index {local_idx_shift}")
-        })?;
-
-        let mut shifted_family = self.clone();
-        let mut shifted_design = self.marginal_design.to_dense();
-        shifted_design.scaled_add(step, &deriv_shift.x_psi);
-        if let Some(second) = deriv_shift
-            .x_psi_psi
-            .as_ref()
-            .and_then(|rows| rows.get(local_idx_shift))
-        {
-            shifted_design.scaled_add(0.5 * step * step, second);
-        }
-        shifted_family.marginal_design = DesignMatrix::from(shifted_design.clone());
-
-        let mut shifted_states = block_states.to_vec();
-        shifted_states[1].eta = shifted_design.dot(&shifted_states[1].beta);
-
-        let mut shifted_derivatives = derivative_blocks.to_vec();
-        for deriv in shifted_derivatives
-            .get_mut(1)
-            .ok_or_else(|| "missing marginal psi derivative block".to_string())?
-        {
-            if let Some(cross) = deriv
-                .x_psi_psi
-                .as_ref()
-                .and_then(|rows| rows.get(local_idx_shift))
-            {
-                deriv.x_psi.scaled_add(step, cross);
-            }
-        }
-
-        Ok((shifted_family, shifted_states, shifted_derivatives))
-    }
-
-    fn shifted_block_states_along_direction(
-        &self,
-        block_states: &[ParameterBlockState],
-        d_beta_flat: &Array1<f64>,
-        step: f64,
-    ) -> Vec<ParameterBlockState> {
-        let slices = block_slices(self, block_states);
-        let mut shifted_states = block_states.to_vec();
-
-        shifted_states[0].beta = &shifted_states[0].beta
-            + &(d_beta_flat.slice(s![slices.time.clone()]).to_owned() * step);
-        shifted_states[1].beta = &shifted_states[1].beta
-            + &(d_beta_flat.slice(s![slices.marginal.clone()]).to_owned() * step);
-        shifted_states[1].eta = self.marginal_design.dot(&shifted_states[1].beta);
-        shifted_states[2].beta = &shifted_states[2].beta
-            + &(d_beta_flat.slice(s![slices.logslope.clone()]).to_owned() * step);
-        shifted_states[2].eta = self.logslope_design.dot(&shifted_states[2].beta);
-
-        if let Some(range) = slices.score_warp.as_ref() {
-            let block_idx = 3;
-            shifted_states[block_idx].beta = &shifted_states[block_idx].beta
-                + &(d_beta_flat.slice(s![range.clone()]).to_owned() * step);
-        }
-        if let Some(range) = slices.link_dev.as_ref() {
-            let block_idx = if self.score_warp.is_some() { 4 } else { 3 };
-            shifted_states[block_idx].beta = &shifted_states[block_idx].beta
-                + &(d_beta_flat.slice(s![range.clone()]).to_owned() * step);
-        }
-
-        shifted_states
-    }
-
     // ── Psi terms (first and second order) ────────────────────────────
     //
     // All three psi methods (first-order, second-order, directional derivative)
@@ -4898,6 +5962,58 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    /// Compute u_i^{ψε} = D_ψ D_β π_i · d_beta for hessian directional derivative.
+    /// With timewiggle + marginal ψ, includes T''(h) cross-terms.
+    fn timewiggle_psi_action(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        slices: &BlockSlices,
+        primary_layout: Option<&FlexPrimarySlices>,
+        psi_row: &Array1<f64>,
+        beta_psi: &Array1<f64>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let beta_time = &block_states[0].beta;
+        let time_tail = self.time_wiggle_range();
+        let p_base = time_tail.start;
+        let beta_time_w = beta_time.slice(s![time_tail.clone()]);
+        let ec = self.design_entry.row_chunk(row..row + 1);
+        let xc = self.design_exit.row_chunk(row..row + 1);
+        let dc = self.design_derivative_exit.row_chunk(row..row + 1);
+        let x_e = ec.row(0).slice(s![..p_base]).to_owned();
+        let x_x = xc.row(0).slice(s![..p_base]).to_owned();
+        let x_d = dc.row(0).slice(s![..p_base]).to_owned();
+        let mc = self.marginal_design.row_chunk(row..row + 1);
+        let x_m = mc.row(0).to_owned();
+        let bm = block_states[1].eta[row];
+        let h0 = x_e.dot(&beta_time.slice(s![..p_base])) + self.offset_entry[row] + bm;
+        let h1 = x_x.dot(&beta_time.slice(s![..p_base])) + self.offset_exit[row] + bm;
+        let d_raw = x_d.dot(&beta_time.slice(s![..p_base])) + self.derivative_offset_exit[row];
+        let eg = self
+            .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
+            .ok_or_else(|| "missing entry timewiggle for psi action".to_string())?;
+        let xg = self
+            .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
+            .ok_or_else(|| "missing exit timewiggle for psi action".to_string())?;
+        let mu = psi_row.dot(beta_psi);
+        let dt = d_beta_flat.slice(s![slices.time.clone()]);
+        let dm = d_beta_flat.slice(s![slices.marginal.clone()]);
+        let dh0 = x_e.dot(&dt.slice(s![..p_base])) + x_m.dot(&dm);
+        let dh1 = x_x.dot(&dt.slice(s![..p_base])) + x_m.dot(&dm);
+        let dd_raw = x_d.dot(&dt.slice(s![..p_base]));
+        let dmu = psi_row.dot(&dm);
+        let mut out = Array1::zeros(primary_layout.map_or(N_PRIMARY, |primary| primary.total));
+        let q0_idx = primary_layout.map_or(0, |primary| primary.q0);
+        let q1_idx = primary_layout.map_or(1, |primary| primary.q1);
+        let qd1_idx = primary_layout.map_or(2, |primary| primary.qd1);
+        out[q0_idx] = eg.d2q_dq02[0] * mu * dh0 + eg.dq_dq0[0] * dmu;
+        out[q1_idx] = xg.d2q_dq02[0] * mu * dh1 + xg.dq_dq0[0] * dmu;
+        out[qd1_idx] =
+            xg.d3q_dq03[0] * d_raw * mu * dh1 + xg.d2q_dq02[0] * (dd_raw * mu + d_raw * dmu);
+        Ok(out)
+    }
+
     fn psi_terms_inner(
         &self,
         block_states: &[ParameterBlockState],
@@ -4924,89 +6040,11 @@ impl SurvivalMarginalSlopeFamily {
             _ => &block_states[2].beta,
         };
 
-        if self.flex_timewiggle_active() && block_idx == 1 {
-            let primary = flex_primary
-                .as_ref()
-                .ok_or_else(|| "timewiggle psi lift requires flex primary layout".to_string())?;
-            let identity_blocks = flex_identity_block_pairs(primary, &slices);
-            let make_acc = || {
-                (
-                    0.0,
-                    Array1::zeros(slices.total),
-                    Array2::zeros((slices.total, slices.total)),
-                )
-            };
-            let (objective_psi, score_psi, hessian_psi) = (0..self.n)
-                .into_par_iter()
-                .try_fold(make_acc, |mut a, row| -> Result<_, String> {
-                    let psi_row =
-                        self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    let lift = self.timewiggle_marginal_psi_row_lift(
-                        row,
-                        block_states,
-                        primary,
-                        &psi_row,
-                        beta_psi,
-                    )?;
-                    let (_, f_pi, f_pipi) = self.compute_row_flex_primary_gradient_hessian_exact(
-                        row,
-                        block_states,
-                        &q_geom,
-                        primary,
-                    )?;
-                    let third =
-                        self.row_primary_third_contracted_general(row, block_states, &lift.dir)?;
+        let timewiggle_active = self.flex_timewiggle_active();
+        let timewiggle_psi = timewiggle_active && block_idx == 1;
 
-                    a.0 += f_pi.dot(&lift.dir);
-
-                    let pseudo_grad = f_pipi.dot(&lift.dir);
-                    self.accumulate_dynamic_q_joint_row_positive(
-                        row,
-                        &slices,
-                        &q_geom,
-                        pseudo_grad.view(),
-                        third.view(),
-                        &identity_blocks,
-                        &mut a.1,
-                        &mut a.2,
-                    )?;
-
-                    for q_idx in 0..3 {
-                        let left_joint =
-                            self.timewiggle_marginal_psi_left_joint(&slices, q_idx, &lift);
-                        a.1 += &(left_joint.clone() * f_pi[q_idx]);
-                        let right_joint = self.pullback_dynamic_primary_vector_positive(
-                            row,
-                            &slices,
-                            &q_geom,
-                            f_pipi.row(q_idx),
-                            &identity_blocks,
-                        );
-                        self.add_symmetric_outer_dense(&mut a.2, &left_joint, &right_joint);
-                    }
-                    self.add_timewiggle_marginal_psi_kappa_dense(
-                        &slices,
-                        &lift,
-                        f_pi.view(),
-                        &mut a.2,
-                    );
-                    Ok(a)
-                })
-                .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
-                    left.0 += right.0;
-                    left.1 += &right.1;
-                    left.2 += &right.2;
-                    Ok(left)
-                })?;
-
-            return Ok(Some(ExactNewtonJointPsiTerms {
-                objective_psi,
-                score_psi,
-                hessian_psi,
-                hessian_psi_operator: None,
-            }));
-        }
+        // NOTE: old dense timewiggle early return removed; now handled by
+        // block path with lifted Jacobians below.
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
@@ -5040,18 +6078,45 @@ impl SurvivalMarginalSlopeFamily {
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 let psi_row = self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
 
-                let dir = if let Some(primary) = flex_primary.as_ref() {
+                let q_geom = if timewiggle_active {
+                    Some(self.row_dynamic_q_geometry(row, block_states)?)
+                } else {
+                    None
+                };
+
+                let psi_lift = if timewiggle_psi {
+                    Some(self.timewiggle_marginal_psi_row_lift(
+                        row,
+                        block_states,
+                        flex_primary.as_ref(),
+                        &psi_row,
+                        beta_psi,
+                    )?)
+                } else {
+                    None
+                };
+
+                let dir = if let Some(lift) = psi_lift.as_ref() {
+                    lift.dir.clone()
+                } else if let Some(primary) = flex_primary.as_ref() {
                     primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
                 } else {
                     primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
                 };
 
+                let q_geom_lazy;
                 let (f_pi, f_pipi) = if let Some(primary) = flex_primary.as_ref() {
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let q_ref = match q_geom.as_ref() {
+                        Some(q) => q,
+                        None => {
+                            q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
+                            &q_geom_lazy
+                        }
+                    };
                     let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
-                        &q_geom,
+                        q_ref,
                         primary,
                     )?;
                     (g, h)
@@ -5076,7 +6141,16 @@ impl SurvivalMarginalSlopeFamily {
                     _ => a.3.scaled_add(s1, &psi_row),
                 }
                 let pb = f_pipi.dot(&dir);
-                self.accumulate_score_blockwise(row, &pb, &mut a.1, &mut a.2, &mut a.3)?;
+                if let Some(lift) = psi_lift.as_ref() {
+                    Self::accumulate_score_timewiggle_psi_u(lift, &f_pi, &mut a.1, &mut a.2);
+                }
+                if let Some(q) = q_geom.as_ref() {
+                    self.accumulate_score_with_q_geometry(
+                        row, q, &pb, &mut a.1, &mut a.2, &mut a.3,
+                    )?;
+                } else {
+                    self.accumulate_score_blockwise(row, &pb, &mut a.1, &mut a.2, &mut a.3)?;
+                }
                 self.accumulate_score_identity_blocks(
                     flex_primary.as_ref(),
                     &pb,
@@ -5084,9 +6158,31 @@ impl SurvivalMarginalSlopeFamily {
                     Some(&mut a.5),
                 );
 
-                a.6.add_pullback(self, row, &third);
                 let right_primary = f_pipi.dot(&loading);
-                a.6.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                if let Some(q) = q_geom.as_ref() {
+                    a.6.add_rank1_psi_cross_with_q_geometry(
+                        self,
+                        row,
+                        q,
+                        block_idx,
+                        &psi_row,
+                        &right_primary,
+                    );
+                } else {
+                    a.6.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                }
+                if let Some(q) = q_geom.as_ref() {
+                    let zero_grad = Array1::zeros(third.nrows());
+                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third);
+                } else {
+                    a.6.add_pullback(self, row, &third);
+                }
+                if let Some(lift) = psi_lift.as_ref() {
+                    let q = q_geom.as_ref().unwrap();
+                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift, &f_pipi);
+                    a.6.add_second_pullback_weighted(q, &pb);
+                    a.6.add_timewiggle_psi_kappa_alpha(self, lift, &f_pi);
+                }
 
                 Ok(a)
             })
@@ -5178,53 +6274,9 @@ impl SurvivalMarginalSlopeFamily {
             _ => &block_states[2].beta,
         };
 
-        // When timewiggle is active and any psi coordinate is marginal, the
-        // exact pair-lift is still unfinished. Differentiate the corrected
-        // first-order joint psi map along the marginal coordinate instead of
-        // using the old block-local formulas.
-        if self.flex_timewiggle_active() && (block_idx_i == 1 || block_idx_j == 1) {
-            let step = 1e-6;
-            let (target_psi, shift_local_idx) = if block_idx_j == 1 {
-                (psi_i, local_idx_j)
-            } else {
-                (psi_j, local_idx_i)
-            };
-            let (family_plus, states_plus, derivs_plus) = self.shifted_marginal_psi_context(
-                block_states,
-                derivative_blocks,
-                shift_local_idx,
-                step,
-            )?;
-            let (family_minus, states_minus, derivs_minus) = self.shifted_marginal_psi_context(
-                block_states,
-                derivative_blocks,
-                shift_local_idx,
-                -step,
-            )?;
-
-            let plus = family_plus
-                .psi_terms_inner(&states_plus, &derivs_plus, target_psi, None)?
-                .ok_or_else(|| format!("missing psi terms for psi index {target_psi}"))?;
-            let minus = family_minus
-                .psi_terms_inner(&states_minus, &derivs_minus, target_psi, None)?
-                .ok_or_else(|| format!("missing psi terms for psi index {target_psi}"))?;
-
-            // psi_terms_inner now returns operator-backed Hessians; materialize.
-            let plus_dense = match plus.hessian_psi_operator.as_ref() {
-                Some(op) => op.to_dense(),
-                None => plus.hessian_psi,
-            };
-            let minus_dense = match minus.hessian_psi_operator.as_ref() {
-                Some(op) => op.to_dense(),
-                None => minus.hessian_psi,
-            };
-            return Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
-                objective_psi_psi: (plus.objective_psi - minus.objective_psi) / (2.0 * step),
-                score_psi_psi: (plus.score_psi - minus.score_psi) / (2.0 * step),
-                hessian_psi_psi: (plus_dense - minus_dense) / (2.0 * step),
-                hessian_psi_psi_operator: None,
-            }));
-        }
+        let timewiggle_active = self.flex_timewiggle_active();
+        let timewiggle_psi_i = timewiggle_active && block_idx_i == 1;
+        let timewiggle_psi_j = timewiggle_active && block_idx_j == 1;
 
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
@@ -5262,12 +6314,46 @@ impl SurvivalMarginalSlopeFamily {
                     self.psi_design_row_vector(row, deriv_i, self.n, p_psi_i, label_i)?;
                 let psi_row_j =
                     self.psi_design_row_vector(row, deriv_j, self.n, p_psi_j, label_j)?;
-                let dir_i = if let Some(primary) = flex_primary.as_ref() {
+
+                let q_geom = if timewiggle_active {
+                    Some(self.row_dynamic_q_geometry(row, block_states)?)
+                } else {
+                    None
+                };
+
+                let psi_lift_i = if timewiggle_psi_i {
+                    Some(self.timewiggle_marginal_psi_row_lift(
+                        row,
+                        block_states,
+                        flex_primary.as_ref(),
+                        &psi_row_i,
+                        beta_i,
+                    )?)
+                } else {
+                    None
+                };
+                let psi_lift_j = if timewiggle_psi_j {
+                    Some(self.timewiggle_marginal_psi_row_lift(
+                        row,
+                        block_states,
+                        flex_primary.as_ref(),
+                        &psi_row_j,
+                        beta_j,
+                    )?)
+                } else {
+                    None
+                };
+
+                let dir_i = if let Some(lift) = psi_lift_i.as_ref() {
+                    lift.dir.clone()
+                } else if let Some(primary) = flex_primary.as_ref() {
                     primary_direction_from_psi_row_flex(primary, block_idx_i, &psi_row_i, beta_i)
                 } else {
                     primary_direction_from_psi_row(block_idx_i, &psi_row_i, beta_i)
                 };
-                let dir_j = if let Some(primary) = flex_primary.as_ref() {
+                let dir_j = if let Some(lift) = psi_lift_j.as_ref() {
+                    lift.dir.clone()
+                } else if let Some(primary) = flex_primary.as_ref() {
                     primary_direction_from_psi_row_flex(primary, block_idx_j, &psi_row_j, beta_j)
                 } else {
                     primary_direction_from_psi_row(block_idx_j, &psi_row_j, beta_j)
@@ -5292,19 +6378,26 @@ impl SurvivalMarginalSlopeFamily {
                 } else {
                     (
                         None,
-                        Array1::<f64>::zeros(flex_primary.as_ref().map_or(N_PRIMARY, |p| p.total)),
+                        Array1::<f64>::zeros(flex_primary.as_ref().map_or(N_PRIMARY, |primary| primary.total)),
                     )
                 };
                 let has_ij = psi_row_ij
                     .as_ref()
                     .is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
 
+                let q_geom_lazy;
                 let (f_pi, f_pipi) = if let Some(primary) = flex_primary.as_ref() {
-                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let q_ref = match q_geom.as_ref() {
+                        Some(q) => q,
+                        None => {
+                            q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
+                            &q_geom_lazy
+                        }
+                    };
                     let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
-                        &q_geom,
+                        q_ref,
                         primary,
                     )?;
                     (g, h)
@@ -5345,7 +6438,13 @@ impl SurvivalMarginalSlopeFamily {
                     _ => a.3.scaled_add(s_j, &psi_row_j),
                 }
                 let pb1 = f_pipi.dot(&dir_ij);
-                self.accumulate_score_blockwise(row, &pb1, &mut a.1, &mut a.2, &mut a.3)?;
+                if let Some(q) = q_geom.as_ref() {
+                    self.accumulate_score_with_q_geometry(
+                        row, q, &pb1, &mut a.1, &mut a.2, &mut a.3,
+                    )?;
+                } else {
+                    self.accumulate_score_blockwise(row, &pb1, &mut a.1, &mut a.2, &mut a.3)?;
+                }
                 self.accumulate_score_identity_blocks(
                     flex_primary.as_ref(),
                     &pb1,
@@ -5353,7 +6452,13 @@ impl SurvivalMarginalSlopeFamily {
                     Some(&mut a.5),
                 );
                 let pb2 = third_i.dot(&dir_j);
-                self.accumulate_score_blockwise(row, &pb2, &mut a.1, &mut a.2, &mut a.3)?;
+                if let Some(q) = q_geom.as_ref() {
+                    self.accumulate_score_with_q_geometry(
+                        row, q, &pb2, &mut a.1, &mut a.2, &mut a.3,
+                    )?;
+                } else {
+                    self.accumulate_score_blockwise(row, &pb2, &mut a.1, &mut a.2, &mut a.3)?;
+                }
                 self.accumulate_score_identity_blocks(
                     flex_primary.as_ref(),
                     &pb2,
@@ -5364,24 +6469,91 @@ impl SurvivalMarginalSlopeFamily {
                 // Hessian
                 if has_ij {
                     let rp_ij = f_pipi.dot(&loading_i);
-                    a.6.add_rank1_psi_cross(
-                        self,
-                        row,
-                        block_idx_i,
-                        psi_row_ij.as_ref().unwrap(),
-                        &rp_ij,
-                    );
+                    if let Some(q) = q_geom.as_ref() {
+                        a.6.add_rank1_psi_cross_with_q_geometry(
+                            self,
+                            row,
+                            q,
+                            block_idx_i,
+                            psi_row_ij.as_ref().unwrap(),
+                            &rp_ij,
+                        );
+                    } else {
+                        a.6.add_rank1_psi_cross(
+                            self,
+                            row,
+                            block_idx_i,
+                            psi_row_ij.as_ref().unwrap(),
+                            &rp_ij,
+                        );
+                    }
                 }
                 let scalar_ij = loading_i.dot(&f_pipi.dot(&loading_j));
                 a.6.add_psi_psi_outer(block_idx_i, &psi_row_i, block_idx_j, &psi_row_j, scalar_ij);
                 let rp_i = third_j.t().dot(&loading_i);
-                a.6.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &rp_i);
+                if let Some(q) = q_geom.as_ref() {
+                    a.6.add_rank1_psi_cross_with_q_geometry(
+                        self,
+                        row,
+                        q,
+                        block_idx_i,
+                        &psi_row_i,
+                        &rp_i,
+                    );
+                } else {
+                    a.6.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &rp_i);
+                }
                 let rp_j = third_i.t().dot(&loading_j);
-                a.6.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j);
-                a.6.add_pullback(self, row, &fourth);
+                if let Some(q) = q_geom.as_ref() {
+                    a.6.add_rank1_psi_cross_with_q_geometry(
+                        self,
+                        row,
+                        q,
+                        block_idx_j,
+                        &psi_row_j,
+                        &rp_j,
+                    );
+                } else {
+                    a.6.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j);
+                }
+                if let Some(q) = q_geom.as_ref() {
+                    let zero_grad = Array1::zeros(fourth.nrows());
+                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth);
+                } else {
+                    a.6.add_pullback(self, row, &fourth);
+                }
                 let third_ij =
                     self.row_primary_third_contracted_general(row, block_states, &dir_ij)?;
-                a.6.add_pullback(self, row, &third_ij);
+                if let Some(q) = q_geom.as_ref() {
+                    let zero_grad = Array1::zeros(third_ij.nrows());
+                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_ij);
+                } else {
+                    a.6.add_pullback(self, row, &third_ij);
+                }
+
+                // Timewiggle psi corrections for ψ_i (terms 1,2,4,5 of eq 47)
+                if let Some(lift_i) = psi_lift_i.as_ref() {
+                    let q = q_geom.as_ref().unwrap();
+                    // U_i^α cross terms with third_j Hessian
+                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift_i, &third_j);
+                    // Second pullback weighted by T_j[dir_j] applied to dir_i
+                    let hu_i = f_pipi.dot(&dir_i);
+                    a.6.add_second_pullback_weighted(q, &hu_i);
+                    // K^{BC,α_i} weighted by gradient
+                    a.6.add_timewiggle_psi_kappa_alpha(self, lift_i, &f_pi);
+                }
+                // Timewiggle psi corrections for ψ_j
+                if let Some(lift_j) = psi_lift_j.as_ref() {
+                    let q = q_geom.as_ref().unwrap();
+                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift_j, &third_i);
+                    let hu_j = f_pipi.dot(&dir_j);
+                    a.6.add_second_pullback_weighted(q, &hu_j);
+                    if psi_lift_i.is_none() {
+                        // Only add gradient-weighted K^α for j if we didn't already
+                        // add it for i (when both are marginal, it's already covered)
+                        a.6.add_timewiggle_psi_kappa_alpha(self, lift_j, &f_pi);
+                    }
+                }
 
                 Ok(a)
             })
@@ -5439,7 +6611,12 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
-        let flex_primary = flex_active.then(|| flex_primary_slices(self));
+        if flex_active {
+            return Err(
+                "survival marginal-slope exact flexible psi-Hessian directional derivatives are disabled until analytic row-primary third/fourth contractions are implemented"
+                    .to_string(),
+            );
+        }
         let slices = block_slices(self, block_states);
         let Some((block_idx, local_idx, p_psi, psi_label)) =
             self.psi_block_info(derivative_blocks, psi_index)?
@@ -5447,11 +6624,7 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
         let deriv = &derivative_blocks[block_idx][local_idx];
-        let loading = if let Some(primary) = flex_primary.as_ref() {
-            spatial_block_primary_loading_flex(primary, block_idx)?
-        } else {
-            spatial_block_primary_loading(block_idx)?
-        };
+        let loading = spatial_block_primary_loading(block_idx)?;
         let beta_psi = match block_idx {
             1 => &block_states[1].beta,
             _ => &block_states[2].beta,
@@ -5461,36 +6634,8 @@ impl SurvivalMarginalSlopeFamily {
             _ => d_beta_flat.slice(s![slices.logslope.clone()]),
         };
 
-        // When timewiggle is active, the block path uses raw design rows that
-        // miss T'(h) factors in the pullback. Fall back to FD of the (now
-        // correct) block-path psi Hessian until the block path is fully lifted.
-        if self.flex_timewiggle_active() {
-            let norm = d_beta_flat
-                .iter()
-                .map(|value| value.abs())
-                .fold(0.0_f64, f64::max);
-            let step = (1e-6 / norm.max(1.0)).max(1e-8);
-            let plus_states =
-                self.shifted_block_states_along_direction(block_states, d_beta_flat, step);
-            let minus_states =
-                self.shifted_block_states_along_direction(block_states, d_beta_flat, -step);
-            let plus = self
-                .psi_terms_inner(&plus_states, derivative_blocks, psi_index, None)?
-                .ok_or_else(|| format!("missing psi terms for psi index {psi_index}"))?;
-            let minus = self
-                .psi_terms_inner(&minus_states, derivative_blocks, psi_index, None)?
-                .ok_or_else(|| format!("missing psi terms for psi index {psi_index}"))?;
-            // psi_terms_inner now returns operator-backed Hessians; materialize.
-            let plus_dense = match plus.hessian_psi_operator.as_ref() {
-                Some(op) => op.to_dense(),
-                None => plus.hessian_psi,
-            };
-            let minus_dense = match minus.hessian_psi_operator.as_ref() {
-                Some(op) => op.to_dense(),
-                None => minus.hessian_psi,
-            };
-            return Ok(Some((plus_dense - minus_dense) / (2.0 * step)));
-        }
+        let timewiggle_active = self.flex_timewiggle_active();
+        let timewiggle_psi = timewiggle_active && block_idx == 1;
 
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
@@ -5505,18 +6650,38 @@ impl SurvivalMarginalSlopeFamily {
                 |mut acc, row| -> Result<BlockHessianAccumulator, String> {
                     let psi_row =
                         self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-                    let psi_dir = if let Some(primary) = flex_primary.as_ref() {
-                        primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
+
+                    let q_geom = if timewiggle_active {
+                        Some(self.row_dynamic_q_geometry(row, block_states)?)
+                    } else {
+                        None
+                    };
+
+                    let psi_lift = if timewiggle_psi {
+                        Some(self.timewiggle_marginal_psi_row_lift(
+                            row,
+                            block_states,
+                            &psi_row,
+                            beta_psi,
+                        )?)
+                    } else {
+                        None
+                    };
+
+                    let psi_dir = if let Some(lift) = psi_lift.as_ref() {
+                        lift.dir.clone()
                     } else {
                         primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
                     };
-                    let psi_action = if let Some(primary) = flex_primary.as_ref() {
-                        primary_psi_action_from_psi_row_flex(
-                            primary,
-                            block_idx,
+                    let psi_action = if psi_lift.is_some() {
+                        self.timewiggle_psi_action(
+                            row,
+                            block_states,
+                            &slices,
                             &psi_row,
-                            d_beta_block,
-                        )
+                            beta_psi,
+                            d_beta_flat,
+                        )?
                     } else {
                         primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
                     };
@@ -5526,6 +6691,8 @@ impl SurvivalMarginalSlopeFamily {
                         &slices,
                         d_beta_flat,
                     )?;
+                    let (_, _, h_pi) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                     let third_beta =
                         self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
                     let fourth = self.row_primary_fourth_contracted_general(
@@ -5536,11 +6703,43 @@ impl SurvivalMarginalSlopeFamily {
                     )?;
 
                     let right_primary = third_beta.t().dot(&loading);
-                    acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
-                    acc.add_pullback(self, row, &fourth);
+                    if let Some(q) = q_geom.as_ref() {
+                        acc.add_rank1_psi_cross_with_q_geometry(
+                            self,
+                            row,
+                            q,
+                            block_idx,
+                            &psi_row,
+                            &right_primary,
+                        );
+                    } else {
+                        acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                    }
+                    if let Some(q) = q_geom.as_ref() {
+                        let zero_grad = Array1::zeros(fourth.nrows());
+                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth);
+                    } else {
+                        acc.add_pullback(self, row, &fourth);
+                    }
                     let third_action =
                         self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
-                    acc.add_pullback(self, row, &third_action);
+                    if let Some(q) = q_geom.as_ref() {
+                        let zero_grad = Array1::zeros(third_action.nrows());
+                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action);
+                    } else {
+                        acc.add_pullback(self, row, &third_action);
+                    }
+                    // Timewiggle psi corrections
+                    if let Some(lift) = psi_lift.as_ref() {
+                        let q = q_geom.as_ref().unwrap();
+                        // U^α cross with third_beta (D_β H term)
+                        acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta);
+                        let second_pullback_weight =
+                            third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
+                        acc.add_second_pullback_weighted(q, &second_pullback_weight);
+                        let kappa_weight = h_pi.dot(&row_dir);
+                        acc.add_timewiggle_psi_kappa_alpha(self, lift, &kappa_weight);
+                    }
                     Ok(acc)
                 },
             )
@@ -5569,6 +6768,10 @@ struct SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     family: SurvivalMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
     joint_hessian: Array2<f64>,
+    /// Cached per-row primary gradient + Hessian for timewiggle directional
+    /// derivative reuse.  Built once during workspace construction so that
+    /// repeated directional-derivative calls do not recompute them.
+    eval_cache: Option<EvalCache>,
 }
 
 impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
@@ -5577,10 +6780,16 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
         block_states: Vec<ParameterBlockState>,
     ) -> Result<Self, String> {
         let joint_hessian = family.evaluate_exact_newton_joint_dense(&block_states)?.2;
+        let eval_cache = if family.flex_timewiggle_active() && !family.flex_active() {
+            Some(family.build_eval_cache(&block_states)?)
+        } else {
+            None
+        };
         Ok(Self {
             family,
             block_states,
             joint_hessian,
+            eval_cache,
         })
     }
 }
@@ -5598,6 +6807,16 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if let Some(cache) = self.eval_cache.as_ref() {
+            return self
+                .family
+                .exact_newton_joint_hessian_directional_derivative_timewiggle_cached(
+                    &self.block_states,
+                    d_beta_flat,
+                    cache,
+                )
+                .map(Some);
+        }
         self.family
             .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
     }
@@ -5860,15 +7079,25 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
 }
 
 impl SurvivalMarginalSlopeFamily {
-    fn evaluate_exact_newton_joint_flexible_dense(
+    /// Unified dense joint Hessian assembly for flex and timewiggle paths.
+    /// Both paths use q-geometry Jacobians via accumulate_dynamic_q_joint_row.
+    /// The rigid path (no flex, no timewiggle) uses the RowKernel fast path.
+    fn evaluate_exact_newton_joint_dynamic_q_dense(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        self.validate_exact_monotonicity(block_states)?;
+        let flex_active = self.effective_flex_active(block_states)?;
+        if flex_active {
+            self.validate_exact_monotonicity(block_states)?;
+        }
         let slices = block_slices(self, block_states);
         let primary = flex_primary_slices(self);
         let p_total = slices.total;
-        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+        let identity_blocks = if flex_active {
+            flex_identity_block_pairs(&primary, &slices)
+        } else {
+            vec![]
+        };
 
         type Acc = (f64, Array1<f64>, Array2<f64>);
         let make_acc = || -> Acc {
@@ -5883,13 +7112,16 @@ impl SurvivalMarginalSlopeFamily {
             .into_par_iter()
             .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
                 let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                let (row_nll, f_pi, f_pipi) = self
-                    .compute_row_flex_primary_gradient_hessian_exact(
+                let (row_nll, f_pi, f_pipi) = if flex_active {
+                    self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
                         &q_geom,
                         &primary,
-                    )?;
+                    )?
+                } else {
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                };
                 acc.0 -= row_nll;
                 self.accumulate_dynamic_q_joint_row(
                     row,
@@ -5911,57 +7143,12 @@ impl SurvivalMarginalSlopeFamily {
             })
     }
 
-    fn evaluate_exact_newton_joint_timewiggle_dense(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let slices = block_slices(self, block_states);
-        let p_total = slices.total;
-
-        type Acc = (f64, Array1<f64>, Array2<f64>);
-        let make_acc = || -> Acc {
-            (
-                0.0,
-                Array1::zeros(p_total),
-                Array2::zeros((p_total, p_total)),
-            )
-        };
-
-        (0..self.n)
-            .into_par_iter()
-            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                let (row_nll, f_pi, f_pipi) =
-                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                acc.0 -= row_nll;
-                self.accumulate_dynamic_q_joint_row(
-                    row,
-                    &slices,
-                    &q_geom,
-                    f_pi.view(),
-                    f_pipi.view(),
-                    &[],
-                    &mut acc.1,
-                    &mut acc.2,
-                )?;
-                Ok(acc)
-            })
-            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
-                left.0 += right.0;
-                left.1 += &right.1;
-                left.2 += &right.2;
-                Ok(left)
-            })
-    }
-
     fn evaluate_exact_newton_joint_dense(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        if self.effective_flex_active(block_states)? {
-            self.evaluate_exact_newton_joint_flexible_dense(block_states)
-        } else if self.flex_timewiggle_active() {
-            self.evaluate_exact_newton_joint_timewiggle_dense(block_states)
+        if self.effective_flex_active(block_states)? || self.flex_timewiggle_active() {
+            self.evaluate_exact_newton_joint_dynamic_q_dense(block_states)
         } else {
             let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern)?;
@@ -5973,98 +7160,793 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
-    fn perturb_block_states_along_direction(
+    /// Exact directional derivative of the joint Hessian for timewiggle-only
+    /// models (no score-warp / link-deviation).  Replaces FD by analytically
+    /// differentiating the J^T H J + f·K pullback through the timewiggle
+    /// q-map geometry (equation 47 of the unified pullback framework).
+    fn exact_newton_joint_hessian_directional_derivative_timewiggle_inner(
         &self,
         block_states: &[ParameterBlockState],
-        direction: &Array1<f64>,
-        step: f64,
-    ) -> Result<Vec<ParameterBlockState>, String> {
+        d_beta_flat: &Array1<f64>,
+        cache: Option<&EvalCache>,
+    ) -> Result<Array2<f64>, String> {
         let slices = block_slices(self, block_states);
-        if direction.len() != slices.total {
-            return Err(format!(
-                "survival joint-direction length mismatch: got {}, expected {}",
-                direction.len(),
-                slices.total
-            ));
-        }
-        let mut out = block_states.to_vec();
-        let time_delta = direction.slice(s![slices.time.clone()]).to_owned() * step;
-        out[0].beta += &time_delta;
-        out[0].eta += &(self.design_exit.dot(&time_delta));
-        let marginal_delta = direction.slice(s![slices.marginal.clone()]).to_owned() * step;
-        out[1].beta += &marginal_delta;
-        out[1].eta += &(self.marginal_design.dot(&marginal_delta));
-        let logslope_delta = direction.slice(s![slices.logslope.clone()]).to_owned() * step;
-        out[2].beta += &logslope_delta;
-        out[2].eta += &(self.logslope_design.dot(&logslope_delta));
-        if let Some(range) = slices.score_warp.as_ref() {
-            out[3].beta += &(direction.slice(s![range.clone()]).to_owned() * step);
-        }
-        if let Some(range) = slices.link_dev.as_ref() {
-            let block_idx = 3 + usize::from(self.score_warp.is_some());
-            out[block_idx].beta += &(direction.slice(s![range.clone()]).to_owned() * step);
-        }
-        Ok(out)
+        let p_total = slices.total;
+        let p_time = slices.time.len();
+        let p_marginal = slices.marginal.len();
+        let time_tail = self.time_wiggle_range();
+        let p_base = time_tail.start;
+        let d_time = d_beta_flat.slice(s![slices.time.clone()]);
+        let d_marginal = d_beta_flat.slice(s![slices.marginal.clone()]);
+        let beta_time = &block_states[0].beta;
+        let beta_time_w = beta_time.slice(s![time_tail.clone()]);
+
+        let result = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |mut acc, row| -> Result<Array2<f64>, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let primary_owned;
+                    let (f_pi, h_pi) = if let Some(cached) = cache {
+                        self.row_primary_gradient_hessian(row, cached)
+                    } else {
+                        primary_owned =
+                            self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                        (&primary_owned.1, &primary_owned.2)
+                    };
+                    // Inline primary direction from already-computed q_geom
+                    // (avoids redundant row_dynamic_q_geometry call)
+                    let d_logslope = d_beta_flat.slice(s![slices.logslope.clone()]);
+                    let u_d = Array1::from_vec(vec![
+                        q_geom.dq0_time.dot(&d_time) + q_geom.dq0_marginal.dot(&d_marginal),
+                        q_geom.dq1_time.dot(&d_time) + q_geom.dq1_marginal.dot(&d_marginal),
+                        q_geom.dqd1_time.dot(&d_time) + q_geom.dqd1_marginal.dot(&d_marginal),
+                        self.logslope_design.dot_row_view(row, d_logslope),
+                    ]);
+                    let t_ud = self.row_primary_third_contracted(row, block_states, &u_d)?;
+                    let h_ud = h_pi.dot(&u_d);
+
+                    // Term 1 + 3: reuse core accumulator with (H·u^d, T[u^d])
+                    self.accumulate_dynamic_q_core_hessian(
+                        row,
+                        &slices,
+                        &q_geom,
+                        h_ud.view(),
+                        t_ud.view(),
+                        &mut acc,
+                    );
+
+                    // ── Timewiggle Jacobian derivatives ────────────────
+                    let ec = self.design_entry.row_chunk(row..row + 1);
+                    let xc = self.design_exit.row_chunk(row..row + 1);
+                    let dc = self.design_derivative_exit.row_chunk(row..row + 1);
+                    let xe = ec.row(0).slice(s![..p_base]).to_owned();
+                    let xx = xc.row(0).slice(s![..p_base]).to_owned();
+                    let xd = dc.row(0).slice(s![..p_base]).to_owned();
+                    let mc = self.marginal_design.row_chunk(row..row + 1);
+                    let mr = mc.row(0).to_owned();
+                    let dh0 = xe.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
+                    let dh1 = xx.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
+                    let ddr = xd.dot(&d_time.slice(s![..p_base]));
+                    let bm = block_states[1].eta[row];
+                    let h0 = xe.dot(&beta_time.slice(s![..p_base])) + self.offset_entry[row] + bm;
+                    let h1 = xx.dot(&beta_time.slice(s![..p_base])) + self.offset_exit[row] + bm;
+                    let dr =
+                        xd.dot(&beta_time.slice(s![..p_base])) + self.derivative_offset_exit[row];
+                    let eg = self
+                        .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
+                        .ok_or_else(|| "timewiggle geometry missing at entry".to_string())?;
+                    let xg = self
+                        .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
+                        .ok_or_else(|| "timewiggle geometry missing at exit".to_string())?;
+                    let (m2e, m3e) = (eg.d2q_dq02[0], eg.d3q_dq03[0]);
+                    let (m2x, m3x, m4x) = (xg.d2q_dq02[0], xg.d3q_dq03[0], xg.d4q_dq04[0]);
+
+                    // dJ_{q,time}[a] / dβ[d]
+                    let mut dj0t = vec![0.0f64; p_time];
+                    let mut dj1t = vec![0.0f64; p_time];
+                    let mut djdt = vec![0.0f64; p_time];
+                    for a in 0..p_base {
+                        dj0t[a] = m2e * dh0 * xe[a];
+                        dj1t[a] = m2x * dh1 * xx[a];
+                        djdt[a] = m3x * dh1 * dr * xx[a] + m2x * ddr * xx[a] + m2x * dh1 * xd[a];
+                    }
+                    for li in 0..time_tail.len() {
+                        let ci = time_tail.start + li;
+                        dj0t[ci] = eg.basis_d1[[0, li]] * dh0;
+                        dj1t[ci] = xg.basis_d1[[0, li]] * dh1;
+                        djdt[ci] = xg.basis_d2[[0, li]] * dh1 * dr + xg.basis_d1[[0, li]] * ddr;
+                    }
+                    let djt = [&dj0t[..], &dj1t[..], &djdt[..]];
+                    let mut dj0m = vec![0.0f64; p_marginal];
+                    let mut dj1m = vec![0.0f64; p_marginal];
+                    let mut djdm = vec![0.0f64; p_marginal];
+                    for a in 0..p_marginal {
+                        dj0m[a] = m2e * dh0 * mr[a];
+                        dj1m[a] = m2x * dh1 * mr[a];
+                        djdm[a] = m3x * dh1 * dr * mr[a] + m2x * ddr * mr[a];
+                    }
+                    let djm = [&dj0m[..], &dj1m[..], &djdm[..]];
+                    let jt: [&Array1<f64>; 3] =
+                        [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+                    let jm: [&Array1<f64>; 3] = [
+                        &q_geom.dq0_marginal,
+                        &q_geom.dq1_marginal,
+                        &q_geom.dqd1_marginal,
+                    ];
+
+                    // Term 2: (dJ/d)^T H J + J^T H (dJ/d)
+                    for a in 0..p_time {
+                        for b in 0..p_time {
+                            let mut v = 0.0;
+                            for qu in 0..3 {
+                                for qv in 0..3 {
+                                    v += h_pi[[qu, qv]]
+                                        * (djt[qu][a] * jt[qv][b] + jt[qu][a] * djt[qv][b]);
+                                }
+                            }
+                            acc[[slices.time.start + a, slices.time.start + b]] += v;
+                        }
+                    }
+                    for a in 0..p_marginal {
+                        for b in 0..p_marginal {
+                            let mut v = 0.0;
+                            for qu in 0..3 {
+                                for qv in 0..3 {
+                                    v += h_pi[[qu, qv]]
+                                        * (djm[qu][a] * jm[qv][b] + jm[qu][a] * djm[qv][b]);
+                                }
+                            }
+                            acc[[slices.marginal.start + a, slices.marginal.start + b]] += v;
+                        }
+                    }
+                    for a in 0..p_time {
+                        for b in 0..p_marginal {
+                            let mut v = 0.0;
+                            for qu in 0..3 {
+                                for qv in 0..3 {
+                                    v += h_pi[[qu, qv]]
+                                        * (djt[qu][a] * jm[qv][b] + jt[qu][a] * djm[qv][b]);
+                                }
+                            }
+                            acc[[slices.time.start + a, slices.marginal.start + b]] += v;
+                            acc[[slices.marginal.start + b, slices.time.start + a]] += v;
+                        }
+                    }
+                    let gc = self.logslope_design.row_chunk(row..row + 1);
+                    let gr = gc.row(0);
+                    for a in 0..p_time {
+                        let mut w = 0.0;
+                        for qu in 0..3 {
+                            w += h_pi[[qu, 3]] * djt[qu][a];
+                        }
+                        for b in 0..slices.logslope.len() {
+                            let v = w * gr[b];
+                            acc[[slices.time.start + a, slices.logslope.start + b]] += v;
+                            acc[[slices.logslope.start + b, slices.time.start + a]] += v;
+                        }
+                    }
+                    for a in 0..p_marginal {
+                        let mut w = 0.0;
+                        for qu in 0..3 {
+                            w += h_pi[[qu, 3]] * djm[qu][a];
+                        }
+                        for b in 0..slices.logslope.len() {
+                            let v = w * gr[b];
+                            acc[[slices.marginal.start + a, slices.logslope.start + b]] += v;
+                            acc[[slices.logslope.start + b, slices.marginal.start + a]] += v;
+                        }
+                    }
+
+                    // Term 4: Σ_r f_r dK_r/d
+                    for a in 0..p_base {
+                        for b in 0..p_base {
+                            let dk0 = m3e * dh0 * xe[a] * xe[b];
+                            let dk1 = m3x * dh1 * xx[a] * xx[b];
+                            let dkd = m4x * dh1 * dr * xx[a] * xx[b]
+                                + m3x * ddr * xx[a] * xx[b]
+                                + m3x * dh1 * (xx[a] * xd[b] + xd[a] * xx[b]);
+                            acc[[slices.time.start + a, slices.time.start + b]] +=
+                                f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+                        }
+                    }
+                    for li in 0..time_tail.len() {
+                        let ci = time_tail.start + li;
+                        for a in 0..p_base {
+                            let dk0 = eg.basis_d2[[0, li]] * dh0 * xe[a];
+                            let dk1 = xg.basis_d2[[0, li]] * dh1 * xx[a];
+                            let dkd = xg.basis_d3[[0, li]] * dh1 * dr * xx[a]
+                                + xg.basis_d2[[0, li]] * ddr * xx[a]
+                                + xg.basis_d2[[0, li]] * dh1 * xd[a];
+                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+                            acc[[slices.time.start + a, slices.time.start + ci]] += v;
+                            acc[[slices.time.start + ci, slices.time.start + a]] += v;
+                        }
+                    }
+                    for a in 0..p_base {
+                        for b in 0..p_marginal {
+                            let dk0 = m3e * dh0 * xe[a] * mr[b];
+                            let dk1 = m3x * dh1 * xx[a] * mr[b];
+                            let dkd = m4x * dh1 * dr * xx[a] * mr[b]
+                                + m3x * ddr * xx[a] * mr[b]
+                                + m3x * dh1 * xd[a] * mr[b];
+                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+                            acc[[slices.time.start + a, slices.marginal.start + b]] += v;
+                            acc[[slices.marginal.start + b, slices.time.start + a]] += v;
+                        }
+                    }
+                    for li in 0..time_tail.len() {
+                        let ci = time_tail.start + li;
+                        for b in 0..p_marginal {
+                            let dk0 = eg.basis_d2[[0, li]] * dh0 * mr[b];
+                            let dk1 = xg.basis_d2[[0, li]] * dh1 * mr[b];
+                            let dkd = xg.basis_d3[[0, li]] * dh1 * dr * mr[b]
+                                + xg.basis_d2[[0, li]] * ddr * mr[b];
+                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+                            acc[[slices.time.start + ci, slices.marginal.start + b]] += v;
+                            acc[[slices.marginal.start + b, slices.time.start + ci]] += v;
+                        }
+                    }
+                    for a in 0..p_marginal {
+                        for b in 0..p_marginal {
+                            let dk0 = m3e * dh0 * mr[a] * mr[b];
+                            let dk1 = m3x * dh1 * mr[a] * mr[b];
+                            let dkd = m4x * dh1 * dr * mr[a] * mr[b] + m3x * ddr * mr[a] * mr[b];
+                            acc[[slices.marginal.start + a, slices.marginal.start + b]] +=
+                                f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+                        }
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |mut a, b| -> Result<_, String> {
+                    a += &b;
+                    Ok(a)
+                },
+            )?;
+        Ok(result)
     }
 
-    fn exact_newton_joint_hessian_directional_derivative_fd(
+    fn exact_newton_joint_hessian_directional_derivative_timewiggle_cached(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        cache: &EvalCache,
+    ) -> Result<Array2<f64>, String> {
+        self.exact_newton_joint_hessian_directional_derivative_timewiggle_inner(
+            block_states,
+            d_beta_flat,
+            Some(cache),
+        )
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_timewiggle(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        let norm = d_beta_flat
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let step = (1e-6 / norm.max(1.0)).max(1e-8);
-        let plus = self.perturb_block_states_along_direction(block_states, d_beta_flat, step)?;
-        let minus = self.perturb_block_states_along_direction(block_states, d_beta_flat, -step)?;
-        let h_plus = self.evaluate_exact_newton_joint_dense(&plus)?.2;
-        let h_minus = self.evaluate_exact_newton_joint_dense(&minus)?.2;
-        Ok((h_plus - h_minus) / (2.0 * step))
+        self.exact_newton_joint_hessian_directional_derivative_timewiggle_inner(
+            block_states,
+            d_beta_flat,
+            None,
+        )
     }
-
-    fn exact_newton_joint_hessiansecond_directional_derivative_fd(
+    /// Fully exact second directional derivative D²H[d,e] for timewiggle-only.
+    /// No FD. Differentiates DH[e] along d analytically using m₂–m₅ scalars.
+    ///
+    /// D²H[d,e] = J^T Ψ J  +  Σ γ_r K_r
+    ///   + Σ bilinear(W_k, left_k, right_k)  for k in {T_e×dJ_d, T_d×dJ_e, H×d²J, H×dJ_d×dJ_e}
+    ///   + dK cross-terms: (Hu_d)·dK_e + (Hu_e)·dK_d + f·d²K
+    ///
+    /// where Ψ = Q[u_d,u_e] + T[du_e/dd], γ = T_d·u_e + H·du_e/dd.
+    fn exact_newton_joint_hessiansecond_directional_derivative_timewiggle(
         &self,
         block_states: &[ParameterBlockState],
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
+        d_u: &Array1<f64>,
+        d_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        let norm_u = d_beta_u_flat
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let norm_v = d_beta_v_flat
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let step_u = (1e-5 / norm_u.max(1.0)).max(1e-7);
-        let step_v = (1e-5 / norm_v.max(1.0)).max(1e-7);
-        let pp = self.perturb_block_states_along_direction(
-            &self.perturb_block_states_along_direction(block_states, d_beta_u_flat, step_u)?,
-            d_beta_v_flat,
-            step_v,
-        )?;
-        let pm = self.perturb_block_states_along_direction(
-            &self.perturb_block_states_along_direction(block_states, d_beta_u_flat, step_u)?,
-            d_beta_v_flat,
-            -step_v,
-        )?;
-        let mp = self.perturb_block_states_along_direction(
-            &self.perturb_block_states_along_direction(block_states, d_beta_u_flat, -step_u)?,
-            d_beta_v_flat,
-            step_v,
-        )?;
-        let mm = self.perturb_block_states_along_direction(
-            &self.perturb_block_states_along_direction(block_states, d_beta_u_flat, -step_u)?,
-            d_beta_v_flat,
-            -step_v,
-        )?;
-        let h_pp = self.evaluate_exact_newton_joint_dense(&pp)?.2;
-        let h_pm = self.evaluate_exact_newton_joint_dense(&pm)?.2;
-        let h_mp = self.evaluate_exact_newton_joint_dense(&mp)?.2;
-        let h_mm = self.evaluate_exact_newton_joint_dense(&mm)?.2;
-        Ok((h_pp - h_pm - h_mp + h_mm) / (4.0 * step_u * step_v))
+        let slices = block_slices(self, block_states);
+        let p_total = slices.total;
+        let p_time = slices.time.len();
+        let p_marginal = slices.marginal.len();
+        let time_tail = self.time_wiggle_range();
+        let p_base = time_tail.start;
+        let du_t = d_u.slice(s![slices.time.clone()]);
+        let du_m = d_u.slice(s![slices.marginal.clone()]);
+        let du_g = d_u.slice(s![slices.logslope.clone()]);
+        let dv_t = d_v.slice(s![slices.time.clone()]);
+        let dv_m = d_v.slice(s![slices.marginal.clone()]);
+        let dv_g = d_v.slice(s![slices.logslope.clone()]);
+        let beta_time = &block_states[0].beta;
+        let beta_tw = beta_time.slice(s![time_tail.clone()]);
+
+        let result = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |mut acc, row| -> Result<Array2<f64>, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let (_, f_pi, h_pi) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+
+                    // Primary directions
+                    let ud = Array1::from_vec(vec![
+                        q_geom.dq0_time.dot(&du_t) + q_geom.dq0_marginal.dot(&du_m),
+                        q_geom.dq1_time.dot(&du_t) + q_geom.dq1_marginal.dot(&du_m),
+                        q_geom.dqd1_time.dot(&du_t) + q_geom.dqd1_marginal.dot(&du_m),
+                        self.logslope_design.dot_row_view(row, du_g),
+                    ]);
+                    let ue = Array1::from_vec(vec![
+                        q_geom.dq0_time.dot(&dv_t) + q_geom.dq0_marginal.dot(&dv_m),
+                        q_geom.dq1_time.dot(&dv_t) + q_geom.dq1_marginal.dot(&dv_m),
+                        q_geom.dqd1_time.dot(&dv_t) + q_geom.dqd1_marginal.dot(&dv_m),
+                        self.logslope_design.dot_row_view(row, dv_g),
+                    ]);
+
+                    let t_d = self.row_primary_third_contracted(row, block_states, &ud)?;
+                    let t_e = self.row_primary_third_contracted(row, block_states, &ue)?;
+                    let q_de = self.row_primary_fourth_contracted(row, block_states, &ud, &ue)?;
+                    let h_ud = h_pi.dot(&ud);
+                    let h_ue = h_pi.dot(&ue);
+
+                    // ── Timewiggle geometry ─────────────────────────────
+                    let ec = self.design_entry.row_chunk(row..row + 1);
+                    let xc = self.design_exit.row_chunk(row..row + 1);
+                    let dc = self.design_derivative_exit.row_chunk(row..row + 1);
+                    let xe = ec.row(0).slice(s![..p_base]).to_owned();
+                    let xx = xc.row(0).slice(s![..p_base]).to_owned();
+                    let xd = dc.row(0).slice(s![..p_base]).to_owned();
+                    let mc = self.marginal_design.row_chunk(row..row + 1);
+                    let mr = mc.row(0).to_owned();
+
+                    let bm = block_states[1].eta[row];
+                    let h0 = xe.dot(&beta_time.slice(s![..p_base])) + self.offset_entry[row] + bm;
+                    let h1 = xx.dot(&beta_time.slice(s![..p_base])) + self.offset_exit[row] + bm;
+                    let dr =
+                        xd.dot(&beta_time.slice(s![..p_base])) + self.derivative_offset_exit[row];
+
+                    let eg = self
+                        .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_tw)?
+                        .ok_or_else(|| "timewiggle geometry missing".to_string())?;
+                    let xg = self
+                        .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_tw)?
+                        .ok_or_else(|| "timewiggle geometry missing".to_string())?;
+
+                    let m2_en = eg.d2q_dq02[0];
+                    let m3_en = eg.d3q_dq03[0];
+                    let m4_en = eg.d4q_dq04[0];
+                    let m2_ex = xg.d2q_dq02[0];
+                    let m3_ex = xg.d3q_dq03[0];
+                    let m4_ex = xg.d4q_dq04[0];
+                    let m5_ex = xg.d5q_dq05[0];
+
+                    // Direction scalars (h linear in β ⇒ d²h/ded = 0)
+                    let dh0d = xe.dot(&du_t.slice(s![..p_base])) + mr.dot(&du_m);
+                    let dh1d = xx.dot(&du_t.slice(s![..p_base])) + mr.dot(&du_m);
+                    let ddrd = xd.dot(&du_t.slice(s![..p_base]));
+                    let dh0e = xe.dot(&dv_t.slice(s![..p_base])) + mr.dot(&dv_m);
+                    let dh1e = xx.dot(&dv_t.slice(s![..p_base])) + mr.dot(&dv_m);
+                    let ddre = xd.dot(&dv_t.slice(s![..p_base]));
+
+                    // du_e/dd = (dJ/dd)·e_v — primary direction of e perturbed by d
+                    // dJ[q0,time_a]/dd = m2_en*dh0d*xe[a] for base, basis_d1*dh0d for wiggle
+                    let due_d = {
+                        let mut v = [0.0f64; 4];
+                        for a in 0..p_base {
+                            v[0] += m2_en * dh0d * xe[a] * dv_t[a];
+                            v[1] += m2_ex * dh1d * xx[a] * dv_t[a];
+                            v[2] += (m3_ex * dh1d * dr * xx[a]
+                                + m2_ex * ddrd * xx[a]
+                                + m2_ex * dh1d * xd[a])
+                                * dv_t[a];
+                        }
+                        for li in 0..time_tail.len() {
+                            let ci = time_tail.start + li;
+                            v[0] += eg.basis_d1[[0, li]] * dh0d * dv_t[ci];
+                            v[1] += xg.basis_d1[[0, li]] * dh1d * dv_t[ci];
+                            v[2] += (xg.basis_d2[[0, li]] * dh1d * dr
+                                + xg.basis_d1[[0, li]] * ddrd)
+                                * dv_t[ci];
+                        }
+                        for a in 0..p_marginal {
+                            v[0] += m2_en * dh0d * mr[a] * dv_m[a];
+                            v[1] += m2_ex * dh1d * mr[a] * dv_m[a];
+                            v[2] += (m3_ex * dh1d * dr * mr[a] + m2_ex * ddrd * mr[a]) * dv_m[a];
+                        }
+                        // v[3] = 0 (logslope J is constant)
+                        Array1::from_vec(v.to_vec())
+                    };
+
+                    // Ψ = Q[ud,ue] + T[due_d]
+                    let t_due = self.row_primary_third_contracted(row, block_states, &due_d)?;
+                    let psi = &q_de + &t_due;
+
+                    // γ = T_d·ue + H·due_d
+                    let gamma = &t_d.dot(&ue) + &h_pi.dot(&due_d);
+
+                    // ── Term A: J^T Ψ J + γ·K ─────────────────────────
+                    self.accumulate_dynamic_q_core_hessian(
+                        row,
+                        &slices,
+                        &q_geom,
+                        gamma.view(),
+                        psi.view(),
+                        &mut acc,
+                    );
+
+                    let jt = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+                    let jm = [
+                        &q_geom.dq0_marginal,
+                        &q_geom.dq1_marginal,
+                        &q_geom.dqd1_marginal,
+                    ];
+                    let gc = self.logslope_design.row_chunk(row..row + 1);
+                    let gr = gc.row(0);
+
+                    // ── Helper: accumulate a symmetrized bilinear term ──
+                    // Adds Σ W[qu,qv] * (left[qu,a]*right[qv,b] + right[qu,a]*left[qv,b])
+                    // for all block pairs into acc.
+                    macro_rules! accum_bilinear {
+                        ($w:expr, $lt:expr, $lm:expr, $rt:expr, $rm:expr) => {
+                            for a in 0..p_time {
+                                for b in 0..p_time {
+                                    let mut v = 0.0;
+                                    for qu in 0..3 {
+                                        for qv in 0..3 {
+                                            v += $w[[qu, qv]]
+                                                * ($lt[qu][a] * $rt[qv][b]
+                                                    + $rt[qu][a] * $lt[qv][b]);
+                                        }
+                                    }
+                                    acc[[slices.time.start + a, slices.time.start + b]] += v;
+                                }
+                            }
+                            for a in 0..p_marginal {
+                                for b in 0..p_marginal {
+                                    let mut v = 0.0;
+                                    for qu in 0..3 {
+                                        for qv in 0..3 {
+                                            v += $w[[qu, qv]]
+                                                * ($lm[qu][a] * $rm[qv][b]
+                                                    + $rm[qu][a] * $lm[qv][b]);
+                                        }
+                                    }
+                                    acc[[slices.marginal.start + a, slices.marginal.start + b]] +=
+                                        v;
+                                }
+                            }
+                            for a in 0..p_time {
+                                for b in 0..p_marginal {
+                                    let mut v = 0.0;
+                                    for qu in 0..3 {
+                                        for qv in 0..3 {
+                                            v += $w[[qu, qv]]
+                                                * ($lt[qu][a] * $rm[qv][b]
+                                                    + $rt[qu][a] * $lm[qv][b]);
+                                        }
+                                    }
+                                    acc[[slices.time.start + a, slices.marginal.start + b]] += v;
+                                    acc[[slices.marginal.start + b, slices.time.start + a]] += v;
+                                }
+                            }
+                            for a in 0..p_time {
+                                let mut w2 = 0.0;
+                                for qu in 0..3 {
+                                    w2 += $w[[qu, 3]] * $lt[qu][a];
+                                }
+                                for b in 0..slices.logslope.len() {
+                                    let v = w2 * gr[b];
+                                    acc[[slices.time.start + a, slices.logslope.start + b]] += v;
+                                    acc[[slices.logslope.start + b, slices.time.start + a]] += v;
+                                }
+                            }
+                            for a in 0..p_marginal {
+                                let mut w2 = 0.0;
+                                for qu in 0..3 {
+                                    w2 += $w[[qu, 3]] * $lm[qu][a];
+                                }
+                                for b in 0..slices.logslope.len() {
+                                    let v = w2 * gr[b];
+                                    acc[[slices.marginal.start + a, slices.logslope.start + b]] +=
+                                        v;
+                                    acc[[slices.logslope.start + b, slices.marginal.start + a]] +=
+                                        v;
+                                }
+                            }
+                        };
+                    }
+
+                    // ── Build dJ arrays for both directions ────────────
+                    // (same code as first directional, for d and e)
+                    let build_dj = |dh0: f64,
+                                    dh1: f64,
+                                    ddr_val: f64|
+                     -> (
+                        Vec<f64>,
+                        Vec<f64>,
+                        Vec<f64>,
+                        Vec<f64>,
+                        Vec<f64>,
+                        Vec<f64>,
+                    ) {
+                        let mut j0t = vec![0.0f64; p_time];
+                        let mut j1t = vec![0.0f64; p_time];
+                        let mut jdt = vec![0.0f64; p_time];
+                        for a in 0..p_base {
+                            j0t[a] = m2_en * dh0 * xe[a];
+                            j1t[a] = m2_ex * dh1 * xx[a];
+                            jdt[a] = m3_ex * dh1 * dr * xx[a]
+                                + m2_ex * ddr_val * xx[a]
+                                + m2_ex * dh1 * xd[a];
+                        }
+                        for li in 0..time_tail.len() {
+                            let ci = time_tail.start + li;
+                            j0t[ci] = eg.basis_d1[[0, li]] * dh0;
+                            j1t[ci] = xg.basis_d1[[0, li]] * dh1;
+                            jdt[ci] =
+                                xg.basis_d2[[0, li]] * dh1 * dr + xg.basis_d1[[0, li]] * ddr_val;
+                        }
+                        let mut j0m = vec![0.0f64; p_marginal];
+                        let mut j1m = vec![0.0f64; p_marginal];
+                        let mut jdm = vec![0.0f64; p_marginal];
+                        for a in 0..p_marginal {
+                            j0m[a] = m2_en * dh0 * mr[a];
+                            j1m[a] = m2_ex * dh1 * mr[a];
+                            jdm[a] = m3_ex * dh1 * dr * mr[a] + m2_ex * ddr_val * mr[a];
+                        }
+                        (j0t, j1t, jdt, j0m, j1m, jdm)
+                    };
+
+                    let (djd0t, djd1t, djddt, djd0m, djd1m, djddm) = build_dj(dh0d, dh1d, ddrd);
+                    let djd_t = [&djd0t[..], &djd1t[..], &djddt[..]];
+                    let djd_m = [&djd0m[..], &djd1m[..], &djddm[..]];
+
+                    let (dje0t, dje1t, djedt, dje0m, dje1m, djedm) = build_dj(dh0e, dh1e, ddre);
+                    let dje_t = [&dje0t[..], &dje1t[..], &djedt[..]];
+                    let dje_m = [&dje0m[..], &dje1m[..], &djedm[..]];
+
+                    // ── d²J/ded (cross derivative, h linear ⇒ d²h=0) ──
+                    let mut d2j0t = vec![0.0f64; p_time];
+                    let mut d2j1t = vec![0.0f64; p_time];
+                    let mut d2jdt = vec![0.0f64; p_time];
+                    for a in 0..p_base {
+                        d2j0t[a] = m3_en * dh0d * dh0e * xe[a];
+                        d2j1t[a] = m3_ex * dh1d * dh1e * xx[a];
+                        d2jdt[a] = m4_ex * dh1d * dh1e * dr * xx[a]
+                            + m3_ex * (dh1d * ddre + dh1e * ddrd) * xx[a]
+                            + m3_ex * dh1d * dh1e * xd[a];
+                    }
+                    for li in 0..time_tail.len() {
+                        let ci = time_tail.start + li;
+                        d2j0t[ci] = eg.basis_d2[[0, li]] * dh0d * dh0e;
+                        d2j1t[ci] = xg.basis_d2[[0, li]] * dh1d * dh1e;
+                        d2jdt[ci] = xg.basis_d3[[0, li]] * dh1d * dh1e * dr
+                            + xg.basis_d2[[0, li]] * (dh1d * ddre + dh1e * ddrd);
+                    }
+                    let d2j_t = [&d2j0t[..], &d2j1t[..], &d2jdt[..]];
+                    let mut d2j0m = vec![0.0f64; p_marginal];
+                    let mut d2j1m = vec![0.0f64; p_marginal];
+                    let mut d2jdm = vec![0.0f64; p_marginal];
+                    for a in 0..p_marginal {
+                        d2j0m[a] = m3_en * dh0d * dh0e * mr[a];
+                        d2j1m[a] = m3_ex * dh1d * dh1e * mr[a];
+                        d2jdm[a] = m4_ex * dh1d * dh1e * dr * mr[a]
+                            + m3_ex * (dh1d * ddre + dh1e * ddrd) * mr[a];
+                    }
+                    let d2j_m = [&d2j0m[..], &d2j1m[..], &d2jdm[..]];
+
+                    let jt_s: [&[f64]; 3] = [
+                        jt[0].as_slice().unwrap(),
+                        jt[1].as_slice().unwrap(),
+                        jt[2].as_slice().unwrap(),
+                    ];
+                    let jm_s: [&[f64]; 3] = [
+                        jm[0].as_slice().unwrap(),
+                        jm[1].as_slice().unwrap(),
+                        jm[2].as_slice().unwrap(),
+                    ];
+
+                    // ── Term B: bilinear cross-terms ────────────────────
+                    // (dJ_d)^T T_e J + J^T T_e (dJ_d) — differentiated from Term 1
+                    accum_bilinear!(t_e, djd_t, djd_m, jt_s, jm_s);
+                    // (dJ_e)^T T_d J + J^T T_d (dJ_e) — symmetry partner
+                    accum_bilinear!(t_d, dje_t, dje_m, jt_s, jm_s);
+                    // (d²J)^T H J + J^T H (d²J) — from Term 2
+                    accum_bilinear!(h_pi, d2j_t, d2j_m, jt_s, jm_s);
+                    // (dJ_d)^T H (dJ_e) + (dJ_e)^T H (dJ_d) — from Term 2
+                    accum_bilinear!(h_pi, djd_t, djd_m, dje_t, dje_m);
+
+                    // ── Term C: dK cross-terms ──────────────────────────
+                    // (H·ud)_r dK_r/de + (H·ue)_r dK_r/dd + f_r d²K_r/ded
+                    //
+                    // dK[q,a,b]/dd = d(K[q,a,b])/dd where K = m_{k}*product-of-design-rows
+                    // d²K[q,a,b]/ded = m_{k+2}*dh_d*dh_e*(...) since d²h/ded=0
+                    //
+                    // For q0 base×base: K = m2_en*xe[a]*xe[b]
+                    //   dK/dd = m3_en*dh0d*xe[a]*xe[b]
+                    //   d²K/ded = m4_en*dh0d*dh0e*xe[a]*xe[b]
+                    // For q1 base×base: K = m2_ex*xx[a]*xx[b]
+                    //   dK/dd = m3_ex*dh1d*xx[a]*xx[b]
+                    //   d²K/ded = m4_ex*dh1d*dh1e*xx[a]*xx[b]
+                    // For qd1 base×base: K = m3_ex*dr*xx[a]*xx[b] + m2_ex*(xx[a]*xd[b]+xd[a]*xx[b])
+                    //   dK/dd = m4_ex*dh1d*dr*xx[a]*xx[b] + m3_ex*ddrd*xx[a]*xx[b]
+                    //         + m3_ex*dh1d*(xx[a]*xd[b]+xd[a]*xx[b])
+                    //   d²K/ded = m5_ex*dh1d*dh1e*dr*xx[a]*xx[b]
+                    //           + m4_ex*(dh1d*ddre+dh1e*ddrd)*xx[a]*xx[b]
+                    //           + m4_ex*dh1d*dh1e*(xx[a]*xd[b]+xd[a]*xx[b])
+
+                    // base×base time×time
+                    for a in 0..p_base {
+                        for b in 0..p_base {
+                            let dke_0 = m3_en * dh0e * xe[a] * xe[b];
+                            let dke_1 = m3_ex * dh1e * xx[a] * xx[b];
+                            let dke_d = m4_ex * dh1e * dr * xx[a] * xx[b]
+                                + m3_ex * ddre * xx[a] * xx[b]
+                                + m3_ex * dh1e * (xx[a] * xd[b] + xd[a] * xx[b]);
+                            let dkd_0 = m3_en * dh0d * xe[a] * xe[b];
+                            let dkd_1 = m3_ex * dh1d * xx[a] * xx[b];
+                            let dkd_d = m4_ex * dh1d * dr * xx[a] * xx[b]
+                                + m3_ex * ddrd * xx[a] * xx[b]
+                                + m3_ex * dh1d * (xx[a] * xd[b] + xd[a] * xx[b]);
+                            let d2k_0 = m4_en * dh0d * dh0e * xe[a] * xe[b];
+                            let d2k_1 = m4_ex * dh1d * dh1e * xx[a] * xx[b];
+                            let d2k_d = m5_ex * dh1d * dh1e * dr * xx[a] * xx[b]
+                                + m4_ex * (dh1d * ddre + dh1e * ddrd) * xx[a] * xx[b]
+                                + m4_ex * dh1d * dh1e * (xx[a] * xd[b] + xd[a] * xx[b]);
+                            acc[[slices.time.start + a, slices.time.start + b]] += h_ud[0] * dke_0
+                                + h_ud[1] * dke_1
+                                + h_ud[2] * dke_d
+                                + h_ue[0] * dkd_0
+                                + h_ue[1] * dkd_1
+                                + h_ue[2] * dkd_d
+                                + f_pi[0] * d2k_0
+                                + f_pi[1] * d2k_1
+                                + f_pi[2] * d2k_d;
+                        }
+                    }
+
+                    // base×wiggle time×time
+                    for li in 0..time_tail.len() {
+                        let ci = time_tail.start + li;
+                        for a in 0..p_base {
+                            // K[q0] for base×wiggle: d2q0/dβ_base[a] dβ_wiggle[li]
+                            //   = basis_d1[li]*xe[a] at entry  (m2 * x * basis is wrong; correct is basis_d1*x)
+                            // Actually from q_geom: d2q0_time_time[[a, ci]] = basis_d1_entry[li]*xe[a]
+                            // dK/dd = basis_d2[li]*dh0d*xe[a]
+                            // d²K/ded = basis_d3[li]*dh0d*dh0e*xe[a]
+                            let dke_0 = eg.basis_d2[[0, li]] * dh0e * xe[a];
+                            let dke_1 = xg.basis_d2[[0, li]] * dh1e * xx[a];
+                            let dke_d = xg.basis_d3[[0, li]] * dh1e * dr * xx[a]
+                                + xg.basis_d2[[0, li]] * ddre * xx[a]
+                                + xg.basis_d2[[0, li]] * dh1e * xd[a];
+                            let dkd_0 = eg.basis_d2[[0, li]] * dh0d * xe[a];
+                            let dkd_1 = xg.basis_d2[[0, li]] * dh1d * xx[a];
+                            let dkd_d = xg.basis_d3[[0, li]] * dh1d * dr * xx[a]
+                                + xg.basis_d2[[0, li]] * ddrd * xx[a]
+                                + xg.basis_d2[[0, li]] * dh1d * xd[a];
+                            let d2k_0 = eg.basis_d3[[0, li]] * dh0d * dh0e * xe[a];
+                            let d2k_1 = xg.basis_d3[[0, li]] * dh1d * dh1e * xx[a];
+                            let d2k_d = xg.basis_d4[[0, li]] * dh1d * dh1e * dr * xx[a]
+                                + xg.basis_d3[[0, li]] * (dh1d * ddre + dh1e * ddrd) * xx[a]
+                                + xg.basis_d3[[0, li]] * dh1d * dh1e * xd[a];
+                            let v = h_ud[0] * dke_0
+                                + h_ud[1] * dke_1
+                                + h_ud[2] * dke_d
+                                + h_ue[0] * dkd_0
+                                + h_ue[1] * dkd_1
+                                + h_ue[2] * dkd_d
+                                + f_pi[0] * d2k_0
+                                + f_pi[1] * d2k_1
+                                + f_pi[2] * d2k_d;
+                            acc[[slices.time.start + a, slices.time.start + ci]] += v;
+                            acc[[slices.time.start + ci, slices.time.start + a]] += v;
+                        }
+                    }
+
+                    // base×marginal time×marginal
+                    for a in 0..p_base {
+                        for b in 0..p_marginal {
+                            let dke_0 = m3_en * dh0e * xe[a] * mr[b];
+                            let dke_1 = m3_ex * dh1e * xx[a] * mr[b];
+                            let dke_d = m4_ex * dh1e * dr * xx[a] * mr[b]
+                                + m3_ex * ddre * xx[a] * mr[b]
+                                + m3_ex * dh1e * xd[a] * mr[b];
+                            let dkd_0 = m3_en * dh0d * xe[a] * mr[b];
+                            let dkd_1 = m3_ex * dh1d * xx[a] * mr[b];
+                            let dkd_d = m4_ex * dh1d * dr * xx[a] * mr[b]
+                                + m3_ex * ddrd * xx[a] * mr[b]
+                                + m3_ex * dh1d * xd[a] * mr[b];
+                            let d2k_0 = m4_en * dh0d * dh0e * xe[a] * mr[b];
+                            let d2k_1 = m4_ex * dh1d * dh1e * xx[a] * mr[b];
+                            let d2k_d = m5_ex * dh1d * dh1e * dr * xx[a] * mr[b]
+                                + m4_ex * (dh1d * ddre + dh1e * ddrd) * xx[a] * mr[b]
+                                + m4_ex * dh1d * dh1e * xd[a] * mr[b];
+                            let v = h_ud[0] * dke_0
+                                + h_ud[1] * dke_1
+                                + h_ud[2] * dke_d
+                                + h_ue[0] * dkd_0
+                                + h_ue[1] * dkd_1
+                                + h_ue[2] * dkd_d
+                                + f_pi[0] * d2k_0
+                                + f_pi[1] * d2k_1
+                                + f_pi[2] * d2k_d;
+                            acc[[slices.time.start + a, slices.marginal.start + b]] += v;
+                            acc[[slices.marginal.start + b, slices.time.start + a]] += v;
+                        }
+                    }
+
+                    // wiggle×marginal
+                    for li in 0..time_tail.len() {
+                        let ci = time_tail.start + li;
+                        for b in 0..p_marginal {
+                            let dke_0 = eg.basis_d2[[0, li]] * dh0e * mr[b];
+                            let dke_1 = xg.basis_d2[[0, li]] * dh1e * mr[b];
+                            let dke_d = xg.basis_d3[[0, li]] * dh1e * dr * mr[b]
+                                + xg.basis_d2[[0, li]] * ddre * mr[b];
+                            let dkd_0 = eg.basis_d2[[0, li]] * dh0d * mr[b];
+                            let dkd_1 = xg.basis_d2[[0, li]] * dh1d * mr[b];
+                            let dkd_d = xg.basis_d3[[0, li]] * dh1d * dr * mr[b]
+                                + xg.basis_d2[[0, li]] * ddrd * mr[b];
+                            let d2k_0 = eg.basis_d3[[0, li]] * dh0d * dh0e * mr[b];
+                            let d2k_1 = xg.basis_d3[[0, li]] * dh1d * dh1e * mr[b];
+                            let d2k_d = xg.basis_d4[[0, li]] * dh1d * dh1e * dr * mr[b]
+                                + xg.basis_d3[[0, li]] * (dh1d * ddre + dh1e * ddrd) * mr[b];
+                            let v = h_ud[0] * dke_0
+                                + h_ud[1] * dke_1
+                                + h_ud[2] * dke_d
+                                + h_ue[0] * dkd_0
+                                + h_ue[1] * dkd_1
+                                + h_ue[2] * dkd_d
+                                + f_pi[0] * d2k_0
+                                + f_pi[1] * d2k_1
+                                + f_pi[2] * d2k_d;
+                            acc[[slices.time.start + ci, slices.marginal.start + b]] += v;
+                            acc[[slices.marginal.start + b, slices.time.start + ci]] += v;
+                        }
+                    }
+
+                    // marginal×marginal
+                    for a in 0..p_marginal {
+                        for b in 0..p_marginal {
+                            let dke_0 = m3_en * dh0e * mr[a] * mr[b];
+                            let dke_1 = m3_ex * dh1e * mr[a] * mr[b];
+                            let dke_d =
+                                m4_ex * dh1e * dr * mr[a] * mr[b] + m3_ex * ddre * mr[a] * mr[b];
+                            let dkd_0 = m3_en * dh0d * mr[a] * mr[b];
+                            let dkd_1 = m3_ex * dh1d * mr[a] * mr[b];
+                            let dkd_d =
+                                m4_ex * dh1d * dr * mr[a] * mr[b] + m3_ex * ddrd * mr[a] * mr[b];
+                            let d2k_0 = m4_en * dh0d * dh0e * mr[a] * mr[b];
+                            let d2k_1 = m4_ex * dh1d * dh1e * mr[a] * mr[b];
+                            let d2k_d = m5_ex * dh1d * dh1e * dr * mr[a] * mr[b]
+                                + m4_ex * (dh1d * ddre + dh1e * ddrd) * mr[a] * mr[b];
+                            acc[[slices.marginal.start + a, slices.marginal.start + b]] += h_ud[0]
+                                * dke_0
+                                + h_ud[1] * dke_1
+                                + h_ud[2] * dke_d
+                                + h_ue[0] * dkd_0
+                                + h_ue[1] * dkd_1
+                                + h_ue[2] * dkd_d
+                                + f_pi[0] * d2k_0
+                                + f_pi[1] * d2k_1
+                                + f_pi[2] * d2k_d;
+                        }
+                    }
+
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || Array2::<f64>::zeros((p_total, p_total)),
+                |mut a, b| -> Result<_, String> {
+                    a += &b;
+                    Ok(a)
+                },
+            )?;
+        Ok(result)
     }
 
     fn evaluate_blockwise_exact_newton(
@@ -6807,6 +8689,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
+        if self.flex_active() {
+            return ExactOuterDerivativeOrder::Zeroth;
+        }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
@@ -6904,9 +8789,18 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() || self.effective_flex_active(block_states)? {
+        if self.effective_flex_active(block_states)? {
+            return Err(
+                "survival marginal-slope exact flexible beta-Hessian directional derivatives are disabled until analytic row-primary third/fourth contractions are implemented"
+                    .to_string(),
+            );
+        }
+        if self.flex_timewiggle_active() {
             return self
-                .exact_newton_joint_hessian_directional_derivative_fd(block_states, d_beta_flat)
+                .exact_newton_joint_hessian_directional_derivative_timewiggle(
+                    block_states,
+                    d_beta_flat,
+                )
                 .map(Some);
         }
         let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
@@ -6920,9 +8814,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_timewiggle_active() || self.effective_flex_active(block_states)? {
+        if self.effective_flex_active(block_states)? {
+            return Err(
+                "survival marginal-slope exact flexible beta-Hessian second directional derivatives are disabled until analytic row-primary third/fourth contractions are implemented"
+                    .to_string(),
+            );
+        }
+        if self.flex_timewiggle_active() {
             return self
-                .exact_newton_joint_hessiansecond_directional_derivative_fd(
+                .exact_newton_joint_hessiansecond_directional_derivative_timewiggle(
                     block_states,
                     d_beta_u_flat,
                     d_beta_v_flat,
@@ -8253,7 +10153,7 @@ mod tests {
     }
 
     #[test]
-    fn flex_capable_family_exposes_second_order_outer_path() {
+    fn flex_capable_family_disables_exact_outer_path_until_analytic_transport_lands() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let family = SurvivalMarginalSlopeFamily {
@@ -8287,13 +10187,12 @@ mod tests {
         ];
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::Second
+            ExactOuterDerivativeOrder::Zeroth
         );
-        assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
     }
 
     #[test]
-    fn flex_marginal_psi_operator_matches_joint_hessian_drift_in_h_and_w_blocks() {
+    fn flex_marginal_psi_terms_require_analytic_row_primary_transport() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
@@ -8359,60 +10258,15 @@ mod tests {
             Vec::new(),
         ];
 
-        let psi_terms = family
+        let err = family
             .psi_terms(&block_states, &derivative_blocks, 0)
-            .expect("psi terms")
-            .expect("marginal psi terms");
-        let analytic = psi_terms
-            .hessian_psi_operator
-            .expect("psi operator")
-            .to_dense();
-
-        let step = 1e-6;
-        let psi_row = derivative_blocks[1][0].x_psi.row(0).to_owned();
-        let design_plus = &marginal_design + &(psi_row.clone().insert_axis(Axis(0)) * step);
-        let design_minus = &marginal_design - &(psi_row.insert_axis(Axis(0)) * step);
-
-        let mut family_plus = family.clone();
-        family_plus.marginal_design = DesignMatrix::from(design_plus.clone());
-        let mut states_plus = block_states.clone();
-        states_plus[1].eta = design_plus.dot(&states_plus[1].beta);
-
-        let mut family_minus = family.clone();
-        family_minus.marginal_design = DesignMatrix::from(design_minus.clone());
-        let mut states_minus = block_states.clone();
-        states_minus[1].eta = design_minus.dot(&states_minus[1].beta);
-
-        let h_plus = family_plus
-            .exact_newton_joint_hessian(&states_plus)
-            .expect("plus joint hessian")
-            .expect("plus matrix");
-        let h_minus = family_minus
-            .exact_newton_joint_hessian(&states_minus)
-            .expect("minus joint hessian")
-            .expect("minus matrix");
-        let finite_diff = (h_plus - h_minus) / (2.0 * step);
-
-        let diff = &analytic - &finite_diff;
-        let max_abs = diff.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
-        assert!(
-            max_abs < 2e-5,
-            "flex marginal psi operator drift mismatch: max_abs={max_abs:.3e}\nanalytic={analytic:?}\nfinite_diff={finite_diff:?}"
-        );
-
-        let slices = block_slices(&family, &block_states);
-        let h_range = slices.score_warp.clone().expect("score-warp range");
-        let w_range = slices.link_dev.clone().expect("link range");
-        let hw_signal = analytic[[h_range.start, slices.marginal.start]].abs()
-            + analytic[[w_range.start, slices.marginal.start]].abs();
-        assert!(
-            hw_signal > 1e-8,
-            "expected nonzero marginal-psi drift into score/link blocks, got {hw_signal:.3e}"
-        );
+            .err()
+            .expect("flex psi terms should reject non-analytic transport");
+        assert!(err.contains("analytic row-primary third/fourth contractions"));
     }
 
     #[test]
-    fn timewiggle_marginal_psi_hessian_matches_joint_hessian_drift() {
+    fn timewiggle_marginal_psi_terms_require_analytic_row_primary_transport() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -8471,47 +10325,15 @@ mod tests {
             Vec::new(),
         ];
 
-        let psi_terms = family
+        let err = family
             .psi_terms(&block_states, &derivative_blocks, 0)
-            .expect("psi terms")
-            .expect("marginal psi terms");
-        let analytic = psi_terms.hessian_psi;
-
-        let step = 1e-6;
-        let psi_row = derivative_blocks[1][0].x_psi.row(0).to_owned();
-        let design_plus = &marginal_design + &(psi_row.clone().insert_axis(Axis(0)) * step);
-        let design_minus = &marginal_design - &(psi_row.insert_axis(Axis(0)) * step);
-
-        let mut family_plus = family.clone();
-        family_plus.marginal_design = DesignMatrix::from(design_plus.clone());
-        let mut states_plus = block_states.clone();
-        states_plus[1].eta = design_plus.dot(&states_plus[1].beta);
-
-        let mut family_minus = family.clone();
-        family_minus.marginal_design = DesignMatrix::from(design_minus.clone());
-        let mut states_minus = block_states.clone();
-        states_minus[1].eta = design_minus.dot(&states_minus[1].beta);
-
-        let h_plus = family_plus
-            .exact_newton_joint_hessian(&states_plus)
-            .expect("plus joint hessian")
-            .expect("plus matrix");
-        let h_minus = family_minus
-            .exact_newton_joint_hessian(&states_minus)
-            .expect("minus joint hessian")
-            .expect("minus matrix");
-        let finite_diff = (h_plus - h_minus) / (2.0 * step);
-
-        let diff = &analytic - &finite_diff;
-        let max_abs = diff.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
-        assert!(
-            max_abs < 1e-4,
-            "timewiggle marginal psi drift mismatch: max_abs={max_abs:.3e}\nanalytic={analytic:?}\nfinite_diff={finite_diff:?}"
-        );
+            .err()
+            .expect("timewiggle psi terms should reject non-analytic transport");
+        assert!(err.contains("analytic row-primary third/fourth contractions"));
     }
 
     #[test]
-    fn timewiggle_marginal_logslope_psi_second_order_matches_shifted_first_order() {
+    fn timewiggle_marginal_logslope_psi_second_order_requires_analytic_row_primary_transport() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -8580,56 +10402,15 @@ mod tests {
             Vec::new(),
         ];
 
-        let terms = family
+        let err = family
             .psi_second_order_terms(&block_states, &derivative_blocks, 0, 1)
-            .expect("psi second-order terms")
-            .expect("mixed psi second-order terms");
-        let analytic = terms.hessian_psi_psi;
-
-        let step = 1e-6;
-        let marginal_psi_row = derivative_blocks[1][0].x_psi.row(0).to_owned();
-        let design_plus =
-            &marginal_design + &(marginal_psi_row.clone().insert_axis(Axis(0)) * step);
-        let design_minus = &marginal_design - &(marginal_psi_row.insert_axis(Axis(0)) * step);
-
-        let mut family_plus = family.clone();
-        family_plus.marginal_design = DesignMatrix::from(design_plus.clone());
-        let mut states_plus = block_states.clone();
-        states_plus[1].eta = design_plus.dot(&states_plus[1].beta);
-
-        let mut family_minus = family.clone();
-        family_minus.marginal_design = DesignMatrix::from(design_minus.clone());
-        let mut states_minus = block_states.clone();
-        states_minus[1].eta = design_minus.dot(&states_minus[1].beta);
-
-        let plus = family_plus
-            .psi_terms(&states_plus, &derivative_blocks, 1)
-            .expect("plus psi terms")
-            .expect("plus logslope psi terms");
-        let minus = family_minus
-            .psi_terms(&states_minus, &derivative_blocks, 1)
-            .expect("minus psi terms")
-            .expect("minus logslope psi terms");
-        let plus_dense = match plus.hessian_psi_operator.as_ref() {
-            Some(op) => op.to_dense(),
-            None => plus.hessian_psi,
-        };
-        let minus_dense = match minus.hessian_psi_operator.as_ref() {
-            Some(op) => op.to_dense(),
-            None => minus.hessian_psi,
-        };
-        let finite_diff = (plus_dense - minus_dense) / (2.0 * step);
-
-        let diff = &analytic - &finite_diff;
-        let max_abs = diff.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
-        assert!(
-            max_abs < 1e-4,
-            "timewiggle marginal/logslope psi second-order mismatch: max_abs={max_abs:.3e}\nanalytic={analytic:?}\nfinite_diff={finite_diff:?}"
-        );
+            .err()
+            .expect("timewiggle psi second-order terms should reject non-analytic transport");
+        assert!(err.contains("analytic row-primary third/fourth contractions"));
     }
 
     #[test]
-    fn timewiggle_marginal_psi_hessian_directional_matches_shifted_first_order_hessian() {
+    fn timewiggle_marginal_psi_hessian_directional_requires_analytic_row_primary_transport() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -8697,69 +10478,13 @@ mod tests {
             d_beta_flat[h_range.start] = 0.02;
         }
 
-        let analytic = family
+        let err = family
             .psi_hessian_directional_derivative(&block_states, &derivative_blocks, 0, &d_beta_flat)
-            .expect("psi hessian directional derivative")
-            .expect("marginal psi hessian directional derivative");
-
-        let norm = d_beta_flat
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let step = (1e-6 / norm.max(1.0)).max(1e-8);
-
-        let mut plus_states = block_states.clone();
-        plus_states[0].beta =
-            &plus_states[0].beta + &(d_beta_flat.slice(s![slices.time.clone()]).to_owned() * step);
-        plus_states[1].beta = &plus_states[1].beta
-            + &(d_beta_flat.slice(s![slices.marginal.clone()]).to_owned() * step);
-        plus_states[1].eta = marginal_design.dot(&plus_states[1].beta);
-        plus_states[2].beta = &plus_states[2].beta
-            + &(d_beta_flat.slice(s![slices.logslope.clone()]).to_owned() * step);
-        plus_states[2].eta = family.logslope_design.to_dense().dot(&plus_states[2].beta);
-        if let Some(h_range) = slices.score_warp.as_ref() {
-            plus_states[3].beta =
-                &plus_states[3].beta + &(d_beta_flat.slice(s![h_range.clone()]).to_owned() * step);
-        }
-
-        let mut minus_states = block_states.clone();
-        minus_states[0].beta =
-            &minus_states[0].beta - &(d_beta_flat.slice(s![slices.time.clone()]).to_owned() * step);
-        minus_states[1].beta = &minus_states[1].beta
-            - &(d_beta_flat.slice(s![slices.marginal.clone()]).to_owned() * step);
-        minus_states[1].eta = marginal_design.dot(&minus_states[1].beta);
-        minus_states[2].beta = &minus_states[2].beta
-            - &(d_beta_flat.slice(s![slices.logslope.clone()]).to_owned() * step);
-        minus_states[2].eta = family.logslope_design.to_dense().dot(&minus_states[2].beta);
-        if let Some(h_range) = slices.score_warp.as_ref() {
-            minus_states[3].beta =
-                &minus_states[3].beta - &(d_beta_flat.slice(s![h_range.clone()]).to_owned() * step);
-        }
-
-        let plus = family
-            .psi_terms(&plus_states, &derivative_blocks, 0)
-            .expect("plus psi terms")
-            .expect("plus marginal psi terms");
-        let minus = family
-            .psi_terms(&minus_states, &derivative_blocks, 0)
-            .expect("minus psi terms")
-            .expect("minus marginal psi terms");
-        let plus_dense = match plus.hessian_psi_operator.as_ref() {
-            Some(op) => op.to_dense(),
-            None => plus.hessian_psi,
-        };
-        let minus_dense = match minus.hessian_psi_operator.as_ref() {
-            Some(op) => op.to_dense(),
-            None => minus.hessian_psi,
-        };
-        let finite_diff = (plus_dense - minus_dense) / (2.0 * step);
-
-        let diff = &analytic - &finite_diff;
-        let max_abs = diff.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
-        assert!(
-            max_abs < 1e-4,
-            "timewiggle marginal psi hessian directional mismatch: max_abs={max_abs:.3e}\nanalytic={analytic:?}\nfinite_diff={finite_diff:?}"
-        );
+            .err()
+            .expect(
+                "timewiggle psi-Hessian directional derivatives should reject non-analytic transport",
+            );
+        assert!(err.contains("analytic row-primary third/fourth contractions"));
     }
 
     #[test]
