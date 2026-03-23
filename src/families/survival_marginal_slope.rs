@@ -30,10 +30,10 @@ use crate::families::survival_location_scale::{
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
+    TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
@@ -92,6 +92,8 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub marginalspec_resolved: TermCollectionSpec,
     pub logslopespec_resolved: TermCollectionSpec,
     pub marginal_design: TermCollectionDesign,
+    /// Learned or fixed Gaussian-shift frailty SD.  `None` = no frailty.
+    pub gaussian_frailty_sd: Option<f64>,
     pub logslope_design: TermCollectionDesign,
     pub baseline_slope: f64,
     pub time_block_penalties_len: usize,
@@ -11871,7 +11873,17 @@ pub fn fit_survival_marginal_slope_terms(
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
     validate_spec(&spec)?;
     let n = spec.age_entry.len();
-    let probit_scale = probit_frailty_scale(fixed_gaussian_shift_sigma(&spec.frailty));
+    let sigma_learnable = matches!(
+        &spec.frailty,
+        FrailtySpec::GaussianShift { sigma_fixed: None }
+    );
+    let initial_sigma = match &spec.frailty {
+        FrailtySpec::GaussianShift { sigma_fixed: Some(s) } => Some(*s),
+        FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
+        FrailtySpec::None => None,
+        _ => None,
+    };
+    let probit_scale = probit_frailty_scale(initial_sigma);
     let baseline_slope = pooled_survival_baseline(
         &spec.event_target,
         &spec.weights,
@@ -11933,6 +11945,7 @@ pub fn fit_survival_marginal_slope_terms(
 
     let hints = RefCell::new(ThetaHints::default());
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
+    let current_sigma = std::cell::Cell::new(initial_sigma);
 
     let event = Arc::new(spec.event_target.clone());
     let weights = Arc::new(spec.weights.clone());
@@ -11956,14 +11969,15 @@ pub fn fit_survival_marginal_slope_terms(
     )?;
 
     let make_family = |marginal_design: &TermCollectionDesign,
-                       logslope_design: &TermCollectionDesign|
+                       logslope_design: &TermCollectionDesign,
+                       sigma: Option<f64>|
      -> SurvivalMarginalSlopeFamily {
         SurvivalMarginalSlopeFamily {
             n,
             event: Arc::clone(&event),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
-            gaussian_frailty_sd: fixed_gaussian_shift_sigma(&spec.frailty),
+            gaussian_frailty_sd: sigma,
             derivative_guard,
             design_entry: design_entry.clone(),
             design_exit: design_exit.clone(),
@@ -12071,7 +12085,7 @@ pub fn fit_survival_marginal_slope_terms(
                     .map_or(0, |prepared| prepared.block.penalties.len()),
         );
         let rigid_blocks = build_blocks(&rigid_rho, &marginal_design, &logslope_design)?;
-        let rigid_family = make_family(&marginal_design, &logslope_design);
+        let rigid_family = make_family(&marginal_design, &logslope_design, current_sigma.get());
         if let Ok(rigid_fit) = inner_fit(&rigid_family, &rigid_blocks, options) {
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = rigid_fit.block_states.get(0) {
@@ -12117,7 +12131,7 @@ pub fn fit_survival_marginal_slope_terms(
 
     let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
-    let initial_family = make_family(&marginal_design, &logslope_design);
+    let initial_family = make_family(&marginal_design, &logslope_design, current_sigma.get());
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
@@ -12134,77 +12148,149 @@ pub fn fit_survival_marginal_slope_terms(
     // Only the baseline and slope surface blocks can have spatial terms
     let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
     let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
-    let solved = optimize_spatial_length_scale_exact_joint(
-        data,
-        &[marginalspec_boot.clone(), logslopespec_boot.clone()],
-        &[marginal_terms, logslope_terms],
-        kappa_options,
-        &setup,
-        crate::seeding::SeedRiskProfile::Survival,
-        analytic_joint_gradient_available,
-        analytic_joint_hessian_available,
-        |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let blocks = build_blocks(rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1]);
-            let fit = inner_fit(&family, &blocks, options)?;
-            let mut hints_mut = hints.borrow_mut();
-            if let Some(block) = fit.block_states.get(0) {
-                hints_mut.time_beta = Some(block.beta.clone());
-            }
-            if let Some(block) = fit.block_states.get(1) {
-                hints_mut.marginal_beta = Some(block.beta.clone());
-            }
-            if let Some(block) = fit.block_states.get(2) {
-                hints_mut.logslope_beta = Some(block.beta.clone());
-            }
-            if score_warp_prepared.is_some() {
-                if let Some(block) = fit.block_states.get(3) {
-                    hints_mut.score_warp_beta = Some(block.beta.clone());
+
+    // ── Run a single [ρ,ψ] optimization at the current sigma ──────────
+    let run_at_sigma = |sigma: Option<f64>| -> Result<SpatialLengthScaleOptimizationResult<UnifiedFitResult>, String> {
+        current_sigma.set(sigma);
+        exact_warm_start.replace(None);
+        optimize_spatial_length_scale_exact_joint(
+            data,
+            &[marginalspec_boot.clone(), logslopespec_boot.clone()],
+            &[marginal_terms.clone(), logslope_terms.clone()],
+            kappa_options,
+            &setup,
+            crate::seeding::SeedRiskProfile::Survival,
+            analytic_joint_gradient_available,
+            analytic_joint_hessian_available,
+            |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+                let family = make_family(&designs[0], &designs[1], current_sigma.get());
+                let fit = inner_fit(&family, &blocks, options)?;
+                let mut hints_mut = hints.borrow_mut();
+                if let Some(block) = fit.block_states.get(0) {
+                    hints_mut.time_beta = Some(block.beta.clone());
+                }
+                if let Some(block) = fit.block_states.get(1) {
+                    hints_mut.marginal_beta = Some(block.beta.clone());
+                }
+                if let Some(block) = fit.block_states.get(2) {
+                    hints_mut.logslope_beta = Some(block.beta.clone());
+                }
+                if score_warp_prepared.is_some() {
+                    if let Some(block) = fit.block_states.get(3) {
+                        hints_mut.score_warp_beta = Some(block.beta.clone());
+                    }
+                }
+                if link_dev_prepared.is_some() {
+                    let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
+                    if let Some(block) = fit.block_states.get(link_idx) {
+                        hints_mut.link_dev_beta = Some(block.beta.clone());
+                    }
+                }
+                Ok(fit)
+            },
+            |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
+                let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+                let family = make_family(&designs[0], &designs[1], current_sigma.get());
+                let mut derivative_blocks = vec![
+                    Vec::new(),
+                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
+                        .unwrap_or_default(),
+                    build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
+                        .unwrap_or_default(),
+                ];
+                if family.score_warp.is_some() {
+                    derivative_blocks.push(Vec::new());
+                }
+                if family.link_dev.is_some() {
+                    derivative_blocks.push(Vec::new());
+                }
+                let eval = evaluate_custom_family_joint_hyper(
+                    &family,
+                    &blocks,
+                    options,
+                    rho,
+                    &derivative_blocks,
+                    exact_warm_start.borrow().as_ref(),
+                    need_hessian,
+                )?;
+                exact_warm_start.replace(Some(eval.warm_start));
+                if need_hessian && eval.outer_hessian.is_none() {
+                    return Err(
+                        "exact survival marginal-slope joint objective did not return an outer Hessian"
+                            .to_string(),
+                    );
+                }
+                Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            },
+        )
+    };
+
+    // ── Profile optimization over sigma ───────────────────────────────
+    let (solved, final_sigma) = if sigma_learnable {
+        let candidates = [0.1, 0.3, 0.5, 0.8, 1.2];
+        let mut best_cost = f64::INFINITY;
+        let mut best_sigma = 0.5_f64;
+        let mut best_result = None;
+        for &sigma_try in &candidates {
+            match run_at_sigma(Some(sigma_try)) {
+                Ok(res) => {
+                    let cost = res.fit.reml_score;
+                    log::debug!(
+                        "survival marginal-slope sigma profile: sigma={sigma_try:.3}, REML={cost:.6}"
+                    );
+                    if cost < best_cost {
+                        best_cost = cost;
+                        best_sigma = sigma_try;
+                        best_result = Some(res);
+                    }
+                }
+                Err(e) => {
+                    log::debug!(
+                        "survival marginal-slope sigma profile: sigma={sigma_try:.3} failed: {e}"
+                    );
                 }
             }
-            if link_dev_prepared.is_some() {
-                let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
-                if let Some(block) = fit.block_states.get(link_idx) {
-                    hints_mut.link_dev_beta = Some(block.beta.clone());
-                }
+        }
+
+        const PHI: f64 = 0.6180339887498949;
+        let mut lo = (best_sigma * 0.3).max(0.01);
+        let mut hi = (best_sigma * 3.0).min(5.0);
+        for _ in 0..8 {
+            if (hi - lo) < 0.02 * best_sigma.max(0.05) {
+                break;
             }
-            Ok(fit)
-        },
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
-            let blocks = build_blocks(rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1]);
-            let mut derivative_blocks = vec![
-                Vec::new(),
-                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
-                    .unwrap_or_default(),
-                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
-                    .unwrap_or_default(),
-            ];
-            if family.score_warp.is_some() {
-                derivative_blocks.push(Vec::new());
+            let m1 = hi - PHI * (hi - lo);
+            let m2 = lo + PHI * (hi - lo);
+            let c1 = run_at_sigma(Some(m1))
+                .map(|r| r.fit.reml_score)
+                .unwrap_or(f64::INFINITY);
+            let c2 = run_at_sigma(Some(m2))
+                .map(|r| r.fit.reml_score)
+                .unwrap_or(f64::INFINITY);
+            if c1 < c2 {
+                hi = m2;
+            } else {
+                lo = m1;
             }
-            if family.link_dev.is_some() {
-                derivative_blocks.push(Vec::new());
-            }
-            let eval = evaluate_custom_family_joint_hyper(
-                &family,
-                &blocks,
-                options,
-                rho,
-                &derivative_blocks,
-                exact_warm_start.borrow().as_ref(),
-                need_hessian,
-            )?;
-            exact_warm_start.replace(Some(eval.warm_start));
-            if need_hessian && eval.outer_hessian.is_none() {
-                return Err(
-                    "exact survival marginal-slope joint objective did not return an outer Hessian"
-                        .to_string(),
-                );
-            }
-            Ok((eval.objective, eval.gradient, eval.outer_hessian))
-        },
-    )?;
+        }
+        let refined_sigma = 0.5 * (lo + hi);
+        let final_result = run_at_sigma(Some(refined_sigma))?;
+        let final_cost = final_result.fit.reml_score;
+        if final_cost <= best_cost {
+            (final_result, Some(refined_sigma))
+        } else {
+            (
+                best_result.ok_or_else(|| {
+                    "survival marginal-slope sigma profile: no valid grid point".to_string()
+                })?,
+                Some(best_sigma),
+            )
+        }
+    } else {
+        let solved = run_at_sigma(initial_sigma)?;
+        (solved, initial_sigma)
+    };
 
     let mut resolved_specs = solved.resolved_specs;
     let designs = solved.designs;
@@ -12214,6 +12300,7 @@ pub fn fit_survival_marginal_slope_terms(
         logslopespec_resolved: resolved_specs.remove(0),
         marginal_design: designs[0].clone(),
         logslope_design: designs[1].clone(),
+        gaussian_frailty_sd: final_sigma,
         baseline_slope,
         time_block_penalties_len: time_penalties_len,
         score_warp_runtime,
