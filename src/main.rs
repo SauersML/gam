@@ -10913,16 +10913,6 @@ fn parse_optional_covariance(
         .transpose()
 }
 
-fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Array1<f64> {
-    let xc = x.dot(cov);
-    let mut out = Array1::<f64>::zeros(x.nrows());
-    for i in 0..x.nrows() {
-        let v = x.row(i).dot(&xc.row(i)).max(0.0);
-        out[i] = v.sqrt();
-    }
-    out
-}
-
 fn linear_predictor_se_from_backend<F>(
     backend: &PredictionCovarianceBackend<'_>,
     n_rows: usize,

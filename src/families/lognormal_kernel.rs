@@ -159,10 +159,6 @@ impl ProbitFrailtyScaleJet {
         }
     }
 
-    /// Build from t = log(σ) directly.
-    pub fn from_log_sigma(log_sigma: f64) -> Self {
-        Self::new(log_sigma.exp())
-    }
 }
 
 #[inline]

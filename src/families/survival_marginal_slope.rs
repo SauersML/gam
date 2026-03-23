@@ -306,15 +306,6 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
     ]
 }
 
-#[inline]
-fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
-    match frailty {
-        FrailtySpec::None => None,
-        FrailtySpec::GaussianShift { sigma_fixed } => *sigma_fixed,
-        FrailtySpec::HazardMultiplier { .. } => None,
-    }
-}
-
 fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
     crate::families::lognormal_kernel::ProbitFrailtyScale::new(gaussian_frailty_sd.unwrap_or(0.0)).s
 }
