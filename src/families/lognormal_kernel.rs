@@ -8,13 +8,13 @@
 //! to evaluating kernel bundles at shifted arguments.
 //!
 //! Row likelihoods for binary and survival models are small signed sums of
-//! kernel terms; [`LogKernelSumJet`] provides numerically stable log-space
-//! derivatives of such sums.
+//! kernel terms; [`LogKernelSumJet`] evaluates their log-derivatives from
+//! log-space kernel bundles and treats non-positive signed sums as invalid rows.
 
 use crate::estimate::EstimationError;
 use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
-    latent_cloglog_inverse_link_jet5_controlled, lognormal_laplace_term_shared,
+    latent_cloglog_inverse_link_jet5_controlled, lognormal_laplace_unit_term_shared,
     validate_latent_cloglog_inputs,
 };
 use serde::{Deserialize, Serialize};
@@ -151,13 +151,7 @@ fn worst_mode(
 /// The value is always finite (or `NEG_INFINITY` when the kernel is zero), so
 /// it cannot overflow or underflow.
 #[inline]
-pub fn log_kernel_term(
-    quadctx: &QuadratureContext,
-    k: usize,
-    m: f64,
-    mu: f64,
-    sigma: f64,
-) -> Result<(f64, IntegratedExpectationMode), EstimationError> {
+fn validate_kernel_inputs(m: f64, mu: f64, sigma: f64) -> Result<(), EstimationError> {
     if !m.is_finite() || m < 0.0 {
         return Err(EstimationError::InvalidInput(format!(
             "lognormal kernel requires finite m >= 0, got {m}"
@@ -168,13 +162,25 @@ pub fn log_kernel_term(
             "lognormal kernel requires finite mu and sigma >= 0, got mu={mu}, sigma={sigma}"
         )));
     }
+    Ok(())
+}
+
+#[inline]
+pub fn log_kernel_term(
+    quadctx: &QuadratureContext,
+    k: usize,
+    m: f64,
+    mu: f64,
+    sigma: f64,
+) -> Result<(f64, IntegratedExpectationMode), EstimationError> {
+    validate_kernel_inputs(m, mu, sigma)?;
     let kf = k as f64;
     let prefix = kf * mu + 0.5 * kf * kf * sigma * sigma;
     if m == 0.0 {
         return Ok((prefix, IntegratedExpectationMode::ExactClosedForm));
     }
-    let shifted_mu = mu + kf * sigma * sigma;
-    let (laplace, mode) = lognormal_laplace_term_shared(quadctx, m, shifted_mu, sigma);
+    let shifted_mu = mu + kf * sigma * sigma + m.ln();
+    let (laplace, mode) = lognormal_laplace_unit_term_shared(quadctx, shifted_mu, sigma);
     if laplace <= 0.0 {
         return Ok((f64::NEG_INFINITY, mode));
     }
@@ -209,12 +215,36 @@ pub fn log_kernel_bundle(
     sigma: f64,
     max_k: usize,
 ) -> Result<LogLognormalKernelBundle, EstimationError> {
+    validate_kernel_inputs(m, mu, sigma)?;
     let mut log_values = Vec::with_capacity(max_k + 1);
+    if m == 0.0 {
+        let sigma2 = sigma * sigma;
+        let mut prefix = 0.0;
+        for k in 0..=max_k {
+            log_values.push(prefix);
+            prefix += mu + (k as f64 + 0.5) * sigma2;
+        }
+        return Ok(LogLognormalKernelBundle {
+            log_values,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        });
+    }
+
+    let sigma2 = sigma * sigma;
+    let log_m = m.ln();
+    let mut shifted_mu = mu + log_m;
+    let mut prefix = 0.0;
     let mut mode = IntegratedExpectationMode::ExactClosedForm;
     for k in 0..=max_k {
-        let (log_val, val_mode) = log_kernel_term(quadctx, k, m, mu, sigma)?;
-        log_values.push(log_val);
+        let (laplace, val_mode) = lognormal_laplace_unit_term_shared(quadctx, shifted_mu, sigma);
+        log_values.push(if laplace > 0.0 {
+            prefix + laplace.ln()
+        } else {
+            f64::NEG_INFINITY
+        });
         mode = worst_mode(mode, val_mode);
+        prefix += mu + (k as f64 + 0.5) * sigma2;
+        shifted_mu += sigma2;
     }
     Ok(LogLognormalKernelBundle { log_values, mode })
 }
@@ -323,7 +353,7 @@ pub fn latent_cloglog_jet5(
     // - mean through d5 are all derived from the same lognormal-Laplace kernel
     //   terms K_{k,1}(eta, sigma),
     // - there is no finite-difference bridge for d2 / d3,
-    // - and the entire jet stays on one exact/control stack.
+    // - and every derivative order uses the same routed kernel backend.
     let jet = latent_cloglog_inverse_link_jet5_controlled(quadctx, eta, sigma);
     Ok(LatentCLogLogJet5 {
         mean: jet.mean,
@@ -352,7 +382,7 @@ pub fn latent_cloglog_inverse_link_jet(
     })
 }
 
-// ─── LogKernelSumJet: log-sum derivatives (log-space stable) ─────────────────
+// ─── LogKernelSumJet: log-sum derivatives from log-space bundles ─────────────
 
 /// A single signed term in a kernel sum: coefficient × K_{k,m}.
 #[derive(Clone, Copy, Debug)]
@@ -371,11 +401,13 @@ pub struct KernelSumTerm {
 /// latent families.  The numerator and denominator of a row likelihood are
 /// each a small signed sum of kernel terms.
 ///
-/// All arithmetic is performed in log-space using [`log_kernel_bundle`] and
-/// [`kernel_ratio_jet`], so it remains numerically stable even when individual
-/// kernel values would overflow (`exp(>709)`) or underflow in value space.
-/// Signed differences (e.g. interval censoring `K_{0,M_L} − K_{0,M_R}`)
-/// are computed via [`log1mexp`] to avoid catastrophic cancellation.
+/// The value path is assembled from log-space kernel bundles and ratio jets,
+/// so individual kernel terms are never exponentiated before the final signed
+/// sum. That avoids the old overflow/underflow problems from value-space
+/// kernels. When the signed sum is zero or negative, this returns an invalid
+/// row (`value = -∞`) instead of trying to continue with a floored surrogate.
+/// Signed two-term differences (e.g. interval censoring `K_{0,M_L} − K_{0,M_R}`)
+/// are still combined through the shared sign-aware log-sum path.
 #[derive(Clone, Copy, Debug)]
 pub struct LogKernelSumJet {
     /// log(Σ a_j K_j)
@@ -390,6 +422,89 @@ pub struct LogKernelSumJet {
 }
 
 impl LogKernelSumJet {
+    #[inline]
+    fn non_positive(mode: IntegratedExpectationMode) -> Self {
+        Self {
+            value: f64::NEG_INFINITY,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+            mode,
+        }
+    }
+
+    #[inline]
+    fn from_log_value_and_ratios(
+        value: f64,
+        ratio: [f64; 5],
+        mode: IntegratedExpectationMode,
+    ) -> Self {
+        let r1 = ratio[1];
+        let r2 = ratio[2];
+        let r3 = ratio[3];
+        Self {
+            value,
+            d1: r1,
+            d2: r2 - r1 * r1,
+            d3: r3 - 3.0 * r1 * r2 + 2.0 * r1 * r1 * r1,
+            mode,
+        }
+    }
+
+    #[inline]
+    fn term_log_mag_and_ratio(
+        bundle: &LogLognormalKernelBundle,
+        term: KernelSumTerm,
+    ) -> (f64, [f64; 5]) {
+        (
+            term.coeff.abs().ln() + bundle.get(term.k),
+            kernel_ratio_jet(bundle, term.k, term.m, 3),
+        )
+    }
+
+    fn evaluate_two_terms(
+        quadctx: &QuadratureContext,
+        t0: KernelSumTerm,
+        t1: KernelSumTerm,
+        mu: f64,
+        sigma: f64,
+    ) -> Result<Self, EstimationError> {
+        let max_k_needed = t0.k.max(t1.k) + 4;
+        let bundle0 = log_kernel_bundle(quadctx, t0.m, mu, sigma, max_k_needed)?;
+        let mut overall_mode = bundle0.mode;
+        let bundle1_owned = if (t0.m - t1.m).abs() < 1e-300 {
+            None
+        } else {
+            let bundle1 = log_kernel_bundle(quadctx, t1.m, mu, sigma, max_k_needed)?;
+            overall_mode = worst_mode(overall_mode, bundle1.mode);
+            Some(bundle1)
+        };
+        let bundle1 = bundle1_owned.as_ref().unwrap_or(&bundle0);
+
+        let (log_mag0, ratio0) = Self::term_log_mag_and_ratio(&bundle0, t0);
+        let (log_mag1, ratio1) = Self::term_log_mag_and_ratio(bundle1, t1);
+        let log_mags = [log_mag0, log_mag1];
+        let signs = [t0.coeff.signum(), t1.coeff.signum()];
+        let (log_s, sign_s) = signed_log_sum_exp(&log_mags, &signs);
+        if !log_s.is_finite() || sign_s <= 0.0 {
+            return Ok(Self::non_positive(overall_mode));
+        }
+
+        let w0 = sign_s * signs[0] * (log_mag0 - log_s).exp();
+        let w1 = sign_s * signs[1] * (log_mag1 - log_s).exp();
+        let wr1 = w0 * ratio0[1] + w1 * ratio1[1];
+        let wr2 = w0 * ratio0[2] + w1 * ratio1[2];
+        let wr3 = w0 * ratio0[3] + w1 * ratio1[3];
+
+        Ok(Self {
+            value: log_s,
+            d1: wr1,
+            d2: wr2 - wr1 * wr1,
+            d3: wr3 - 3.0 * wr1 * wr2 + 2.0 * wr1 * wr1 * wr1,
+            mode: overall_mode,
+        })
+    }
+
     /// Evaluate for a single positive kernel term (fast path).
     ///
     /// Computes `log(K_{k,m})` and its μ-derivatives from exact recurrences,
@@ -403,25 +518,20 @@ impl LogKernelSumJet {
     ) -> Result<Self, EstimationError> {
         let max_k_needed = k + 4;
         let lb = log_kernel_bundle(quadctx, m, mu, sigma, max_k_needed)?;
-        let log_val = lb.get(k);
-        let ratio = kernel_ratio_jet(&lb, k, m, 3);
-        let r1 = ratio[1];
-        let r2 = ratio[2];
-        let r3 = ratio[3];
-
-        Ok(Self {
-            value: log_val,
-            d1: r1,
-            d2: r2 - r1 * r1,
-            d3: r3 - 3.0 * r1 * r2 + 2.0 * r1 * r1 * r1,
-            mode: lb.mode,
-        })
+        Ok(Self::from_log_value_and_ratios(
+            lb.get(k),
+            kernel_ratio_jet(&lb, k, m, 3),
+            lb.mode,
+        ))
     }
 
     /// Evaluate `log(Σ a_j K_j)` and its μ-derivatives for a small signed sum.
     ///
     /// All terms share the same `(μ, σ)`.  Both the value and derivative
-    /// ratios are computed entirely in log-space:
+    /// ratios are computed entirely in log-space.  The runtime latent-survival
+    /// rows in this repo are almost always one-term or two-term sums, so those
+    /// cases stay on dedicated stack paths; the heap-backed logic below is only
+    /// for genuinely longer symbolic sums:
     ///
     /// 1. Per-term log-magnitudes `log|a_j| + log K_{k_j,m_j}` and signs.
     /// 2. Sign-aware log-sum-exp to get `log|S|` and `sign(S)`.
@@ -443,13 +553,9 @@ impl LogKernelSumJet {
                 // Negative or zero coefficient: the sum is non-positive, so
                 // log(sum) is undefined.  Return −∞ (impossible observation),
                 // matching the general path's sign_s ≤ 0 branch.
-                return Ok(Self {
-                    value: f64::NEG_INFINITY,
-                    d1: 0.0,
-                    d2: 0.0,
-                    d3: 0.0,
-                    mode: IntegratedExpectationMode::ExactClosedForm,
-                });
+                return Ok(Self::non_positive(
+                    IntegratedExpectationMode::ExactClosedForm,
+                ));
             }
             let jet = Self::single_term(quadctx, t.k, t.m, mu, sigma)?;
             return Ok(Self {
@@ -460,6 +566,9 @@ impl LogKernelSumJet {
                 mode: jet.mode,
             });
         }
+        if terms.len() == 2 {
+            return Self::evaluate_two_terms(quadctx, terms[0], terms[1], mu, sigma);
+        }
 
         let max_k_needed = terms.iter().map(|t| t.k).max().unwrap_or(0) + 4;
 
@@ -467,7 +576,10 @@ impl LogKernelSumJet {
         let mut log_bundles: Vec<(f64, LogLognormalKernelBundle)> = Vec::with_capacity(2);
         let mut overall_mode = IntegratedExpectationMode::ExactClosedForm;
         for term in terms {
-            if !log_bundles.iter().any(|(m, _)| (*m - term.m).abs() < 1e-300) {
+            if !log_bundles
+                .iter()
+                .any(|(m, _)| (*m - term.m).abs() < 1e-300)
+            {
                 let b = log_kernel_bundle(quadctx, term.m, mu, sigma, max_k_needed)?;
                 overall_mode = worst_mode(overall_mode, b.mode);
                 log_bundles.push((term.m, b));
@@ -498,13 +610,7 @@ impl LogKernelSumJet {
 
         if !log_s.is_finite() || sign_s <= 0.0 {
             // Sum is zero or negative — degenerate row.
-            return Ok(Self {
-                value: f64::NEG_INFINITY,
-                d1: 0.0,
-                d2: 0.0,
-                d3: 0.0,
-                mode: overall_mode,
-            });
+            return Ok(Self::non_positive(overall_mode));
         }
 
         // Importance weights w_j = sign(S) · sign(a_j) · exp(log|a_j K_j| − log|S|).
@@ -661,7 +767,8 @@ impl LatentSurvivalRow {
     /// Delayed-entry right-censored row with explicit loaded/unloaded masses.
     ///
     /// `mass_entry` and `mass_exit` are cumulative loaded masses `B_L(a_in)`
-    /// and `B_L(a_out)`, not an increment over `(a_in, a_out]`.
+    /// and `B_L(a_out)` for this row object. They are not an increment over
+    /// `(a_in, a_out]`.
     pub fn right_censored(
         mass_entry: f64,
         mass_exit: f64,
@@ -730,37 +837,169 @@ impl LatentSurvivalRow {
             hazard_unloaded: 0.0,
         }
     }
+
+    pub fn validate(&self) -> Result<(), EstimationError> {
+        let fields = [
+            ("mass_entry", self.mass_entry),
+            ("mass_exit", self.mass_exit),
+            ("mass_left", self.mass_left),
+            ("mass_right", self.mass_right),
+            ("mass_unloaded_left", self.mass_unloaded_left),
+            ("mass_unloaded_right", self.mass_unloaded_right),
+            ("mass_unloaded_entry", self.mass_unloaded_entry),
+            ("mass_unloaded_exit", self.mass_unloaded_exit),
+            ("hazard_loaded", self.hazard_loaded),
+            ("hazard_unloaded", self.hazard_unloaded),
+        ];
+        for (name, value) in fields {
+            if !value.is_finite() || value < 0.0 {
+                return Err(EstimationError::InvalidInput(format!(
+                    "latent survival row has invalid {name}={value}; expected a finite non-negative value"
+                )));
+            }
+        }
+
+        match self.event_type {
+            LatentSurvivalEventType::RightCensored => {
+                if self.mass_exit < self.mass_entry {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent survival right-censored row requires mass_exit >= mass_entry, got {} < {}",
+                        self.mass_exit, self.mass_entry
+                    )));
+                }
+                if self.mass_unloaded_exit < self.mass_unloaded_entry {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent survival right-censored row requires unloaded exit mass >= unloaded entry mass, got {} < {}",
+                        self.mass_unloaded_exit, self.mass_unloaded_entry
+                    )));
+                }
+                if self.mass_left > 0.0
+                    || self.mass_right > 0.0
+                    || self.mass_unloaded_left > 0.0
+                    || self.mass_unloaded_right > 0.0
+                    || self.hazard_loaded > 0.0
+                    || self.hazard_unloaded > 0.0
+                {
+                    return Err(EstimationError::InvalidInput(
+                        "latent survival right-censored row cannot carry interval masses or event hazards"
+                            .to_string(),
+                    ));
+                }
+            }
+            LatentSurvivalEventType::ExactEvent => {
+                if self.mass_exit < self.mass_entry {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent survival exact-event row requires mass_exit >= mass_entry, got {} < {}",
+                        self.mass_exit, self.mass_entry
+                    )));
+                }
+                if self.mass_unloaded_exit < self.mass_unloaded_entry {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent survival exact-event row requires unloaded exit mass >= unloaded entry mass, got {} < {}",
+                        self.mass_unloaded_exit, self.mass_unloaded_entry
+                    )));
+                }
+                if self.mass_left > 0.0
+                    || self.mass_right > 0.0
+                    || self.mass_unloaded_left > 0.0
+                    || self.mass_unloaded_right > 0.0
+                {
+                    return Err(EstimationError::InvalidInput(
+                        "latent survival exact-event row cannot carry interval masses".to_string(),
+                    ));
+                }
+                if self.hazard_loaded == 0.0 && self.hazard_unloaded == 0.0 {
+                    return Err(EstimationError::InvalidInput(
+                        "latent survival exact-event row requires a positive loaded or unloaded hazard"
+                            .to_string(),
+                    ));
+                }
+            }
+            LatentSurvivalEventType::IntervalCensored => {
+                if self.mass_left < self.mass_entry || self.mass_right < self.mass_left {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent survival interval row requires mass_entry <= mass_left <= mass_right, got entry={}, left={}, right={}",
+                        self.mass_entry, self.mass_left, self.mass_right
+                    )));
+                }
+                if self.mass_unloaded_left < self.mass_unloaded_entry
+                    || self.mass_unloaded_right < self.mass_unloaded_left
+                {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent survival interval row requires unloaded_entry <= unloaded_left <= unloaded_right, got entry={}, left={}, right={}",
+                        self.mass_unloaded_entry, self.mass_unloaded_left, self.mass_unloaded_right
+                    )));
+                }
+                if self.mass_exit > 0.0
+                    || self.mass_unloaded_exit > 0.0
+                    || self.hazard_loaded > 0.0
+                    || self.hazard_unloaded > 0.0
+                {
+                    return Err(EstimationError::InvalidInput(
+                        "latent survival interval row cannot carry exit masses or event hazards"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
-fn exact_event_kernel_terms(row: &LatentSurvivalRow) -> Result<Vec<KernelSumTerm>, EstimationError> {
+fn exact_event_kernel_jet(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    mu: f64,
+    sigma: f64,
+) -> Result<LogKernelSumJet, EstimationError> {
     if row.hazard_loaded < 0.0 || row.hazard_unloaded < 0.0 {
         return Err(EstimationError::InvalidInput(format!(
             "latent survival exact-event hazards must be non-negative, got loaded={} unloaded={}",
             row.hazard_loaded, row.hazard_unloaded
         )));
     }
-    let mut terms = Vec::with_capacity(2);
-    if row.hazard_unloaded > 0.0 {
-        terms.push(KernelSumTerm {
-            coeff: row.hazard_unloaded,
-            k: 0,
-            m: row.mass_exit,
-        });
-    }
-    if row.hazard_loaded > 0.0 {
-        terms.push(KernelSumTerm {
-            coeff: row.hazard_loaded,
-            k: 1,
-            m: row.mass_exit,
-        });
-    }
-    if terms.is_empty() {
-        return Err(EstimationError::InvalidInput(
+    match (row.hazard_unloaded > 0.0, row.hazard_loaded > 0.0) {
+        (true, true) => {
+            let terms = [
+                KernelSumTerm {
+                    coeff: row.hazard_unloaded,
+                    k: 0,
+                    m: row.mass_exit,
+                },
+                KernelSumTerm {
+                    coeff: row.hazard_loaded,
+                    k: 1,
+                    m: row.mass_exit,
+                },
+            ];
+            LogKernelSumJet::evaluate(quadctx, &terms, mu, sigma)
+        }
+        (true, false) => {
+            let jet = LogKernelSumJet::single_term(quadctx, 0, row.mass_exit, mu, sigma)?;
+            Ok(LogKernelSumJet {
+                value: row.hazard_unloaded.ln() + jet.value,
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        (false, true) => {
+            let jet = LogKernelSumJet::single_term(quadctx, 1, row.mass_exit, mu, sigma)?;
+            Ok(LogKernelSumJet {
+                value: row.hazard_loaded.ln() + jet.value,
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        (false, false) => Err(EstimationError::InvalidInput(
             "latent survival exact-event row requires a positive loaded or unloaded hazard"
                 .to_string(),
-        ));
+        )),
     }
-    Ok(terms)
 }
 
 /// Row-level log-likelihood and μ-derivatives for the latent survival model.
@@ -784,15 +1023,13 @@ impl LatentSurvivalRowJet {
         mu: f64,
         sigma: f64,
     ) -> Result<Self, EstimationError> {
+        row.validate()?;
         match row.event_type {
             LatentSurvivalEventType::RightCensored => Self::right_censored(quadctx, mu, sigma, row),
             LatentSurvivalEventType::ExactEvent => Self::exact_event(quadctx, mu, sigma, row),
-            LatentSurvivalEventType::IntervalCensored => Self::interval_censored(
-                quadctx,
-                mu,
-                sigma,
-                row,
-            ),
+            LatentSurvivalEventType::IntervalCensored => {
+                Self::interval_censored(quadctx, mu, sigma, row)
+            }
         }
     }
 
@@ -859,8 +1096,7 @@ impl LatentSurvivalRowJet {
             } else {
                 0.0
             };
-        let terms = exact_event_kernel_terms(row)?;
-        let num = LogKernelSumJet::evaluate(quadctx, &terms, mu, sigma)?;
+        let num = exact_event_kernel_jet(quadctx, row, mu, sigma)?;
 
         if row.mass_entry > 1e-300 {
             let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;

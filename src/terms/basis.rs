@@ -6926,8 +6926,7 @@ fn duchon_matern_block_jet4(
     let g1 = -c * k1 * r_nu * k_nu_m1;
     let g2 = c * k2 * r_nu * k_nu_m2 - c * k1 * r_nu_m1 * k_nu_m1;
     let g3 = 3.0 * c * k2 * r_nu_m1 * k_nu_m2 - c * k3 * r_nu * k_nu_m3;
-    let g4 = 3.0 * c * k2 * r_nu_m2 * k_nu_m2
-        - 6.0 * c * k3 * r_nu_m1 * k_nu_m3
+    let g4 = 3.0 * c * k2 * r_nu_m2 * k_nu_m2 - 6.0 * c * k3 * r_nu_m1 * k_nu_m3
         + c * k4 * r_nu * k_nu_m4;
 
     Ok((g0, g1, g2, g3, g4))
@@ -9708,18 +9707,21 @@ fn duchon_radial_jets(
                 || !nearby.is_finite()
                 || (analytic - nearby).abs() > 1e3 * nearby.abs().max(1.0)
         };
-        let (phi_rr, t_collision, t_rr_collision) = if collision_limit_disagrees(
-            analytic_t_collision,
-            out.t,
-        ) || collision_limit_disagrees(analytic_t_rr_collision, out.t_rr)
-        {
-            // Keep the origin limit on the same coherent jet family as the
-            // nearby regularized evaluation when the analytic Taylor carrier
-            // is clearly inconsistent.
-            (out.q, out.t, out.t_rr)
-        } else {
-            (analytic_phi_rr, analytic_t_collision, analytic_t_rr_collision)
-        };
+        let (phi_rr, t_collision, t_rr_collision) =
+            if collision_limit_disagrees(analytic_t_collision, out.t)
+                || collision_limit_disagrees(analytic_t_rr_collision, out.t_rr)
+            {
+                // Keep the origin limit on the same coherent jet family as the
+                // nearby regularized evaluation when the analytic Taylor carrier
+                // is clearly inconsistent.
+                (out.q, out.t, out.t_rr)
+            } else {
+                (
+                    analytic_phi_rr,
+                    analytic_t_collision,
+                    analytic_t_rr_collision,
+                )
+            };
 
         let r2 = r * r;
         let r3 = r2 * r;

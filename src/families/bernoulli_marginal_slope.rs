@@ -1,34 +1,34 @@
 use crate::custom_family::{
-    build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
-    second_psi_linear_map, slice_joint_into_block_working_sets, BlockWorkingSet,
-    BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
+    cost_gated_outer_order, custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
+    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
+    slice_joint_into_block_working_sets,
 };
-use crate::estimate::reml::unified::HyperOperator;
 use crate::estimate::UnifiedFitResult;
+use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{
-    select_wiggle_basis_from_seed, ParameterBlockInput, WiggleBlockConfig,
+    ParameterBlockInput, WiggleBlockConfig, select_wiggle_basis_from_seed,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
-    build_row_kernel_cache, row_kernel_gradient, row_kernel_hessian_dense,
-    row_kernel_log_likelihood, RowKernel, RowKernelHessianWorkspace,
+    RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
+    row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
-    build_term_collection_designs_joint, freeze_term_collection_from_design,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_joint,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
-use ndarray::{s, Array1, Array2, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
@@ -37,7 +37,7 @@ use std::sync::Arc;
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
 pub use deviation_runtime::{
-    local_cubic_from_uniform_span_samples, sampled_span_points, DeviationRuntime,
+    DeviationRuntime, local_cubic_from_uniform_span_samples, sampled_span_points,
 };
 pub(crate) use deviation_runtime::{
     anchored_deviation_basis_with_transform, derive_deviation_basis_transform,
@@ -2136,6 +2136,19 @@ impl BernoulliMarginalSlopeFamily {
         self.score_warp.is_some() || self.link_dev.is_some()
     }
 
+    /// The denested exact path is active whenever either deviation runtime is
+    /// configured. Zero coefficient vectors still keep the flexible geometry
+    /// live so derivatives with respect to those coefficients remain available.
+    fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
+        if self.score_warp.is_some() && self.score_beta(block_states)?.is_none() {
+            return Err("missing bernoulli score-warp block state".to_string());
+        }
+        if self.link_dev.is_some() && self.link_beta(block_states)?.is_none() {
+            return Err("missing bernoulli link-deviation block state".to_string());
+        }
+        Ok(self.flex_active())
+    }
+
     fn validate_exact_monotonicity(
         &self,
         block_states: &[ParameterBlockState],
@@ -2242,7 +2255,7 @@ impl BernoulliMarginalSlopeFamily {
         let slope = block_states[1].eta[row];
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
-        let (intercept, m_a) = if self.flex_active() {
+        let (intercept, m_a) = if self.effective_flex_active(block_states)? {
             self.solve_row_intercept_base(marginal_eta, slope, beta_h, beta_w)?
         } else {
             (
@@ -2678,7 +2691,7 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         // Flex path: full IFT analytic kernel.
-        if self.flex_active() {
+        if self.effective_flex_active(block_states)? {
             let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
             let neglog = self.compute_row_analytic_flex_into(
                 row,
@@ -3146,7 +3159,7 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let q = block_states[0].eta[row];
             let g = block_states[1].eta[row];
             let kern = RigidProbitKernel::new(
@@ -3656,7 +3669,7 @@ impl BernoulliMarginalSlopeFamily {
         dir_u: &Array1<f64>,
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let q = block_states[0].eta[row];
             let g = block_states[1].eta[row];
             let kern = RigidProbitKernel::new(
@@ -4612,7 +4625,7 @@ impl BernoulliMarginalSlopeFamily {
             dir_u,
             dir_v,
         )?;
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             return Ok(ordered);
         }
 
@@ -4774,7 +4787,7 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
 
         // ── Rigid closed-form: scalar kernel + design row ops ────────
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
@@ -4869,7 +4882,7 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
 
         // ── Rigid closed-form: no jets, no row contexts ──────────────
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let diagonal = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
@@ -5652,7 +5665,7 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
 
         // ── Rigid closed-form: 3rd-order scalar kernel ───────────────
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
@@ -5745,7 +5758,7 @@ impl BernoulliMarginalSlopeFamily {
         let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
@@ -5823,7 +5836,7 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
         let slices = block_slices(self);
-        let flex_active = self.flex_active();
+        let flex_active = self.effective_flex_active(block_states)?;
 
         // ── Joint-then-slice path (rigid, p < 512) ──────────────────────
         //
@@ -6202,7 +6215,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         self.validate_exact_monotonicity(block_states)?;
-        let flex_active = self.flex_active();
+        let flex_active = self.effective_flex_active(block_states)?;
         if !flex_active {
             // Rigid probit: vectorized closed-form.
             // η_i = q_i·c_i + s_f b_i·z_i  where c_i = √(1+(s_f b_i)²)
@@ -6299,7 +6312,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if slices.total >= 512 {
             return Ok(None);
         }
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern)?;
             return Ok(Some(crate::families::row_kernel::row_kernel_hessian_dense(
@@ -6329,7 +6342,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             // Rigid path: use generic RowKernel<2> operator
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)))
@@ -6349,7 +6362,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
             crate::families::row_kernel::row_kernel_directional_derivative(&kern, sl).map(Some)
@@ -6369,7 +6382,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if !self.flex_active() {
+        if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
             let sv = d_beta_v_flat.as_slice().ok_or("non-contiguous d_beta_v")?;
@@ -7007,12 +7020,11 @@ mod tests {
     use super::*;
     use crate::custom_family::CustomFamily;
     use crate::families::bernoulli_marginal_slope::exact_kernel::{
-        branch_cell as branch_exact_cell, build_denested_partition_cells,
+        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
+        LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
         denested_cell_coefficient_partials as exact_denested_cell_coefficient_partials,
         global_cubic_from_local as exact_global_cubic_from_local,
         transformed_link_cubic as exact_transformed_link_cubic,
-        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
-        LocalSpanCubic,
     };
     use ndarray::array;
 
@@ -7478,7 +7490,8 @@ mod tests {
         let beta = Array1::from_iter((0..dim).map(|idx| 0.025 * (idx as f64 + 1.0)));
         let n_spans = prepared.runtime.breakpoints().len().saturating_sub(1);
         let support_left = prepared.runtime.breakpoints()[0];
-        let support_right = prepared.runtime.breakpoints()[prepared.runtime.breakpoints().len() - 1];
+        let support_right =
+            prepared.runtime.breakpoints()[prepared.runtime.breakpoints().len() - 1];
 
         for span_idx in 0..n_spans {
             let cubic = prepared
@@ -7553,7 +7566,8 @@ mod tests {
         .expect("build deviation block");
         let basis_idx = 0usize;
         let support_left = prepared.runtime.breakpoints()[0];
-        let support_right = prepared.runtime.breakpoints()[prepared.runtime.breakpoints().len() - 1];
+        let support_right =
+            prepared.runtime.breakpoints()[prepared.runtime.breakpoints().len() - 1];
         let cubic = prepared
             .runtime
             .basis_span_cubic(0, basis_idx)
@@ -12069,13 +12083,17 @@ mod tests {
         ];
         let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
-        assert!(family
-            .exact_newton_joint_hessian_workspace(&block_states, &specs)
-            .expect("flex hessian workspace")
-            .is_some());
-        assert!(family
-            .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
-            .expect("flex psi workspace")
-            .is_some());
+        assert!(
+            family
+                .exact_newton_joint_hessian_workspace(&block_states, &specs)
+                .expect("flex hessian workspace")
+                .is_some()
+        );
+        assert!(
+            family
+                .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
+                .expect("flex psi workspace")
+                .is_some()
+        );
     }
 }

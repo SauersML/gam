@@ -1,7 +1,7 @@
 use crate::custom_family::BlockwiseFitOptions;
 use crate::estimate::{EstimationError, FitOptions, FittedLinkState, UnifiedFitResult};
 use crate::families::bernoulli_marginal_slope::{
-    BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec,
+    BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec, DeviationBlockConfig,
     fit_bernoulli_marginal_slope_terms,
 };
 use crate::families::gamlss::{
@@ -13,7 +13,7 @@ use crate::families::gamlss::{
     fit_gaussian_location_scale_terms_with_selected_wiggle,
     select_binomial_location_scale_link_wiggle_basis_from_pilot,
     select_binomial_mean_link_wiggle_basis_from_pilot,
-    select_gaussian_location_scale_link_wiggle_basis_from_pilot,
+    select_gaussian_location_scale_link_wiggle_basis_from_pilot, split_wiggle_penalty_orders,
 };
 use crate::families::latent_survival::{
     LatentBinaryTermFitResult, LatentBinaryTermSpec, LatentSurvivalTermFitResult,
@@ -236,6 +236,40 @@ fn ensure_joint_wiggle_supported(link: &InverseLink, context: &str) -> Result<()
             "{context} does not support latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted standard links"
         )),
         InverseLink::Standard(_) => Ok(()),
+    }
+}
+
+fn deviation_block_config_from_formula_linkwiggle(
+    wiggle: &LinkWiggleFormulaSpec,
+) -> DeviationBlockConfig {
+    let (penalty_order, penalty_orders) = split_wiggle_penalty_orders(2, &wiggle.penalty_orders);
+    DeviationBlockConfig {
+        degree: wiggle.degree,
+        num_internal_knots: wiggle.num_internal_knots,
+        penalty_order,
+        penalty_orders,
+        double_penalty: wiggle.double_penalty,
+        monotonicity_eps: 1e-4,
+    }
+}
+
+fn fixed_gaussian_shift_frailty_from_spec(
+    frailty: &FrailtySpec,
+    context: &str,
+) -> Result<FrailtySpec, String> {
+    match frailty {
+        FrailtySpec::None => Ok(FrailtySpec::None),
+        FrailtySpec::GaussianShift {
+            sigma_fixed: Some(sigma),
+        } => Ok(FrailtySpec::GaussianShift {
+            sigma_fixed: Some(*sigma),
+        }),
+        FrailtySpec::GaussianShift { sigma_fixed: None } => Err(format!(
+            "{context} currently requires a fixed GaussianShift sigma"
+        )),
+        FrailtySpec::HazardMultiplier { .. } => Err(format!(
+            "{context} requires FrailtySpec::GaussianShift or no frailty"
+        )),
     }
 }
 
@@ -754,13 +788,23 @@ fn fit_survival_marginal_slope_model(
 fn fit_latent_survival_model(
     request: LatentSurvivalFitRequest<'_>,
 ) -> Result<LatentSurvivalTermFitResult, String> {
-    fit_latent_survival_terms(request.data, request.spec, request.frailty, &request.options)
+    fit_latent_survival_terms(
+        request.data,
+        request.spec,
+        request.frailty,
+        &request.options,
+    )
 }
 
 fn fit_latent_binary_model(
     request: LatentBinaryFitRequest<'_>,
 ) -> Result<LatentBinaryTermFitResult, String> {
-    fit_latent_binary_terms(request.data, request.spec, request.frailty, &request.options)
+    fit_latent_binary_terms(
+        request.data,
+        request.spec,
+        request.frailty,
+        &request.options,
+    )
 }
 
 fn fit_transformation_normal_model(
@@ -817,11 +861,10 @@ use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, append_zero_tail_columns,
     build_latent_survival_baseline_offsets, build_survival_baseline_offsets,
-    build_survival_time_basis,
-    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
-    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    initial_survival_baseline_config_for_fit, normalize_survival_time_pair,
-    optimize_survival_baseline_config, parse_survival_distribution,
+    build_survival_time_basis, build_survival_timewiggle_from_baseline,
+    build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
+    evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
+    normalize_survival_time_pair, optimize_survival_baseline_config, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
 };
@@ -864,7 +907,8 @@ pub struct FitConfig {
     pub time_degree: usize,
     pub time_num_internal_knots: usize,
     pub time_smooth_lambda: f64,
-    /// Survival likelihood mode: "location-scale", "transformation", "weibull", "marginal-slope", or "latent".
+    /// Survival likelihood mode: "location-scale", "transformation", "weibull",
+    /// "marginal-slope", "latent", or "latent-binary".
     pub survival_likelihood: String,
     /// Residual distribution: "gaussian", "logistic", "gumbel".
     pub survival_distribution: String,
@@ -1161,10 +1205,12 @@ fn prepare_workflow_survival_time_stack(
             wiggle.ncols,
         );
         for (idx, penalty) in wiggle.penalties.iter().enumerate() {
-            let mut embedded =
-                Array2::<f64>::zeros((p_base + wiggle.ncols, p_base + wiggle.ncols));
+            let mut embedded = Array2::<f64>::zeros((p_base + wiggle.ncols, p_base + wiggle.ncols));
             embedded
-                .slice_mut(s![p_base..p_base + wiggle.ncols, p_base..p_base + wiggle.ncols])
+                .slice_mut(s![
+                    p_base..p_base + wiggle.ncols,
+                    p_base..p_base + wiggle.ncols
+                ])
                 .assign(penalty);
             time_penalties.push(embedded);
             time_nullspace_dims.push(wiggle.nullspace_dims.get(idx).copied().unwrap_or(0));
@@ -1436,8 +1482,7 @@ fn materialize_survival<'a>(
     if matches!(
         survival_mode,
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
-    )
-        && baseline_cfg.target == SurvivalBaselineTarget::Linear
+    ) && baseline_cfg.target == SurvivalBaselineTarget::Linear
     {
         return Err(
             "latent hazard-window families require a non-linear scalar baseline target; use baseline_target weibull, gompertz, or gompertz-makeham"
@@ -1454,9 +1499,7 @@ fn materialize_survival<'a>(
     let exact_derivative_guard = match survival_mode {
         SurvivalLikelihoodMode::LocationScale
         | SurvivalLikelihoodMode::Latent
-        | SurvivalLikelihoodMode::LatentBinary => {
-            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD
-        }
+        | SurvivalLikelihoodMode::LatentBinary => DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
         SurvivalLikelihoodMode::MarginalSlope => DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => 0.0,
     };
@@ -1469,10 +1512,7 @@ fn materialize_survival<'a>(
         Some((config.time_num_internal_knots, config.time_smooth_lambda)),
     )?;
     if survival_mode != SurvivalLikelihoodMode::Weibull {
-        require_structural_survival_time_basis(
-            &time_build.basisname,
-            "workflow survival fitting",
-        )?;
+        require_structural_survival_time_basis(&time_build.basisname, "workflow survival fitting")?;
     }
     let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &time_cfg)?;
     center_survival_time_designs_at_anchor(
@@ -1544,6 +1584,11 @@ fn materialize_survival<'a>(
         }
     };
     let marginal_z = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        if parsed.linkspec.is_some() {
+            return Err(
+                "link(...) is not implemented for the survival marginal-slope family".to_string(),
+            );
+        }
         let z_col_name = config
             .z_column
             .as_deref()
@@ -1558,6 +1603,18 @@ fn materialize_survival<'a>(
     let marginal_logslopespec = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         if let Some(ls_formula) = config.logslope_formula.as_deref() {
             let ls_parsed = parse_formula(&format!("{} ~ {ls_formula}", parsed.response))?;
+            if ls_parsed.linkspec.is_some() {
+                return Err(
+                    "link(...) is not supported in logslope_formula for the survival marginal-slope family"
+                        .to_string(),
+                );
+            }
+            if ls_parsed.linkwiggle.is_some() {
+                return Err(
+                    "linkwiggle(...) is not supported in logslope_formula for the survival marginal-slope family"
+                        .to_string(),
+                );
+            }
             Some(build_termspec(
                 &ls_parsed.terms,
                 data,
@@ -1570,6 +1627,43 @@ fn materialize_survival<'a>(
     } else {
         None
     };
+    let marginal_slope_link_dev = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        if parsed.linkwiggle.is_some() {
+            inference_notes.push(
+                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
+            );
+            inference_notes.push(
+                "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic transport cells with analytic value evaluation and calibrated survival normalization"
+                    .to_string(),
+            );
+        } else {
+            inference_notes.push(
+                "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
+            );
+        }
+        parsed
+            .linkwiggle
+            .as_ref()
+            .map(deviation_block_config_from_formula_linkwiggle)
+    } else {
+        None
+    };
+    let marginal_slope_frailty = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        Some(fixed_gaussian_shift_frailty_from_spec(
+            config.frailty.as_ref().unwrap_or(&FrailtySpec::None),
+            "survival marginal-slope",
+        )?)
+    } else {
+        None
+    };
+    let marginal_slope_score_warp = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        parsed
+            .linkwiggle
+            .as_ref()
+            .map(|_| DeviationBlockConfig::default())
+    } else {
+        None
+    };
 
     match survival_mode {
         SurvivalLikelihoodMode::LocationScale if config.frailty.is_some() => {
@@ -1578,18 +1672,11 @@ fn materialize_survival<'a>(
                     .to_string(),
             );
         }
-        SurvivalLikelihoodMode::MarginalSlope if effective_timewiggle.is_some() => {
-            return Err(
-                "timewiggle is only implemented for survival-likelihood=location-scale in the exact dynamic path"
-                    .to_string(),
-            );
-        }
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
             if effective_timewiggle.is_some() =>
         {
             return Err(
-                "timewiggle is not implemented for latent survival/binary likelihoods"
-                    .to_string(),
+                "timewiggle is not implemented for latent survival/binary likelihoods".to_string(),
             );
         }
         _ => {}
@@ -1599,11 +1686,7 @@ fn materialize_survival<'a>(
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
     ) {
         let frailty = config.frailty.as_ref().unwrap_or(&FrailtySpec::None);
-        Some(fixed_latent_hazard_frailty(
-            frailty,
-            "workflow latent survival/binary",
-        )?
-        .1)
+        Some(fixed_latent_hazard_frailty(frailty, "workflow latent survival/binary")?.1)
     } else {
         None
     };
@@ -1680,7 +1763,7 @@ fn materialize_survival<'a>(
 
     let build_marginal_slope_request =
         |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
-            let (_, time_block) = build_time_block(candidate)?;
+            let (prepared, time_block) = build_time_block(candidate)?;
             Ok::<_, String>(SurvivalMarginalSlopeFitRequest {
                 data: data.values.view(),
                 spec: SurvivalMarginalSlopeTermSpec {
@@ -1693,18 +1776,23 @@ fn materialize_survival<'a>(
                     })?,
                     marginalspec: termspec.clone(),
                     marginal_offset: threshold_offset.clone(),
-                    frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
+                    frailty: marginal_slope_frailty.clone().ok_or_else(|| {
+                        "internal error: marginal-slope frailty validation missing".to_string()
+                    })?,
                     derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                     time_block,
-                    timewiggle_block: None,
+                    timewiggle_block: prepared.timewiggle_block,
                     logslopespec: marginal_logslopespec.clone().ok_or_else(|| {
                         "marginal-slope survival is missing logslope spec".to_string()
                     })?,
                     logslope_offset: log_sigma_offset.clone(),
-                    score_warp: None,
-                    link_dev: None,
+                    score_warp: marginal_slope_score_warp.clone(),
+                    link_dev: marginal_slope_link_dev.clone(),
                 },
-                options: BlockwiseFitOptions::default(),
+                options: BlockwiseFitOptions {
+                    compute_covariance: true,
+                    ..Default::default()
+                },
                 kappa_options: SpatialLengthScaleOptimizationOptions::default(),
             })
         };
@@ -1770,8 +1858,7 @@ fn materialize_survival<'a>(
     let build_latent_binary_request =
         |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
             let loading = latent_loading.ok_or_else(|| {
-                "internal error: latent binary loading missing after frailty validation"
-                    .to_string()
+                "internal error: latent binary loading missing after frailty validation".to_string()
             })?;
             let prepared = prepare_workflow_survival_time_stack(
                 &age_entry,

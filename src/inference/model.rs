@@ -317,6 +317,9 @@ pub enum FittedFamily {
         survival_distribution: Option<String>,
         frailty: FrailtySpec,
     },
+    LatentSurvival {
+        frailty: FrailtySpec,
+    },
     TransformationNormal {
         likelihood: LikelihoodFamily,
     },
@@ -828,13 +831,16 @@ impl FittedFamily {
             | Self::MarginalSlope { likelihood, .. }
             | Self::Survival { likelihood, .. }
             | Self::TransformationNormal { likelihood, .. } => *likelihood,
+            Self::LatentSurvival { .. } => LikelihoodFamily::RoystonParmar,
         }
     }
 
     #[inline]
     pub fn frailty(&self) -> Option<&FrailtySpec> {
         match self {
-            Self::MarginalSlope { frailty, .. } | Self::Survival { frailty, .. } => Some(frailty),
+            Self::MarginalSlope { frailty, .. }
+            | Self::Survival { frailty, .. }
+            | Self::LatentSurvival { frailty } => Some(frailty),
             _ => None,
         }
     }
@@ -970,7 +976,9 @@ impl FittedModel {
     #[inline]
     pub fn predict_model_class(&self) -> PredictModelClass {
         match self.payload().family_state {
-            FittedFamily::Survival { .. } => PredictModelClass::Survival,
+            FittedFamily::Survival { .. } | FittedFamily::LatentSurvival { .. } => {
+                PredictModelClass::Survival
+            }
             FittedFamily::MarginalSlope { .. } => PredictModelClass::BernoulliMarginalSlope,
             FittedFamily::TransformationNormal { .. } => PredictModelClass::TransformationNormal,
             FittedFamily::LocationScale {
@@ -1267,7 +1275,7 @@ impl FittedModel {
                 Ok(stateful.or_else(|| link.map(InverseLink::Standard)))
             }
             FittedFamily::MarginalSlope { .. } => Ok(None),
-            FittedFamily::Survival { .. } => Ok(None),
+            FittedFamily::Survival { .. } | FittedFamily::LatentSurvival { .. } => Ok(None),
             FittedFamily::TransformationNormal { .. } => Ok(None),
         }
     }
@@ -1552,6 +1560,34 @@ impl FittedModel {
             } else if !matches!(frailty, FrailtySpec::None) {
                 return Err(
                     "non-marginal survival models do not currently persist a frailty modifier"
+                        .to_string(),
+                );
+            }
+        }
+        if let FittedFamily::LatentSurvival { frailty } = &self.family_state {
+            match frailty {
+                FrailtySpec::HazardMultiplier {
+                    sigma_fixed: Some(_),
+                    ..
+                } => {}
+                FrailtySpec::HazardMultiplier {
+                    sigma_fixed: None, ..
+                } => {
+                    return Err(
+                        "latent survival model requires a fixed HazardMultiplier sigma in family_state.frailty"
+                            .to_string(),
+                    );
+                }
+                FrailtySpec::GaussianShift { .. } | FrailtySpec::None => {
+                    return Err(
+                        "latent survival model requires a fixed HazardMultiplier frailty specification"
+                            .to_string(),
+                    );
+                }
+            }
+            if self.survival_likelihood.as_deref() != Some("latent") {
+                return Err(
+                    "latent survival model must persist survival_likelihood=latent"
                         .to_string(),
                 );
             }

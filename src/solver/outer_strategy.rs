@@ -1337,11 +1337,7 @@ fn run_outer_with_plan(
     for &idx in &screened_indices {
         attempted[idx] = true;
         obj.reset();
-        match finite_outer_eval_for_seed(
-            obj,
-            &seeds[idx],
-            "outer seed verification failed",
-        ) {
+        match finite_outer_eval_for_seed(obj, &seeds[idx], "outer seed verification failed") {
             Ok(()) => verified_indices.push(idx),
             Err(err) => {
                 log::warn!(
@@ -1356,11 +1352,7 @@ fn run_outer_with_plan(
                 continue;
             }
             obj.reset();
-            match finite_outer_eval_for_seed(
-                obj,
-                &seeds[idx],
-                "outer seed verification failed",
-            ) {
+            match finite_outer_eval_for_seed(obj, &seeds[idx], "outer seed verification failed") {
                 Ok(()) => {
                     verified_indices.push(idx);
                     if verified_indices.len() == budget {
