@@ -1211,7 +1211,14 @@ fn logit_posterior_meanwith_deriv_controlled(
         ));
     }
     match logit_posterior_meanwith_deriv_exact(mu, sigma) {
-        Ok(out) => Ok(out),
+        Ok(out) => {
+            let ghq = logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
+            if integrated_mean_derivative_drift_exceeds(&out, &ghq, 5e-11, 5e-8, 5e-11, 5e-7) {
+                Ok(ghq)
+            } else {
+                Ok(out)
+            }
+        }
         Err(_) => Ok(logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma)),
     }
 }
@@ -2340,35 +2347,40 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
-    if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
-        return cloglog_small_sigma_taylor(mu, sigma);
-    }
-    if let Some(out) = cloglog_extreme_asymptotic(mu, sigma) {
-        return out;
-    }
-
-    let ((survival, mode), (shifted_survival, shifted_mode)) =
-        cloglog_survival_pair_controlled(ctx, mu, sigma);
-    if matches!(mode, IntegratedExpectationMode::QuadratureFallback)
-        || matches!(shifted_mode, IntegratedExpectationMode::QuadratureFallback)
-    {
-        return cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
-    }
-    let mean = cloglog_mean_from_survival(survival);
-    let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
-    let mode = if matches!(mode, IntegratedExpectationMode::ControlledAsymptotic)
-        || matches!(
-            shifted_mode,
-            IntegratedExpectationMode::ControlledAsymptotic
-        ) {
-        IntegratedExpectationMode::ControlledAsymptotic
+    let candidate = if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
+        cloglog_small_sigma_taylor(mu, sigma)
+    } else if let Some(out) = cloglog_extreme_asymptotic(mu, sigma) {
+        out
     } else {
-        mode
+        let ((survival, mode), (shifted_survival, shifted_mode)) =
+            cloglog_survival_pair_controlled(ctx, mu, sigma);
+        if matches!(mode, IntegratedExpectationMode::QuadratureFallback)
+            || matches!(shifted_mode, IntegratedExpectationMode::QuadratureFallback)
+        {
+            return cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
+        }
+        let mean = cloglog_mean_from_survival(survival);
+        let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
+        let mode = if matches!(mode, IntegratedExpectationMode::ControlledAsymptotic)
+            || matches!(
+                shifted_mode,
+                IntegratedExpectationMode::ControlledAsymptotic
+            ) {
+            IntegratedExpectationMode::ControlledAsymptotic
+        } else {
+            mode
+        };
+        IntegratedMeanDerivative {
+            mean,
+            dmean_dmu: dmean.max(0.0),
+            mode,
+        }
     };
-    IntegratedMeanDerivative {
-        mean,
-        dmean_dmu: dmean.max(0.0),
-        mode,
+    let ghq = cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
+    if integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 5e-11, 5e-8, 5e-11, 5e-7) {
+        ghq
+    } else {
+        candidate
     }
 }
 
@@ -2451,12 +2463,20 @@ pub fn integrated_inverse_link_jet(
             })
         }
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
-        LinkFunction::Logit => integrate_inverse_link_jet_from_scalar_backend(
-            mu,
-            sigma,
-            |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
-            |x| component_point_jet(LinkComponent::Logit, x),
-        ),
+        LinkFunction::Logit => {
+            let candidate = integrate_inverse_link_jet_from_scalar_backend(
+                mu,
+                sigma,
+                |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
+                |x| component_point_jet(LinkComponent::Logit, x),
+            )?;
+            let ghq = integrated_logit_jet_ghq(quadctx, mu, sigma);
+            if integrated_jet_drift_exceeds(&candidate, &ghq, 2e-8, 2e-5) {
+                Ok(ghq)
+            } else {
+                Ok(candidate)
+            }
+        }
         LinkFunction::CLogLog => {
             validate_latent_cloglog_inputs(mu, sigma)?;
             Ok(latent_cloglog_inverse_link_jet5_controlled(quadctx, mu, sigma).into_jet3())
@@ -2500,6 +2520,50 @@ fn integrated_expectation_mode_rank(mode: IntegratedExpectationMode) -> u8 {
 }
 
 #[inline]
+fn integrated_scalar_drift_exceeds(
+    candidate: f64,
+    reference: f64,
+    abs_tol: f64,
+    rel_tol: f64,
+) -> bool {
+    if !(candidate.is_finite() && reference.is_finite()) {
+        return true;
+    }
+    (candidate - reference).abs() > abs_tol.max(rel_tol * reference.abs().max(candidate.abs()))
+}
+
+#[inline]
+fn integrated_mean_derivative_drift_exceeds(
+    candidate: &IntegratedMeanDerivative,
+    reference: &IntegratedMeanDerivative,
+    mean_abs_tol: f64,
+    mean_rel_tol: f64,
+    deriv_abs_tol: f64,
+    deriv_rel_tol: f64,
+) -> bool {
+    integrated_scalar_drift_exceeds(candidate.mean, reference.mean, mean_abs_tol, mean_rel_tol)
+        || integrated_scalar_drift_exceeds(
+            candidate.dmean_dmu,
+            reference.dmean_dmu,
+            deriv_abs_tol,
+            deriv_rel_tol,
+        )
+}
+
+#[inline]
+fn integrated_jet_drift_exceeds(
+    candidate: &IntegratedInverseLinkJet,
+    reference: &IntegratedInverseLinkJet,
+    abs_tol: f64,
+    rel_tol: f64,
+) -> bool {
+    integrated_scalar_drift_exceeds(candidate.mean, reference.mean, abs_tol, rel_tol)
+        || integrated_scalar_drift_exceeds(candidate.d1, reference.d1, abs_tol, rel_tol)
+        || integrated_scalar_drift_exceeds(candidate.d2, reference.d2, abs_tol, rel_tol)
+        || integrated_scalar_drift_exceeds(candidate.d3, reference.d3, abs_tol, rel_tol)
+}
+
+#[inline]
 fn component_point_jet(component: LinkComponent, x: f64) -> (f64, f64, f64, f64) {
     // Keep the point-mass quadrature kernels wired to the same inverse-link
     // implementation used by mixture links and survival residual distributions.
@@ -2519,13 +2583,7 @@ fn integrated_mixture_component_jet(
     // produces identical d2, d3 regardless of whether it enters as a
     // standalone link or as a mixture component.
     match component {
-        LinkComponent::Logit => integrate_inverse_link_jet_from_scalar_backend(
-            mu,
-            sigma,
-            |m, s| logit_posterior_meanwith_deriv_controlled(ctx, m, s),
-            |x| component_point_jet(LinkComponent::Logit, x),
-        )
-        .unwrap_or_else(|_| integrated_logit_jet_ghq(ctx, mu, sigma)),
+        LinkComponent::Logit => integrated_logit_jet_ghq(ctx, mu, sigma),
         LinkComponent::Probit => integrated_probit_jet(mu, sigma),
         LinkComponent::CLogLog => {
             latent_cloglog_inverse_link_jet5_controlled(ctx, mu, sigma).into_jet3()
@@ -3148,6 +3206,11 @@ pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
 
     let scalar = cloglog_posterior_meanwith_deriv_controlled(ctx, mu, sigma);
     let ghq = integrated_cloglog_eta_jet_ghq(ctx, mu, sigma);
+    if integrated_scalar_drift_exceeds(scalar.mean, ghq.mean, 5e-11, 5e-8)
+        || integrated_scalar_drift_exceeds(scalar.dmean_dmu, ghq.d1, 5e-11, 5e-7)
+    {
+        return ghq;
+    }
 
     // d2, d3 via fourth-order central differences of the scalar backend's d1.
     // This guarantees consistency with mean/d1 — see comment above.

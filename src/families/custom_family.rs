@@ -6626,6 +6626,18 @@ fn joint_outer_evaluate(
         eval_mode,
         ext_bundle.map(|bundle| bundle.scaled(rho_curvature_scale)),
     )?;
+    if !objective.is_finite() {
+        return Err("joint outer evaluation produced a non-finite objective".to_string());
+    }
+    if grad.iter().any(|value| !value.is_finite()) {
+        return Err("joint outer evaluation produced a non-finite gradient".to_string());
+    }
+    if outer_hessian
+        .as_ref()
+        .is_some_and(|hessian| hessian.iter().any(|value| !value.is_finite()))
+    {
+        return Err("joint outer evaluation produced a non-finite Hessian".to_string());
+    }
 
     let warm = ConstrainedWarmStart {
         rho: rho.clone(),
