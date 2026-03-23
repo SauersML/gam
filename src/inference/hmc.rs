@@ -332,6 +332,8 @@ struct SharedData {
     penalty: Arc<Array2<f64>>,
     /// MAP estimate (mode) μ [dim]
     mode: Arc<Array1<f64>>,
+    /// Fitted Gamma shape (used only for Gamma-log likelihoods).
+    gamma_shape: f64,
     /// Number of samples
     n_samples: usize,
     /// Number of coefficients
@@ -424,6 +426,7 @@ impl NutsPosterior {
         mode: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
         nuts_family: NutsFamily,
+        gamma_shape: f64,
         firth_enabled: bool,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
@@ -465,6 +468,7 @@ impl NutsPosterior {
             weights: Arc::new(weights.to_owned()),
             penalty: Arc::new(penalty_matrix.to_owned()),
             mode: Arc::new(mode.to_owned()),
+            gamma_shape,
             n_samples,
             dim,
         };
@@ -873,21 +877,22 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
     (ll, grad_ll)
 }
 
-/// Gamma(log) log-likelihood and gradient (shape=1).
-///
-/// log p(y|η) = −η − y·exp(−η), gradient = X'(w ⊙ (y/μ − 1))
 fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let n = data.n_samples;
     let mut ll = 0.0;
     let mut residual = Array1::<f64>::zeros(n);
+    let shape = data.gamma_shape.max(1e-10);
 
     for i in 0..n {
         let eta_i = eta[i].clamp(-700.0, 700.0);
         let mu_i = eta_i.exp();
         let y_i = data.y[i];
         let w_i = data.weights[i];
-        ll += w_i * (-eta_i - y_i / mu_i);
-        residual[i] = w_i * (y_i / mu_i - 1.0);
+        ll += w_i
+            * (shape * shape.ln() - statrs::function::gamma::ln_gamma(shape) - shape * eta_i
+                + (shape - 1.0) * y_i.max(1e-12).ln()
+                - shape * y_i / mu_i);
+        residual[i] = w_i * shape * (y_i / mu_i - 1.0);
     }
 
     let grad_ll = fast_atv(&data.x, &residual);
@@ -943,6 +948,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             NutsFamily::BinomialLogit,
+            1.0,
             true,
         )
         .expect("posterior");
@@ -995,6 +1001,7 @@ mod tests {
             weights: Arc::new(weights.clone()),
             penalty: Arc::new(Array2::zeros((x.ncols(), x.ncols()))),
             mode: Arc::new(Array1::zeros(x.ncols())),
+            gamma_shape: 1.0,
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -1061,6 +1068,7 @@ mod tests {
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
                 hessian: non_spdhessian.view(),
+                gamma_shape: None,
                 firth_bias_reduction: false,
             }),
             &cfg,
@@ -1095,6 +1103,7 @@ mod tests {
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
                 hessian: non_spdhessian.view(),
+                gamma_shape: None,
                 firth_bias_reduction: false,
             }),
             &cfg,
@@ -1134,6 +1143,7 @@ mod tests {
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
                 hessian: hessian.view(),
+                gamma_shape: None,
                 firth_bias_reduction: true,
             }),
             &cfg,
@@ -1217,6 +1227,7 @@ mod tests {
             rho_mode.view(),
             LikelihoodFamily::GaussianIdentity,
             InverseLink::Standard(LinkFunction::Identity),
+            None,
             RhoPrior::Flat,
             false,
         )
@@ -1259,6 +1270,7 @@ mod tests {
             array![0.0].view(),
             LikelihoodFamily::GaussianIdentity,
             InverseLink::Standard(LinkFunction::Identity),
+            None,
             prior.clone(),
             false,
         )
@@ -1273,6 +1285,7 @@ mod tests {
             array![2.5].view(),
             LikelihoodFamily::GaussianIdentity,
             InverseLink::Standard(LinkFunction::Identity),
+            None,
             prior,
             false,
         )
@@ -1310,6 +1323,7 @@ mod tests {
             weights: Arc::new(weights),
             penalty: Arc::new(Array2::zeros((1, 1))),
             mode: Arc::new(Array1::zeros(1)),
+            gamma_shape: 1.0,
             n_samples: 2,
             dim: 1,
         };
@@ -1415,6 +1429,7 @@ mod tests {
             rho.view(),
             LikelihoodFamily::GaussianIdentity,
             InverseLink::Standard(LinkFunction::Identity),
+            None,
             RhoPrior::Flat,
             false,
         )
@@ -1467,6 +1482,7 @@ mod tests {
             weights: Arc::new(array![1.0, 1.0]),
             penalty: Arc::new(Array2::zeros((1, 1))),
             mode: Arc::new(Array1::zeros(1)),
+            gamma_shape: 1.0,
             n_samples: 2,
             dim: 1,
         };
@@ -2501,6 +2517,7 @@ pub(crate) fn run_nuts_sampling(
     mode: ArrayView1<f64>,
     hessian: ArrayView2<f64>,
     nuts_family: NutsFamily,
+    gamma_shape: f64,
     firth_bias_reduction: bool,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
@@ -2517,6 +2534,7 @@ pub(crate) fn run_nuts_sampling(
         mode,
         hessian,
         nuts_family,
+        gamma_shape,
         firth_bias_reduction,
     )?;
 
@@ -2600,6 +2618,7 @@ pub struct GlmFlatInputs<'a> {
     pub penalty_matrix: ArrayView2<'a, f64>,
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
+    pub gamma_shape: Option<f64>,
     pub firth_bias_reduction: bool,
 }
 
@@ -2661,6 +2680,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.mode,
             glm.hessian,
             NutsFamily::Gaussian,
+            1.0,
             glm.firth_bias_reduction,
             config,
         ),
@@ -2685,6 +2705,7 @@ pub fn run_nuts_sampling_flattened_family(
                     glm.mode,
                     glm.hessian,
                     NutsFamily::BinomialLogit,
+                    1.0,
                     glm.firth_bias_reduction,
                     config,
                 )
@@ -2698,6 +2719,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.mode,
             glm.hessian,
             NutsFamily::BinomialProbit,
+            1.0,
             glm.firth_bias_reduction,
             config,
         ),
@@ -2709,6 +2731,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.mode,
             glm.hessian,
             NutsFamily::BinomialCLogLog,
+            1.0,
             glm.firth_bias_reduction,
             config,
         ),
@@ -2720,6 +2743,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.mode,
             glm.hessian,
             NutsFamily::BinomialCLogLog,
+            1.0,
             glm.firth_bias_reduction,
             config,
         ),
@@ -2773,6 +2797,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.mode,
             glm.hessian,
             NutsFamily::PoissonLog,
+            1.0,
             glm.firth_bias_reduction,
             config,
         ),
@@ -2784,6 +2809,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.mode,
             glm.hessian,
             NutsFamily::GammaLog,
+            glm.gamma_shape.unwrap_or(1.0),
             glm.firth_bias_reduction,
             config,
         ),
@@ -2842,7 +2868,7 @@ pub struct LinkWigglePosterior {
     p_link: usize,
     n_samples: usize,
     nuts_family: NutsFamily,
-    /// Dispersion parameter (only used for Gaussian)
+    /// Family-specific noise parameter: Gaussian sigma or Gamma shape.
     scale: f64,
 }
 
@@ -3076,7 +3102,7 @@ impl LinkWigglePosterior {
             }
             NutsFamily::GammaLog => {
                 let mut ll_acc = 0.0;
-                let shape = 1.0 / self.scale.max(1e-10);
+                let shape = self.scale.max(1e-10);
                 for i in 0..self.n_samples {
                     let eta_i = eta[i].clamp(-30.0, 30.0);
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
@@ -3645,6 +3671,7 @@ impl JointBetaRhoPosterior {
         rho_mode: ArrayView1<f64>,
         likelihood_family: LikelihoodFamily,
         inverse_link: InverseLink,
+        gamma_shape: Option<f64>,
         rho_prior: RhoPrior,
         firth_enabled: bool,
     ) -> Result<Self, String> {
@@ -3747,6 +3774,7 @@ impl JointBetaRhoPosterior {
             weights: Arc::new(weights.to_owned()),
             penalty: Arc::new(s_combined),
             mode: Arc::new(mode.to_owned()),
+            gamma_shape: gamma_shape.unwrap_or(1.0),
             n_samples,
             dim: n_beta,
         };
@@ -3931,6 +3959,7 @@ pub struct JointBetaRhoInputs<'a> {
     pub weights: ArrayView1<'a, f64>,
     pub likelihood_family: LikelihoodFamily,
     pub inverse_link: InverseLink,
+    pub gamma_shape: Option<f64>,
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
     pub penalty_roots: Vec<CanonicalPenalty>,
@@ -3973,6 +4002,7 @@ pub fn run_joint_beta_rho_sampling(
         inputs.rho_mode,
         inputs.likelihood_family,
         inputs.inverse_link.clone(),
+        inputs.gamma_shape,
         inputs.rho_prior.clone(),
         inputs.firth_bias_reduction,
     )?;

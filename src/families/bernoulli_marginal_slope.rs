@@ -11,7 +11,9 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
-use crate::families::gamlss::{ParameterBlockInput, WiggleBlockConfig, select_wiggle_basis_from_seed};
+use crate::families::gamlss::{
+    ParameterBlockInput, WiggleBlockConfig, select_wiggle_basis_from_seed,
+};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -32,8 +34,8 @@ use statrs::function::erf::erfc;
 use std::cell::RefCell;
 use std::sync::Arc;
 
-pub(crate) mod exact_kernel;
 mod deviation_runtime;
+pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
 pub(crate) use deviation_runtime::{
     anchored_deviation_basis_with_transform, derive_deviation_basis_transform,
@@ -1886,14 +1888,18 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &'a [ParameterBlockState],
     ) -> Result<Option<&'a Array1<f64>>, String> {
-        Ok(self.score_block_state(block_states)?.map(|state| &state.beta))
+        Ok(self
+            .score_block_state(block_states)?
+            .map(|state| &state.beta))
     }
 
     fn link_beta<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
     ) -> Result<Option<&'a Array1<f64>>, String> {
-        Ok(self.link_block_state(block_states)?.map(|state| &state.beta))
+        Ok(self
+            .link_block_state(block_states)?
+            .map(|state| &state.beta))
     }
 
     fn validate_exact_block_state_shapes(
@@ -2863,8 +2869,12 @@ impl BernoulliMarginalSlopeFamily {
                 );
                 for u in 1..r {
                     for v in u..r {
-                        let second_coeff =
-                            coeff_jet.pair_from_b_family(coeff_jet.b_first, u, v, COEFF_SUPPORT_BHW);
+                        let second_coeff = coeff_jet.pair_from_b_family(
+                            coeff_jet.b_first,
+                            u,
+                            v,
+                            COEFF_SUPPORT_BHW,
+                        );
                         let val = exact::cell_second_derivative_from_moments(
                             cell,
                             &coeff_jet.first[u],
@@ -3497,14 +3507,12 @@ impl BernoulliMarginalSlopeFamily {
         }
         for u in 1..r {
             for v in u..r {
-                let second_coeff =
-                    g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW);
+                let second_coeff = g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW);
                 let val = eval_coeff4_at(&second_coeff, z_obs);
                 g_uv[[u, v]] = val;
                 g_uv[[v, u]] = val;
 
-                let third_coeff =
-                    g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_BW);
+                let third_coeff = g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_BW);
                 let third_val = eval_coeff4_at(&third_coeff, z_obs);
                 g_auv[[u, v]] = third_val;
                 g_auv[[v, u]] = third_val;
@@ -3521,18 +3529,10 @@ impl BernoulliMarginalSlopeFamily {
         let g_aa_dir = eval_coeff4_at(&g_aa_dir_fixed, z_obs);
 
         for u in 1..r {
-            g_u_dir_fixed[u] = g_jet.param_directional_from_b_family(
-                g_jet.b_first,
-                u,
-                dir,
-                COEFF_SUPPORT_BHW,
-            );
-            g_au_dir_fixed[u] = g_jet.param_directional_from_b_family(
-                g_jet.ab_first,
-                u,
-                dir,
-                COEFF_SUPPORT_BW,
-            );
+            g_u_dir_fixed[u] =
+                g_jet.param_directional_from_b_family(g_jet.b_first, u, dir, COEFF_SUPPORT_BHW);
+            g_au_dir_fixed[u] =
+                g_jet.param_directional_from_b_family(g_jet.ab_first, u, dir, COEFF_SUPPORT_BW);
         }
 
         let mut g_u_dir = Array1::<f64>::zeros(r);
@@ -4272,16 +4272,13 @@ impl BernoulliMarginalSlopeFamily {
         }
         for u in 1..r {
             for v in u..r {
-                let second_coeff =
-                    g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW);
+                let second_coeff = g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW);
                 let val = eval_coeff4_at(&second_coeff, z_obs);
                 g_uv[[u, v]] = val;
                 g_uv[[v, u]] = val;
 
-                let third_coeff =
-                    g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_BW);
-                let fourth_coeff =
-                    g_jet.pair_from_b_family(g_jet.aab_first, u, v, COEFF_SUPPORT_W);
+                let third_coeff = g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_BW);
+                let fourth_coeff = g_jet.pair_from_b_family(g_jet.aab_first, u, v, COEFF_SUPPORT_W);
                 let third_val = eval_coeff4_at(&third_coeff, z_obs);
                 let fourth_val = eval_coeff4_at(&fourth_coeff, z_obs);
                 g_auv[[u, v]] = third_val;
@@ -4291,18 +4288,12 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
-        let g_dir_u_fixed =
-            g_jet.directional_family(g_jet.first, dir_u, COEFF_SUPPORT_BHW);
-        let g_dir_v_fixed =
-            g_jet.directional_family(g_jet.first, dir_v, COEFF_SUPPORT_BHW);
-        let g_a_dir_u_fixed =
-            g_jet.directional_family(g_jet.a_first, dir_u, COEFF_SUPPORT_BW);
-        let g_a_dir_v_fixed =
-            g_jet.directional_family(g_jet.a_first, dir_v, COEFF_SUPPORT_BW);
-        let g_aa_dir_u_fixed =
-            g_jet.directional_family(g_jet.aa_first, dir_u, COEFF_SUPPORT_BW);
-        let g_aa_dir_v_fixed =
-            g_jet.directional_family(g_jet.aa_first, dir_v, COEFF_SUPPORT_BW);
+        let g_dir_u_fixed = g_jet.directional_family(g_jet.first, dir_u, COEFF_SUPPORT_BHW);
+        let g_dir_v_fixed = g_jet.directional_family(g_jet.first, dir_v, COEFF_SUPPORT_BHW);
+        let g_a_dir_u_fixed = g_jet.directional_family(g_jet.a_first, dir_u, COEFF_SUPPORT_BW);
+        let g_a_dir_v_fixed = g_jet.directional_family(g_jet.a_first, dir_v, COEFF_SUPPORT_BW);
+        let g_aa_dir_u_fixed = g_jet.directional_family(g_jet.aa_first, dir_u, COEFF_SUPPORT_BW);
+        let g_aa_dir_v_fixed = g_jet.directional_family(g_jet.aa_first, dir_v, COEFF_SUPPORT_BW);
         let g_dir_uv_fixed =
             g_jet.mixed_directional_from_b_family(g_jet.b_first, dir_u, dir_v, COEFF_SUPPORT_BHW);
         let g_a_dir_uv_fixed =
@@ -4333,44 +4324,18 @@ impl BernoulliMarginalSlopeFamily {
         let mut g_auv_v_fixed = Array2::<f64>::zeros((r, r));
 
         for u in 1..r {
-            let tmp_u = g_jet.param_directional_from_b_family(
-                g_jet.b_first,
-                u,
-                dir_u,
-                COEFF_SUPPORT_BHW,
-            );
-            let tmp_v = g_jet.param_directional_from_b_family(
-                g_jet.b_first,
-                u,
-                dir_v,
-                COEFF_SUPPORT_BHW,
-            );
-            let tmp_uv = g_jet.param_mixed_from_bb_family(
-                g_jet.bb_first,
-                u,
-                dir_u,
-                dir_v,
-                COEFF_SUPPORT_BW,
-            );
-            let tmp_au_u = g_jet.param_directional_from_b_family(
-                g_jet.ab_first,
-                u,
-                dir_u,
-                COEFF_SUPPORT_BW,
-            );
-            let tmp_au_v = g_jet.param_directional_from_b_family(
-                g_jet.ab_first,
-                u,
-                dir_v,
-                COEFF_SUPPORT_BW,
-            );
-            let tmp_au_uv = g_jet.param_mixed_from_bb_family(
-                g_jet.abb_first,
-                u,
-                dir_u,
-                dir_v,
-                COEFF_SUPPORT_W,
-            );
+            let tmp_u =
+                g_jet.param_directional_from_b_family(g_jet.b_first, u, dir_u, COEFF_SUPPORT_BHW);
+            let tmp_v =
+                g_jet.param_directional_from_b_family(g_jet.b_first, u, dir_v, COEFF_SUPPORT_BHW);
+            let tmp_uv =
+                g_jet.param_mixed_from_bb_family(g_jet.bb_first, u, dir_u, dir_v, COEFF_SUPPORT_BW);
+            let tmp_au_u =
+                g_jet.param_directional_from_b_family(g_jet.ab_first, u, dir_u, COEFF_SUPPORT_BW);
+            let tmp_au_v =
+                g_jet.param_directional_from_b_family(g_jet.ab_first, u, dir_v, COEFF_SUPPORT_BW);
+            let tmp_au_uv =
+                g_jet.param_mixed_from_bb_family(g_jet.abb_first, u, dir_u, dir_v, COEFF_SUPPORT_W);
             g_u_u_fixed[u] = eval_coeff4_at(&tmp_u, z_obs);
             g_u_v_fixed[u] = eval_coeff4_at(&tmp_v, z_obs);
             g_u_uv_fixed[u] = eval_coeff4_at(&tmp_uv, z_obs);
@@ -4563,8 +4528,7 @@ impl BernoulliMarginalSlopeFamily {
         let eta_dir_v = g_a * a_dir_v + g_dir_v;
         let eta_u_dir_u = eta_uv.dot(dir_u);
         let eta_u_dir_v = eta_uv.dot(dir_v);
-        let eta_dir_uv =
-            g_a_v * a_dir_u + g_a_u_fixed * a_dir_v + g_a * a_dir_uv + g_dir_uv;
+        let eta_dir_uv = g_a_v * a_dir_u + g_a_u_fixed * a_dir_v + g_a * a_dir_uv + g_dir_uv;
         let eta_u_uv = eta_uv_u.dot(dir_v);
 
         let y_i = self.y[row];
@@ -5865,10 +5829,8 @@ impl BernoulliMarginalSlopeFamily {
             let mut ll = 0.0;
             let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
             let mut grad_logslope = Array1::<f64>::zeros(slices.logslope.len());
-            let mut grad_h: Option<Array1<f64>> =
-                slices.h.as_ref().map(|r| Array1::zeros(r.len()));
-            let mut grad_w: Option<Array1<f64>> =
-                slices.w.as_ref().map(|r| Array1::zeros(r.len()));
+            let mut grad_h: Option<Array1<f64>> = slices.h.as_ref().map(|r| Array1::zeros(r.len()));
+            let mut grad_w: Option<Array1<f64>> = slices.w.as_ref().map(|r| Array1::zeros(r.len()));
             let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
             for row in 0..n {
                 let row_ctx = Self::row_ctx(&cache, row);
@@ -6254,9 +6216,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             }
         }
         if self.link_block_index().is_some_and(|idx| block_idx == idx) {
-            if let (Some(runtime), Some(beta_w)) =
-                (&self.link_dev, self.link_beta(block_states)?)
-            {
+            if let (Some(runtime), Some(beta_w)) = (&self.link_dev, self.link_beta(block_states)?) {
                 return runtime.max_feasible_monotone_step(beta_w, delta);
             }
         }
@@ -7198,7 +7158,10 @@ mod tests {
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
             dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(Array1::zeros(score_prepared.runtime.basis_dim()), seed.len()),
+            dummy_block_state(
+                Array1::zeros(score_prepared.runtime.basis_dim()),
+                seed.len(),
+            ),
             dummy_block_state(Array1::zeros(link_prepared.runtime.basis_dim()), seed.len()),
         ];
 

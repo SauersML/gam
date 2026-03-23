@@ -4204,7 +4204,6 @@ fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Ar
     Array1::from_iter((0..x.nrows()).map(|i| x.row(i).dot(&xc.row(i)).max(0.0).sqrt()))
 }
 
-
 #[derive(Clone)]
 struct SurvivalWiggleGeometry {
     basis: Array2<f64>,
@@ -4687,8 +4686,7 @@ impl SurvivalLocationScaleFamily {
             time_jac_exit
                 .slice_mut(s![.., time_wiggle_range.start..time_wiggle_range.end])
                 .assign(
-                    &wiggle_exit_full
-                        .slice(s![.., time_wiggle_range.start..time_wiggle_range.end]),
+                    &wiggle_exit_full.slice(s![.., time_wiggle_range.start..time_wiggle_range.end]),
                 );
             let wiggle_qdot = scale_dense_rows(&wig_exit.basis_d1, &d_base)?;
             let wiggle_qdot_full = embed_tail_columns(
@@ -4699,8 +4697,7 @@ impl SurvivalLocationScaleFamily {
             time_jac_deriv
                 .slice_mut(s![.., time_wiggle_range.start..time_wiggle_range.end])
                 .assign(
-                    &wiggle_qdot_full
-                        .slice(s![.., time_wiggle_range.start..time_wiggle_range.end]),
+                    &wiggle_qdot_full.slice(s![.., time_wiggle_range.start..time_wiggle_range.end]),
                 );
             time_wiggle_basis_d1_entry = Some(wig_entry.basis_d1.clone());
             time_wiggle_basis_d1_exit = Some(wig_exit.basis_d1.clone());
@@ -5108,17 +5105,24 @@ struct LowRankGaussianFactor {
 // Exact projected-Gaussian handling for possibly singular covariance blocks.
 // We integrate over the active standard-normal coordinates rather than adding
 // jitter or inverting the covariance directly.
-fn factorize_psd_covariance(covariance: &Array2<f64>, label: &str) -> Result<LowRankGaussianFactor, String> {
+fn factorize_psd_covariance(
+    covariance: &Array2<f64>,
+    label: &str,
+) -> Result<LowRankGaussianFactor, String> {
     let covariance = symmetrize_and_clip_covariance(covariance);
     let (eigenvalues, eigenvectors_full) = covariance
         .eigh(faer::Side::Lower)
         .map_err(|e| format!("{label} eigendecomposition failed: {e}"))?;
-    let max_abs_eigenvalue = eigenvalues.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let max_abs_eigenvalue = eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
     let tol = (max_abs_eigenvalue * 1e-12).max(1e-14);
     if eigenvalues.iter().any(|&ev| ev < -tol) {
         return Err(format!(
             "{label} is not positive semidefinite: minimum eigenvalue {:.3e}",
-            eigenvalues.iter().fold(f64::INFINITY, |acc, &ev| acc.min(ev))
+            eigenvalues
+                .iter()
+                .fold(f64::INFINITY, |acc, &ev| acc.min(ev))
         ));
     }
 
@@ -5147,11 +5151,7 @@ fn factorize_psd_covariance(covariance: &Array2<f64>, label: &str) -> Result<Low
     })
 }
 
-fn apply_low_rank_gaussian_factor3(
-    mu: [f64; 3],
-    factor: &Array2<f64>,
-    z: &[f64],
-) -> [f64; 3] {
+fn apply_low_rank_gaussian_factor3(mu: [f64; 3], factor: &Array2<f64>, z: &[f64]) -> [f64; 3] {
     let mut x = mu;
     for row in 0..3 {
         for (col, &latent) in z.iter().enumerate() {
@@ -5316,7 +5316,9 @@ fn exact_survival_response_moments_row(
         let mut regression = cov_wy.dot(&htl_factor.eigenvectors);
         for col in 0..regression.ncols() {
             let scale = htl_factor.inv_sqrt_eigenvalues[col];
-            regression.column_mut(col).mapv_inplace(|value| value * scale);
+            regression
+                .column_mut(col)
+                .mapv_inplace(|value| value * scale);
         }
         let cov_cond =
             symmetrize_and_clip_covariance(&(cov_ww - regression.dot(&regression.t().to_owned())));
@@ -5549,7 +5551,8 @@ impl SurvivalLocationScaleFamily {
             let h_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
                 + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
                 + &q.d1_qdot1 * &q.d2qdot_tt);
-            let h_entry = -(&q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v)));
+            let h_entry =
+                -(&q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v)));
             let h_deriv = -(&q.d2_qdot1 * &q.dqdot_td.mapv(|v| safe_product(v, v)));
             let h_exit_deriv =
                 -(&q.d2_qdot1 * &(&q.dqdot_t * &q.dqdot_td) + &q.d1_qdot1 * &q.d2qdot_ttd);
@@ -5576,7 +5579,8 @@ impl SurvivalLocationScaleFamily {
                 + &(&q.d1_q1 * &q.d2q_ls)
                 + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
                 + &(&q.d1_qdot1 * &q.d2qdot_ls));
-            let h_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v)) + &(&q.d1_q0 * d2q_ls_entry));
+            let h_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v))
+                + &(&q.d1_q0 * d2q_ls_entry));
             let h_deriv = -(&q.d2_qdot1 * &q.dqdot_lsd.mapv(|v| safe_product(v, v)));
             let h_exit_deriv =
                 -(&q.d2_qdot1 * &(&q.dqdot_ls * &q.dqdot_lsd) + &q.d1_qdot1 * &q.d2qdot_lslsd);
@@ -6202,8 +6206,10 @@ impl SurvivalLocationScaleFamily {
             &h_threshold_threshold,
         );
 
-        let h_ll_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v)) + &(&q.d1_q0 * d2q_ls_entry));
-        let h_ll_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v)) + &(&q.d1_q1 * &q.d2q_ls));
+        let h_ll_entry =
+            -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v)) + &(&q.d1_q0 * d2q_ls_entry));
+        let h_ll_exit =
+            -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v)) + &(&q.d1_q1 * &q.d2q_ls));
         let dh_ll_entry_i = -(&q.d3_q0 * &q0_i * &dq_ls_entry.mapv(|v| safe_product(v, v))
             + &(2.0 * &q.d2_q0 * dq_ls_entry * &dq_ls_entry_i)
             + &(&q.d2_q0 * &q0_i * d2q_ls_entry)
@@ -7650,8 +7656,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let dh_tt_exit = -(&q.d3_q1 * &q1_psi * &q.dq_t.mapv(|v| safe_product(v, v))
             + &(2.0 * &q.d2_q1 * &q.dq_t * &dq_t_exit_psi));
 
-        let h_ll_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v)) + &(&q.d1_q0 * d2q_ls_entry));
-        let h_ll_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v)) + &(&q.d1_q1 * &q.d2q_ls));
+        let h_ll_entry =
+            -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v)) + &(&q.d1_q0 * d2q_ls_entry));
+        let h_ll_exit =
+            -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v)) + &(&q.d1_q1 * &q.d2q_ls));
         let dh_ll_entry = -(&q.d3_q0 * &q0_psi * &dq_ls_entry.mapv(|v| safe_product(v, v))
             + &(2.0 * &q.d2_q0 * dq_ls_entry * &dq_ls_entry_psi)
             + &(&q.d2_q0 * &q0_psi * d2q_ls_entry)
@@ -11385,7 +11393,9 @@ mod tests {
         let mut regression = cov_wy.dot(&htl_factor.eigenvectors);
         for col in 0..regression.ncols() {
             let scale = htl_factor.inv_sqrt_eigenvalues[col];
-            regression.column_mut(col).mapv_inplace(|value| value * scale);
+            regression
+                .column_mut(col)
+                .mapv_inplace(|value| value * scale);
         }
         let cov_cond =
             symmetrize_and_clip_covariance(&(cov_ww - regression.dot(&regression.t().to_owned())));

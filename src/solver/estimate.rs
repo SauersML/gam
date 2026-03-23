@@ -2279,6 +2279,7 @@ where
                             weights: w_o.view(),
                             likelihood_family: opts.family,
                             inverse_link: hmc_inverse_link,
+                            gamma_shape: selected_pirls_res.likelihood.gamma_shape(),
                             mode: selected_pirls_res.beta_transformed.view(),
                             hessian: hessian_dense.view(),
                             penalty_roots: selected_pirls_res
@@ -2484,8 +2485,8 @@ where
 
     // Persist residual-based scale for Gaussian identity models.
     // Contract: residual standard deviation sigma, not variance.
-    let standard_deviation = match cfg.link_function() {
-        LinkFunction::Identity => {
+    let standard_deviation = match pirls_res.likelihood.family {
+        GlmLikelihoodFamily::GaussianIdentity => {
             let denom = if opts.compute_inference {
                 (n - mp).max(1.0)
             } else {
@@ -2493,12 +2494,14 @@ where
             };
             (weighted_rss / denom).sqrt()
         }
-        LinkFunction::Logit
-        | LinkFunction::Log
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::Sas
-        | LinkFunction::BetaLogistic => 1.0,
+        GlmLikelihoodFamily::GammaLog => pirls_res.likelihood.gamma_shape().unwrap_or(1.0),
+        GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::PoissonLog => 1.0,
     };
 
     // Compute gradient norm at final rho for reporting
@@ -2594,7 +2597,7 @@ where
     });
 
     let pirls_status = pirls_res.status;
-    let likelihood_spec = cfg.likelihood();
+    let likelihood_spec = pirls_res.likelihood;
     let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
         y_o.view(),
         &pirls_res.finalmu,
@@ -3239,7 +3242,8 @@ fn validate_likelihood_scale_estimation(
                 )))
             }
         }
-        LikelihoodScaleMetadata::FixedGammaShape { shape } => {
+        LikelihoodScaleMetadata::FixedGammaShape { shape }
+        | LikelihoodScaleMetadata::EstimatedGammaShape { shape } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.shape", shape)?;
             if shape > 0.0 {
                 Ok(())

@@ -231,9 +231,7 @@ pub fn row_kernel_gradient<const K: usize>(
 }
 
 /// Log-likelihood from cached row kernels: ℓ = -Σ_i nll_i.
-pub fn row_kernel_log_likelihood<const K: usize>(
-    cache: &RowKernelCache<K>,
-) -> f64 {
+pub fn row_kernel_log_likelihood<const K: usize>(cache: &RowKernelCache<K>) -> f64 {
     -cache.nll.iter().sum::<f64>()
 }
 

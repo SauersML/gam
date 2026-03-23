@@ -63,8 +63,7 @@ mod tests {
     #[test]
     fn deduplicates_knots_into_breakpoints() {
         assert_eq!(
-            breakpoints_from_knots(&[-2.0, -2.0, 0.0, 1.5, 1.5, 3.0], "test breakpoints")
-                .unwrap(),
+            breakpoints_from_knots(&[-2.0, -2.0, 0.0, 1.5, 1.5, 3.0], "test breakpoints").unwrap(),
             vec![-2.0, 0.0, 1.5, 3.0]
         );
     }

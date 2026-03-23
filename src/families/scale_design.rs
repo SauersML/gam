@@ -1,10 +1,10 @@
-use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, FaerArrayView};
+use crate::faer_ndarray::{FaerArrayView, default_rrqr_rank_alpha, fast_ab};
 use crate::matrix::DesignMatrix;
 use dyn_stack::{MemBuffer, MemStack};
-use faer::prelude::ReborrowMut;
 use faer::Unbind;
-use faer::{get_global_parallelism, Conj};
-use ndarray::{s, Array1, Array2};
+use faer::prelude::ReborrowMut;
+use faer::{Conj, get_global_parallelism};
+use ndarray::{Array1, Array2, s};
 use std::ops::Range;
 
 const COLUMN_TOL: f64 = 1e-12;
@@ -93,8 +93,7 @@ pub fn apply_scale_deviation_transform(
         let end = (start + chunk_rows).min(n);
         let primary_chunk = primary_design.slice(s![start..end, ..]).to_owned();
         let noise_chunk = rawnoise_design.slice(s![start..end, ..]).to_owned();
-        let chunk =
-            apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
+        let chunk = apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
         out.slice_mut(s![start..end, ..]).assign(&chunk);
     }
     Ok(out)
@@ -306,7 +305,10 @@ fn apply_projection_chunk(
     if first_active >= projection_coef.ncols() {
         Array2::<f64>::zeros((primary_chunk.nrows(), 0))
     } else {
-        fast_ab(primary_chunk, &projection_coef.slice(s![.., first_active..]).to_owned())
+        fast_ab(
+            primary_chunk,
+            &projection_coef.slice(s![.., first_active..]).to_owned(),
+        )
     }
 }
 
@@ -532,8 +534,7 @@ pub fn build_scale_deviation_operator(
         let end = (start + chunk_rows).min(n);
         let primary_chunk = primary_design.row_chunk(start..end);
         let noise_chunk = rawnoise_design.row_chunk(start..end);
-        let chunk =
-            apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
+        let chunk = apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
         out.slice_mut(s![start..end, ..]).assign(&chunk);
     }
     Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(

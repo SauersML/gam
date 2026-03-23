@@ -108,8 +108,7 @@ impl OuterCapability {
     }
 
     fn prefers_fd_hessian_newton(&self) -> bool {
-        self.gradient == Derivative::Analytic
-            && self.n_params <= SMALL_OUTER_FD_HESSIAN_MAX_PARAMS
+        self.gradient == Derivative::Analytic && self.n_params <= SMALL_OUTER_FD_HESSIAN_MAX_PARAMS
     }
 
     fn efs_plan_eligible(&self) -> bool {
@@ -240,18 +239,14 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // a quantitative check each step via `barrier_curvature_is_significant`
         // and bails out early if the barrier curvature becomes non-negligible
         // relative to the penalized Hessian diagonal.
-        (Analytic, Unavailable) if cap.efs_plan_eligible() => {
-            OuterPlan {
-                solver: S::Efs,
-                hessian_source: H::EfsFixedPoint,
-            }
-        }
-        (Unavailable, Unavailable) if cap.efs_plan_eligible() => {
-            OuterPlan {
-                solver: S::Efs,
-                hessian_source: H::EfsFixedPoint,
-            }
-        }
+        (Analytic, Unavailable) if cap.efs_plan_eligible() => OuterPlan {
+            solver: S::Efs,
+            hessian_source: H::EfsFixedPoint,
+        },
+        (Unavailable, Unavailable) if cap.efs_plan_eligible() => OuterPlan {
+            solver: S::Efs,
+            hessian_source: H::EfsFixedPoint,
+        },
 
         // Hybrid EFS: ψ (design-moving) coords present alongside ρ coords.
         //
@@ -265,18 +260,14 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         //
         // This stays O(1) H⁻¹ solves per iteration (vs O(dim(θ)) for BFGS)
         // and uses the same trace Gram matrix that EFS already computes.
-        (Analytic, Unavailable) if cap.hybrid_efs_plan_eligible() => {
-            OuterPlan {
-                solver: S::HybridEfs,
-                hessian_source: H::HybridEfsFixedPoint,
-            }
-        }
-        (Unavailable, Unavailable) if cap.hybrid_efs_plan_eligible() => {
-            OuterPlan {
-                solver: S::HybridEfs,
-                hessian_source: H::HybridEfsFixedPoint,
-            }
-        }
+        (Analytic, Unavailable) if cap.hybrid_efs_plan_eligible() => OuterPlan {
+            solver: S::HybridEfs,
+            hessian_source: H::HybridEfsFixedPoint,
+        },
+        (Unavailable, Unavailable) if cap.hybrid_efs_plan_eligible() => OuterPlan {
+            solver: S::HybridEfs,
+            hessian_source: H::HybridEfsFixedPoint,
+        },
 
         // Small analytic-gradient problems should still use a real second-order
         // method even when the Hessian must be approximated numerically.

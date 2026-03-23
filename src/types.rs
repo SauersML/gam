@@ -231,7 +231,7 @@ impl LikelihoodFamily {
     pub fn default_scale_metadata(self) -> LikelihoodScaleMetadata {
         match self {
             Self::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
-            Self::GammaLog => LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 },
+            Self::GammaLog => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
             Self::BinomialLogit
             | Self::BinomialProbit
             | Self::BinomialCLogLog
@@ -280,6 +280,8 @@ pub enum LikelihoodScaleMetadata {
     FixedDispersion { phi: f64 },
     /// Fixed Gamma shape `k`, equivalent to `phi = 1 / k`.
     FixedGammaShape { shape: f64 },
+    /// Gamma shape `k` estimated jointly with the mean model.
+    EstimatedGammaShape { shape: f64 },
     /// The engine does not expose fixed-scale semantics for this family.
     Unspecified,
 }
@@ -289,7 +291,9 @@ impl LikelihoodScaleMetadata {
     pub fn fixed_phi(self) -> Option<f64> {
         match self {
             Self::FixedDispersion { phi } => Some(phi),
-            Self::FixedGammaShape { shape } => Some(1.0 / shape),
+            Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => {
+                Some(1.0 / shape)
+            }
             Self::ProfiledGaussian | Self::Unspecified => None,
         }
     }
@@ -297,9 +301,14 @@ impl LikelihoodScaleMetadata {
     #[inline]
     pub fn gamma_shape(self) -> Option<f64> {
         match self {
-            Self::FixedGammaShape { shape } => Some(shape),
+            Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => Some(shape),
             _ => None,
         }
+    }
+
+    #[inline]
+    pub fn gamma_shape_is_estimated(self) -> bool {
+        matches!(self, Self::EstimatedGammaShape { .. })
     }
 }
 
@@ -324,7 +333,7 @@ impl GlmLikelihoodSpec {
         let scale = match family {
             GlmLikelihoodFamily::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
             GlmLikelihoodFamily::GammaLog => {
-                LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 }
+                LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 }
             }
             GlmLikelihoodFamily::BinomialLogit
             | GlmLikelihoodFamily::BinomialProbit
@@ -357,6 +366,23 @@ impl GlmLikelihoodSpec {
     #[inline]
     pub fn gamma_shape(self) -> Option<f64> {
         self.scale.gamma_shape()
+    }
+
+    #[inline]
+    pub fn with_gamma_shape(mut self, shape: f64) -> Self {
+        self.scale = match self.scale {
+            LikelihoodScaleMetadata::FixedGammaShape { .. } => {
+                LikelihoodScaleMetadata::FixedGammaShape { shape }
+            }
+            LikelihoodScaleMetadata::EstimatedGammaShape { .. } => {
+                LikelihoodScaleMetadata::EstimatedGammaShape { shape }
+            }
+            _ if self.family == GlmLikelihoodFamily::GammaLog => {
+                LikelihoodScaleMetadata::EstimatedGammaShape { shape }
+            }
+            other => other,
+        };
+        self
     }
 }
 

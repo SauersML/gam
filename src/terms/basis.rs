@@ -9530,22 +9530,9 @@ fn duchon_radial_jets(
     // Derive every non-phi radial scalar from the same off-origin phi jets so
     // the Duchon identities cannot drift across independently assembled paths.
     (
-        out.q,
-        out.q_r,
-        out.q_rr,
-        out.lap,
-        out.lap_r,
-        out.lap_rr,
-        out.t,
-        out.t_r,
-        out.t_rr,
+        out.q, out.q_r, out.q_rr, out.lap, out.lap_r, out.lap_rr, out.t, out.t_r, out.t_rr,
     ) = duchon_operator_jets_from_phi_derivatives(
-        out.phi_r,
-        out.phi_rr,
-        phi_rrr,
-        phi_rrrr,
-        r_eval,
-        d,
+        out.phi_r, out.phi_rr, phi_rrr, phi_rrrr, r_eval, d,
     );
 
     if r < r_floor {
@@ -9605,22 +9592,9 @@ fn duchon_radial_jets(
 
         if r > 0.0 {
             (
-                out.q,
-                out.q_r,
-                out.q_rr,
-                out.lap,
-                out.lap_r,
-                out.lap_rr,
-                out.t,
-                out.t_r,
-                out.t_rr,
+                out.q, out.q_r, out.q_rr, out.lap, out.lap_r, out.lap_rr, out.t, out.t_r, out.t_rr,
             ) = duchon_operator_jets_from_phi_derivatives(
-                out.phi_r,
-                out.phi_rr,
-                phi_rrr,
-                phi_rrrr,
-                r,
-                d,
+                out.phi_r, out.phi_rr, phi_rrr, phi_rrrr, r, d,
             );
         } else {
             out.q = phi_rr;
