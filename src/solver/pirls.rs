@@ -1666,9 +1666,9 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             //
             // The working response (z) and the coefficients β are in the transformed
             // basis when a reparameterization is used. The Jeffreys term is the
-            // identifiable-subspace Fisher pseudodeterminant
-            //   Φ(β) = 0.5 * log|X^T W X|_+,
-            // not a penalized logdet. Its PIRLS hat-diagonal adjustment must
+            // identifiable-subspace Fisher logdet evaluated on a canonical
+            // orthonormal basis of the transformed design column space,
+            // not a raw-coordinate logdet. Its PIRLS hat-diagonal adjustment must
             // therefore be computed from that same transformed-design Fisher
             // matrix, otherwise the inner objective and the outer LAML
             // derivatives disagree.
@@ -2867,10 +2867,120 @@ fn compress_activeworking_set(
         outrow += 1;
     }
 
+    // Phase 2: rank-revealing reduction via column-pivoted QR.
+    //
+    // After parallel-row deduplication, the rows may still be nearly linearly
+    // dependent.  Such near-dependence makes the KKT saddle-point system
+    // ill-conditioned.  We use pivoted QR on A^T to determine the numerical
+    // row rank and keep only the independent rows.  Dropped rows have their
+    // group positions merged into the most-aligned kept row so that the
+    // active-set QP can still release the underlying original constraints.
+    let (a_out, b_out, groups_out) = rank_reduce_rows_pivoted_qr(a_out, b_out, groups_out);
+
     Ok(CompressedActiveWorkingSet {
         constraints: LinearInequalityConstraints { a: a_out, b: b_out },
         groups: groups_out,
     })
+}
+
+/// Reduce a constraint matrix to full row rank using column-pivoted QR on A^T.
+///
+/// Given k constraint rows in R^p, computes the numerical row rank r via
+/// pivoted QR of A^T (p × k) with a tolerance scaled to `eps · max(k, p) ·
+/// |R₀₀|`, and retains only the r pivot rows.  Dropped rows have their
+/// group membership merged into the most-aligned kept row so that the
+/// active-set QP can still release the underlying original constraints via
+/// multiplier signs.
+///
+/// This is a shared numerical primitive used by both the PIRLS and
+/// custom-family active-set solvers.
+pub(crate) fn rank_reduce_rows_pivoted_qr(
+    a: Array2<f64>,
+    b: Array1<f64>,
+    groups: Vec<Vec<usize>>,
+) -> (Array2<f64>, Array1<f64>, Vec<Vec<usize>>) {
+    let k = a.nrows();
+    let p = a.ncols();
+    if k <= 1 {
+        return (a, b, groups);
+    }
+
+    // Build faer view of A^T (p × k) for column-pivoted QR.
+    // Column j of A^T = row j of A, so pivoting on columns selects
+    // the most independent *rows* of A.
+    let mut at_faer = faer::Mat::<f64>::zeros(p, k);
+    for i in 0..k {
+        for j in 0..p {
+            at_faer[(j, i)] = a[[i, j]];
+        }
+    }
+
+    let qr = at_faer.as_ref().col_piv_qr();
+    let r_mat = qr.thin_R();
+    let diag_len = r_mat.nrows().min(r_mat.ncols());
+    let leading_diag = if diag_len > 0 {
+        r_mat[(0, 0)].abs()
+    } else {
+        0.0
+    };
+
+    // Rank tolerance consistent with the project's rrqr_nullspace_basis:
+    //   tol = ALPHA · eps · max(k, p) · max(|R₀₀|, 1).
+    const RANK_ALPHA: f64 = 100.0;
+    let tol = RANK_ALPHA * f64::EPSILON * (k.max(p).max(1) as f64) * leading_diag.max(1.0);
+
+    let rank = (0..diag_len).filter(|&i| r_mat[(i, i)].abs() > tol).count();
+    if rank >= k {
+        // Already full row rank — nothing to drop.
+        return (a, b, groups);
+    }
+
+    // The column pivot permutation P maps: column j of A^T·P → column P_fwd[j]
+    // of A^T = row P_fwd[j] of A.  The first `rank` pivoted columns are the
+    // independent rows.
+    let (perm_fwd, _) = qr.P().arrays();
+    let kept_orig: Vec<usize> = (0..rank).map(|j| perm_fwd[j].unbound()).collect();
+    let dropped_orig: Vec<usize> = (rank..k).map(|j| perm_fwd[j].unbound()).collect();
+
+    // Build lookup: original row index → output row index.
+    let mut orig_to_out = std::collections::HashMap::with_capacity(rank);
+    let mut a_out = Array2::<f64>::zeros((rank, p));
+    let mut b_out = Array1::<f64>::zeros(rank);
+    let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(rank);
+    for (out_idx, &orig_idx) in kept_orig.iter().enumerate() {
+        a_out.row_mut(out_idx).assign(&a.row(orig_idx));
+        b_out[out_idx] = b[orig_idx];
+        groups_out.push(groups[orig_idx].clone());
+        orig_to_out.insert(orig_idx, out_idx);
+    }
+
+    // Merge each dropped row's group into the most-aligned kept row.
+    for &dropped_idx in &dropped_orig {
+        let mut best_align = -1.0_f64;
+        let mut best_target = kept_orig[0];
+        for &ki in &kept_orig {
+            let dot = a.row(ki).dot(&a.row(dropped_idx)).abs();
+            if dot > best_align {
+                best_align = dot;
+                best_target = ki;
+            }
+        }
+        let &out_idx = orig_to_out
+            .get(&best_target)
+            .expect("merge target must be a kept row");
+        groups_out[out_idx].extend_from_slice(&groups[dropped_idx]);
+    }
+
+    if rank < k {
+        log::debug!(
+            "rank-reduced active constraints from {} to {} rows (rank deficiency {})",
+            k,
+            rank,
+            k - rank
+        );
+    }
+
+    (a_out, b_out, groups_out)
 }
 
 fn working_set_kkt_diagnostics_frommultipliers(
@@ -3397,7 +3507,8 @@ where
         let mut value = state.deviance + state.penalty_term;
         if options.firth_bias_reduction {
             if let Some(jeffreys_logdet) = state.jeffreys_logdet() {
-                // Jeffreys/Firth adds +0.5 log|XᵀWX|_+ to the log-likelihood,
+                // Jeffreys/Firth adds the identifiable-subspace Jeffreys term
+                // Φ to the log-likelihood,
                 // so the PIRLS deviance is reduced by 2 * Φ.
                 value -= 2.0 * jeffreys_logdet;
             }
@@ -5519,19 +5630,10 @@ fn bernoulli_logit_geometry_from_jet(
     y: f64,
     priorweight: f64,
     jet: crate::mixture_link::LogitJet5,
-    applyweight_floor: bool,
     zero_on_nonsmooth: bool,
 ) -> WorkingBernoulliGeometry {
-    const MIN_WEIGHT: f64 = 1e-12;
-    const MIN_D_FOR_Z: f64 = 1e-6;
-
     let fisher = jet.d1;
-    let fisher_effective = if applyweight_floor {
-        fisher.max(MIN_WEIGHT)
-    } else {
-        fisher
-    };
-    let nonsmooth = eta_raw != eta_used || fisher <= MIN_WEIGHT;
+    let nonsmooth = eta_raw != eta_used || !fisher.is_finite() || fisher < 0.0;
     let (c, d) = if nonsmooth && zero_on_nonsmooth {
         (0.0, 0.0)
     } else {
@@ -5539,8 +5641,8 @@ fn bernoulli_logit_geometry_from_jet(
     };
     WorkingBernoulliGeometry {
         mu: jet.mu,
-        weight: priorweight * fisher_effective,
-        z: eta_used + (y - jet.mu) / jet.d1.max(MIN_D_FOR_Z),
+        weight: priorweight * fisher,
+        z: bernoulli_working_response(eta_used, y, jet.mu, jet.d1),
         c,
         d,
     }
@@ -5568,23 +5670,15 @@ fn bernoulli_geometry_from_jet(
     y: f64,
     priorweight: f64,
     jet: MixtureInverseLinkJet,
-    applyweight_floor: bool,
     zero_on_nonsmooth: bool,
 ) -> WorkingBernoulliGeometry {
-    const MIN_WEIGHT: f64 = 1e-12;
-    const MIN_D_FOR_Z: f64 = 1e-6;
     const PROB_EPS: f64 = 1e-8;
 
     let mu = jet.mu;
     let v = (mu * (1.0 - mu)).max(PROB_EPS);
     let n0 = jet.d1 * jet.d1;
     let fisher = n0 / v;
-    let fisher_effective = if applyweight_floor {
-        fisher.max(MIN_WEIGHT)
-    } else {
-        fisher
-    };
-    let nonsmooth = eta_raw != eta_used || fisher <= MIN_WEIGHT;
+    let nonsmooth = eta_raw != eta_used || !fisher.is_finite() || fisher < 0.0;
     let (c, d) = if nonsmooth && zero_on_nonsmooth {
         (0.0, 0.0)
     } else {
@@ -5599,11 +5693,22 @@ fn bernoulli_geometry_from_jet(
     };
     WorkingBernoulliGeometry {
         mu,
-        weight: priorweight * fisher_effective,
-        z: eta_used + (y - mu) / jet.d1.max(MIN_D_FOR_Z),
+        weight: priorweight * fisher,
+        z: bernoulli_working_response(eta_used, y, mu, jet.d1),
         c,
         d,
     }
+}
+
+#[inline]
+fn bernoulli_working_response(eta: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
+    if dmu_deta.is_finite() && dmu_deta > 0.0 {
+        let delta = (y - mu) / dmu_deta;
+        if delta.is_finite() {
+            return eta + delta;
+        }
+    }
+    eta
 }
 
 #[inline]
@@ -5735,7 +5840,6 @@ pub fn update_glmvectors(
                 y[i],
                 priorweights[i],
                 jet,
-                true,
                 logit_clampzero_enabled(),
             );
             mu[i] = geom.mu;
@@ -5780,7 +5884,6 @@ pub fn update_glmvectors(
                         y[i],
                         priorweights[i],
                         logit_inverse_link_jet5(eta_used),
-                        true,
                         zero_on_nonsmooth,
                     )
                 } else {
@@ -5790,7 +5893,6 @@ pub fn update_glmvectors(
                         y[i],
                         priorweights[i],
                         jet,
-                        true,
                         zero_on_nonsmooth,
                     )
                 };
@@ -5993,7 +6095,6 @@ pub fn update_glmvectors_integrated_for_link(
             y[i],
             priorweights[i],
             local_jet,
-            false,
             zero_on_nonsmooth,
         );
         mu[i] = geom.mu;
@@ -6162,7 +6263,6 @@ fn computeworkingweight_derivatives_from_eta(
                     jet.mu,
                     priorweights[i],
                     jet,
-                    true,
                     zero_on_nonsmooth,
                 );
                 c[i] = geom.c;
@@ -7750,6 +7850,21 @@ mod tests {
             eta[0],
             mu[0],
             jet.mu
+        );
+        let expected_z = eta[0] + (y[0] - jet.mu) / jet.d1;
+        assert!(
+            (z[0] - expected_z).abs() < 1e-12,
+            "pure logit PIRLS z should preserve the exact working response at eta={}; got {} vs {}",
+            eta[0],
+            z[0],
+            expected_z
+        );
+        assert!(
+            (weights[0] * (z[0] - eta[0]) - (y[0] - jet.mu)).abs() < 1e-30,
+            "pure logit PIRLS score carrier should preserve y-mu at eta={}; got {} vs {}",
+            eta[0],
+            weights[0] * (z[0] - eta[0]),
+            y[0] - jet.mu
         );
     }
 

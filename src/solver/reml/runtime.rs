@@ -1560,10 +1560,11 @@ impl<'a> RemlState<'a> {
                 // This keeps B_k/B_{kl} solves on the same objective surface as
                 // the Firth-augmented stationarity system.
                 //
-                // Conceptually Φ is the pseudodeterminant term 0.5 log|XᵀWX|_+.
-                // The hphi block below is therefore the curvature of that
-                // identifiable-subspace Jeffreys penalty, represented in the
-                // current transformed basis.
+                // Conceptually Φ is the identifiable-subspace Jeffreys term
+                // obtained by evaluating W on a canonical orthonormal basis of
+                // the transformed design column space. The hphi block below is
+                // therefore the curvature of that basis-invariant penalty,
+                // represented in the current transformed basis.
                 let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
                 let diag_term = Self::xt_diag_x_dense_into(
                     &firth_op.x_dense,

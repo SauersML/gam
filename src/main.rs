@@ -471,7 +471,7 @@ enum PredictModeArg {
     Map,
 }
 
-const MODEL_VERSION: u32 = 2;
+const MODEL_VERSION: u32 = 3;
 
 struct CliFirthValidation<'a> {
     enabled: bool,
@@ -2240,14 +2240,13 @@ fn effective_predict_offset_columns<'a>(
     )
 }
 
-fn require_saved_survival_likelihood_mode(model: &SavedModel) -> Result<SurvivalLikelihoodMode, String> {
-    let raw = model
-        .survival_likelihood
-        .as_deref()
-        .ok_or_else(|| {
-            "saved survival model is missing survival_likelihood metadata; refit with current CLI"
-                .to_string()
-        })?;
+fn require_saved_survival_likelihood_mode(
+    model: &SavedModel,
+) -> Result<SurvivalLikelihoodMode, String> {
+    let raw = model.survival_likelihood.as_deref().ok_or_else(|| {
+        "saved survival model is missing survival_likelihood metadata; refit with current CLI"
+            .to_string()
+    })?;
     parse_survival_likelihood_mode(raw)
 }
 
@@ -7595,11 +7594,19 @@ fn build_location_scale_saved_model(
 
 fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
     SavedAnchoredDeviationRuntime {
+        schema_version:
+            gam::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
         kernel: "ExactDenestedCubic".to_string(),
         knots: runtime.knots.to_vec(),
         degree: runtime.degree,
         value_span_degree: runtime.value_span_degree,
         basis_dim: runtime.basis_dim,
+        basis_transform: runtime
+            .basis_transform
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
     }
 }
 
@@ -7785,8 +7792,8 @@ fn solve_saved_survival_intercept(
     link_runtime: Option<&SavedAnchoredDeviationRuntime>,
     link_beta: Option<&Array1<f64>>,
 ) -> Result<f64, String> {
-    let eval = |a: f64| -> Result<(f64, f64), String> {
-        evaluate_saved_survival_calibration(
+    let eval = |a: f64| -> Result<(f64, f64, f64), String> {
+        let (f, f_a) = evaluate_saved_survival_calibration(
             a,
             q,
             slope,
@@ -7795,89 +7802,19 @@ fn solve_saved_survival_intercept(
             score_beta,
             link_runtime,
             link_beta,
-        )
+        )?;
+        Ok((f, f_a, 0.0))
     };
-    let mut a = q * (1.0 + slope * slope).sqrt();
-    let (f_init, _) = eval(a)?;
-    if f_init == 0.0 {
-        return Ok(a);
-    }
-
-    let mut step = (0.25 * (1.0 + a.abs())).max(1.0);
-    let (mut lo, mut hi) = if f_init < 0.0 {
-        let lo = a;
-        loop {
-            let hi = a + step;
-            let (f_candidate, _) = eval(hi)?;
-            if f_candidate >= 0.0 {
-                break (lo, hi);
-            }
-            a = hi;
-            step *= 2.0;
-            if step > 1e6 {
-                return Err(
-                    "saved survival marginal-slope intercept solve failed to bracket root above"
-                        .to_string(),
-                );
-            }
-        }
-    } else {
-        let hi = a;
-        loop {
-            let lo = a - step;
-            let (f_candidate, _) = eval(lo)?;
-            if f_candidate <= 0.0 {
-                break (lo, hi);
-            }
-            a = lo;
-            step *= 2.0;
-            if step > 1e6 {
-                return Err(
-                    "saved survival marginal-slope intercept solve failed to bracket root below"
-                        .to_string(),
-                );
-            }
-        }
-    };
-
-    let mut best_a = a;
-    let mut best_f = f_init.abs();
-    for _ in 0..64 {
-        let mid = 0.5 * (lo + hi);
-        let (f_mid, f_a_mid) = eval(mid)?;
-        if f_mid.abs() < best_f {
-            best_f = f_mid.abs();
-            best_a = mid;
-        }
-        if f_mid.abs() <= 1e-12 {
-            return Ok(mid);
-        }
-        let newton = if f_a_mid.is_finite() && f_a_mid.abs() > 1e-12 {
-            let candidate = mid - f_mid / f_a_mid;
-            if candidate > lo && candidate < hi {
-                Some(candidate)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let probe = newton.unwrap_or(mid);
-        let (f_probe, _) = eval(probe)?;
-        if f_probe.abs() < best_f {
-            best_f = f_probe.abs();
-            best_a = probe;
-        }
-        if f_probe <= 0.0 {
-            lo = probe;
-        } else {
-            hi = probe;
-        }
-        if (hi - lo).abs() <= 1e-12 * (1.0 + hi.abs() + lo.abs()) {
-            break;
-        }
-    }
-    Ok(best_a)
+    let a_init = q * (1.0 + slope * slope).sqrt();
+    let (root, _) = crate::families::monotone_root::solve_monotone_root(
+        eval,
+        a_init,
+        "saved survival intercept",
+        1e-12,
+        64,
+        64,
+    )?;
+    Ok(root)
 }
 
 fn saved_survival_observed_eta(
@@ -8987,6 +8924,9 @@ fn resolve_binomial_inverse_link_for_fit(
                 .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
             Ok(InverseLink::BetaLogistic(state))
         }
+        LikelihoodFamily::BinomialLatentCLogLog => Err(format!(
+            "{context} does not construct latent-cloglog links directly; use the latent-cloglog family path with explicit frailty"
+        )),
         LikelihoodFamily::BinomialLogit
         | LikelihoodFamily::BinomialProbit
         | LikelihoodFamily::BinomialCLogLog => Ok(InverseLink::Standard(effective_link)),
@@ -9201,9 +9141,7 @@ fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<Invers
         .link
         .as_deref()
         .or(model.survival_distribution.as_deref())
-        .ok_or_else(|| {
-            "saved survival model is missing link/distribution metadata".to_string()
-        })?;
+        .ok_or_else(|| "saved survival model is missing link/distribution metadata".to_string())?;
     let name = raw.trim().to_ascii_lowercase();
     if name == "loglog" || name == "cauchit" {
         let component = if name == "loglog" {
@@ -12247,10 +12185,18 @@ mod tests {
             "survival",
         );
         payload.score_warp_runtime = Some(SavedAnchoredDeviationRuntime {
+            schema_version:
+                gam::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
             kernel: "BadKernel".to_string(),
             knots: vec![-1.0, -1.0, 1.0, 1.0],
             degree: 3,
+            value_span_degree: 3,
             basis_dim: 2,
+            basis_transform: Array2::<f64>::eye(2)
+                .rows()
+                .into_iter()
+                .map(|row| row.to_vec())
+                .collect(),
         });
         let model = SavedModel::from_payload(payload);
 
@@ -12274,10 +12220,18 @@ mod tests {
         .expect("score-warp basis")
         .ncols();
         let saved_runtime = SavedAnchoredDeviationRuntime {
+            schema_version:
+                gam::families::bernoulli_marginal_slope::ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION,
             kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
             knots,
             degree,
+            value_span_degree: 3,
             basis_dim,
+            basis_transform: Array2::<f64>::eye(basis_dim)
+                .rows()
+                .into_iter()
+                .map(|row| row.to_vec())
+                .collect(),
         };
         let zero_beta = Array1::zeros(basis_dim);
 

@@ -222,7 +222,7 @@ fn ensure_joint_wiggle_supported(link: &InverseLink, context: &str) -> Result<()
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
         | InverseLink::Mixture(_) => Err(format!(
-            "{context} does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+            "{context} does not support latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted standard links"
         )),
         InverseLink::Standard(_) => Ok(()),
     }

@@ -1,7 +1,9 @@
-use crate::faer_ndarray::{FaerArrayView, fast_av};
+use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, FaerArrayView};
 use crate::matrix::{BlockDesignOperator, DesignBlock, DesignMatrix, ReparamDesignOperator};
-use faer::prelude::SolveLstsq;
-use ndarray::{Array1, Array2, ArrayView1, s};
+use dyn_stack::{MemBuffer, MemStack};
+use faer::prelude::ReborrowMut;
+use faer::{get_global_parallelism, Conj};
+use ndarray::{s, Array1, Array2, ArrayView1};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -114,13 +116,19 @@ pub fn apply_scale_deviation_transform(
     {
         return Err("scale deviation apply column mismatch".to_string());
     }
-    let mut out = rawnoise_design.clone();
-    for j in transform.non_intercept_start.min(out.ncols())..out.ncols() {
-        let projected = fast_av(primary_design, &transform.projection_coef.column(j));
-        for i in 0..out.nrows() {
-            out[[i, j]] = (out[[i, j]] - projected[i] - transform.weighted_column_mean[j])
-                * transform.rescale[j];
-        }
+    let n = rawnoise_design.nrows();
+    let p_primary = primary_design.ncols();
+    let p_noise = rawnoise_design.ncols();
+    let reparam = scale_deviation_reparam_matrix(transform);
+    let chunk_rows = scale_design_row_chunk_size(n, p_primary + p_noise + 1);
+    let mut out = Array2::<f64>::zeros((n, p_noise));
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let primary_chunk = primary_design.slice(s![start..end, ..]).to_owned();
+        let noise_chunk = rawnoise_design.slice(s![start..end, ..]).to_owned();
+        let chunk =
+            apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, reparam.as_ref());
+        out.slice_mut(s![start..end, ..]).assign(&chunk);
     }
     Ok(out)
 }
@@ -216,6 +224,10 @@ fn build_weighted_primary_design(
     wx
 }
 
+fn rrqr_rank_tolerance(leading_diag: f64, major_dim: usize) -> f64 {
+    default_rrqr_rank_alpha() * f64::EPSILON * (major_dim.max(1) as f64) * leading_diag.max(1.0)
+}
+
 fn solve_scale_projection(
     primary_design: ScaleDesignMatrixRef<'_>,
     noise_design: ScaleDesignMatrixRef<'_>,
@@ -237,14 +249,20 @@ fn solve_scale_projection(
     let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows);
     let wx_faer = FaerArrayView::new(&wx);
     let qr = wx_faer.as_ref().col_piv_qr();
+    let r = qr.thin_R();
+    let diag_len = r.nrows().min(r.ncols());
+    let leading_diag = if diag_len > 0 { r[(0, 0)].abs() } else { 0.0 };
+    let tol = rrqr_rank_tolerance(leading_diag, n.max(p_primary));
+    let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
+    let (perm_fwd, _) = qr.P().arrays();
+    let perm_fwd: Vec<usize> = perm_fwd.iter().map(|idx| idx.unbound()).collect();
     let chunk_cols = (SCALE_DESIGN_TARGET_CHUNK_BYTES / (n.max(1) * std::mem::size_of::<f64>()))
         .max(1)
         .min(active_cols);
-    let mut rhs = Array2::<f64>::zeros((n, chunk_cols));
 
     for chunk_start in (0..active_cols).step_by(chunk_cols) {
         let width = (active_cols - chunk_start).min(chunk_cols);
-        rhs.fill(0.0);
+        let mut rhs = Array2::<f64>::zeros((n, width));
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
             let noise_chunk = noise_design.row_chunk(start..end);
@@ -258,13 +276,38 @@ fn solve_scale_projection(
         }
 
         let mut rhs_mat = crate::faer_ndarray::array2_to_matmut(&mut rhs);
-        qr.solve_lstsq_in_place(rhs_mat.as_mut());
-        projection_coef
-            .slice_mut(s![
-                ..,
-                first_active + chunk_start..first_active + chunk_start + width
-            ])
-            .assign(&rhs.slice(s![..p_primary, ..width]));
+        faer::linalg::householder::apply_block_householder_sequence_on_the_left_in_place_with_conj(
+            qr.Q_basis(),
+            qr.Q_coeff(),
+            Conj::Yes,
+            rhs_mat.as_mut(),
+            get_global_parallelism(),
+            MemStack::new(&mut MemBuffer::new(
+                faer::linalg::householder::apply_block_householder_sequence_on_the_left_in_place_scratch::<f64>(
+                    n,
+                    qr.Q_coeff().nrows(),
+                    width,
+                ),
+            )),
+        );
+
+        let mut pivoted_solution = Array2::<f64>::zeros((p_primary, width));
+        for col in 0..width {
+            for i in (0..rank).rev() {
+                let mut accum = rhs[[i, col]];
+                for k in (i + 1)..rank {
+                    accum -= r[(i, k)] * pivoted_solution[[k, col]];
+                }
+                pivoted_solution[[i, col]] = accum / r[(i, i)];
+            }
+        }
+        for pivoted_col in 0..rank {
+            let orig_col = perm_fwd[pivoted_col];
+            for rhs_col in 0..width {
+                projection_coef[[orig_col, first_active + chunk_start + rhs_col]] =
+                    pivoted_solution[[pivoted_col, rhs_col]];
+            }
+        }
     }
 
     Ok(projection_coef)
@@ -425,6 +468,23 @@ fn design_block_from_matrix(design: DesignMatrix) -> DesignBlock {
         DesignMatrix::Dense(matrix) => DesignBlock::Dense(matrix),
         other => DesignBlock::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(other))),
     }
+}
+
+fn apply_scale_deviation_reparam_chunk(
+    primary_chunk: &Array2<f64>,
+    noise_chunk: &Array2<f64>,
+    reparam: &Array2<f64>,
+) -> Array2<f64> {
+    let rows = noise_chunk.nrows();
+    let p_noise = noise_chunk.ncols();
+    let p_primary = primary_chunk.ncols();
+    let mut augmented = Array2::<f64>::zeros((rows, p_noise + p_primary + 1));
+    augmented.slice_mut(s![.., ..p_noise]).assign(noise_chunk);
+    augmented
+        .slice_mut(s![.., p_noise..p_noise + p_primary])
+        .assign(primary_chunk);
+    augmented.column_mut(p_noise + p_primary).fill(1.0);
+    fast_ab(&augmented, reparam)
 }
 
 fn scale_deviation_reparam_matrix(transform: &ScaleDeviationTransform) -> Arc<Array2<f64>> {

@@ -4158,7 +4158,7 @@ fn compress_active_constraint_set(
         out_row += 1;
     }
 
-    // Phase 2: rank-revealing reduction via incremental modified Gram-Schmidt.
+    // Phase 2: rank-revealing reduction via column-pivoted QR.
     //
     // After parallel-row deduplication, the rows may still be nearly linearly
     // dependent (e.g. consecutive B-spline difference rows in dense-data
@@ -4166,12 +4166,10 @@ fn compress_active_constraint_set(
     // ill-conditioned, causing the direct LBLt factorization to fail and the
     // SVD pseudoinverse fallback to produce inaccurate directions.
     //
-    // We incrementally build an orthonormal basis of the row space and keep
-    // only those rows that contribute a new independent direction. Dropped
-    // rows have their member constraint ids merged into the most-aligned kept
-    // row so that the active-set QP can still release the underlying original
-    // constraints via multiplier signs.
-    let (a, b, member_constraint_ids) = rank_reduce_constraint_rows(a, b, member_constraint_ids);
+    // Uses the shared pivoted-QR rank compressor that is also used by the
+    // PIRLS active-set solver.
+    let (a, b, member_constraint_ids) =
+        crate::pirls::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
 
     for (row_idx, group_constraint_ids) in member_constraint_ids.iter().enumerate() {
         if group_constraint_ids.is_empty() {
@@ -4187,117 +4185,55 @@ fn compress_active_constraint_set(
     })
 }
 
-/// Reduce the constraint matrix to full row rank by dropping rows that are
-/// nearly in the span of earlier rows.  Uses incremental modified
-/// Gram-Schmidt for rank detection, which is O(k · p · r) where k is the
-/// input row count, p the column count, and r the numerical rank.
-///
-/// For each dropped row its member constraint ids are merged into the kept row
-/// with the largest absolute dot product, preserving the active-set QP's
-/// ability to release the original constraints represented by that row.
-fn rank_reduce_constraint_rows(
-    a: Array2<f64>,
-    b: Array1<f64>,
-    member_constraint_ids: Vec<Vec<usize>>,
-) -> (Array2<f64>, Array1<f64>, Vec<Vec<usize>>) {
-    let k = a.nrows();
-    let p = a.ncols();
-    if k <= 1 {
-        return (a, b, member_constraint_ids);
+/// Prune the active set to contain only one representative constraint per
+/// numerically independent row.  This prevents returning near-collinear
+/// active constraints that would make downstream KKT systems ill-conditioned.
+fn prune_active_to_independent(
+    active: &mut Vec<usize>,
+    is_active: &mut [bool],
+    constraints: &LinearInequalityConstraints,
+    x: &Array1<f64>,
+    _tol_active: f64,
+) {
+    if active.len() <= 1 {
+        return;
     }
-
-    // Row norms for tolerance scaling.
-    let row_norms: Vec<f64> = (0..k).map(|i| a.row(i).dot(&a.row(i)).sqrt()).collect();
-    let max_norm = row_norms.iter().fold(0.0_f64, |acc, &v| acc.max(v));
-    // Rank tolerance: rows whose orthogonal residual (relative to the
-    // accepted basis) falls below this are considered dependent.  The
-    // eps^{2/3} · max_norm heuristic is standard for numerical rank
-    // determination; the absolute floor prevents false drops when all
-    // rows are tiny.
-    let rank_tol = (1e-10 * max_norm).max(1e-14);
-
-    // Incremental modified Gram-Schmidt.
-    let mut q_basis: Vec<Array1<f64>> = Vec::with_capacity(k.min(p));
-    let mut kept: Vec<usize> = Vec::with_capacity(k.min(p));
-    // For each dropped row, record which kept row it should merge into.
-    let mut merge_target: Vec<Option<usize>> = vec![None; k];
-
-    for i in 0..k {
-        if row_norms[i] <= rank_tol {
-            // Near-zero row — merge into first kept row if one exists.
-            if let Some(&first) = kept.first() {
-                merge_target[i] = Some(first);
+    if let Ok(compressed) = compress_active_constraint_set(constraints, active) {
+        if compressed.member_constraint_ids.len() < active.len() {
+            // Rank reduction merged some groups.  Keep the tightest-slack
+            // representative from each independent group.
+            for &id in active.iter() {
+                is_active[id] = false;
             }
-            continue;
-        }
-
-        // Orthogonalize against the current basis (modified Gram-Schmidt).
-        let mut residual = a.row(i).to_owned();
-        for q in &q_basis {
-            let coeff = residual.dot(q);
-            residual.scaled_add(-coeff, q);
-        }
-
-        let residual_norm = residual.dot(&residual).sqrt();
-        if residual_norm > rank_tol {
-            // Linearly independent — accept this row.
-            residual.mapv_inplace(|v| v / residual_norm);
-            q_basis.push(residual);
-            kept.push(i);
-        } else {
-            // Linearly dependent — find the kept row most aligned with
-            // this one (largest |dot product|) and merge into its group.
-            let mut best_align = 0.0_f64;
-            let mut best_target = kept[0];
-            for &ki in &kept {
-                let dot = a.row(ki).dot(&a.row(i)).abs();
-                if dot > best_align {
-                    best_align = dot;
-                    best_target = ki;
-                }
+            active.clear();
+            for group in &compressed.member_constraint_ids {
+                // Pick the member with the smallest slack (most tightly
+                // active), breaking ties by constraint index for determinism.
+                let best = group
+                    .iter()
+                    .copied()
+                    .min_by(|&a_id, &b_id| {
+                        let sa = constraints.a.row(a_id).dot(x) - constraints.b[a_id];
+                        let sb = constraints.a.row(b_id).dot(x) - constraints.b[b_id];
+                        sa.partial_cmp(&sb)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a_id.cmp(&b_id))
+                    })
+                    .unwrap_or(group[0]);
+                active.push(best);
+                is_active[best] = true;
             }
-            merge_target[i] = Some(best_target);
+            // Also add back any constraints that are genuinely active
+            // (slack ≤ tol) but were dropped as near-dependent.  This
+            // keeps the solution correct when re-entering the solver
+            // later with the returned active set as a warm-start hint.
+            //
+            // (We intentionally do NOT add them — the warm-start will
+            // re-detect them via the slack check.  Keeping only the
+            // independent representatives is the whole point of this
+            // pruning.)
         }
     }
-
-    // If nothing was dropped the matrix is already full rank.
-    if kept.len() == k {
-        return (a, b, member_constraint_ids);
-    }
-
-    // Build the reduced output.
-    let r = kept.len();
-    let mut a_out = Array2::<f64>::zeros((r, p));
-    let mut b_out = Array1::<f64>::zeros(r);
-    let mut member_constraint_ids_out: Vec<Vec<usize>> = Vec::with_capacity(r);
-    let mut orig_to_out = std::collections::HashMap::with_capacity(r);
-    for (out_idx, &orig_idx) in kept.iter().enumerate() {
-        a_out.row_mut(out_idx).assign(&a.row(orig_idx));
-        b_out[out_idx] = b[orig_idx];
-        member_constraint_ids_out.push(member_constraint_ids[orig_idx].clone());
-        orig_to_out.insert(orig_idx, out_idx);
-    }
-
-    // Merge dropped member-constraint ids into their targets.
-    for i in 0..k {
-        if let Some(target_orig) = merge_target[i] {
-            let &out_idx = orig_to_out
-                .get(&target_orig)
-                .expect("merge target must be a kept row");
-            member_constraint_ids_out[out_idx].extend_from_slice(&member_constraint_ids[i]);
-        }
-    }
-
-    if kept.len() < k {
-        log::debug!(
-            "rank-reduced active constraints from {} to {} rows (rank deficiency {})",
-            k,
-            kept.len(),
-            k - kept.len()
-        );
-    }
-
-    (a_out, b_out, member_constraint_ids_out)
 }
 
 fn check_linear_feasibility(
@@ -4424,6 +4360,7 @@ fn solve_quadraticwith_linear_constraints(
                 )?;
                 continue;
             }
+            prune_active_to_independent(&mut active, &mut is_active, constraints, &x, tol_active);
             return Ok((x, active));
         }
 
@@ -4479,6 +4416,7 @@ fn solve_quadraticwith_linear_constraints(
             && step_norm <= step_tol
             && min_lambda_true >= -(10.0 * tol_dual)
         {
+            prune_active_to_independent(&mut active, &mut is_active, constraints, &x, tol_active);
             return Ok((x, active));
         }
     }
@@ -10871,7 +10809,7 @@ mod tests {
         let b = array![0.0, 0.0, 0.0];
         let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
         let (a_out, b_out, member_constraint_ids_out) =
-            rank_reduce_constraint_rows(a, b, member_constraint_ids);
+            crate::pirls::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
         assert_eq!(
             a_out.nrows(),
             2,
@@ -10893,7 +10831,7 @@ mod tests {
         let b = array![0.0, 0.0, 0.0];
         let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
         let (a_out, b_out, member_constraint_ids_out) =
-            rank_reduce_constraint_rows(a, b, member_constraint_ids);
+            crate::pirls::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
         // All three rows are independent in R^2 (but we only have rank 2).
         // The first two span R^2, so row 3 = row 1 + row 2 is dependent.
         assert_eq!(a_out.nrows(), 2);

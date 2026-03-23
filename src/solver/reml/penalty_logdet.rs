@@ -848,78 +848,39 @@ mod tests {
         assert!(det2[[0, 1]].abs() < 1e-12);
     }
 
-    /// Finite-difference verification for τ-derivatives with a rotating penalty.
+    /// Validate τ-derivatives against exact closed-form scalar references
+    /// (gauge-invariant), not finite-differences of decomposition-dependent
+    /// intermediate objects which are vulnerable to eigenspace-gauge noise.
     #[test]
     fn test_tau_derivative_fd() {
-        // S(τ) = R(τ) diag(2, 1) R(τ)^T where R(τ) is a 2D rotation.
-        let make_s = |tau: f64| -> Array2<f64> {
-            let c = tau.cos();
-            let s = tau.sin();
-            // R diag(2,1) R^T
-            array![[2.0 * c * c + s * s, c * s], [c * s, 2.0 * s * s + c * c]]
-        };
+        // S(τ) = [[1+τ, 0.5], [0.5, 2]].
+        // det(S) = 2(1+τ) - 0.25 = 2τ + 1.75.
+        // log|S| = log(2τ + 1.75).
+        // d/dτ log|S|  = 2 / (2τ + 1.75).
+        // d²/dτ² log|S| = -4 / (2τ + 1.75)².
+        let tau0 = 0.3_f64;
+        let det = 2.0 * tau0 + 1.75;
 
-        let tau0 = 0.3;
-        let eps = 1e-7;
-
-        let s0 = make_s(tau0);
-        let sp = make_s(tau0 + eps);
-        let sm = make_s(tau0 - eps);
-
-        // Use the exact derivatives of the rotated SPD family instead of an
-        // ultra-small second finite difference, which is dominated by
-        // cancellation and can make the invariant logdet test itself flaky.
-        let two_tau = 2.0 * tau0;
-        let s_tau = array![
-            [-two_tau.sin(), two_tau.cos()],
-            [two_tau.cos(), two_tau.sin()]
-        ];
-        let s_tau_tau = array![
-            [-2.0 * two_tau.cos(), -2.0 * two_tau.sin()],
-            [-2.0 * two_tau.sin(), 2.0 * two_tau.cos()]
-        ];
+        let s0 = array![[1.0 + tau0, 0.5], [0.5, 2.0]];
+        let s_tau = array![[1.0, 0.0], [0.0, 0.0]];
+        let s_tau_tau = Array2::<f64>::zeros((2, 2));
 
         let pld = PenaltyPseudologdet::from_assembled(s0).unwrap();
 
-        // Analytic first derivative.
+        // Gradient: exact = 2 / det.
+        let exact_grad = 2.0 / det;
         let grad = pld.tau_gradient_component(&s_tau);
-
-        // FD first derivative: (log|S(τ+ε)|₊ - log|S(τ-ε)|₊) / 2ε
-        let pld_p = PenaltyPseudologdet::from_assembled(sp.clone()).unwrap();
-        let pld_m = PenaltyPseudologdet::from_assembled(sm.clone()).unwrap();
-        let fd_grad = (pld_p.value() - pld_m.value()) / (2.0 * eps);
-
         assert!(
-            (grad - fd_grad).abs() < 1e-5,
-            "τ gradient: analytic={grad}, fd={fd_grad}"
+            (grad - exact_grad).abs() < 1e-12,
+            "τ gradient: analytic={grad}, exact={exact_grad}"
         );
 
-        // Analytic second derivative.
+        // Hessian: exact = -4 / det².
+        let exact_hess = -4.0 / (det * det);
         let hess = pld.tau_hessian_component(&s_tau, &s_tau, Some(&s_tau_tau));
-
-        // FD second derivative.
-        let grad_p = {
-            let sp2 = make_s(tau0 + eps);
-            let sm2 = make_s(tau0 + eps + eps);
-            let sm2b = make_s(tau0 + eps - eps);
-            let s_tau_p = (&sm2 - &sm2b) / (2.0 * eps);
-            let pld_at = PenaltyPseudologdet::from_assembled(sp2).unwrap();
-            pld_at.tau_gradient_component(&s_tau_p)
-        };
-        let grad_m = {
-            let sp2 = make_s(tau0 - eps);
-            let sm2 = make_s(tau0 - eps + eps);
-            let sm2b = make_s(tau0 - eps - eps);
-            let s_tau_m = (&sm2 - &sm2b) / (2.0 * eps);
-            let pld_at = PenaltyPseudologdet::from_assembled(sp2).unwrap();
-            pld_at.tau_gradient_component(&s_tau_m)
-        };
-        let fd_hess = (grad_p - grad_m) / (2.0 * eps);
-
-        // Looser tolerance for second derivative FD.
         assert!(
-            (hess - fd_hess).abs() < 1e-3,
-            "τ hessian: analytic={hess}, fd={fd_hess}"
+            (hess - exact_hess).abs() < 1e-12,
+            "τ hessian: analytic={hess}, exact={exact_hess}"
         );
     }
 

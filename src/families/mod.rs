@@ -5,6 +5,7 @@ pub mod family_meta;
 pub mod gamlss;
 pub mod latent_survival;
 pub mod lognormal_kernel;
+pub mod monotone_root;
 pub mod row_kernel;
 pub mod royston_parmar;
 pub mod scale_design;

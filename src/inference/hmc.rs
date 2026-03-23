@@ -377,7 +377,8 @@ pub struct NutsPosterior {
     chol_t: Array2<f64>,
     /// Family for log-likelihood computation
     nuts_family: NutsFamily,
-    /// Whether to add the Jeffreys/Firth term 0.5 log|I(β)| to the target
+    /// Whether to add the identifiable-subspace Jeffreys/Firth term to the
+    /// target
     firth_enabled: bool,
 }
 
@@ -597,7 +598,8 @@ fn validate_firth_likelihood_support(
     Ok(())
 }
 
-/// Compute the Jeffreys/Firth contribution 0.5 log|I(β)| and its β-gradient.
+/// Compute the identifiable-subspace Jeffreys/Firth contribution and its
+/// β-gradient.
 ///
 /// HMC uses the same `FirthDenseOperator` as the REML exact-gradient path.
 /// The operator owns the reduced identifiable Fisher factorization, the
@@ -2506,7 +2508,7 @@ pub(crate) fn run_nuts_sampling(
     let dim = mode.len();
 
     // Create posterior target with analytical gradients. When Firth is enabled,
-    // this target includes the Jeffreys prior term 0.5 log|I(β)|.
+    // this target includes the identifiable-subspace Jeffreys term.
     let target = NutsPosterior::new(
         x,
         y,
@@ -3238,16 +3240,16 @@ pub fn run_link_wiggle_nuts_sampling(
 // joint posterior p(β, ρ | y) ∝ p(y|β) p(β|ρ) p(ρ).
 //
 // The joint log-posterior is:
-//   log p(β, ρ | y) = ℓ(y|β) + 0.5 log|I(β)| [if Firth]
+//   log p(β, ρ | y) = ℓ(y|β) + Φ(β) [if Firth]
 //                    - 0.5 β'S(ρ)β + 0.5 log|S(ρ)|_+ + log p(ρ) + const
 //
 // Gradients:
-//   ∇_β: ∇_β ℓ + ∇_β[0.5 log|I(β)|] [if Firth] - S(ρ) β
+//   ∇_β: ∇_β ℓ + ∇_β Φ(β) [if Firth] - S(ρ) β
 //   ∂/∂ρ_k: -0.5 λ_k β'S_k β + 0.5 tr(S_+⁻¹ A_k) + ∂log p(ρ)/∂ρ_k
 //
 // This completely avoids the Laplace approximation. When Firth bias reduction
-// is active, the sampled target also includes the Jeffreys term
-// 0.5 log|I(β)| in addition to the smoothing-parameter prior.
+// is active, the sampled target also includes the Jeffreys term Φ(β) in
+// addition to the smoothing-parameter prior.
 
 /// Directional cubic non-Gaussianity diagnostic for the Laplace approximation.
 ///
@@ -3627,7 +3629,8 @@ struct JointBetaRhoPosterior {
     rho_prior: RhoPrior,
     /// LAML-converged ρ (used only to initialize chains)
     rho_mode: Array1<f64>,
-    /// Whether to add the Jeffreys/Firth term 0.5 log|I(β)| to the target
+    /// Whether to add the identifiable-subspace Jeffreys/Firth term to the
+    /// target
     firth_enabled: bool,
 }
 

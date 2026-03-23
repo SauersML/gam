@@ -1,6 +1,9 @@
 use crate::basis::BasisFamily;
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
+use crate::families::bernoulli_marginal_slope::{
+    ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION, anchored_deviation_basis_with_transform,
+};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
@@ -346,11 +349,13 @@ pub struct SavedBaselineTimeWiggleRuntime {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedAnchoredDeviationRuntime {
+    pub schema_version: u32,
     pub kernel: String,
     pub knots: Vec<f64>,
     pub degree: usize,
     pub value_span_degree: usize,
     pub basis_dim: usize,
+    pub basis_transform: Vec<Vec<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -509,6 +514,12 @@ impl SavedBaselineTimeWiggleRuntime {
 
 impl SavedAnchoredDeviationRuntime {
     fn validate_kernel(&self) -> Result<(), String> {
+        if self.schema_version != ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION {
+            return Err(format!(
+                "saved anchored deviation runtime uses unsupported schema_version {}; expected {}",
+                self.schema_version, ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
+            ));
+        }
         if self.kernel.is_empty() {
             return Err(
                 "saved anchored deviation runtime is missing the exact kernel marker".to_string(),
@@ -529,7 +540,45 @@ impl SavedAnchoredDeviationRuntime {
                 self.value_span_degree
             ));
         }
+        let _ = self.basis_transform_matrix()?;
         Ok(())
+    }
+
+    fn basis_transform_matrix(&self) -> Result<Array2<f64>, String> {
+        if self.basis_transform.is_empty() {
+            return Err(
+                "saved anchored deviation runtime is missing the training basis transform"
+                    .to_string(),
+            );
+        }
+        let cols = self.basis_transform[0].len();
+        if cols != self.basis_dim {
+            return Err(format!(
+                "saved anchored deviation basis transform width mismatch: transform has {} columns but runtime expects {}",
+                cols, self.basis_dim
+            ));
+        }
+        let rows = self.basis_transform.len();
+        let mut transform = Array2::<f64>::zeros((rows, cols));
+        for (i, row) in self.basis_transform.iter().enumerate() {
+            if row.len() != cols {
+                return Err(format!(
+                    "saved anchored deviation basis transform row {} has width {}, expected {}",
+                    i,
+                    row.len(),
+                    cols
+                ));
+            }
+            for (j, &value) in row.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "saved anchored deviation basis transform entry ({i},{j}) is non-finite"
+                    ));
+                }
+                transform[[i, j]] = value;
+            }
+        }
+        Ok(transform)
     }
 
     fn constrained_basis(
@@ -539,10 +588,12 @@ impl SavedAnchoredDeviationRuntime {
     ) -> Result<Array2<f64>, String> {
         self.validate_kernel()?;
         let knot_arr = Array1::from_vec(self.knots.clone());
-        let constrained = monotone_wiggle_basis_with_derivative_order(
+        let basis_transform = self.basis_transform_matrix()?;
+        let constrained = anchored_deviation_basis_with_transform(
             values.view(),
             &knot_arr,
             self.degree,
+            &basis_transform,
             basis_options.derivative_order,
         )?;
         if constrained.ncols() != self.basis_dim {
