@@ -971,7 +971,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let fit_tol = 1e-6f64;
     let weights = resolve_weight_column(&ds, &col_map, args.weights_column.as_deref())?;
     let offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
-    let frailty = fit_frailty_spec_from_args(args, "fit")?;
+    let frailty = fit_frailty_spec_from_args(&args, "fit")?;
     if let Some(choice) = link_choice.as_ref() {
         if matches!(choice.mode, LinkMode::Flexible) {
             if choice.mixture_components.is_some() {
@@ -5041,6 +5041,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
         }
 
+        let frailty = fixed_gaussian_shift_frailty_from_spec(
+            &fit_frailty_spec_from_survival_args(&args, "survival marginal-slope")?,
+            "survival marginal-slope",
+        )?;
         let spec = SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
@@ -5049,7 +5053,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             z,
             marginalspec: termspec.clone(),
             marginal_offset: threshold_offset.clone(),
-            frailty: fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd),
+            frailty: frailty.clone(),
             derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
             time_block: TimeBlockInput {
                 design_entry: time_design_entry.clone(),
@@ -5120,7 +5124,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
                     survival_distribution: Some("probit".to_string()),
-                    frailty: fixed_gaussian_shift_frailty_from_latent_sd(args.latent_sd),
+                    frailty: frailty,
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             );
@@ -5188,9 +5192,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         if parsed.linkspec.is_some() {
             return Err("link(...) is not implemented for the survival latent family".to_string());
         }
-        let latent_sd = args.latent_sd.ok_or_else(|| {
-            "--latent-sd is required with --survival-likelihood latent".to_string()
-        })?;
+        let frailty = fit_frailty_spec_from_survival_args(&args, "latent survival")?;
+        latent_cloglog_state_from_frailty_spec(&frailty, "latent survival")?;
 
         // Compile LatentSurvivalRow for each data row from the baseline offsets.
         // eta_offset_entry[i] = log H_0(entry_i)
@@ -5232,10 +5235,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             });
         }
 
-        let frailty = gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(latent_sd),
-            loading: gam::families::lognormal_kernel::HazardLoading::Full,
-        };
         let options = gam::families::custom_family::BlockwiseFitOptions {
             compute_covariance: true,
             ..Default::default()
@@ -7832,7 +7831,7 @@ fn solve_saved_survival_intercept(
         Ok((f, f_a, 0.0))
     };
     let a_init = q * (1.0 + slope * slope).sqrt();
-    let (root, _) = crate::families::monotone_root::solve_monotone_root(
+    let (root, _) = gam::families::monotone_root::solve_monotone_root(
         eval,
         a_init,
         "saved survival intercept",
@@ -10379,6 +10378,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
             disable_score_warp: false,
             disable_link_dev: false,
             transformation_normal: false,
@@ -10566,6 +10568,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
             disable_score_warp: false,
             disable_link_dev: false,
             transformation_normal: false,
@@ -10655,6 +10660,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
             disable_score_warp: false,
             disable_link_dev: false,
             transformation_normal: false,
@@ -10738,6 +10746,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
             disable_score_warp: false,
             disable_link_dev: false,
             transformation_normal: false,
@@ -12151,7 +12162,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         let cfg = parse_survival_time_basis_config(
             &args.time_basis,
@@ -12201,7 +12214,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         let err = parse_survival_time_basis_config(
             &args.time_basis,
@@ -12790,7 +12805,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("sas".to_string());
         args.sas_init = Some("0.15,-0.70".to_string());
@@ -12842,7 +12859,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("sas".to_string());
         args.beta_logistic_init = Some("0.1,0.2".to_string());
@@ -12888,7 +12907,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("logit".to_string());
         args.sas_init = Some("0.1,0.2".to_string());
@@ -12934,7 +12955,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("beta-logistic".to_string());
         args.beta_logistic_init = Some("0.25,0.80".to_string());
@@ -12986,7 +13009,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("beta-logistic".to_string());
         args.sas_init = Some("0.1,0.2".to_string());
@@ -13032,7 +13057,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("logit".to_string());
         args.beta_logistic_init = Some("0.1,0.2".to_string());
@@ -13078,7 +13105,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         let link = parse_survival_inverse_link(&args).expect("loglog survival link");
         match link {
@@ -13152,7 +13181,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("flexible(logit)".to_string());
         let link = parse_survival_inverse_link(&args).expect("flexible survival link");
@@ -13197,7 +13228,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("flexible(blended(logit,probit))".to_string());
         args.mixture_rho = Some("0.2".to_string());
@@ -13244,7 +13277,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         args.link = Some("bogus".to_string());
         let err =
@@ -13638,7 +13673,9 @@ mod tests {
             weights_column: None,
             offset_column: None,
             noise_offset_column: None,
-            latent_sd: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
         };
         let result = super::run_survival(args);
         assert!(
