@@ -44,7 +44,7 @@ fn max_abs_matrix_diff(lhs: &Array2<f64>, rhs: &Array2<f64>) -> f64 {
     max_diff
 }
 
-pub(crate) fn sampled_span_points(left: f64, right: f64) -> Array1<f64> {
+pub fn sampled_span_points(left: f64, right: f64) -> Array1<f64> {
     let width = right - left;
     Array1::from_vec(vec![
         left,
@@ -54,7 +54,7 @@ pub(crate) fn sampled_span_points(left: f64, right: f64) -> Array1<f64> {
     ])
 }
 
-pub(crate) fn local_cubic_from_uniform_span_samples(
+pub fn local_cubic_from_uniform_span_samples(
     left: f64,
     right: f64,
     y0: f64,
@@ -593,14 +593,6 @@ impl DeviationRuntime {
     /// For I-spline bases this is the saturated integral value.
     fn right_tail_value(&self, beta: &Array1<f64>) -> f64 {
         self.right_boundary_value_row.dot(beta)
-    }
-
-    pub(crate) fn support_left(&self) -> f64 {
-        self.endpoint_points[0]
-    }
-
-    pub(crate) fn support_right(&self) -> f64 {
-        self.endpoint_points[self.endpoint_points.len() - 1]
     }
 
     // ── monotonicity enforcement ──

@@ -1229,35 +1229,59 @@ pub fn affine_anchor_moment_vector(
     out
 }
 
-/// Evaluate an affine cell (c2=c3=0) exactly.  Supports semi-infinite bounds.
+fn affine_zero_moment(alpha: f64, beta: f64, left: f64, right: f64) -> f64 {
+    let s = (1.0 + beta * beta).sqrt();
+    let mu = -alpha * beta / (1.0 + beta * beta);
+    let y_left = if left.is_infinite() {
+        if left.is_sign_positive() {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        }
+    } else {
+        s * (left - mu)
+    };
+    let y_right = if right.is_infinite() {
+        if right.is_sign_positive() {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        }
+    } else {
+        s * (right - mu)
+    };
+    let anchor = (-alpha * alpha / (2.0 * s * s)).exp() / s;
+    let span_mass = (2.0 * std::f64::consts::PI).sqrt() * (normal_cdf(y_right) - normal_cdf(y_left));
+    anchor * span_mass
+}
+
+fn affine_value_from_moment_primitive(alpha: f64, beta: f64, left: f64, right: f64) -> f64 {
+    let mut acc = 0.0;
+    for (&node, &weight) in BVN_GL_NODES_20.iter().zip(BVN_GL_WEIGHTS_20.iter()) {
+        let s = 0.5 * (node + 1.0);
+        let angle = std::f64::consts::FRAC_PI_2 * s;
+        let tail = angle.tan();
+        let alpha_prime = alpha - tail;
+        let jacobian = std::f64::consts::FRAC_PI_2 * (1.0 + tail * tail);
+        let deriv = INV_TWO_PI * affine_zero_moment(alpha_prime, beta, left, right);
+        acc += weight * deriv * jacobian;
+    }
+    (0.5 * acc).clamp(0.0, 1.0)
+}
+
+/// Evaluate an affine cell (c2=c3=0) with a value/moment-consistent primitive.
 ///
-/// **Value–moment architecture:**
-///
-/// `value` = ∫ φ(z) Φ(α+βz) dz  (the BVN integral), computed via the
-///   Drezner–Wesolowsky 20-point GL representation, which is exact to
-///   f64 machine precision (~2e-16 max error for all (h,k,ρ)).
-///
-/// `moments[n]` = ∫ zⁿ exp(-½(z²+η²)) dz  (the exp(-q) moments), computed
-///   from exact truncated-Gaussian recurrences with no quadrature.
-///
-/// These are different integrals (BVN CDF vs bivariate normal density)
-/// but related by:  d(value)/dα = (1/(2π)) · moments[0].
-///
-/// The holonomic transport in `evaluate_non_affine_cell_state` couples
-/// them correctly: value updates use `INV_TWO_PI * moments`, and the
-/// 20-pt GL anchor ensures the initial BVN value is exact to f64.
+/// Value and moments are now generated from the same affine moment primitive.
+/// The zero-moment derivative is exact, and `value` is reconstructed by
+/// integrating `d value / d alpha = INV_TWO_PI * moments[0]` over `alpha`
+/// on a transformed semi-infinite domain.
 pub fn evaluate_affine_cell_state(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
     let alpha = cell.c0;
     let beta = cell.c1;
-    let s = (1.0 + beta * beta).sqrt();
-    let second = alpha / s;
-    let rho = -beta / s;
-    let right = bivariate_normal_cdf(cell.right, second, rho)?;
-    let left = bivariate_normal_cdf(cell.left, second, rho)?;
-    let value = (right - left).clamp(0.0, 1.0);
+    let value = affine_value_from_moment_primitive(alpha, beta, cell.left, cell.right);
     let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
     Ok(CellMomentState {
         branch: ExactCellBranch::Affine,
@@ -1704,6 +1728,39 @@ mod tests {
             });
             assert!((state.moments[degree] - target).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn affine_cell_value_matches_zero_moment_derivative() {
+        let cell = DenestedCubicCell {
+            left: -1.1,
+            right: 0.7,
+            c0: 0.23,
+            c1: -0.41,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        let h = 1e-6;
+        let plus = evaluate_affine_cell_state(
+            DenestedCubicCell {
+                c0: cell.c0 + h,
+                ..cell
+            },
+            0,
+        )
+        .expect("affine plus");
+        let minus = evaluate_affine_cell_state(
+            DenestedCubicCell {
+                c0: cell.c0 - h,
+                ..cell
+            },
+            0,
+        )
+        .expect("affine minus");
+        let center = evaluate_affine_cell_state(cell, 0).expect("affine center");
+        let d_value = (plus.value - minus.value) / (2.0 * h);
+        let target = INV_TWO_PI * center.moments[0];
+        assert!((d_value - target).abs() < 1e-8);
     }
 
     #[test]
