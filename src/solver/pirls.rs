@@ -10,9 +10,7 @@ use crate::linalg::sparse_exact::{
 };
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
-use crate::mixture_link::{
-    InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5,
-};
+use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5};
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{

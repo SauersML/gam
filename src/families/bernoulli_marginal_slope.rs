@@ -62,6 +62,7 @@ impl Default for DeviationBlockConfig {
 pub struct DeviationRuntime {
     pub knots: Array1<f64>,
     pub degree: usize,
+    pub value_span_degree: usize,
     pub basis_dim: usize,
     pub monotonicity_eps: f64,
     endpoint_points: Array1<f64>,
@@ -413,12 +414,6 @@ pub(crate) fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    if cfg.degree != 3 {
-        return Err(format!(
-            "exact de-nested cubic bernoulli marginal-slope requires cubic deviation blocks (degree=3), got degree={}",
-            cfg.degree
-        ));
-    }
     let selected = select_wiggle_basis_from_seed(
         seed.view(),
         &WiggleBlockConfig {
@@ -429,10 +424,18 @@ pub(crate) fn build_deviation_block_from_seed(
         },
         &cfg.penalty_orders,
     )?;
+    if !selected.structure.fourth_derivative_is_structurally_zero() {
+        return Err(format!(
+            "exact de-nested cubic bernoulli marginal-slope requires a deviation value basis whose fourth derivative is structurally zero on every span, got piecewise degree {} from public degree={}",
+            selected.structure.value_span_degree,
+            cfg.degree
+        ));
+    }
     let block = selected.block;
     let dim = block.design.ncols();
     let knots = selected.knots;
     let degree = selected.degree;
+    let value_span_degree = selected.structure.value_span_degree;
     let mut endpoint_points = Vec::new();
     for &knot in knots.iter() {
         if endpoint_points
@@ -466,9 +469,35 @@ pub(crate) fn build_deviation_block_from_seed(
     let span_left_points = Array1::from_vec(span_left);
     let span_right_points = Array1::from_vec(span_right);
     let span_mid_points = Array1::from_vec(span_mid);
+
+    // Structural invariant: the exact de-nested cubic path requires that the
+    // value basis is piecewise cubic on every knot span, i.e. the fourth
+    // derivative is identically zero.  Verify this by evaluating the fourth
+    // derivative design at the span midpoints — if any entry is nonzero, the
+    // basis degree is too high and the cubic Taylor reconstruction would lose
+    // a nonzero higher-order term.
+    let d4_design = monotone_wiggle_basis_with_derivative_order(
+        span_mid_points.view(),
+        &knots,
+        degree,
+        4,
+    )?;
+    let d4_max = d4_design
+        .iter()
+        .copied()
+        .fold(0.0_f64, |a, b| a.max(b.abs()));
+    if d4_max > 1e-10 {
+        return Err(format!(
+            "exact de-nested cubic path requires a piecewise-cubic value basis \
+             (structurally zero fourth derivative), but the fourth derivative design \
+             has max |entry| = {d4_max:.6e} — the basis is higher than cubic"
+        ));
+    }
+
     let runtime = DeviationRuntime {
         knots: knots.clone(),
         degree,
+        value_span_degree,
         basis_dim: dim,
         monotonicity_eps: cfg.monotonicity_eps,
         span_left_value_design: monotone_wiggle_basis_with_derivative_order(
@@ -1062,34 +1091,22 @@ struct BlockSlices {
     total: usize,
 }
 
-fn block_slices(
-    states: &[ParameterBlockState],
-    has_score_warp: bool,
-    has_link_dev: bool,
-) -> BlockSlices {
+fn block_slices(family: &BernoulliMarginalSlopeFamily) -> BlockSlices {
     let mut cursor = 0usize;
-    let mut block_idx = 0usize;
-    let marginal = cursor..cursor + states[block_idx].beta.len();
+    let marginal = cursor..cursor + family.marginal_design.ncols();
     cursor = marginal.end;
-    block_idx += 1;
-    let logslope = cursor..cursor + states[block_idx].beta.len();
+    let logslope = cursor..cursor + family.logslope_design.ncols();
     cursor = logslope.end;
-    block_idx += 1;
-    let h = if has_score_warp {
-        let range = cursor..cursor + states[block_idx].beta.len();
+    let h = family.score_warp.as_ref().map(|runtime| {
+        let range = cursor..cursor + runtime.basis_dim;
         cursor = range.end;
-        block_idx += 1;
-        Some(range)
-    } else {
-        None
-    };
-    let w = if has_link_dev {
-        let range = cursor..cursor + states[block_idx].beta.len();
+        range
+    });
+    let w = family.link_dev.as_ref().map(|runtime| {
+        let range = cursor..cursor + runtime.basis_dim;
         cursor = range.end;
-        Some(range)
-    } else {
-        None
-    };
+        range
+    });
     BlockSlices {
         marginal,
         logslope,
@@ -1101,12 +1118,16 @@ fn block_slices(
 
 #[derive(Clone)]
 struct PrimarySlices {
+    q: usize,
+    logslope: usize,
     h: Option<std::ops::Range<usize>>,
     w: Option<std::ops::Range<usize>>,
     total: usize,
 }
 
 fn primary_slices(slices: &BlockSlices) -> PrimarySlices {
+    let q = 0usize;
+    let logslope = 1usize;
     let mut cursor = 2usize;
     let h = slices.h.as_ref().map(|range| {
         let out = cursor..cursor + range.len();
@@ -1119,6 +1140,8 @@ fn primary_slices(slices: &BlockSlices) -> PrimarySlices {
         out
     });
     PrimarySlices {
+        q,
+        logslope,
         h,
         w,
         total: cursor,
@@ -1722,11 +1745,7 @@ struct BernoulliRigidRowKernel {
 
 impl BernoulliRigidRowKernel {
     fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
-        let slices = block_slices(
-            &block_states,
-            family.score_warp.is_some(),
-            family.link_dev.is_some(),
-        );
+        let slices = block_slices(&family);
         Self {
             family,
             block_states,
@@ -2294,11 +2313,7 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
-        let slices = block_slices(
-            block_states,
-            self.score_warp.is_some(),
-            self.link_dev.is_some(),
-        );
+        let slices = block_slices(self);
         let primary = primary_slices(&slices);
         let n = self.y.len();
         let row_contexts: Result<Vec<_>, String> = (0..n)
@@ -2334,10 +2349,10 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
         let mut out = Array1::<f64>::zeros(primary.total);
-        out[0] = self
+        out[primary.q] = self
             .marginal_design
             .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
-        out[1] = self
+        out[primary.logslope] = self
             .logslope_design
             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
         if let (Some(block_range), Some(primary_range)) = (slices.h.as_ref(), primary.h.as_ref()) {
@@ -2433,7 +2448,7 @@ impl BernoulliMarginalSlopeFamily {
                     self.marginal_design.ncols(),
                     "BernoulliMarginalSlopeFamily marginal",
                 )?;
-                out[0] = x_row.dot(&block_states[0].beta);
+                out[primary.q] = x_row.dot(&block_states[0].beta);
             }
             1 => {
                 let x_row = self.psi_design_row_vector(
@@ -2443,7 +2458,7 @@ impl BernoulliMarginalSlopeFamily {
                     self.logslope_design.ncols(),
                     "BernoulliMarginalSlopeFamily log-slope",
                 )?;
-                out[1] = x_row.dot(&block_states[1].beta);
+                out[primary.logslope] = x_row.dot(&block_states[1].beta);
             }
             _ => {
                 return Err(format!(
@@ -2478,7 +2493,8 @@ impl BernoulliMarginalSlopeFamily {
                     self.marginal_design.ncols(),
                     "BernoulliMarginalSlopeFamily marginal",
                 )?;
-                out[0] = x_row.dot(&d_beta_flat.slice(s![slices.marginal.clone()]).to_owned())
+                out[primary.q] =
+                    x_row.dot(&d_beta_flat.slice(s![slices.marginal.clone()]).to_owned())
             }
             1 => {
                 let x_row = self.psi_design_row_vector(
@@ -2488,7 +2504,8 @@ impl BernoulliMarginalSlopeFamily {
                     self.logslope_design.ncols(),
                     "BernoulliMarginalSlopeFamily log-slope",
                 )?;
-                out[1] = x_row.dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned())
+                out[primary.logslope] =
+                    x_row.dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned())
             }
             _ => {
                 return Err(format!(
@@ -2530,7 +2547,7 @@ impl BernoulliMarginalSlopeFamily {
                     self.marginal_design.ncols(),
                     "BernoulliMarginalSlopeFamily marginal",
                 )?;
-                out[0] = x_row.dot(&block_states[0].beta);
+                out[primary.q] = x_row.dot(&block_states[0].beta);
             }
             1 => {
                 let x_row = self.psi_second_design_row_vector(
@@ -2542,7 +2559,7 @@ impl BernoulliMarginalSlopeFamily {
                     self.logslope_design.ncols(),
                     "BernoulliMarginalSlopeFamily log-slope",
                 )?;
-                out[1] = x_row.dot(&block_states[1].beta);
+                out[primary.logslope] = x_row.dot(&block_states[1].beta);
             }
             _ => {
                 return Err(format!(
@@ -2564,12 +2581,12 @@ impl BernoulliMarginalSlopeFamily {
         {
             let mut marginal = out.slice_mut(s![slices.marginal.clone()]);
             self.marginal_design
-                .axpy_row_into(row, primary_vec[0], &mut marginal)?;
+                .axpy_row_into(row, primary_vec[primary.q], &mut marginal)?;
         }
         {
             let mut logslope = out.slice_mut(s![slices.logslope.clone()]);
             self.logslope_design
-                .axpy_row_into(row, primary_vec[1], &mut logslope)?;
+                .axpy_row_into(row, primary_vec[primary.logslope], &mut logslope)?;
         }
         if let Some(primary_h) = primary.h.as_ref() {
             if let Some(block_h) = slices.h.as_ref() {
@@ -3103,8 +3120,8 @@ impl BernoulliMarginalSlopeFamily {
         primary: &PrimarySlices,
     ) -> Array1<f64> {
         let mut point = Array1::<f64>::zeros(primary.total);
-        point[0] = block_states[0].eta[row];
-        point[1] = block_states[1].eta[row];
+        point[primary.q] = block_states[0].eta[row];
+        point[primary.logslope] = block_states[1].eta[row];
         if let Some(h_range) = primary.h.as_ref() {
             point
                 .slice_mut(s![h_range.start..h_range.end])
@@ -3132,7 +3149,7 @@ impl BernoulliMarginalSlopeFamily {
             .w
             .as_ref()
             .map(|range| point.slice(s![range.start..range.end]).to_owned());
-        (point[0], point[1], beta_h, beta_w)
+        (point[primary.q], point[primary.logslope], beta_h, beta_w)
     }
 
     fn observed_denested_cell_partials(
@@ -6613,11 +6630,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_idx: usize,
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
-        let slices = block_slices(
-            block_states,
-            self.score_warp.is_some(),
-            self.link_dev.is_some(),
-        );
+        let slices = block_slices(self);
         if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
             if let Some(runtime) = &self.score_warp {
                 return runtime.max_feasible_monotone_step(&block_states[2].beta, delta);
@@ -6644,11 +6657,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        let slices = block_slices(
-            block_states,
-            self.score_warp.is_some(),
-            self.link_dev.is_some(),
-        );
+        let slices = block_slices(self);
         if slices.total >= 512 {
             return Ok(None);
         }
@@ -6838,11 +6847,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 block_states.len()
             ));
         }
-        let slices = block_slices(
-            block_states,
-            self.score_warp.is_some(),
-            self.link_dev.is_some(),
-        );
+        let slices = block_slices(self);
         if slices.h.as_ref().is_some_and(|_| block_idx == 2) {
             if let Some(runtime) = &self.score_warp {
                 let current = &block_states[2].beta;
@@ -7488,10 +7493,20 @@ mod tests {
             dummy_block_state(beta_link.clone(), seed.len()),
         ];
 
-        let slices = block_slices(&block_states, false, true);
+        let slices = block_slices(&family);
         assert!(slices.h.is_none(), "score-warp slice should be absent");
         let link_slice = slices.w.as_ref().expect("link slice");
-        assert_eq!(link_slice.start, 2, "link-only block should occupy block 2");
+        assert_eq!(
+            slices.marginal.len(),
+            0,
+            "zero-column marginal design should not contribute coefficient coordinates"
+        );
+        assert_eq!(
+            slices.logslope.len(),
+            0,
+            "zero-column logslope design should not contribute coefficient coordinates"
+        );
+        assert_eq!(link_slice.start, 0, "link-only coefficients should start at 0");
         assert_eq!(link_slice.len(), link_dim);
 
         let primary = primary_slices(&slices);
@@ -7535,6 +7550,69 @@ mod tests {
                 .expect("link constraint lookup")
                 .is_none(),
             "link block should use exact monotonicity runtime rather than endpoint-only linear constraints"
+        );
+    }
+
+    #[test]
+    fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let score_prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let link_prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(Array1::zeros(seed.len())),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            gaussian_frailty_sd: None,
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+        };
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(Array1::zeros(score_prepared.runtime.basis_dim), seed.len()),
+            dummy_block_state(Array1::zeros(link_prepared.runtime.basis_dim), seed.len()),
+        ];
+
+        let cache = family
+            .build_exact_eval_cache(&block_states)
+            .expect("exact eval cache");
+        assert_eq!(cache.slices.marginal.len(), 0);
+        assert_eq!(cache.slices.logslope.len(), 0);
+        assert_eq!(cache.slices.h.as_ref().expect("h slice").start, 0);
+        assert_eq!(
+            cache.slices.w.as_ref().expect("w slice").start,
+            score_prepared.runtime.basis_dim
+        );
+        assert_eq!(
+            cache.slices.total,
+            score_prepared.runtime.basis_dim + link_prepared.runtime.basis_dim
+        );
+        assert_eq!(cache.primary.q, 0);
+        assert_eq!(cache.primary.logslope, 1);
+        assert_eq!(cache.primary.h.as_ref().expect("primary h").start, 2);
+        assert_eq!(
+            cache.primary.w.as_ref().expect("primary w").start,
+            2 + score_prepared.runtime.basis_dim
         );
     }
 
@@ -8457,7 +8535,7 @@ mod tests {
             dummy_block_state(beta_link.clone(), seed.len()),
         ];
 
-        let slices = block_slices(&block_states, false, true);
+        let slices = block_slices(&family);
         assert!(slices.h.is_none(), "score-warp absent → no h slice");
         let primary = primary_slices(&slices);
         assert!(primary.h.is_none(), "primary h absent");
@@ -8551,7 +8629,7 @@ mod tests {
             dummy_block_state(beta_score, seed.len()),
         ];
 
-        let slices = block_slices(&block_states, true, false);
+        let slices = block_slices(&family);
         assert!(slices.w.is_none(), "link-dev absent → no w slice");
         let primary = primary_slices(&slices);
         assert!(primary.w.is_none(), "primary w absent");
@@ -8641,7 +8719,7 @@ mod tests {
             dummy_block_state(beta_link, seed.len()),
         ];
 
-        let slices = block_slices(&block_states, false, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -8735,7 +8813,7 @@ mod tests {
             dummy_block_state(beta_score, seed.len()),
         ];
 
-        let slices = block_slices(&block_states, true, false);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -9491,7 +9569,7 @@ mod tests {
             },
         ];
 
-        let slices = block_slices(&block_states, true, true);
+        let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
         let third = family
             .exact_newton_joint_hessian_directional_derivative(&block_states, &zero)
@@ -9572,7 +9650,7 @@ mod tests {
             },
         ];
 
-        let slices = block_slices(&block_states, true, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -10346,7 +10424,7 @@ mod tests {
             },
         ];
 
-        let slices = block_slices(&block_states, true, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -10468,7 +10546,7 @@ mod tests {
             },
         ];
 
-        let slices = block_slices(&block_states, true, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -10577,7 +10655,7 @@ mod tests {
             },
         ];
 
-        let slices = block_slices(&block_states, true, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -11023,7 +11101,7 @@ mod tests {
             },
         ];
 
-        let slices = block_slices(&block_states, true, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -11119,7 +11197,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
         };
-        let slices = block_slices(&block_states, true, false);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -11202,7 +11280,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
         };
-        let slices = block_slices(&block_states, false, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -11285,7 +11363,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
         };
-        let slices = block_slices(&block_states, true, false);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir = Array1::<f64>::zeros(total);
         dir[slices.marginal.start] = -0.35;
@@ -11371,7 +11449,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
         };
-        let slices = block_slices(&block_states, false, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir = Array1::<f64>::zeros(total);
         dir[slices.marginal.start] = 0.4;
@@ -11457,7 +11535,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
         };
-        let slices = block_slices(&block_states, true, false);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -11534,7 +11612,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
         };
-        let slices = block_slices(&block_states, false, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
@@ -11611,7 +11689,7 @@ mod tests {
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
         };
-        let slices = block_slices(&block_states, true, false);
+        let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
         let third = family
             .exact_newton_joint_hessian_directional_derivative(&block_states, &zero)
@@ -11671,7 +11749,7 @@ mod tests {
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
         };
-        let slices = block_slices(&block_states, false, true);
+        let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
         let third = family
             .exact_newton_joint_hessian_directional_derivative(&block_states, &zero)
@@ -12107,7 +12185,7 @@ mod tests {
             },
         ];
 
-        let slices = block_slices(&block_states, true, true);
+        let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);

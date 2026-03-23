@@ -349,6 +349,7 @@ pub struct SavedAnchoredDeviationRuntime {
     pub kernel: String,
     pub knots: Vec<f64>,
     pub degree: usize,
+    pub value_span_degree: usize,
     pub basis_dim: usize,
 }
 
@@ -522,10 +523,10 @@ impl SavedAnchoredDeviationRuntime {
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
             ));
         }
-        if self.degree != 3 {
+        if self.value_span_degree >= 4 {
             return Err(format!(
-                "saved anchored deviation runtime must be cubic (degree=3), got degree={}",
-                self.degree
+                "saved anchored deviation runtime requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {}",
+                self.value_span_degree
             ));
         }
         Ok(())
@@ -1146,16 +1147,6 @@ impl FittedModel {
                         .to_string()
                 })
                 .map(Some),
-            FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialLatentCLogLog,
-                base_link,
-            } => match base_link {
-                Some(InverseLink::LatentCLogLog(state)) => Ok(Some(*state)),
-                _ => Err(
-                    "latent-cloglog-binomial location-scale model is missing latent cloglog base_link state"
-                        .to_string(),
-                ),
-            },
             _ => Ok(None),
         }
     }
@@ -1511,11 +1502,41 @@ impl FittedModel {
         ) {
             self.saved_mixture_state()?;
         }
+        if matches!(
+            self.family_state,
+            FittedFamily::Standard {
+                likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+                ..
+            }
+        ) {
+            self.saved_latent_cloglog_state()?;
+        }
+        if matches!(
+            self.family_state,
+            FittedFamily::LocationScale {
+                likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+                ..
+            }
+        ) {
+            return Err(
+                "latent-cloglog-binomial is not supported for location-scale saved models"
+                    .to_string(),
+            );
+        }
+        if self.is_survival_model() && self.survival_likelihood.is_none() {
+            return Err(
+                "saved survival model is missing survival_likelihood metadata; refit with current CLI"
+                    .to_string(),
+            );
+        }
         if self.is_survival_model()
             && self
                 .survival_likelihood
                 .as_deref()
-                .unwrap_or("transformation")
+                .ok_or_else(|| {
+                    "saved survival model is missing survival_likelihood metadata; refit with current CLI"
+                        .to_string()
+                })?
                 .eq_ignore_ascii_case("location-scale")
             && (self.survival_beta_time.is_none()
                 || self.survival_beta_threshold.is_none()

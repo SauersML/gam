@@ -5591,9 +5591,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     .collect::<Vec<_>>();
     let fitted_link = match family {
         LikelihoodFamily::BinomialLatentCLogLog => FittedLinkState::LatentCLogLog {
-            state: latent_cloglog_state.expect(
-                "BinomialLatentCLogLog requires an explicit latent-cloglog state",
-            ),
+            state: latent_cloglog_state
+                .expect("BinomialLatentCLogLog requires an explicit latent-cloglog state"),
         },
         LikelihoodFamily::BinomialMixture => mixture_link_state
             .clone()

@@ -194,6 +194,36 @@ pub enum BasisFamily {
     ISpline,
 }
 
+/// Return the polynomial degree of a basis family's value basis on each active
+/// knot span.
+///
+/// For I-splines this is the degree of the integrated value basis itself, not
+/// the public degree of the underlying B-spline recurrence.
+pub fn basis_family_value_span_polynomial_degree(
+    basis_family: BasisFamily,
+    degree: usize,
+) -> Result<usize, BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    match basis_family {
+        BasisFamily::BSpline | BasisFamily::MSpline => Ok(degree),
+        BasisFamily::ISpline => degree
+            .checked_add(1)
+            .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string())),
+    }
+}
+
+/// Whether the value basis has a structurally zero derivative of the requested
+/// order on every knot span.
+pub fn basis_family_value_derivative_is_structurally_zero(
+    basis_family: BasisFamily,
+    degree: usize,
+    derivative_order: usize,
+) -> Result<bool, BasisError> {
+    Ok(derivative_order > basis_family_value_span_polynomial_degree(basis_family, degree)?)
+}
+
 /// Specifies the source of knots for basis generation.
 #[derive(Clone, Debug)]
 pub enum KnotSource<'a> {
@@ -9125,56 +9155,6 @@ fn duchon_has_classicalsecond_order_origin(p_order: usize, s_order: usize, k_dim
     2 * (p_order + s_order) > k_dim + 2
 }
 
-#[inline(always)]
-fn radial_log_power_derivatives(c: f64, e: f64, a: f64, b: f64, r: f64) -> (f64, f64, f64) {
-    let rr = r.max(1e-300);
-    let log_r = rr.ln();
-    let value = c * rr.powf(e) * (a * log_r + b);
-    let first = c * rr.powf(e - 1.0) * (e * (a * log_r + b) + a);
-    let second = c * rr.powf(e - 2.0) * (e * (e - 1.0) * (a * log_r + b) + (2.0 * e - 1.0) * a);
-    (value, first, second)
-}
-
-#[inline(always)]
-fn duchon_polyharmonic_q_l_r_triplets(
-    r: f64,
-    m: usize,
-    k_dim: usize,
-) -> ((f64, f64, f64), (f64, f64, f64)) {
-    if r <= 0.0 {
-        return ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0));
-    }
-    let k_half = 0.5 * k_dim as f64;
-    let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
-    let rr = r.max(1e-300);
-    if k_dim % 2 == 0 && m >= (k_dim / 2) {
-        let c = polyharmonic_log_sign(m, k_dim)
-            / (2.0_f64.powi((2 * m - 1) as i32)
-                * std::f64::consts::PI.powf(k_half)
-                * gamma_lanczos(m as f64)
-                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
-        let q = radial_log_power_derivatives(c, alpha - 2.0, alpha, 1.0, rr);
-        let lap = radial_log_power_derivatives(
-            c,
-            alpha - 2.0,
-            alpha * (alpha + k_dim as f64 - 2.0),
-            2.0 * alpha + k_dim as f64 - 2.0,
-            rr,
-        );
-        return (q, lap);
-    }
-    let c = gamma_lanczos(k_half - m as f64)
-        / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
-    let q0 = c * alpha * rr.powf(alpha - 2.0);
-    let q1 = c * alpha * (alpha - 2.0) * rr.powf(alpha - 3.0);
-    let q2 = c * alpha * (alpha - 2.0) * (alpha - 3.0) * rr.powf(alpha - 4.0);
-    let l_coeff = c * alpha * (alpha + k_dim as f64 - 2.0);
-    let l0 = l_coeff * rr.powf(alpha - 2.0);
-    let l1 = l_coeff * (alpha - 2.0) * rr.powf(alpha - 3.0);
-    let l2 = l_coeff * (alpha - 2.0) * (alpha - 3.0) * rr.powf(alpha - 4.0);
-    ((q0, q1, q2), (l0, l1, l2))
-}
-
 #[derive(Clone, Copy)]
 struct DuchonMaternDerivativeTerm {
     coeff: f64,
@@ -9258,44 +9238,6 @@ fn duchon_matern_block_radial_derivative(
         value += term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term;
     }
     Ok(c * value)
-}
-
-#[inline(always)]
-fn duchon_matern_block_r3(
-    r: f64,
-    kappa: f64,
-    n_order: usize,
-    k_dim: usize,
-) -> Result<f64, BasisError> {
-    duchon_matern_block_radial_derivative(r, kappa, n_order, k_dim, 3)
-}
-
-#[inline(always)]
-fn duchon_matern_block_q_l_r_triplets(
-    r: f64,
-    kappa: f64,
-    n_order: usize,
-    k_dim: usize,
-) -> Result<((f64, f64, f64), (f64, f64, f64)), BasisError> {
-    if r <= 0.0 {
-        return Ok(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)));
-    }
-    let (_, first, second) = duchon_matern_block_triplet(r, kappa, n_order, k_dim)?;
-    let third = duchon_matern_block_r3(r, kappa, n_order, k_dim)?;
-    let q0 = first / r;
-    let q1 = (second - q0) / r;
-    let q2 = third / r - 2.0 * second / (r * r) + 2.0 * first / (r * r * r);
-    let (m0, m1, m2) = duchon_matern_block_triplet(r, kappa, n_order, k_dim)?;
-    let (prev0, prev1, prev2) = if n_order > 1 {
-        duchon_matern_block_triplet(r, kappa, n_order - 1, k_dim)?
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-    let k2 = kappa * kappa;
-    let l0 = k2 * m0 - prev0;
-    let l1 = k2 * m1 - prev1;
-    let l2 = k2 * m2 - prev2;
-    Ok(((q0, q1, q2), (l0, l1, l2)))
 }
 
 #[inline(always)]
@@ -9550,7 +9492,10 @@ fn duchon_radial_jets(
     let kappa = 1.0 / length_scale.max(1e-300);
     let r_floor = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
     let r_eval = r.max(r_floor);
+    let d = k_dim as f64;
     let mut out = DuchonRadialJets::default();
+    let mut phi_rrr = 0.0;
+    let mut phi_rrrr = 0.0;
 
     // Value path keeps the intrinsic diagonal convention used by the actual basis.
     out.phi = duchon_matern_kernel_general_from_distance(
@@ -9572,39 +9517,38 @@ fn duchon_radial_jets(
             continue;
         }
         let (_, dm, d2m) = polyharmonic_kernel_triplet(r_eval, m, k_dim)?;
-        let ((q0, q1, q2), (l0, l1, l2)) = duchon_polyharmonic_q_l_r_triplets(r_eval, m, k_dim);
         out.phi_r += coeff * dm;
         out.phi_rr += coeff * d2m;
-        out.q += coeff * q0;
-        out.q_r += coeff * q1;
-        out.q_rr += coeff * q2;
-        out.lap += coeff * l0;
-        out.lap_r += coeff * l1;
-        out.lap_rr += coeff * l2;
+        phi_rrr += coeff * duchon_polyharmonic_radial_derivative_at_r(r_eval, m, k_dim, 3);
+        phi_rrrr += coeff * duchon_polyharmonic_radial_derivative_at_r(r_eval, m, k_dim, 4);
     }
     for (n, coeff) in coeffs.b.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
         let (_, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
-        let ((q0, q1, q2), (l0, l1, l2)) =
-            duchon_matern_block_q_l_r_triplets(r_eval, kappa, n, k_dim)?;
         out.phi_r += coeff * dn;
         out.phi_rr += coeff * d2n;
-        out.q += coeff * q0;
-        out.q_r += coeff * q1;
-        out.q_rr += coeff * q2;
-        out.lap += coeff * l0;
-        out.lap_r += coeff * l1;
-        out.lap_rr += coeff * l2;
+        phi_rrr += coeff * duchon_matern_block_radial_derivative(r_eval, kappa, n, k_dim, 3)?;
+        phi_rrrr += coeff * duchon_matern_block_radial_derivative(r_eval, kappa, n, k_dim, 4)?;
     }
 
-    // Compute t = R²φ = (φ'' - q) / r² = q' / r for r > 0.
-    // Use q'/r directly: q_r is assembled from the same partial-fraction
-    // blocks as q_rr and gives the most stable derivative-consistent path.
+    // Derive all radial operator scalars from the same phi-derivative family:
+    //   q = phi_r / r
+    //   q_r = (phi_rr - q) / r
+    //   q_rr = phi_rrr / r - 2 q_r / r
+    //   Delta phi = phi_rr + (d - 1) q
+    //   t = q_r / r
+    // This keeps {phi, q, lap, t} inside one exact differentiable family.
+    out.q = out.phi_r / r_eval;
+    out.q_r = (out.phi_rr - out.q) / r_eval;
+    out.q_rr = (phi_rrr - 2.0 * out.q_r) / r_eval;
+    out.lap = out.phi_rr + (d - 1.0) * out.q;
+    out.lap_r = phi_rrr + (d - 1.0) * out.q_r;
+    out.lap_rr = phi_rrrr + (d - 1.0) * out.q_rr;
     out.t = out.q_r / r_eval;
     out.t_r = (out.q_rr - out.t) / r_eval;
-    out.t_rr = (out.lap_rr + 2.0 * out.t - (k_dim as f64 + 4.0) * out.q_rr) / (r_eval * r_eval);
+    out.t_rr = (out.lap_rr + 2.0 * out.t - (d + 4.0) * out.q_rr) / (r_eval * r_eval);
 
     if r < r_floor {
         // When r is below the derivative evaluation floor the generic formulas
@@ -9639,8 +9583,6 @@ fn duchon_radial_jets(
         let r3 = r2 * r;
         let r4 = r2 * r2;
         let r5 = r4 * r;
-        let d = k_dim as f64;
-
         // Consistent even-power Taylor expansions near r=0:
         //
         //   phi(r) = a0 + a2 r^2 + a4 r^4 + a6 r^6 + ...

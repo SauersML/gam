@@ -240,10 +240,7 @@ fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
 }
 
 fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
-    crate::families::lognormal_kernel::ProbitFrailtyScale::new(
-        gaussian_frailty_sd.unwrap_or(0.0),
-    )
-    .s
+    crate::families::lognormal_kernel::ProbitFrailtyScale::new(gaussian_frailty_sd.unwrap_or(0.0)).s
 }
 
 struct ObservedDenestedCellPartials {
@@ -2280,7 +2277,10 @@ impl SurvivalMarginalSlopeFamily {
                 let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
                 rho[idx] = eval_coeff4_at(
-                    &scale_coeff4(exact_kernel::score_basis_cell_coefficients(basis_span, b), scale),
+                    &scale_coeff4(
+                        exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                        scale,
+                    ),
                     z_obs,
                 );
             }
@@ -2290,7 +2290,10 @@ impl SurvivalMarginalSlopeFamily {
                 let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
                 let idx = w_range.start + local_idx;
                 rho[idx] = eval_coeff4_at(
-                    &scale_coeff4(exact_kernel::link_basis_cell_coefficients(basis_span, a, b), scale),
+                    &scale_coeff4(
+                        exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+                        scale,
+                    ),
                     z_obs,
                 );
                 let (dc_aw, _) =

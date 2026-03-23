@@ -21,7 +21,10 @@ fn latent_cloglog_quadctx() -> &'static crate::quadrature::QuadratureContext {
 }
 
 #[inline]
-fn latent_cloglog_point_jet(state: &LatentCLogLogState, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+fn latent_cloglog_point_jet(
+    state: &LatentCLogLogState,
+    eta: f64,
+) -> Result<InverseLinkJet, EstimationError> {
     let jet = latent_cloglog_jet5(latent_cloglog_quadctx(), eta, state.latent_sd)?;
     Ok(InverseLinkJet {
         mu: jet.mean,
@@ -887,12 +890,9 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
         InverseLink::Standard(LinkFunction::CLogLog) => Ok(
             component_inverse_link_pdfthird_derivative(LinkComponent::CLogLog, eta),
         ),
-        InverseLink::LatentCLogLog(state) => Ok(latent_cloglog_jet5(
-            latent_cloglog_quadctx(),
-            eta,
-            state.latent_sd,
-        )?
-        .d4),
+        InverseLink::LatentCLogLog(state) => {
+            Ok(latent_cloglog_jet5(latent_cloglog_quadctx(), eta, state.latent_sd)?.d4)
+        }
         InverseLink::Standard(LinkFunction::Sas) => {
             Ok(sas_inverse_link_pdfthird_derivative(eta, 0.0, 0.0))
         }
@@ -939,12 +939,9 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
         InverseLink::Standard(LinkFunction::CLogLog) => Ok(
             component_inverse_link_pdffourth_derivative(LinkComponent::CLogLog, eta),
         ),
-        InverseLink::LatentCLogLog(state) => Ok(latent_cloglog_jet5(
-            latent_cloglog_quadctx(),
-            eta,
-            state.latent_sd,
-        )?
-        .d5),
+        InverseLink::LatentCLogLog(state) => {
+            Ok(latent_cloglog_jet5(latent_cloglog_quadctx(), eta, state.latent_sd)?.d5)
+        }
         InverseLink::Standard(LinkFunction::Sas) => {
             Ok(sas_inverse_link_pdffourth_derivative(eta, 0.0, 0.0))
         }
@@ -1053,8 +1050,7 @@ pub fn inverse_link_jet_for_family(
             sas_link_state,
         ),
         LikelihoodFamily::BinomialLatentCLogLog => Err(EstimationError::InvalidInput(
-            "BinomialLatentCLogLog inverse-link requires explicit latent cloglog state"
-                .to_string(),
+            "BinomialLatentCLogLog inverse-link requires explicit latent cloglog state".to_string(),
         )),
         LikelihoodFamily::BinomialSas => inverse_link_jet_for_link_function(
             LinkFunction::Sas,

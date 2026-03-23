@@ -3,6 +3,7 @@
 //!
 //! Model: Λ(a|U) = B(a)·exp(U),  U ~ N(μ, σ²),  σ fixed.
 
+use crate::estimate::UnifiedFitResult;
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, fit_custom_family,
@@ -11,7 +12,6 @@ use crate::families::gamlss::{FamilyMetadata, ParameterLink};
 use crate::families::lognormal_kernel::{
     FrailtySpec, HazardLoading, LatentSurvivalRow, LatentSurvivalRowJet, RowJet2Block,
 };
-use crate::estimate::UnifiedFitResult;
 use crate::quadrature::QuadratureContext;
 use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -102,22 +102,19 @@ fn validate_latent_survival_inputs(
         } => Err(format!(
             "latent-survival currently supports only HazardLoading::Full, got {loading:?}"
         )),
-        FrailtySpec::HazardMultiplier { sigma_fixed: None, .. } => Err(
-            "latent-survival currently requires a fixed hazard-multiplier sigma".to_string(),
-        ),
-        FrailtySpec::GaussianShift { .. } => Err(
-            "latent-survival requires HazardMultiplier frailty, not GaussianShift".to_string(),
-        ),
+        FrailtySpec::HazardMultiplier {
+            sigma_fixed: None, ..
+        } => Err("latent-survival currently requires a fixed hazard-multiplier sigma".to_string()),
+        FrailtySpec::GaussianShift { .. } => {
+            Err("latent-survival requires HazardMultiplier frailty, not GaussianShift".to_string())
+        }
         FrailtySpec::None => Err(
             "latent-survival requires a fixed HazardMultiplier frailty specification".to_string(),
         ),
     }
 }
 
-fn build_eta_blockspec(
-    design: &TermCollectionDesign,
-    n_rows: usize,
-) -> ParameterBlockSpec {
+fn build_eta_blockspec(design: &TermCollectionDesign, n_rows: usize) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "eta".to_string(),
         design: design.design.clone(),
@@ -201,10 +198,7 @@ impl CustomFamily for LatentSurvivalFamily {
         })
     }
 
-    fn log_likelihood_only(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<f64, String> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         let state = expect_single_block(block_states, "LatentSurvivalFamily")?;
         let eta = &state.eta;
         let n = self.rows.len();
@@ -305,7 +299,11 @@ impl CustomFamily for LatentSurvivalLearnableSigmaFamily {
             } else {
                 z_mu[i] = mu_i + jet.score_mu / jet.neg_hessian_mu;
                 let raw = wi * jet.neg_hessian_mu;
-                w_mu[i] = if !raw.is_finite() || raw <= 0.0 { 0.0 } else { raw.max(MIN_WEIGHT) };
+                w_mu[i] = if !raw.is_finite() || raw <= 0.0 {
+                    0.0
+                } else {
+                    raw.max(MIN_WEIGHT)
+                };
             }
 
             // Block 1 (log_sigma)
@@ -315,7 +313,11 @@ impl CustomFamily for LatentSurvivalLearnableSigmaFamily {
             } else {
                 z_t[i] = t_i + jet.score_t / jet.neg_hessian_t;
                 let raw = wi * jet.neg_hessian_t;
-                w_t[i] = if !raw.is_finite() || raw <= 0.0 { 0.0 } else { raw.max(MIN_WEIGHT) };
+                w_t[i] = if !raw.is_finite() || raw <= 0.0 {
+                    0.0
+                } else {
+                    raw.max(MIN_WEIGHT)
+                };
             }
         }
 
@@ -355,8 +357,9 @@ impl CustomFamily for LatentSurvivalLearnableSigmaFamily {
                 continue;
             }
             let sigma_i = eta_t[i].exp();
-            let jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &self.rows[i], eta_mu[i], sigma_i)
-                .map_err(|e| format!("LatentSurvivalLearnableSigmaFamily row {i}: {e}"))?;
+            let jet =
+                LatentSurvivalRowJet::evaluate(&self.quadctx, &self.rows[i], eta_mu[i], sigma_i)
+                    .map_err(|e| format!("LatentSurvivalLearnableSigmaFamily row {i}: {e}"))?;
             ll += wi * jet.log_lik;
         }
         Ok(ll)
