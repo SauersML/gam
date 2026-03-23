@@ -15,6 +15,7 @@
 use crate::estimate::EstimationError;
 use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
+    cloglog_ghq_jet5_adaptive, cloglog_point_jet5, cloglog_posterior_meanwith_deriv_controlled,
     lognormal_laplace_term_shared,
 };
 use serde::{Deserialize, Serialize};
@@ -239,20 +240,30 @@ pub fn latent_cloglog_jet5(
     eta: f64,
     sigma: f64,
 ) -> Result<LatentCLogLogJet5, EstimationError> {
-    let bundle = kernel_bundle(quadctx, 1.0, eta, sigma.max(0.0), 5)?;
-    let a1 = bundle.get(1);
-    let a2 = bundle.get(2);
-    let a3 = bundle.get(3);
-    let a4 = bundle.get(4);
-    let a5 = bundle.get(5);
+    let sigma = sigma.max(0.0);
+    if sigma <= 1e-10 {
+        let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(eta);
+        return Ok(LatentCLogLogJet5 {
+            mean,
+            d1,
+            d2,
+            d3,
+            d4,
+            d5,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        });
+    }
+
+    let base = cloglog_posterior_meanwith_deriv_controlled(quadctx, eta, sigma);
+    let (_, _, d2, d3, d4, d5) = cloglog_ghq_jet5_adaptive(quadctx, eta, sigma);
     Ok(LatentCLogLogJet5 {
-        mean: (1.0 - bundle.get(0)).clamp(0.0, 1.0),
-        d1: a1.max(0.0),
-        d2: a1 - a2,
-        d3: a1 - 3.0 * a2 + a3,
-        d4: a1 - 7.0 * a2 + 6.0 * a3 - a4,
-        d5: a1 - 15.0 * a2 + 25.0 * a3 - 10.0 * a4 + a5,
-        mode: bundle.mode,
+        mean: base.mean,
+        d1: base.dmean_dmu.max(0.0),
+        d2,
+        d3,
+        d4,
+        d5,
+        mode: base.mode,
     })
 }
 
@@ -847,6 +858,20 @@ fn survival_row_d4_ll(
 mod tests {
     use super::*;
 
+    fn latent_binomial_row_log_lik(
+        ctx: &QuadratureContext,
+        eta: f64,
+        sigma: f64,
+        y: f64,
+        weight: f64,
+    ) -> f64 {
+        let mu = latent_cloglog_jet5(ctx, eta, sigma)
+            .expect("latent jet")
+            .mean;
+        let mu = mu.clamp(1e-12, 1.0 - 1e-12);
+        weight * (y * mu.ln() + (1.0 - y) * (1.0 - mu).ln())
+    }
+
     #[test]
     fn kernel_mu_jet_d1_fd_check() {
         let ctx = QuadratureContext::new();
@@ -1013,5 +1038,96 @@ mod tests {
         assert!((jet.d3 - d3).abs() < 1e-12);
         assert!((jet.d4 - d4).abs() < 1e-12);
         assert!((jet.d5 - d5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn latent_cloglog_jet_curvature_envelope_matches_scalar_backend_differences() {
+        const CURVATURE_ABS_EPS: f64 = 2e-5;
+        const CURVATURE_REL_EPS: f64 = 2e-3;
+        const THIRD_ABS_EPS: f64 = 8e-5;
+        const THIRD_REL_EPS: f64 = 8e-3;
+
+        let ctx = QuadratureContext::new();
+        let cases = [(-4.0, 0.15), (-1.2, 0.35), (0.4, 0.6), (1.3, 0.9)];
+        let h = 2e-4;
+
+        for (eta, sigma) in cases {
+            let jet = latent_cloglog_jet5(&ctx, eta, sigma).expect("latent jet");
+            let dm2 = crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(
+                &ctx,
+                eta - 2.0 * h,
+                sigma,
+            );
+            let dm1 = crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(
+                &ctx,
+                eta - h,
+                sigma,
+            );
+            let d0 =
+                crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(&ctx, eta, sigma);
+            let dp1 = crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(
+                &ctx,
+                eta + h,
+                sigma,
+            );
+            let dp2 = crate::quadrature::cloglog_posterior_meanwith_deriv_controlled(
+                &ctx,
+                eta + 2.0 * h,
+                sigma,
+            );
+
+            let d2fd = (dm2.dmean_dmu - 8.0 * dm1.dmean_dmu + 8.0 * dp1.dmean_dmu - dp2.dmean_dmu)
+                / (12.0 * h);
+            let d3fd = (-dp2.dmean_dmu + 16.0 * dp1.dmean_dmu - 30.0 * d0.dmean_dmu
+                + 16.0 * dm1.dmean_dmu
+                - dm2.dmean_dmu)
+                / (12.0 * h * h);
+
+            let d2_err = (jet.d2 - d2fd).abs();
+            let d3_err = (jet.d3 - d3fd).abs();
+
+            assert!(
+                d2_err <= CURVATURE_ABS_EPS.max(CURVATURE_REL_EPS * d2fd.abs()),
+                "latent cloglog curvature envelope failed at eta={eta}, sigma={sigma}: analytic={} fd={}",
+                jet.d2,
+                d2fd
+            );
+            assert!(
+                d3_err <= THIRD_ABS_EPS.max(THIRD_REL_EPS * d3fd.abs()),
+                "latent cloglog third-derivative envelope failed at eta={eta}, sigma={sigma}: analytic={} fd={}",
+                jet.d3,
+                d3fd
+            );
+        }
+    }
+
+    #[test]
+    fn latent_cloglog_binomial_row_neg_hessian_matches_fd() {
+        let ctx = QuadratureContext::new();
+        let eta = 0.4;
+        let sigma = 0.6;
+        let y = 0.35;
+        let weight = 2.0;
+        let h = 1e-4;
+
+        let jet = latent_cloglog_jet5(&ctx, eta, sigma).expect("latent jet");
+        let mu = jet.mean.clamp(1e-12, 1.0 - 1e-12);
+        let ellmu = y / mu - (1.0 - y) / (1.0 - mu);
+        let ellmumu = -y / (mu * mu) - (1.0 - y) / ((1.0 - mu) * (1.0 - mu));
+        let neg_hessian = -weight * (ellmumu * jet.d1 * jet.d1 + ellmu * jet.d2);
+
+        let ll_minus = latent_binomial_row_log_lik(&ctx, eta - h, sigma, y, weight);
+        let ll0 = latent_binomial_row_log_lik(&ctx, eta, sigma, y, weight);
+        let ll_plus = latent_binomial_row_log_lik(&ctx, eta + h, sigma, y, weight);
+        let neg_hessian_fd = -(ll_plus - 2.0 * ll0 + ll_minus) / (h * h);
+
+        let err = (neg_hessian - neg_hessian_fd).abs();
+        let tol = 2e-5_f64.max(3e-3 * neg_hessian_fd.abs());
+        assert!(
+            err <= tol,
+            "latent cloglog Bernoulli row curvature mismatch: analytic={} fd={}",
+            neg_hessian,
+            neg_hessian_fd
+        );
     }
 }

@@ -2781,7 +2781,15 @@ mod tests {
         let logdet_h: f64 = {
             use crate::faer_ndarray::FaerEigh;
             let (evals, _) = h_dense.eigh(faer::Side::Lower).expect("eigh");
-            evals.iter().map(|&v| v.ln()).sum()
+            let max_ev = evals.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs()));
+            let eps = f64::EPSILON.sqrt() * max_ev.max(1.0);
+            evals
+                .iter()
+                .map(|&sigma| {
+                    let r = 0.5 * (sigma + (sigma * sigma + 4.0 * eps * eps).sqrt());
+                    r.ln()
+                })
+                .sum()
         };
         let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;
 

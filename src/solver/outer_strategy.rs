@@ -196,21 +196,6 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             hessian_source: H::Analytic,
         },
 
-        // For small problems, an analytic gradient plus an explicit FD Hessian
-        // is still the best-conditioned outer model and matches the intended
-        // "few hyperparameters -> Newton" policy.
-        (Analytic, FiniteDifference) if cap.n_params <= 8 => OuterPlan {
-            solver: S::NewtonTrustRegion,
-            hessian_source: H::FiniteDifference,
-        },
-
-        // Analytic gradient but no Hessian: for a small number of outer
-        // coordinates we still prefer Newton with an internal FD Hessian.
-        (Analytic, Unavailable) if cap.n_params <= 8 => OuterPlan {
-            solver: S::NewtonTrustRegion,
-            hessian_source: H::FiniteDifference,
-        },
-
         // EFS: all penalty-like coords, no analytic Hessian, many params.
         // Multiplicative fixed-point needs only traces — no gradient evals.
         // Much cheaper than BFGS for k=10-50 smoothing parameters.
@@ -1548,7 +1533,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_fd_hessian_selects_newton() {
+    fn plan_fd_hessian_selects_bfgs() {
+        // FD Hessian is never used; BFGS is preferred over Newton+FD.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::FiniteDifference,
@@ -1558,12 +1544,13 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
-        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
-    fn plan_no_hessian_few_params_selects_fd() {
+    fn plan_no_hessian_few_params_selects_bfgs() {
+        // Even with few params, BFGS is preferred over Newton+FD.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -1573,8 +1560,8 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
-        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -1624,7 +1611,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_boundary_8_params_uses_fd() {
+    fn plan_boundary_8_params_uses_bfgs() {
+        // No FD even at the old boundary — BFGS everywhere.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -1634,7 +1622,7 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -1692,8 +1680,8 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        // With few params and analytic gradient, FD Newton is better.
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
+        // Few params but no EFS (below threshold); BFGS, never FD.
+        assert_eq!(p.solver, Solver::Bfgs);
     }
 
     #[test]
@@ -1920,7 +1908,7 @@ mod tests {
 
     #[test]
     fn plan_hybrid_efs_not_selected_few_params() {
-        // With few params, FD Hessian is preferred over hybrid EFS.
+        // With few params, BFGS is preferred over hybrid EFS (and never FD).
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -1930,8 +1918,7 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        // Few params + analytic gradient → FD Newton is better.
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
+        assert_eq!(p.solver, Solver::Bfgs);
     }
 
     #[test]

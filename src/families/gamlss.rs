@@ -1,7 +1,7 @@
 use crate::basis::{
-    BasisFamily, BasisOptions, Dense, KnotSource, PenaltyInfo, PenaltySource, create_basis,
-    create_difference_penalty_matrix, create_ispline_derivative_dense,
+    BasisFamily, BasisOptions, Dense, KnotSource, PenaltyInfo, PenaltySource,
     basis_family_value_derivative_is_structurally_zero, basis_family_value_span_polynomial_degree,
+    create_basis, create_difference_penalty_matrix, create_ispline_derivative_dense,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -478,11 +478,9 @@ fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, String> {
 #[inline]
 pub(crate) fn monotone_wiggle_structure(degree: usize) -> Result<MonotoneWiggleStructure, String> {
     let internal_degree = monotone_wiggle_internal_degree(degree)?;
-    let value_span_degree = basis_family_value_span_polynomial_degree(
-        BasisFamily::ISpline,
-        internal_degree,
-    )
-    .map_err(|e| e.to_string())?;
+    let value_span_degree =
+        basis_family_value_span_polynomial_degree(BasisFamily::ISpline, internal_degree)
+            .map_err(|e| e.to_string())?;
     let fourth_derivative_zero = basis_family_value_derivative_is_structurally_zero(
         BasisFamily::ISpline,
         internal_degree,

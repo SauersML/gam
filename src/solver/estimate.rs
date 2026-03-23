@@ -783,6 +783,11 @@ impl RemlConfig {
         }
     }
 
+    fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = max_iterations;
+        self
+    }
+
     fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }

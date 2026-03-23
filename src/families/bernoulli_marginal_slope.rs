@@ -12,11 +12,12 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{
-    ParameterBlockInput, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
-    select_wiggle_basis_from_seed,
+    MonotoneWiggleStructure, ParameterBlockInput, WiggleBlockConfig,
+    monotone_wiggle_basis_with_derivative_order, select_wiggle_basis_from_seed,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
+use crate::linalg::utils::matrix_inversewith_regularization;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
@@ -34,6 +35,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 pub(crate) mod exact_kernel;
+
+pub(crate) const ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -58,6 +61,17 @@ impl Default for DeviationBlockConfig {
     }
 }
 
+/// Precomputed per-span Taylor design matrices for a monotone deviation basis.
+///
+/// **Structural invariant:** the value basis must be piecewise cubic
+/// (`value_span_degree <= 3`) so that the fourth derivative is identically
+/// zero on every knot span.  This allows `local_cubic_on_span` and
+/// `basis_span_cubic` to reconstruct each basis function as an *exact*
+/// Taylor polynomial `c₀ + c₁t + c₂t² + c₃t³` — no truncation error.
+///
+/// The invariant is enforced at construction time in [`DeviationRuntime::try_new`]:
+/// both a type-level check (`MonotoneWiggleStructure::fourth_derivative_is_structurally_zero`)
+/// and a numerical verification (max |d⁴/dx⁴| at span midpoints) must pass.
 #[derive(Clone, Debug)]
 pub struct DeviationRuntime {
     pub knots: Array1<f64>,
@@ -65,6 +79,7 @@ pub struct DeviationRuntime {
     pub value_span_degree: usize,
     pub basis_dim: usize,
     pub monotonicity_eps: f64,
+    pub basis_transform: Array2<f64>,
     endpoint_points: Array1<f64>,
     span_left_value_design: Array2<f64>,
     span_left_points: Array1<f64>,
@@ -139,6 +154,110 @@ struct ThetaHints {
 }
 
 impl DeviationRuntime {
+    /// Construct a `DeviationRuntime`, enforcing the piecewise-cubic invariant.
+    ///
+    /// Returns `Err` if:
+    /// - `structure.fourth_derivative_is_structurally_zero()` is false
+    ///   (type-level rejection based on basis family and degree), OR
+    /// - the numerically evaluated fourth-derivative design at span midpoints
+    ///   has any entry with `|value| > 1e-10` (belt-and-suspenders check).
+    #[allow(clippy::too_many_arguments)]
+    fn try_new(
+        knots: Array1<f64>,
+        degree: usize,
+        structure: &MonotoneWiggleStructure,
+        basis_dim: usize,
+        monotonicity_eps: f64,
+        basis_transform: Array2<f64>,
+        endpoint_points: Array1<f64>,
+        span_left_points: Array1<f64>,
+        span_right_points: Array1<f64>,
+        span_mid_points: &Array1<f64>,
+    ) -> Result<Self, String> {
+        // ── gate 1: structural / type-level ──
+        if !structure.fourth_derivative_is_structurally_zero() {
+            return Err(format!(
+                "DeviationRuntime requires a piecewise-cubic value basis \
+                 (fourth derivative structurally zero), but the monotone wiggle \
+                 basis has per-span polynomial degree {} (from public degree {})",
+                structure.value_span_degree, degree
+            ));
+        }
+
+        // ── gate 2: numerical verification ──
+        let d4_design = anchored_deviation_basis_with_transform(
+            span_mid_points.view(),
+            &knots,
+            degree,
+            &basis_transform,
+            4,
+        )?;
+        let d4_max = d4_design
+            .iter()
+            .copied()
+            .fold(0.0_f64, |a, b| a.max(b.abs()));
+        if d4_max > 1e-10 {
+            return Err(format!(
+                "DeviationRuntime numerical fourth-derivative check failed: \
+                 max |d⁴/dx⁴| at span midpoints = {d4_max:.6e} (expected 0)"
+            ));
+        }
+
+        // ── build design matrices ──
+        let span_left_value_design = anchored_deviation_basis_with_transform(
+            span_left_points.view(),
+            &knots,
+            degree,
+            &basis_transform,
+            0,
+        )?;
+        let span_left_d1_design = anchored_deviation_basis_with_transform(
+            span_left_points.view(),
+            &knots,
+            degree,
+            &basis_transform,
+            1,
+        )?;
+        let span_right_d1_design = anchored_deviation_basis_with_transform(
+            span_right_points.view(),
+            &knots,
+            degree,
+            &basis_transform,
+            1,
+        )?;
+        let span_left_d2_design = anchored_deviation_basis_with_transform(
+            span_left_points.view(),
+            &knots,
+            degree,
+            &basis_transform,
+            2,
+        )?;
+        let span_mid_d3_design = anchored_deviation_basis_with_transform(
+            span_mid_points.view(),
+            &knots,
+            degree,
+            &basis_transform,
+            3,
+        )?;
+
+        Ok(Self {
+            knots,
+            degree,
+            value_span_degree: structure.value_span_degree,
+            basis_dim,
+            monotonicity_eps,
+            basis_transform,
+            endpoint_points,
+            span_left_value_design,
+            span_left_points,
+            span_right_points,
+            span_left_d1_design,
+            span_right_d1_design,
+            span_left_d2_design,
+            span_mid_d3_design,
+        })
+    }
+
     fn validate_beta_shape(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {
         if beta.len() != self.basis_dim {
             return Err(format!(
@@ -151,38 +270,53 @@ impl DeviationRuntime {
     }
 
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        monotone_wiggle_basis_with_derivative_order(
+        anchored_deviation_basis_with_transform(
             values.view(),
             &self.knots,
             self.degree,
+            &self.basis_transform,
             BasisOptions::value().derivative_order,
         )
     }
 
     pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        monotone_wiggle_basis_with_derivative_order(
+        anchored_deviation_basis_with_transform(
             values.view(),
             &self.knots,
             self.degree,
+            &self.basis_transform,
             BasisOptions::first_derivative().derivative_order,
         )
     }
 
     pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        monotone_wiggle_basis_with_derivative_order(
+        anchored_deviation_basis_with_transform(
             values.view(),
             &self.knots,
             self.degree,
+            &self.basis_transform,
             BasisOptions::second_derivative().derivative_order,
         )
     }
 
     pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        monotone_wiggle_basis_with_derivative_order(values.view(), &self.knots, self.degree, 3)
+        anchored_deviation_basis_with_transform(
+            values.view(),
+            &self.knots,
+            self.degree,
+            &self.basis_transform,
+            3,
+        )
     }
 
     pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        monotone_wiggle_basis_with_derivative_order(values.view(), &self.knots, self.degree, 4)
+        anchored_deviation_basis_with_transform(
+            values.view(),
+            &self.knots,
+            self.degree,
+            &self.basis_transform,
+            4,
+        )
     }
 
     fn span_count(&self) -> usize {
@@ -410,6 +544,75 @@ impl DeviationRuntime {
     }
 }
 
+pub(crate) fn anchored_deviation_basis_with_transform(
+    values: ndarray::ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    basis_transform: &Array2<f64>,
+    derivative_order: usize,
+) -> Result<Array2<f64>, String> {
+    let raw = monotone_wiggle_basis_with_derivative_order(values, knots, degree, derivative_order)?;
+    if raw.ncols() != basis_transform.nrows() {
+        return Err(format!(
+            "anchored deviation raw basis mismatch: transform expects {} rows but raw basis has {} columns",
+            basis_transform.nrows(),
+            raw.ncols()
+        ));
+    }
+    Ok(raw.dot(basis_transform))
+}
+
+fn max_abs_matrix_diff(lhs: &Array2<f64>, rhs: &Array2<f64>) -> f64 {
+    if lhs.dim() != rhs.dim() {
+        return f64::INFINITY;
+    }
+    let mut max_diff = 0.0_f64;
+    for i in 0..lhs.nrows() {
+        for j in 0..lhs.ncols() {
+            max_diff = max_diff.max((lhs[[i, j]] - rhs[[i, j]]).abs());
+        }
+    }
+    max_diff
+}
+
+fn derive_deviation_basis_transform(
+    seed: &Array1<f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    constrained_design: &DesignMatrix,
+) -> Result<Array2<f64>, String> {
+    let raw_design = monotone_wiggle_basis_with_derivative_order(seed.view(), knots, degree, 0)?;
+    let constrained_dense = constrained_design.to_dense();
+    if raw_design.nrows() != constrained_dense.nrows() {
+        return Err(format!(
+            "anchored deviation design row mismatch while deriving replay transform: raw rows={}, constrained rows={}",
+            raw_design.nrows(),
+            constrained_dense.nrows()
+        ));
+    }
+    if raw_design.ncols() == constrained_dense.ncols()
+        && max_abs_matrix_diff(&raw_design, &constrained_dense) <= 1e-12
+    {
+        return Ok(Array2::<f64>::eye(raw_design.ncols()));
+    }
+
+    let gram = raw_design.t().dot(&raw_design);
+    let rhs = raw_design.t().dot(&constrained_dense);
+    let gram_inv = matrix_inversewith_regularization(&gram, "anchored deviation basis replay")
+        .ok_or_else(|| {
+            "failed to derive anchored deviation replay transform from training design".to_string()
+        })?;
+    let basis_transform = gram_inv.dot(&rhs);
+    let replayed = raw_design.dot(&basis_transform);
+    let replay_error = max_abs_matrix_diff(&replayed, &constrained_dense);
+    if !replay_error.is_finite() || replay_error > 1e-8 {
+        return Err(format!(
+            "anchored deviation replay transform does not exactly reproduce the training design (max abs error {replay_error:.3e})"
+        ));
+    }
+    Ok(basis_transform)
+}
+
 pub(crate) fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
@@ -424,18 +627,13 @@ pub(crate) fn build_deviation_block_from_seed(
         },
         &cfg.penalty_orders,
     )?;
-    if !selected.structure.fourth_derivative_is_structurally_zero() {
-        return Err(format!(
-            "exact de-nested cubic bernoulli marginal-slope requires a deviation value basis whose fourth derivative is structurally zero on every span, got piecewise degree {} from public degree={}",
-            selected.structure.value_span_degree,
-            cfg.degree
-        ));
-    }
     let block = selected.block;
     let dim = block.design.ncols();
     let knots = selected.knots;
     let degree = selected.degree;
-    let value_span_degree = selected.structure.value_span_degree;
+    let basis_transform = derive_deviation_basis_transform(seed, &knots, degree, &block.design)?;
+
+    // Deduplicate knots into breakpoints, derive span intervals.
     let mut endpoint_points = Vec::new();
     for &knot in knots.iter() {
         if endpoint_points
@@ -465,75 +663,20 @@ pub(crate) fn build_deviation_block_from_seed(
     if span_left.is_empty() {
         return Err("deviation runtime requires at least one active knot span".to_string());
     }
-    let endpoint_points = Array1::from_vec(endpoint_points);
-    let span_left_points = Array1::from_vec(span_left);
-    let span_right_points = Array1::from_vec(span_right);
-    let span_mid_points = Array1::from_vec(span_mid);
 
-    // Structural invariant: the exact de-nested cubic path requires that the
-    // value basis is piecewise cubic on every knot span, i.e. the fourth
-    // derivative is identically zero.  Verify this by evaluating the fourth
-    // derivative design at the span midpoints — if any entry is nonzero, the
-    // basis degree is too high and the cubic Taylor reconstruction would lose
-    // a nonzero higher-order term.
-    let d4_design = monotone_wiggle_basis_with_derivative_order(
-        span_mid_points.view(),
-        &knots,
+    // Construction and cubic-invariant enforcement delegated to try_new.
+    let runtime = DeviationRuntime::try_new(
+        knots,
         degree,
-        4,
+        &selected.structure,
+        dim,
+        cfg.monotonicity_eps,
+        basis_transform,
+        Array1::from_vec(endpoint_points),
+        Array1::from_vec(span_left),
+        Array1::from_vec(span_right),
+        &Array1::from_vec(span_mid),
     )?;
-    let d4_max = d4_design
-        .iter()
-        .copied()
-        .fold(0.0_f64, |a, b| a.max(b.abs()));
-    if d4_max > 1e-10 {
-        return Err(format!(
-            "exact de-nested cubic path requires a piecewise-cubic value basis \
-             (structurally zero fourth derivative), but the fourth derivative design \
-             has max |entry| = {d4_max:.6e} — the basis is higher than cubic"
-        ));
-    }
-
-    let runtime = DeviationRuntime {
-        knots: knots.clone(),
-        degree,
-        value_span_degree,
-        basis_dim: dim,
-        monotonicity_eps: cfg.monotonicity_eps,
-        span_left_value_design: monotone_wiggle_basis_with_derivative_order(
-            span_left_points.view(),
-            &knots,
-            degree,
-            0,
-        )?,
-        span_left_d1_design: monotone_wiggle_basis_with_derivative_order(
-            span_left_points.view(),
-            &knots,
-            degree,
-            1,
-        )?,
-        span_right_d1_design: monotone_wiggle_basis_with_derivative_order(
-            span_right_points.view(),
-            &knots,
-            degree,
-            1,
-        )?,
-        span_left_d2_design: monotone_wiggle_basis_with_derivative_order(
-            span_left_points.view(),
-            &knots,
-            degree,
-            2,
-        )?,
-        span_mid_d3_design: monotone_wiggle_basis_with_derivative_order(
-            span_mid_points.view(),
-            &knots,
-            degree,
-            3,
-        )?,
-        endpoint_points,
-        span_left_points,
-        span_right_points,
-    };
     Ok(DeviationPrepared { block, runtime })
 }
 
@@ -2107,11 +2250,6 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64), String> {
-        // Evaluate the de-nested calibration equation through the exact
-        // cell-partition kernel: affine cells use the closed-form anchor and
-        // quartic/sextic cells use transported non-affine moments.
-        //   F(a) = E[ Φ(a + b z + b Δ_h(z) + Δ_w(a + b z)) ] - Φ(q)
-        // and its derivative with respect to a.
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
             self.evaluate_denested_calibration(a, marginal_eta, slope, beta_h, beta_w)
         };
@@ -2120,7 +2258,7 @@ impl BernoulliMarginalSlopeFamily {
         // When link deviation is active, upgrade to affine-link warm start:
         //   L(u) ≈ ℓ₀ + ℓ₁·u  ⟹  a = (q·√(1+ℓ₁²b²) − ℓ₀) / ℓ₁
         let a_rigid = marginal_eta * (1.0 + slope * slope).sqrt();
-        let mut a = if beta_w.is_some() {
+        let a_init = if beta_w.is_some() {
             let v = Array1::from_vec(vec![a_rigid]);
             let (l_val, l_d1) = self.link_terms_value_d1(&v, beta_w)?;
             let ell1 = l_d1[0];
@@ -2134,144 +2272,14 @@ impl BernoulliMarginalSlopeFamily {
             a_rigid
         };
 
-        // First bracket the unique monotone root. The previous implementation
-        // took unconstrained Newton steps before a sign bracket existed, which
-        // is unstable in the extreme probit tail because F(a) saturates while
-        // F'(a) is tiny, producing huge oscillatory jumps.
-        let (f_init, f_deriv_init, _) = eval(a)?;
-        if f_init == 0.0 {
-            return Ok((a, f_deriv_init));
-        }
-
-        let mut lo;
-        let mut hi;
-        let f_lo;
-        let f_hi;
-        let mut bracket_step = (0.25 * (1.0 + a.abs())).max(1.0);
-        if f_init < 0.0 {
-            lo = a;
-            let mut found = None;
-            for _ in 0..64 {
-                let hi_try = a + bracket_step;
-                let (f_try, _, _) = eval(hi_try)?;
-                if f_try >= 0.0 {
-                    found = Some((hi_try, f_try));
-                    break;
-                }
-                lo = hi_try;
-                bracket_step *= 2.0;
-            }
-            let Some((hi_found, f_hi_found)) = found else {
-                return Err(format!(
-                    "bernoulli marginal-slope intercept solve failed to bracket root from below: \
-                     q={marginal_eta:.6}, slope={slope:.6}, last_a={lo:.6}"
-                ));
-            };
-            hi = hi_found;
-            let (f_lo_val, _, _) = eval(lo)?;
-            f_lo = f_lo_val;
-            f_hi = f_hi_found;
-        } else {
-            hi = a;
-            let mut found = None;
-            for _ in 0..64 {
-                let lo_try = a - bracket_step;
-                let (f_try, _, _) = eval(lo_try)?;
-                if f_try <= 0.0 {
-                    found = Some((lo_try, f_try));
-                    break;
-                }
-                hi = lo_try;
-                bracket_step *= 2.0;
-            }
-            let Some((lo_found, f_lo_found)) = found else {
-                return Err(format!(
-                    "bernoulli marginal-slope intercept solve failed to bracket root from above: \
-                     q={marginal_eta:.6}, slope={slope:.6}, last_a={hi:.6}"
-                ));
-            };
-            lo = lo_found;
-            let (f_hi_val, _, _) = eval(hi)?;
-            f_hi = f_hi_val;
-            f_lo = f_lo_found;
-        }
-
-        let (mut best_a, mut best_f, mut best_deriv) = if f_init.abs() <= f_lo.abs().min(f_hi.abs())
-        {
-            (a, f_init, f_deriv_init)
-        } else if f_lo.abs() <= f_hi.abs() {
-            let (_, d_lo, _) = eval(lo)?;
-            (lo, f_lo, d_lo)
-        } else {
-            let (_, d_hi, _) = eval(hi)?;
-            (hi, f_hi, d_hi)
-        };
-
-        a = a.clamp(lo, hi);
-        for _ in 0..48 {
-            let (f_val, f_deriv, _) = eval(a)?;
-            if f_val.abs() < best_f.abs() {
-                best_a = a;
-                best_f = f_val;
-                best_deriv = f_deriv;
-            }
-            if f_val.abs() <= 1e-10 {
-                best_a = a;
-                best_f = f_val;
-                best_deriv = f_deriv;
-                break;
-            }
-
-            if f_val < 0.0 {
-                lo = a;
-            } else {
-                hi = a;
-            }
-
-            if (hi - lo) <= 1e-12 * (1.0 + a.abs()) {
-                let mid = 0.5 * (lo + hi);
-                let (f_mid, f_mid_deriv, _) = eval(mid)?;
-                if f_mid.abs() < best_f.abs() {
-                    best_a = mid;
-                    best_f = f_mid;
-                    best_deriv = f_mid_deriv;
-                }
-                break;
-            }
-
-            let midpoint = 0.5 * (lo + hi);
-            let a_newton = if f_deriv.is_finite() && f_deriv > 0.0 {
-                let cand = a - f_val / f_deriv;
-                if cand > lo && cand < hi {
-                    cand
-                } else {
-                    midpoint
-                }
-            } else {
-                midpoint
-            };
-            a = a_newton;
-        }
-
-        // Adaptive tolerance: for extreme slopes the intercept equation
-        // becomes numerically flat and 1e-8 absolute precision is not
-        // achievable.  Accept the best bracketed solution when the
-        // relative residual is small.
-        let target = normal_cdf(marginal_eta);
-        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
-        if best_f.abs() > abs_tol {
-            return Err(format!(
-                "bernoulli marginal-slope intercept solve failed: \
-                 residual={best_f:.3e} at a={best_a:.6}, target Φ(q)={target:.6}"
-            ));
-        }
-        if !best_deriv.is_finite() || best_deriv <= 0.0 {
-            return Err(format!(
-                "bernoulli marginal-slope intercept solve produced non-positive calibration derivative: \
-                 M_a={best_deriv:.3e} at a={best_a:.6}"
-            ));
-        }
-        Ok((best_a, best_deriv))
+        super::monotone_root::solve_monotone_root(
+            eval,
+            a_init,
+            "bernoulli intercept",
+            1e-10,
+            64,
+            48,
+        )
     }
 
     fn build_row_exact_context(
@@ -2585,8 +2593,11 @@ impl BernoulliMarginalSlopeFamily {
         }
         {
             let mut logslope = out.slice_mut(s![slices.logslope.clone()]);
-            self.logslope_design
-                .axpy_row_into(row, primary_vec[primary.logslope], &mut logslope)?;
+            self.logslope_design.axpy_row_into(
+                row,
+                primary_vec[primary.logslope],
+                &mut logslope,
+            )?;
         }
         if let Some(primary_h) = primary.h.as_ref() {
             if let Some(block_h) = slices.h.as_ref() {
@@ -4161,7 +4172,20 @@ impl BernoulliMarginalSlopeFamily {
 
             coeff_u_dir_u[1] = coeff_b_dir_u;
             coeff_u_dir_v[1] = coeff_b_dir_v;
-            coeff_u_dir_uv[1] = coeff_dir_uv;
+            coeff_u_dir_uv[1] = {
+                let mut out = [0.0; 4];
+                add_scaled_coeff4(&mut out, &coeff_bbu[1], dir_u_b * dir_v_b);
+                if let Some(w_range) = w_range {
+                    for idx in w_range.clone() {
+                        add_scaled_coeff4(
+                            &mut out,
+                            &coeff_bbu[idx],
+                            dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                        );
+                    }
+                }
+                out
+            };
             coeff_au_dir_u[1] = {
                 let mut out = [0.0; 4];
                 add_scaled_coeff4(&mut out, &coeff_abu[1], dir_u_b);
@@ -4775,7 +4799,20 @@ impl BernoulliMarginalSlopeFamily {
             }
             out
         };
-        tmp_uv[1] = g_dir_uv_fixed;
+        tmp_uv[1] = {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &g_bbu_fixed[1], dir_u_b * dir_v_b);
+            if let Some(w_range) = w_range {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(
+                        &mut out,
+                        &g_bbu_fixed[idx],
+                        dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
+                    );
+                }
+            }
+            out
+        };
         tmp_au_u[1] = {
             let mut out = [0.0; 4];
             add_scaled_coeff4(&mut out, &g_abu_fixed[1], dir_u_b);
@@ -7506,7 +7543,10 @@ mod tests {
             0,
             "zero-column logslope design should not contribute coefficient coordinates"
         );
-        assert_eq!(link_slice.start, 0, "link-only coefficients should start at 0");
+        assert_eq!(
+            link_slice.start, 0,
+            "link-only coefficients should start at 0"
+        );
         assert_eq!(link_slice.len(), link_dim);
 
         let primary = primary_slices(&slices);
@@ -7767,19 +7807,34 @@ mod tests {
     }
 
     #[test]
-    fn exact_monotonicity_requires_cubic_deviation_basis() {
+    fn exact_monotonicity_accepts_lower_degree_when_fourth_derivative_is_structurally_zero() {
         let seed = array![-1.0, 0.0, 1.0];
-        let err = match build_deviation_block_from_seed(
+        let prepared = build_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 degree: 2,
                 ..DeviationBlockConfig::default()
             },
+        )
+        .expect("quadratic deviation basis should remain exact");
+        assert_eq!(prepared.runtime.degree, 2);
+        assert_eq!(prepared.runtime.value_span_degree, 2);
+    }
+
+    #[test]
+    fn exact_monotonicity_rejects_deviation_basis_with_nonzero_fourth_derivative() {
+        let seed = array![-1.0, 0.0, 1.0];
+        let err = match build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                degree: 4,
+                ..DeviationBlockConfig::default()
+            },
         ) {
-            Ok(_) => panic!("non-cubic deviation basis should be rejected"),
+            Ok(_) => panic!("quartic deviation basis should be rejected"),
             Err(err) => err,
         };
-        assert!(err.contains("requires cubic deviation blocks"));
+        assert!(err.contains("fourth derivative is structurally zero"));
     }
 
     #[test]
@@ -7882,6 +7937,34 @@ mod tests {
                 .expect("basis cubic at x");
             assert_eq!(selected.left, cubic.left);
             assert_eq!(selected.right, cubic.right);
+        }
+    }
+
+    #[test]
+    fn deviation_runtime_replays_the_exact_training_basis() {
+        let seed = array![-2.0, -1.0, -0.25, 0.25, 1.0, 2.0];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build deviation block");
+
+        let replayed = prepared
+            .runtime
+            .design(&seed)
+            .expect("replay anchored deviation design");
+        let trained = prepared.block.design.to_dense();
+        assert_eq!(replayed.dim(), trained.dim());
+        for i in 0..replayed.nrows() {
+            for j in 0..replayed.ncols() {
+                assert!(
+                    (replayed[[i, j]] - trained[[i, j]]).abs() <= 1e-10,
+                    "replayed anchored deviation design mismatch at ({i},{j})"
+                );
+            }
         }
     }
 
@@ -8723,16 +8806,12 @@ mod tests {
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[slices.marginal.start] = 0.4;
-        dir_u[slices.logslope.start] = -0.3;
         let w_range = slices.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.15;
         if w_range.len() > 1 {
             dir_u[w_range.start + 1] = -0.07;
         }
 
-        dir_v[slices.marginal.start] = -0.2;
-        dir_v[slices.logslope.start] = 0.25;
         dir_v[w_range.start] = 0.09;
         if w_range.len() > 1 {
             dir_v[w_range.start + 1] = 0.03;
@@ -8817,16 +8896,12 @@ mod tests {
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[slices.marginal.start] = -0.35;
-        dir_u[slices.logslope.start] = 0.28;
         let h_range = slices.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.12;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.06;
         }
 
-        dir_v[slices.marginal.start] = 0.18;
-        dir_v[slices.logslope.start] = -0.22;
         dir_v[h_range.start] = 0.07;
         if h_range.len() > 1 {
             dir_v[h_range.start + 1] = 0.05;
@@ -8914,16 +8989,16 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = -0.35;
-        dir_u[cache.slices.logslope.start] = 0.28;
-        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[cache.primary.q] = -0.35;
+        dir_u[cache.primary.logslope] = 0.28;
+        let h_range = cache.primary.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.12;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.06;
         }
 
-        dir_v[cache.slices.marginal.start] = 0.18;
-        dir_v[cache.slices.logslope.start] = -0.22;
+        dir_v[cache.primary.q] = 0.18;
+        dir_v[cache.primary.logslope] = -0.22;
         dir_v[h_range.start] = 0.07;
         if h_range.len() > 1 {
             dir_v[h_range.start + 1] = 0.05;
@@ -9037,16 +9112,16 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = 0.4;
-        dir_u[cache.slices.logslope.start] = -0.3;
-        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[cache.primary.q] = 0.4;
+        dir_u[cache.primary.logslope] = -0.3;
+        let w_range = cache.primary.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.15;
         if w_range.len() > 1 {
             dir_u[w_range.start + 1] = -0.07;
         }
 
-        dir_v[cache.slices.marginal.start] = -0.2;
-        dir_v[cache.slices.logslope.start] = 0.25;
+        dir_v[cache.primary.q] = -0.2;
+        dir_v[cache.primary.logslope] = 0.25;
         dir_v[w_range.start] = 0.09;
         if w_range.len() > 1 {
             dir_v[w_range.start + 1] = 0.03;
@@ -9180,18 +9255,18 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = 0.7;
-        dir_u[cache.slices.logslope.start] = -0.2;
-        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[cache.primary.q] = 0.7;
+        dir_u[cache.primary.logslope] = -0.2;
+        let h_range = cache.primary.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.1;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.05;
         }
-        let w_range = cache.slices.w.as_ref().expect("w slice");
+        let w_range = cache.primary.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.08;
 
-        dir_v[cache.slices.marginal.start] = -0.4;
-        dir_v[cache.slices.logslope.start] = 0.3;
+        dir_v[cache.primary.q] = -0.4;
+        dir_v[cache.primary.logslope] = 0.3;
         dir_v[h_range.start] = -0.03;
         dir_v[w_range.start] = 0.06;
         if w_range.len() > 1 {
@@ -9759,18 +9834,18 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = 0.7;
-        dir_u[cache.slices.logslope.start] = -0.2;
-        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[cache.primary.q] = 0.7;
+        dir_u[cache.primary.logslope] = -0.2;
+        let h_range = cache.primary.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.1;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.05;
         }
-        let w_range = cache.slices.w.as_ref().expect("w slice");
+        let w_range = cache.primary.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.08;
 
-        dir_v[cache.slices.marginal.start] = -0.4;
-        dir_v[cache.slices.logslope.start] = 0.3;
+        dir_v[cache.primary.q] = -0.4;
+        dir_v[cache.primary.logslope] = 0.3;
         dir_v[h_range.start] = -0.03;
         dir_v[w_range.start] = 0.06;
         if w_range.len() > 1 {
@@ -9881,18 +9956,18 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = 0.7;
-        dir_u[cache.slices.logslope.start] = -0.2;
-        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[cache.primary.q] = 0.7;
+        dir_u[cache.primary.logslope] = -0.2;
+        let h_range = cache.primary.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.1;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.05;
         }
-        let w_range = cache.slices.w.as_ref().expect("w slice");
+        let w_range = cache.primary.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.08;
 
-        dir_v[cache.slices.marginal.start] = -0.4;
-        dir_v[cache.slices.logslope.start] = 0.3;
+        dir_v[cache.primary.q] = -0.4;
+        dir_v[cache.primary.logslope] = 0.3;
         dir_v[h_range.start] = -0.03;
         dir_v[w_range.start] = 0.06;
         if w_range.len() > 1 {
@@ -10003,16 +10078,16 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = -0.35;
-        dir_u[cache.slices.logslope.start] = 0.28;
-        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[cache.primary.q] = -0.35;
+        dir_u[cache.primary.logslope] = 0.28;
+        let h_range = cache.primary.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.12;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.06;
         }
 
-        dir_v[cache.slices.marginal.start] = 0.18;
-        dir_v[cache.slices.logslope.start] = -0.22;
+        dir_v[cache.primary.q] = 0.18;
+        dir_v[cache.primary.logslope] = -0.22;
         dir_v[h_range.start] = 0.07;
         if h_range.len() > 1 {
             dir_v[h_range.start + 1] = 0.05;
@@ -10099,16 +10174,16 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = 0.4;
-        dir_u[cache.slices.logslope.start] = -0.3;
-        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[cache.primary.q] = 0.4;
+        dir_u[cache.primary.logslope] = -0.3;
+        let w_range = cache.primary.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.15;
         if w_range.len() > 1 {
             dir_u[w_range.start + 1] = -0.07;
         }
 
-        dir_v[cache.slices.marginal.start] = -0.2;
-        dir_v[cache.slices.logslope.start] = 0.25;
+        dir_v[cache.primary.q] = -0.2;
+        dir_v[cache.primary.logslope] = 0.25;
         dir_v[w_range.start] = 0.09;
         if w_range.len() > 1 {
             dir_v[w_range.start + 1] = 0.03;
@@ -10194,9 +10269,9 @@ mod tests {
             .expect("exact eval cache");
         let total = cache.primary.total;
         let mut dir = Array1::<f64>::zeros(total);
-        dir[cache.slices.marginal.start] = -0.35;
-        dir[cache.slices.logslope.start] = 0.28;
-        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir[cache.primary.q] = -0.35;
+        dir[cache.primary.logslope] = 0.28;
+        let h_range = cache.primary.h.as_ref().expect("h slice");
         dir[h_range.start] = 0.12;
         if h_range.len() > 1 {
             dir[h_range.start + 1] = -0.06;
@@ -10301,9 +10376,9 @@ mod tests {
             .expect("exact eval cache");
         let total = cache.primary.total;
         let mut dir = Array1::<f64>::zeros(total);
-        dir[cache.slices.marginal.start] = 0.4;
-        dir[cache.slices.logslope.start] = -0.3;
-        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir[cache.primary.q] = 0.4;
+        dir[cache.primary.logslope] = -0.3;
+        let w_range = cache.primary.w.as_ref().expect("w slice");
         dir[w_range.start] = 0.15;
         if w_range.len() > 1 {
             dir[w_range.start + 1] = -0.07;
@@ -10768,18 +10843,18 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = 0.7;
-        dir_u[cache.slices.logslope.start] = -0.2;
-        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[cache.primary.q] = 0.7;
+        dir_u[cache.primary.logslope] = -0.2;
+        let h_range = cache.primary.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.1;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.05;
         }
-        let w_range = cache.slices.w.as_ref().expect("w slice");
+        let w_range = cache.primary.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.08;
 
-        dir_v[cache.slices.marginal.start] = -0.4;
-        dir_v[cache.slices.logslope.start] = 0.3;
+        dir_v[cache.primary.q] = -0.4;
+        dir_v[cache.primary.logslope] = 0.3;
         dir_v[h_range.start] = -0.03;
         dir_v[w_range.start] = 0.06;
         if w_range.len() > 1 {
@@ -10876,16 +10951,16 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = -0.35;
-        dir_u[cache.slices.logslope.start] = 0.28;
-        let h_range = cache.slices.h.as_ref().expect("h slice");
+        dir_u[cache.primary.q] = -0.35;
+        dir_u[cache.primary.logslope] = 0.28;
+        let h_range = cache.primary.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.12;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.06;
         }
 
-        dir_v[cache.slices.marginal.start] = 0.18;
-        dir_v[cache.slices.logslope.start] = -0.22;
+        dir_v[cache.primary.q] = 0.18;
+        dir_v[cache.primary.logslope] = -0.22;
         dir_v[h_range.start] = 0.07;
         if h_range.len() > 1 {
             dir_v[h_range.start + 1] = 0.05;
@@ -10981,16 +11056,16 @@ mod tests {
         let total = cache.primary.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[cache.slices.marginal.start] = 0.4;
-        dir_u[cache.slices.logslope.start] = -0.3;
-        let w_range = cache.slices.w.as_ref().expect("w slice");
+        dir_u[cache.primary.q] = 0.4;
+        dir_u[cache.primary.logslope] = -0.3;
+        let w_range = cache.primary.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.15;
         if w_range.len() > 1 {
             dir_u[w_range.start + 1] = -0.07;
         }
 
-        dir_v[cache.slices.marginal.start] = -0.2;
-        dir_v[cache.slices.logslope.start] = 0.25;
+        dir_v[cache.primary.q] = -0.2;
+        dir_v[cache.primary.logslope] = 0.25;
         dir_v[w_range.start] = 0.09;
         if w_range.len() > 1 {
             dir_v[w_range.start + 1] = 0.03;
@@ -11201,16 +11276,12 @@ mod tests {
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[slices.marginal.start] = -0.35;
-        dir_u[slices.logslope.start] = 0.28;
         let h_range = slices.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.12;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.06;
         }
 
-        dir_v[slices.marginal.start] = 0.18;
-        dir_v[slices.logslope.start] = -0.22;
         dir_v[h_range.start] = 0.07;
         if h_range.len() > 1 {
             dir_v[h_range.start + 1] = 0.05;
@@ -11284,16 +11355,12 @@ mod tests {
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[slices.marginal.start] = 0.4;
-        dir_u[slices.logslope.start] = -0.3;
         let w_range = slices.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.15;
         if w_range.len() > 1 {
             dir_u[w_range.start + 1] = -0.07;
         }
 
-        dir_v[slices.marginal.start] = -0.2;
-        dir_v[slices.logslope.start] = 0.25;
         dir_v[w_range.start] = 0.09;
         if w_range.len() > 1 {
             dir_v[w_range.start + 1] = 0.03;
@@ -11366,8 +11433,6 @@ mod tests {
         let slices = block_slices(&family);
         let total = slices.total;
         let mut dir = Array1::<f64>::zeros(total);
-        dir[slices.marginal.start] = -0.35;
-        dir[slices.logslope.start] = 0.28;
         let h_range = slices.h.as_ref().expect("h slice");
         dir[h_range.start] = 0.12;
         if h_range.len() > 1 {
@@ -11452,8 +11517,6 @@ mod tests {
         let slices = block_slices(&family);
         let total = slices.total;
         let mut dir = Array1::<f64>::zeros(total);
-        dir[slices.marginal.start] = 0.4;
-        dir[slices.logslope.start] = -0.3;
         let w_range = slices.w.as_ref().expect("w slice");
         dir[w_range.start] = 0.15;
         if w_range.len() > 1 {
@@ -11539,16 +11602,12 @@ mod tests {
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[slices.marginal.start] = -0.35;
-        dir_u[slices.logslope.start] = 0.28;
         let h_range = slices.h.as_ref().expect("h slice");
         dir_u[h_range.start] = 0.12;
         if h_range.len() > 1 {
             dir_u[h_range.start + 1] = -0.06;
         }
 
-        dir_v[slices.marginal.start] = 0.18;
-        dir_v[slices.logslope.start] = -0.22;
         dir_v[h_range.start] = 0.07;
         if h_range.len() > 1 {
             dir_v[h_range.start + 1] = 0.05;
@@ -11616,16 +11675,12 @@ mod tests {
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
         let mut dir_v = Array1::<f64>::zeros(total);
-        dir_u[slices.marginal.start] = 0.4;
-        dir_u[slices.logslope.start] = -0.3;
         let w_range = slices.w.as_ref().expect("w slice");
         dir_u[w_range.start] = 0.15;
         if w_range.len() > 1 {
             dir_u[w_range.start + 1] = -0.07;
         }
 
-        dir_v[slices.marginal.start] = -0.2;
-        dir_v[slices.logslope.start] = 0.25;
         dir_v[w_range.start] = 0.09;
         if w_range.len() > 1 {
             dir_v[w_range.start + 1] = 0.03;

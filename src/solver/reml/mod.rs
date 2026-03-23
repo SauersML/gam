@@ -289,11 +289,14 @@ mod tests {
             [0.0, 0.0, 0.0, 0.3],
         ];
         let offset = Array1::<f64>::zeros(y.len());
+        // Rank-deficient Firth logit needs more inner iterations to converge
+        // tightly enough for the envelope-theorem derivative tests.
         let cfg = RemlConfig::external(
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-9,
             true,
-        );
+        )
+        .with_max_iterations(500);
         let p = x.ncols();
         use crate::estimate::PenaltySpec;
         let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
@@ -552,7 +555,8 @@ mod tests {
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-10,
             true,
-        );
+        )
+        .with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let rho = array![0.0];
         let theta = array![0.0, 0.0, 0.0];
@@ -2371,13 +2375,18 @@ pub(crate) struct FirthDenseOperator {
     // choose Q for the identifiable subspace of A^{1/2} X, and set:
     //   X_r := A^{1/2} X Q          (A = I when no fixed observation weights),
     //   W   := diag(w), with w_i = mu_i (1 - mu_i), 0 < w_i <= 1/4 for finite logit eta,
-    //   I_r := X_rᵀ W X_r.
+    //   I_r := X_rᵀ W X_r,
+    //   S_r := X_rᵀ X_r.
     //
     // Firth term is represented as:
-    //   Phi(beta) = 0.5 log |I_r(beta)|,
-    // which equals 0.5 log|Xᵀ A W X|_+ (pseudodeterminant in the full space)
-    // but is smooth because I_r is SPD as long as the identifiable weighted
-    // design has full column rank and w_i > 0.
+    //   Phi(beta) = 0.5 log |I_r(beta)| - 0.5 log |S_r|,
+    // which is exactly
+    //   0.5 log |Uᵀ W U|
+    // for the canonical orthonormalized identifiable design
+    //   U = X_r S_r^{-1/2}.
+    // This removes the raw-basis term from explicit reduced designs while
+    // keeping the same identifiable-subspace hat matrix and beta derivatives,
+    // because S_r is fixed with respect to beta.
     //
     // Mapping back to the full p-space uses:
     //   I_+^dagger = Q I_r^{-1} Qᵀ.
@@ -2401,7 +2410,10 @@ pub(crate) struct FirthDenseOperator {
     observation_weight_sqrt: Option<Array1<f64>>,
     // I_r^{-1}
     k_reduced: Array2<f64>,
-    // 0.5 log|I_r| at the current eta.
+    // S_r^{-1} with S_r = X_rᵀ X_r. Used to remove the reduced-coordinate
+    // basis term from Phi_tau when the design moves.
+    x_metric_reduced_inv: Array2<f64>,
+    // 0.5 (log|I_r| - log|S_r|) at the current eta.
     half_log_det: f64,
     // h = diag(M), M = X_r K_r X_r'
     h_diag: Array1<f64>,

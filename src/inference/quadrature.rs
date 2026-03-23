@@ -1297,6 +1297,58 @@ fn cloglog_survival_extreme_asymptotic(
     None
 }
 
+// ── Exact Gumbel survival primitives ─────────────────────────────────────
+//
+// The Gumbel survival function S(x) = exp(-exp(x)) and its derivative
+// S'(x) = exp(x)·exp(-exp(x)) are the building blocks for the cloglog
+// link and all survival transforms.  These two functions are exact for ALL
+// finite x under IEEE 754 without any clamping:
+//
+//   x → -∞: exp(x) → 0,    S → exp(-0) = 1,  S' → 0·1 = 0
+//   x → +∞: exp(x) → +∞,   S → exp(-∞) = 0,  S' → ∞·0 = 0
+//
+// The only subtlety is in S': when x > 709, exp(x) overflows to +∞,
+// and ∞ · 0 = NaN.  But x - exp(x) → -∞ for any x > 0, so S' = 0.
+// We detect the intermediate overflow and return 0.0 exactly.
+
+/// Exact Gumbel survival: S(x) = exp(-exp(x)).
+///
+/// No clamping — IEEE 754 handles both tails correctly:
+/// - exp(x) underflows to 0 for x < -745 → S = exp(-0) = 1.0
+/// - exp(x) overflows to ∞ for x > 709  → S = exp(-∞) = 0.0
+#[inline]
+fn gumbel_survival(x: f64) -> f64 {
+    (-x.exp()).exp()
+}
+
+/// Exact Gumbel survival derivative: S'(x) = exp(x) · exp(-exp(x)).
+///
+/// Handles intermediate overflow: when exp(x) = ∞, the true derivative
+/// is 0 (double-exponential decay dominates), so we return 0.0.
+#[inline]
+fn gumbel_survival_d1(x: f64) -> f64 {
+    let ex = x.exp();
+    if ex.is_infinite() {
+        0.0
+    } else {
+        ex * (-ex).exp()
+    }
+}
+
+/// Exact cloglog mean: μ(x) = 1 - exp(-exp(x)) via expm1 to avoid
+/// catastrophic cancellation when exp(x) ≈ 0 (far negative tail).
+///
+/// This is the universal formula — it works for ALL finite x, not just
+/// the negative tail.  For x > 709, exp(x) overflows but expm1(-∞) = -1,
+/// giving μ = 1.0 exactly.
+///
+/// Delegates to `cloglog_negative_tail_mean` which implements the same
+/// expm1 formulation.
+#[inline]
+fn cloglog_mean_exact(x: f64) -> f64 {
+    cloglog_negative_tail_mean(x)
+}
+
 // ── Cloglog negative-tail asymptotics ────────────────────────────────────
 //
 // For the cloglog link μ(η) = 1 − exp(−exp(η)), when η ≪ 0:
@@ -1432,12 +1484,8 @@ fn cloglog_posterior_meanwith_deriv_ghq(
     sigma: f64,
 ) -> IntegratedMeanDerivative {
     let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
-    let dmean_dmu = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
-        let z = x.clamp(-30.0, 30.0);
-        let ez = z.exp();
-        ez * (-ez).exp()
-    })
-    .max(0.0);
+    let dmean_dmu =
+        integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| gumbel_survival_d1(x)).max(0.0);
     IntegratedMeanDerivative {
         mean,
         dmean_dmu,
@@ -1447,11 +1495,7 @@ fn cloglog_posterior_meanwith_deriv_ghq(
 
 #[inline]
 fn survival_posterior_mean_ghq(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let z = x.clamp(-30.0, 30.0);
-        (-(z.exp())).exp()
-    })
-    .clamp(0.0, 1.0)
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| gumbel_survival(x)).clamp(0.0, 1.0)
 }
 
 fn cloglog_survival_term_controlled(
@@ -1496,9 +1540,8 @@ fn cloglog_survival_term_controlled(
     // 256-point GHQ on representative difficult points such as
     // (-20, 0.1), (-5, 5), (0, 20), (10, 0.5), (10, 10), and (-0.5, 100).
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
-        let z = mu.clamp(-30.0, 30.0);
         return (
-            (-(z.exp())).exp().clamp(0.0, 1.0),
+            gumbel_survival(mu).clamp(0.0, 1.0),
             IntegratedExpectationMode::ExactClosedForm,
         );
     }
@@ -2217,29 +2260,13 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     // magical universal formula, but one shared mathematical target with the
     // best evaluator chosen for each regime.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
-        let z = mu.clamp(-30.0, 30.0);
-        let clamp_active = z != mu;
-        let ez = z.exp();
-        let surv = (-ez).exp();
         return IntegratedMeanDerivative {
-            mean: if clamp_active && mu < -30.0 {
-                // Negative tail: μ(η) = 1−exp(−exp(η)) ≈ exp(η) when η≪0.
-                cloglog_negative_tail_mean(mu)
-            } else {
-                1.0 - surv
-            },
-            dmean_dmu: if clamp_active {
-                if mu < -30.0 {
-                    // Negative tail: dμ/dη = exp(η)·exp(−exp(η)) ≈ exp(η).
-                    cloglog_negative_tail_derivative(mu)
-                } else {
-                    // Positive tail: dμ/dη = exp(η)·exp(−exp(η)) is below f64
-                    // precision for η > 30 (double-exponential decay).
-                    0.0
-                }
-            } else {
-                (ez * surv).max(0.0)
-            },
+            // cloglog_mean_exact uses expm1 to avoid 1 − 1 cancellation for
+            // all mu, and handles exp overflow (mu > 709) via expm1(-∞) = −1.
+            mean: cloglog_mean_exact(mu),
+            // gumbel_survival_d1 is exact for all finite mu: it detects
+            // intermediate exp overflow and returns 0.0 (correct limit).
+            dmean_dmu: gumbel_survival_d1(mu),
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
@@ -2884,6 +2911,35 @@ impl GhqValue for (f64, f64, f64, f64) {
             self.1 * factor,
             self.2 * factor,
             self.3 * factor,
+        )
+    }
+}
+
+impl GhqValue for (f64, f64, f64, f64, f64, f64) {
+    #[inline]
+    fn zero() -> Self {
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    }
+
+    #[inline]
+    fn addweighted(&mut self, weight: f64, value: Self) {
+        self.0 += weight * value.0;
+        self.1 += weight * value.1;
+        self.2 += weight * value.2;
+        self.3 += weight * value.3;
+        self.4 += weight * value.4;
+        self.5 += weight * value.5;
+    }
+
+    #[inline]
+    fn scale(self, factor: f64) -> Self {
+        (
+            self.0 * factor,
+            self.1 * factor,
+            self.2 * factor,
+            self.3 * factor,
+            self.4 * factor,
+            self.5 * factor,
         )
     }
 }
@@ -3664,6 +3720,50 @@ pub struct CLogLogConvolutionDerivatives {
     pub l_sigmasigmasigmasigma: f64,
 }
 
+#[inline]
+fn cloglog_horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
+    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
+}
+
+#[inline]
+fn cloglog_stable_poly_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
+    if coeffs.is_empty() || !x.is_finite() {
+        return 0.0;
+    }
+    if x <= 600.0 {
+        return cloglog_horner_polynomial(x, coeffs) * (-x).exp();
+    }
+
+    let inv_x = x.recip();
+    let mut tail = 0.0;
+    for &c in coeffs {
+        tail = tail * inv_x + c;
+    }
+    let degree = (coeffs.len() - 1) as f64;
+    let scale = (degree * x.ln() - x).exp();
+    scale * tail
+}
+
+#[inline]
+pub(crate) fn cloglog_point_jet5(t: f64) -> (f64, f64, f64, f64, f64, f64) {
+    if t.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    }
+    let et = t.exp();
+    if !et.is_finite() {
+        return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    (
+        -(-et).exp_m1(),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0]),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -1.0]),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -3.0, 1.0]),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -7.0, 6.0, -1.0]),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -15.0, 25.0, -10.0, 1.0]),
+    )
+}
+
 /// CLogLog inverse link `g(t) = 1 - exp(-exp(t))` and its first four
 /// derivatives, evaluated in a numerically stable way.
 ///
@@ -3713,6 +3813,15 @@ fn cloglog_g_derivatives(t: f64) -> (f64, f64, f64, f64, f64) {
     let g4 = (-et3 + 6.0 * et2 - 7.0 * et + 1.0) * h;
 
     (g, g1, g2, g3, g4)
+}
+
+#[inline]
+pub(crate) fn cloglog_ghq_jet5_adaptive(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> (f64, f64, f64, f64, f64, f64) {
+    integrate_normal_ghq_adaptive(ctx, mu, sigma, cloglog_point_jet5)
 }
 
 /// Compute `L(μ,σ) = E[g(μ + σZ)]` via Gauss-Hermite quadrature.
@@ -4441,26 +4550,76 @@ mod tests {
     }
 
     #[test]
-    fn test_cloglog_taylor_clamped_branch_is_locally_flat() {
-        let out = cloglog_small_sigma_taylor(-40.0, 0.1);
-        let h = 1e-6;
-        let plus = cloglog_small_sigma_taylor(-40.0 + h, 0.1).mean;
-        let minus = cloglog_small_sigma_taylor(-40.0 - h, 0.1).mean;
-        let fd = (plus - minus) / (2.0 * h);
-        assert_eq!(fd, 0.0);
-        assert_eq!(out.dmean_dmu, 0.0);
+    fn simpson_integrate<F>(a: f64, b: f64, n_intervals: usize, f: F) -> f64
+    where
+        F: Fn(f64) -> f64,
+    {
+        assert_eq!(n_intervals % 2, 0, "Simpson integration requires an even n");
+        let h = (b - a) / n_intervals as f64;
+        let mut sum = f(a) + f(b);
+        for i in 1..n_intervals {
+            let x = a + i as f64 * h;
+            let w = if i % 2 == 0 { 2.0 } else { 4.0 };
+            sum += w * f(x);
+        }
+        sum * h / 3.0
+    }
+
+    fn cloglog_reference_mean_and_derivative(mu: f64, sigma: f64) -> (f64, f64) {
+        if sigma <= CLOGLOG_SIGMA_DEGENERATE {
+            return (cloglog_mean_exact(mu), gumbel_survival_d1(mu));
+        }
+
+        let z_max = 12.0;
+        let n_intervals = 4096;
+        let inv_sqrt_2pi = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
+        let mean = simpson_integrate(-z_max, z_max, n_intervals, |z| {
+            let eta = mu + sigma * z;
+            inv_sqrt_2pi * (-0.5 * z * z).exp() * cloglog_mean_exact(eta)
+        });
+        let deriv = simpson_integrate(-z_max, z_max, n_intervals, |z| {
+            let eta = mu + sigma * z;
+            inv_sqrt_2pi * (-0.5 * z * z).exp() * gumbel_survival_d1(eta)
+        });
+        (mean, deriv)
     }
 
     #[test]
-    fn test_cloglog_degenerate_clamped_branch_is_locally_flat() {
+    fn test_cloglog_taylor_negative_tail_matches_mathematical_target() {
+        let mu = -40.0;
+        let sigma = 0.1;
+        let out = cloglog_small_sigma_taylor(mu, sigma);
+        let (expected_mean, expected_deriv) = cloglog_reference_mean_and_derivative(mu, sigma);
+
+        assert!(out.dmean_dmu > 0.0, "negative-tail derivative should remain positive");
+        assert_relative_eq!(out.mean, expected_mean, epsilon = 1e-30, max_relative = 1e-12);
+        assert_relative_eq!(
+            out.dmean_dmu,
+            expected_deriv,
+            epsilon = 1e-30,
+            max_relative = 1e-12
+        );
+    }
+
+    #[test]
+    fn test_cloglog_degenerate_negative_tail_matches_pointwise_target() {
         let ctx = QuadratureContext::new();
-        let out = cloglog_posterior_meanwith_deriv_controlled(&ctx, -40.0, 0.0);
-        let h = 1e-6;
-        let plus = cloglog_posterior_meanwith_deriv_controlled(&ctx, -40.0 + h, 0.0).mean;
-        let minus = cloglog_posterior_meanwith_deriv_controlled(&ctx, -40.0 - h, 0.0).mean;
-        let fd = (plus - minus) / (2.0 * h);
-        assert_eq!(fd, 0.0);
-        assert_eq!(out.dmean_dmu, 0.0);
+        let mu = -40.0;
+        let out = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, 0.0);
+
+        assert!(out.dmean_dmu > 0.0, "degenerate negative-tail derivative should remain positive");
+        assert_relative_eq!(
+            out.mean,
+            cloglog_mean_exact(mu),
+            epsilon = 1e-30,
+            max_relative = 1e-15
+        );
+        assert_relative_eq!(
+            out.dmean_dmu,
+            gumbel_survival_d1(mu),
+            epsilon = 1e-30,
+            max_relative = 1e-15
+        );
     }
 
     #[test]
@@ -4958,19 +5117,13 @@ mod tests {
     }
 
     #[test]
-    fn cloglog_ghq_value_consistent_with_existing_cloglog() {
-        // Cross-check: our L(mu, sigma) should match the existing
-        // cloglog_posterior_mean which uses integrate_normal_ghq_adaptive
+    fn cloglog_ghq_value_matches_mathematical_target_in_central_regime() {
         let ctx = QuadratureContext::new();
         for &mu in &[-1.0, 0.0, 0.5, 2.0] {
             for &sigma in &[0.1, 0.5, 1.0] {
-                let our_val = cloglog_ghq_value(&ctx, mu, sigma, 51);
-                // The existing function uses eta=mu, se_eta=sigma
-                let existing = cloglog_posterior_mean(&ctx, mu, sigma);
-                // They may use different node counts or different code paths
-                // (the existing one uses controlled/exact backends for some
-                // regimes), so allow a small tolerance.
-                assert_relative_eq!(our_val, existing, epsilon = 1e-6,);
+                let ghq = cloglog_ghq_value(&ctx, mu, sigma, 51);
+                let (expected_mean, _) = cloglog_reference_mean_and_derivative(mu, sigma);
+                assert_relative_eq!(ghq, expected_mean, epsilon = 1e-12, max_relative = 2e-8);
             }
         }
     }
@@ -5007,70 +5160,41 @@ mod tests {
     }
 
     #[test]
-    fn cloglog_negative_tail_continuous_across_clamp_boundary_degenerate() {
-        // The degenerate-sigma (σ≈0) branch transitions from the exact
-        // formula (η ≥ −30) to the tail asymptotic (η < −30).
-        // Verify continuity: evaluations just inside and just outside the
-        // clamp window should agree to high relative accuracy.
+    fn cloglog_negative_tail_degenerate_branch_matches_target_across_boundary() {
         let ctx = QuadratureContext::default();
         let sigma = 0.0;
-        let inside = cloglog_posterior_meanwith_deriv_controlled(&ctx, -29.999, sigma);
-        let outside = cloglog_posterior_meanwith_deriv_controlled(&ctx, -30.001, sigma);
-
-        // Means: both ≈ exp(−30) ≈ 9.36e-14.
-        let mean_rel = (inside.mean - outside.mean).abs()
-            / inside.mean.abs().max(outside.mean.abs()).max(1e-300);
-        assert!(
-            mean_rel < 1e-3,
-            "mean discontinuity at clamp boundary: inside={:.6e} outside={:.6e} rel={mean_rel:.3e}",
-            inside.mean,
-            outside.mean
-        );
-
-        // Derivatives: both ≈ exp(−30).
-        let deriv_rel = (inside.dmean_dmu - outside.dmean_dmu).abs()
-            / inside
-                .dmean_dmu
-                .abs()
-                .max(outside.dmean_dmu.abs())
-                .max(1e-300);
-        assert!(
-            deriv_rel < 1e-3,
-            "derivative discontinuity at clamp boundary: inside={:.6e} outside={:.6e} rel={deriv_rel:.3e}",
-            inside.dmean_dmu,
-            outside.dmean_dmu
-        );
+        for &mu in &[-30.001, -30.0, -29.999] {
+            let out = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
+            assert_relative_eq!(
+                out.mean,
+                cloglog_mean_exact(mu),
+                epsilon = 1e-28,
+                max_relative = 1e-15
+            );
+            assert_relative_eq!(
+                out.dmean_dmu,
+                gumbel_survival_d1(mu),
+                epsilon = 1e-28,
+                max_relative = 1e-15
+            );
+        }
     }
 
     #[test]
-    fn cloglog_negative_tail_continuous_across_clamp_boundary_small_sigma() {
-        // Same continuity check for the small-sigma Taylor branch.
+    fn cloglog_negative_tail_small_sigma_branch_matches_target_across_boundary() {
         let ctx = QuadratureContext::default();
-        let sigma = 0.1; // within CLOGLOG_SIGMA_TAYLOR_MAX = 0.25
-        let inside = cloglog_posterior_meanwith_deriv_controlled(&ctx, -29.999, sigma);
-        let outside = cloglog_posterior_meanwith_deriv_controlled(&ctx, -30.001, sigma);
-
-        let mean_rel = (inside.mean - outside.mean).abs()
-            / inside.mean.abs().max(outside.mean.abs()).max(1e-300);
-        assert!(
-            mean_rel < 1e-3,
-            "mean discontinuity (small σ): inside={:.6e} outside={:.6e} rel={mean_rel:.3e}",
-            inside.mean,
-            outside.mean
-        );
-
-        let deriv_rel = (inside.dmean_dmu - outside.dmean_dmu).abs()
-            / inside
-                .dmean_dmu
-                .abs()
-                .max(outside.dmean_dmu.abs())
-                .max(1e-300);
-        assert!(
-            deriv_rel < 1e-3,
-            "derivative discontinuity (small σ): inside={:.6e} outside={:.6e} rel={deriv_rel:.3e}",
-            inside.dmean_dmu,
-            outside.dmean_dmu
-        );
+        let sigma = 0.1;
+        for &mu in &[-30.001, -30.0, -29.999] {
+            let out = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
+            let (expected_mean, expected_deriv) = cloglog_reference_mean_and_derivative(mu, sigma);
+            assert_relative_eq!(out.mean, expected_mean, epsilon = 1e-24, max_relative = 1e-10);
+            assert_relative_eq!(
+                out.dmean_dmu,
+                expected_deriv,
+                epsilon = 1e-24,
+                max_relative = 1e-10
+            );
+        }
     }
 
     #[test]

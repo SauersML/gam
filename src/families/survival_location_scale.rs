@@ -23,6 +23,7 @@ use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
     infer_non_intercept_start_design,
 };
+use crate::linalg::utils::matrix_inversewith_regularization;
 use crate::matrix::{
     BlockDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix,
     EmbeddedColumnBlock, EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator,
@@ -79,9 +80,10 @@ fn softplus(x: f64) -> f64 {
 //
 // The protection strategy is layered:
 //
-//   Layer 1 – `exp_neg_stable`: clamp the exp argument to [-500, 500] so
-//     inv_sigma ≤ exp(500) ≈ 1.4e217.  This is the primary guard and
-//     prevents overflow at the source.  With this clamp, products like
+//   Layer 1 – `exp_neg_stable`: cap the exp argument at +500 (one-sided)
+//     so inv_sigma ≤ exp(500) ≈ 1.4e217, preventing overflow at the
+//     source.  Underflow (exp(-x) → 0 for large positive x) is allowed
+//     because it is the mathematically correct limit.  Products like
 //     inv_sigma * eta_t stay finite for any eta_t below ~1e91.
 //
 //   Layer 2 – `survival_q0_from_eta`: uses log-space arithmetic to detect
@@ -110,10 +112,17 @@ fn softplus(x: f64) -> f64 {
 /// reaching MAX ≈ 1.8e308, sufficient for any reasonable multiplicative chain.
 const EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
 
+/// Overflow-safe exp(-x): guards against overflow when x is very negative
+/// (i.e. exp(-x) very large) by capping the exponent at +500, but allows
+/// natural IEEE 754 underflow to 0.0 when x is very positive.
+///
+/// The one-sided guard is critical: for x = 701 the correct value is
+/// exp(-701) ≈ 5e-305 (essentially zero), NOT exp(-500) ≈ 7e-218.
+/// A two-sided clamp would return the latter, which is ~1e87× too large
+/// and destroys far-tail exact derivatives.
 #[inline]
 fn exp_neg_stable(x: f64) -> f64 {
-    let arg = (-x).clamp(-EXP_NEG_STABLE_MAX_ARG, EXP_NEG_STABLE_MAX_ARG);
-    arg.exp()
+    (-x).min(EXP_NEG_STABLE_MAX_ARG).exp()
 }
 
 #[inline]
@@ -248,8 +257,7 @@ fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
     if eta_t == 0.0 {
         return 0.0;
     }
-    let log_abs =
-        eta_t.abs().ln() + (-eta_ls).clamp(-EXP_NEG_STABLE_MAX_ARG, EXP_NEG_STABLE_MAX_ARG);
+    let log_abs = eta_t.abs().ln() + (-eta_ls).min(EXP_NEG_STABLE_MAX_ARG);
     if log_abs > EXP_NEG_STABLE_MAX_ARG {
         if eta_t > 0.0 { -f64::MAX } else { f64::MAX }
     } else {
@@ -4924,6 +4932,237 @@ fn prediction_linear_predictors(
     })
 }
 
+fn survival_posterior_mean_block_ranges(
+    p_time: usize,
+    p_t: usize,
+    p_ls: usize,
+    pw: usize,
+) -> (
+    std::ops::Range<usize>,
+    std::ops::Range<usize>,
+    std::ops::Range<usize>,
+    Option<std::ops::Range<usize>>,
+) {
+    let time = 0..p_time;
+    let threshold = time.end..time.end + p_t;
+    let log_sigma = threshold.end..threshold.end + p_ls;
+    let wiggle = (pw > 0).then_some(log_sigma.end..log_sigma.end + pw);
+    (time, threshold, log_sigma, wiggle)
+}
+
+fn projected_survival_posterior_mean_covariance(
+    covariance: &Array2<f64>,
+    a_h: &Array1<f64>,
+    a_t: &Array1<f64>,
+    a_ls: &Array1<f64>,
+    p_time: usize,
+    p_t: usize,
+    p_ls: usize,
+) -> [[f64; 3]; 3] {
+    let (time, threshold, log_sigma, _) =
+        survival_posterior_mean_block_ranges(p_time, p_t, p_ls, 0);
+    let cov_hh = covariance.slice(s![time.start..time.end, time.start..time.end]);
+    let cov_tt = covariance.slice(s![
+        threshold.start..threshold.end,
+        threshold.start..threshold.end
+    ]);
+    let cov_ll = covariance.slice(s![
+        log_sigma.start..log_sigma.end,
+        log_sigma.start..log_sigma.end
+    ]);
+    let cov_ht = covariance.slice(s![time.start..time.end, threshold.start..threshold.end]);
+    let cov_hl = covariance.slice(s![time.start..time.end, log_sigma.start..log_sigma.end]);
+    let cov_tl = covariance.slice(s![
+        threshold.start..threshold.end,
+        log_sigma.start..log_sigma.end
+    ]);
+    let var_h = a_h.dot(&cov_hh.dot(a_h));
+    let var_t = a_t.dot(&cov_tt.dot(a_t));
+    let var_ls = a_ls.dot(&cov_ll.dot(a_ls));
+    let cov_ht_i = a_h.dot(&cov_ht.dot(a_t));
+    let cov_hl_i = a_h.dot(&cov_hl.dot(a_ls));
+    let cov_tl_i = a_t.dot(&cov_tl.dot(a_ls));
+    [
+        [var_h, cov_ht_i, cov_hl_i],
+        [cov_ht_i, var_t, cov_tl_i],
+        [cov_hl_i, cov_tl_i, var_ls],
+    ]
+}
+
+fn covariance3_to_array2(cov: [[f64; 3]; 3]) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((3, 3));
+    for i in 0..3 {
+        for j in 0..3 {
+            out[[i, j]] = cov[i][j];
+        }
+    }
+    out
+}
+
+fn symmetrize_and_clip_covariance(cov: &Array2<f64>) -> Array2<f64> {
+    let mut out = cov.clone();
+    for i in 0..out.nrows() {
+        out[[i, i]] = out[[i, i]].max(0.0);
+        for j in (i + 1)..out.ncols() {
+            let avg = 0.5 * (out[[i, j]] + out[[j, i]]);
+            out[[i, j]] = avg;
+            out[[j, i]] = avg;
+        }
+    }
+    out
+}
+
+fn exact_survival_posterior_mean_row(
+    input: &SurvivalLocationScalePredictInput,
+    fit: &UnifiedFitResult,
+    covariance: &Array2<f64>,
+    row: usize,
+    quadctx: &crate::quadrature::QuadratureContext,
+) -> Result<f64, String> {
+    if input.time_wiggle_ncols > 0 {
+        return Err(
+            "predict_survival_location_scale_posterior_mean: exact posterior mean is not implemented for time-wiggle models"
+                .to_string(),
+        );
+    }
+
+    let beta_time = fit.beta_time();
+    let beta_threshold = fit.beta_threshold();
+    let beta_log_sigma = fit.beta_log_sigma();
+    let beta_link_wiggle = fit.beta_link_wiggle();
+    let p_time = beta_time.len();
+    let p_t = beta_threshold.len();
+    let p_ls = beta_log_sigma.len();
+    let pw = beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+    let (time, threshold, log_sigma, wiggle) =
+        survival_posterior_mean_block_ranges(p_time, p_t, p_ls, pw);
+
+    let a_h = input.x_time_exit.row(row).to_owned();
+    let x_t = input.x_threshold.to_dense_arc();
+    let x_ls = input.x_log_sigma.to_dense_arc();
+    let a_t = x_t.row(row).to_owned();
+    let a_ls = x_ls.row(row).to_owned();
+
+    let mu_h = a_h.dot(&beta_time) + input.eta_time_offset_exit[row];
+    let mu_t = a_t.dot(&beta_threshold) + input.eta_threshold_offset[row];
+    let mu_ls = a_ls.dot(&beta_log_sigma) + input.eta_log_sigma_offset[row];
+    let mu = [mu_h, mu_t, mu_ls];
+    let cov_htl = projected_survival_posterior_mean_covariance(
+        covariance, &a_h, &a_t, &a_ls, p_time, p_t, p_ls,
+    );
+
+    if let (Some(beta_w), Some(wiggle_range)) = (beta_link_wiggle.as_ref(), wiggle) {
+        let knots = input
+            .link_wiggle_knots
+            .as_ref()
+            .or(fit.artifacts.survival_link_wiggle_knots.as_ref())
+            .ok_or_else(|| {
+                "predict_survival_location_scale_posterior_mean: link-wiggle coefficients are missing knot metadata"
+                    .to_string()
+            })?;
+        let degree = input
+            .link_wiggle_degree
+            .or(fit.artifacts.survival_link_wiggle_degree)
+            .ok_or_else(|| {
+                "predict_survival_location_scale_posterior_mean: link-wiggle coefficients are missing degree metadata"
+                    .to_string()
+            })?;
+
+        let cov_htl_arr = covariance3_to_array2(cov_htl);
+        let inv_cov_htl = if cov_htl_arr.iter().all(|v| v.abs() <= 1e-12) {
+            Array2::<f64>::zeros((3, 3))
+        } else {
+            matrix_inversewith_regularization(
+                &cov_htl_arr,
+                "survival posterior-mean projected covariance",
+            )
+            .ok_or_else(|| {
+                "predict_survival_location_scale_posterior_mean: failed to invert projected [h, threshold, log_sigma] covariance"
+                    .to_string()
+            })?
+        };
+
+        let cov_wy = {
+            let mut out = Array2::<f64>::zeros((pw, 3));
+            let cov_wh = covariance
+                .slice(s![
+                    wiggle_range.start..wiggle_range.end,
+                    time.start..time.end
+                ])
+                .to_owned();
+            let cov_wt = covariance
+                .slice(s![
+                    wiggle_range.start..wiggle_range.end,
+                    threshold.start..threshold.end
+                ])
+                .to_owned();
+            let cov_wl = covariance
+                .slice(s![
+                    wiggle_range.start..wiggle_range.end,
+                    log_sigma.start..log_sigma.end
+                ])
+                .to_owned();
+            out.column_mut(0).assign(&cov_wh.dot(&a_h));
+            out.column_mut(1).assign(&cov_wt.dot(&a_t));
+            out.column_mut(2).assign(&cov_wl.dot(&a_ls));
+            out
+        };
+        let cov_ww = covariance
+            .slice(s![
+                wiggle_range.start..wiggle_range.end,
+                wiggle_range.start..wiggle_range.end
+            ])
+            .to_owned();
+        let cov_cond = symmetrize_and_clip_covariance(
+            &(cov_ww - cov_wy.dot(&inv_cov_htl.dot(&cov_wy.t().to_owned()))),
+        );
+        let regression = cov_wy.dot(&inv_cov_htl);
+
+        return crate::quadrature::normal_expectation_nd_adaptive_result::<3, _, String>(
+            quadctx,
+            mu,
+            cov_htl,
+            15,
+            |x| {
+                let centered = Array1::from_vec(vec![x[0] - mu[0], x[1] - mu[1], x[2] - mu[2]]);
+                let cond_mean = beta_w + &regression.dot(&centered);
+                let q0 = survival_q0_from_eta(x[1], x[2]);
+                let q0_arr = Array1::from_vec(vec![q0]);
+                let basis = survival_wiggle_basis_with_options(
+                    q0_arr.view(),
+                    knots,
+                    degree,
+                    BasisOptions::value(),
+                )?;
+                if basis.ncols() != cond_mean.len() {
+                    return Err(format!(
+                        "predict_survival_location_scale_posterior_mean: link-wiggle basis/beta mismatch: {} vs {}",
+                        basis.ncols(),
+                        cond_mean.len()
+                    ));
+                }
+                let b = basis.row(0).to_owned();
+                let w_mean = b.dot(&cond_mean);
+                let w_var = b.dot(&cov_cond.dot(&b)).max(0.0);
+                Ok(crate::quadrature::normal_expectation_1d_adaptive(
+                    quadctx,
+                    x[0] + q0 + w_mean,
+                    w_var.sqrt(),
+                    |eta| inverse_link_survival_probvalue(&input.inverse_link, eta),
+                ))
+            },
+        )
+        .map(|value| value.clamp(0.0, 1.0));
+    }
+
+    Ok(
+        crate::quadrature::normal_expectation_3d_adaptive(quadctx, mu, cov_htl, |h, t, ls| {
+            inverse_link_survival_probvalue(&input.inverse_link, h + survival_q0_from_eta(t, ls))
+        })
+        .clamp(0.0, 1.0),
+    )
+}
+
 fn lift_conditional_covariance(
     cov_reduced: &Array2<f64>,
     z: &Array2<f64>,
@@ -8749,7 +8988,6 @@ pub fn predict_survival_location_scale_posterior_mean(
 ) -> Result<SurvivalLocationScalePredictResult, String> {
     let pred = predict_survival_location_scale(input, fit)?;
     let n = input.x_time_exit.nrows();
-    let predictors = prediction_linear_predictors(input, fit)?;
     let p_time = fit.beta_time().len();
     let p_t = fit.beta_threshold().len();
     let p_ls = fit.beta_log_sigma().len();
@@ -8771,38 +9009,11 @@ pub fn predict_survival_location_scale_posterior_mean(
                 .to_string(),
         );
     }
-    let inv_sigma = predictors.eta_ls.mapv(exp_sigma_inverse_from_eta_scalar);
-    let wiggle_design = predictors.wiggle_design.as_ref();
-    let dq_dq0 = predictors.dq_dq0.as_ref();
-    let mut grad = Array2::<f64>::zeros((n, p_total));
-    let x_t_dense = input.x_threshold.to_dense();
-    let x_ls_dense = input.x_log_sigma.to_dense();
-    for i in 0..n {
-        for j in 0..p_time {
-            grad[[i, j]] = predictors.time_jac[[i, j]];
-        }
-        let scale = dq_dq0.as_ref().map_or(1.0, |v| v[i]);
-        for j in 0..p_t {
-            grad[[i, p_time + j]] = -scale * inv_sigma[i] * x_t_dense[[i, j]];
-        }
-        let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i];
-        for j in 0..p_ls {
-            grad[[i, p_time + p_t + j]] = coeff_ls * x_ls_dense[[i, j]];
-        }
-        if let Some(xw) = wiggle_design {
-            for j in 0..pw {
-                grad[[i, p_time + p_t + p_ls + j]] = xw[[i, j]];
-            }
-        }
-    }
-    let eta_se = linear_predictor_se(grad.view(), covariance);
     let quadctx = crate::quadrature::QuadratureContext::new();
-    let survival_prob = Array1::from_iter((0..n).map(|i| {
-        crate::quadrature::normal_expectation_1d_adaptive(&quadctx, pred.eta[i], eta_se[i], |eta| {
-            inverse_link_survival_probvalue(&input.inverse_link, eta)
-        })
-        .clamp(0.0, 1.0)
-    }));
+    let mut survival_prob = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        survival_prob[i] = exact_survival_posterior_mean_row(input, fit, covariance, i, &quadctx)?;
+    }
 
     Ok(SurvivalLocationScalePredictResult {
         eta: pred.eta,
@@ -8948,13 +9159,15 @@ mod tests {
         beta_link_wiggle: Option<Array1<f64>>,
     ) -> UnifiedFitResult {
         let lambdas_linkwiggle = beta_link_wiggle.as_ref().map(|_| Array1::zeros(0));
+        let link_wiggle_knots = beta_link_wiggle.as_ref().map(|_| array![-1.0, 0.0, 1.0]);
+        let link_wiggle_degree = beta_link_wiggle.as_ref().map(|_| 2usize);
         survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
             beta_time,
             beta_threshold,
             beta_log_sigma,
             beta_link_wiggle,
-            link_wiggle_knots: None,
-            link_wiggle_degree: None,
+            link_wiggle_knots,
+            link_wiggle_degree,
             lambdas_time: Array1::zeros(0),
             lambdas_threshold: Array1::zeros(0),
             lambdas_log_sigma: Array1::zeros(0),
@@ -10993,21 +11206,12 @@ mod tests {
 
         let x_t = input.x_threshold.to_dense_arc();
         let x_ls = input.x_log_sigma.to_dense_arc();
-        let xw = input
-            .x_link_wiggle
-            .as_ref()
-            .expect("wiggle design")
-            .to_dense_arc();
         let mu_h = input.x_time_exit.row(0).dot(&fit.beta_time()) + input.eta_time_offset_exit[0];
-        let mu_t = x_t.row(0).dot(&fit.beta_threshold());
-        let mu_ls = x_ls.row(0).dot(&fit.beta_log_sigma());
-        let muw = xw
-            .row(0)
-            .dot(fit.beta_link_wiggle().as_ref().expect("wiggle beta"));
+        let mu_t = x_t.row(0).dot(&fit.beta_threshold()) + input.eta_threshold_offset[0];
+        let mu_ls = x_ls.row(0).dot(&fit.beta_log_sigma()) + input.eta_log_sigma_offset[0];
         let cov_hh = covariance.slice(s![0..2, 0..2]).to_owned();
         let cov_tt = covariance.slice(s![2..4, 2..4]).to_owned();
         let cov_ll = covariance.slice(s![4..6, 4..6]).to_owned();
-        let covww = covariance.slice(s![6..8, 6..8]).to_owned();
         let cov_ht = covariance.slice(s![0..2, 2..4]).to_owned();
         let cov_hl = covariance.slice(s![0..2, 4..6]).to_owned();
         let cov_hw = covariance.slice(s![0..2, 6..8]).to_owned();
@@ -11020,7 +11224,6 @@ mod tests {
             .dot(&cov_hh.dot(&input.x_time_exit.row(0).to_owned()));
         let var_t = x_t.row(0).dot(&cov_tt.dot(&x_t.row(0).to_owned()));
         let var_ls = x_ls.row(0).dot(&cov_ll.dot(&x_ls.row(0).to_owned()));
-        let varw = xw.row(0).dot(&covww.dot(&xw.row(0).to_owned()));
         let cov_ht_i = input
             .x_time_exit
             .row(0)
@@ -11029,31 +11232,63 @@ mod tests {
             .x_time_exit
             .row(0)
             .dot(&cov_hl.dot(&x_ls.row(0).to_owned()));
-        let cov_hw_i = input
-            .x_time_exit
-            .row(0)
-            .dot(&cov_hw.dot(&xw.row(0).to_owned()));
         let cov_tl_i = x_t.row(0).dot(&cov_tl.dot(&x_ls.row(0).to_owned()));
-        let cov_tw_i = x_t.row(0).dot(&cov_tw.dot(&xw.row(0).to_owned()));
-        let cov_lw_i = x_ls.row(0).dot(&cov_lw.dot(&xw.row(0).to_owned()));
         let quadctx = crate::quadrature::QuadratureContext::new();
-        let ghq = crate::quadrature::normal_expectation_nd_adaptive::<4, _>(
-            &quadctx,
-            [mu_h, mu_t, mu_ls, muw],
-            [
-                [var_h, cov_ht_i, cov_hl_i, cov_hw_i],
-                [cov_ht_i, var_t, cov_tl_i, cov_tw_i],
-                [cov_hl_i, cov_tl_i, var_ls, cov_lw_i],
-                [cov_hw_i, cov_tw_i, cov_lw_i, varw],
-            ],
-            11,
-            |x| {
-                inverse_link_survival_probvalue(
-                    &input.inverse_link,
-                    x[0] - x[1] * exp_sigma_inverse_from_eta_scalar(x[2]) + x[3],
-                )
-            },
+        let cov_htl = [
+            [var_h, cov_ht_i, cov_hl_i],
+            [cov_ht_i, var_t, cov_tl_i],
+            [cov_hl_i, cov_tl_i, var_ls],
+        ];
+        let cov_htl_arr = covariance3_to_array2(cov_htl);
+        let inv_cov_htl = crate::linalg::utils::matrix_inversewith_regularization(
+            &cov_htl_arr,
+            "wiggle posterior mean test projected covariance",
+        )
+        .expect("invert projected covariance");
+        let cov_wy = {
+            let mut out = Array2::<f64>::zeros((2, 3));
+            out.column_mut(0)
+                .assign(&cov_hw.t().dot(&input.x_time_exit.row(0).to_owned()));
+            out.column_mut(1)
+                .assign(&cov_tw.t().dot(&x_t.row(0).to_owned()));
+            out.column_mut(2)
+                .assign(&cov_lw.t().dot(&x_ls.row(0).to_owned()));
+            out
+        };
+        let cov_ww = covariance.slice(s![6..8, 6..8]).to_owned();
+        let cov_cond = symmetrize_and_clip_covariance(
+            &(cov_ww - cov_wy.dot(&inv_cov_htl.dot(&cov_wy.t().to_owned()))),
         );
+        let regression = cov_wy.dot(&inv_cov_htl);
+        let ghq = crate::quadrature::normal_expectation_nd_adaptive_result::<3, _, String>(
+            &quadctx,
+            [mu_h, mu_t, mu_ls],
+            cov_htl,
+            15,
+            |x| {
+                let centered = Array1::from_vec(vec![x[0] - mu_h, x[1] - mu_t, x[2] - mu_ls]);
+                let cond_beta_w =
+                    fit.beta_link_wiggle().expect("wiggle beta") + &regression.dot(&centered);
+                let q0 = survival_q0_from_eta(x[1], x[2]);
+                let q0_arr = Array1::from_vec(vec![q0]);
+                let basis = survival_wiggle_basis_with_options(
+                    q0_arr.view(),
+                    input.link_wiggle_knots.as_ref().expect("wiggle knots"),
+                    input.link_wiggle_degree.expect("wiggle degree"),
+                    BasisOptions::value(),
+                )?;
+                let b = basis.row(0).to_owned();
+                let w_mean = b.dot(&cond_beta_w);
+                let w_var = b.dot(&cov_cond.dot(&b)).max(0.0);
+                Ok(crate::quadrature::normal_expectation_1d_adaptive(
+                    &quadctx,
+                    x[0] + q0 + w_mean,
+                    w_var.sqrt(),
+                    |eta| inverse_link_survival_probvalue(&input.inverse_link, eta),
+                ))
+            },
+        )
+        .expect("exact conditional wiggle ghq");
         assert!((reduced.survival_prob[0] - ghq).abs() <= 2e-4);
     }
 
