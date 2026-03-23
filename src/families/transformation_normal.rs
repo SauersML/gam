@@ -76,6 +76,12 @@ impl Default for TransformationNormalConfig {
     }
 }
 
+/// Hard cap for the tensor-product width used by the transformation-normal
+/// response basis. The fit repeatedly factorizes dense penalized Hessians, so
+/// letting the response basis stay at its default size when the covariate side
+/// is already wide creates cubic blowups on small datasets.
+const MAX_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+
 /// Optional warm-start for the transformation model: per-observation location and
 /// scale values from a prior mean/SD normalizer.
 #[derive(Clone, Debug)]
@@ -837,6 +843,25 @@ fn build_response_basis(
     }
 
     Ok((resp_val, resp_deriv, resp_penalties, knots, transform))
+}
+
+fn effective_response_num_internal_knots(
+    config: &TransformationNormalConfig,
+    n_obs: usize,
+    p_cov: usize,
+) -> usize {
+    let sample_cap = (n_obs / 10).max(1);
+    let min_internal = 1usize;
+    let max_resp_cols_from_tensor =
+        (MAX_TRANSFORMATION_TENSOR_WIDTH / p_cov.max(1)).max(config.response_degree + 2);
+    let tensor_cap = max_resp_cols_from_tensor
+        .saturating_sub(config.response_degree + 1)
+        .max(min_internal);
+    config
+        .response_num_internal_knots
+        .min(sample_cap)
+        .min(tensor_cap)
+        .max(min_internal)
 }
 
 /// Build the nullspace projection that anchors B-spline deviations at the response
@@ -1868,28 +1893,37 @@ pub fn fit_transformation_normal(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
-    // 1. Build response basis ONCE — it is independent of κ.
-    let (resp_val, resp_deriv, resp_penalties, resp_knots, resp_transform) =
-        build_response_basis(response, config)?;
+    // 1. Build a bootstrap covariate design first so the response basis can
+    // adapt to the tensor width instead of always using the global default.
+    let boot_design = build_term_collection_design(covariate_data, covariate_spec)
+        .map_err(|e| format!("failed to build bootstrap covariate design: {e}"))?;
+    let boot_spec = freeze_term_collection_from_design(covariate_spec, &boot_design)
+        .map_err(|e| format!("failed to freeze bootstrap covariate spatial basis centers: {e}"))?;
+    let mut effective_config = config.clone();
+    effective_config.response_num_internal_knots =
+        effective_response_num_internal_knots(config, response.len(), boot_design.design.ncols());
 
-    // 2. Check whether spatial κ optimization is needed.
+    // 2. Build response basis ONCE — it is independent of κ once the effective
+    // response complexity has been chosen.
+    let (resp_val, resp_deriv, resp_penalties, resp_knots, resp_transform) =
+        build_response_basis(response, &effective_config)?;
+
+    // 3. Check whether spatial κ optimization is needed.
     let spatial_terms = spatial_length_scale_term_indices(covariate_spec);
 
     if spatial_terms.is_empty() || !kappa_options.enabled {
         // ------------------------------------------------------------------
         // NO κ: build family directly, fit, return.
         // ------------------------------------------------------------------
-        let cov_design = build_term_collection_design(covariate_data, covariate_spec)
-            .map_err(|e| format!("failed to build covariate design: {e}"))?;
-        let cov_spec_resolved = freeze_term_collection_from_design(covariate_spec, &cov_design)
-            .map_err(|e| format!("failed to freeze covariate spatial basis centers: {e}"))?;
+        let cov_design = boot_design;
+        let cov_spec_resolved = boot_spec;
 
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             resp_val,
             resp_deriv,
             resp_penalties,
             resp_knots.clone(),
-            config.response_degree,
+            effective_config.response_degree,
             resp_transform,
             weights,
             offset,
@@ -1899,7 +1933,7 @@ pub fn fit_transformation_normal(
                 .iter()
                 .map(|bp| PenaltyMatrix::from_blockwise(bp.clone(), cov_design.design.ncols()))
                 .collect(),
-            config,
+            &effective_config,
             warm_start,
         )?;
         let blocks = vec![family.block_spec()];
@@ -1917,12 +1951,6 @@ pub fn fit_transformation_normal(
     // ------------------------------------------------------------------
     // YES κ: use the N-block spatial length-scale optimizer (1 block).
     // ------------------------------------------------------------------
-
-    // Build bootstrap covariate design and frozen spec.
-    let boot_design = build_term_collection_design(covariate_data, covariate_spec)
-        .map_err(|e| format!("failed to build bootstrap covariate design: {e}"))?;
-    let boot_spec = freeze_term_collection_from_design(covariate_spec, &boot_design)
-        .map_err(|e| format!("failed to freeze bootstrap covariate spatial basis centers: {e}"))?;
 
     // Build ExactJointHyperSetup for 1 block.
     let n_penalties = boot_design.penalties.len();
@@ -1950,7 +1978,7 @@ pub fn fit_transformation_normal(
         resp_deriv.clone(),
         resp_penalties.clone(),
         resp_knots.clone(),
-        config.response_degree,
+        effective_config.response_degree,
         resp_transform.clone(),
         weights,
         offset,
@@ -1960,7 +1988,7 @@ pub fn fit_transformation_normal(
             .iter()
             .map(|bp| PenaltyMatrix::from_blockwise(bp.clone(), boot_design.design.ncols()))
             .collect(),
-        config,
+        &effective_config,
         warm_start,
     )?;
     let probe_blocks = vec![probe_family.block_spec()];
@@ -1987,8 +2015,8 @@ pub fn fit_transformation_normal(
     let rp = resp_penalties.clone();
     let rk = resp_knots.clone();
     let rt = resp_transform.clone();
-    let rdeg = config.response_degree;
-    let cfg = config.clone();
+    let rdeg = effective_config.response_degree;
+    let cfg = effective_config.clone();
     let ws = warm_start.cloned();
 
     // Helper: build family from prebuilt response basis + covariate design.
