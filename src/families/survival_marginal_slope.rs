@@ -153,9 +153,8 @@ fn block_slices(
     block_states: &[ParameterBlockState],
 ) -> BlockSlices {
     if !block_states.is_empty() {
-        let expected_blocks = 3
-            + usize::from(family.score_warp.is_some())
-            + usize::from(family.link_dev.is_some());
+        let expected_blocks =
+            3 + usize::from(family.score_warp.is_some()) + usize::from(family.link_dev.is_some());
         assert_eq!(
             block_states.len(),
             expected_blocks,
@@ -2137,9 +2136,9 @@ impl SurvivalMarginalSlopeFamily {
         let mut a_uv = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
-                let value = (f_uv[[u, v]] - d_u[u] * a_u[v] - d_u[v] * a_u[u]
-                    - f_aa * a_u[u] * a_u[v])
-                    / d_check;
+                let value =
+                    (f_uv[[u, v]] - d_u[u] * a_u[v] - d_u[v] * a_u[u] - f_aa * a_u[u] * a_u[v])
+                        / d_check;
                 a_uv[[u, v]] = value;
                 a_uv[[v, u]] = value;
             }
@@ -5238,8 +5237,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         if !structure.fourth_derivative_is_structurally_zero() {
             return Err(format!(
                 "survival-marginal-slope score-warp requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {} from public degree={}",
-                structure.value_span_degree,
-                cfg.degree
+                structure.value_span_degree, cfg.degree
             ));
         }
     }
@@ -5248,8 +5246,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         if !structure.fourth_derivative_is_structurally_zero() {
             return Err(format!(
                 "survival-marginal-slope link deviation requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {} from public degree={}",
-                structure.value_span_degree,
-                cfg.degree
+                structure.value_span_degree, cfg.degree
             ));
         }
     }

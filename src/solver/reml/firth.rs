@@ -1325,13 +1325,7 @@ mod tests {
 
     #[test]
     fn full_rank_identifiable_basis_diagonalizes_design_metric() {
-        let x = array![
-            [1.0, -1.2],
-            [1.0, -0.4],
-            [1.0, 0.1],
-            [1.0, 0.7],
-            [1.0, 1.3],
-        ];
+        let x = array![[1.0, -1.2], [1.0, -0.4], [1.0, 0.1], [1.0, 0.7], [1.0, 1.3],];
         let beta = array![0.25, -0.5];
         let eta = x.dot(&beta);
         let observation_weights = array![1.0, 0.5, 1.75, 0.9, 1.2];

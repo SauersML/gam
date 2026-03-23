@@ -15,8 +15,8 @@
 use crate::estimate::EstimationError;
 use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
-    latent_cloglog_inverse_link_jet5_controlled, validate_latent_cloglog_inputs,
-    lognormal_laplace_term_shared,
+    latent_cloglog_inverse_link_jet5_controlled, lognormal_laplace_term_shared,
+    validate_latent_cloglog_inputs,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;

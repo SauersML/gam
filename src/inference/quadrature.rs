@@ -252,10 +252,7 @@ impl IntegratedInverseLinkJet5 {
 }
 
 #[inline]
-pub(crate) fn validate_latent_cloglog_inputs(
-    eta: f64,
-    sigma: f64,
-) -> Result<(), EstimationError> {
+pub(crate) fn validate_latent_cloglog_inputs(eta: f64, sigma: f64) -> Result<(), EstimationError> {
     if !eta.is_finite() || !sigma.is_finite() || sigma < 0.0 {
         return Err(EstimationError::InvalidInput(format!(
             "latent cloglog jet requires finite eta and sigma >= 0, got eta={eta}, sigma={sigma}"
@@ -2363,8 +2360,7 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
         || matches!(
             shifted_mode,
             IntegratedExpectationMode::ControlledAsymptotic
-        )
-    {
+        ) {
         IntegratedExpectationMode::ControlledAsymptotic
     } else {
         mode
@@ -3161,8 +3157,8 @@ pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
     let sm2 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu - 2.0 * h, sigma);
     let sp2 = cloglog_posterior_meanwith_deriv_controlled(ctx, mu + 2.0 * h, sigma);
 
-    let d2 = (sm2.dmean_dmu - 8.0 * sm1.dmean_dmu + 8.0 * sp1.dmean_dmu - sp2.dmean_dmu)
-        / (12.0 * h);
+    let d2 =
+        (sm2.dmean_dmu - 8.0 * sm1.dmean_dmu + 8.0 * sp1.dmean_dmu - sp2.dmean_dmu) / (12.0 * h);
     let d3 = (-sp2.dmean_dmu + 16.0 * sp1.dmean_dmu - 30.0 * scalar.dmean_dmu
         + 16.0 * sm1.dmean_dmu
         - sm2.dmean_dmu)
@@ -4811,10 +4807,30 @@ mod tests {
         let expected_d3 = (t - 3.0 * t * t + t * t * t) * s;
 
         assert!(cloglog.1 > 0.0, "negative-tail d1 should remain positive");
-        assert_relative_eq!(cloglog.0, expected_mean, epsilon = 1e-30, max_relative = 1e-15);
-        assert_relative_eq!(cloglog.1, expected_d1, epsilon = 1e-30, max_relative = 1e-15);
-        assert_relative_eq!(cloglog.2, expected_d2, epsilon = 1e-30, max_relative = 1e-15);
-        assert_relative_eq!(cloglog.3, expected_d3, epsilon = 1e-30, max_relative = 1e-15);
+        assert_relative_eq!(
+            cloglog.0,
+            expected_mean,
+            epsilon = 1e-30,
+            max_relative = 1e-15
+        );
+        assert_relative_eq!(
+            cloglog.1,
+            expected_d1,
+            epsilon = 1e-30,
+            max_relative = 1e-15
+        );
+        assert_relative_eq!(
+            cloglog.2,
+            expected_d2,
+            epsilon = 1e-30,
+            max_relative = 1e-15
+        );
+        assert_relative_eq!(
+            cloglog.3,
+            expected_d3,
+            epsilon = 1e-30,
+            max_relative = 1e-15
+        );
     }
 
     #[test]
@@ -5366,5 +5382,4 @@ mod tests {
             );
         }
     }
-
 }

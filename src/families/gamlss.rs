@@ -3690,7 +3690,6 @@ fn mirror_upper_to_lower(target: &mut Array2<f64>) {
     }
 }
 
-
 struct BinomialLocationScaleCore {
     sigma: Array1<f64>,
     dsigma_deta: Array1<f64>,

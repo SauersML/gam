@@ -1778,7 +1778,6 @@ impl<'a> RemlState<'a> {
                     self.y,
                     self.weights,
                     self.offset.view(),
-                    pirls_config.likelihood,
                     &pirls_config.link_kind,
                 )?));
             }
@@ -2402,7 +2401,7 @@ impl<'a> RemlState<'a> {
             DispersionHandling::ProfiledGaussian
         } else {
             DispersionHandling::Fixed {
-                phi: 1.0,
+                phi: pirls_result.likelihood.fixed_phi().unwrap_or(1.0),
                 include_logdet_h: true,
                 include_logdet_s: true,
             }
@@ -2411,7 +2410,7 @@ impl<'a> RemlState<'a> {
         let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
             self.y,
             &pirls_result.finalmu,
-            self.config.likelihood(),
+            pirls_result.likelihood,
             self.weights,
         );
 
@@ -2492,7 +2491,7 @@ impl<'a> RemlState<'a> {
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
                 (
                     DispersionHandling::Fixed {
-                        phi: 1.0,
+                        phi: pirls_result.likelihood.fixed_phi().unwrap_or(1.0),
                         include_logdet_h: true,
                         include_logdet_s: true,
                     },
@@ -2518,7 +2517,7 @@ impl<'a> RemlState<'a> {
         let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
             self.y,
             &pirls_result.finalmu,
-            self.config.likelihood(),
+            pirls_result.likelihood,
             self.weights,
         );
 

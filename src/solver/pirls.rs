@@ -33,6 +33,7 @@ use ndarray::{
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
+use statrs::function::gamma::{digamma, ln_gamma};
 
 use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::{Auto, Spec};
@@ -54,6 +55,96 @@ fn array1_is_finite(values: &Array1<f64>) -> bool {
 #[inline]
 fn array2_is_finite(values: &Array2<f64>) -> bool {
     values.iter().all(|v| v.is_finite())
+}
+
+const GAMMA_SHAPE_MIN: f64 = 1e-8;
+const GAMMA_SHAPE_MAX: f64 = 1e12;
+const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
+
+#[inline]
+fn gamma_shape_score(shape: f64, target: f64) -> f64 {
+    shape.ln() - digamma(shape) - target
+}
+
+fn estimate_gamma_shape_from_eta(
+    y: ArrayView1<'_, f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+) -> f64 {
+    const EPS: f64 = 1e-12;
+
+    let mut weighted_target = 0.0;
+    let mut total_weight = 0.0;
+    for i in 0..eta.len() {
+        let wi = priorweights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        let yi = y[i].max(EPS);
+        let mui = eta[i].clamp(-700.0, 700.0).exp().max(EPS);
+        let ratio = yi / mui;
+        weighted_target += wi * (ratio - ratio.ln() - 1.0);
+        total_weight += wi;
+    }
+
+    if total_weight <= 0.0 {
+        return 1.0;
+    }
+
+    let target = (weighted_target / total_weight).max(0.0);
+    if target <= GAMMA_SHAPE_TARGET_TOL {
+        return GAMMA_SHAPE_MAX;
+    }
+
+    let discriminant = (target - 3.0) * (target - 3.0) + 24.0 * target;
+    let approx = ((3.0 - target) + discriminant.sqrt()) / (12.0 * target);
+    let mut lo = GAMMA_SHAPE_MIN;
+    let mut hi = approx.max(1.0);
+
+    while hi < GAMMA_SHAPE_MAX && gamma_shape_score(hi, target) > 0.0 {
+        hi = (hi * 2.0).min(GAMMA_SHAPE_MAX);
+    }
+    if gamma_shape_score(hi, target) > 0.0 {
+        return GAMMA_SHAPE_MAX;
+    }
+
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        if gamma_shape_score(mid, target) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo) <= GAMMA_SHAPE_TARGET_TOL * hi.max(1.0) {
+            break;
+        }
+    }
+
+    0.5 * (lo + hi)
+}
+
+#[inline]
+fn gamma_loglikelihood_with_shape(
+    y: ArrayView1<'_, f64>,
+    mu: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    shape: f64,
+) -> f64 {
+    const EPS: f64 = 1e-12;
+    let shape_c = shape.clamp(GAMMA_SHAPE_MIN, GAMMA_SHAPE_MAX);
+    let shape_ln = shape_c.ln();
+    let ln_gamma_shape = ln_gamma(shape_c);
+    ndarray::Zip::from(y)
+        .and(mu)
+        .and(priorweights)
+        .fold(0.0, |acc, &yi, &mui, &wi| {
+            let yi_c = yi.max(EPS);
+            let mui_c = mui.max(EPS);
+            acc + wi
+                * (shape_c * shape_ln - ln_gamma_shape - shape_c * mui_c.ln()
+                    + (shape_c - 1.0) * yi_c.ln()
+                    - shape_c * yi_c / mui_c)
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1202,6 +1293,7 @@ struct GamWorkingModel<'a> {
 }
 
 struct GamModelFinalState {
+    likelihood: GlmLikelihoodSpec,
     coordinate_frame: PirlsCoordinateFrame,
     finalmu: Array1<f64>,
     finalweights: Array1<f64>,
@@ -1331,6 +1423,7 @@ impl<'a> GamWorkingModel<'a> {
             }
         };
         GamModelFinalState {
+            likelihood: self.likelihood,
             coordinate_frame,
             finalmu: lastmu,
             finalweights: lasthessian_weights,
@@ -1550,6 +1643,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.workspace.eta_buf.assign(&self.offset);
         self.workspace.eta_buf += &matvec_tmp;
         self.workspace.matvec_buf = matvec_tmp;
+
+        if self.likelihood.scale.gamma_shape_is_estimated() {
+            let shape =
+                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
+            self.likelihood = self.likelihood.with_gamma_shape(shape);
+        }
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.
         // This coherently accounts for uncertainty in the base prediction.
@@ -4103,6 +4202,7 @@ pub enum PirlsStatus {
 /// one would need MCMC sampling from the posterior and average f(patient, β) over samples.
 #[derive(Clone)]
 pub struct PirlsResult {
+    pub likelihood: GlmLikelihoodSpec,
     // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
     pub beta_transformed: Coefficients,
     pub penalized_hessian_transformed: SymmetricMatrix,
@@ -4194,6 +4294,7 @@ impl PirlsResult {
 
     pub(crate) fn compact_for_reml_cache(&self) -> Self {
         Self {
+            likelihood: self.likelihood,
             beta_transformed: self.beta_transformed.clone(),
             penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
             stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
@@ -4239,7 +4340,6 @@ impl PirlsResult {
         y: ArrayView1<'_, f64>,
         priorweights: ArrayView1<'_, f64>,
         offset: ArrayView1<'_, f64>,
-        likelihood: GlmLikelihoodSpec,
         inverse_link: &InverseLink,
     ) -> Result<Self, EstimationError> {
         if !self.cache_compacted {
@@ -4248,7 +4348,7 @@ impl PirlsResult {
 
         let (score_c_array, score_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
             computeworkingweight_derivatives_from_eta(
-                likelihood,
+                self.likelihood,
                 inverse_link,
                 &self.final_eta,
                 priorweights,
@@ -4256,7 +4356,7 @@ impl PirlsResult {
         let (finalweights, solve_c_array, solve_d_array) =
             if self.hessian_curvature == HessianCurvatureKind::Observed {
                 compute_observed_hessian_curvature_arrays(
-                    likelihood,
+                    self.likelihood,
                     inverse_link,
                     &self.final_eta,
                     y,
@@ -4277,6 +4377,7 @@ impl PirlsResult {
         // Lazy rehydration: wrap in ReparamOperator instead of materializing X·Qs.
         let qs_arc = Arc::new(self.reparam_result.qs.clone());
         Ok(Self {
+            likelihood: self.likelihood,
             beta_transformed: self.beta_transformed.clone(),
             penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
             stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
@@ -4319,6 +4420,7 @@ impl PirlsResult {
 
 fn assemble_pirls_result(
     working_summary: &WorkingModelPirlsResult,
+    likelihood: GlmLikelihoodSpec,
     offset: ArrayView1<'_, f64>,
     penalized_hessian_transformed: SymmetricMatrix,
     stabilizedhessian_transformed: SymmetricMatrix,
@@ -4341,6 +4443,7 @@ fn assemble_pirls_result(
 ) -> PirlsResult {
     let final_eta_arr = working_summary.state.eta.as_ref().clone();
     PirlsResult {
+        likelihood,
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
         stabilizedhessian_transformed,
@@ -4965,6 +5068,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let reparam_result = materialize_final_reparam_result()?;
         let qs_arc_final = Arc::new(reparam_result.qs.clone());
         let pirls_result = PirlsResult {
+            likelihood: config.likelihood,
             beta_transformed,
             penalized_hessian_transformed: penalized_hessian,
             stabilizedhessian_transformed: stabilizedhessian,
@@ -5090,6 +5194,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     let final_state = working_model.into_final_state();
     let GamModelFinalState {
+        likelihood: final_likelihood,
         coordinate_frame,
         finalmu,
         finalweights,
@@ -5175,6 +5280,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 
     let pirls_result = assemble_pirls_result(
         &working_summary,
+        final_likelihood,
         offset,
         penalized_hessian_transformed,
         stabilizedhessian_transformed,
@@ -5683,7 +5789,11 @@ fn bernoulli_geometry_from_jet(
     let mu = jet.mu;
     let v = mu * (1.0 - mu);
     let n0 = jet.d1 * jet.d1;
-    let fisher = if v.is_finite() && v > 0.0 { n0 / v } else { 0.0 };
+    let fisher = if v.is_finite() && v > 0.0 {
+        n0 / v
+    } else {
+        0.0
+    };
     let nonsmooth =
         eta_raw != eta_used || !v.is_finite() || v <= 0.0 || !fisher.is_finite() || fisher < 0.0;
     let (c, d) = if nonsmooth {
@@ -5874,8 +5984,7 @@ pub fn update_glmvectors(
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
             let zero_on_nonsmooth =
-                matches!(link, LinkFunction::Logit)
-                    && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
+                matches!(link, LinkFunction::Logit) && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
             let mut derivatives = derivatives;
             for i in 0..n {
                 let eta_used = match link {
@@ -5909,13 +6018,8 @@ pub fn update_glmvectors(
                     }
                 } else {
                     let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                    let geom = bernoulli_geometry_from_jet(
-                        eta[i],
-                        eta_used,
-                        y[i],
-                        priorweights[i],
-                        jet,
-                    );
+                    let geom =
+                        bernoulli_geometry_from_jet(eta[i], eta_used, y[i], priorweights[i], jet);
                     mu[i] = geom.mu;
                     weights[i] = geom.weight;
                     z[i] = geom.z;
@@ -6109,13 +6213,7 @@ pub fn update_glmvectors_integrated_for_link(
             d3: jet.d3,
         };
         let e = eta[i].clamp(-700.0, 700.0);
-        let geom = bernoulli_geometry_from_jet(
-            eta[i],
-            e,
-            y[i],
-            priorweights[i],
-            local_jet,
-        );
+        let geom = bernoulli_geometry_from_jet(eta[i], e, y[i], priorweights[i], local_jet);
         mu[i] = geom.mu;
         weights[i] = geom.weight;
         z[i] = geom.z;
@@ -6264,8 +6362,7 @@ fn computeworkingweight_derivatives_from_eta(
         | GlmLikelihoodFamily::BinomialMixture => {
             let link = inverse_link.link_function();
             let zero_on_nonsmooth =
-                matches!(link, LinkFunction::Logit)
-                    && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
+                matches!(link, LinkFunction::Logit) && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
             for i in 0..n {
                 let eta_used = match link {
                     LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
@@ -6293,13 +6390,8 @@ fn computeworkingweight_derivatives_from_eta(
                     d3mu_deta3[i] = jet.d3;
                 } else {
                     let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                    let geom = bernoulli_geometry_from_jet(
-                        eta[i],
-                        eta_used,
-                        jet.mu,
-                        priorweights[i],
-                        jet,
-                    );
+                    let geom =
+                        bernoulli_geometry_from_jet(eta[i], eta_used, jet.mu, priorweights[i], jet);
                     c[i] = geom.c;
                     d[i] = geom.d;
                     dmu_deta[i] = jet.d1;
@@ -7178,15 +7270,12 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                     acc + wi * (log_term - mui_c)
                 })
         }
-        GlmLikelihoodFamily::GammaLog => {
-            ndarray::Zip::from(y)
-                .and(mu)
-                .and(priorweights)
-                .fold(0.0, |acc, &yi, &mui, &wi| {
-                    let mui_c = mui.max(EPS);
-                    acc + wi * likelihood.gamma_shape().unwrap_or(1.0) * (-mui_c.ln() - yi / mui_c)
-                })
-        }
+        GlmLikelihoodFamily::GammaLog => gamma_loglikelihood_with_shape(
+            y,
+            mu,
+            priorweights,
+            likelihood.gamma_shape().unwrap_or(1.0),
+        ),
     }
 }
 
@@ -7421,10 +7510,9 @@ mod tests {
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet,
         calculate_deviance, compress_activeworking_set, compute_constraint_kkt_diagnostics,
         compute_observed_hessian_curvature_arrays, default_beta_guess_external,
-        fit_model_for_fixed_rho, should_log_pirls_decision_summary,
-        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
-        solve_newton_directionwith_lower_bounds, update_glmvectors,
-        working_set_kkt_diagnostics_frommultipliers,
+        fit_model_for_fixed_rho, should_log_pirls_decision_summary, should_use_sparse_native_pirls,
+        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
+        update_glmvectors, working_set_kkt_diagnostics_frommultipliers,
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
@@ -8038,7 +8126,6 @@ mod tests {
                 y.view(),
                 w.view(),
                 offset.view(),
-                GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::PoissonLog),
                 &InverseLink::Standard(LinkFunction::Log),
             )
             .expect("rehydration should succeed");

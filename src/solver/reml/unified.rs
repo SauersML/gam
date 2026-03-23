@@ -2577,11 +2577,7 @@ fn outer_gradient_entry(
     } else {
         0.0
     };
-    let det_term = if incl_logdet_s {
-        0.5 * ld_s_i
-    } else {
-        0.0
-    };
+    let det_term = if incl_logdet_s { 0.5 * ld_s_i } else { 0.0 };
     penalty_term + trace_term - det_term
 }
 
@@ -2619,8 +2615,7 @@ fn outer_hessian_entry(
 ) -> f64 {
     let q_raw = pair_a - g_i_dot_v_j;
     let q = if is_profiled {
-        q_raw / profiled_phi
-            - 2.0 * a_i * a_j / (profiled_nu * profiled_phi * profiled_phi)
+        q_raw / profiled_phi - 2.0 * a_i * a_j / (profiled_nu * profiled_phi * profiled_phi)
     } else {
         q_raw
     };
@@ -3025,8 +3020,7 @@ pub fn reml_laml_evaluate(
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
             stoch_traces[idx]
         } else if coord.uses_operator_fast_path() {
-            let op =
-                coord.scaled_operator(curvature_lambdas[idx], rho_corrections[idx].as_ref());
+            let op = coord.scaled_operator(curvature_lambdas[idx], rho_corrections[idx].as_ref());
             hop.trace_logdet_h_k_operator(&op, None)
         } else if coord.is_block_local() && rho_corrections[idx].is_none() {
             let (block, start, end) = coord.scaled_block_local(1.0);
@@ -3755,8 +3749,7 @@ fn compute_outer_hessian(
             };
 
             let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
-            rhs += &solution.penalty_coords[kk]
-                .scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
+            rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
             if kk == ll {
                 rhs -= &a_k_betas[kk];
             }
@@ -3825,11 +3818,7 @@ fn compute_outer_hessian(
                         .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
                     rhs -= &pair.g;
 
-                    let base = compute_base_h2_trace(
-                        hop,
-                        &pair.b_mat,
-                        pair.b_operator.as_deref(),
-                    );
+                    let base = compute_base_h2_trace(hop, &pair.b_mat, pair.b_operator.as_deref());
 
                     let m_terms = compute_drift_deriv_traces(
                         hop,
@@ -3910,11 +3899,7 @@ fn compute_outer_hessian(
                     rhs += &coord_i.drift.apply(&ext_v[jj]);
                     rhs -= &pair.g;
 
-                    let base = compute_base_h2_trace(
-                        hop,
-                        &pair.b_mat,
-                        pair.b_operator.as_deref(),
-                    );
+                    let base = compute_base_h2_trace(hop, &pair.b_mat, pair.b_operator.as_deref());
 
                     let m_terms = compute_drift_deriv_traces(
                         hop,

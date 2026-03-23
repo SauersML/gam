@@ -165,9 +165,7 @@ impl DeviationRuntime {
             );
         }
         if basis_transform.iter().any(|value| !value.is_finite()) {
-            return Err(
-                "DeviationRuntime basis transform contains non-finite entries".to_string(),
-            );
+            return Err("DeviationRuntime basis transform contains non-finite entries".to_string());
         }
 
         // ── gate 1: structural / type-level ──
@@ -182,7 +180,8 @@ impl DeviationRuntime {
 
         // ── derive breakpoints and span geometry from knots ──
         let bkpts = breakpoints_from_knots(
-            knots.as_slice()
+            knots
+                .as_slice()
                 .ok_or_else(|| "DeviationRuntime knots are not contiguous".to_string())?,
             "DeviationRuntime breakpoints",
         )?;
@@ -199,9 +198,7 @@ impl DeviationRuntime {
             }
         }
         if span_left.is_empty() {
-            return Err(
-                "DeviationRuntime requires at least one active knot span".to_string(),
-            );
+            return Err("DeviationRuntime requires at least one active knot span".to_string());
         }
         let endpoint_points = Array1::from_vec(bkpts);
         let span_left_points = Array1::from_vec(span_left);
