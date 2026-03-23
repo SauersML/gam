@@ -1314,7 +1314,9 @@ pub fn build_latent_survival_baseline_offsets(
     loading: HazardLoading,
 ) -> Result<LatentSurvivalBaselineOffsets, String> {
     if age_entry.len() != age_exit.len() {
-        return Err("latent survival baseline offsets require matching entry/exit lengths".to_string());
+        return Err(
+            "latent survival baseline offsets require matching entry/exit lengths".to_string(),
+        );
     }
 
     fn gompertz_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {

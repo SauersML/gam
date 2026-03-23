@@ -780,6 +780,11 @@ impl BernoulliMarginalSlopePredictor {
         ProbitFrailtyScale::new(self.gaussian_frailty_sd.unwrap_or(0.0)).s
     }
 
+    fn rigid_intercept_from_marginal(&self, marginal_eta: f64, slope: f64) -> f64 {
+        let probit_scale = self.probit_frailty_scale();
+        marginal_eta * (1.0 + (probit_scale * slope).powi(2)).sqrt() / probit_scale
+    }
+
     fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
         [
             scale * coefficients[0],
@@ -787,6 +792,24 @@ impl BernoulliMarginalSlopePredictor {
             scale * coefficients[2],
             scale * coefficients[3],
         ]
+    }
+
+    fn link_terms_value_d1(
+        &self,
+        eta0: &Array1<f64>,
+        beta_link_dev: Option<&Array1<f64>>,
+    ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+        if let (Some(runtime), Some(beta)) = (&self.link_deviation_runtime, beta_link_dev) {
+            let basis = runtime
+                .design(eta0)
+                .map_err(EstimationError::InvalidInput)?;
+            let d1 = runtime
+                .first_derivative_design(eta0)
+                .map_err(EstimationError::InvalidInput)?;
+            Ok((eta0 + &basis.dot(beta), d1.dot(beta) + 1.0))
+        } else {
+            Ok((eta0.clone(), Array1::ones(eta0.len())))
+        }
     }
 
     fn denested_partition_cells(
@@ -1067,7 +1090,8 @@ impl BernoulliMarginalSlopePredictor {
         Ok((marginal, logslope, score_warp, link_dev))
     }
 
-    /// Newton solve for the marginal intercept under the de-nested flexible model
+    /// Safeguarded monotone root solve for the marginal intercept under the
+    /// de-nested flexible model
     ///   η(z) = a + b z + b Δ_h(z) + Δ_w(a + b z).
     fn solve_intercept_scalar(
         &self,
@@ -1077,46 +1101,60 @@ impl BernoulliMarginalSlopePredictor {
         score_warp_beta: Option<&Array1<f64>>,
         warm_start_buf: &mut Array1<f64>,
     ) -> Result<f64, EstimationError> {
-        // Rigid warm start: a₀ = q·√(1+b²).  With affine link Δ_w(u) ≈ ℓ₀+ℓ₁·u,
-        // approximate intercept is (q·√(1+(1+ℓ₁)²b²) − ℓ₀) / (1+ℓ₁).
-        let link_dim = link_dev_beta.map_or(0, Array1::len);
-        let mut intercept = marginal_eta * (1.0 + slope * slope).sqrt();
-        if let (Some(runtime), Some(beta)) = (self.link_deviation_runtime.as_ref(), link_dev_beta) {
-            warm_start_buf[0] = intercept;
-            let one_pt = warm_start_buf.slice(ndarray::s![0..1]).to_owned();
-            let basis = runtime
-                .design(&one_pt)
-                .map_err(EstimationError::InvalidInput)?;
-            let d1_basis = runtime
-                .first_derivative_design(&one_pt)
-                .map_err(EstimationError::InvalidInput)?;
-            let mut dev = 0.0;
-            let mut d1_dev = 0.0;
-            for j in 0..link_dim {
-                dev += basis[[0, j]] * beta[j];
-                d1_dev += d1_basis[[0, j]] * beta[j];
-            }
-            let ell1 = d1_dev + 1.0;
-            if ell1 > 1e-8 {
-                let ell0 = dev - (ell1 - 1.0) * intercept;
-                intercept =
-                    (marginal_eta * (1.0 + ell1 * ell1 * slope * slope).sqrt() - ell0) / ell1;
-            }
-        }
-        for _ in 0..20 {
-            let (f, df, _) = self.evaluate_denested_calibration(
-                intercept,
+        let eval = |a: f64| -> Result<(f64, f64, f64), String> {
+            self.evaluate_denested_calibration(
+                a,
                 marginal_eta,
                 slope,
                 score_warp_beta,
                 link_dev_beta,
-            )?;
-            if f.abs() < 1e-10 {
-                break;
+            )
+            .map_err(|err| err.to_string())
+        };
+
+        let probit_scale = self.probit_frailty_scale();
+        let a_rigid = self.rigid_intercept_from_marginal(marginal_eta, slope);
+        let mut intercept = a_rigid;
+        if let (Some(_), Some(beta)) = (self.link_deviation_runtime.as_ref(), link_dev_beta) {
+            warm_start_buf[0] = a_rigid;
+            let one_pt = warm_start_buf.slice(ndarray::s![0..1]).to_owned();
+            let (l_val, l_d1) = self.link_terms_value_d1(&one_pt, Some(beta))?;
+            let ell1 = l_d1[0];
+            if ell1 > 1e-8 {
+                let ell0 = l_val[0] - ell1 * a_rigid;
+                let observed_logslope = probit_scale * ell1 * slope;
+                intercept = (marginal_eta * (1.0 + observed_logslope * observed_logslope).sqrt()
+                    / probit_scale
+                    - ell0)
+                    / ell1;
             }
-            intercept -= f / df.max(1e-10);
         }
-        Ok(intercept)
+
+        let (root, _) = crate::families::monotone_root::solve_monotone_root(
+            eval,
+            intercept,
+            "saved bernoulli intercept",
+            1e-10,
+            64,
+            48,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+
+        let (f_best, _, _) = self.evaluate_denested_calibration(
+            root,
+            marginal_eta,
+            slope,
+            score_warp_beta,
+            link_dev_beta,
+        )?;
+        let target = crate::probability::normal_cdf(marginal_eta);
+        let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
+        if f_best.abs() > abs_tol {
+            return Err(EstimationError::InvalidInput(format!(
+                "saved bernoulli marginal-slope intercept solve failed: residual={f_best:.3e} at a={root:.6}, target Phi(q)={target:.6}"
+            )));
+        }
+        Ok(root)
     }
 
     fn final_eta_and_gradient_from_theta(

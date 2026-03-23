@@ -1682,7 +1682,16 @@ fn lognormal_laplace_term_controlled(
     if !(z.is_finite() && z > 0.0) {
         return (f64::NAN, IntegratedExpectationMode::QuadratureFallback);
     }
-    cloglog_survival_term_controlled(ctx, mu + z.ln(), sigma)
+    lognormal_laplace_unit_term_shared(ctx, mu + z.ln(), sigma)
+}
+
+#[inline]
+pub(crate) fn lognormal_laplace_unit_term_shared(
+    ctx: &QuadratureContext,
+    shifted_mu: f64,
+    sigma: f64,
+) -> (f64, IntegratedExpectationMode) {
+    cloglog_survival_term_controlled(ctx, shifted_mu, sigma)
 }
 
 #[inline]
@@ -2587,9 +2596,7 @@ fn integrated_mixture_component_jet(
         LinkComponent::Logit => integrated_inverse_link_jet(ctx, LinkFunction::Logit, mu, sigma)
             .unwrap_or_else(|_| integrated_logit_jet_ghq(ctx, mu, sigma)),
         LinkComponent::Probit => integrated_probit_jet(mu, sigma),
-        LinkComponent::CLogLog => {
-            integrated_cloglog_inverse_link_jet_controlled(ctx, mu, sigma)
-        }
+        LinkComponent::CLogLog => integrated_cloglog_inverse_link_jet_controlled(ctx, mu, sigma),
         LinkComponent::LogLog | LinkComponent::Cauchit => {
             let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
                 component_point_jet(component, x)
@@ -3152,7 +3159,7 @@ pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet5 {
-    // Exact latent-cloglog derivative tower via the shared lognormal-Laplace
+    // Single latent-cloglog derivative tower via the shared lognormal-Laplace
     // kernel terms
     //
     //   K_k(mu, sigma) := E[exp(k eta - exp(eta))],   eta ~ N(mu, sigma^2).
@@ -3169,9 +3176,11 @@ pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
     //   d4 = K1 - 7 K2 + 6 K3 - K4
     //   d5 = K1 - 15 K2 + 25 K3 - 10 K4 + K5.
     //
-    // Each K_k is evaluated through the same shared lognormal-Laplace backend
+    // Each K_k is evaluated through the same routed lognormal-Laplace backend
     // used elsewhere in the cloglog/survival stack, so there is no finite-
-    // difference bridge in the latent jet anymore.
+    // difference bridge in the latent jet anymore. The returned `mode` still
+    // records whether that scalar backend was closed-form, controlled, special-
+    // function, or quadrature fallback at runtime.
     if sigma <= 1e-10 {
         let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(mu);
         return IntegratedInverseLinkJet5 {

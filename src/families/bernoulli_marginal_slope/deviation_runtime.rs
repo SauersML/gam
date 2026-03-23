@@ -1,7 +1,7 @@
 use crate::basis::BasisOptions;
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::{
-    monotone_wiggle_basis_with_derivative_order, MonotoneWiggleStructure,
+    MonotoneWiggleStructure, monotone_wiggle_basis_with_derivative_order,
 };
 use crate::linalg::utils::matrix_inversewith_regularization;
 use crate::matrix::DesignMatrix;

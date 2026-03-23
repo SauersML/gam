@@ -10,6 +10,8 @@
 //!
 //! Unlike the old compiled-row path, the cumulative masses and baseline hazard
 //! are rebuilt inside the optimizer from the current time-basis coefficients.
+//! The current family-level fit surface uses exact events and right censoring;
+//! interval-censored rows exist at the kernel layer but are not exposed here.
 
 use crate::estimate::UnifiedFitResult;
 use crate::families::custom_family::{
@@ -92,6 +94,7 @@ pub struct LatentSurvivalFamily {
     pub event_target: Array1<u8>,
     pub weights: Array1<f64>,
     pub latent_sd: f64,
+    pub hazard_loading: HazardLoading,
     pub unloaded_mass_entry: Array1<f64>,
     pub unloaded_mass_exit: Array1<f64>,
     pub unloaded_hazard_exit: Array1<f64>,
@@ -108,6 +111,7 @@ pub struct LatentBinaryFamily {
     pub event_target: Array1<u8>,
     pub weights: Array1<f64>,
     pub latent_sd: f64,
+    pub hazard_loading: HazardLoading,
     pub unloaded_mass_entry: Array1<f64>,
     pub unloaded_mass_exit: Array1<f64>,
     pub x_time_entry: Array2<f64>,
@@ -204,7 +208,11 @@ impl LatentBinaryFamily {
         if eta_mean.len() != n || self.weights.len() != n {
             return Err("latent binary mean eta dimension mismatch".to_string());
         }
-        Ok((eta_time.slice(s![0..n]), eta_time.slice(s![n..2 * n]), eta_mean))
+        Ok((
+            eta_time.slice(s![0..n]),
+            eta_time.slice(s![n..2 * n]),
+            eta_mean,
+        ))
     }
 }
 
@@ -228,11 +236,9 @@ pub fn fixed_latent_hazard_frailty(
         } => Err(format!(
             "{context} requires a fixed hazard-multiplier sigma; learnable sigma is not implemented for this family"
         )),
-        FrailtySpec::GaussianShift { .. } => {
-            Err(format!(
-                "{context} requires HazardMultiplier frailty, not GaussianShift"
-            ))
-        }
+        FrailtySpec::GaussianShift { .. } => Err(format!(
+            "{context} requires HazardMultiplier frailty, not GaussianShift"
+        )),
         FrailtySpec::None => Err(format!(
             "{context} requires a fixed HazardMultiplier frailty specification"
         )),
@@ -257,15 +263,18 @@ pub fn fit_latent_survival_terms(
     options: &BlockwiseFitOptions,
 ) -> Result<LatentSurvivalTermFitResult, String> {
     let latent_sd = validate_latent_survival_inputs(data, &spec, &frailty)?;
-    let mean_design = build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
-    let resolvedspec =
-        freeze_term_collection_from_design(&spec.meanspec, &mean_design).map_err(|e| e.to_string())?;
+    let (_, hazard_loading) = fixed_latent_hazard_frailty(&frailty, "latent-survival")?;
+    let mean_design =
+        build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
+    let resolvedspec = freeze_term_collection_from_design(&spec.meanspec, &mean_design)
+        .map_err(|e| e.to_string())?;
     let time_prepared = prepare_latent_time_block(&spec.time_block, spec.derivative_guard)?;
 
     let family = LatentSurvivalFamily {
         event_target: spec.event_target.clone(),
         weights: spec.weights.clone(),
         latent_sd,
+        hazard_loading,
         unloaded_mass_entry: spec.unloaded_mass_entry.clone(),
         unloaded_mass_exit: spec.unloaded_mass_exit.clone(),
         unloaded_hazard_exit: spec.unloaded_hazard_exit.clone(),
@@ -296,15 +305,18 @@ pub fn fit_latent_binary_terms(
     options: &BlockwiseFitOptions,
 ) -> Result<LatentBinaryTermFitResult, String> {
     let latent_sd = validate_latent_binary_inputs(data, &spec, &frailty)?;
-    let mean_design = build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
-    let resolvedspec =
-        freeze_term_collection_from_design(&spec.meanspec, &mean_design).map_err(|e| e.to_string())?;
+    let (_, hazard_loading) = fixed_latent_hazard_frailty(&frailty, "latent-binary")?;
+    let mean_design =
+        build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
+    let resolvedspec = freeze_term_collection_from_design(&spec.meanspec, &mean_design)
+        .map_err(|e| e.to_string())?;
     let time_prepared = prepare_latent_time_block(&spec.time_block, spec.derivative_guard)?;
 
     let family = LatentBinaryFamily {
         event_target: spec.event_target.clone(),
         weights: spec.weights.clone(),
         latent_sd,
+        hazard_loading,
         unloaded_mass_entry: spec.unloaded_mass_entry.clone(),
         unloaded_mass_exit: spec.unloaded_mass_exit.clone(),
         x_time_entry: time_prepared.design_entry.clone(),
@@ -331,6 +343,7 @@ fn validate_latent_survival_inputs(
     spec: &LatentSurvivalTermSpec,
     frailty: &FrailtySpec,
 ) -> Result<f64, String> {
+    let (sigma, hazard_loading) = fixed_latent_hazard_frailty(frailty, "latent-survival")?;
     let n = data.nrows();
     if n == 0 {
         return Err("latent-survival requires a non-empty dataset".to_string());
@@ -365,6 +378,7 @@ fn validate_latent_survival_inputs(
     for i in 0..n {
         let entry = spec.age_entry[i];
         let exit = spec.age_exit[i];
+        let event = spec.event_target[i];
         let weight = spec.weights[i];
         let unloaded_entry = spec.unloaded_mass_entry[i];
         let unloaded_exit = spec.unloaded_mass_exit[i];
@@ -383,6 +397,13 @@ fn validate_latent_survival_inputs(
                 i + 1,
                 entry,
                 exit
+            ));
+        }
+        if event > 1 {
+            return Err(format!(
+                "latent-survival row {} has invalid event target {}; expected 0 or 1",
+                i + 1,
+                event
             ));
         }
         if !weight.is_finite() || weight < 0.0 {
@@ -407,6 +428,14 @@ fn validate_latent_survival_inputs(
                 unloaded_hazard
             ));
         }
+        validate_unloaded_components_for_loading(
+            "latent-survival",
+            i,
+            hazard_loading,
+            unloaded_entry,
+            unloaded_exit,
+            Some(unloaded_hazard),
+        )?;
     }
     let time_block = &spec.time_block;
     let p_time = time_block.design_exit.ncols();
@@ -422,7 +451,8 @@ fn validate_latent_survival_inputs(
             time_block.design_derivative_exit.nrows()
         ));
     }
-    if time_block.design_entry.ncols() != p_time || time_block.design_derivative_exit.ncols() != p_time
+    if time_block.design_entry.ncols() != p_time
+        || time_block.design_derivative_exit.ncols() != p_time
     {
         return Err(format!(
             "latent-survival time block column mismatch: entry_cols={}, exit_cols={}, derivative_cols={}",
@@ -443,7 +473,35 @@ fn validate_latent_survival_inputs(
             time_block.derivative_offset_exit.len()
         ));
     }
-    fixed_latent_hazard_frailty(frailty, "latent-survival").map(|(sigma, _)| sigma)
+    Ok(sigma)
+}
+
+fn validate_unloaded_components_for_loading(
+    context: &str,
+    row_index: usize,
+    loading: HazardLoading,
+    unloaded_entry: f64,
+    unloaded_exit: f64,
+    unloaded_hazard: Option<f64>,
+) -> Result<(), String> {
+    match loading {
+        HazardLoading::Full => {
+            if unloaded_entry != 0.0
+                || unloaded_exit != 0.0
+                || unloaded_hazard.is_some_and(|hazard| hazard != 0.0)
+            {
+                return Err(format!(
+                    "{context} row {} uses full hazard loading, so unloaded components must be exactly zero; got entry_mass={}, exit_mass={}, exit_hazard={}",
+                    row_index + 1,
+                    unloaded_entry,
+                    unloaded_exit,
+                    unloaded_hazard.unwrap_or(0.0)
+                ));
+            }
+        }
+        HazardLoading::LoadedVsUnloaded => {}
+    }
+    Ok(())
 }
 
 fn validate_latent_binary_inputs(
@@ -451,6 +509,7 @@ fn validate_latent_binary_inputs(
     spec: &LatentBinaryTermSpec,
     frailty: &FrailtySpec,
 ) -> Result<f64, String> {
+    let (sigma, hazard_loading) = fixed_latent_hazard_frailty(frailty, "latent-binary")?;
     let n = data.nrows();
     if n == 0 {
         return Err("latent-binary requires a non-empty dataset".to_string());
@@ -529,6 +588,14 @@ fn validate_latent_binary_inputs(
                 unloaded_exit,
             ));
         }
+        validate_unloaded_components_for_loading(
+            "latent-binary",
+            i,
+            hazard_loading,
+            unloaded_entry,
+            unloaded_exit,
+            None,
+        )?;
     }
     let time_block = &spec.time_block;
     let p_time = time_block.design_exit.ncols();
@@ -544,7 +611,8 @@ fn validate_latent_binary_inputs(
             time_block.design_derivative_exit.nrows()
         ));
     }
-    if time_block.design_entry.ncols() != p_time || time_block.design_derivative_exit.ncols() != p_time
+    if time_block.design_entry.ncols() != p_time
+        || time_block.design_derivative_exit.ncols() != p_time
     {
         return Err(format!(
             "latent-binary time block column mismatch: entry_cols={}, exit_cols={}, derivative_cols={}",
@@ -565,7 +633,7 @@ fn validate_latent_binary_inputs(
             time_block.derivative_offset_exit.len()
         ));
     }
-    fixed_latent_hazard_frailty(frailty, "latent-binary").map(|(sigma, _)| sigma)
+    Ok(sigma)
 }
 
 fn prepare_latent_time_block(
@@ -587,7 +655,11 @@ fn prepare_latent_time_block(
         derivative_guard,
     )?;
     let initial_beta = linear_constraints.as_ref().map(|constraints| {
-        project_onto_linear_constraints(design_exit.ncols(), constraints, input.initial_beta.as_ref())
+        project_onto_linear_constraints(
+            design_exit.ncols(),
+            constraints,
+            input.initial_beta.as_ref(),
+        )
     });
     Ok(PreparedLatentTimeBlock {
         design_entry,
@@ -668,7 +740,11 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
     }
 }
 
-fn log_kernel_ratio(bundle: &crate::families::lognormal_kernel::LogLognormalKernelBundle, num: usize, den: usize) -> f64 {
+fn log_kernel_ratio(
+    bundle: &crate::families::lognormal_kernel::LogLognormalKernelBundle,
+    num: usize,
+    den: usize,
+) -> f64 {
     let delta = bundle.get(num) - bundle.get(den);
     if delta.is_finite() {
         delta.exp()
@@ -778,7 +854,8 @@ fn latent_survival_time_jet(
             }
         }
         LatentSurvivalEventType::IntervalCensored => Err(
-            "latent survival dynamic time derivatives do not implement interval censoring".to_string(),
+            "latent survival dynamic time derivatives do not implement interval censoring"
+                .to_string(),
         ),
     }
 }
@@ -824,6 +901,8 @@ fn dense_symmetric_cross_accumulate(
 }
 
 fn build_latent_survival_row(
+    row_index: usize,
+    hazard_loading: HazardLoading,
     event_type: LatentSurvivalEventType,
     q_entry: f64,
     q_exit: f64,
@@ -831,10 +910,44 @@ fn build_latent_survival_row(
     unloaded_mass_entry: f64,
     unloaded_mass_exit: f64,
     unloaded_hazard_exit: f64,
-) -> LatentSurvivalRow {
+) -> Result<LatentSurvivalRow, String> {
+    if !(q_entry.is_finite() && q_exit.is_finite()) {
+        return Err(format!(
+            "latent survival requires finite q_entry and q_exit, got q_entry={q_entry}, q_exit={q_exit}"
+        ));
+    }
+    if q_exit < q_entry {
+        return Err(format!(
+            "latent survival requires q_exit >= q_entry so cumulative mass is monotone, got q_entry={q_entry}, q_exit={q_exit}"
+        ));
+    }
+    if !(unloaded_mass_entry.is_finite()
+        && unloaded_mass_exit.is_finite()
+        && unloaded_hazard_exit.is_finite())
+    {
+        return Err(format!(
+            "latent survival requires finite unloaded components, got entry_mass={unloaded_mass_entry}, exit_mass={unloaded_mass_exit}, exit_hazard={unloaded_hazard_exit}"
+        ));
+    }
+    if unloaded_mass_entry < 0.0
+        || unloaded_mass_exit < unloaded_mass_entry
+        || unloaded_hazard_exit < 0.0
+    {
+        return Err(format!(
+            "latent survival requires unloaded masses/hazard to be non-negative and monotone, got entry_mass={unloaded_mass_entry}, exit_mass={unloaded_mass_exit}, exit_hazard={unloaded_hazard_exit}"
+        ));
+    }
+    validate_unloaded_components_for_loading(
+        "latent-survival",
+        row_index,
+        hazard_loading,
+        unloaded_mass_entry,
+        unloaded_mass_exit,
+        Some(unloaded_hazard_exit),
+    )?;
     let mass_entry = q_entry.exp();
     let mass_exit = q_exit.exp();
-    match event_type {
+    let row = match event_type {
         LatentSurvivalEventType::RightCensored => LatentSurvivalRow::right_censored(
             mass_entry,
             mass_exit,
@@ -846,13 +959,22 @@ fn build_latent_survival_row(
             mass_exit,
             unloaded_mass_entry,
             unloaded_mass_exit,
-            mass_exit * qdot_exit,
+            mass_exit
+                * if qdot_exit.is_finite() && qdot_exit > 0.0 {
+                    qdot_exit
+                } else {
+                    return Err(format!(
+                        "latent survival exact event requires positive finite baseline hazard derivative, got {qdot_exit}"
+                    ));
+                },
             unloaded_hazard_exit,
         ),
         LatentSurvivalEventType::IntervalCensored => unreachable!(
             "latent survival fit path currently exposes only exact events and right censoring"
         ),
-    }
+    };
+    row.validate().map_err(|e| e.to_string())?;
+    Ok(row)
 }
 
 #[derive(Clone, Copy)]
@@ -932,6 +1054,8 @@ impl CustomFamily for LatentSurvivalFamily {
             }
 
             let row = build_latent_survival_row(
+                i,
+                self.hazard_loading,
                 event_type,
                 q_entry[i],
                 q_exit[i],
@@ -939,9 +1063,10 @@ impl CustomFamily for LatentSurvivalFamily {
                 self.unloaded_mass_entry[i],
                 self.unloaded_mass_exit[i],
                 self.unloaded_hazard_exit[i],
-            );
-            let row_jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
-                .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
+            )?;
+            let row_jet =
+                LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
+                    .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
             ll += wi * row_jet.log_lik;
 
             let mean_row = self.x_mean.row_chunk(i..i + 1);
@@ -951,13 +1076,8 @@ impl CustomFamily for LatentSurvivalFamily {
             }
             dense_outer_accumulate(&mut hess_mean, wi * row_jet.neg_hessian, mean_vec);
 
-            let time_jet = latent_survival_time_jet(
-                &self.quadctx,
-                &row,
-                qdot_exit[i],
-                mu[i],
-                self.latent_sd,
-            )?;
+            let time_jet =
+                latent_survival_time_jet(&self.quadctx, &row, qdot_exit[i], mu[i], self.latent_sd)?;
             let t_entry = self.x_time_entry.row(i);
             let t_exit = self.x_time_exit.row(i);
             let t_deriv = self.x_time_derivative_exit.row(i);
@@ -1012,6 +1132,8 @@ impl CustomFamily for LatentSurvivalFamily {
                 LatentSurvivalEventType::RightCensored
             };
             let row = build_latent_survival_row(
+                i,
+                self.hazard_loading,
                 event_type,
                 q_entry[i],
                 q_exit[i],
@@ -1019,7 +1141,7 @@ impl CustomFamily for LatentSurvivalFamily {
                 self.unloaded_mass_entry[i],
                 self.unloaded_mass_exit[i],
                 self.unloaded_hazard_exit[i],
-            );
+            )?;
             let jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
                 .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
             ll += wi * jet.log_lik;
@@ -1065,12 +1187,17 @@ impl CustomFamily for LatentBinaryFamily {
                     q_entry[i], q_exit[i], mu[i]
                 ));
             }
-            let row = LatentSurvivalRow::right_censored(
-                q_entry[i].exp(),
-                q_exit[i].exp(),
+            let row = build_latent_survival_row(
+                i,
+                self.hazard_loading,
+                LatentSurvivalEventType::RightCensored,
+                q_entry[i],
+                q_exit[i],
+                1.0,
                 self.unloaded_mass_entry[i],
                 self.unloaded_mass_exit[i],
-            );
+                0.0,
+            )?;
             let survival_jet =
                 LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
                     .map_err(|e| format!("LatentBinaryFamily row {i}: {e}"))?;
@@ -1088,7 +1215,8 @@ impl CustomFamily for LatentBinaryFamily {
                     + binary.outer_scale * survival_jet.score * survival_jet.score);
             dense_outer_accumulate(&mut hess_mean, mean_neg_hess, mean_vec);
 
-            let time_jet = latent_survival_time_jet(&self.quadctx, &row, 0.0, mu[i], self.latent_sd)?;
+            let time_jet =
+                latent_survival_time_jet(&self.quadctx, &row, 0.0, mu[i], self.latent_sd)?;
             let t_entry = self.x_time_entry.row(i);
             let t_exit = self.x_time_exit.row(i);
             for j in 0..p_time {
@@ -1149,16 +1277,22 @@ impl CustomFamily for LatentBinaryFamily {
             if wi <= MIN_WEIGHT {
                 continue;
             }
-            let row = LatentSurvivalRow::right_censored(
-                q_entry[i].exp(),
-                q_exit[i].exp(),
+            let row = build_latent_survival_row(
+                i,
+                self.hazard_loading,
+                LatentSurvivalEventType::RightCensored,
+                q_entry[i],
+                q_exit[i],
+                1.0,
                 self.unloaded_mass_entry[i],
                 self.unloaded_mass_exit[i],
-            );
+                0.0,
+            )?;
             let survival_jet =
                 LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
                     .map_err(|e| format!("LatentBinaryFamily row {i}: {e}"))?;
-            ll += wi * binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?.log_lik;
+            ll +=
+                wi * binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?.log_lik;
         }
         Ok(ll)
     }

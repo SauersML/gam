@@ -17,10 +17,10 @@ use gam::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime,
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
-use gam::families::latent_survival::fixed_latent_hazard_frailty;
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
 };
+use gam::families::latent_survival::fixed_latent_hazard_frailty;
 use gam::families::scale_design::{
     ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
     infer_non_intercept_start,
@@ -69,13 +69,13 @@ use gam::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, append_zero_tail_columns,
     build_latent_survival_baseline_offsets, build_survival_baseline_offsets,
-    build_survival_time_basis,
-    build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
-    build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
-    evaluate_survival_baseline, evaluate_survival_time_basis_row, normalize_survival_time_pair,
-    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
-    parse_survival_time_basis_config, require_structural_survival_time_basis,
-    resolve_survival_time_anchor_value, survival_baseline_targetname, survival_likelihood_modename,
+    build_survival_time_basis, build_survival_timewiggle_derivative_design,
+    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    center_survival_time_designs_at_anchor, evaluate_survival_baseline,
+    evaluate_survival_time_basis_row, normalize_survival_time_pair, parse_survival_baseline_config,
+    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
+    survival_baseline_targetname, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
@@ -94,10 +94,9 @@ use gam::types::{
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
-    LinkWiggleConfig,
-    StandardBinomialWiggleConfig, StandardFitRequest, SurvivalLocationScaleFitRequest,
-    SurvivalMarginalSlopeFitRequest, TransformationNormalFitRequest, fit_model,
-    resolve_offset_column, resolve_weight_column,
+    LinkWiggleConfig, StandardBinomialWiggleConfig, StandardFitRequest,
+    SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
+    TransformationNormalFitRequest, fit_model, resolve_offset_column, resolve_weight_column,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -1366,11 +1365,12 @@ fn run_fit_bernoulli_marginal_slope(
         &fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?,
         "bernoulli marginal-slope",
     )?;
-    let routed_link_dev = match parsed.linkwiggle.as_ref() {
-        Some(wiggle) => Some(deviation_block_config_from_formula_linkwiggle(wiggle)),
-        None if args.disable_link_dev => None,
-        None => Some(DeviationBlockConfig::default()),
-    };
+    let routed_link_dev = parsed
+        .linkwiggle
+        .as_ref()
+        .map(deviation_block_config_from_formula_linkwiggle);
+    let requested_score_warp = parsed.linkwiggle.is_some() && !args.disable_score_warp;
+    let requested_flex = requested_score_warp || routed_link_dev.is_some();
     inference_notes.push(
         "bernoulli marginal-slope expects z to already be PIT-probit standardized to latent N(0,1) upstream".to_string(),
     );
@@ -1380,7 +1380,7 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
-    if args.disable_score_warp && routed_link_dev.is_none() {
+    if !requested_flex {
         inference_notes.push(
             "bernoulli marginal-slope rigid probit mode is algebraic closed-form exact".to_string(),
         );
@@ -1409,11 +1409,7 @@ fn run_fit_bernoulli_marginal_slope(
                 marginal_offset,
                 logslope_offset,
                 frailty: frailty.clone(),
-                score_warp: if args.disable_score_warp {
-                    None
-                } else {
-                    Some(DeviationBlockConfig::default())
-                },
+                score_warp: requested_score_warp.then(DeviationBlockConfig::default),
                 link_dev: routed_link_dev,
             },
             options,
@@ -2615,7 +2611,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     result
 }
 
-struct LatentSurvivalPluginJet {
+struct LatentWindowPluginJet {
     survival: f64,
     score_mu: f64,
     score_q_entry: f64,
@@ -2623,12 +2619,80 @@ struct LatentSurvivalPluginJet {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LatentWindowPredictionMode {
+enum SavedLatentWindowKind {
     Survival,
     EventProbability,
 }
 
-fn latent_survival_plugin_survival(
+impl SavedLatentWindowKind {
+    fn family_label(self) -> &'static str {
+        match self {
+            SavedLatentWindowKind::Survival => "saved latent survival",
+            SavedLatentWindowKind::EventProbability => "saved latent binary",
+        }
+    }
+
+    fn covariance_label(self) -> &'static str {
+        match self {
+            SavedLatentWindowKind::Survival => "saved latent survival",
+            SavedLatentWindowKind::EventProbability => "saved latent binary",
+        }
+    }
+
+    fn output_stage(self) -> &'static str {
+        match self {
+            SavedLatentWindowKind::Survival => "writing latent survival predictions",
+            SavedLatentWindowKind::EventProbability => "writing latent binary predictions",
+        }
+    }
+
+    fn response_from_survival(self, survival: f64) -> f64 {
+        match self {
+            SavedLatentWindowKind::Survival => survival,
+            SavedLatentWindowKind::EventProbability => 1.0 - survival,
+        }
+    }
+
+    fn response_gradient(self, jet: &LatentWindowPluginJet) -> [f64; 3] {
+        let scale = match self {
+            SavedLatentWindowKind::Survival => jet.survival,
+            SavedLatentWindowKind::EventProbability => -jet.survival,
+        };
+        [
+            scale * jet.score_mu,
+            scale * jet.score_q_entry,
+            scale * jet.score_q_exit,
+        ]
+    }
+
+    fn write_predictions(
+        self,
+        path: &Path,
+        eta: ArrayView1<'_, f64>,
+        mean: ArrayView1<'_, f64>,
+        mean_lower: Option<ArrayView1<'_, f64>>,
+        mean_upper: Option<ArrayView1<'_, f64>>,
+    ) -> Result<(), String> {
+        match self {
+            SavedLatentWindowKind::Survival => {
+                write_survival_prediction_csv(path, eta, mean, None, mean_lower, mean_upper)
+            }
+            SavedLatentWindowKind::EventProbability => {
+                write_survival_binary_prediction_csv(path, eta, mean, None, mean_lower, mean_upper)
+            }
+        }
+    }
+}
+
+struct PreparedSavedLatentWindowPrediction {
+    sigma: f64,
+    fit: UnifiedFitResult,
+    eta: Array1<f64>,
+    q_entry: Array1<f64>,
+    q_exit: Array1<f64>,
+}
+
+fn latent_window_plugin_survival(
     quadctx: &gam::quadrature::QuadratureContext,
     q_entry: f64,
     q_exit: f64,
@@ -2636,17 +2700,16 @@ fn latent_survival_plugin_survival(
     unloaded_mass_exit: f64,
     mu: f64,
     sigma: f64,
-) -> Result<LatentSurvivalPluginJet, String> {
+) -> Result<LatentWindowPluginJet, String> {
     let row = gam::families::lognormal_kernel::LatentSurvivalRow::right_censored(
         q_entry.exp(),
         q_exit.exp(),
         unloaded_mass_entry,
         unloaded_mass_exit,
     );
-    let jet = gam::families::lognormal_kernel::LatentSurvivalRowJet::evaluate(
-        quadctx, &row, mu, sigma,
-    )
-    .map_err(|e| format!("latent survival prediction failed: {e}"))?;
+    let jet =
+        gam::families::lognormal_kernel::LatentSurvivalRowJet::evaluate(quadctx, &row, mu, sigma)
+            .map_err(|e| format!("latent hazard-window prediction failed: {e}"))?;
     let score_q_entry = if row.mass_entry > 0.0 {
         let bundle = gam::families::lognormal_kernel::log_kernel_bundle(
             quadctx,
@@ -2655,7 +2718,7 @@ fn latent_survival_plugin_survival(
             sigma,
             1,
         )
-        .map_err(|e| format!("latent survival entry kernel evaluation failed: {e}"))?;
+        .map_err(|e| format!("latent hazard-window entry kernel evaluation failed: {e}"))?;
         let ratio = (bundle.get(1) - bundle.get(0)).exp();
         row.mass_entry * ratio
     } else {
@@ -2669,13 +2732,13 @@ fn latent_survival_plugin_survival(
             sigma,
             1,
         )
-        .map_err(|e| format!("latent survival exit kernel evaluation failed: {e}"))?;
+        .map_err(|e| format!("latent hazard-window exit kernel evaluation failed: {e}"))?;
         let ratio = (bundle.get(1) - bundle.get(0)).exp();
         -row.mass_exit * ratio
     } else {
         0.0
     };
-    Ok(LatentSurvivalPluginJet {
+    Ok(LatentWindowPluginJet {
         survival: jet.log_lik.exp().clamp(0.0, 1.0),
         score_mu: jet.score,
         score_q_entry,
@@ -2683,10 +2746,7 @@ fn latent_survival_plugin_survival(
     })
 }
 
-fn block_range_by_role(
-    fit: &UnifiedFitResult,
-    role: BlockRole,
-) -> Option<std::ops::Range<usize>> {
+fn block_range_by_role(fit: &UnifiedFitResult, role: BlockRole) -> Option<std::ops::Range<usize>> {
     let mut offset = 0usize;
     for block in &fit.blocks {
         let end = offset + block.beta.len();
@@ -2698,18 +2758,27 @@ fn block_range_by_role(
     None
 }
 
-fn latent_survival_joint_local_covariances(
+fn saved_latent_window_local_covariances(
     cov_design: &DesignMatrix,
     x_time_entry: &Array2<f64>,
     x_time_exit: &Array2<f64>,
     fit: &UnifiedFitResult,
     backend: &PredictionCovarianceBackend<'_>,
+    kind: SavedLatentWindowKind,
 ) -> Result<Vec<Vec<Array1<f64>>>, String> {
     let fit_dim = backend.nrows();
-    let mean_range = block_range_by_role(fit, BlockRole::Mean)
-        .ok_or_else(|| "saved latent-survival model is missing its mean block".to_string())?;
-    let time_range = block_range_by_role(fit, BlockRole::Time)
-        .ok_or_else(|| "saved latent-survival model is missing its time block".to_string())?;
+    let mean_range = block_range_by_role(fit, BlockRole::Mean).ok_or_else(|| {
+        format!(
+            "{} model is missing its mean block",
+            kind.covariance_label()
+        )
+    })?;
+    let time_range = block_range_by_role(fit, BlockRole::Time).ok_or_else(|| {
+        format!(
+            "{} model is missing its time block",
+            kind.covariance_label()
+        )
+    })?;
     rowwise_local_covariances(backend, cov_design.nrows(), 3, |rows| {
         let mean_rows = cov_design.row_chunk(rows.clone());
         let time_entry_rows = x_time_entry.slice(s![rows.clone(), ..]).to_owned();
@@ -2728,94 +2797,119 @@ fn latent_survival_joint_local_covariances(
             .assign(&time_exit_rows);
         Ok(vec![mean_grad, entry_grad, exit_grad])
     })
-    .map_err(|e| format!("saved latent-survival covariance application failed: {e}"))
+    .map_err(|e| {
+        format!(
+            "{} covariance application failed: {e}",
+            kind.covariance_label()
+        )
+    })
 }
 
-fn run_predict_saved_latent_window(
+fn prepare_saved_latent_window_prediction(
+    model: &SavedModel,
+    cov_design: &DesignMatrix,
+    prepared: &PreparedSurvivalTimeStack,
+    primary_offset: &Array1<f64>,
+    kind: SavedLatentWindowKind,
+) -> Result<PreparedSavedLatentWindowPrediction, String> {
+    let (sigma, _) = fixed_hazard_multiplier_from_saved_family(&model.family_state)?;
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let beta_block = fit.block_by_role(BlockRole::Mean).ok_or_else(|| {
+        format!(
+            "{} model is missing its mean coefficient block",
+            kind.family_label()
+        )
+    })?;
+    let beta = beta_block.beta.clone();
+    if beta.len() != cov_design.ncols() {
+        return Err(format!(
+            "{} model/design mismatch: beta has {} coefficients but design has {} columns",
+            kind.family_label(),
+            beta.len(),
+            cov_design.ncols()
+        ));
+    }
+    let beta_time = fit.beta_time().to_owned();
+    if beta_time.is_empty() {
+        return Err(format!(
+            "{} model is missing its time coefficient block",
+            kind.family_label()
+        ));
+    }
+    if beta_time.len() != prepared.time_design_exit.ncols() {
+        return Err(format!(
+            "{} time/design mismatch: beta_time has {} coefficients but rebuilt time design has {} columns",
+            kind.family_label(),
+            beta_time.len(),
+            prepared.time_design_exit.ncols()
+        ));
+    }
+    let eta = cov_design.dot(&beta) + primary_offset;
+    let q_entry = prepared.time_design_entry.dot(&beta_time) + &prepared.eta_offset_entry;
+    let q_exit = prepared.time_design_exit.dot(&beta_time) + &prepared.eta_offset_exit;
+
+    Ok(PreparedSavedLatentWindowPrediction {
+        sigma,
+        fit,
+        eta,
+        q_entry,
+        q_exit,
+    })
+}
+
+fn run_predict_saved_latent_window_impl(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
     model: &SavedModel,
     cov_design: &DesignMatrix,
     prepared: &PreparedSurvivalTimeStack,
     primary_offset: &Array1<f64>,
-    mode: LatentWindowPredictionMode,
+    kind: SavedLatentWindowKind,
 ) -> Result<(), String> {
-    let (sigma, _) = fixed_hazard_multiplier_from_saved_family(&model.family_state)?;
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let beta_block = fit_saved
-        .block_by_role(BlockRole::Mean)
-        .ok_or_else(|| {
-            "saved latent-survival model is missing its mean coefficient block".to_string()
-        })?;
-    let beta = &beta_block.beta;
-    if beta.len() != cov_design.ncols() {
-        return Err(format!(
-            "saved latent-survival model/design mismatch: beta has {} coefficients but design has {} columns",
-            beta.len(),
-            cov_design.ncols()
-        ));
-    }
-    let beta_time = fit_saved.beta_time();
-    if beta_time.is_empty() {
-        return Err("saved latent-survival model is missing its time coefficient block".to_string());
-    }
-    if beta_time.len() != prepared.time_design_exit.ncols() {
-        return Err(format!(
-            "saved latent-survival time/design mismatch: beta_time has {} coefficients but rebuilt time design has {} columns",
-            beta_time.len(),
-            prepared.time_design_exit.ncols()
-        ));
-    }
-
+    let state =
+        prepare_saved_latent_window_prediction(model, cov_design, prepared, primary_offset, kind)?;
     let n = cov_design.nrows();
-    let eta = cov_design.dot(beta) + primary_offset;
-    let q_entry = prepared.time_design_entry.dot(&beta_time) + &prepared.eta_offset_entry;
-    let q_exit = prepared.time_design_exit.dot(&beta_time) + &prepared.eta_offset_exit;
     let quadctx = gam::quadrature::QuadratureContext::new();
     let plugin_jets = (0..n)
         .map(|i| {
-            latent_survival_plugin_survival(
+            latent_window_plugin_survival(
                 &quadctx,
-                q_entry[i],
-                q_exit[i],
+                state.q_entry[i],
+                state.q_exit[i],
                 prepared.unloaded_mass_entry[i],
                 prepared.unloaded_mass_exit[i],
-                eta[i],
-                sigma,
+                state.eta[i],
+                state.sigma,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let plugin_mean = Array1::from_vec(
         plugin_jets
             .iter()
-            .map(|jet| {
-                if mode == LatentWindowPredictionMode::Survival {
-                    jet.survival
-                } else {
-                    1.0 - jet.survival
-                }
-            })
+            .map(|jet| kind.response_from_survival(jet.survival))
             .collect(),
     );
 
     let need_covariance = args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
     let local_covariances = if need_covariance {
         let backend = prediction_backend_from_model(model, args.covariance_mode)?;
-        if backend.nrows() != fit_saved.beta.len() {
+        if backend.nrows() != state.fit.beta.len() {
             return Err(format!(
-                "saved latent-survival covariance/backend mismatch: got dimension {}, expected {}",
+                "{} covariance/backend mismatch: got dimension {}, expected {}",
+                kind.covariance_label(),
                 backend.nrows(),
-                fit_saved.beta.len()
+                state.fit.beta.len()
             ));
         }
         let x_time_entry = prepared.time_design_entry.to_dense();
         let x_time_exit = prepared.time_design_exit.to_dense();
-        Some(latent_survival_joint_local_covariances(
+        Some(saved_latent_window_local_covariances(
             cov_design,
             &x_time_entry,
             &x_time_exit,
-            &fit_saved,
+            &state.fit,
             &backend,
+            kind,
         )?)
     } else {
         None
@@ -2835,48 +2929,43 @@ fn run_predict_saved_latent_window(
             None
         };
         for i in 0..n {
-            let (m1, m2) =
-                gam::quadrature::normal_expectation_nd_adaptive_result::<3, _, _, String>(
-                    &quadctx,
-                    [eta[i], q_entry[i], q_exit[i]],
+            let (m1, m2) = gam::quadrature::normal_expectation_nd_adaptive_result::<3, _, _, String>(
+                &quadctx,
+                [state.eta[i], state.q_entry[i], state.q_exit[i]],
+                [
                     [
-                        [
-                            local_cov[0][0][i].max(0.0),
-                            local_cov[0][1][i],
-                            local_cov[0][2][i],
-                        ],
-                        [
-                            local_cov[1][0][i],
-                            local_cov[1][1][i].max(0.0),
-                            local_cov[1][2][i],
-                        ],
-                        [
-                            local_cov[2][0][i],
-                            local_cov[2][1][i],
-                            local_cov[2][2][i].max(0.0),
-                        ],
+                        local_cov[0][0][i].max(0.0),
+                        local_cov[0][1][i],
+                        local_cov[0][2][i],
                     ],
-                    15,
-                    |x| {
-                        latent_survival_plugin_survival(
-                            &quadctx,
-                            x[1],
-                            x[2],
-                            prepared.unloaded_mass_entry[i],
-                            prepared.unloaded_mass_exit[i],
-                            x[0],
-                            sigma,
-                        )
-                        .map(|jet| {
-                            let mean = if mode == LatentWindowPredictionMode::Survival {
-                                jet.survival
-                            } else {
-                                1.0 - jet.survival
-                            };
-                            (mean, mean * mean)
-                        })
-                    },
-                )?;
+                    [
+                        local_cov[1][0][i],
+                        local_cov[1][1][i].max(0.0),
+                        local_cov[1][2][i],
+                    ],
+                    [
+                        local_cov[2][0][i],
+                        local_cov[2][1][i],
+                        local_cov[2][2][i].max(0.0),
+                    ],
+                ],
+                15,
+                |x| {
+                    latent_window_plugin_survival(
+                        &quadctx,
+                        x[1],
+                        x[2],
+                        prepared.unloaded_mass_entry[i],
+                        prepared.unloaded_mass_exit[i],
+                        x[0],
+                        state.sigma,
+                    )
+                    .map(|jet| {
+                        let mean = kind.response_from_survival(jet.survival);
+                        (mean, mean * mean)
+                    })
+                },
+            )?;
             posterior_mean[i] = m1.clamp(0.0, 1.0);
             if let Some(sd) = response_sd.as_mut() {
                 sd[i] = (m2 - m1 * m1).max(0.0).sqrt();
@@ -2912,16 +3001,7 @@ fn run_predict_saved_latent_window(
         let response_sd = Array1::from_vec(
             (0..n)
                 .map(|i| {
-                    let sign = if mode == LatentWindowPredictionMode::Survival {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    let grad = [
-                        sign * plugin_jets[i].survival * plugin_jets[i].score_mu,
-                        sign * plugin_jets[i].survival * plugin_jets[i].score_q_entry,
-                        sign * plugin_jets[i].survival * plugin_jets[i].score_q_exit,
-                    ];
+                    let grad = kind.response_gradient(&plugin_jets[i]);
                     let cov = [
                         [
                             local_cov[0][0][i].max(0.0),
@@ -2955,32 +3035,58 @@ fn run_predict_saved_latent_window(
     }
 
     progress.advance_workflow(4);
-    progress.set_stage("predict", "writing survival predictions");
-    if mode == LatentWindowPredictionMode::Survival {
-        write_survival_prediction_csv(
-            &args.out,
-            eta.view(),
-            mean.view(),
-            None,
-            mean_lo.as_ref().map(|a| a.view()),
-            mean_hi.as_ref().map(|a| a.view()),
-        )?;
-    } else {
-        write_prediction_csv(
-            &args.out,
-            eta.view(),
-            mean.view(),
-            None,
-            mean_lo.as_ref().map(|a| a.view()),
-            mean_hi.as_ref().map(|a| a.view()),
-        )?;
-    }
+    progress.set_stage("predict", kind.output_stage());
+    kind.write_predictions(
+        &args.out,
+        state.eta.view(),
+        mean.view(),
+        mean_lo.as_ref().map(|a| a.view()),
+        mean_hi.as_ref().map(|a| a.view()),
+    )?;
     println!(
         "wrote predictions: {} (rows={})",
         args.out.display(),
         mean.len()
     );
     Ok(())
+}
+
+fn run_predict_saved_latent_survival(
+    progress: &mut gam::visualizer::VisualizerSession,
+    args: &PredictArgs,
+    model: &SavedModel,
+    cov_design: &DesignMatrix,
+    prepared: &PreparedSurvivalTimeStack,
+    primary_offset: &Array1<f64>,
+) -> Result<(), String> {
+    run_predict_saved_latent_window_impl(
+        progress,
+        args,
+        model,
+        cov_design,
+        prepared,
+        primary_offset,
+        SavedLatentWindowKind::Survival,
+    )
+}
+
+fn run_predict_saved_latent_binary(
+    progress: &mut gam::visualizer::VisualizerSession,
+    args: &PredictArgs,
+    model: &SavedModel,
+    cov_design: &DesignMatrix,
+    prepared: &PreparedSurvivalTimeStack,
+    primary_offset: &Array1<f64>,
+) -> Result<(), String> {
+    run_predict_saved_latent_window_impl(
+        progress,
+        args,
+        model,
+        cov_design,
+        prepared,
+        primary_offset,
+        SavedLatentWindowKind::EventProbability,
+    )
 }
 
 /// Special-case survival prediction.
@@ -3094,19 +3200,25 @@ fn run_predict_survival(
             None,
             Some(loading),
         )?;
-        return run_predict_saved_latent_window(
-            progress,
-            args,
-            model,
-            &cov_design.design,
-            &prepared,
-            primary_offset,
-            if saved_likelihood_mode == SurvivalLikelihoodMode::Latent {
-                LatentWindowPredictionMode::Survival
-            } else {
-                LatentWindowPredictionMode::EventProbability
-            },
-        );
+        return match saved_likelihood_mode {
+            SurvivalLikelihoodMode::Latent => run_predict_saved_latent_survival(
+                progress,
+                args,
+                model,
+                &cov_design.design,
+                &prepared,
+                primary_offset,
+            ),
+            SurvivalLikelihoodMode::LatentBinary => run_predict_saved_latent_binary(
+                progress,
+                args,
+                model,
+                &cov_design.design,
+                &prepared,
+                primary_offset,
+            ),
+            _ => unreachable!(),
+        };
     }
     let mut eta_offset_entry = Array1::<f64>::zeros(n);
     let mut eta_offset_exit = Array1::<f64>::zeros(n);
@@ -5437,8 +5549,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     if matches!(
         likelihood_mode,
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
-    )
-        && baseline_cfg.target == SurvivalBaselineTarget::Linear
+    ) && baseline_cfg.target == SurvivalBaselineTarget::Linear
     {
         return Err(
             "latent survival/binary likelihoods require a non-linear scalar baseline target; use --baseline-target weibull, gompertz, or gompertz-makeham"
@@ -5898,6 +6009,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             .linkwiggle
             .as_ref()
             .map(deviation_block_config_from_formula_linkwiggle);
+        let requested_score_warp = parsed.linkwiggle.is_some();
         if parsed.linkwiggle.is_some() {
             inference_notes.push(
                 "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
@@ -5960,7 +6072,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             timewiggle_block: prepared.timewiggle_block.clone(),
             logslopespec: logslopespec.clone(),
             logslope_offset: log_sigma_offset.clone(),
-            score_warp: Some(DeviationBlockConfig::default()),
+            score_warp: requested_score_warp.then(DeviationBlockConfig::default),
             link_dev: routed_link_dev.clone(),
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {
@@ -6139,10 +6251,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         let build_time_block = |prepared: &PreparedSurvivalTimeStack| {
             let time_p = prepared.time_design_exit.ncols();
-            let time_initial_log_lambdas = survival_time_initial_log_lambdas(
-                &time_build,
-                &prepared.time_penalties,
-            );
+            let time_initial_log_lambdas =
+                survival_time_initial_log_lambdas(&time_build, &prepared.time_penalties);
             TimeBlockInput {
                 design_entry: prepared.time_design_entry.clone(),
                 design_exit: prepared.time_design_exit.clone(),
@@ -6157,8 +6267,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 initial_beta: Some(Array1::from_elem(time_p, 1e-4)),
             }
         };
-        let build_survival_request = |prepared: PreparedSurvivalTimeStack| {
-            LatentSurvivalFitRequest {
+        let build_survival_request =
+            |prepared: PreparedSurvivalTimeStack| LatentSurvivalFitRequest {
                 data: ds.values.view(),
                 spec: gam::families::latent_survival::LatentSurvivalTermSpec {
                     age_entry: age_entry.clone(),
@@ -6175,8 +6285,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 },
                 frailty: frailty.clone(),
                 options: options.clone(),
-            }
-        };
+            };
         let build_binary_request = |prepared: PreparedSurvivalTimeStack| LatentBinaryFitRequest {
             data: ds.values.view(),
             spec: gam::families::latent_survival::LatentBinaryTermSpec {
@@ -6263,30 +6372,30 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             },
         );
         let fit = match likelihood_mode {
-            SurvivalLikelihoodMode::Latent => match fit_model(FitRequest::LatentSurvival(
-                build_survival_request(prepared),
-            )) {
-                Ok(FitResult::LatentSurvival(result)) => result.fit,
-                Ok(_) => {
-                    return Err(
-                        "internal latent survival workflow returned the wrong result variant"
-                            .to_string(),
-                    );
+            SurvivalLikelihoodMode::Latent => {
+                match fit_model(FitRequest::LatentSurvival(build_survival_request(prepared))) {
+                    Ok(FitResult::LatentSurvival(result)) => result.fit,
+                    Ok(_) => {
+                        return Err(
+                            "internal latent survival workflow returned the wrong result variant"
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => return Err(format!("latent survival fit failed: {e}")),
                 }
-                Err(e) => return Err(format!("latent survival fit failed: {e}")),
-            },
-            SurvivalLikelihoodMode::LatentBinary => match fit_model(FitRequest::LatentBinary(
-                build_binary_request(prepared),
-            )) {
-                Ok(FitResult::LatentBinary(result)) => result.fit,
-                Ok(_) => {
-                    return Err(
-                        "internal latent binary workflow returned the wrong result variant"
-                            .to_string(),
-                    );
+            }
+            SurvivalLikelihoodMode::LatentBinary => {
+                match fit_model(FitRequest::LatentBinary(build_binary_request(prepared))) {
+                    Ok(FitResult::LatentBinary(result)) => result.fit,
+                    Ok(_) => {
+                        return Err(
+                            "internal latent binary workflow returned the wrong result variant"
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => return Err(format!("latent binary fit failed: {e}")),
                 }
-                Err(e) => return Err(format!("latent binary fit failed: {e}")),
-            },
+            }
             _ => unreachable!(),
         };
         println!(
@@ -6987,8 +7096,13 @@ fn run_sample_survival(
 ) -> Result<gam::hmc::NutsResult, String> {
     progress.set_stage("sample", "building survival sampling design");
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
-    if saved_likelihood_mode == SurvivalLikelihoodMode::Latent {
-        return Err("sampling is not implemented for saved latent-survival models".to_string());
+    if matches!(
+        saved_likelihood_mode,
+        SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
+    ) {
+        return Err(
+            "sampling is not implemented for saved latent survival/binary models".to_string(),
+        );
     }
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         return Err(
@@ -9230,11 +9344,11 @@ fn fixed_hazard_multiplier_from_saved_family(
         Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
             sigma_fixed: None,
             ..
-        }) => Err("saved latent-survival model requires a fixed HazardMultiplier sigma; learnable sigma is not implemented for latent survival".to_string()),
+        }) => Err("saved latent survival/binary model requires a fixed HazardMultiplier sigma; learnable sigma is not implemented for latent hazard-window families".to_string()),
         Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { .. })
         | Some(gam::families::lognormal_kernel::FrailtySpec::None)
         | None => Err(
-            "saved latent-survival model requires a fixed HazardMultiplier frailty specification"
+            "saved latent survival/binary model requires a fixed HazardMultiplier frailty specification"
                 .to_string(),
         ),
     }
@@ -11421,6 +11535,63 @@ fn write_survival_prediction_csv(
     write_prediction_csv_unified(path, &cols)
 }
 
+/// Convenience wrapper for binary deployment predictions backed by a survival
+/// hazard window (includes explicit `event_prob`, `failure_prob`, and
+/// `survival_prob` columns).
+fn write_survival_binary_prediction_csv(
+    path: &Path,
+    eta: ArrayView1<'_, f64>,
+    event_prob: ArrayView1<'_, f64>,
+    eta_se: Option<ArrayView1<'_, f64>>,
+    event_lower: Option<ArrayView1<'_, f64>>,
+    event_upper: Option<ArrayView1<'_, f64>>,
+) -> Result<(), String> {
+    let eta_v: Vec<f64> = eta.to_vec();
+    let event_v: Vec<f64> = event_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
+    let risk_v: Vec<f64> = eta_v.clone();
+    let survival_v: Vec<f64> = event_v.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
+
+    let mut cols: Vec<(&str, &[f64])> = vec![
+        ("eta", &eta_v),
+        ("mean", &event_v),
+        ("event_prob", &event_v),
+        ("failure_prob", &event_v),
+        ("survival_prob", &survival_v),
+        ("risk_score", &risk_v),
+    ];
+
+    let se_v: Vec<f64>;
+    let lo_v: Vec<f64>;
+    let hi_v: Vec<f64>;
+    if let Some(se) = eta_se {
+        se_v = se.to_vec();
+        lo_v = event_lower
+            .ok_or_else(|| {
+                "internal error: event_lower missing while effective_se is present".to_string()
+            })?
+            .to_vec();
+        hi_v = event_upper
+            .ok_or_else(|| {
+                "internal error: event_upper missing while effective_se is present".to_string()
+            })?
+            .to_vec();
+        cols.push(("effective_se", &se_v));
+        cols.push(("mean_lower", &lo_v));
+        cols.push(("mean_upper", &hi_v));
+    } else if let (Some(lo), Some(hi)) = (event_lower, event_upper) {
+        lo_v = lo.to_vec();
+        hi_v = hi.to_vec();
+        cols.push(("mean_lower", &lo_v));
+        cols.push(("mean_upper", &hi_v));
+    } else if event_lower.is_some() {
+        return Err("internal error: event_upper missing while event_lower is present".to_string());
+    } else if event_upper.is_some() {
+        return Err("internal error: event_lower missing while event_upper is present".to_string());
+    }
+
+    write_prediction_csv_unified(path, &cols)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -11439,7 +11610,8 @@ mod tests {
         required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
         saved_linkwiggle_design, summarizewiggle_domain, validate_cli_firth_configuration,
-        write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
+        write_gaussian_location_scale_prediction_csv, write_survival_binary_prediction_csv,
+        write_survival_prediction_csv,
     };
     use super::{CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit, run_predict};
     use csv::StringRecord;
@@ -13179,6 +13351,30 @@ mod tests {
     }
 
     #[test]
+    fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_survival_binary_pred_schema_{ts}.csv"));
+
+        let eta: Array1<f64> = array![0.5, -0.25];
+        let event = array![0.7, 0.2];
+        write_survival_binary_prediction_csv(&path, eta.view(), event.view(), None, None, None)
+            .expect("write survival binary prediction csv");
+
+        let text = fs::read_to_string(&path).expect("read csv");
+        let header = text.lines().next().unwrap_or("");
+        assert_eq!(
+            header, "eta,mean,event_prob,failure_prob,survival_prob,risk_score",
+            "survival binary output schema changed unexpectedly"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn gaussian_location_scale_prediction_csv_includes_sigma_column() {
         let mut path = std::env::temp_dir();
         let ts = SystemTime::now()
@@ -13732,6 +13928,105 @@ mod tests {
         let lines = csv.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("mean"));
+    }
+
+    #[test]
+    fn run_predict_survival_supports_saved_latent_survival_model() {
+        let blocks = vec![
+            gam::estimate::FittedBlock {
+                beta: array![0.0],
+                role: BlockRole::Time,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            gam::estimate::FittedBlock {
+                beta: array![0.0],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ];
+        let fit_result = compact_saved_multiblock_fit_result(
+            blocks,
+            Array1::zeros(0),
+            1.0,
+            Some(Array2::<f64>::eye(2)),
+            None,
+            saved_fit_summary_stub(),
+        );
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ 1",
+            ModelKind::Survival,
+            FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("latent".to_string()),
+                survival_distribution: None,
+                frailty: gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                    sigma_fixed: Some(0.3),
+                    loading: gam::families::lognormal_kernel::HazardLoading::Full,
+                },
+            },
+            "survival",
+        );
+        payload.fit_result = Some(fit_result.clone());
+        payload.unified = Some(fit_result);
+        payload.survival_entry = Some("entry".to_string());
+        payload.survival_exit = Some("exit".to_string());
+        payload.survival_event = Some("event".to_string());
+        payload.survivalspec = Some("net".to_string());
+        payload.survival_baseline_target = Some("weibull".to_string());
+        payload.survival_baseline_scale = Some(15.0);
+        payload.survival_baseline_shape = Some(1.3);
+        payload.survival_time_basis = Some("linear".to_string());
+        payload.survival_time_degree = Some(1);
+        payload.survival_time_knots = Some(vec![]);
+        payload.survival_time_keep_cols = Some(vec![0]);
+        payload.survival_time_smooth_lambda = Some(1e-4);
+        payload.survival_time_anchor = Some(0.0);
+        payload.survival_beta_time = Some(vec![0.0]);
+        payload.survival_likelihood = Some("latent".to_string());
+        payload.training_headers = Some(vec!["entry".to_string(), "exit".to_string()]);
+        payload.resolved_termspec = Some(empty_termspec());
+        let model = SavedModel::from_payload(payload);
+
+        let data = array![[10.0, 20.0], [12.0, 24.0]];
+        let col_map = HashMap::from([("entry".to_string(), 0usize), ("exit".to_string(), 1usize)]);
+        let out_dir = tempdir().expect("tempdir");
+        let out_path = out_dir.path().join("latent_survival_pred.csv");
+        let args = PredictArgs {
+            model: PathBuf::from("unused.model.json"),
+            new_data: PathBuf::from("unused.csv"),
+            out: out_path.clone(),
+            offset_column: None,
+            noise_offset_column: None,
+            uncertainty: false,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::Map,
+        };
+
+        let mut progress = gam::visualizer::VisualizerSession::new(false);
+        super::run_predict_survival(
+            &mut progress,
+            &args,
+            &model,
+            data.view(),
+            &col_map,
+            model.training_headers.as_ref(),
+            &Array1::zeros(data.nrows()),
+            &Array1::zeros(data.nrows()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("latent survival predict should succeed");
+
+        let csv = fs::read_to_string(&out_path).expect("prediction csv");
+        let lines = csv.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "eta,mean,survival_prob,risk_score,failure_prob");
     }
 
     #[test]

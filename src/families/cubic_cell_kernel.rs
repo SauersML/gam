@@ -1157,11 +1157,7 @@ fn truncated_gaussian_moment_raw(a: f64, b: f64, order: usize) -> f64 {
         0 => {
             let cdf = |x: f64| {
                 if x.is_infinite() {
-                    if x.is_sign_positive() {
-                        1.0
-                    } else {
-                        0.0
-                    }
+                    if x.is_sign_positive() { 1.0 } else { 0.0 }
                 } else {
                     0.5 * (1.0 + statrs::function::erf::erf(x / std::f64::consts::SQRT_2))
                 }
@@ -1251,7 +1247,8 @@ fn affine_zero_moment(alpha: f64, beta: f64, left: f64, right: f64) -> f64 {
         s * (right - mu)
     };
     let anchor = (-alpha * alpha / (2.0 * s * s)).exp() / s;
-    let span_mass = (2.0 * std::f64::consts::PI).sqrt() * (normal_cdf(y_right) - normal_cdf(y_left));
+    let span_mass =
+        (2.0 * std::f64::consts::PI).sqrt() * (normal_cdf(y_right) - normal_cdf(y_left));
     anchor * span_mass
 }
 
@@ -1638,7 +1635,8 @@ pub fn evaluate_cell_moments(
         // Semi-infinite tail cells must be affine: the deviation saturates
         // to a constant outside support, so c2=c3=0.  Both the BVN CDF
         // and the truncated-Gaussian moment vector handle infinite bounds.
-        if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL {
+        if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL
+        {
             return Err(format!(
                 "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
                 cell.left, cell.right, cell.c2, cell.c3
@@ -3717,13 +3715,17 @@ mod tests {
         )
         .expect("cells a1");
         assert!(cells_a0.len() >= score_breaks.len() - 1);
-        assert!(cells_a0
-            .windows(2)
-            .all(|w| (w[0].cell.right - w[1].cell.left).abs() <= 1e-12));
-        assert!(cells_a0
-            .iter()
-            .zip(cells_a1.iter())
-            .any(|(lhs, rhs)| (lhs.cell.left - rhs.cell.left).abs() > 1e-10));
+        assert!(
+            cells_a0
+                .windows(2)
+                .all(|w| (w[0].cell.right - w[1].cell.left).abs() <= 1e-12)
+        );
+        assert!(
+            cells_a0
+                .iter()
+                .zip(cells_a1.iter())
+                .any(|(lhs, rhs)| (lhs.cell.left - rhs.cell.left).abs() > 1e-10)
+        );
         assert!(cells_a0.first().unwrap().cell.left.is_infinite());
         assert!(cells_a0.last().unwrap().cell.right.is_infinite());
     }
