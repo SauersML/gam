@@ -213,67 +213,90 @@ fn validate_spec(
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
     }
-    // Enforce z is approximately standard normal.
-    // The Gaussian decoupling identity E[Φ(a + β Z)] = Φ(a / √(1+β²))
-    // holds only when Z ~ N(0, 1).  Checking mean ≈ 0, sd ≈ 1 is necessary
-    // but NOT sufficient: a standardized non-normal distribution would pass
-    // those checks but invalidate the closed form.  We additionally check
-    // weighted skewness ≈ 0 and excess kurtosis ≈ 0 to catch the most
-    // common violations (e.g. heavy tails, asymmetry, discrete scores).
-    let weight_sum = spec.weights.iter().copied().sum::<f64>();
-    if weight_sum.is_finite() && weight_sum > 0.0 {
-        let mean = spec
-            .z
-            .iter()
-            .zip(spec.weights.iter())
-            .map(|(&zi, &wi)| wi * zi)
-            .sum::<f64>()
-            / weight_sum;
-        let var = spec
-            .z
-            .iter()
-            .zip(spec.weights.iter())
-            .map(|(&zi, &wi)| wi * (zi - mean) * (zi - mean))
-            .sum::<f64>()
-            / weight_sum;
-        let sd = var.sqrt();
-        if mean.abs() > 0.1 || (sd - 1.0).abs() > 0.1 {
-            return Err(format!(
-                "bernoulli-marginal-slope requires z to already represent a latent N(0,1) score; \
-                 weighted mean 0 and weighted sd 1 are necessary sanity checks. got mean={mean:.6e}, sd={sd:.6e}"
-            ));
-        }
-        // Weighted skewness and excess kurtosis as normality gates.
-        // For Z ~ N(0,1): skewness = 0, excess kurtosis = 0.
-        if sd > 1e-12 {
-            let skew = spec
-                .z
-                .iter()
-                .zip(spec.weights.iter())
-                .map(|(&zi, &wi)| wi * ((zi - mean) / sd).powi(3))
-                .sum::<f64>()
-                / weight_sum;
-            let kurt = spec
-                .z
-                .iter()
-                .zip(spec.weights.iter())
-                .map(|(&zi, &wi)| wi * ((zi - mean) / sd).powi(4))
-                .sum::<f64>()
-                / weight_sum
-                - 3.0;
-            // Tolerances are generous for finite-sample noise but catch
-            // obviously non-Gaussian shapes (e.g. uniform: kurt ≈ -1.2).
-            if skew.abs() > 0.5 || kurt.abs() > 1.5 {
-                log::warn!(
-                    "bernoulli-marginal-slope: z has skewness={skew:.3} and \
-                     excess kurtosis={kurt:.3}; the calibrated marginal-slope \
-                     model assumes the latent score is distributed as Z~N(0,1). \
-                     Results may be biased if z is not approximately normal."
-                );
-            }
-        }
-    }
     Ok(())
+}
+
+/// Recenter/rescale latent z for finite-sample identification while still
+/// rejecting obviously non-Gaussian inputs. Both marginal-slope families use
+/// the same latent-score convention, so survival reuses this helper too.
+pub(crate) fn standardize_latent_z(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    if z.len() != weights.len() {
+        return Err(format!(
+            "{context} latent-score normalization length mismatch: z={}, weights={}",
+            z.len(),
+            weights.len()
+        ));
+    }
+    let weight_sum = weights.iter().copied().sum::<f64>();
+    let weight_sq_sum = weights.iter().map(|&w| w * w).sum::<f64>();
+    if !(weight_sum.is_finite()
+        && weight_sum > 0.0
+        && weight_sq_sum.is_finite()
+        && weight_sq_sum > 0.0)
+    {
+        return Err(format!("{context} requires positive finite total weight"));
+    }
+    let effective_n = weight_sum * weight_sum / weight_sq_sum;
+    if !(effective_n.is_finite() && effective_n > 1.0) {
+        return Err(format!(
+            "{context} requires at least two effective observations for latent-score normalization"
+        ));
+    }
+    let mean = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * zi)
+        .sum::<f64>()
+        / weight_sum;
+    let var = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * (zi - mean) * (zi - mean))
+        .sum::<f64>()
+        / weight_sum;
+    let sd = var.sqrt();
+    if !(sd.is_finite() && sd > 1e-12) {
+        return Err(format!(
+            "{context} requires z with positive finite weighted standard deviation"
+        ));
+    }
+    let mean_tol = 4.0 / effective_n.sqrt();
+    let sd_tol = 4.0 / (2.0 * (effective_n - 1.0).max(1.0)).sqrt();
+    if mean.abs() > mean_tol || (sd - 1.0).abs() > sd_tol {
+        return Err(format!(
+            "{context} requires z to already be approximately latent N(0,1) before identification normalization; got mean={mean:.6e}, sd={sd:.6e}, effective_n={effective_n:.1}, allowed_mean={mean_tol:.3e}, allowed_sd={sd_tol:.3e}"
+        ));
+    }
+
+    let z_std = z.mapv(|zi| (zi - mean) / sd);
+    let skew = z_std
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * zi.powi(3))
+        .sum::<f64>()
+        / weight_sum;
+    let kurt = z_std
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * zi.powi(4))
+        .sum::<f64>()
+        / weight_sum
+        - 3.0;
+    if skew.abs() > 2.0 || kurt.abs() > 7.0 {
+        return Err(format!(
+            "{context} requires z to be approximately Gaussian after identification normalization; got skewness={skew:.3}, excess_kurtosis={kurt:.3}"
+        ));
+    }
+    if skew.abs() > 0.75 || kurt.abs() > 2.0 {
+        log::warn!(
+            "{context}: z has skewness={skew:.3} and excess kurtosis={kurt:.3}; the calibrated marginal-slope model assumes latent Gaussian scores"
+        );
+    }
+    Ok(z_std)
 }
 
 fn pooled_probit_baseline(
@@ -6751,7 +6774,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
+    let mut spec = spec;
     validate_spec(data, &spec)?;
+    spec.z = standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let sigma_learnable = matches!(
         &spec.frailty,
@@ -12206,6 +12231,27 @@ mod tests {
                 assert!((fourth[[i, j]] - fourth[[j, i]]).abs() < 1e-8);
             }
         }
+    }
+
+    #[test]
+    fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
+        let z = array![-0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67];
+        let weights = array![1.0; 12];
+        let standardized =
+            standardize_latent_z(&z, &weights, "bernoulli-marginal-slope").expect("normalize z");
+        let mean = standardized.sum() / standardized.len() as f64;
+        let var = standardized.iter().map(|v| v * v).sum::<f64>() / standardized.len() as f64;
+        assert!(mean.abs() < 1e-12);
+        assert!((var.sqrt() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn latent_z_normalization_rejects_extreme_non_gaussian_scores() {
+        let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
+        let weights = array![1.0; 6];
+        let err = standardize_latent_z(&z, &weights, "bernoulli-marginal-slope")
+            .expect_err("expected non-gaussian rejection");
+        assert!(err.contains("approximately Gaussian"));
     }
 
     #[test]
