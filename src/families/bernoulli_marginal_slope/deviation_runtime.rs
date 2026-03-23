@@ -3,8 +3,10 @@ use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::{
     MonotoneWiggleStructure, monotone_wiggle_basis_with_derivative_order,
 };
-use crate::span::{span_index_for_breakpoints, validate_breakpoints};
-use ndarray::{Array1, Array2, s};
+use crate::linalg::utils::matrix_inversewith_regularization;
+use crate::matrix::DesignMatrix;
+use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
+use ndarray::{Array1, Array2};
 
 /// Evaluate the monotone wiggle basis (or a derivative) at `values`, then
 /// right-multiply by `basis_transform` to map from the raw I-spline columns
@@ -27,11 +29,64 @@ pub(crate) fn anchored_deviation_basis_with_transform(
     Ok(raw.dot(basis_transform))
 }
 
+fn max_abs_matrix_diff(lhs: &Array2<f64>, rhs: &Array2<f64>) -> f64 {
+    if lhs.dim() != rhs.dim() {
+        return f64::INFINITY;
+    }
+    let mut max_diff = 0.0_f64;
+    for i in 0..lhs.nrows() {
+        for j in 0..lhs.ncols() {
+            max_diff = max_diff.max((lhs[[i, j]] - rhs[[i, j]]).abs());
+        }
+    }
+    max_diff
+}
+
+/// Recover the exact raw-basis-to-trained-basis replay map used for saved
+/// anchored deviations. This must reproduce the training design exactly.
+pub(crate) fn derive_deviation_basis_transform(
+    seed: &Array1<f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    constrained_design: &DesignMatrix,
+) -> Result<Array2<f64>, String> {
+    let raw_design = monotone_wiggle_basis_with_derivative_order(seed.view(), knots, degree, 0)?;
+    let constrained_dense = constrained_design.to_dense();
+    if raw_design.nrows() != constrained_dense.nrows() {
+        return Err(format!(
+            "anchored deviation design row mismatch while deriving replay transform: raw rows={}, constrained rows={}",
+            raw_design.nrows(),
+            constrained_dense.nrows()
+        ));
+    }
+    if raw_design.ncols() == constrained_dense.ncols()
+        && max_abs_matrix_diff(&raw_design, &constrained_dense) <= 1e-12
+    {
+        return Ok(Array2::<f64>::eye(raw_design.ncols()));
+    }
+
+    let gram = raw_design.t().dot(&raw_design);
+    let rhs = raw_design.t().dot(&constrained_dense);
+    let gram_inv = matrix_inversewith_regularization(&gram, "anchored deviation basis replay")
+        .ok_or_else(|| {
+            "failed to derive anchored deviation replay transform from training design".to_string()
+        })?;
+    let basis_transform = gram_inv.dot(&rhs);
+    let replayed = raw_design.dot(&basis_transform);
+    let replay_error = max_abs_matrix_diff(&replayed, &constrained_dense);
+    if !replay_error.is_finite() || replay_error > 1e-8 {
+        return Err(format!(
+            "anchored deviation replay transform does not exactly reproduce the training design (max abs error {replay_error:.3e})"
+        ));
+    }
+    Ok(basis_transform)
+}
+
 /// Precomputed per-span Taylor design matrices for a monotone deviation basis.
 ///
-/// **Structural invariant:** the value basis must be piecewise cubic
-/// (`value_span_degree <= 3`) so that the fourth derivative is identically
-/// zero on every knot span.  This allows [`local_cubic_on_span`] and
+/// **Structural invariant:** the value basis must have a structurally zero
+/// fourth derivative on every knot span (`value_span_degree <= 3`). This
+/// allows [`local_cubic_on_span`] and
 /// [`basis_span_cubic`] to reconstruct each basis function as an *exact*
 /// Taylor polynomial `c₀ + c₁t + c₂t² + c₃t³` — no truncation error.
 ///
@@ -62,7 +117,7 @@ pub struct DeviationRuntime {
 }
 
 impl DeviationRuntime {
-    /// Construct a `DeviationRuntime`, enforcing the piecewise-cubic invariant.
+    /// Construct a `DeviationRuntime`, enforcing the zero-fourth-derivative invariant.
     ///
     /// Derives breakpoints and span intervals from `knots` internally — callers
     /// cannot supply inconsistent span geometry.
@@ -83,27 +138,54 @@ impl DeviationRuntime {
         monotonicity_eps: f64,
         basis_transform: Array2<f64>,
     ) -> Result<Self, String> {
+        if degree < 2 {
+            return Err(format!(
+                "DeviationRuntime requires a monotone wiggle degree >= 2, got {}",
+                degree
+            ));
+        }
+        if basis_dim == 0 {
+            return Err("DeviationRuntime requires at least one deviation coefficient".to_string());
+        }
+        if !monotonicity_eps.is_finite() || monotonicity_eps < 0.0 {
+            return Err(format!(
+                "DeviationRuntime monotonicity_eps must be finite and non-negative, got {monotonicity_eps}"
+            ));
+        }
+        if basis_transform.ncols() != basis_dim {
+            return Err(format!(
+                "DeviationRuntime basis transform width mismatch: transform has {} columns but basis_dim is {}",
+                basis_transform.ncols(),
+                basis_dim
+            ));
+        }
+        if basis_transform.nrows() == 0 {
+            return Err(
+                "DeviationRuntime basis transform must have at least one raw column".to_string(),
+            );
+        }
+        if basis_transform.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "DeviationRuntime basis transform contains non-finite entries".to_string(),
+            );
+        }
+
         // ── gate 1: structural / type-level ──
         if !structure.fourth_derivative_is_structurally_zero() {
             return Err(format!(
-                "DeviationRuntime requires a piecewise-cubic value basis \
-                 (fourth derivative structurally zero), but the monotone wiggle \
+                "DeviationRuntime requires a value basis whose fourth derivative \
+                 is structurally zero on every span, but the monotone wiggle \
                  basis has per-span polynomial degree {} (from public degree {})",
                 structure.value_span_degree, degree
             ));
         }
 
         // ── derive breakpoints and span geometry from knots ──
-        let mut bkpts = Vec::new();
-        for &knot in knots.iter() {
-            if bkpts
-                .last()
-                .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
-            {
-                bkpts.push(knot);
-            }
-        }
-        validate_breakpoints(&bkpts, "DeviationRuntime breakpoints")?;
+        let bkpts = breakpoints_from_knots(
+            knots.as_slice()
+                .ok_or_else(|| "DeviationRuntime knots are not contiguous".to_string())?,
+            "DeviationRuntime breakpoints",
+        )?;
         let mut span_left = Vec::new();
         let mut span_right = Vec::new();
         let mut span_mid = Vec::new();

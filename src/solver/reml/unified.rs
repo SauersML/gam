@@ -894,12 +894,14 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
 /// Differentiating H twice with respect to the outer smoothing parameters
 /// (via the implicit function theorem) produces FIVE distinct contributions.
 /// Without these, the unified REML evaluator cannot compute the exact outer
-/// Hessian and must fall back to BFGS for the outer optimization.
+/// Hessian, so the outer planner must downgrade to a non-analytic-Hessian
+/// strategy (finite-difference Hessian Newton for small problems, otherwise
+/// BFGS).
 ///
 /// This provider stores pre-computed ingredients from the converged P-IRLS
 /// inner loop and implements both first-order (∂H/∂ρ_k) and second-order
-/// (∂²H/∂ρ_k∂ρ_l) Hessian corrections analytically, enabling exact Newton
-/// for the outer REML and eliminating the BFGS fallback.
+/// (∂²H/∂ρ_k∂ρ_l) Hessian corrections analytically, enabling the exact
+/// analytic-Hessian outer plan instead of those downgraded strategies.
 ///
 /// # Mathematical framework (response.md Sections 3 and 6)
 ///
@@ -2530,6 +2532,108 @@ fn trace_hinv_drift_cross(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Shared outer-derivative formulas
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These helpers implement the analytic identities ONCE so that all
+// coordinate types (ρ, τ, ψ) and all pair types (ρ-ρ, ρ-ext, ext-ext)
+// go through the same formula. Any chain-rule or transformed-parameter
+// fix automatically applies to every code path.
+
+/// Compute one entry of the outer gradient.
+///
+/// The universal three-term formula is:
+///
+/// ```text
+///   ∂V/∂θ_i = a_i_scaled + ½ tr(G_ε Ḣ_i) − ½ ∂_i log|S|₊
+/// ```
+///
+/// where:
+/// - `a_i` is the fixed-β cost derivative (0.5 × β̂ᵀAₖβ̂ for ρ, coord.a for ext)
+/// - `trace_logdet_i` is tr(G_ε(H) Ḣ_i) (logdet gradient operator applied to
+///   the total Hessian drift including IFT correction)
+/// - `ld_s_i` is ∂_i log|S|₊ (penalty pseudo-logdet derivative)
+///
+/// The dispersion handling scales the penalty term:
+/// - Profiled Gaussian: dp_cgrad × a_i / φ̂
+/// - Fixed dispersion: a_i
+#[inline]
+fn outer_gradient_entry(
+    a_i: f64,
+    trace_logdet_i: f64,
+    ld_s_i: f64,
+    dispersion: &DispersionHandling,
+    dp_cgrad: f64,
+    profiled_scale: f64,
+    incl_logdet_h: bool,
+    incl_logdet_s: bool,
+) -> f64 {
+    let penalty_term = match dispersion {
+        DispersionHandling::ProfiledGaussian => dp_cgrad * a_i / profiled_scale,
+        DispersionHandling::Fixed { .. } => a_i,
+    };
+    let trace_term = if incl_logdet_h {
+        0.5 * trace_logdet_i
+    } else {
+        0.0
+    };
+    let det_term = if incl_logdet_s {
+        0.5 * ld_s_i
+    } else {
+        0.0
+    };
+    penalty_term + trace_term - det_term
+}
+
+/// Compute one entry of the outer Hessian.
+///
+/// The universal three-term formula is:
+///
+/// ```text
+///   ∂²V/∂θ_i∂θ_j = Q_ij + L_ij + P_ij
+/// ```
+///
+/// where:
+/// - Q_ij = pair_a − g_i·v_j  (penalty quadratic second derivative, with
+///   profiled Gaussian cross-correction: − 2 a_i a_j / (ν φ̂²))
+/// - L_ij = ½ (cross_trace + h2_trace) (logdet Hessian)
+/// - P_ij = −½ pair_ld_s  (penalty logdet second derivative)
+///
+/// The `cross_trace` is −tr(H⁻¹ Ḣ_j H⁻¹ Ḣ_i) from the spectral kernel
+/// (or stochastic estimator).  The `h2_trace` is tr(G_ε Ḧ_ij) from the
+/// second Hessian drift including IFT and fourth-derivative corrections.
+#[inline]
+fn outer_hessian_entry(
+    a_i: f64,
+    a_j: f64,
+    g_i_dot_v_j: f64,
+    pair_a: f64,
+    cross_trace: f64,
+    h2_trace: f64,
+    pair_ld_s: f64,
+    profiled_phi: f64,
+    profiled_nu: f64,
+    is_profiled: bool,
+    incl_logdet_h: bool,
+    incl_logdet_s: bool,
+) -> f64 {
+    let q_raw = pair_a - g_i_dot_v_j;
+    let q = if is_profiled {
+        q_raw / profiled_phi
+            - 2.0 * a_i * a_j / (profiled_nu * profiled_phi * profiled_phi)
+    } else {
+        q_raw
+    };
+    let l = if incl_logdet_h {
+        0.5 * (cross_trace + h2_trace)
+    } else {
+        0.0
+    };
+    let p = if incl_logdet_s { -0.5 * pair_ld_s } else { 0.0 };
+    q + l + p
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  The single evaluator
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2903,83 +3007,73 @@ pub fn reml_laml_evaluate(
         None
     };
 
+    // ── Gradient: one shared formula for ALL coordinate types ──
+    //
+    // Both ρ and ext coordinates are processed through outer_gradient_entry()
+    // so that the three-term formula (penalty + trace − det) is written once.
+
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
         let a_k_beta = &rho_penalty_a_k_betas[idx];
 
-        // Term 1: penalty quadratic derivative.
-        // For Gaussian (profiled): dp_cgrad × D_k / (2φ̂) where D_k = β̂ᵀAₖβ̂.
-        // For non-Gaussian: 0.5 × β̂ᵀAₖβ̂ (direct from LAML formula).
-        let d_k = solution.beta.dot(a_k_beta);
+        // Cost derivative: a_i = ½ β̂ᵀ Aₖ β̂.
+        let a_i = 0.5 * solution.beta.dot(a_k_beta);
 
-        let penalty_term = match &solution.dispersion {
-            DispersionHandling::ProfiledGaussian => dp_cgrad * (d_k / (2.0 * profiled_scale)),
-            DispersionHandling::Fixed { .. } => 0.5 * d_k,
-        };
-
-        // Term 2: ½ tr(G_ε(H) Hₖ) — derivative of ½ log|R_ε(H)|.
-        // Uses the logdet gradient operator G_ε (which differs from H⁻¹ for
-        // spectral regularization).
-        // Hₖ = Aₖ + (third-derivative correction).
-        // Zero when include_logdet_h is false (MPL/PQL).
-        let trace_term = if !incl_logdet_h {
+        // Trace term: tr(G_ε(H) Ḣₖ) where Ḣₖ = Aₖ + C[vₖ].
+        let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
-            // Stochastic path: use pre-computed batched Hutchinson estimate.
-            // The estimator already computed tr(H⁻¹ Hₖ) for all k in a
-            // single pass, amortizing the H⁻¹ solve across coordinates.
-            0.5 * stoch_traces[idx]
+            stoch_traces[idx]
+        } else if coord.uses_operator_fast_path() {
+            let op =
+                coord.scaled_operator(curvature_lambdas[idx], rho_corrections[idx].as_ref());
+            hop.trace_logdet_h_k_operator(&op, None)
+        } else if coord.is_block_local() && rho_corrections[idx].is_none() {
+            let (block, start, end) = coord.scaled_block_local(1.0);
+            hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
         } else {
-            if coord.uses_operator_fast_path() {
-                let op =
-                    coord.scaled_operator(curvature_lambdas[idx], rho_corrections[idx].as_ref());
-                0.5 * hop.trace_logdet_h_k_operator(&op, None)
-            } else if coord.is_block_local() && rho_corrections[idx].is_none() {
-                // Block-local penalty with no observation correction:
-                // compute trace using only the block slice of the eigenbasis.
-                let (block, start, end) = coord.scaled_block_local(1.0);
-                0.5 * hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
-            } else {
-                let mut a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
-                if let Some(corr) = rho_corrections[idx].as_ref() {
-                    a_k_matrix += corr;
-                }
-                0.5 * hop.trace_logdet_h_k(&a_k_matrix, None)
+            let mut a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
+            if let Some(corr) = rho_corrections[idx].as_ref() {
+                a_k_matrix += corr;
             }
+            hop.trace_logdet_h_k(&a_k_matrix, None)
         };
 
-        // Term 3: −½ ∂/∂ρₖ L_δ(S) — smooth pseudo-logdet derivative.
-        // Zero when include_logdet_s is false (MPL/PQL).
-        let det_term = if !incl_logdet_s {
-            0.0
-        } else {
-            0.5 * solution.penalty_logdet.first[idx]
-        };
-
-        grad[idx] = penalty_term + trace_term - det_term;
+        grad[idx] = outer_gradient_entry(
+            a_i,
+            trace_logdet_i,
+            solution.penalty_logdet.first[idx],
+            &solution.dispersion,
+            dp_cgrad,
+            profiled_scale,
+            incl_logdet_h,
+            incl_logdet_s,
+        );
     }
 
     // Extended hyperparameter gradient (ψ/τ coordinates).
+    //
+    // Uses the SAME outer_gradient_entry() formula as ρ coordinates above.
+    //
+    // Sign convention: hessian_derivative_correction() expects v_i = H⁻¹(g_i)
+    // (positive), matching the ρ convention where v_k = H⁻¹(A_k β̂). The
+    // implementation internally negates to get the mode direction β_i = −v_i.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let grad_idx = k + ext_idx;
 
-        // Mode response for τ/ψ coordinates: β_i = H⁻¹ g_i.
-        // The HessianDerivativeProvider convention is the NEGATED β-direction,
-        // so correction terms consume -β_i rather than β_i itself.
+        // Mode response: v_i = H⁻¹(g_i).
         let v_i = hop.solve(&coord.g);
-        let corr_dir_i = v_i.mapv(|v| -v);
 
-        // Trace term: ½ tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + C[β_i]
-        // Uses the logdet gradient operator G_ε.
-        let trace_term = if !incl_logdet_h {
+        // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + C[v_i].
+        // The HessianDerivativeProvider takes v_i (positive) and internally
+        // computes D_β H[−v_i], matching the ρ-coordinate convention.
+        let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
-            // Stochastic path: ext traces are stored after the k ρ-traces.
-            0.5 * stoch_traces[k + ext_idx]
+            stoch_traces[k + ext_idx]
         } else {
-            // Exact path.
             let correction = if effective_deriv.has_corrections() {
-                effective_deriv.hessian_derivative_correction(&corr_dir_i)?
+                effective_deriv.hessian_derivative_correction(&v_i)?
             } else {
                 None
             };
@@ -2988,23 +3082,23 @@ pub fn reml_laml_evaluate(
                 .operator_ref()
                 .filter(|_| coord.drift.uses_operator_fast_path())
             {
-                0.5 * hop.trace_logdet_h_k_operator(op, correction.as_ref())
+                hop.trace_logdet_h_k_operator(op, correction.as_ref())
             } else {
                 let h_i = coord.drift.materialize();
-                0.5 * hop.trace_logdet_h_k(&h_i, correction.as_ref())
+                hop.trace_logdet_h_k(&h_i, correction.as_ref())
             }
         };
 
-        // Penalty term: a_i (with profiled Gaussian rescaling if applicable)
-        let penalty_term = match &solution.dispersion {
-            DispersionHandling::ProfiledGaussian => dp_cgrad * (coord.a / profiled_scale),
-            DispersionHandling::Fixed { .. } => coord.a,
-        };
-
-        // Logdet S term: -½ ∂_i log|S|₊
-        let det_term = if incl_logdet_s { 0.5 * coord.ld_s } else { 0.0 };
-
-        grad[grad_idx] = penalty_term + trace_term - det_term;
+        grad[grad_idx] = outer_gradient_entry(
+            coord.a,
+            trace_logdet_i,
+            coord.ld_s,
+            &solution.dispersion,
+            dp_cgrad,
+            profiled_scale,
+            incl_logdet_h,
+            incl_logdet_s,
+        );
     }
 
     // Add correction gradients (ρ-only).
@@ -3287,6 +3381,116 @@ fn compute_fourth_derivative_trace(
     Some(hop.trace_logdet_gradient(&q_mat))
 }
 
+/// Compute the IFT second-derivative correction contribution to h2_trace.
+///
+/// This is the SINGLE implementation of the formula:
+///
+/// ```text
+///   correction = tr(G_ε C[u_ij]) + tr(G_ε Q[v_i, v_j])
+/// ```
+///
+/// where u_ij is the second implicit derivative RHS (already solved or
+/// consumed via the adjoint shortcut), and v_i, v_j are the first-order
+/// mode responses (positive convention: v = H⁻¹(g)).
+///
+/// When the adjoint z_c is available, uses the O(p) shortcut:
+///   C_trace = rhs · z_c,  Q_trace = compute_fourth_derivative_trace(v_i, v_j)
+///
+/// Otherwise falls back to the O(p²) direct path:
+///   u = H⁻¹(rhs),  correction = hessian_second_derivative_correction(v_i, v_j, u)
+fn compute_ift_correction_trace(
+    hop: &dyn HessianOperator,
+    rhs: &Array1<f64>,
+    v_i: &Array1<f64>,
+    v_j: &Array1<f64>,
+    effective_deriv: &dyn HessianDerivativeProvider,
+    adjoint_z_c: Option<&Array1<f64>>,
+    glm_ingredients: Option<&ScalarGlmIngredients<'_>>,
+) -> Result<f64, String> {
+    if !effective_deriv.has_corrections() {
+        return Ok(0.0);
+    }
+    if let Some(z_c) = adjoint_z_c {
+        let c_trace = rhs.dot(z_c);
+        let d_trace = glm_ingredients
+            .and_then(|ing| compute_fourth_derivative_trace(ing, v_i, v_j, hop))
+            .unwrap_or(0.0);
+        Ok(c_trace + d_trace)
+    } else {
+        let u = hop.solve(rhs);
+        if let Some(correction) =
+            effective_deriv.hessian_second_derivative_correction(v_i, v_j, &u)?
+        {
+            Ok(hop.trace_logdet_gradient(&correction))
+        } else {
+            Ok(0.0)
+        }
+    }
+}
+
+/// Compute the β-dependent drift derivative traces: M_i[v_j] + M_j[v_i].
+///
+/// When a coordinate's fixed-β Hessian drift B depends on β, the second
+/// Hessian drift Ḧ_{ij} includes additional terms D_β B_i[v_j] and
+/// D_β B_j[v_i].  This function computes their traces through G_ε.
+///
+/// For ρ coordinates, B_k = A_k (penalty derivative) is β-independent, so
+/// `b_depends_on_beta = false` and this returns 0.
+fn compute_drift_deriv_traces(
+    hop: &dyn HessianOperator,
+    b_i_depends: bool,
+    b_j_depends: bool,
+    ext_i: Option<usize>,
+    ext_j: Option<usize>,
+    v_i: &Array1<f64>,
+    v_j: &Array1<f64>,
+    fixed_drift_deriv: Option<&FixedDriftDerivFn>,
+) -> f64 {
+    let mut trace = 0.0;
+    // M_i[v_j] = D_β B_i[v_j]
+    if b_i_depends {
+        if let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv) {
+            if let Some(result) = drift_fn(ei, v_j) {
+                trace += match result {
+                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
+                    DriftDerivResult::Operator(ref op) => hop.trace_logdet_operator(op.as_ref()),
+                };
+            }
+        }
+    }
+    // M_j[v_i] = D_β B_j[v_i]
+    if b_j_depends {
+        if let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv) {
+            if let Some(result) = drift_fn(ej, v_i) {
+                trace += match result {
+                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
+                    DriftDerivResult::Operator(ref op) => hop.trace_logdet_operator(op.as_ref()),
+                };
+            }
+        }
+    }
+    trace
+}
+
+/// Compute the base trace of the fixed-β second Hessian drift: tr(G_ε ∂²H/∂θ_i∂θ_j|_β).
+///
+/// Uses the operator-backed path when available, otherwise falls back to
+/// dense matrix trace.  Returns 0 when neither is provided (e.g., ρ-ρ
+/// off-diagonal where the fixed-β second drift is zero).
+fn compute_base_h2_trace(
+    hop: &dyn HessianOperator,
+    b_mat: &Array2<f64>,
+    b_operator: Option<&dyn HyperOperator>,
+) -> f64 {
+    if let Some(op) = b_operator {
+        hop.trace_logdet_operator(op)
+    } else if b_mat.nrows() > 0 {
+        hop.trace_logdet_gradient(b_mat)
+    } else {
+        0.0
+    }
+}
+
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
 ///
 /// Uses the precomputed HessianOperator for all linear algebra.
@@ -3420,13 +3624,15 @@ fn compute_outer_hessian(
         && !effective_deriv.has_corrections();
 
     // Precompute ext mode responses and total Hessian drifts.
+    //
+    // Sign convention: v_i = H⁻¹(g_i) is stored POSITIVE, matching the ρ
+    // convention v_k = H⁻¹(A_k β̂).  The HessianDerivativeProvider trait
+    // internally negates to get the mode direction β_i = −v_i.
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
-    let mut ext_corr_dirs: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
     let mut ext_h_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(ext_dim);
 
     for coord in solution.ext_coords.iter() {
         let v_i = hop.solve(&coord.g);
-        let corr_dir_i = v_i.mapv(|v| -v);
 
         if use_stochastic_cross_traces {
             if let Some(op) = coord
@@ -3438,7 +3644,6 @@ fn compute_outer_hessian(
                     // Skip dense materialization: stochastic cross-traces
                     // will use the implicit operator directly.
                     ext_v.push(v_i);
-                    ext_corr_dirs.push(corr_dir_i);
                     ext_h_matrices.push(None);
                     continue;
                 }
@@ -3449,13 +3654,14 @@ fn compute_outer_hessian(
         // operator-only fast path.
         let mut h_i = coord.drift.materialize();
         if effective_deriv.has_corrections() {
-            if let Some(corr) = effective_deriv.hessian_derivative_correction(&corr_dir_i)? {
+            // Pass v_i (positive) — the trait internally negates to get
+            // D_β H[−v_i], the IFT correction at direction β_i = −v_i.
+            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
                 h_i += &corr;
             }
         }
 
         ext_v.push(v_i);
-        ext_corr_dirs.push(corr_dir_i);
         ext_h_matrices.push(Some(h_i));
     }
 
@@ -3520,133 +3726,67 @@ fn compute_outer_hessian(
         None
     };
 
-    // ── ρ-ρ block ──
+    // ── ρ-ρ block ── (uses shared helpers for all trace computations)
 
     for kk in 0..k {
         for ll in kk..k {
-            // Q_{kl}: a_{kl} − gₖᵀ H⁻¹ gₗ
-            // a_{kl} = δ_{kl} · ½ β̂ᵀ Aₖ β̂  (since ∂²S/∂ρₖ² = Aₖ, cross = 0)
-            // gₖᵀ H⁻¹ gₗ = (Aₖβ̂)ᵀ vₗ = (Aₗβ̂)ᵀ vₖ  (by symmetry of H⁻¹)
-            let q_kl_raw =
-                -a_k_betas[ll].dot(&v_ks[kk]) + if kk == ll { rho_a_vals[kk] } else { 0.0 };
-            let q_kl = if is_profiled {
-                q_kl_raw / profiled_phi
-                    - 2.0 * rho_a_vals[kk] * rho_a_vals[ll]
-                        / (profiled_nu * profiled_phi * profiled_phi)
-            } else {
-                q_kl_raw
-            };
+            let pair_a = if kk == ll { rho_a_vals[kk] } else { 0.0 };
 
-            // L_{kl}: trace curvature of ½ log|R_ε(H)|.
-            //
-            // ∂²_{kl} log|R_ε(H)| = tr(G_ε Ḧ_{kl}) + Γ-cross(Ḣ_k, Ḣ_l)
-            //
-            // The Γ-cross term uses the spectral divided-difference kernel
-            // (replacing the standard -tr(H⁻¹ Ḣ_l H⁻¹ Ḣ_k) for non-spectral backends).
-            //
-            // When stochastic cross-traces are available, use the precomputed
-            // matrix (which uses the CORRECT estimator for tr(H⁻¹ A_d H⁻¹ A_e)).
             let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
-                // Stochastic cross-trace gives +tr(H⁻¹ Hk H⁻¹ Hl).
-                // The outer Hessian needs -tr(...), matching trace_logdet_hessian_cross.
                 -sct[[kk, ll]]
             } else {
                 hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll])
             };
 
-            // tr(G_ε Ḧ_{kl}): computed via the deriv_provider.
+            // Second Hessian drift trace via shared helpers.
             //
-            // Ḧ_{kl} = δ_{kl} Aₖ + X' diag(c ⊙ X β_{kl} + d ⊙ (X β_k)(X β_l)) X
-            //
-            // where β_k = −vₖ = −H⁻¹(Aₖβ̂) and the second implicit derivative is:
-            //   β_{kl} = H⁻¹(Ḣₗ vₖ + Aₖ vₗ − δ_{kl} Aₖ β̂)
-            //
-            // (derived from differentiating H β_k + Aₖ β̂ = 0 w.r.t. ρₗ).
-            let h_kl_trace = if kk == ll {
-                // Diagonal: Ḧ_{kk} = Aₖ + correction(β_{kk}, vₖ, vₖ)
-                // Base is tr(G_ε Aₖ), NOT tr(G_ε Ḣₖ).
-                let base = if solution.penalty_coords[kk].is_block_local() {
+            // RHS = Ḣ_l v_k + B_k v_l − δ_{kl} g_k
+            // base = δ_{kl} tr(G_ε A_k)
+            // correction = compute_ift_correction_trace(RHS, v_k, v_l)
+            let base = if kk == ll {
+                if solution.penalty_coords[kk].is_block_local() {
                     let (block, start, end) = solution.penalty_coords[kk].scaled_block_local(1.0);
                     hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
                 } else {
                     hop.trace_logdet_gradient(&a_k_matrices[kk])
-                };
-                if effective_deriv.has_corrections() {
-                    // β_{kk} RHS = Ḣₖ vₖ + Aₖ vₖ − Aₖ β̂
-                    // Use scaled_matvec for block-local penalty efficiency.
-                    let mut rhs = h_k_matrices[kk].dot(&v_ks[kk]);
-                    rhs += &solution.penalty_coords[kk]
-                        .scaled_matvec(&v_ks[kk], curvature_lambdas[kk]);
-                    rhs -= &a_k_betas[kk];
-
-                    if let Some(ref z_c) = adjoint_z_c {
-                        // Adjoint shortcut: tr(H⁻¹ C[u_kk]) = rhs · z_c
-                        let c_trace = rhs.dot(z_c);
-                        let d_trace = glm_ingredients
-                            .as_ref()
-                            .and_then(|ing| {
-                                compute_fourth_derivative_trace(ing, &v_ks[kk], &v_ks[kk], hop)
-                            })
-                            .unwrap_or(0.0);
-                        base + c_trace + d_trace
-                    } else {
-                        let u_kk = hop.solve(&rhs);
-                        if let Some(correction) = effective_deriv
-                            .hessian_second_derivative_correction(&v_ks[kk], &v_ks[kk], &u_kk)?
-                        {
-                            base + hop.trace_logdet_gradient(&correction)
-                        } else {
-                            base
-                        }
-                    }
-                } else {
-                    base
                 }
-            } else {
-                // Off-diagonal: Ḧ_{kl} = correction(β_{kl}, vₖ, vₗ) only (no Aₖ base).
-                if effective_deriv.has_corrections() {
-                    let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
-                    rhs += &solution.penalty_coords[kk]
-                        .scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
-
-                    if let Some(ref z_c) = adjoint_z_c {
-                        let c_trace = rhs.dot(z_c);
-                        let d_trace = glm_ingredients
-                            .as_ref()
-                            .and_then(|ing| {
-                                compute_fourth_derivative_trace(ing, &v_ks[kk], &v_ks[ll], hop)
-                            })
-                            .unwrap_or(0.0);
-                        c_trace + d_trace
-                    } else {
-                        let u_kl = hop.solve(&rhs);
-                        if let Some(correction) = effective_deriv
-                            .hessian_second_derivative_correction(&v_ks[kk], &v_ks[ll], &u_kl)?
-                        {
-                            hop.trace_logdet_gradient(&correction)
-                        } else {
-                            0.0
-                        }
-                    }
-                } else {
-                    0.0
-                }
-            };
-
-            let l_kl = if incl_logdet_h {
-                0.5 * (cross_trace + h_kl_trace)
             } else {
                 0.0
             };
 
-            // P_{kl}: penalty logdet second derivative
-            let p_kl = if incl_logdet_s {
-                -0.5 * det2[[kk, ll]]
-            } else {
-                0.0
-            };
+            let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
+            rhs += &solution.penalty_coords[kk]
+                .scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
+            if kk == ll {
+                rhs -= &a_k_betas[kk];
+            }
 
-            let h_val = q_kl + l_kl + p_kl;
+            let correction = compute_ift_correction_trace(
+                hop,
+                &rhs,
+                &v_ks[kk],
+                &v_ks[ll],
+                effective_deriv,
+                adjoint_z_c.as_ref(),
+                glm_ingredients.as_ref(),
+            )?;
+
+            let h_kl_trace = base + correction;
+
+            let h_val = outer_hessian_entry(
+                rho_a_vals[kk],
+                rho_a_vals[ll],
+                a_k_betas[ll].dot(&v_ks[kk]),
+                pair_a,
+                cross_trace,
+                h_kl_trace,
+                det2[[kk, ll]],
+                profiled_phi,
+                profiled_nu,
+                is_profiled,
+                incl_logdet_h,
+                incl_logdet_s,
+            );
             hess[[kk, ll]] = h_val;
             if kk != ll {
                 hess[[ll, kk]] = h_val;
@@ -3654,28 +3794,15 @@ fn compute_outer_hessian(
         }
     }
 
-    // ── ρ-ext cross block ──
+    // ── ρ-ext cross block ── (uses shared helpers for all trace computations)
 
     if let Some(ref rho_ext_fn) = solution.rho_ext_pair_fn {
         for rho_idx in 0..k {
             for ext_idx in 0..ext_dim {
                 let pair = rho_ext_fn(rho_idx, ext_idx);
+                let a_ext = solution.ext_coords[ext_idx].a;
 
-                // Q term: a_ij - g_rho^T H^{-1} g_ext
-                let q_raw = pair.a - a_k_betas[rho_idx].dot(&ext_v[ext_idx]);
-                let q_term = if is_profiled {
-                    let a_ext = solution.ext_coords[ext_idx].a;
-                    q_raw / profiled_phi
-                        - 2.0 * rho_a_vals[rho_idx] * a_ext
-                            / (profiled_nu * profiled_phi * profiled_phi)
-                } else {
-                    q_raw
-                };
-
-                let l_term = if incl_logdet_h {
-                    // Cross term: -tr(H⁻¹ Ḣ_ext H⁻¹ Ḣ_rho).
-                    // Use stochastic precomputed matrix when available,
-                    // otherwise fall back to exact spectral computation.
+                let (cross_trace, h2_trace) = if incl_logdet_h {
                     let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
                         -sct[[rho_idx, k + ext_idx]]
                     } else {
@@ -3687,13 +3814,7 @@ fn compute_outer_hessian(
                         )
                     };
 
-                    // β_{ρ,ext} = H⁻¹(−g_{ρ,ext} + B_ρ v_ext + B_ext v_ρ − C[v_ext] v_ρ)
-                    //           = H⁻¹(−g_{ρ,ext} + A_ρ v_ext + Ḣ_ext v_ρ)
-                    // where Ḣ_ext = B_ext + C[β_ext] already encodes the −C[v_ext] v_ρ.
-                    //
-                    // When using stochastic cross-traces, operator-only
-                    // coordinates do not materialize a dense Hessian drift, so
-                    // the drift object handles the matvec directly.
+                    // RHS: Ḣ_ext v_rho + B_rho v_ext − g_{rho,ext}
                     let ext_h_v_rho = if let Some(h_i) = ext_h_matrices[ext_idx].as_ref() {
                         h_i.dot(&v_ks[rho_idx])
                     } else {
@@ -3704,74 +3825,59 @@ fn compute_outer_hessian(
                         .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
                     rhs -= &pair.g;
 
-                    // Ḧ_{rho,ext}: second Hessian drift.
-                    // Base: pair.b_mat (fixed-β second derivative of H).
-                    // + C[u_re] + Q[v_rho, v_ext] via second_correction.
-                    // + M_ext[v_rho] if ext coord has β-dependent B.
-                    // M_rho ≡ 0 (ρ is β-independent).
-                    let mut h2_trace = if let Some(ref op) = pair.b_operator {
-                        hop.trace_logdet_operator(op.as_ref())
-                    } else {
-                        hop.trace_logdet_gradient(&pair.b_mat)
-                    };
+                    let base = compute_base_h2_trace(
+                        hop,
+                        &pair.b_mat,
+                        pair.b_operator.as_deref(),
+                    );
 
-                    // M_ext[v_rho] = D_β B_ext[v_rho]
-                    if solution.ext_coords[ext_idx].b_depends_on_beta {
-                        if let Some(ref drift_fn) = solution.fixed_drift_deriv {
-                            if let Some(result) = drift_fn(ext_idx, &v_ks[rho_idx]) {
-                                h2_trace += match result {
-                                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
-                                    DriftDerivResult::Operator(ref op) => {
-                                        hop.trace_logdet_operator(op.as_ref())
-                                    }
-                                };
-                            }
-                        }
-                    }
+                    let m_terms = compute_drift_deriv_traces(
+                        hop,
+                        false, // ρ drift is β-independent
+                        solution.ext_coords[ext_idx].b_depends_on_beta,
+                        None,
+                        Some(ext_idx),
+                        &v_ks[rho_idx],
+                        &ext_v[ext_idx],
+                        solution.fixed_drift_deriv.as_ref(),
+                    );
 
-                    // C[u_re] + Q[v_rho, v_ext] via second_correction
-                    if effective_deriv.has_corrections() {
-                        if let Some(ref z_c) = adjoint_z_c {
-                            h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = glm_ingredients.as_ref().and_then(|ing| {
-                                compute_fourth_derivative_trace(
-                                    ing,
-                                    &v_ks[rho_idx],
-                                    &ext_corr_dirs[ext_idx],
-                                    hop,
-                                )
-                            }) {
-                                h2_trace += d_trace;
-                            }
-                        } else {
-                            let u_re = hop.solve(&rhs);
-                            if let Some(correction) = effective_deriv
-                                .hessian_second_derivative_correction(
-                                    &v_ks[rho_idx],
-                                    &ext_corr_dirs[ext_idx],
-                                    &u_re,
-                                )?
-                            {
-                                h2_trace += hop.trace_logdet_gradient(&correction);
-                            }
-                        }
-                    }
+                    let correction = compute_ift_correction_trace(
+                        hop,
+                        &rhs,
+                        &v_ks[rho_idx],
+                        &ext_v[ext_idx],
+                        effective_deriv,
+                        adjoint_z_c.as_ref(),
+                        glm_ingredients.as_ref(),
+                    )?;
 
-                    0.5 * (cross_trace + h2_trace)
+                    (cross_trace, base + m_terms + correction)
                 } else {
-                    0.0
+                    (0.0, 0.0)
                 };
 
-                let p_term = if incl_logdet_s { -0.5 * pair.ld_s } else { 0.0 };
-
-                let h_val = q_term + l_term + p_term;
+                let h_val = outer_hessian_entry(
+                    rho_a_vals[rho_idx],
+                    a_ext,
+                    a_k_betas[rho_idx].dot(&ext_v[ext_idx]),
+                    pair.a,
+                    cross_trace,
+                    h2_trace,
+                    pair.ld_s,
+                    profiled_phi,
+                    profiled_nu,
+                    is_profiled,
+                    incl_logdet_h,
+                    incl_logdet_s,
+                );
                 hess[[rho_idx, k + ext_idx]] = h_val;
                 hess[[k + ext_idx, rho_idx]] = h_val;
             }
         }
     }
 
-    // ── ext-ext block ──
+    // ── ext-ext block ── (uses shared helpers for all trace computations)
 
     if let Some(ref ext_pair_fn) = solution.ext_coord_pair_fn {
         for ii in 0..ext_dim {
@@ -3780,20 +3886,7 @@ fn compute_outer_hessian(
                 let coord_i = &solution.ext_coords[ii];
                 let coord_j = &solution.ext_coords[jj];
 
-                // Q term: a_ij - g_i^T H^{-1} g_j
-                // For diagonal (ii == jj): a_ii includes the ½ β̂ᵀ ∂²S/∂ψ² β̂ term
-                // which is already in pair.a.
-                let q_raw = pair.a - coord_i.g.dot(&ext_v[jj]);
-                let q_term = if is_profiled {
-                    q_raw / profiled_phi
-                        - 2.0 * coord_i.a * coord_j.a / (profiled_nu * profiled_phi * profiled_phi)
-                } else {
-                    q_raw
-                };
-
-                let l_term = if incl_logdet_h {
-                    // Cross term: -tr(H⁻¹ Ḣ_j H⁻¹ Ḣ_i).
-                    // Use stochastic precomputed matrix when available.
+                let (cross_trace, h2_trace) = if incl_logdet_h {
                     let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
                         -sct[[k + ii, k + jj]]
                     } else {
@@ -3807,90 +3900,62 @@ fn compute_outer_hessian(
                         )
                     };
 
-                    // β_{ij} = H⁻¹(−g_ij + B_i v_j + Ḣ_j v_i)
-                    // When stochastic cross-traces are active, operator-only
-                    // coordinates do not materialize a dense Hessian drift.
+                    // RHS: Ḣ_j v_i + B_i v_j − g_ij
                     let hj_vi = if let Some(h_j) = ext_h_matrices[jj].as_ref() {
                         h_j.dot(&ext_v[ii])
                     } else {
                         coord_j.drift.apply(&ext_v[ii])
                     };
                     let mut rhs = hj_vi;
-                    let bi_vj = coord_i.drift.apply(&ext_v[jj]);
-                    rhs += &bi_vj;
+                    rhs += &coord_i.drift.apply(&ext_v[jj]);
                     rhs -= &pair.g;
 
-                    // Ḧ_{ij}: second Hessian drift (using logdet gradient operator G_ε).
-                    let mut h2_trace = if let Some(ref op) = pair.b_operator {
-                        hop.trace_logdet_operator(op.as_ref())
-                    } else {
-                        hop.trace_logdet_gradient(&pair.b_mat)
-                    };
+                    let base = compute_base_h2_trace(
+                        hop,
+                        &pair.b_mat,
+                        pair.b_operator.as_deref(),
+                    );
 
-                    // M_i[v_j]: D_β B_i[v_j] if B_i depends on β
-                    if coord_i.b_depends_on_beta {
-                        if let Some(ref drift_fn) = solution.fixed_drift_deriv {
-                            if let Some(result) = drift_fn(ii, &ext_v[jj]) {
-                                h2_trace += match result {
-                                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
-                                    DriftDerivResult::Operator(ref op) => {
-                                        hop.trace_logdet_operator(op.as_ref())
-                                    }
-                                };
-                            }
-                        }
-                    }
+                    let m_terms = compute_drift_deriv_traces(
+                        hop,
+                        coord_i.b_depends_on_beta,
+                        coord_j.b_depends_on_beta,
+                        Some(ii),
+                        Some(jj),
+                        &ext_v[ii],
+                        &ext_v[jj],
+                        solution.fixed_drift_deriv.as_ref(),
+                    );
 
-                    // M_j[v_i]: D_β B_j[v_i] if B_j depends on β
-                    if coord_j.b_depends_on_beta {
-                        if let Some(ref drift_fn) = solution.fixed_drift_deriv {
-                            if let Some(result) = drift_fn(jj, &ext_v[ii]) {
-                                h2_trace += match result {
-                                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
-                                    DriftDerivResult::Operator(ref op) => {
-                                        hop.trace_logdet_operator(op.as_ref())
-                                    }
-                                };
-                            }
-                        }
-                    }
+                    let correction = compute_ift_correction_trace(
+                        hop,
+                        &rhs,
+                        &ext_v[ii],
+                        &ext_v[jj],
+                        effective_deriv,
+                        adjoint_z_c.as_ref(),
+                        glm_ingredients.as_ref(),
+                    )?;
 
-                    // C[u_ij] + Q[v_i, v_j] via second_correction
-                    if effective_deriv.has_corrections() {
-                        if let Some(ref z_c) = adjoint_z_c {
-                            h2_trace += rhs.dot(z_c);
-                            if let Some(d_trace) = glm_ingredients.as_ref().and_then(|ing| {
-                                compute_fourth_derivative_trace(
-                                    ing,
-                                    &ext_corr_dirs[ii],
-                                    &ext_corr_dirs[jj],
-                                    hop,
-                                )
-                            }) {
-                                h2_trace += d_trace;
-                            }
-                        } else {
-                            let u_ij = hop.solve(&rhs);
-                            if let Some(correction) = effective_deriv
-                                .hessian_second_derivative_correction(
-                                    &ext_corr_dirs[ii],
-                                    &ext_corr_dirs[jj],
-                                    &u_ij,
-                                )?
-                            {
-                                h2_trace += hop.trace_logdet_gradient(&correction);
-                            }
-                        }
-                    }
-
-                    0.5 * (cross_trace + h2_trace)
+                    (cross_trace, base + m_terms + correction)
                 } else {
-                    0.0
+                    (0.0, 0.0)
                 };
 
-                let p_term = if incl_logdet_s { -0.5 * pair.ld_s } else { 0.0 };
-
-                let h_val = q_term + l_term + p_term;
+                let h_val = outer_hessian_entry(
+                    coord_i.a,
+                    coord_j.a,
+                    coord_i.g.dot(&ext_v[jj]),
+                    pair.a,
+                    cross_trace,
+                    h2_trace,
+                    pair.ld_s,
+                    profiled_phi,
+                    profiled_nu,
+                    is_profiled,
+                    incl_logdet_h,
+                    incl_logdet_s,
+                );
                 hess[[k + ii, k + jj]] = h_val;
                 if ii != jj {
                     hess[[k + jj, k + ii]] = h_val;

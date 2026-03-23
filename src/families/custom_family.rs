@@ -4229,7 +4229,6 @@ fn prune_active_to_independent(
     is_active: &mut [bool],
     constraints: &LinearInequalityConstraints,
     x: &Array1<f64>,
-    _tol_active: f64,
 ) {
     if active.len() <= 1 {
         return;
@@ -4396,7 +4395,7 @@ fn solve_quadraticwith_linear_constraints(
                 )?;
                 continue;
             }
-            prune_active_to_independent(&mut active, &mut is_active, constraints, &x, tol_active);
+            prune_active_to_independent(&mut active, &mut is_active, constraints, &x);
             return Ok((x, active));
         }
 
@@ -4452,7 +4451,7 @@ fn solve_quadraticwith_linear_constraints(
             && step_norm <= step_tol
             && min_lambda_true >= -(10.0 * tol_dual)
         {
-            prune_active_to_independent(&mut active, &mut is_active, constraints, &x, tol_active);
+            prune_active_to_independent(&mut active, &mut is_active, constraints, &x);
             return Ok((x, active));
         }
     }

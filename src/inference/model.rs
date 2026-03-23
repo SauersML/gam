@@ -1,9 +1,7 @@
 use crate::basis::BasisFamily;
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::{
-    ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION, anchored_deviation_basis_with_transform,
-};
+use crate::families::bernoulli_marginal_slope::anchored_deviation_basis_with_transform;
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
@@ -17,7 +15,7 @@ use crate::inference::predict::{
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
-use crate::span::{span_index_for_breakpoints, validate_breakpoints};
+use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec,
     SasLinkState,
@@ -349,7 +347,6 @@ pub struct SavedBaselineTimeWiggleRuntime {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedAnchoredDeviationRuntime {
-    pub schema_version: u32,
     pub kernel: String,
     pub knots: Vec<f64>,
     pub degree: usize,
@@ -513,13 +510,7 @@ impl SavedBaselineTimeWiggleRuntime {
 }
 
 impl SavedAnchoredDeviationRuntime {
-    fn validate_kernel(&self) -> Result<(), String> {
-        if self.schema_version != ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION {
-            return Err(format!(
-                "saved anchored deviation runtime uses unsupported schema_version {}; expected {}",
-                self.schema_version, ANCHORED_DEVIATION_RUNTIME_SCHEMA_VERSION
-            ));
-        }
+    pub(crate) fn validate_exact_replay_contract(&self) -> Result<(), String> {
         if self.kernel.is_empty() {
             return Err(
                 "saved anchored deviation runtime is missing the exact kernel marker".to_string(),
@@ -534,9 +525,9 @@ impl SavedAnchoredDeviationRuntime {
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
             ));
         }
-        if self.degree != 3 {
+        if self.degree < 2 {
             return Err(format!(
-                "saved anchored deviation runtime must be cubic (degree=3), got degree={}",
+                "saved anchored deviation runtime degree must be >= 2, got {}",
                 self.degree
             ));
         }
@@ -546,7 +537,7 @@ impl SavedAnchoredDeviationRuntime {
                 self.value_span_degree
             ));
         }
-        let _ = self.basis_transform_matrix()?;
+        self.basis_transform_matrix()?;
         Ok(())
     }
 
@@ -592,7 +583,7 @@ impl SavedAnchoredDeviationRuntime {
         values: &Array1<f64>,
         basis_options: BasisOptions,
     ) -> Result<Array2<f64>, String> {
-        self.validate_kernel()?;
+        self.validate_exact_replay_contract()?;
         let knot_arr = Array1::from_vec(self.knots.clone());
         let basis_transform = self.basis_transform_matrix()?;
         let constrained = anchored_deviation_basis_with_transform(
@@ -613,21 +604,11 @@ impl SavedAnchoredDeviationRuntime {
     }
 
     pub fn breakpoints(&self) -> Result<Vec<f64>, String> {
-        self.validate_kernel()?;
+        self.validate_exact_replay_contract()?;
         if self.knots.is_empty() {
             return Err("saved anchored deviation runtime is missing knots".to_string());
         }
-        let mut points = Vec::new();
-        for &knot in &self.knots {
-            if points
-                .last()
-                .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
-            {
-                points.push(knot);
-            }
-        }
-        validate_breakpoints(&points, "saved anchored deviation runtime breakpoints")?;
-        Ok(points)
+        breakpoints_from_knots(&self.knots, "saved anchored deviation runtime breakpoints")
     }
 
     pub fn span_count(&self) -> Result<usize, String> {
@@ -645,7 +626,7 @@ impl SavedAnchoredDeviationRuntime {
         span_idx: usize,
     ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
     {
-        self.validate_kernel()?;
+        self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(format!(
                 "saved anchored deviation coefficient length mismatch: got {}, expected {}",
@@ -687,7 +668,7 @@ impl SavedAnchoredDeviationRuntime {
         basis_idx: usize,
     ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
     {
-        self.validate_kernel()?;
+        self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(format!(
                 "saved anchored deviation basis index {} out of range for {} coefficients",
@@ -1058,12 +1039,12 @@ impl FittedModel {
             PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival
         ) {
             if let Some(runtime) = self.payload().score_warp_runtime.as_ref() {
-                runtime.validate_kernel().map_err(|err| {
+                runtime.validate_exact_replay_contract().map_err(|err| {
                     format!("saved anchored score-warp runtime is invalid: {err}")
                 })?;
             }
             if let Some(runtime) = self.payload().link_deviation_runtime.as_ref() {
-                runtime.validate_kernel().map_err(|err| {
+                runtime.validate_exact_replay_contract().map_err(|err| {
                     format!("saved anchored link-deviation runtime is invalid: {err}")
                 })?;
             }

@@ -5792,28 +5792,12 @@ fn duchon_kernel_radial_triplet(
     k_dim: usize,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
 ) -> Result<(f64, f64, f64), BasisError> {
-    // Generic Duchon decomposition derivatives
-    // Partial-fraction representation:
-    //   phi(r) = sum_{m>=1} a_m * Phi_m(r) + sum_{n>=1} b_n * M_n(r),
-    // where:
-    //   Phi_m = polyharmonic block (power/log-power),
-    //   M_n   = c_n * r^nu * K_nu(kappa r).
+    // Public Duchon (phi, phi_r, phi_rr) triplet.
     //
-    // We evaluate phi through the canonical kernel function (ensures exact match
-    // with basis-value construction), and evaluate phi', phi'' analytically by
-    // summing derivatives of each block.
-    //
-    // Full Duchon derivative strategy
-    // Kernel is represented by partial fractions:
-    //   phi(r) = sum_m a_m * Phi_m(r) + sum_n b_n * M_n(r),
-    // where Phi_m are polyharmonic blocks and M_n are Matérn-Bessel blocks.
-    //
-    // We evaluate phi itself from the canonical kernel evaluator to ensure
-    // consistency with the basis design path, then compute derivatives from the
-    // same decomposition analytically:
-    //   phi'  = sum_m a_m * Phi_m'  + sum_n b_n * M_n'
-    //   phi'' = sum_m a_m * Phi_m'' + sum_n b_n * M_n''.
-    //
+    // Pure Duchon keeps its direct polyharmonic path. Hybrid Duchon now
+    // delegates to `duchon_radial_jets(...)` so every public radial derivative
+    // shares the exact same differentiable family as q/lap/t and the operator
+    // penalty code paths.
     let value = duchon_matern_kernel_general_from_distance(
         r,
         length_scale,
@@ -9484,9 +9468,9 @@ fn duchon_operator_jets_from_phi_derivatives(
     let t_r = (q_rr - t) / r;
     let t_rr = (lap_rr + 2.0 * t - (d + 4.0) * q_rr) / (r * r);
 
-    debug_assert!(((phi_rr - (q + r * q_r)).abs()) <= 1e-10 * phi_rr.abs().max(1.0));
-    debug_assert!(((t - (phi_rr - q) / (r * r)).abs()) <= 1e-10 * t.abs().max(1.0));
-    debug_assert!(((lap - (d * q + r * r * t)).abs()) <= 1e-10 * lap.abs().max(1.0));
+    assert!(((phi_rr - (q + r * q_r)).abs()) <= 1e-10 * phi_rr.abs().max(1.0));
+    assert!(((t - (phi_rr - q) / (r * r)).abs()) <= 1e-10 * t.abs().max(1.0));
+    assert!(((lap - (d * q + r * r * t)).abs()) <= 1e-10 * lap.abs().max(1.0));
 
     (q, q_r, q_rr, lap, lap_r, lap_rr, t, t_r, t_rr)
 }

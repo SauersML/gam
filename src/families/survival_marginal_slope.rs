@@ -5,7 +5,7 @@ use crate::custom_family::{
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, build_block_spatial_psi_derivatives, cost_gated_outer_order,
     custom_family_outer_derivatives, evaluate_custom_family_joint_hyper, first_psi_linear_map,
-    fit_custom_family, second_psi_linear_map,
+    fit_custom_family, second_psi_linear_map, slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
@@ -19,7 +19,10 @@ use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, monotone_wiggle_structure,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
-use crate::families::row_kernel::{RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache};
+use crate::families::row_kernel::{
+    RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
+    row_kernel_hessian_dense, row_kernel_log_likelihood,
+};
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
     time_derivative_lower_bound_constraints,
@@ -149,9 +152,20 @@ fn block_slices(
     family: &SurvivalMarginalSlopeFamily,
     block_states: &[ParameterBlockState],
 ) -> BlockSlices {
-    let time = 0..block_states[0].beta.len();
-    let marginal = time.end..time.end + block_states[1].beta.len();
-    let logslope = marginal.end..marginal.end + block_states[2].beta.len();
+    if !block_states.is_empty() {
+        let expected_blocks = 3
+            + usize::from(family.score_warp.is_some())
+            + usize::from(family.link_dev.is_some());
+        assert_eq!(
+            block_states.len(),
+            expected_blocks,
+            "survival marginal-slope block layout mismatch: expected {expected_blocks} blocks, got {}",
+            block_states.len()
+        );
+    }
+    let time = 0..family.design_entry.ncols();
+    let marginal = time.end..time.end + family.marginal_design.ncols();
+    let logslope = marginal.end..marginal.end + family.logslope_design.ncols();
     let mut cursor = logslope.end;
     let score_warp = family.score_warp.as_ref().map(|runtime| {
         let range = cursor..cursor + runtime.basis_dim();
@@ -1903,23 +1917,16 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<f64, String> {
-        let scale = self.probit_frailty_scale();
-        let mut d = 0.0;
-        for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
-            let cell = partition_cell.cell;
-            let state = exact_kernel::evaluate_cell_moments(cell, 4)?;
-            let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                b,
-            );
-            let dc_da = scale_coeff4(dc_da_raw, scale);
-            d += exact_kernel::cell_polynomial_integral_from_moments(
-                &dc_da,
-                &state.moments,
-                "survival D_t",
-            )?;
+        // Density normalization is |F'(a)| for the same calibration equation
+        // solved by `solve_row_survival_intercept`. Reusing that exact
+        // derivative convention avoids sign drift between the solver path and
+        // the direct-check path.
+        let (_, f_a, _) = self.evaluate_denested_survival_calibration(a, 0.0, b, beta_h, beta_w)?;
+        let d = f_a.abs();
+        if !d.is_finite() || d <= 0.0 {
+            return Err(format!(
+                "survival marginal-slope produced non-positive calibration derivative |F'(a)|={d:.3e}"
+            ));
         }
         Ok(d)
     }
@@ -1955,12 +1962,11 @@ impl SurvivalMarginalSlopeFamily {
             ));
         }
         let (a0, _) = self.solve_row_survival_intercept(q0, g, beta_h, beta_w)?;
-        let (a1, d1_calib) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
-        let d1 = self.evaluate_survival_denom_d(a1, g, beta_h, beta_w)?;
+        let (a1, d1) = self.solve_row_survival_intercept(q1, g, beta_h, beta_w)?;
         if !d1.is_finite() || d1 <= 0.0 {
             return Err(format!(
                 "survival marginal-slope row {row} produced non-positive density normalization D1={d1:.3e} (calibration derivative {:.3e})",
-                d1_calib
+                d1
             ));
         }
         let (eta0, _) = self.observed_denested_eta_chi(row, a0, g, beta_h, beta_w)?;
@@ -2078,28 +2084,7 @@ impl SurvivalMarginalSlopeFamily {
         f_u[q_index] += phi_q;
         f_uv[[q_index, q_index]] += -q * phi_q;
 
-        let mut d_check = 0.0;
-        for partition_cell in self.denested_partition_cells(a, b, beta_h, beta_w)? {
-            let cell = partition_cell.cell;
-            let z_mid = 0.5 * (cell.left + cell.right);
-            let u_mid = a + b * z_mid;
-            let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
-            let fixed = self.denested_cell_primary_fixed_partials(
-                primary,
-                a,
-                b,
-                partition_cell.score_span,
-                partition_cell.link_span,
-                z_mid,
-                u_mid,
-            )?;
-            let chi_poly = fixed.dc_da.to_vec();
-            d_check += exact_kernel::cell_polynomial_integral_from_moments(
-                &chi_poly,
-                &state.moments,
-                "survival D_t",
-            )?;
-        }
+        let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
         if !d_check.is_finite() || d_check <= 0.0 {
             return Err(format!(
                 "survival marginal-slope row {row} produced non-positive density normalization D={d_check:.3e}"
@@ -2153,7 +2138,7 @@ impl SurvivalMarginalSlopeFamily {
         for u in 0..p {
             for v in u..p {
                 let value = (f_uv[[u, v]] - d_u[u] * a_u[v] - d_u[v] * a_u[u]
-                    + f_aa * a_u[u] * a_u[v])
+                    - f_aa * a_u[u] * a_u[v])
                     / d_check;
                 a_uv[[u, v]] = value;
                 a_uv[[v, u]] = value;
@@ -3598,8 +3583,18 @@ impl SurvivalMarginalSlopeFamily {
         if self.flex_timewiggle_active() {
             return self.evaluate_blockwise_exact_newton_timewiggle_dense(block_states);
         }
-        // Detect sparse designs → sparse Hessian path (O(nnz) memory per
-        // worker instead of O(p²), sparse Cholesky downstream).
+
+        // For all non-flex, non-timewiggle modes: use the dense joint path
+        // when p is small enough.  This guarantees block Hessians are
+        // principal blocks of the joint Hessian regardless of whether the
+        // underlying designs happen to be sparse.
+        let slices = block_slices(self, block_states);
+        if slices.total < 512 {
+            return self.evaluate_blockwise_exact_newton_dense(block_states);
+        }
+
+        // Large p (>= 512): joint dense Hessian is too expensive.
+        // Fall back to blockwise sparse/mixed assembly for memory efficiency.
         let time_csrs = match (
             self.design_entry.as_sparse(),
             self.design_exit.as_sparse(),
@@ -3644,6 +3639,17 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    /// Blockwise exact-Newton for the flexible (score-warp / link-deviation)
+    /// model.
+    ///
+    /// The flex path has an extended primary space (q0, q1, qd1, g, h?, w?)
+    /// whose pullback into β-space is not yet wired through the
+    /// `add_pullback_primary_hessian` infrastructure that the standard
+    /// RowKernel<4> path uses.  Until that extension lands, the flex path
+    /// assembles block Hessians independently.  This is the one remaining
+    /// place where blockwise and joint Hessians are not structurally
+    /// identical; extending the pullback to the flex primary indices will
+    /// close this gap.
     fn evaluate_blockwise_exact_newton_flexible_dense(
         &self,
         block_states: &[ParameterBlockState],
@@ -3878,6 +3884,13 @@ impl SurvivalMarginalSlopeFamily {
         })
     }
 
+    /// Blockwise exact-Newton for the time-wiggle model.
+    ///
+    /// Same structural limitation as the flexible path: the time-wiggle
+    /// q-geometry (dynamic dq0/dtime, d²q0/dtime²) generates an
+    /// extended Jacobian that `add_pullback_primary_hessian` does not
+    /// yet cover.  Block Hessians are assembled independently until the
+    /// RowKernel<4> pullback is generalised to the time-wiggle Jacobian.
     fn evaluate_blockwise_exact_newton_timewiggle_dense(
         &self,
         block_states: &[ParameterBlockState],
@@ -4318,111 +4331,37 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
+        // Build RowKernel — the single source of truth for all exact-Newton
+        // quantities.  The cache evaluates every row kernel once and stores
+        // (nll_i, g_i[4], H_i[4×4]).
+        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+        let cache = build_row_kernel_cache(&kern)?;
+
+        let ll = row_kernel_log_likelihood(&cache);
+
+        // Joint gradient:  g = -Σ_i Jᵢᵀ gᵢ  (sign: gᵢ are NLL gradients,
+        // we negate to get log-likelihood gradient).
+        let nll_grad = row_kernel_gradient(&kern, &cache);
+        let joint_gradient = -nll_grad;
+
+        // Joint Hessian (NLL Hessian = negative Hessian of log-likelihood,
+        // which is exactly what BlockWorkingSet::ExactNewton.hessian stores).
+        let joint_hessian = row_kernel_hessian_dense(&kern, &cache);
+
+        // Slice principal diagonal blocks — block Hessians are views of the
+        // joint Hessian, never independently derived.
         let slices = block_slices(self, block_states);
-        let p_t = slices.time.len();
-        let p_m = slices.marginal.len();
-        let p_g = slices.logslope.len();
-
-        type Acc = (
-            f64,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            Array2<f64>,
-            Array2<f64>,
-            Array2<f64>,
-        );
-
-        let make_acc = || -> Acc {
-            (
-                0.0,
-                Array1::zeros(p_t),
-                Array1::zeros(p_m),
-                Array1::zeros(p_g),
-                Array2::zeros((p_t, p_t)),
-                Array2::zeros((p_m, p_m)),
-                Array2::zeros((p_g, p_g)),
-            )
-        };
-        let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope) =
-            (0..self.n)
-                .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
-                    let (row_nll, f_pi, f_pipi) =
-                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                    acc.0 -= row_nll;
-
-                    {
-                        let mut time = acc.1.view_mut();
-                        self.design_entry
-                            .axpy_row_into(row, -f_pi[0], &mut time)
-                            .expect("time entry axpy dim mismatch");
-                        self.design_exit
-                            .axpy_row_into(row, -f_pi[1], &mut time)
-                            .expect("time exit axpy dim mismatch");
-                        self.design_derivative_exit
-                            .axpy_row_into(row, -f_pi[2], &mut time)
-                            .expect("time deriv axpy dim mismatch");
-                    }
-                    self.marginal_design
-                        .axpy_row_into(row, -(f_pi[0] + f_pi[1]), &mut acc.2.view_mut())
-                        .expect("survival marginal block axpy should match block dimensions");
-                    self.logslope_design
-                        .axpy_row_into(row, -f_pi[3], &mut acc.3.view_mut())
-                        .expect("survival logslope block axpy should match block dimensions");
-
-                    let designs = [
-                        &self.design_entry,
-                        &self.design_exit,
-                        &self.design_derivative_exit,
-                    ];
-                    for a in 0..3 {
-                        for b in 0..3 {
-                            designs[a]
-                                .row_outer_into(row, designs[b], f_pipi[[a, b]], &mut acc.4)
-                                .expect("time row_outer_into dim mismatch");
-                        }
-                    }
-
-                    self.marginal_design
-                        .syr_row_into(
-                            row,
-                            f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]],
-                            &mut acc.5,
-                        )
-                        .expect("survival marginal block syr should match block dimensions");
-                    self.logslope_design
-                        .syr_row_into(row, f_pipi[[3, 3]], &mut acc.6)
-                        .expect("survival logslope block syr should match block dimensions");
-                    Ok(acc)
-                })
-                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
-                    a.0 += b.0;
-                    a.1 += &b.1;
-                    a.2 += &b.2;
-                    a.3 += &b.3;
-                    a.4 += &b.4;
-                    a.5 += &b.5;
-                    a.6 += &b.6;
-                    Ok(a)
-                })?;
-
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets: vec![
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_time,
-                    hessian: SymmetricMatrix::Dense(hess_time),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_marginal,
-                    hessian: SymmetricMatrix::Dense(hess_marginal),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_logslope,
-                    hessian: SymmetricMatrix::Dense(hess_logslope),
-                },
-            ],
+            blockworking_sets: slice_joint_into_block_working_sets(
+                vec![
+                    joint_gradient.slice(s![slices.time.clone()]).to_owned(),
+                    joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
+                    joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
+                ],
+                &joint_hessian,
+                &[slices.time, slices.marginal, slices.logslope],
+            ),
         })
     }
 

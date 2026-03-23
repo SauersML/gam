@@ -1,11 +1,11 @@
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, FaerArrayView};
-use crate::matrix::{BlockDesignOperator, DesignBlock, DesignMatrix, ReparamDesignOperator};
+use crate::matrix::DesignMatrix;
 use dyn_stack::{MemBuffer, MemStack};
 use faer::prelude::ReborrowMut;
+use faer::Unbind;
 use faer::{get_global_parallelism, Conj};
-use ndarray::{s, Array1, Array2, ArrayView1};
+use ndarray::{s, Array1, Array2};
 use std::ops::Range;
-use std::sync::Arc;
 
 const COLUMN_TOL: f64 = 1e-12;
 const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -47,45 +47,13 @@ impl ScaleDesignMatrixRef<'_> {
     }
 }
 
-fn weighted_mean(col: ArrayView1<'_, f64>, weights: &Array1<f64>) -> Result<f64, String> {
-    if col.len() != weights.len() {
-        return Err("weighted mean dimension mismatch".to_string());
-    }
-    let w_sum: f64 = weights.iter().copied().sum();
-    if !w_sum.is_finite() || w_sum <= 0.0 {
-        return Err("weighted mean requires positive finite total weight".to_string());
-    }
-    Ok(col
-        .iter()
-        .zip(weights.iter())
-        .map(|(&x, &w)| x * w)
-        .sum::<f64>()
-        / w_sum)
-}
-
-fn weighted_centered_ss(col: ArrayView1<'_, f64>, weights: &Array1<f64>) -> Result<f64, String> {
-    let mean = weighted_mean(col, weights)?;
-    Ok(col
-        .iter()
-        .zip(weights.iter())
-        .map(|(&x, &w)| {
-            let dx = x - mean;
-            w * dx * dx
-        })
-        .sum())
-}
-
 pub fn infer_non_intercept_start(design: &Array2<f64>, weights: &Array1<f64>) -> usize {
-    let mut end = 0;
-    for j in 0..design.ncols() {
-        let ss = weighted_centered_ss(design.column(j), weights).unwrap_or(0.0);
-        if ss <= COLUMN_TOL {
-            end = j + 1;
-        } else {
-            break;
-        }
-    }
-    end
+    infer_non_intercept_start_impl(
+        ScaleDesignMatrixRef::Dense(design),
+        weights,
+        "weighted column stats row mismatch".to_string(),
+    )
+    .unwrap_or(0)
 }
 
 pub fn build_scale_deviation_transform(
@@ -119,15 +87,14 @@ pub fn apply_scale_deviation_transform(
     let n = rawnoise_design.nrows();
     let p_primary = primary_design.ncols();
     let p_noise = rawnoise_design.ncols();
-    let reparam = scale_deviation_reparam_matrix(transform);
-    let chunk_rows = scale_design_row_chunk_size(n, p_primary + p_noise + 1);
+    let chunk_rows = scale_design_row_chunk_size(n, p_primary.max(p_noise));
     let mut out = Array2::<f64>::zeros((n, p_noise));
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
         let primary_chunk = primary_design.slice(s![start..end, ..]).to_owned();
         let noise_chunk = rawnoise_design.slice(s![start..end, ..]).to_owned();
         let chunk =
-            apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, reparam.as_ref());
+            apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
         out.slice_mut(s![start..end, ..]).assign(&chunk);
     }
     Ok(out)
@@ -165,16 +132,13 @@ fn scale_design_row_chunk_size(nrows: usize, max_cols: usize) -> usize {
         .min(nrows.max(1))
 }
 
-fn weighted_column_stats_design(
-    design: &DesignMatrix,
+fn weighted_column_stats(
+    design: ScaleDesignMatrixRef<'_>,
     weights: &Array1<f64>,
+    row_mismatch_error: String,
 ) -> Result<WeightedColumnStats, String> {
     if design.nrows() != weights.len() {
-        return Err(format!(
-            "weighted column stats row mismatch: design has {} rows, weights have {} entries",
-            design.nrows(),
-            weights.len()
-        ));
+        return Err(row_mismatch_error);
     }
     let total_weight = validate_scale_weights(weights)?;
     let p = design.ncols();
@@ -201,6 +165,25 @@ fn weighted_column_stats_design(
         weighted_sum_sq,
         total_weight,
     })
+}
+
+fn infer_non_intercept_start_impl(
+    design: ScaleDesignMatrixRef<'_>,
+    weights: &Array1<f64>,
+    row_mismatch_error: String,
+) -> Result<usize, String> {
+    let stats = weighted_column_stats(design, weights, row_mismatch_error)?;
+    let mut end = 0;
+    for j in 0..stats.weighted_sum.len() {
+        let centered_ss = stats.weighted_sum_sq[j]
+            - stats.weighted_sum[j] * stats.weighted_sum[j] / stats.total_weight;
+        if centered_ss <= COLUMN_TOL {
+            end = j + 1;
+        } else {
+            break;
+        }
+    }
+    Ok(end)
 }
 
 fn build_weighted_primary_design(
@@ -282,7 +265,7 @@ fn solve_scale_projection(
             qr.Q_basis(),
             qr.Q_coeff(),
             Conj::Yes,
-            rhs_mat.as_mut(),
+            rhs_mat.rb_mut(),
             get_global_parallelism(),
             MemStack::new(&mut MemBuffer::new(
                 faer::linalg::householder::apply_block_householder_sequence_on_the_left_in_place_scratch::<f64>(
@@ -316,14 +299,14 @@ fn solve_scale_projection(
 }
 
 fn apply_projection_chunk(
-    x_chunk: &Array2<f64>,
+    primary_chunk: &Array2<f64>,
     projection_coef: &Array2<f64>,
     first_active: usize,
 ) -> Array2<f64> {
     if first_active >= projection_coef.ncols() {
-        Array2::<f64>::zeros((x_chunk.nrows(), 0))
+        Array2::<f64>::zeros((primary_chunk.nrows(), 0))
     } else {
-        fast_ab(x_chunk, &projection_coef.slice(s![.., first_active..]))
+        fast_ab(primary_chunk, &projection_coef.slice(s![.., first_active..]).to_owned())
     }
 }
 
@@ -356,6 +339,12 @@ fn build_scale_deviation_transform_impl(
     let active_cols = p_noise - first_active;
 
     if active_cols > 0 {
+        let projection_only_transform = ScaleDeviationTransform {
+            projection_coef: projection_coef.clone(),
+            weighted_column_mean: Array1::<f64>::zeros(p_noise),
+            rescale: Array1::<f64>::ones(p_noise),
+            non_intercept_start,
+        };
         let mut w_sum = 0.0;
         let mut w_resid_sum = Array1::<f64>::zeros(active_cols);
         let mut w_noise_sum = Array1::<f64>::zeros(active_cols);
@@ -364,7 +353,11 @@ fn build_scale_deviation_transform_impl(
             let end = (start + chunk_rows).min(n);
             let x_chunk = primary_design.row_chunk(start..end);
             let noise_chunk = noise_design.row_chunk(start..end);
-            let fitted_chunk = apply_projection_chunk(&x_chunk, &projection_coef, first_active);
+            let resid_chunk = apply_scale_deviation_reparam_chunk(
+                &x_chunk,
+                &noise_chunk,
+                &projection_only_transform,
+            );
             for local in 0..(end - start) {
                 let w = weights[start + local];
                 if w == 0.0 {
@@ -374,7 +367,7 @@ fn build_scale_deviation_transform_impl(
                 for jj in 0..active_cols {
                     let nij = noise_chunk[[local, first_active + jj]];
                     w_noise_sum[jj] += w * nij;
-                    w_resid_sum[jj] += w * (nij - fitted_chunk[[local, jj]]);
+                    w_resid_sum[jj] += w * resid_chunk[[local, first_active + jj]];
                 }
             }
         }
@@ -392,7 +385,11 @@ fn build_scale_deviation_transform_impl(
             let end = (start + chunk_rows).min(n);
             let x_chunk = primary_design.row_chunk(start..end);
             let noise_chunk = noise_design.row_chunk(start..end);
-            let fitted_chunk = apply_projection_chunk(&x_chunk, &projection_coef, first_active);
+            let resid_chunk = apply_scale_deviation_reparam_chunk(
+                &x_chunk,
+                &noise_chunk,
+                &projection_only_transform,
+            );
             for local in 0..(end - start) {
                 let w = weights[start + local];
                 if w == 0.0 {
@@ -402,7 +399,7 @@ fn build_scale_deviation_transform_impl(
                     let nij = noise_chunk[[local, first_active + jj]];
                     let d_orig = nij - noise_mean[jj];
                     orig_css[jj] += w * d_orig * d_orig;
-                    let d_resid = nij - fitted_chunk[[local, jj]] - resid_center[jj];
+                    let d_resid = resid_chunk[[local, first_active + jj]] - resid_center[jj];
                     resid_css[jj] += w * d_resid * d_resid;
                 }
             }
@@ -436,18 +433,15 @@ pub fn infer_non_intercept_start_design(
     design: &DesignMatrix,
     weights: &Array1<f64>,
 ) -> Result<usize, String> {
-    let stats = weighted_column_stats_design(design, weights)?;
-    let mut end = 0;
-    for j in 0..design.ncols() {
-        let centered_ss = stats.weighted_sum_sq[j]
-            - stats.weighted_sum[j] * stats.weighted_sum[j] / stats.total_weight;
-        if centered_ss <= COLUMN_TOL {
-            end = j + 1;
-        } else {
-            break;
-        }
-    }
-    Ok(end)
+    infer_non_intercept_start_impl(
+        ScaleDesignMatrixRef::Design(design),
+        weights,
+        format!(
+            "weighted column stats row mismatch: design has {} rows, weights have {} entries",
+            design.nrows(),
+            weights.len()
+        ),
+    )
 }
 
 pub fn build_scale_deviation_transform_design(
@@ -465,47 +459,45 @@ pub fn build_scale_deviation_transform_design(
     )
 }
 
-fn design_block_from_matrix(design: DesignMatrix) -> DesignBlock {
-    match design {
-        DesignMatrix::Dense(matrix) => DesignBlock::Dense(matrix),
-        other => DesignBlock::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(other))),
-    }
-}
-
+/// Apply the scale-deviation reparameterisation to a chunk of rows.
+///
+/// Instead of embedding the projection coefficients into a large augmented
+/// matrix (which changes FP operation order relative to the canonical
+/// `apply_projection_chunk`), we compute the projection via the shared
+/// helper and then fold in rescaling and centering explicitly.  This
+/// guarantees bit-identical projection arithmetic on both paths.
 fn apply_scale_deviation_reparam_chunk(
     primary_chunk: &Array2<f64>,
     noise_chunk: &Array2<f64>,
-    reparam: &Array2<f64>,
+    transform: &ScaleDeviationTransform,
 ) -> Array2<f64> {
     let rows = noise_chunk.nrows();
     let p_noise = noise_chunk.ncols();
-    let p_primary = primary_chunk.ncols();
-    let mut augmented = Array2::<f64>::zeros((rows, p_noise + p_primary + 1));
-    augmented.slice_mut(s![.., ..p_noise]).assign(noise_chunk);
-    augmented
-        .slice_mut(s![.., p_noise..p_noise + p_primary])
-        .assign(primary_chunk);
-    augmented.column_mut(p_noise + p_primary).fill(1.0);
-    fast_ab(&augmented, reparam)
-}
-
-fn scale_deviation_reparam_matrix(transform: &ScaleDeviationTransform) -> Arc<Array2<f64>> {
-    let p_noise = transform.projection_coef.ncols();
-    let p_primary = transform.projection_coef.nrows();
     let first_active = transform.non_intercept_start.min(p_noise);
-    let mut q = Array2::<f64>::zeros((p_noise + p_primary + 1, p_noise));
+    let mut out = Array2::<f64>::zeros((rows, p_noise));
+
+    // Pass-through columns (intercept-like) are copied verbatim.
     for j in 0..first_active {
-        q[[j, j]] = 1.0;
-    }
-    for j in first_active..p_noise {
-        let scale = transform.rescale[j];
-        q[[j, j]] = scale;
-        q[[p_noise + p_primary, j]] = -transform.weighted_column_mean[j] * scale;
-        for i in 0..p_primary {
-            q[[p_noise + i, j]] = -transform.projection_coef[[i, j]] * scale;
+        for i in 0..rows {
+            out[[i, j]] = noise_chunk[[i, j]];
         }
     }
-    Arc::new(q)
+
+    // Active columns: residual = noise - projection, then center & rescale.
+    if first_active < p_noise {
+        let fitted =
+            apply_projection_chunk(primary_chunk, &transform.projection_coef, first_active);
+        for j in first_active..p_noise {
+            let jj = j - first_active;
+            let scale = transform.rescale[j];
+            let center = transform.weighted_column_mean[j];
+            for i in 0..rows {
+                out[[i, j]] = (noise_chunk[[i, j]] - fitted[[i, jj]] - center) * scale;
+            }
+        }
+    }
+
+    out
 }
 
 pub fn build_scale_deviation_operator(
@@ -532,15 +524,20 @@ pub fn build_scale_deviation_operator(
         ));
     }
     let n = rawnoise_design.nrows();
-    let base = BlockDesignOperator::new(vec![
-        design_block_from_matrix(rawnoise_design),
-        design_block_from_matrix(primary_design),
-        DesignBlock::Intercept(n),
-    ])?;
-    let operator =
-        ReparamDesignOperator::new(Arc::new(base), scale_deviation_reparam_matrix(transform))?;
+    let p_primary = primary_design.ncols();
+    let p_noise = rawnoise_design.ncols();
+    let chunk_rows = scale_design_row_chunk_size(n, p_primary.max(p_noise));
+    let mut out = Array2::<f64>::zeros((n, p_noise));
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let primary_chunk = primary_design.row_chunk(start..end);
+        let noise_chunk = rawnoise_design.row_chunk(start..end);
+        let chunk =
+            apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
+        out.slice_mut(s![start..end, ..]).assign(&chunk);
+    }
     Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-        Arc::new(operator),
+        out,
     )))
 }
 

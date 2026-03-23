@@ -5,12 +5,15 @@
 //! moving beyond simple hyperparameter-driven models. This is achieved through a
 //! nested optimization scheme, a standard approach for this class of models:
 //!
-//! 1.  Outer Loop (BFGS): Optimizes the log-smoothing parameters (`rho`) by
-//!     maximizing a marginal likelihood criterion. For non-Gaussian models (e.g., Logit),
-//!     this is the Laplace Approximate Marginal Likelihood (LAML). This advanced strategy
-//!     is detailed in Wood (2011), upon which this implementation is heavily based. The
-//!     BFGS algorithm itself is a classic quasi-Newton method, with our implementation
-//!     following the standard described in Nocedal & Wright (2006).
+//! 1.  Outer Loop (planner-selected optimizer): Optimizes the log-smoothing
+//!     parameters (`rho`) by maximizing a marginal likelihood criterion. For
+//!     non-Gaussian models (e.g., Logit), this is the Laplace Approximate
+//!     Marginal Likelihood (LAML). The concrete solver is chosen centrally by
+//!     `outer_strategy` from the derivative capability of the model path:
+//!     ARC with analytic Hessian when available, Newton trust-region with a
+//!     finite-difference Hessian for small analytic-gradient problems, BFGS
+//!     for larger gradient-only problems, and EFS / hybrid EFS when the
+//!     hyperparameter geometry admits those fixed-point updates.
 //!
 //! 2.  Inner Loop (P-IRLS): For each set of trial smoothing parameters from the
 //!     outer loop, this routine finds the corresponding model coefficients (`beta`) by

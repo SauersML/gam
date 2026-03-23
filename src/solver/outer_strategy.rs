@@ -32,7 +32,10 @@ pub enum Derivative {
     /// Exact analytic derivative implemented and available.
     Analytic,
     /// Derivative is available only via finite differences computed inside
-    /// `opt` from a lower-order objective interface.
+    /// `opt` from a lower-order objective interface. This is a real capability
+    /// for gradients; Hessians are normalized to `Unavailable` at planning time
+    /// because the choice to synthesize an FD Hessian is owned centrally by
+    /// `plan()`, not by callers.
     FiniteDifference,
     /// No analytic derivative; must be approximated or skipped.
     Unavailable,
@@ -43,6 +46,8 @@ pub enum Derivative {
 /// Each call site that optimizes smoothing parameters constructs one of these
 /// to describe its analytic derivative coverage. The [`plan`] function then
 /// selects the optimizer and Hessian strategy.
+const SMALL_OUTER_FD_HESSIAN_MAX_PARAMS: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct OuterCapability {
     pub gradient: Derivative,
@@ -57,7 +62,9 @@ pub struct OuterCapability {
     ///
     /// # Hybrid EFS strategy (when `psi_dim > 0`)
     ///
-    /// Enabled when `psi_dim > 0`, `n_params > 8`, and `fixed_point_available`.
+    /// Enabled when `psi_dim > 0`,
+    /// `n_params > SMALL_OUTER_FD_HESSIAN_MAX_PARAMS`, and
+    /// `fixed_point_available`.
     /// Combines:
     /// - Standard EFS multiplicative fixed-point updates for ρ coordinates
     /// - Safeguarded preconditioned gradient steps for ψ coordinates:
@@ -98,6 +105,30 @@ impl OuterCapability {
     /// True when ψ (design-moving) coordinates are present.
     pub fn has_psi_coords(&self) -> bool {
         self.psi_dim > 0
+    }
+
+    fn prefers_fd_hessian_newton(&self) -> bool {
+        self.gradient == Derivative::Analytic
+            && self.n_params <= SMALL_OUTER_FD_HESSIAN_MAX_PARAMS
+    }
+
+    fn efs_plan_eligible(&self) -> bool {
+        self.fixed_point_available
+            && self.all_penalty_like()
+            && self.n_params > SMALL_OUTER_FD_HESSIAN_MAX_PARAMS
+    }
+
+    fn hybrid_efs_plan_eligible(&self) -> bool {
+        self.fixed_point_available
+            && self.has_psi_coords()
+            && self.n_params > SMALL_OUTER_FD_HESSIAN_MAX_PARAMS
+    }
+
+    fn declared_hessian_for_planning(&self) -> Derivative {
+        match self.hessian {
+            Derivative::Analytic => Derivative::Analytic,
+            Derivative::FiniteDifference | Derivative::Unavailable => Derivative::Unavailable,
+        }
     }
 }
 
@@ -190,9 +221,7 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
     use HessianSource as H;
     use Solver as S;
 
-    const SMALL_PARAM_FD_HESSIAN_MAX_DIM: usize = 8;
-
-    match (cap.gradient, cap.hessian) {
+    match (cap.gradient, cap.declared_hessian_for_planning()) {
         (Analytic, Analytic) => OuterPlan {
             solver: S::Arc,
             hessian_source: H::Analytic,
@@ -207,17 +236,13 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // a quantitative check each step via `barrier_curvature_is_significant`
         // and bails out early if the barrier curvature becomes non-negligible
         // relative to the penalized Hessian diagonal.
-        (Analytic, Unavailable)
-            if cap.fixed_point_available && cap.all_penalty_like() && cap.n_params > 8 =>
-        {
+        (Analytic, Unavailable) if cap.efs_plan_eligible() => {
             OuterPlan {
                 solver: S::Efs,
                 hessian_source: H::EfsFixedPoint,
             }
         }
-        (Unavailable, Unavailable)
-            if cap.fixed_point_available && cap.all_penalty_like() && cap.n_params > 8 =>
-        {
+        (Unavailable, Unavailable) if cap.efs_plan_eligible() => {
             OuterPlan {
                 solver: S::Efs,
                 hessian_source: H::EfsFixedPoint,
@@ -236,17 +261,13 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         //
         // This stays O(1) H⁻¹ solves per iteration (vs O(dim(θ)) for BFGS)
         // and uses the same trace Gram matrix that EFS already computes.
-        (Analytic, Unavailable)
-            if cap.fixed_point_available && cap.has_psi_coords() && cap.n_params > 8 =>
-        {
+        (Analytic, Unavailable) if cap.hybrid_efs_plan_eligible() => {
             OuterPlan {
                 solver: S::HybridEfs,
                 hessian_source: H::HybridEfsFixedPoint,
             }
         }
-        (Unavailable, Unavailable)
-            if cap.fixed_point_available && cap.has_psi_coords() && cap.n_params > 8 =>
-        {
+        (Unavailable, Unavailable) if cap.hybrid_efs_plan_eligible() => {
             OuterPlan {
                 solver: S::HybridEfs,
                 hessian_source: H::HybridEfsFixedPoint,
@@ -256,25 +277,14 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // Small analytic-gradient problems should still use a real second-order
         // method even when the Hessian must be approximated numerically.
         // This restores the documented/tested boundary policy:
-        //   n_params <= 8  => Newton trust-region + FD Hessian
-        //   n_params >  8  => BFGS
-        (Analytic, FiniteDifference) if cap.n_params <= SMALL_PARAM_FD_HESSIAN_MAX_DIM => {
-            OuterPlan {
-                solver: S::NewtonTrustRegion,
-                hessian_source: H::FiniteDifference,
-            }
-        }
-        (Analytic, Unavailable) if cap.n_params <= SMALL_PARAM_FD_HESSIAN_MAX_DIM => OuterPlan {
+        //   n_params <= small_outer_fd_hessian_max_params => Newton trust-region + FD Hessian
+        //   n_params  > small_outer_fd_hessian_max_params => BFGS
+        (Analytic, Unavailable) if cap.prefers_fd_hessian_newton() => OuterPlan {
             solver: S::NewtonTrustRegion,
             hessian_source: H::FiniteDifference,
         },
 
         // With many params, FD Hessian is too expensive; fall back to BFGS.
-        (Analytic, FiniteDifference) => OuterPlan {
-            solver: S::Bfgs,
-            hessian_source: H::BfgsApprox,
-        },
-
         (Analytic, Unavailable) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
@@ -310,8 +320,7 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         Derivative::FiniteDifference => " [FD gradient from cost-only objective]",
         _ => "",
     };
-    let barrier_note = if cap.barrier_config.is_some() && cap.all_penalty_like() && cap.n_params > 8
-    {
+    let barrier_note = if cap.barrier_config.is_some() && cap.efs_plan_eligible() {
         " [EFS with runtime barrier-curvature guard]"
     } else {
         ""
@@ -1551,21 +1560,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_fd_hessian_selects_newton_for_few_params() {
-        let cap = OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::FiniteDifference,
-            n_params: 3,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-        };
-        let p = plan(&cap);
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
-        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
-    }
-
-    #[test]
     fn plan_no_hessian_few_params_selects_fd_hessian() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
@@ -1631,7 +1625,7 @@ mod tests {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
-            n_params: 8,
+            n_params: SMALL_OUTER_FD_HESSIAN_MAX_PARAMS,
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
@@ -1646,7 +1640,7 @@ mod tests {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
-            n_params: 9,
+            n_params: SMALL_OUTER_FD_HESSIAN_MAX_PARAMS + 1,
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
@@ -1760,7 +1754,8 @@ mod tests {
     #[test]
     fn plan_efs_allowed_with_barrier_config_no_gradient() {
         // Even without analytic gradient, EFS is selected when all coords
-        // are penalty-like and n_params > 8, regardless of barrier presence.
+        // are penalty-like and the problem is above the small-problem
+        // FD-Hessian threshold, regardless of barrier presence.
         let barrier = BarrierConfig {
             tau: 1e-6,
             constrained_indices: vec![0],
@@ -1877,8 +1872,9 @@ mod tests {
 
     #[test]
     fn plan_hybrid_efs_selected_for_psi_coords_many_params() {
-        // When ψ (design-moving) coords are present and n_params > 8,
-        // the planner should select HybridEfs instead of falling back to BFGS.
+        // When ψ (design-moving) coords are present and the problem is above
+        // the small-problem FD-Hessian threshold, the planner should select
+        // HybridEfs instead of falling back to BFGS.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
