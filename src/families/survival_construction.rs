@@ -13,15 +13,18 @@ use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
     KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
+use crate::estimate::EstimationError;
 use crate::families::gamlss::{
     WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
     monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
 };
+use crate::families::lognormal_kernel::HazardLoading;
 use crate::families::survival_location_scale::{
     ResidualDistribution, SurvivalCovariateTermBlockTemplate,
 };
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
+use crate::solver::outer_strategy::{EfsEval, HessianResult, OuterEval, OuterProblem};
 use ndarray::{Array1, Array2, array, s};
 
 // ---------------------------------------------------------------------------
@@ -92,6 +95,7 @@ pub enum SurvivalLikelihoodMode {
     LocationScale,
     MarginalSlope,
     Latent,
+    LatentBinary,
 }
 
 pub struct SurvivalTimeWiggleBuild {
@@ -265,8 +269,9 @@ pub fn parse_survival_likelihood_mode(raw: &str) -> Result<SurvivalLikelihoodMod
         "location-scale" => Ok(SurvivalLikelihoodMode::LocationScale),
         "marginal-slope" => Ok(SurvivalLikelihoodMode::MarginalSlope),
         "latent" => Ok(SurvivalLikelihoodMode::Latent),
+        "latent-binary" => Ok(SurvivalLikelihoodMode::LatentBinary),
         other => Err(format!(
-            "unsupported --survival-likelihood '{other}'; use transformation|weibull|location-scale|marginal-slope|latent"
+            "unsupported --survival-likelihood '{other}'; use transformation|weibull|location-scale|marginal-slope|latent|latent-binary"
         )),
     }
 }
@@ -278,6 +283,7 @@ pub fn survival_likelihood_modename(mode: SurvivalLikelihoodMode) -> &'static st
         SurvivalLikelihoodMode::LocationScale => "location-scale",
         SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
         SurvivalLikelihoodMode::Latent => "latent",
+        SurvivalLikelihoodMode::LatentBinary => "latent-binary",
     }
 }
 
@@ -299,6 +305,228 @@ pub fn survival_baseline_targetname(target: SurvivalBaselineTarget) -> &'static 
         SurvivalBaselineTarget::Gompertz => "gompertz",
         SurvivalBaselineTarget::GompertzMakeham => "gompertz-makeham",
     }
+}
+
+pub fn positive_survival_time_seed(age_exit: &Array1<f64>) -> f64 {
+    let sum = age_exit
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum::<f64>();
+    let count = age_exit
+        .iter()
+        .filter(|value| value.is_finite() && **value > 0.0)
+        .count()
+        .max(1);
+    (sum / count as f64).max(SURVIVAL_TIME_FLOOR)
+}
+
+pub fn initial_survival_baseline_config_for_fit(
+    target_raw: &str,
+    scale: Option<f64>,
+    shape: Option<f64>,
+    rate: Option<f64>,
+    makeham: Option<f64>,
+    age_exit: &Array1<f64>,
+) -> Result<SurvivalBaselineConfig, String> {
+    let target = match target_raw.trim().to_ascii_lowercase().as_str() {
+        "linear" => SurvivalBaselineTarget::Linear,
+        "weibull" => SurvivalBaselineTarget::Weibull,
+        "gompertz" => SurvivalBaselineTarget::Gompertz,
+        "gompertz-makeham" => SurvivalBaselineTarget::GompertzMakeham,
+        other => {
+            return Err(format!(
+                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
+            ));
+        }
+    };
+    let time_scale_seed = positive_survival_time_seed(age_exit);
+    let cfg = match target {
+        SurvivalBaselineTarget::Linear => SurvivalBaselineConfig {
+            target,
+            scale: None,
+            shape: None,
+            rate: None,
+            makeham: None,
+        },
+        SurvivalBaselineTarget::Weibull => SurvivalBaselineConfig {
+            target,
+            scale: Some(scale.unwrap_or(time_scale_seed)),
+            shape: Some(shape.unwrap_or(1.0)),
+            rate: None,
+            makeham: None,
+        },
+        SurvivalBaselineTarget::Gompertz => SurvivalBaselineConfig {
+            target,
+            scale: None,
+            shape: Some(shape.unwrap_or(0.01)),
+            rate: Some(rate.unwrap_or(1.0 / time_scale_seed)),
+            makeham: None,
+        },
+        SurvivalBaselineTarget::GompertzMakeham => SurvivalBaselineConfig {
+            target,
+            scale: None,
+            shape: Some(shape.unwrap_or(0.01)),
+            rate: Some(rate.unwrap_or(0.5 / time_scale_seed)),
+            makeham: Some(makeham.unwrap_or(0.5 / time_scale_seed)),
+        },
+    };
+    parse_survival_baseline_config(
+        survival_baseline_targetname(cfg.target),
+        cfg.scale,
+        cfg.shape,
+        cfg.rate,
+        cfg.makeham,
+    )
+}
+
+fn survival_baseline_theta_from_config(
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<Array1<f64>>, String> {
+    Ok(match cfg.target {
+        SurvivalBaselineTarget::Linear => None,
+        SurvivalBaselineTarget::Weibull => Some(array![
+            cfg.scale
+                .ok_or_else(|| "missing weibull baseline scale".to_string())?
+                .ln(),
+            cfg.shape
+                .ok_or_else(|| "missing weibull baseline shape".to_string())?
+                .ln(),
+        ]),
+        SurvivalBaselineTarget::Gompertz => Some(array![
+            cfg.rate
+                .ok_or_else(|| "missing gompertz baseline rate".to_string())?
+                .ln(),
+            cfg.shape
+                .ok_or_else(|| "missing gompertz baseline shape".to_string())?,
+        ]),
+        SurvivalBaselineTarget::GompertzMakeham => Some(array![
+            cfg.rate
+                .ok_or_else(|| "missing gompertz-makeham baseline rate".to_string())?
+                .ln(),
+            cfg.shape
+                .ok_or_else(|| "missing gompertz-makeham baseline shape".to_string())?,
+            cfg.makeham
+                .ok_or_else(|| "missing gompertz-makeham baseline makeham".to_string())?
+                .ln(),
+        ]),
+    })
+}
+
+fn survival_baseline_config_from_theta(
+    target: SurvivalBaselineTarget,
+    theta: &Array1<f64>,
+) -> Result<SurvivalBaselineConfig, String> {
+    let cfg = match target {
+        SurvivalBaselineTarget::Linear => SurvivalBaselineConfig {
+            target,
+            scale: None,
+            shape: None,
+            rate: None,
+            makeham: None,
+        },
+        SurvivalBaselineTarget::Weibull => {
+            if theta.len() != 2 {
+                return Err(format!(
+                    "weibull baseline parameter dimension mismatch: expected 2, got {}",
+                    theta.len()
+                ));
+            }
+            SurvivalBaselineConfig {
+                target,
+                scale: Some(theta[0].exp()),
+                shape: Some(theta[1].exp()),
+                rate: None,
+                makeham: None,
+            }
+        }
+        SurvivalBaselineTarget::Gompertz => {
+            if theta.len() != 2 {
+                return Err(format!(
+                    "gompertz baseline parameter dimension mismatch: expected 2, got {}",
+                    theta.len()
+                ));
+            }
+            SurvivalBaselineConfig {
+                target,
+                scale: None,
+                shape: Some(theta[1]),
+                rate: Some(theta[0].exp()),
+                makeham: None,
+            }
+        }
+        SurvivalBaselineTarget::GompertzMakeham => {
+            if theta.len() != 3 {
+                return Err(format!(
+                    "gompertz-makeham baseline parameter dimension mismatch: expected 3, got {}",
+                    theta.len()
+                ));
+            }
+            SurvivalBaselineConfig {
+                target,
+                scale: None,
+                shape: Some(theta[1]),
+                rate: Some(theta[0].exp()),
+                makeham: Some(theta[2].exp()),
+            }
+        }
+    };
+    parse_survival_baseline_config(
+        survival_baseline_targetname(cfg.target),
+        cfg.scale,
+        cfg.shape,
+        cfg.rate,
+        cfg.makeham,
+    )
+}
+
+pub fn optimize_survival_baseline_config<F>(
+    initial: &SurvivalBaselineConfig,
+    context: &str,
+    objective: F,
+) -> Result<SurvivalBaselineConfig, String>
+where
+    F: FnMut(&SurvivalBaselineConfig) -> Result<f64, String>,
+{
+    let Some(seed) = survival_baseline_theta_from_config(initial)? else {
+        return Ok(initial.clone());
+    };
+    let dim = seed.len();
+    let mut seed_config = crate::seeding::SeedConfig::default();
+    seed_config.max_seeds = 8;
+    seed_config.screening_budget = 3;
+    seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
+    let problem = OuterProblem::new(dim)
+        .with_tolerance(1e-4)
+        .with_max_iter(30)
+        .with_fd_step(1e-3)
+        .with_seed_config(seed_config)
+        .with_heuristic_lambdas(seed.to_vec());
+    let target = initial.target;
+    let mut obj = problem.build_objective(
+        objective,
+        |f: &mut F, theta: &Array1<f64>| {
+            let cfg = survival_baseline_config_from_theta(target, theta)
+                .map_err(EstimationError::InvalidInput)?;
+            f(&cfg).map_err(EstimationError::InvalidInput)
+        },
+        |f: &mut F, theta: &Array1<f64>| {
+            let cfg = survival_baseline_config_from_theta(target, theta)
+                .map_err(EstimationError::InvalidInput)?;
+            let cost = f(&cfg).map_err(EstimationError::InvalidInput)?;
+            Ok(OuterEval {
+                cost,
+                gradient: Array1::zeros(theta.len()),
+                hessian: HessianResult::Unavailable,
+            })
+        },
+        None::<fn(&mut F)>,
+        None::<fn(&mut F, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let result = problem
+        .run(&mut obj, context)
+        .map_err(|error| format!("{context} failed: {error}"))?;
+    survival_baseline_config_from_theta(target, &result.rho)
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,6 +1295,111 @@ pub fn build_survival_baseline_offsets(
         derivative_exit[i] = d1;
     }
     Ok((eta_entry, eta_exit, derivative_exit))
+}
+
+#[derive(Clone, Debug)]
+pub struct LatentSurvivalBaselineOffsets {
+    pub loaded_eta_entry: Array1<f64>,
+    pub loaded_eta_exit: Array1<f64>,
+    pub loaded_derivative_exit: Array1<f64>,
+    pub unloaded_mass_entry: Array1<f64>,
+    pub unloaded_mass_exit: Array1<f64>,
+    pub unloaded_hazard_exit: Array1<f64>,
+}
+
+pub fn build_latent_survival_baseline_offsets(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    cfg: &SurvivalBaselineConfig,
+    loading: HazardLoading,
+) -> Result<LatentSurvivalBaselineOffsets, String> {
+    if age_entry.len() != age_exit.len() {
+        return Err("latent survival baseline offsets require matching entry/exit lengths".to_string());
+    }
+
+    fn gompertz_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {
+        if shape.abs() < 1e-10 {
+            return (rate * age, rate);
+        }
+        let shape_age = shape * age;
+        let cumulative_hazard = (rate / shape) * shape_age.exp_m1();
+        let instant_hazard = rate * shape_age.exp();
+        (cumulative_hazard, instant_hazard)
+    }
+
+    let n = age_entry.len();
+    let mut loaded_eta_entry = Array1::<f64>::zeros(n);
+    let mut loaded_eta_exit = Array1::<f64>::zeros(n);
+    let mut loaded_derivative_exit = Array1::<f64>::zeros(n);
+    let mut unloaded_mass_entry = Array1::<f64>::zeros(n);
+    let mut unloaded_mass_exit = Array1::<f64>::zeros(n);
+    let mut unloaded_hazard_exit = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let entry = age_entry[i];
+        let exit = age_exit[i];
+        if !entry.is_finite() || !exit.is_finite() || entry <= 0.0 || exit <= 0.0 || exit < entry {
+            return Err(format!(
+                "latent survival baseline offsets require finite positive entry/exit ages with exit >= entry (row {})",
+                i + 1
+            ));
+        }
+        match loading {
+            HazardLoading::Full => {
+                let (eta_entry, _) = evaluate_survival_baseline(entry, cfg)?;
+                let (eta_exit, derivative_exit) = evaluate_survival_baseline(exit, cfg)?;
+                loaded_eta_entry[i] = eta_entry;
+                loaded_eta_exit[i] = eta_exit;
+                loaded_derivative_exit[i] = derivative_exit;
+            }
+            HazardLoading::LoadedVsUnloaded => {
+                if cfg.target != SurvivalBaselineTarget::GompertzMakeham {
+                    return Err(format!(
+                        "HazardLoading::LoadedVsUnloaded requires --baseline-target gompertz-makeham, got {}",
+                        survival_baseline_targetname(cfg.target)
+                    ));
+                }
+                let rate = cfg.rate.ok_or_else(|| {
+                    "gompertz-makeham latent survival is missing baseline rate".to_string()
+                })?;
+                let shape = cfg.shape.ok_or_else(|| {
+                    "gompertz-makeham latent survival is missing baseline shape".to_string()
+                })?;
+                let makeham = cfg.makeham.ok_or_else(|| {
+                    "gompertz-makeham latent survival is missing baseline makeham".to_string()
+                })?;
+                let (loaded_entry, _) = gompertz_components(entry, rate, shape);
+                let (loaded_exit, loaded_hazard) = gompertz_components(exit, rate, shape);
+                if !(loaded_entry.is_finite()
+                    && loaded_entry > 0.0
+                    && loaded_exit.is_finite()
+                    && loaded_exit > 0.0
+                    && loaded_hazard.is_finite()
+                    && loaded_hazard > 0.0)
+                {
+                    return Err(format!(
+                        "gompertz-makeham latent loaded component produced a non-positive or non-finite hazard decomposition at row {}",
+                        i + 1
+                    ));
+                }
+                loaded_eta_entry[i] = loaded_entry.ln();
+                loaded_eta_exit[i] = loaded_exit.ln();
+                loaded_derivative_exit[i] = loaded_hazard / loaded_exit;
+                unloaded_mass_entry[i] = makeham * entry;
+                unloaded_mass_exit[i] = makeham * exit;
+                unloaded_hazard_exit[i] = makeham;
+            }
+        }
+    }
+
+    Ok(LatentSurvivalBaselineOffsets {
+        loaded_eta_entry,
+        loaded_eta_exit,
+        loaded_derivative_exit,
+        unloaded_mass_entry,
+        unloaded_mass_exit,
+        unloaded_hazard_exit,
+    })
 }
 
 // ---------------------------------------------------------------------------

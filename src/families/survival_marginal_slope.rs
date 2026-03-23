@@ -289,7 +289,6 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
-#[inline]
 fn fixed_gaussian_shift_sigma(frailty: &FrailtySpec) -> Option<f64> {
     match frailty {
         FrailtySpec::None => None,
@@ -335,8 +334,6 @@ struct CachedPartitionCells {
 struct CachedCellEntry {
     partition_cell: exact_kernel::DenestedPartitionCell,
     neg_cell: exact_kernel::DenestedCubicCell,
-    z_mid: f64,
-    u_mid: f64,
     state: exact_kernel::CellMomentState,
     fixed: DenestedCellPrimaryFixedPartials,
 }
@@ -387,12 +384,6 @@ struct SurvivalMarginalSlopeDynamicRow {
 
 fn unit_primary_direction(idx: usize) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(N_PRIMARY);
-    out[idx] = 1.0;
-    out
-}
-
-fn unit_flex_primary_direction(primary: &FlexPrimarySlices, idx: usize) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(primary.total);
     out[idx] = 1.0;
     out
 }
@@ -1590,15 +1581,6 @@ impl SurvivalMarginalSlopeFamily {
         self.score_warp.is_some() || self.link_dev.is_some()
     }
 
-    fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
-        Ok(self
-            .flex_score_beta(block_states)?
-            .is_some_and(|beta| beta.iter().any(|value| *value != 0.0))
-            || self
-                .flex_link_beta(block_states)?
-                .is_some_and(|beta| beta.iter().any(|value| *value != 0.0)))
-    }
-
     fn flex_score_beta<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
@@ -1633,35 +1615,16 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
-        // Fixed score-z breakpoints: always include ±SCORE_TAIL as minimum
-        // partition (needed even for frailty-only), plus runtime breakpoints.
-        const SCORE_TAIL: f64 = 8.0;
-        let mut score_breaks = vec![-SCORE_TAIL, SCORE_TAIL];
-        if let Some(runtime) = self.score_warp.as_ref() {
-            for &bp in runtime.breakpoints().iter() {
-                if bp > -SCORE_TAIL && bp < SCORE_TAIL {
-                    score_breaks.push(bp);
-                }
-            }
-            score_breaks.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap());
-            score_breaks.dedup_by(|lhs, rhs| (*lhs - *rhs).abs() <= 1e-12);
-        }
-        // Fixed link-u breakpoints: runtime support + fixed padding.
-        const LINK_PAD: f64 = 8.0;
-        let link_breaks = if let Some(runtime) = self.link_dev.as_ref() {
-            let left_ep = runtime.support_left();
-            let right_ep = runtime.support_right();
-            let mut bk = runtime.breakpoints().to_vec();
-            if bk.first().copied().unwrap_or(right_ep) > left_ep - LINK_PAD {
-                bk.insert(0, left_ep - LINK_PAD);
-            }
-            if bk.last().copied().unwrap_or(left_ep) < right_ep + LINK_PAD {
-                bk.push(right_ep + LINK_PAD);
-            }
-            bk
-        } else {
-            vec![-SCORE_TAIL, SCORE_TAIL]
-        };
+        let score_breaks = self
+            .score_warp
+            .as_ref()
+            .map(|runtime| runtime.breakpoints().to_vec())
+            .unwrap_or_default();
+        let link_breaks = self
+            .link_dev
+            .as_ref()
+            .map(|runtime| runtime.breakpoints().to_vec())
+            .unwrap_or_default();
 
         let mut cells = exact_kernel::build_denested_partition_cells_with_tails(
             a,
@@ -1673,8 +1636,8 @@ impl SurvivalMarginalSlopeFamily {
                     runtime.local_cubic_at(beta, z)
                 } else {
                     Ok(exact_kernel::LocalSpanCubic {
-                        left: -SCORE_TAIL,
-                        right: SCORE_TAIL,
+                        left: 0.0,
+                        right: 1.0,
                         c0: 0.0,
                         c1: 0.0,
                         c2: 0.0,
@@ -1687,8 +1650,8 @@ impl SurvivalMarginalSlopeFamily {
                     runtime.local_cubic_at(beta, u)
                 } else {
                     Ok(exact_kernel::LocalSpanCubic {
-                        left: -SCORE_TAIL,
-                        right: SCORE_TAIL,
+                        left: 0.0,
+                        right: 1.0,
                         c0: 0.0,
                         c1: 0.0,
                         c2: 0.0,
@@ -2201,8 +2164,6 @@ impl SurvivalMarginalSlopeFamily {
             cells.push(CachedCellEntry {
                 partition_cell,
                 neg_cell,
-                z_mid,
-                u_mid,
                 state,
                 fixed,
             });
@@ -2232,7 +2193,6 @@ impl SurvivalMarginalSlopeFamily {
         let mut f_aa = 0.0;
 
         for entry in &cached.cells {
-            let cell = entry.partition_cell.cell;
             let neg_cell = entry.neg_cell;
             let state = &entry.state;
             let fixed = &entry.fixed;
@@ -3489,58 +3449,41 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
-    /// Map a coefficient-space direction to primary-space for a given row.
-    fn row_primary_direction_from_flat(
+    fn row_primary_direction_from_flat_dynamic(
         &self,
         row: usize,
+        block_states: &[ParameterBlockState],
         slices: &BlockSlices,
         d_beta_flat: &Array1<f64>,
-    ) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(N_PRIMARY);
+    ) -> Result<Array1<f64>, String> {
+        let flex_primary = self.flex_active().then(|| flex_primary_slices(self));
+        let mut out = Array1::<f64>::zeros(flex_primary.as_ref().map_or(N_PRIMARY, |p| p.total));
         let d_time = d_beta_flat.slice(s![slices.time.clone()]);
-        out[0] = self.design_entry.dot_row_view(row, d_time);
-        out[0] += self
-            .marginal_design
-            .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
-        out[1] = self.design_exit.dot_row_view(row, d_time);
-        out[1] += self
-            .marginal_design
-            .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
-        out[2] = self.design_derivative_exit.dot_row_view(row, d_time);
-        out[3] = self
-            .logslope_design
-            .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-        out
-    }
+        let d_marginal = d_beta_flat.slice(s![slices.marginal.clone()]);
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
 
-    fn row_primary_direction_from_flat_general(
-        &self,
-        row: usize,
-        slices: &BlockSlices,
-        d_beta_flat: &Array1<f64>,
-    ) -> Array1<f64> {
-        if !self.flex_active() {
-            return self.row_primary_direction_from_flat(row, slices, d_beta_flat);
-        }
-        let primary = flex_primary_slices(self);
-        let mut out = Array1::<f64>::zeros(primary.total);
-        let d_time = d_beta_flat.slice(s![slices.time.clone()]);
-        out[primary.q0] = self.design_entry.dot_row_view(row, d_time)
-            + self
-                .marginal_design
-                .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
-        out[primary.q1] = self.design_exit.dot_row_view(row, d_time)
-            + self
-                .marginal_design
-                .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
-        out[primary.qd1] = self.design_derivative_exit.dot_row_view(row, d_time);
-        out[primary.g] = self
+        let q0_dir = q_geom.dq0_time.dot(&d_time) + q_geom.dq0_marginal.dot(&d_marginal);
+        let q1_dir = q_geom.dq1_time.dot(&d_time) + q_geom.dq1_marginal.dot(&d_marginal);
+        let qd1_dir = q_geom.dqd1_time.dot(&d_time) + q_geom.dqd1_marginal.dot(&d_marginal);
+        let g_dir = self
             .logslope_design
             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-        for (primary_range, block_range) in flex_identity_block_pairs(&primary, slices) {
-            out.slice_mut(s![primary_range]).assign(&d_beta_flat.slice(s![block_range]));
+
+        if let Some(primary) = flex_primary.as_ref() {
+            out[primary.q0] = q0_dir;
+            out[primary.q1] = q1_dir;
+            out[primary.qd1] = qd1_dir;
+            out[primary.g] = g_dir;
+            for (primary_range, block_range) in flex_identity_block_pairs(primary, slices) {
+                out.slice_mut(s![primary_range]).assign(&d_beta_flat.slice(s![block_range]));
+            }
+        } else {
+            out[0] = q0_dir;
+            out[1] = q1_dir;
+            out[2] = qd1_dir;
+            out[3] = g_dir;
         }
-        out
+        Ok(out)
     }
 
     // ── Psi (spatial length-scale) derivatives ────────────────────────
@@ -3679,6 +3622,8 @@ impl SurvivalMarginalSlopeFamily {
         psi_index: usize,
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        let flex_active = self.flex_active();
+        let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
         let Some((block_idx, local_idx, p_psi, psi_label)) =
             self.psi_block_info(derivative_blocks, psi_index)?
@@ -3686,8 +3631,8 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
         let deriv = &derivative_blocks[block_idx][local_idx];
-        let loading = if self.flex_active() {
-            spatial_block_primary_loading_flex(&flex_primary_slices(self), block_idx)?
+        let loading = if let Some(primary) = flex_primary.as_ref() {
+            spatial_block_primary_loading_flex(primary, block_idx)?
         } else {
             spatial_block_primary_loading(block_idx)?
         };
@@ -3723,24 +3668,19 @@ impl SurvivalMarginalSlopeFamily {
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 // Compute psi design row once; derive direction from it.
                 let psi_row = self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-                let dir = if self.flex_active() {
-                    primary_direction_from_psi_row_flex(
-                        &flex_primary_slices(self),
-                        block_idx,
-                        &psi_row,
-                        beta_psi,
-                    )
+                let dir = if let Some(primary) = flex_primary.as_ref() {
+                    primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
                 } else {
                     primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
                 };
 
-                let (f_pi, f_pipi) = if self.flex_active() {
+                let (f_pi, f_pipi) = if let Some(primary) = flex_primary.as_ref() {
                     let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
                     let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
                         &q_geom,
-                        &flex_primary_slices(self),
+                        primary,
                     )?;
                     (g, h)
                 } else if let Some(c) = cache {
@@ -3819,6 +3759,8 @@ impl SurvivalMarginalSlopeFamily {
         psi_j: usize,
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let flex_active = self.flex_active();
+        let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
         let Some((block_idx_i, local_idx_i, p_psi_i, label_i)) =
             self.psi_block_info(derivative_blocks, psi_i)?
@@ -3832,13 +3774,13 @@ impl SurvivalMarginalSlopeFamily {
         };
         let deriv_i = &derivative_blocks[block_idx_i][local_idx_i];
         let deriv_j = &derivative_blocks[block_idx_j][local_idx_j];
-        let loading_i = if self.flex_active() {
-            spatial_block_primary_loading_flex(&flex_primary_slices(self), block_idx_i)?
+        let loading_i = if let Some(primary) = flex_primary.as_ref() {
+            spatial_block_primary_loading_flex(primary, block_idx_i)?
         } else {
             spatial_block_primary_loading(block_idx_i)?
         };
-        let loading_j = if self.flex_active() {
-            spatial_block_primary_loading_flex(&flex_primary_slices(self), block_idx_j)?
+        let loading_j = if let Some(primary) = flex_primary.as_ref() {
+            spatial_block_primary_loading_flex(primary, block_idx_j)?
         } else {
             spatial_block_primary_loading(block_idx_j)?
         };
@@ -3881,23 +3823,13 @@ impl SurvivalMarginalSlopeFamily {
                     self.psi_design_row_vector(row, deriv_i, self.n, p_psi_i, label_i)?;
                 let psi_row_j =
                     self.psi_design_row_vector(row, deriv_j, self.n, p_psi_j, label_j)?;
-                let dir_i = if self.flex_active() {
-                    primary_direction_from_psi_row_flex(
-                        &flex_primary_slices(self),
-                        block_idx_i,
-                        &psi_row_i,
-                        beta_i,
-                    )
+                let dir_i = if let Some(primary) = flex_primary.as_ref() {
+                    primary_direction_from_psi_row_flex(primary, block_idx_i, &psi_row_i, beta_i)
                 } else {
                     primary_direction_from_psi_row(block_idx_i, &psi_row_i, beta_i)
                 };
-                let dir_j = if self.flex_active() {
-                    primary_direction_from_psi_row_flex(
-                        &flex_primary_slices(self),
-                        block_idx_j,
-                        &psi_row_j,
-                        beta_j,
-                    )
+                let dir_j = if let Some(primary) = flex_primary.as_ref() {
+                    primary_direction_from_psi_row_flex(primary, block_idx_j, &psi_row_j, beta_j)
                 } else {
                     primary_direction_from_psi_row(block_idx_j, &psi_row_j, beta_j)
                 };
@@ -3912,13 +3844,8 @@ impl SurvivalMarginalSlopeFamily {
                         p_psi_i,
                         label_i,
                     )?;
-                    let d = if self.flex_active() {
-                        primary_second_direction_from_psi_row_flex(
-                            &flex_primary_slices(self),
-                            block_idx_i,
-                            &r,
-                            beta_i,
-                        )
+                    let d = if let Some(primary) = flex_primary.as_ref() {
+                        primary_second_direction_from_psi_row_flex(primary, block_idx_i, &r, beta_i)
                     } else {
                         primary_second_direction_from_psi_row(block_idx_i, &r, beta_i)
                     };
@@ -3926,24 +3853,20 @@ impl SurvivalMarginalSlopeFamily {
                 } else {
                     (
                         None,
-                        Array1::<f64>::zeros(if self.flex_active() {
-                            flex_primary_slices(self).total
-                        } else {
-                            N_PRIMARY
-                        }),
+                        Array1::<f64>::zeros(flex_primary.as_ref().map_or(N_PRIMARY, |p| p.total)),
                     )
                 };
                 let has_ij = psi_row_ij
                     .as_ref()
                     .is_some_and(|r| r.iter().any(|v| v.abs() > 0.0));
 
-                let (f_pi, f_pipi) = if self.flex_active() {
+                let (f_pi, f_pipi) = if let Some(primary) = flex_primary.as_ref() {
                     let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
                     let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
                         &q_geom,
-                        &flex_primary_slices(self),
+                        primary,
                     )?;
                     (g, h)
                 } else if let Some(c) = cache {
@@ -4056,6 +3979,8 @@ impl SurvivalMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        let flex_active = self.flex_active();
+        let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
         let Some((block_idx, local_idx, p_psi, psi_label)) =
             self.psi_block_info(derivative_blocks, psi_index)?
@@ -4063,8 +3988,8 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
         let deriv = &derivative_blocks[block_idx][local_idx];
-        let loading = if self.flex_active() {
-            spatial_block_primary_loading_flex(&flex_primary_slices(self), block_idx)?
+        let loading = if let Some(primary) = flex_primary.as_ref() {
+            spatial_block_primary_loading_flex(primary, block_idx)?
         } else {
             spatial_block_primary_loading(block_idx)?
         };
@@ -4088,28 +4013,22 @@ impl SurvivalMarginalSlopeFamily {
                 |mut acc, row| -> Result<BlockHessianAccumulator, String> {
                     let psi_row =
                         self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
-                    let psi_dir = if self.flex_active() {
-                        primary_direction_from_psi_row_flex(
-                            &flex_primary_slices(self),
-                            block_idx,
-                            &psi_row,
-                            beta_psi,
-                        )
+                    let psi_dir = if let Some(primary) = flex_primary.as_ref() {
+                        primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
                     } else {
                         primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
                     };
-                    let psi_action = if self.flex_active() {
-                        primary_psi_action_from_psi_row_flex(
-                            &flex_primary_slices(self),
-                            block_idx,
-                            &psi_row,
-                            d_beta_block,
-                        )
+                    let psi_action = if let Some(primary) = flex_primary.as_ref() {
+                        primary_psi_action_from_psi_row_flex(primary, block_idx, &psi_row, d_beta_block)
                     } else {
                         primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
                     };
-                    let row_dir =
-                        self.row_primary_direction_from_flat_general(row, &slices, d_beta_flat);
+                    let row_dir = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_beta_flat,
+                    )?;
                     let third_beta =
                         self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
                     let fourth =
@@ -4208,7 +4127,7 @@ impl SurvivalMarginalSlopePsiWorkspace {
         block_states: Vec<ParameterBlockState>,
         derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
-        let cache = if family.effective_flex_active(&block_states)? {
+        let cache = if family.flex_active() {
             None
         } else {
             Some(family.build_eval_cache(&block_states)?)
@@ -5386,18 +5305,20 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        if self.flex_active() {
-            return ExactOuterDerivativeOrder::First;
-        }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
         }
-        // Family-specific row-loop gate for the rigid/timewiggle primary size.
+        // Family-specific row-loop gate for the largest primary dimension this
+        // family can expose on the exact outer path.
         let n = self.n as u64;
         let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
         let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
-        let primary = N_PRIMARY as u64;
+        let primary = if self.flex_active() {
+            flex_primary_slices(self).total as u64
+        } else {
+            N_PRIMARY as u64
+        };
         let row_work = n.saturating_mul(k_pairs).saturating_mul(primary * primary);
         if row_work > EXACT_OUTER_MAX_ROW_WORK {
             ExactOuterDerivativeOrder::First
@@ -5415,7 +5336,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        let flex_active = self.effective_flex_active(block_states)?;
+        let flex_active = self.flex_active();
         if flex_active {
             self.validate_exact_monotonicity(block_states)?;
             let mut ll = 0.0;
@@ -5479,7 +5400,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_active() || self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             return self
                 .exact_newton_joint_hessian_directional_derivative_fd(block_states, d_beta_flat)
                 .map(Some);
@@ -5495,7 +5416,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.flex_active() || self.flex_timewiggle_active() {
+        if self.flex_timewiggle_active() || self.flex_active() {
             return self
                 .exact_newton_joint_hessiansecond_directional_derivative_fd(
                     block_states,
@@ -6553,6 +6474,18 @@ mod tests {
         DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse))
     }
 
+    fn dummy_blockspec(cols: usize) -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            name: "dummy".to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, cols)))),
+            offset: Array1::zeros(1),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(Array1::zeros(cols)),
+        }
+    }
+
     fn test_deviation_runtime() -> DeviationRuntime {
         build_deviation_block_from_seed(
             &array![-1.0, 0.0, 1.0],
@@ -6813,6 +6746,46 @@ mod tests {
         assert!((hess_exact[[primary.q1, primary.g]] - hess_rigid[1][3]).abs() < 1e-7);
         assert!((hess_exact[[primary.qd1, primary.qd1]] - hess_rigid[2][2]).abs() < 1e-7);
         assert!((hess_exact[[primary.g, primary.g]] - hess_rigid[3][3]).abs() < 1e-7);
+    }
+
+    #[test]
+    fn flex_capable_family_exposes_second_order_outer_path() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
+            offset_entry: Arc::new(Array1::zeros(1)),
+            offset_exit: Arc::new(Array1::zeros(1)),
+            derivative_offset_exit: Arc::new(Array1::ones(1)),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let specs = vec![
+            dummy_blockspec(1),
+            dummy_blockspec(0),
+            dummy_blockspec(0),
+            dummy_blockspec(score_runtime.basis_dim()),
+            dummy_blockspec(link_runtime.basis_dim()),
+        ];
+        assert_eq!(
+            family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
+            ExactOuterDerivativeOrder::Second
+        );
+        assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
     }
 
     #[test]

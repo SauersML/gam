@@ -3,10 +3,9 @@
 //! The kernel object `K_{k,m}(μ, σ) := E[exp(k·U − m·exp(U))]`, where
 //! `U ~ N(μ, σ²)`, is the only special function required by all latent families.
 //!
-//! It satisfies exact μ-recurrences (see [`kernel_ratio_jet`]) and heat-equation
-//! σ-identities, so the full derivative calculus for PIRLS,
-//! LAML outer, and learnable σ reduces to evaluating kernel bundles at shifted
-//! arguments.
+//! It satisfies exact μ-recurrences (see [`kernel_ratio_jet`]) and the
+//! corresponding heat-equation σ-identities, so fixed-σ latent families reduce
+//! to evaluating kernel bundles at shifted arguments.
 //!
 //! Row likelihoods for binary and survival models are small signed sums of
 //! kernel terms; [`LogKernelSumJet`] provides numerically stable log-space
@@ -289,7 +288,7 @@ pub fn kernel_ratio_jet(
 /// and `ln(−expm1(−a))` for small `a` (avoids loss of significance).
 #[inline]
 fn log1mexp(a: f64) -> f64 {
-    debug_assert!(a >= 0.0);
+    assert!(a >= 0.0);
     if a > core::f64::consts::LN_2 {
         // exp(-a) < 0.5, so 1 - exp(-a) > 0.5: safe for ln_1p.
         (-(-a).exp()).ln_1p()
@@ -618,10 +617,10 @@ impl fmt::Display for LatentSurvivalEventType {
     }
 }
 
-/// Compiled sufficient statistics for one row of a latent survival model.
+/// Row-level sufficient statistics for one latent survival observation.
 ///
-/// These are produced by upstream data compilation (not the fitting engine)
-/// and represent the integrated nuisance structure of the observation.
+/// This is the canonical row representation used by both fitted-family
+/// evaluation and saved-model prediction.
 ///
 /// For the full-loading model (frailty multiplies entire hazard):
 ///   mass_loaded = total cumulative hazard mass
@@ -644,8 +643,10 @@ pub struct LatentSurvivalRow {
     pub mass_left: f64,
     /// For interval censoring: mass at right boundary B(a_R).
     pub mass_right: f64,
-    /// Log baseline hazard at event time (for exact events only).
-    pub log_baseline_hazard: f64,
+    /// For interval censoring: unloaded mass at left boundary.
+    pub mass_unloaded_left: f64,
+    /// For interval censoring: unloaded mass at right boundary.
+    pub mass_unloaded_right: f64,
     /// Unloaded (background) cumulative mass at entry (0 for full loading).
     pub mass_unloaded_entry: f64,
     /// Unloaded (background) cumulative mass at exit.
@@ -657,31 +658,109 @@ pub struct LatentSurvivalRow {
 }
 
 impl LatentSurvivalRow {
-    /// Standard delayed-entry frailty row under full loading.
+    /// Delayed-entry right-censored row with explicit loaded/unloaded masses.
     ///
-    /// `mass_entry` and `mass_exit` are cumulative masses `B(a_in)` and
-    /// `B(a_out)` / `B(a_event)`, not an increment over `(a_in, a_out]`.
-    /// This preserves survivor selection at entry via the denominator
-    /// `K_{0,B(a_in)}` instead of resetting frailty at study entry.
-    pub fn from_full_loading_cumulative_mass(
-        event_type: LatentSurvivalEventType,
+    /// `mass_entry` and `mass_exit` are cumulative loaded masses `B_L(a_in)`
+    /// and `B_L(a_out)`, not an increment over `(a_in, a_out]`.
+    pub fn right_censored(
         mass_entry: f64,
         mass_exit: f64,
-        log_baseline_hazard: f64,
+        mass_unloaded_entry: f64,
+        mass_unloaded_exit: f64,
     ) -> Self {
         Self {
-            event_type,
+            event_type: LatentSurvivalEventType::RightCensored,
             mass_entry,
             mass_exit,
             mass_left: 0.0,
             mass_right: 0.0,
-            log_baseline_hazard,
-            mass_unloaded_entry: 0.0,
+            mass_unloaded_left: 0.0,
+            mass_unloaded_right: 0.0,
+            mass_unloaded_entry,
+            mass_unloaded_exit,
+            hazard_loaded: 0.0,
+            hazard_unloaded: 0.0,
+        }
+    }
+
+    /// Delayed-entry exact-event row with explicit loaded/unloaded hazard parts.
+    pub fn exact_event(
+        mass_entry: f64,
+        mass_exit: f64,
+        mass_unloaded_entry: f64,
+        mass_unloaded_exit: f64,
+        hazard_loaded: f64,
+        hazard_unloaded: f64,
+    ) -> Self {
+        Self {
+            event_type: LatentSurvivalEventType::ExactEvent,
+            mass_entry,
+            mass_exit,
+            mass_left: 0.0,
+            mass_right: 0.0,
+            mass_unloaded_left: 0.0,
+            mass_unloaded_right: 0.0,
+            mass_unloaded_entry,
+            mass_unloaded_exit,
+            hazard_loaded,
+            hazard_unloaded,
+        }
+    }
+
+    /// Delayed-entry interval-censored row with explicit loaded/unloaded masses.
+    pub fn interval_censored(
+        mass_entry: f64,
+        mass_left: f64,
+        mass_right: f64,
+        mass_unloaded_entry: f64,
+        mass_unloaded_left: f64,
+        mass_unloaded_right: f64,
+    ) -> Self {
+        Self {
+            event_type: LatentSurvivalEventType::IntervalCensored,
+            mass_entry,
+            mass_exit: 0.0,
+            mass_left,
+            mass_right,
+            mass_unloaded_left,
+            mass_unloaded_right,
+            mass_unloaded_entry,
             mass_unloaded_exit: 0.0,
             hazard_loaded: 0.0,
             hazard_unloaded: 0.0,
         }
     }
+}
+
+fn exact_event_kernel_terms(row: &LatentSurvivalRow) -> Result<Vec<KernelSumTerm>, EstimationError> {
+    if row.hazard_loaded < 0.0 || row.hazard_unloaded < 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent survival exact-event hazards must be non-negative, got loaded={} unloaded={}",
+            row.hazard_loaded, row.hazard_unloaded
+        )));
+    }
+    let mut terms = Vec::with_capacity(2);
+    if row.hazard_unloaded > 0.0 {
+        terms.push(KernelSumTerm {
+            coeff: row.hazard_unloaded,
+            k: 0,
+            m: row.mass_exit,
+        });
+    }
+    if row.hazard_loaded > 0.0 {
+        terms.push(KernelSumTerm {
+            coeff: row.hazard_loaded,
+            k: 1,
+            m: row.mass_exit,
+        });
+    }
+    if terms.is_empty() {
+        return Err(EstimationError::InvalidInput(
+            "latent survival exact-event row requires a positive loaded or unloaded hazard"
+                .to_string(),
+        ));
+    }
+    Ok(terms)
 }
 
 /// Row-level log-likelihood and μ-derivatives for the latent survival model.
@@ -712,9 +791,7 @@ impl LatentSurvivalRowJet {
                 quadctx,
                 mu,
                 sigma,
-                row.mass_entry,
-                row.mass_left,
-                row.mass_right,
+                row,
             ),
         }
     }
@@ -769,79 +846,37 @@ impl LatentSurvivalRowJet {
 
     /// Exact event with loaded/unloaded hazard decomposition.
     ///
-    /// When `hazard_unloaded > 0` (Gompertz-Makeham style):
-    ///   `ℓ = log(h_U · K_{0,M_L} + h_L · K_{1,M_L}) - M_U_event + M_U_entry - log K_{0,M_L_entry}`
-    ///
-    /// When `hazard_unloaded == 0` (full loading, the common case):
-    ///   `ℓ = log(h_0) + log K_{1,M} - log K_{0,M_entry}`
-    ///   which is the original formula with `log_baseline_hazard = log(h_L)`.
+    /// `ℓ = log(h_U · K_{0,M_L} + h_L · K_{1,M_L}) - M_U_event + M_U_entry - log K_{0,M_L_entry}`
     fn exact_event(
         quadctx: &QuadratureContext,
         mu: f64,
         sigma: f64,
         row: &LatentSurvivalRow,
     ) -> Result<Self, EstimationError> {
-        let has_unloaded_hazard = row.hazard_unloaded.abs() > 1e-300;
-
         let unloaded_offset =
             if row.mass_unloaded_exit.abs() > 1e-300 || row.mass_unloaded_entry.abs() > 1e-300 {
                 -row.mass_unloaded_exit + row.mass_unloaded_entry
             } else {
                 0.0
             };
+        let terms = exact_event_kernel_terms(row)?;
+        let num = LogKernelSumJet::evaluate(quadctx, &terms, mu, sigma)?;
 
-        if has_unloaded_hazard {
-            // Two-term numerator: h_U · K_{0,M_L} + h_L · K_{1,M_L}
-            let mass_event_loaded = row.mass_exit;
-            let terms = [
-                KernelSumTerm {
-                    coeff: row.hazard_unloaded,
-                    k: 0,
-                    m: mass_event_loaded,
-                },
-                KernelSumTerm {
-                    coeff: row.hazard_loaded,
-                    k: 1,
-                    m: mass_event_loaded,
-                },
-            ];
-            let num = LogKernelSumJet::evaluate(quadctx, &terms, mu, sigma)?;
-
-            if row.mass_entry > 1e-300 {
-                let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
-                Ok(Self {
-                    log_lik: unloaded_offset + num.value - den.value,
-                    score: num.d1 - den.d1,
-                    neg_hessian: -(num.d2 - den.d2),
-                    d3: num.d3 - den.d3,
-                })
-            } else {
-                Ok(Self {
-                    log_lik: unloaded_offset + num.value,
-                    score: num.d1,
-                    neg_hessian: -num.d2,
-                    d3: num.d3,
-                })
-            }
+        if row.mass_entry > 1e-300 {
+            let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
+            Ok(Self {
+                log_lik: unloaded_offset + num.value - den.value,
+                score: num.d1 - den.d1,
+                neg_hessian: -(num.d2 - den.d2),
+                d3: num.d3 - den.d3,
+            })
         } else {
-            // Full-loading path: original formula
-            let num = LogKernelSumJet::single_term(quadctx, 1, row.mass_exit, mu, sigma)?;
-            if row.mass_entry > 1e-300 {
-                let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
-                Ok(Self {
-                    log_lik: unloaded_offset + row.log_baseline_hazard + num.value - den.value,
-                    score: num.d1 - den.d1,
-                    neg_hessian: -(num.d2 - den.d2),
-                    d3: num.d3 - den.d3,
-                })
-            } else {
-                Ok(Self {
-                    log_lik: unloaded_offset + row.log_baseline_hazard + num.value,
-                    score: num.d1,
-                    neg_hessian: -num.d2,
-                    d3: num.d3,
-                })
-            }
+            Ok(Self {
+                log_lik: unloaded_offset + num.value,
+                score: num.d1,
+                neg_hessian: -num.d2,
+                d3: num.d3,
+            })
         }
     }
 
@@ -850,221 +885,37 @@ impl LatentSurvivalRowJet {
         quadctx: &QuadratureContext,
         mu: f64,
         sigma: f64,
-        mass_entry: f64,
-        mass_left: f64,
-        mass_right: f64,
+        row: &LatentSurvivalRow,
     ) -> Result<Self, EstimationError> {
         let num_terms = [
             KernelSumTerm {
-                coeff: 1.0,
+                coeff: (-row.mass_unloaded_left).exp(),
                 k: 0,
-                m: mass_left,
+                m: row.mass_left,
             },
             KernelSumTerm {
-                coeff: -1.0,
+                coeff: -(-row.mass_unloaded_right).exp(),
                 k: 0,
-                m: mass_right,
+                m: row.mass_right,
             },
         ];
         let num = LogKernelSumJet::evaluate(quadctx, &num_terms, mu, sigma)?;
 
-        if mass_entry > 1e-300 {
-            let den = LogKernelSumJet::single_term(quadctx, 0, mass_entry, mu, sigma)?;
+        if row.mass_entry > 1e-300 {
+            let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
             Ok(Self {
-                log_lik: num.value - den.value,
+                log_lik: num.value + row.mass_unloaded_entry - den.value,
                 score: num.d1 - den.d1,
                 neg_hessian: -(num.d2 - den.d2),
                 d3: num.d3 - den.d3,
             })
         } else {
             Ok(Self {
-                log_lik: num.value,
+                log_lik: num.value + row.mass_unloaded_entry,
                 score: num.d1,
                 neg_hessian: -num.d2,
                 d3: num.d3,
             })
-        }
-    }
-}
-
-// ─── 2-block row jet for learnable σ ─────────────────────────────────────────
-
-/// 2-block row jet: μ-block and t = log(σ) block.
-///
-/// Heat-equation identities (t = log σ):
-///   ∂_t ℓ = σ² · ∂²ℓ/∂μ²
-///   ∂²_t ℓ = 2σ² · ∂²ℓ/∂μ² + σ⁴ · ∂⁴ℓ/∂μ⁴
-#[derive(Clone, Copy, Debug)]
-pub struct RowJet2Block {
-    pub log_lik: f64,
-    pub score_mu: f64,
-    pub neg_hessian_mu: f64,
-    pub score_t: f64,
-    pub neg_hessian_t: f64,
-}
-
-impl RowJet2Block {
-    pub fn from_mu_jet(
-        log_lik: f64,
-        score_mu: f64,
-        d2_ll_mu: f64,
-        d4_ll_mu: f64,
-        sigma: f64,
-    ) -> Self {
-        let s2 = sigma * sigma;
-        let s4 = s2 * s2;
-        Self {
-            log_lik,
-            score_mu,
-            neg_hessian_mu: -d2_ll_mu,
-            score_t: s2 * d2_ll_mu,
-            neg_hessian_t: -(2.0 * s2 * d2_ll_mu + s4 * d4_ll_mu),
-        }
-    }
-
-    pub fn latent_survival(
-        quadctx: &QuadratureContext,
-        row: &LatentSurvivalRow,
-        mu: f64,
-        sigma: f64,
-    ) -> Result<Self, EstimationError> {
-        let jet1 = LatentSurvivalRowJet::evaluate(quadctx, row, mu, sigma)?;
-        let d2_ll_mu = -jet1.neg_hessian;
-        let d4_ll_mu = survival_row_d4_ll(quadctx, row, mu, sigma)?;
-        Ok(Self::from_mu_jet(
-            jet1.log_lik,
-            jet1.score,
-            d2_ll_mu,
-            d4_ll_mu,
-            sigma,
-        ))
-    }
-}
-
-#[inline]
-fn log_derivative_4th(r1: f64, r2: f64, r3: f64, r4: f64) -> f64 {
-    r4 - 4.0 * r1 * r3 - 3.0 * r2 * r2 + 12.0 * r1 * r1 * r2 - 6.0 * r1 * r1 * r1 * r1
-}
-
-/// Fourth log-derivative of a single kernel term, computed entirely in
-/// log-space via [`kernel_ratio_jet`].
-fn single_term_d4_log(log_bundle: &LogLognormalKernelBundle, k: usize, m: f64) -> f64 {
-    let ratio = kernel_ratio_jet(log_bundle, k, m, 4);
-    log_derivative_4th(ratio[1], ratio[2], ratio[3], ratio[4])
-}
-
-/// Fourth log-derivative of a signed multi-term kernel sum, computed in
-/// log-space with importance weights (mirrors [`LogKernelSumJet::evaluate`]).
-fn multi_term_d4_log(
-    terms: &[KernelSumTerm],
-    log_bundles: &[(f64, &LogLognormalKernelBundle)],
-) -> f64 {
-    let get_lb = |m: f64| -> &LogLognormalKernelBundle {
-        log_bundles
-            .iter()
-            .find(|(bm, _)| (*bm - m).abs() < 1e-300)
-            .unwrap()
-            .1
-    };
-
-    let mut log_mags: Vec<f64> = Vec::with_capacity(terms.len());
-    let mut signs_vec: Vec<f64> = Vec::with_capacity(terms.len());
-    let mut ratios: Vec<[f64; 5]> = Vec::with_capacity(terms.len());
-    for term in terms {
-        let lb = get_lb(term.m);
-        log_mags.push(term.coeff.abs().ln() + lb.get(term.k));
-        signs_vec.push(term.coeff.signum());
-        ratios.push(kernel_ratio_jet(lb, term.k, term.m, 4));
-    }
-
-    let (log_s, sign_s) = signed_log_sum_exp(&log_mags, &signs_vec);
-    if !log_s.is_finite() || sign_s == 0.0 {
-        return 0.0;
-    }
-
-    let mut wr = [0.0f64; 5];
-    for i in 0..terms.len() {
-        let w = sign_s * signs_vec[i] * (log_mags[i] - log_s).exp();
-        for r in 1..5 {
-            wr[r] += w * ratios[i][r];
-        }
-    }
-
-    log_derivative_4th(wr[1], wr[2], wr[3], wr[4])
-}
-
-fn survival_row_d4_ll(
-    quadctx: &QuadratureContext,
-    row: &LatentSurvivalRow,
-    mu: f64,
-    sigma: f64,
-) -> Result<f64, EstimationError> {
-    let max_k = 5;
-    match row.event_type {
-        LatentSurvivalEventType::RightCensored => {
-            let lb = log_kernel_bundle(quadctx, row.mass_exit, mu, sigma, max_k)?;
-            let mut d4 = single_term_d4_log(&lb, 0, row.mass_exit);
-            if row.mass_entry > 1e-300 {
-                let lbe = log_kernel_bundle(quadctx, row.mass_entry, mu, sigma, max_k)?;
-                d4 -= single_term_d4_log(&lbe, 0, row.mass_entry);
-            }
-            Ok(d4)
-        }
-        LatentSurvivalEventType::ExactEvent => {
-            let has_unloaded_hazard = row.hazard_unloaded.abs() > 1e-300;
-            let lb = log_kernel_bundle(quadctx, row.mass_exit, mu, sigma, 1 + 4)?;
-            let mut d4 = if has_unloaded_hazard {
-                // Two-term numerator: h_U·K_{0,M} + h_L·K_{1,M}.
-                // Previous code only handled the single-term K_{1,M} path
-                // and silently produced wrong d4 when unloaded hazard was
-                // present.
-                let terms = [
-                    KernelSumTerm {
-                        coeff: row.hazard_unloaded,
-                        k: 0,
-                        m: row.mass_exit,
-                    },
-                    KernelSumTerm {
-                        coeff: row.hazard_loaded,
-                        k: 1,
-                        m: row.mass_exit,
-                    },
-                ];
-                multi_term_d4_log(&terms, &[(row.mass_exit, &lb)])
-            } else {
-                // Full-loading: single-term K_{1,M}.
-                single_term_d4_log(&lb, 1, row.mass_exit)
-            };
-            if row.mass_entry > 1e-300 {
-                let lbe = log_kernel_bundle(quadctx, row.mass_entry, mu, sigma, max_k)?;
-                d4 -= single_term_d4_log(&lbe, 0, row.mass_entry);
-            }
-            Ok(d4)
-        }
-        LatentSurvivalEventType::IntervalCensored => {
-            let lbl = log_kernel_bundle(quadctx, row.mass_left, mu, sigma, max_k)?;
-            let lbr = log_kernel_bundle(quadctx, row.mass_right, mu, sigma, max_k)?;
-            let terms = [
-                KernelSumTerm {
-                    coeff: 1.0,
-                    k: 0,
-                    m: row.mass_left,
-                },
-                KernelSumTerm {
-                    coeff: -1.0,
-                    k: 0,
-                    m: row.mass_right,
-                },
-            ];
-            let mut d4 = multi_term_d4_log(
-                &terms,
-                &[(row.mass_left, &lbl), (row.mass_right, &lbr)],
-            );
-            if row.mass_entry > 1e-300 {
-                let lbe = log_kernel_bundle(quadctx, row.mass_entry, mu, sigma, max_k)?;
-                d4 -= single_term_d4_log(&lbe, 0, row.mass_entry);
-            }
-            Ok(d4)
         }
     }
 }
@@ -1124,18 +975,7 @@ mod tests {
         let mu = -0.5;
         let sigma = 0.3;
         let h = 1e-6;
-        let row = LatentSurvivalRow {
-            event_type: LatentSurvivalEventType::RightCensored,
-            mass_entry: 0.0,
-            mass_exit: 2.0,
-            mass_left: 0.0,
-            mass_right: 0.0,
-            log_baseline_hazard: 0.0,
-            mass_unloaded_entry: 0.0,
-            mass_unloaded_exit: 0.0,
-            hazard_loaded: 0.0,
-            hazard_unloaded: 0.0,
-        };
+        let row = LatentSurvivalRow::right_censored(0.0, 2.0, 0.0, 0.0);
         let ll_p = LatentSurvivalRowJet::evaluate(&ctx, &row, mu + h, sigma)
             .unwrap()
             .log_lik;
@@ -1157,18 +997,51 @@ mod tests {
         let mu = 0.2;
         let sigma = 0.5;
         let h = 1e-6;
-        let row = LatentSurvivalRow {
-            event_type: LatentSurvivalEventType::ExactEvent,
-            mass_entry: 0.0,
-            mass_exit: 1.5,
-            mass_left: 0.0,
-            mass_right: 0.0,
-            log_baseline_hazard: -0.3,
-            mass_unloaded_entry: 0.0,
-            mass_unloaded_exit: 0.0,
-            hazard_loaded: 0.0,
-            hazard_unloaded: 0.0,
-        };
+        let row = LatentSurvivalRow::exact_event(0.0, 1.5, 0.0, 0.0, (-0.3f64).exp(), 0.0);
+        let ll_p = LatentSurvivalRowJet::evaluate(&ctx, &row, mu + h, sigma)
+            .unwrap()
+            .log_lik;
+        let ll_m = LatentSurvivalRowJet::evaluate(&ctx, &row, mu - h, sigma)
+            .unwrap()
+            .log_lik;
+        let fd_score = (ll_p - ll_m) / (2.0 * h);
+        let jet = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma).unwrap();
+        assert!(
+            (jet.score - fd_score).abs() / fd_score.abs().max(1e-15) < 1e-3,
+            "score={}, fd={fd_score}",
+            jet.score
+        );
+    }
+
+    #[test]
+    fn survival_exact_event_loaded_vs_unloaded_score_fd() {
+        let ctx = QuadratureContext::new();
+        let mu = -0.1;
+        let sigma = 0.4;
+        let h = 1e-6;
+        let row = LatentSurvivalRow::exact_event(0.3, 1.2, 0.2, 0.6, 0.9, 0.15);
+        let ll_p = LatentSurvivalRowJet::evaluate(&ctx, &row, mu + h, sigma)
+            .unwrap()
+            .log_lik;
+        let ll_m = LatentSurvivalRowJet::evaluate(&ctx, &row, mu - h, sigma)
+            .unwrap()
+            .log_lik;
+        let fd_score = (ll_p - ll_m) / (2.0 * h);
+        let jet = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma).unwrap();
+        assert!(
+            (jet.score - fd_score).abs() / fd_score.abs().max(1e-15) < 1e-3,
+            "score={}, fd={fd_score}",
+            jet.score
+        );
+    }
+
+    #[test]
+    fn survival_right_censored_loaded_vs_unloaded_score_fd() {
+        let ctx = QuadratureContext::new();
+        let mu = 0.15;
+        let sigma = 0.35;
+        let h = 1e-6;
+        let row = LatentSurvivalRow::right_censored(0.4, 1.7, 0.1, 0.5);
         let ll_p = LatentSurvivalRowJet::evaluate(&ctx, &row, mu + h, sigma)
             .unwrap()
             .log_lik;
@@ -1190,18 +1063,7 @@ mod tests {
         let mu = 0.0;
         let sigma = 0.6;
         let h = 1e-6;
-        let row = LatentSurvivalRow {
-            event_type: LatentSurvivalEventType::IntervalCensored,
-            mass_entry: 0.0,
-            mass_exit: 0.0,
-            mass_left: 1.0,
-            mass_right: 2.0,
-            log_baseline_hazard: 0.0,
-            mass_unloaded_entry: 0.0,
-            mass_unloaded_exit: 0.0,
-            hazard_loaded: 0.0,
-            hazard_unloaded: 0.0,
-        };
+        let row = LatentSurvivalRow::interval_censored(0.0, 1.0, 2.0, 0.0, 0.0, 0.0);
         let ll_p = LatentSurvivalRowJet::evaluate(&ctx, &row, mu + h, sigma)
             .unwrap()
             .log_lik;

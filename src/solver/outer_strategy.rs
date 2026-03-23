@@ -1344,7 +1344,9 @@ fn run_outer_with_plan(
         ) {
             Ok(()) => verified_indices.push(idx),
             Err(err) => {
-                log::warn!("[OUTER] {context}: rejecting screened seed after full verification: {err}");
+                log::warn!(
+                    "[OUTER] {context}: rejecting screened seed after full verification: {err:?}"
+                );
             }
         }
     }
@@ -1367,14 +1369,14 @@ fn run_outer_with_plan(
                 }
                 Err(err) => {
                     log::warn!(
-                        "[OUTER] {context}: rejecting fallback seed after full verification: {err}"
+                        "[OUTER] {context}: rejecting fallback seed after full verification: {err:?}"
                     );
                 }
             }
         }
     }
     obj.reset();
-    let screened = if verified_indices.is_empty() {
+    let screened: Vec<Array1<f64>> = if verified_indices.is_empty() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
             "all candidate seeds failed full outer verification ({context})"
         )));

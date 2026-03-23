@@ -6813,6 +6813,126 @@ fn polyharmonic_kernel_triplet(
     Ok((value, first, second))
 }
 
+/// Unified radial jet for one polyharmonic partial-fraction block.
+///
+/// Returns (φ, φ', φ'', φ''', φ'''') from a single consistent evaluation,
+/// sharing normalization constant, r_safe, and log_r.  This eliminates the
+/// possibility of numerical drift between the triplet and higher-order
+/// derivative paths.
+fn polyharmonic_block_jet4(
+    r: f64,
+    m: usize,
+    k_dim: usize,
+) -> Result<(f64, f64, f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "polyharmonic distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if r <= 0.0 {
+        return Ok((0.0, 0.0, 0.0, 0.0, 0.0));
+    }
+
+    let k_half = 0.5 * k_dim as f64;
+    let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
+    let r_safe = r.max(1e-300);
+    let log_r = r_safe.ln();
+
+    if k_dim % 2 == 0 && m >= (k_dim / 2) {
+        // Log case: φ_m(r) = c · r^α · ln(r)
+        let c = polyharmonic_log_sign(m, k_dim)
+            / (2.0_f64.powi((2 * m - 1) as i32)
+                * std::f64::consts::PI.powf(k_half)
+                * gamma_lanczos(m as f64)
+                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+        let mut out = [0.0; 5];
+        for d in 0..5 {
+            let e = alpha - d as f64;
+            let ff = falling_factorial(alpha, d);
+            let ff_d = falling_factorial_derivative(alpha, d);
+            out[d] = c * r_safe.powf(e) * (ff * log_r + ff_d);
+        }
+        return Ok((out[0], out[1], out[2], out[3], out[4]));
+    }
+
+    // Power-only case: φ_m(r) = c · r^α
+    let c = gamma_lanczos(k_half - m as f64)
+        / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
+    let mut out = [0.0; 5];
+    for d in 0..5 {
+        let e = alpha - d as f64;
+        out[d] = c * falling_factorial(alpha, d) * r_safe.powf(e);
+    }
+    Ok((out[0], out[1], out[2], out[3], out[4]))
+}
+
+/// Unified radial jet for one Matérn/Bessel-potential partial-fraction block.
+///
+/// Returns (g, g', g'', g''', g'''') from a single consistent evaluation,
+/// sharing the normalization constant and all Bessel K evaluations.
+///
+/// Uses the exact recurrence derived from d/dr[r^ν K_ν(κr)] and the
+/// Bessel identity dK_ν/dz = −K_{ν−1}(z) − (ν/z)K_ν(z), which gives
+/// the cancellation pattern:
+///
+///   g^(0) = c · r^ν · K_ν(z)
+///   g^(1) = −c · κ · r^ν · K_{ν−1}(z)
+///   g^(2) = c·κ² r^ν K_{ν−2} − c·κ r^{ν−1} K_{ν−1}
+///   g^(3) = 3c·κ² r^{ν−1} K_{ν−2} − c·κ³ r^ν K_{ν−3}
+///   g^(4) = 3c·κ² r^{ν−2} K_{ν−2} − 6c·κ³ r^{ν−1} K_{ν−3} + c·κ⁴ r^ν K_{ν−4}
+fn duchon_matern_block_jet4(
+    r: f64,
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+) -> Result<(f64, f64, f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon Matérn-block distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !kappa.is_finite() || kappa <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon Matérn-block kappa must be finite and positive".to_string(),
+        ));
+    }
+    if r <= 0.0 {
+        return Ok((0.0, 0.0, 0.0, 0.0, 0.0));
+    }
+
+    let n = n_order as f64;
+    let k_half = 0.5 * k_dim as f64;
+    let nu = n - k_half;
+    let c = kappa.powf(k_half - n)
+        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+
+    let z = (kappa * r).max(1e-300);
+    // Evaluate all 5 Bessel K orders from a single consistent set.
+    let k_nu = bessel_k_real_half_integer_or_integer(nu.abs(), z)?;
+    let k_nu_m1 = bessel_k_real_half_integer_or_integer((nu - 1.0).abs(), z)?;
+    let k_nu_m2 = bessel_k_real_half_integer_or_integer((nu - 2.0).abs(), z)?;
+    let k_nu_m3 = bessel_k_real_half_integer_or_integer((nu - 3.0).abs(), z)?;
+    let k_nu_m4 = bessel_k_real_half_integer_or_integer((nu - 4.0).abs(), z)?;
+
+    let r_nu = r.powf(nu);
+    let r_nu_m1 = r.powf(nu - 1.0);
+    let r_nu_m2 = r.powf(nu - 2.0);
+    let k1 = kappa;
+    let k2 = kappa * kappa;
+    let k3 = k2 * kappa;
+    let k4 = k3 * kappa;
+
+    let g0 = c * r_nu * k_nu;
+    let g1 = -c * k1 * r_nu * k_nu_m1;
+    let g2 = c * k2 * r_nu * k_nu_m2 - c * k1 * r_nu_m1 * k_nu_m1;
+    let g3 = 3.0 * c * k2 * r_nu_m1 * k_nu_m2 - c * k3 * r_nu * k_nu_m3;
+    let g4 = 3.0 * c * k2 * r_nu_m2 * k_nu_m2
+        - 6.0 * c * k3 * r_nu_m1 * k_nu_m3
+        + c * k4 * r_nu * k_nu_m4;
+
+    Ok((g0, g1, g2, g3, g4))
+}
+
 #[inline(always)]
 fn pure_duchon_block_order(p_order: usize, s_order: usize) -> usize {
     p_order + s_order
@@ -9506,25 +9626,30 @@ fn duchon_radial_jets(
         )));
     }
 
+    // Unified jet4 evaluation: every block produces (φ, φ', φ'', φ''', φ'''')
+    // from a single consistent code path, sharing normalization constants and
+    // intermediate values.  This eliminates the triplet/radial-derivative drift
+    // that occurs when the 1st-2nd derivatives use one formula and the 3rd-4th
+    // use a separate generic path.
     for (m, coeff) in coeffs.a.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
-        let (_, dm, d2m) = polyharmonic_kernel_triplet(r_eval, m, k_dim)?;
-        out.phi_r += coeff * dm;
-        out.phi_rr += coeff * d2m;
-        phi_rrr += coeff * duchon_polyharmonic_radial_derivative_at_r(r_eval, m, k_dim, 3);
-        phi_rrrr += coeff * duchon_polyharmonic_radial_derivative_at_r(r_eval, m, k_dim, 4);
+        let (_, d1, d2, d3, d4) = polyharmonic_block_jet4(r_eval, m, k_dim)?;
+        out.phi_r += coeff * d1;
+        out.phi_rr += coeff * d2;
+        phi_rrr += coeff * d3;
+        phi_rrrr += coeff * d4;
     }
     for (n, coeff) in coeffs.b.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
-        let (_, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
-        out.phi_r += coeff * dn;
-        out.phi_rr += coeff * d2n;
-        phi_rrr += coeff * duchon_matern_block_radial_derivative(r_eval, kappa, n, k_dim, 3)?;
-        phi_rrrr += coeff * duchon_matern_block_radial_derivative(r_eval, kappa, n, k_dim, 4)?;
+        let (_, d1, d2, d3, d4) = duchon_matern_block_jet4(r_eval, kappa, n, k_dim)?;
+        out.phi_r += coeff * d1;
+        out.phi_rr += coeff * d2;
+        phi_rrr += coeff * d3;
+        phi_rrrr += coeff * d4;
     }
 
     // Derive every non-phi radial scalar from the same off-origin phi jets so

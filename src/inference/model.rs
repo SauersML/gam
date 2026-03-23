@@ -1,9 +1,9 @@
 use crate::basis::BasisFamily;
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::anchored_deviation_basis_with_transform;
-use crate::families::bernoulli_marginal_slope::deviation_runtime::{
-    local_cubic_from_uniform_span_samples, sampled_span_points,
+use crate::families::bernoulli_marginal_slope::{
+    anchored_deviation_basis_with_transform, local_cubic_from_uniform_span_samples,
+    sampled_span_points,
 };
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,

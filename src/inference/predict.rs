@@ -799,36 +799,21 @@ impl BernoulliMarginalSlopePredictor {
         Vec<crate::families::bernoulli_marginal_slope::exact_kernel::DenestedPartitionCell>,
         EstimationError,
     > {
-        let score_tail = 8.0;
-        let mut score_breaks = if let Some(runtime) = self.score_warp_runtime.as_ref() {
+        let score_breaks = if let Some(runtime) = self.score_warp_runtime.as_ref() {
             runtime
                 .breakpoints()
                 .map_err(EstimationError::InvalidInput)?
         } else {
-            vec![-8.0, 8.0]
+            Vec::new()
         };
-        if score_breaks.first().copied().unwrap_or(score_tail) > -score_tail {
-            score_breaks.insert(0, -score_tail);
-        }
-        if score_breaks.last().copied().unwrap_or(-score_tail) < score_tail {
-            score_breaks.push(score_tail);
-        }
-        let link_tail = 8.0 * (1.0 + b.abs());
-        let mut link_breaks = if let Some(runtime) = self.link_deviation_runtime.as_ref() {
+        let link_breaks = if let Some(runtime) = self.link_deviation_runtime.as_ref() {
             runtime
                 .breakpoints()
                 .map_err(EstimationError::InvalidInput)?
         } else {
-            vec![a - link_tail, a + link_tail]
+            Vec::new()
         };
-        if link_breaks.first().copied().unwrap_or(a + link_tail) > a - link_tail {
-            link_breaks.insert(0, a - link_tail);
-        }
-        if link_breaks.last().copied().unwrap_or(a - link_tail) < a + link_tail {
-            link_breaks.push(a + link_tail);
-        }
-        let mut cells =
-            crate::families::bernoulli_marginal_slope::exact_kernel::build_denested_partition_cells(
+        let mut cells = crate::families::bernoulli_marginal_slope::exact_kernel::build_denested_partition_cells_with_tails(
             a,
             b,
             &score_breaks,
@@ -839,16 +824,14 @@ impl BernoulliMarginalSlopePredictor {
                 {
                     runtime.local_cubic_at(beta, z).map_err(|err| err)
                 } else {
-                    Ok(
-                        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                            left: -8.0,
-                            right: 8.0,
-                            c0: 0.0,
-                            c1: 0.0,
-                            c2: 0.0,
-                            c3: 0.0,
-                        },
-                    )
+                    Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                        left: 0.0,
+                        right: 1.0,
+                        c0: 0.0,
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    })
                 }
             },
             |u| {
@@ -857,16 +840,14 @@ impl BernoulliMarginalSlopePredictor {
                 {
                     runtime.local_cubic_at(beta, u).map_err(|err| err)
                 } else {
-                    Ok(
-                        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                            left: a - 8.0 * (1.0 + b.abs()),
-                            right: a + 8.0 * (1.0 + b.abs()),
-                            c0: 0.0,
-                            c1: 0.0,
-                            c2: 0.0,
-                            c3: 0.0,
-                        },
-                    )
+                    Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                        left: 0.0,
+                        right: 1.0,
+                        c0: 0.0,
+                        c1: 0.0,
+                        c2: 0.0,
+                        c3: 0.0,
+                    })
                 }
             },
         )
