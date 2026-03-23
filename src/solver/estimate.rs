@@ -40,9 +40,9 @@ use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
-    Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodFamily,
-    LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
-    LatentCLogLogState, MixtureLinkState, RidgePassport, SasLinkState,
+    Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LatentCLogLogState,
+    LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization,
+    LogSmoothingParamsView, MixtureLinkState, RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -1386,15 +1386,20 @@ fn resolved_external_config(
             "mixture_link and sas_link are mutually exclusive".to_string(),
         ));
     }
-    if matches!(opts.family, crate::types::LikelihoodFamily::BinomialLatentCLogLog)
-        && opts.latent_cloglog.is_none()
+    if matches!(
+        opts.family,
+        crate::types::LikelihoodFamily::BinomialLatentCLogLog
+    ) && opts.latent_cloglog.is_none()
     {
         return Err(EstimationError::InvalidInput(
             "BinomialLatentCLogLog requires latent_cloglog state".to_string(),
         ));
     }
     if opts.latent_cloglog.is_some()
-        && !matches!(opts.family, crate::types::LikelihoodFamily::BinomialLatentCLogLog)
+        && !matches!(
+            opts.family,
+            crate::types::LikelihoodFamily::BinomialLatentCLogLog
+        )
     {
         return Err(EstimationError::InvalidInput(
             "latent_cloglog is only supported with BinomialLatentCLogLog".to_string(),
@@ -2991,10 +2996,9 @@ pub enum FittedLinkState {
 fn validate_fitted_link_estimation(fitted_link: &FittedLinkState) -> Result<(), EstimationError> {
     match fitted_link {
         FittedLinkState::Standard(_) => Ok(()),
-        FittedLinkState::LatentCLogLog { state } => ensure_finite_scalar_estimation(
-            "fit_result.latent_cloglog.latent_sd",
-            state.latent_sd,
-        ),
+        FittedLinkState::LatentCLogLog { state } => {
+            ensure_finite_scalar_estimation("fit_result.latent_cloglog.latent_sd", state.latent_sd)
+        }
         FittedLinkState::Mixture { state, covariance } => {
             validate_all_finite_estimation(
                 "fit_result.mixture_link_rho",

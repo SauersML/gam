@@ -1120,7 +1120,9 @@ fn materialize_standard<'a>(
                     "latent-cloglog-binomial requires HazardLoading::Full, got {loading:?}"
                 ));
             }
-            FrailtySpec::HazardMultiplier { sigma_fixed: None, .. } => {
+            FrailtySpec::HazardMultiplier {
+                sigma_fixed: None, ..
+            } => {
                 return Err(
                     "latent-cloglog-binomial currently requires a fixed hazard-multiplier sigma"
                         .to_string(),
@@ -1139,7 +1141,8 @@ fn materialize_standard<'a>(
             }
         };
         Some(
-            LatentCLogLogState::new(sigma).map_err(|e| format!("invalid latent_cloglog state: {e}"))?,
+            LatentCLogLogState::new(sigma)
+                .map_err(|e| format!("invalid latent_cloglog state: {e}"))?,
         )
     } else {
         if config.frailty.is_some() {
@@ -1514,8 +1517,7 @@ fn materialize_survival<'a>(
         SurvivalLikelihoodMode::Latent => {
             if timewiggle_build.is_some() {
                 return Err(
-                    "timewiggle is not implemented for survival-likelihood=latent"
-                        .to_string(),
+                    "timewiggle is not implemented for survival-likelihood=latent".to_string(),
                 );
             }
 
@@ -1564,10 +1566,7 @@ fn materialize_survival<'a>(
                 });
             }
 
-            let frailty = config
-                .frailty
-                .clone()
-                .unwrap_or(FrailtySpec::None);
+            let frailty = config.frailty.clone().unwrap_or(FrailtySpec::None);
 
             Ok(MaterializedModel {
                 request: FitRequest::LatentSurvival(LatentSurvivalFitRequest {
@@ -1633,8 +1632,7 @@ fn materialize_location_scale<'a>(
 
     if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
         return Err(
-            "latent-cloglog-binomial is not implemented for location-scale fitting"
-                .to_string(),
+            "latent-cloglog-binomial is not implemented for location-scale fitting".to_string(),
         );
     }
 

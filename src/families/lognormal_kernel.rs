@@ -151,7 +151,10 @@ fn mode_rank(mode: IntegratedExpectationMode) -> u8 {
 }
 
 #[inline]
-fn worst_mode(a: IntegratedExpectationMode, b: IntegratedExpectationMode) -> IntegratedExpectationMode {
+fn worst_mode(
+    a: IntegratedExpectationMode,
+    b: IntegratedExpectationMode,
+) -> IntegratedExpectationMode {
     if mode_rank(a) >= mode_rank(b) { a } else { b }
 }
 
@@ -297,8 +300,7 @@ pub fn kernel_mu_jet(bundle: &LognormalKernelBundle, k: usize, m: f64, order: us
         jet[2] = kf * kf * a(0) - (2.0 * kf + 1.0) * m * a(1) + m * m * a(2);
     }
     if order >= 3 {
-        jet[3] = kf * kf * kf * a(0)
-            - (3.0 * kf * kf + 3.0 * kf + 1.0) * m * a(1)
+        jet[3] = kf * kf * kf * a(0) - (3.0 * kf * kf + 3.0 * kf + 1.0) * m * a(1)
             + 3.0 * (kf + 1.0) * m * m * a(2)
             - m * m * m * a(3);
     }
@@ -309,8 +311,7 @@ pub fn kernel_mu_jet(bundle: &LognormalKernelBundle, k: usize, m: f64, order: us
         let m2 = m * m;
         let m3 = m2 * m;
         let m4 = m3 * m;
-        jet[4] = k4 * a(0)
-            - (4.0 * k3 + 6.0 * k2 + 4.0 * kf + 1.0) * m * a(1)
+        jet[4] = k4 * a(0) - (4.0 * k3 + 6.0 * k2 + 4.0 * kf + 1.0) * m * a(1)
             + (6.0 * k2 + 12.0 * kf + 7.0) * m2 * a(2)
             - (4.0 * kf + 6.0) * m3 * a(3)
             + m4 * a(4);
@@ -530,12 +531,8 @@ impl LatentSurvivalRowJet {
         sigma: f64,
     ) -> Result<Self, EstimationError> {
         match row.event_type {
-            LatentSurvivalEventType::RightCensored => {
-                Self::right_censored(quadctx, mu, sigma, row)
-            }
-            LatentSurvivalEventType::ExactEvent => {
-                Self::exact_event(quadctx, mu, sigma, row)
-            }
+            LatentSurvivalEventType::RightCensored => Self::right_censored(quadctx, mu, sigma, row),
+            LatentSurvivalEventType::ExactEvent => Self::exact_event(quadctx, mu, sigma, row),
             LatentSurvivalEventType::IntervalCensored => Self::interval_censored(
                 quadctx,
                 mu,
@@ -560,8 +557,8 @@ impl LatentSurvivalRowJet {
         sigma: f64,
         row: &LatentSurvivalRow,
     ) -> Result<Self, EstimationError> {
-        let has_unloaded = row.mass_unloaded_exit.abs() > 1e-300
-            || row.mass_unloaded_entry.abs() > 1e-300;
+        let has_unloaded =
+            row.mass_unloaded_exit.abs() > 1e-300 || row.mass_unloaded_entry.abs() > 1e-300;
 
         // Loaded mass for the kernel terms: when unloaded mass is present,
         // mass_exit contains only the loaded component; otherwise it is the
@@ -611,13 +608,12 @@ impl LatentSurvivalRowJet {
     ) -> Result<Self, EstimationError> {
         let has_unloaded_hazard = row.hazard_unloaded.abs() > 1e-300;
 
-        let unloaded_offset = if row.mass_unloaded_exit.abs() > 1e-300
-            || row.mass_unloaded_entry.abs() > 1e-300
-        {
-            -row.mass_unloaded_exit + row.mass_unloaded_entry
-        } else {
-            0.0
-        };
+        let unloaded_offset =
+            if row.mass_unloaded_exit.abs() > 1e-300 || row.mass_unloaded_entry.abs() > 1e-300 {
+                -row.mass_unloaded_exit + row.mass_unloaded_entry
+            } else {
+                0.0
+            };
 
         if has_unloaded_hazard {
             // Two-term numerator: h_U · K_{0,M_L} + h_L · K_{1,M_L}
@@ -637,8 +633,7 @@ impl LatentSurvivalRowJet {
             let num = LogKernelSumJet::evaluate(quadctx, &terms, mu, sigma)?;
 
             if row.mass_entry > 1e-300 {
-                let den =
-                    LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
+                let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
                 Ok(Self {
                     log_lik: unloaded_offset + num.value - den.value,
                     score: num.d1 - den.d1,
@@ -655,14 +650,11 @@ impl LatentSurvivalRowJet {
             }
         } else {
             // Full-loading path: original formula
-            let num =
-                LogKernelSumJet::single_term(quadctx, 1, row.mass_exit, mu, sigma)?;
+            let num = LogKernelSumJet::single_term(quadctx, 1, row.mass_exit, mu, sigma)?;
             if row.mass_entry > 1e-300 {
-                let den =
-                    LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
+                let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
                 Ok(Self {
-                    log_lik: unloaded_offset + row.log_baseline_hazard + num.value
-                        - den.value,
+                    log_lik: unloaded_offset + row.log_baseline_hazard + num.value - den.value,
                     score: num.d1 - den.d1,
                     neg_hessian: -(num.d2 - den.d2),
                     d3: num.d3 - den.d3,
@@ -764,14 +756,19 @@ impl RowJet2Block {
         let jet1 = LatentSurvivalRowJet::evaluate(quadctx, row, mu, sigma)?;
         let d2_ll_mu = -jet1.neg_hessian;
         let d4_ll_mu = survival_row_d4_ll(quadctx, row, mu, sigma)?;
-        Ok(Self::from_mu_jet(jet1.log_lik, jet1.score, d2_ll_mu, d4_ll_mu, sigma))
+        Ok(Self::from_mu_jet(
+            jet1.log_lik,
+            jet1.score,
+            d2_ll_mu,
+            d4_ll_mu,
+            sigma,
+        ))
     }
 }
 
 #[inline]
 fn log_derivative_4th(r1: f64, r2: f64, r3: f64, r4: f64) -> f64 {
-    r4 - 4.0 * r1 * r3 - 3.0 * r2 * r2 + 12.0 * r1 * r1 * r2
-        - 6.0 * r1 * r1 * r1 * r1
+    r4 - 4.0 * r1 * r3 - 3.0 * r2 * r2 + 12.0 * r1 * r1 * r2 - 6.0 * r1 * r1 * r1 * r1
 }
 
 fn single_term_d4_log(bundle: &LognormalKernelBundle, k: usize, m: f64) -> f64 {
@@ -811,18 +808,32 @@ fn survival_row_d4_ll(
             let bl = kernel_bundle(quadctx, row.mass_left, mu, sigma, max_k)?;
             let br = kernel_bundle(quadctx, row.mass_right, mu, sigma, max_k)?;
             let terms = [
-                KernelSumTerm { coeff: 1.0, k: 0, m: row.mass_left },
-                KernelSumTerm { coeff: -1.0, k: 0, m: row.mass_right },
+                KernelSumTerm {
+                    coeff: 1.0,
+                    k: 0,
+                    m: row.mass_left,
+                },
+                KernelSumTerm {
+                    coeff: -1.0,
+                    k: 0,
+                    m: row.mass_right,
+                },
             ];
             // Accumulate S⁽⁰⁾..S⁽⁴⁾ over the two terms.
             let mut s = [0.0; 5];
             for term in &terms {
-                let bnd = if (term.m - row.mass_left).abs() < 1e-300 { &bl } else { &br };
+                let bnd = if (term.m - row.mass_left).abs() < 1e-300 {
+                    &bl
+                } else {
+                    &br
+                };
                 let jet = kernel_mu_jet(bnd, term.k, term.m, 4);
-                for r in 0..5 { s[r] += term.coeff * jet[r]; }
+                for r in 0..5 {
+                    s[r] += term.coeff * jet[r];
+                }
             }
             let sv = s[0].max(LOG_FLOOR);
-            let mut d4 = log_derivative_4th(s[1]/sv, s[2]/sv, s[3]/sv, s[4]/sv);
+            let mut d4 = log_derivative_4th(s[1] / sv, s[2] / sv, s[3] / sv, s[4] / sv);
             if row.mass_entry > 1e-300 {
                 let be = kernel_bundle(quadctx, row.mass_entry, mu, sigma, max_k)?;
                 d4 -= single_term_d4_log(&be, 0, row.mass_entry);
@@ -1003,5 +1014,4 @@ mod tests {
         assert!((jet.d4 - d4).abs() < 1e-12);
         assert!((jet.d5 - d5).abs() < 1e-12);
     }
-
 }

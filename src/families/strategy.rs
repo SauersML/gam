@@ -233,16 +233,12 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 let total_sigma = se_eta.hypot(state.latent_sd);
                 let m1 = latent_cloglog_inverse_link_jet(quadctx, eta, total_sigma)?.mean;
                 let m2 = normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
-                    latent_cloglog_inverse_link_jet(
-                        quadctx,
-                        x,
-                        state.latent_sd,
-                    )
-                    .map(|jet| {
-                        let p = jet.mean;
-                        p * p
-                    })
-                    .unwrap_or(f64::NAN)
+                    latent_cloglog_inverse_link_jet(quadctx, x, state.latent_sd)
+                        .map(|jet| {
+                            let p = jet.mean;
+                            p * p
+                        })
+                        .unwrap_or(f64::NAN)
                 });
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }

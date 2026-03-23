@@ -979,10 +979,10 @@ impl BernoulliMarginalSlopePredictor {
                     crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 ));
             }
-            if runtime.degree != 3 {
+            if runtime.value_span_degree >= 4 {
                 return Err(format!(
-                    "bernoulli marginal-slope score-warp runtime must be cubic (degree=3), got degree={}",
-                    runtime.degree
+                    "bernoulli marginal-slope score-warp runtime requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {}",
+                    runtime.value_span_degree
                 ));
             }
         }
@@ -1002,10 +1002,10 @@ impl BernoulliMarginalSlopePredictor {
                     crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 ));
             }
-            if runtime.degree != 3 {
+            if runtime.value_span_degree >= 4 {
                 return Err(format!(
-                    "bernoulli marginal-slope link-deviation runtime must be cubic (degree=3), got degree={}",
-                    runtime.degree
+                    "bernoulli marginal-slope link-deviation runtime requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {}",
+                    runtime.value_span_degree
                 ));
             }
         }
@@ -3633,6 +3633,7 @@ mod tests {
                 kernel: "OldQuadrature".to_string(),
                 knots: vec![-10.0, -10.0, 10.0, 10.0],
                 degree: 1,
+                value_span_degree: 1,
                 basis_dim: 2,
             }),
             link_deviation_runtime: None,
@@ -3652,6 +3653,7 @@ mod tests {
                     .to_string(),
             knots: vec![-10.0, -10.0, -10.0, -10.0, 10.0, 10.0, 10.0, 10.0],
             degree: 3,
+            value_span_degree: 3,
             basis_dim: 2,
         };
         assert!(cubic.design(&array![0.0]).is_ok());
@@ -3665,6 +3667,7 @@ mod tests {
                     .to_string(),
             knots: vec![-2.0, -2.0, -2.0, -2.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0],
             degree: 3,
+            value_span_degree: 3,
             basis_dim: 3,
         };
         let beta = array![0.1, -0.03, 0.05];
@@ -3707,6 +3710,7 @@ mod tests {
                     .to_string(),
             knots: vec![-2.0, -2.0, -2.0, -2.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0],
             degree: 3,
+            value_span_degree: 3,
             basis_dim: 3,
         };
         let cubic = runtime.basis_span_cubic(0, 1).expect("basis span cubic");

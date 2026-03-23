@@ -2240,6 +2240,17 @@ fn effective_predict_offset_columns<'a>(
     )
 }
 
+fn require_saved_survival_likelihood_mode(model: &SavedModel) -> Result<SurvivalLikelihoodMode, String> {
+    let raw = model
+        .survival_likelihood
+        .as_deref()
+        .ok_or_else(|| {
+            "saved survival model is missing survival_likelihood metadata; refit with current CLI"
+                .to_string()
+        })?;
+    parse_survival_likelihood_mode(raw)
+}
+
 fn resolve_predict_offsets(
     model: &SavedModel,
     data: &Dataset,
@@ -2254,12 +2265,7 @@ fn resolve_predict_offsets(
         PredictModelClass::BernoulliMarginalSlope => true,
         PredictModelClass::TransformationNormal => false,
         PredictModelClass::Survival => {
-            let saved_likelihood_mode = parse_survival_likelihood_mode(
-                model
-                    .survival_likelihood
-                    .as_deref()
-                    .unwrap_or("transformation"),
-            )?;
+            let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
             matches!(
                 saved_likelihood_mode,
                 SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
@@ -2641,12 +2647,7 @@ fn run_predict_survival(
     }
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
-    let saved_likelihood_mode = parse_survival_likelihood_mode(
-        model
-            .survival_likelihood
-            .as_deref()
-            .unwrap_or("transformation"),
-    )?;
+    let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
@@ -5811,14 +5812,9 @@ fn run_sample_survival(
     cfg: &NutsConfig,
 ) -> Result<gam::hmc::NutsResult, String> {
     progress.set_stage("sample", "building survival sampling design");
-    let saved_likelihood_mode = parse_survival_likelihood_mode(
-        model
-            .survival_likelihood
-            .as_deref()
-            .unwrap_or("transformation"),
-    )?;
+    let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::Latent {
-        return Err("saved latent-survival prediction is not implemented".to_string());
+        return Err("sampling is not implemented for saved latent-survival models".to_string());
     }
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         return Err(
@@ -7602,6 +7598,7 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
         kernel: "ExactDenestedCubic".to_string(),
         knots: runtime.knots.to_vec(),
         degree: runtime.degree,
+        value_span_degree: runtime.value_span_degree,
         basis_dim: runtime.basis_dim,
     }
 }
@@ -9204,7 +9201,9 @@ fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<Invers
         .link
         .as_deref()
         .or(model.survival_distribution.as_deref())
-        .unwrap_or("probit");
+        .ok_or_else(|| {
+            "saved survival model is missing link/distribution metadata".to_string()
+        })?;
     let name = raw.trim().to_ascii_lowercase();
     if name == "loglog" || name == "cauchit" {
         let component = if name == "loglog" {

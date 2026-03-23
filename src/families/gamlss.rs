@@ -1,6 +1,7 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, PenaltyInfo, PenaltySource, create_basis,
+    BasisFamily, BasisOptions, Dense, KnotSource, PenaltyInfo, PenaltySource, create_basis,
     create_difference_penalty_matrix, create_ispline_derivative_dense,
+    basis_family_value_derivative_is_structurally_zero, basis_family_value_span_polynomial_degree,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -290,7 +291,19 @@ pub struct WiggleBlockConfig {
 pub(crate) struct SelectedWiggleBasis {
     pub knots: Array1<f64>,
     pub degree: usize,
+    pub structure: MonotoneWiggleStructure,
     pub block: ParameterBlockInput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MonotoneWiggleStructure {
+    pub value_span_degree: usize,
+}
+
+impl MonotoneWiggleStructure {
+    pub(crate) fn fourth_derivative_is_structurally_zero(&self) -> bool {
+        self.value_span_degree < 4
+    }
 }
 
 impl ParameterBlockInput {
@@ -460,6 +473,24 @@ fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, String> {
         .checked_sub(1)
         .filter(|&internal_degree| internal_degree >= 1)
         .ok_or_else(|| "monotone wiggle degree must be >= 2".to_string())
+}
+
+#[inline]
+pub(crate) fn monotone_wiggle_structure(degree: usize) -> Result<MonotoneWiggleStructure, String> {
+    let internal_degree = monotone_wiggle_internal_degree(degree)?;
+    let value_span_degree = basis_family_value_span_polynomial_degree(
+        BasisFamily::ISpline,
+        internal_degree,
+    )
+    .map_err(|e| e.to_string())?;
+    let fourth_derivative_zero = basis_family_value_derivative_is_structurally_zero(
+        BasisFamily::ISpline,
+        internal_degree,
+        4,
+    )
+    .map_err(|e| e.to_string())?;
+    debug_assert_eq!(fourth_derivative_zero, value_span_degree < 4);
+    Ok(MonotoneWiggleStructure { value_span_degree })
 }
 
 #[inline]
@@ -670,9 +701,11 @@ pub(crate) fn select_wiggle_basis_from_seed(
     };
     let (mut block, knots) = buildwiggle_block_input_from_seed(seed, &effective_cfg)?;
     append_selected_wiggle_penalty_orders(&mut block, &extra_orders)?;
+    let structure = monotone_wiggle_structure(cfg.degree)?;
     Ok(SelectedWiggleBasis {
         knots,
         degree: cfg.degree,
+        structure,
         block,
     })
 }
@@ -2634,6 +2667,7 @@ pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
         knots: wiggle_knots,
         degree: wiggle_degree,
         block: wiggle_block,
+        ..
     } = selected_wiggle_basis;
     let solved = fit_gaussian_location_scalewiggle_terms(
         data,
@@ -2747,6 +2781,7 @@ pub(crate) fn fit_binomial_location_scale_terms_with_selected_wiggle(
         knots: wiggle_knots,
         degree: wiggle_degree,
         block: wiggle_block,
+        ..
     } = selected_wiggle_basis;
     let solved = fit_binomial_location_scalewiggle_terms(
         data,
@@ -2809,6 +2844,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         knots: wiggle_knots,
         degree: wiggle_degree,
         block: wiggle_block,
+        ..
     } = selected_wiggle_basis;
 
     let spatial_terms = spatial_length_scale_term_indices(pilot_spec);
@@ -15440,9 +15476,8 @@ mod tests {
         knots: &Array1<f64>,
         degree: usize,
     ) -> Array1<D> {
-        let bs_degree = monotone_wiggle_internal_degree(degree)
-            .expect("monotone wiggle degree")
-            + 1;
+        let bs_degree =
+            monotone_wiggle_internal_degree(degree).expect("monotone wiggle degree") + 1;
         let left = knots[bs_degree];
         let full = bspline_basis_scalar_numdual(x, knots, bs_degree);
         let left_full = bspline_basis_scalar_numdual(D::from(left), knots, bs_degree);

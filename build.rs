@@ -1549,7 +1549,10 @@ fn main() {
         let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR not set");
         let lint_path = Path::new(&out_dir).join("lint_errors.rs");
         std::fs::write(&lint_path, "// Lint checks skipped\n").unwrap_or_else(|e| {
-            panic!("failed to write lint errors to {}: {e}", lint_path.display());
+            panic!(
+                "failed to write lint errors to {}: {e}",
+                lint_path.display()
+            );
         });
         return;
     }
@@ -1863,12 +1866,18 @@ fn main() {
             ));
         }
         std::fs::write(&lint_path, generated).unwrap_or_else(|e| {
-            panic!("failed to write lint errors to {}: {e}", lint_path.display());
+            panic!(
+                "failed to write lint errors to {}: {e}",
+                lint_path.display()
+            );
         });
     } else {
         // No violations — write an empty file so the include! never fails.
         std::fs::write(&lint_path, "// No lint violations\n").unwrap_or_else(|e| {
-            panic!("failed to write lint errors to {}: {e}", lint_path.display());
+            panic!(
+                "failed to write lint errors to {}: {e}",
+                lint_path.display()
+            );
         });
     }
 
