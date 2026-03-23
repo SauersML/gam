@@ -3517,14 +3517,6 @@ mod tests {
     use crate::types::LinkFunction;
     use ndarray::{Array1, Array2, array};
 
-    fn nested_column_selection(raw_dim: usize, basis_dim: usize) -> Vec<Vec<f64>> {
-        let mut out = vec![vec![0.0; basis_dim]; raw_dim];
-        for idx in 0..basis_dim.min(raw_dim) {
-            out[idx][idx] = 1.0;
-        }
-        out
-    }
-
     fn saved_runtime_from_deviation_runtime(
         runtime: &crate::families::bernoulli_marginal_slope::DeviationRuntime,
     ) -> SavedAnchoredDeviationRuntime {
@@ -3532,12 +3524,25 @@ mod tests {
             kernel:
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                     .to_string(),
-            knots: runtime.knots().to_vec(),
-            degree: runtime.degree(),
-            value_span_degree: runtime.value_span_degree(),
+            breakpoints: runtime.breakpoints().to_vec(),
             basis_dim: runtime.basis_dim(),
-            basis_transform: runtime
-                .basis_transform()
+            span_c0: runtime
+                .span_c0()
+                .outer_iter()
+                .map(|row| row.to_vec())
+                .collect(),
+            span_c1: runtime
+                .span_c1()
+                .outer_iter()
+                .map(|row| row.to_vec())
+                .collect(),
+            span_c2: runtime
+                .span_c2()
+                .outer_iter()
+                .map(|row| row.to_vec())
+                .collect(),
+            span_c3: runtime
+                .span_c3()
                 .outer_iter()
                 .map(|row| row.to_vec())
                 .collect(),
@@ -3680,12 +3685,10 @@ mod tests {
         let quadratic = saved_runtime_from_deviation_runtime(&quadratic_prepared.runtime);
         assert!(quadratic.design(&array![0.0]).is_ok());
 
-        let structurally_invalid = SavedAnchoredDeviationRuntime {
-            value_span_degree: 4,
-            ..production_runtime.clone()
-        };
+        let mut structurally_invalid = production_runtime.clone();
+        structurally_invalid.span_c0[0].pop();
         let err = structurally_invalid.design(&array![0.0]).unwrap_err();
-        assert!(err.contains("piecewise degree 4"));
+        assert!(err.contains("c0 row 0 has width"));
 
         let cubic = production_runtime;
         assert!(cubic.design(&array![0.0]).is_ok());
@@ -3693,26 +3696,20 @@ mod tests {
 
     #[test]
     fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
-        let knots = vec![-2.0, -2.0, -2.0, -2.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0];
-        let raw_basis_dim = crate::families::gamlss::monotone_wiggle_basis_with_derivative_order(
-            array![0.0].view(),
-            &Array1::from_vec(knots.clone()),
-            3,
-            0,
+        let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
+        let prepared = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..Default::default()
+            },
         )
-        .expect("raw basis")
-        .ncols();
-        let runtime = SavedAnchoredDeviationRuntime {
-            kernel:
-                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                    .to_string(),
-            knots,
-            degree: 3,
-            value_span_degree: 3,
-            basis_dim: 3,
-            basis_transform: nested_column_selection(raw_basis_dim, 3),
-        };
-        let beta = array![0.1, -0.03, 0.05];
+        .expect("build saved anchored deviation runtime");
+        let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
+        let beta = Array1::from_iter(
+            (0..runtime.basis_dim)
+                .map(|idx| 0.02 * (idx as f64 + 1.0) * (-1.0_f64).powi(idx as i32)),
+        );
         let n_spans = runtime.span_count().expect("span count");
         assert!(n_spans >= 2);
         for span_idx in 0..n_spans {
@@ -3746,25 +3743,16 @@ mod tests {
 
     #[test]
     fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
-        let knots = vec![-2.0, -2.0, -2.0, -2.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0];
-        let raw_basis_dim = crate::families::gamlss::monotone_wiggle_basis_with_derivative_order(
-            array![0.0].view(),
-            &Array1::from_vec(knots.clone()),
-            3,
-            0,
+        let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
+        let prepared = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..Default::default()
+            },
         )
-        .expect("raw basis")
-        .ncols();
-        let runtime = SavedAnchoredDeviationRuntime {
-            kernel:
-                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                    .to_string(),
-            knots,
-            degree: 3,
-            value_span_degree: 3,
-            basis_dim: 3,
-            basis_transform: nested_column_selection(raw_basis_dim, 3),
-        };
+        .expect("build saved anchored deviation runtime");
+        let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
         let cubic = runtime.basis_span_cubic(0, 1).expect("basis span cubic");
         let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
         let design = runtime.design(&x_eval).expect("basis design");

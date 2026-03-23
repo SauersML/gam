@@ -2271,6 +2271,30 @@ fn effective_predict_offset_columns<'a>(
 fn require_saved_survival_likelihood_mode(
     model: &SavedModel,
 ) -> Result<SurvivalLikelihoodMode, String> {
+    if matches!(&model.family_state, FittedFamily::LatentSurvival { .. }) {
+        return match model.survival_likelihood.as_deref() {
+            Some("latent") => Ok(SurvivalLikelihoodMode::Latent),
+            Some(other) => Err(format!(
+                "saved latent survival model has contradictory survival_likelihood metadata: expected 'latent', got '{other}'"
+            )),
+            None => Err(
+                "saved latent survival model is missing survival_likelihood=latent metadata; refit with current CLI"
+                    .to_string(),
+            ),
+        };
+    }
+    if matches!(&model.family_state, FittedFamily::LatentBinary { .. }) {
+        return match model.survival_likelihood.as_deref() {
+            Some("latent-binary") => Ok(SurvivalLikelihoodMode::LatentBinary),
+            Some(other) => Err(format!(
+                "saved latent binary model has contradictory survival_likelihood metadata: expected 'latent-binary', got '{other}'"
+            )),
+            None => Err(
+                "saved latent binary model is missing survival_likelihood=latent-binary metadata; refit with current CLI"
+                    .to_string(),
+            ),
+        };
+    }
     let raw = model.survival_likelihood.as_deref().ok_or_else(|| {
         "saved survival model is missing survival_likelihood metadata; refit with current CLI"
             .to_string()
@@ -5869,6 +5893,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
             payload.survival_baseline_makeham = baseline_cfg.makeham;
+            payload.survival_likelihood = Some(
+                if likelihood_mode == SurvivalLikelihoodMode::Latent {
+                    "latent"
+                } else {
+                    "latent-binary"
+                }
+                .to_string(),
+            );
             payload.survival_time_basis = Some(time_build.basisname.clone());
             payload.survival_time_degree = time_build.degree;
             payload.survival_time_knots = time_build.knots.clone();
@@ -6424,15 +6456,20 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 MODEL_VERSION,
                 formula,
                 ModelKind::Survival,
-                FittedFamily::Survival {
-                    likelihood: LikelihoodFamily::RoystonParmar,
-                    survival_likelihood: Some(
-                        survival_likelihood_modename(likelihood_mode).to_string(),
-                    ),
-                    survival_distribution: None,
-                    frailty,
+                match likelihood_mode {
+                    SurvivalLikelihoodMode::Latent => FittedFamily::LatentSurvival {
+                        frailty: frailty.clone(),
+                    },
+                    SurvivalLikelihoodMode::LatentBinary => FittedFamily::LatentBinary {
+                        frailty: frailty.clone(),
+                    },
+                    _ => unreachable!(),
                 },
-                family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+                if likelihood_mode == SurvivalLikelihoodMode::Latent {
+                    "latent-survival".to_string()
+                } else {
+                    "latent-binary".to_string()
+                },
             );
             payload.unified = Some(fit.clone());
             payload.fit_result = Some(fit.clone());
@@ -6460,8 +6497,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 args.noise_offset_column.clone(),
             );
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
-            payload.survival_likelihood =
-                Some(survival_likelihood_modename(likelihood_mode).to_string());
             payload.training_headers = Some(ds.headers.clone());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(&termspec, &cov_design)
@@ -8889,12 +8924,28 @@ fn build_location_scale_saved_model(
 fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
     SavedAnchoredDeviationRuntime {
         kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
-        knots: runtime.knots().to_vec(),
-        degree: runtime.degree(),
-        value_span_degree: runtime.value_span_degree(),
+        breakpoints: runtime.breakpoints().to_vec(),
         basis_dim: runtime.basis_dim(),
-        basis_transform: runtime
-            .basis_transform()
+        span_c0: runtime
+            .span_c0()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+        span_c1: runtime
+            .span_c1()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+        span_c2: runtime
+            .span_c2()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+        span_c3: runtime
+            .span_c3()
             .rows()
             .into_iter()
             .map(|row| row.to_vec())
@@ -13719,15 +13770,12 @@ mod tests {
         );
         payload.score_warp_runtime = Some(SavedAnchoredDeviationRuntime {
             kernel: "BadKernel".to_string(),
-            knots: vec![-1.0, -1.0, 1.0, 1.0],
-            degree: 3,
-            value_span_degree: 3,
+            breakpoints: vec![-1.0, 1.0],
             basis_dim: 2,
-            basis_transform: Array2::<f64>::eye(2)
-                .rows()
-                .into_iter()
-                .map(|row| row.to_vec())
-                .collect(),
+            span_c0: vec![vec![0.0, 0.0]],
+            span_c1: vec![vec![0.0, 0.0]],
+            span_c2: vec![vec![0.0, 0.0]],
+            span_c3: vec![vec![0.0, 0.0]],
         });
         let model = SavedModel::from_payload(payload);
 
@@ -13740,28 +13788,11 @@ mod tests {
 
     #[test]
     fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
-        let knots = vec![-1.5, -1.5, -1.5, -1.5, 1.5, 1.5, 1.5, 1.5];
-        let degree = DeviationBlockConfig::default().degree;
-        let basis_dim = monotone_wiggle_basis_with_derivative_order(
-            array![-1.5, -0.5, 0.0, 0.5, 1.5].view(),
-            &Array1::from_vec(knots.clone()),
-            degree,
-            0,
-        )
-        .expect("score-warp basis")
-        .ncols();
-        let saved_runtime = SavedAnchoredDeviationRuntime {
-            kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
-            knots,
-            degree,
-            value_span_degree: 3,
-            basis_dim,
-            basis_transform: Array2::<f64>::eye(basis_dim)
-                .rows()
-                .into_iter()
-                .map(|row| row.to_vec())
-                .collect(),
-        };
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(&seed, &DeviationBlockConfig::default())
+            .expect("score-warp basis");
+        let basis_dim = prepared.runtime.basis_dim();
+        let saved_runtime = saved_anchored_deviation_runtime(&prepared.runtime);
         let zero_beta = Array1::zeros(basis_dim);
 
         let q_exit = array![-0.8, 0.4];
@@ -13957,16 +13988,13 @@ mod tests {
         let mut payload = test_payload(
             "Surv(entry, exit, event) ~ 1",
             ModelKind::Survival,
-            FittedFamily::Survival {
-                likelihood: LikelihoodFamily::RoystonParmar,
-                survival_likelihood: Some("latent".to_string()),
-                survival_distribution: None,
+            FittedFamily::LatentSurvival {
                 frailty: gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
                     sigma_fixed: Some(0.3),
                     loading: gam::families::lognormal_kernel::HazardLoading::Full,
                 },
             },
-            "survival",
+            "latent-survival",
         );
         payload.fit_result = Some(fit_result.clone());
         payload.unified = Some(fit_result);
@@ -14027,6 +14055,26 @@ mod tests {
         let lines = csv.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "eta,mean,survival_prob,risk_score,failure_prob");
+    }
+
+    #[test]
+    fn explicit_latent_binary_family_requires_matching_saved_likelihood_metadata() {
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ 1",
+            ModelKind::Survival,
+            FittedFamily::LatentBinary {
+                frailty: gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                    sigma_fixed: Some(0.3),
+                    loading: gam::families::lognormal_kernel::HazardLoading::Full,
+                },
+            },
+            "latent-binary",
+        );
+        payload.survival_likelihood = Some("latent-binary".to_string());
+        let model = SavedModel::from_payload(payload);
+        let mode =
+            super::require_saved_survival_likelihood_mode(&model).expect("latent-binary mode");
+        assert_eq!(mode, SurvivalLikelihoodMode::LatentBinary);
     }
 
     #[test]

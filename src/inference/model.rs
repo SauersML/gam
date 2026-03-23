@@ -1,10 +1,5 @@
-use crate::basis::BasisFamily;
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::{
-    anchored_deviation_basis_with_transform, local_cubic_from_uniform_span_samples,
-    sampled_span_points,
-};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
@@ -18,7 +13,7 @@ use crate::inference::predict::{
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
-use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
+use crate::span::span_index_for_breakpoints;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec,
     SasLinkState,
@@ -320,6 +315,9 @@ pub enum FittedFamily {
     LatentSurvival {
         frailty: FrailtySpec,
     },
+    LatentBinary {
+        frailty: FrailtySpec,
+    },
     TransformationNormal {
         likelihood: LikelihoodFamily,
     },
@@ -354,11 +352,12 @@ pub struct SavedBaselineTimeWiggleRuntime {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedAnchoredDeviationRuntime {
     pub kernel: String,
-    pub knots: Vec<f64>,
-    pub degree: usize,
-    pub value_span_degree: usize,
+    pub breakpoints: Vec<f64>,
     pub basis_dim: usize,
-    pub basis_transform: Vec<Vec<f64>>,
+    pub span_c0: Vec<Vec<f64>>,
+    pub span_c1: Vec<Vec<f64>>,
+    pub span_c2: Vec<Vec<f64>>,
+    pub span_c3: Vec<Vec<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -531,90 +530,134 @@ impl SavedAnchoredDeviationRuntime {
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
             ));
         }
-        if self.degree < 2 {
+        if self.basis_dim == 0 {
             return Err(format!(
-                "saved anchored deviation runtime degree must be >= 2, got {}",
-                self.degree
+                "saved anchored deviation runtime basis_dim must be positive, got {}",
+                self.basis_dim
             ));
         }
-        if self.value_span_degree >= 4 {
+        if self.breakpoints.len() < 2 {
             return Err(format!(
-                "saved anchored deviation runtime requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {}",
-                self.value_span_degree
+                "saved anchored deviation runtime requires at least two breakpoints, got {}",
+                self.breakpoints.len()
             ));
         }
-        self.basis_transform_matrix()?;
+        for window in self.breakpoints.windows(2) {
+            let left = window[0];
+            let right = window[1];
+            if !left.is_finite() || !right.is_finite() || right <= left {
+                return Err(format!(
+                    "saved anchored deviation runtime breakpoints must be finite and strictly increasing, got [{left}, {right}]"
+                ));
+            }
+        }
+        let span_count = self.breakpoints.len() - 1;
+        self.validate_coefficient_matrix(&self.span_c0, "c0", span_count)?;
+        self.validate_coefficient_matrix(&self.span_c1, "c1", span_count)?;
+        self.validate_coefficient_matrix(&self.span_c2, "c2", span_count)?;
+        self.validate_coefficient_matrix(&self.span_c3, "c3", span_count)?;
         Ok(())
     }
 
-    fn basis_transform_matrix(&self) -> Result<Array2<f64>, String> {
-        if self.basis_transform.is_empty() {
-            return Err(
-                "saved anchored deviation runtime is missing the training basis transform"
-                    .to_string(),
-            );
-        }
-        let cols = self.basis_transform[0].len();
-        if cols != self.basis_dim {
+    fn validate_coefficient_matrix(
+        &self,
+        matrix: &[Vec<f64>],
+        label: &str,
+        expected_rows: usize,
+    ) -> Result<(), String> {
+        if matrix.len() != expected_rows {
             return Err(format!(
-                "saved anchored deviation basis transform width mismatch: transform has {} columns but runtime expects {}",
-                cols, self.basis_dim
+                "saved anchored deviation runtime {label} row count mismatch: got {}, expected {}",
+                matrix.len(),
+                expected_rows
             ));
         }
-        let rows = self.basis_transform.len();
-        let mut transform = Array2::<f64>::zeros((rows, cols));
-        for (i, row) in self.basis_transform.iter().enumerate() {
-            if row.len() != cols {
+        for (row_idx, row) in matrix.iter().enumerate() {
+            if row.len() != self.basis_dim {
                 return Err(format!(
-                    "saved anchored deviation basis transform row {} has width {}, expected {}",
-                    i,
+                    "saved anchored deviation runtime {label} row {} has width {}, expected {}",
+                    row_idx,
                     row.len(),
-                    cols
+                    self.basis_dim
                 ));
             }
             for (j, &value) in row.iter().enumerate() {
                 if !value.is_finite() {
                     return Err(format!(
-                        "saved anchored deviation basis transform entry ({i},{j}) is non-finite"
+                        "saved anchored deviation runtime {label} entry ({row_idx},{j}) is non-finite"
                     ));
                 }
-                transform[[i, j]] = value;
             }
         }
-        Ok(transform)
+        Ok(())
     }
 
-    fn constrained_basis(
+    fn right_boundary_basis_value(&self, basis_idx: usize) -> f64 {
+        let last_span = self.breakpoints.len() - 2;
+        let width = self.breakpoints[last_span + 1] - self.breakpoints[last_span];
+        self.span_c0[last_span][basis_idx]
+            + self.span_c1[last_span][basis_idx] * width
+            + self.span_c2[last_span][basis_idx] * width * width
+            + self.span_c3[last_span][basis_idx] * width * width * width
+    }
+
+    fn evaluate_span_polynomial_design(
         &self,
         values: &Array1<f64>,
-        basis_options: BasisOptions,
+        derivative_order: usize,
     ) -> Result<Array2<f64>, String> {
         self.validate_exact_replay_contract()?;
-        let knot_arr = Array1::from_vec(self.knots.clone());
-        let basis_transform = self.basis_transform_matrix()?;
-        let constrained = anchored_deviation_basis_with_transform(
-            values.view(),
-            &knot_arr,
-            self.degree,
-            &basis_transform,
-            basis_options.derivative_order,
-        )?;
-        if constrained.ncols() != self.basis_dim {
-            return Err(format!(
-                "saved anchored deviation basis mismatch: runtime expects {} columns but basis has {}",
-                self.basis_dim,
-                constrained.ncols()
-            ));
+        let (left_ep, right_ep) = self.support_interval()?;
+        let mut out = Array2::<f64>::zeros((values.len(), self.basis_dim));
+        for (row_idx, &value) in values.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "saved anchored deviation runtime design value at row {row_idx} is non-finite ({value})"
+                ));
+            }
+            if value < left_ep {
+                if derivative_order == 0 {
+                    for basis_idx in 0..self.basis_dim {
+                        out[[row_idx, basis_idx]] = self.span_c0[0][basis_idx];
+                    }
+                }
+                continue;
+            }
+            if value > right_ep {
+                if derivative_order == 0 {
+                    for basis_idx in 0..self.basis_dim {
+                        out[[row_idx, basis_idx]] = self.right_boundary_basis_value(basis_idx);
+                    }
+                }
+                continue;
+            }
+            let span_idx = self.span_index_for(value)?;
+            let t = value - self.breakpoints[span_idx];
+            for basis_idx in 0..self.basis_dim {
+                let c0 = self.span_c0[span_idx][basis_idx];
+                let c1 = self.span_c1[span_idx][basis_idx];
+                let c2 = self.span_c2[span_idx][basis_idx];
+                let c3 = self.span_c3[span_idx][basis_idx];
+                out[[row_idx, basis_idx]] = match derivative_order {
+                    0 => c0 + c1 * t + c2 * t * t + c3 * t * t * t,
+                    1 => c1 + 2.0 * c2 * t + 3.0 * c3 * t * t,
+                    2 => 2.0 * c2 + 6.0 * c3 * t,
+                    3 => 6.0 * c3,
+                    4 => 0.0,
+                    other => {
+                        return Err(format!(
+                            "saved anchored deviation runtime only supports derivative orders up to 4, got {other}"
+                        ));
+                    }
+                };
+            }
         }
-        Ok(constrained)
+        Ok(out)
     }
 
     pub fn breakpoints(&self) -> Result<Vec<f64>, String> {
         self.validate_exact_replay_contract()?;
-        if self.knots.is_empty() {
-            return Err("saved anchored deviation runtime is missing knots".to_string());
-        }
-        breakpoints_from_knots(&self.knots, "saved anchored deviation runtime breakpoints")
+        Ok(self.breakpoints.clone())
     }
 
     pub fn span_count(&self) -> Result<usize, String> {
@@ -650,10 +693,31 @@ impl SavedAnchoredDeviationRuntime {
         }
         let left = points[span_idx];
         let right = points[span_idx + 1];
-        let span_points = sampled_span_points(left, right);
-        let values = self.design(&span_points)?.dot(beta);
-        local_cubic_from_uniform_span_samples(
-            left, right, values[0], values[1], values[2], values[3],
+        Ok(
+            crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                left,
+                right,
+                c0: self.span_c0[span_idx]
+                    .iter()
+                    .zip(beta.iter())
+                    .map(|(coeff, weight)| coeff * weight)
+                    .sum(),
+                c1: self.span_c1[span_idx]
+                    .iter()
+                    .zip(beta.iter())
+                    .map(|(coeff, weight)| coeff * weight)
+                    .sum(),
+                c2: self.span_c2[span_idx]
+                    .iter()
+                    .zip(beta.iter())
+                    .map(|(coeff, weight)| coeff * weight)
+                    .sum(),
+                c3: self.span_c3[span_idx]
+                    .iter()
+                    .zip(beta.iter())
+                    .map(|(coeff, weight)| coeff * weight)
+                    .sum(),
+            },
         )
     }
 
@@ -670,9 +734,24 @@ impl SavedAnchoredDeviationRuntime {
                 basis_idx, self.basis_dim
             ));
         }
-        let mut beta = Array1::<f64>::zeros(self.basis_dim);
-        beta[basis_idx] = 1.0;
-        self.local_cubic_on_span(&beta, span_idx)
+        let points = self.breakpoints()?;
+        if span_idx + 1 >= points.len() {
+            return Err(format!(
+                "saved anchored deviation span index {} out of range for {} spans",
+                span_idx,
+                points.len() - 1
+            ));
+        }
+        Ok(
+            crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
+                left: points[span_idx],
+                right: points[span_idx + 1],
+                c0: self.span_c0[span_idx][basis_idx],
+                c1: self.span_c1[span_idx][basis_idx],
+                c2: self.span_c2[span_idx][basis_idx],
+                c3: self.span_c3[span_idx][basis_idx],
+            },
+        )
     }
 
     pub fn basis_cubic_at(
@@ -690,12 +769,11 @@ impl SavedAnchoredDeviationRuntime {
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
-            let left_value = self.design(&Array1::from_vec(vec![left_ep]))?[[0, basis_idx]];
             return Ok(
                 crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
                     left: left_ep,
                     right: left_ep + 1.0,
-                    c0: left_value,
+                    c0: self.span_c0[0][basis_idx],
                     c1: 0.0,
                     c2: 0.0,
                     c3: 0.0,
@@ -703,12 +781,11 @@ impl SavedAnchoredDeviationRuntime {
             );
         }
         if value > right_ep {
-            let right_value = self.design(&Array1::from_vec(vec![right_ep]))?[[0, basis_idx]];
             return Ok(
                 crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
                     left: right_ep,
                     right: right_ep + 1.0,
-                    c0: right_value,
+                    c0: self.right_boundary_basis_value(basis_idx),
                     c1: 0.0,
                     c2: 0.0,
                     c3: 0.0,
@@ -725,17 +802,25 @@ impl SavedAnchoredDeviationRuntime {
         value: f64,
     ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
     {
+        self.validate_exact_replay_contract()?;
+        if beta.len() != self.basis_dim {
+            return Err(format!(
+                "saved anchored deviation coefficient length mismatch: got {}, expected {}",
+                beta.len(),
+                self.basis_dim
+            ));
+        }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
-            let left_value = self
-                .design(&Array1::from_vec(vec![left_ep]))?
-                .row(0)
-                .dot(beta);
             return Ok(
                 crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
                     left: left_ep,
                     right: left_ep + 1.0,
-                    c0: left_value,
+                    c0: self.span_c0[0]
+                        .iter()
+                        .zip(beta.iter())
+                        .map(|(coeff, weight)| coeff * weight)
+                        .sum(),
                     c1: 0.0,
                     c2: 0.0,
                     c3: 0.0,
@@ -743,15 +828,15 @@ impl SavedAnchoredDeviationRuntime {
             );
         }
         if value > right_ep {
-            let right_value = self
-                .design(&Array1::from_vec(vec![right_ep]))?
-                .row(0)
-                .dot(beta);
             return Ok(
                 crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
                     left: right_ep,
                     right: right_ep + 1.0,
-                    c0: right_value,
+                    c0: (0..self.basis_dim)
+                        .map(|basis_idx| {
+                            self.right_boundary_basis_value(basis_idx) * beta[basis_idx]
+                        })
+                        .sum(),
                     c1: 0.0,
                     c2: 0.0,
                     c3: 0.0,
@@ -771,35 +856,29 @@ impl SavedAnchoredDeviationRuntime {
     }
 
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.constrained_basis(values, BasisOptions::value())
+        self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)
     }
 
     pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.constrained_basis(values, BasisOptions::first_derivative())
+        self.evaluate_span_polynomial_design(
+            values,
+            BasisOptions::first_derivative().derivative_order,
+        )
     }
 
     pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.constrained_basis(values, BasisOptions::second_derivative())
+        self.evaluate_span_polynomial_design(
+            values,
+            BasisOptions::second_derivative().derivative_order,
+        )
     }
 
     pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.constrained_basis(
-            values,
-            BasisOptions {
-                derivative_order: 3,
-                basis_family: BasisFamily::BSpline,
-            },
-        )
+        self.evaluate_span_polynomial_design(values, 3)
     }
 
     pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.constrained_basis(
-            values,
-            BasisOptions {
-                derivative_order: 4,
-                basis_family: BasisFamily::BSpline,
-            },
-        )
+        self.evaluate_span_polynomial_design(values, 4)
     }
 }
 
@@ -831,7 +910,9 @@ impl FittedFamily {
             | Self::MarginalSlope { likelihood, .. }
             | Self::Survival { likelihood, .. }
             | Self::TransformationNormal { likelihood, .. } => *likelihood,
-            Self::LatentSurvival { .. } => LikelihoodFamily::RoystonParmar,
+            Self::LatentSurvival { .. } | Self::LatentBinary { .. } => {
+                LikelihoodFamily::RoystonParmar
+            }
         }
     }
 
@@ -840,7 +921,8 @@ impl FittedFamily {
         match self {
             Self::MarginalSlope { frailty, .. }
             | Self::Survival { frailty, .. }
-            | Self::LatentSurvival { frailty } => Some(frailty),
+            | Self::LatentSurvival { frailty }
+            | Self::LatentBinary { frailty } => Some(frailty),
             _ => None,
         }
     }
@@ -976,9 +1058,9 @@ impl FittedModel {
     #[inline]
     pub fn predict_model_class(&self) -> PredictModelClass {
         match self.payload().family_state {
-            FittedFamily::Survival { .. } | FittedFamily::LatentSurvival { .. } => {
-                PredictModelClass::Survival
-            }
+            FittedFamily::Survival { .. }
+            | FittedFamily::LatentSurvival { .. }
+            | FittedFamily::LatentBinary { .. } => PredictModelClass::Survival,
             FittedFamily::MarginalSlope { .. } => PredictModelClass::BernoulliMarginalSlope,
             FittedFamily::TransformationNormal { .. } => PredictModelClass::TransformationNormal,
             FittedFamily::LocationScale {
@@ -1275,7 +1357,9 @@ impl FittedModel {
                 Ok(stateful.or_else(|| link.map(InverseLink::Standard)))
             }
             FittedFamily::MarginalSlope { .. } => Ok(None),
-            FittedFamily::Survival { .. } | FittedFamily::LatentSurvival { .. } => Ok(None),
+            FittedFamily::Survival { .. }
+            | FittedFamily::LatentSurvival { .. }
+            | FittedFamily::LatentBinary { .. } => Ok(None),
             FittedFamily::TransformationNormal { .. } => Ok(None),
         }
     }
@@ -1509,6 +1593,15 @@ impl FittedModel {
             ..
         } = &self.family_state
         {
+            if matches!(
+                survival_likelihood.as_deref(),
+                Some("latent") | Some("latent-binary")
+            ) {
+                return Err(
+                    "latent hazard-window models must persist explicit family_state metadata, not generic survival metadata"
+                        .to_string(),
+                );
+            }
             if survival_likelihood.as_deref() == Some("marginal-slope") {
                 match frailty {
                     FrailtySpec::None
@@ -1525,35 +1618,6 @@ impl FittedModel {
                         return Err(
                             "survival marginal-slope model does not support HazardMultiplier frailty"
                             .to_string(),
-                        );
-                    }
-                }
-            } else if survival_likelihood.as_deref() == Some("latent") {
-                match frailty {
-                    FrailtySpec::HazardMultiplier {
-                        sigma_fixed: Some(_),
-                        loading: crate::families::lognormal_kernel::HazardLoading::Full,
-                    } => {}
-                    FrailtySpec::HazardMultiplier {
-                        sigma_fixed: Some(_),
-                        loading,
-                    } => {
-                        return Err(format!(
-                            "latent survival model requires HazardLoading::Full in family_state.frailty, got {loading:?}"
-                        ));
-                    }
-                    FrailtySpec::HazardMultiplier {
-                        sigma_fixed: None, ..
-                    } => {
-                        return Err(
-                            "latent survival model requires a fixed HazardMultiplier sigma in family_state.frailty"
-                                .to_string(),
-                        );
-                    }
-                    FrailtySpec::GaussianShift { .. } | FrailtySpec::None => {
-                        return Err(
-                            "latent survival model requires a fixed HazardMultiplier frailty specification"
-                                .to_string(),
                         );
                     }
                 }
@@ -1587,7 +1651,34 @@ impl FittedModel {
             }
             if self.survival_likelihood.as_deref() != Some("latent") {
                 return Err(
-                    "latent survival model must persist survival_likelihood=latent"
+                    "latent survival model must persist survival_likelihood=latent".to_string(),
+                );
+            }
+        }
+        if let FittedFamily::LatentBinary { frailty } = &self.family_state {
+            match frailty {
+                FrailtySpec::HazardMultiplier {
+                    sigma_fixed: Some(_),
+                    ..
+                } => {}
+                FrailtySpec::HazardMultiplier {
+                    sigma_fixed: None, ..
+                } => {
+                    return Err(
+                        "latent binary model requires a fixed HazardMultiplier sigma in family_state.frailty"
+                            .to_string(),
+                    );
+                }
+                FrailtySpec::GaussianShift { .. } | FrailtySpec::None => {
+                    return Err(
+                        "latent binary model requires a fixed HazardMultiplier frailty specification"
+                            .to_string(),
+                    );
+                }
+            }
+            if self.survival_likelihood.as_deref() != Some("latent-binary") {
+                return Err(
+                    "latent binary model must persist survival_likelihood=latent-binary"
                         .to_string(),
                 );
             }
@@ -1659,21 +1750,18 @@ impl FittedModel {
                     .to_string(),
             );
         }
-        if self.is_survival_model() && self.survival_likelihood.is_none() {
+        if matches!(self.family_state, FittedFamily::Survival { .. })
+            && self.survival_likelihood.is_none()
+        {
             return Err(
                 "saved survival model is missing survival_likelihood metadata; refit with current CLI"
                     .to_string(),
             );
         }
-        if self.is_survival_model()
-            && self
-                .survival_likelihood
-                .as_deref()
-                .ok_or_else(|| {
-                    "saved survival model is missing survival_likelihood metadata; refit with current CLI"
-                        .to_string()
-                })?
-                .eq_ignore_ascii_case("location-scale")
+        if self
+            .survival_likelihood
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("location-scale"))
             && (self.survival_beta_time.is_none()
                 || self.survival_beta_threshold.is_none()
                 || self.survival_beta_log_sigma.is_none())

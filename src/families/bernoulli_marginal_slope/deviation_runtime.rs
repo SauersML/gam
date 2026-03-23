@@ -128,13 +128,13 @@ pub(crate) fn derive_deviation_basis_transform(
     Ok(basis_transform)
 }
 
-/// Precomputed per-span Taylor design matrices for a monotone deviation basis.
+/// Precomputed per-span cubic coefficient matrices for a monotone deviation basis.
 ///
 /// **Structural invariant:** the value basis must have a structurally zero
 /// fourth derivative on every knot span (`value_span_degree <= 3`). This
-/// allows [`local_cubic_on_span`] and
-/// [`basis_span_cubic`] to reconstruct each basis function as an *exact*
-/// Taylor polynomial `c₀ + c₁t + c₂t² + c₃t³` — no truncation error.
+/// allows the runtime to build one authoritative span-local cubic
+/// `c₀ + c₁t + c₂t² + c₃t³` per basis function and then derive value, d1, d2,
+/// and d3 from that same polynomial everywhere in fit and prediction.
 ///
 /// The invariant is enforced at construction time in [`DeviationRuntime::try_new`]:
 /// both a type-level check ([`MonotoneWiggleStructure::fourth_derivative_is_structurally_zero`])
@@ -146,20 +146,15 @@ pub(crate) fn derive_deviation_basis_transform(
 /// bypassed.
 #[derive(Clone, Debug)]
 pub struct DeviationRuntime {
-    knots: Array1<f64>,
     degree: usize,
     value_span_degree: usize,
     basis_dim: usize,
     monotonicity_eps: f64,
-    basis_transform: Array2<f64>,
     endpoint_points: Array1<f64>,
-    span_left_value_design: Array2<f64>,
-    span_left_points: Array1<f64>,
-    span_right_points: Array1<f64>,
-    span_left_d1_design: Array2<f64>,
-    span_right_d1_design: Array2<f64>,
-    span_left_d2_design: Array2<f64>,
-    span_mid_d3_design: Array2<f64>,
+    span_c0: Array2<f64>,
+    span_c1: Array2<f64>,
+    span_c2: Array2<f64>,
+    span_c3: Array2<f64>,
     /// Deviation basis values at the rightmost breakpoint (1 × basis_dim).
     /// Used for constant-tail continuation outside support: the deviation
     /// saturates at this value for all z > right endpoint.
@@ -275,80 +270,70 @@ impl DeviationRuntime {
         }
 
         // ── build design matrices ──
-        let span_left_value_design = anchored_deviation_basis_with_transform(
-            span_left_points.view(),
+        let sampled_points = span_left_points
+            .iter()
+            .zip(span_right_points.iter())
+            .flat_map(|(&left, &right)| sampled_span_points(left, right).into_iter())
+            .collect::<Vec<_>>();
+        let sampled_points = Array1::from_vec(sampled_points);
+        let sampled_value_design = anchored_deviation_basis_with_transform(
+            sampled_points.view(),
             &knots,
             degree,
             &basis_transform,
             0,
         )?;
-        let span_left_d1_design = anchored_deviation_basis_with_transform(
-            span_left_points.view(),
-            &knots,
-            degree,
-            &basis_transform,
-            1,
-        )?;
-        let span_right_d1_design = anchored_deviation_basis_with_transform(
-            span_right_points.view(),
-            &knots,
-            degree,
-            &basis_transform,
-            1,
-        )?;
-        let span_left_d2_design = anchored_deviation_basis_with_transform(
-            span_left_points.view(),
-            &knots,
-            degree,
-            &basis_transform,
-            2,
-        )?;
-        let span_mid_d3_design = anchored_deviation_basis_with_transform(
-            span_mid_points.view(),
-            &knots,
-            degree,
-            &basis_transform,
-            3,
-        )?;
-
-        // Precompute deviation basis values at the rightmost breakpoint for
-        // constant-tail continuation outside support.
-        let right_endpoint = *endpoint_points.last().ok_or_else(|| {
-            "DeviationRuntime requires at least one breakpoint for right tail".to_string()
-        })?;
-        let right_boundary_value_matrix = anchored_deviation_basis_with_transform(
-            ndarray::arr1(&[right_endpoint]).view(),
-            &knots,
-            degree,
-            &basis_transform,
-            0,
-        )?;
-        let right_boundary_value_row = right_boundary_value_matrix.row(0).to_owned();
+        let n_spans = span_left_points.len();
+        let mut span_c0 = Array2::<f64>::zeros((n_spans, basis_dim));
+        let mut span_c1 = Array2::<f64>::zeros((n_spans, basis_dim));
+        let mut span_c2 = Array2::<f64>::zeros((n_spans, basis_dim));
+        let mut span_c3 = Array2::<f64>::zeros((n_spans, basis_dim));
+        for span_idx in 0..n_spans {
+            let left = span_left_points[span_idx];
+            let right = span_right_points[span_idx];
+            let sample_row = 4 * span_idx;
+            for basis_idx in 0..basis_dim {
+                let cubic = local_cubic_from_uniform_span_samples(
+                    left,
+                    right,
+                    sampled_value_design[[sample_row, basis_idx]],
+                    sampled_value_design[[sample_row + 1, basis_idx]],
+                    sampled_value_design[[sample_row + 2, basis_idx]],
+                    sampled_value_design[[sample_row + 3, basis_idx]],
+                )?;
+                span_c0[[span_idx, basis_idx]] = cubic.c0;
+                span_c1[[span_idx, basis_idx]] = cubic.c1;
+                span_c2[[span_idx, basis_idx]] = cubic.c2;
+                span_c3[[span_idx, basis_idx]] = cubic.c3;
+            }
+        }
+        let last_span_idx = n_spans
+            .checked_sub(1)
+            .ok_or_else(|| "DeviationRuntime requires at least one active knot span".to_string())?;
+        let right_width = span_right_points[last_span_idx] - span_left_points[last_span_idx];
+        let mut right_boundary_value_row = Array1::<f64>::zeros(basis_dim);
+        for basis_idx in 0..basis_dim {
+            right_boundary_value_row[basis_idx] = span_c0[[last_span_idx, basis_idx]]
+                + span_c1[[last_span_idx, basis_idx]] * right_width
+                + span_c2[[last_span_idx, basis_idx]] * right_width * right_width
+                + span_c3[[last_span_idx, basis_idx]] * right_width * right_width * right_width;
+        }
 
         Ok(Self {
-            knots,
             degree,
             value_span_degree: structure.value_span_degree,
             basis_dim,
             monotonicity_eps,
-            basis_transform,
             endpoint_points,
-            span_left_value_design,
-            span_left_points,
-            span_right_points,
-            span_left_d1_design,
-            span_right_d1_design,
-            span_left_d2_design,
-            span_mid_d3_design,
+            span_c0,
+            span_c1,
+            span_c2,
+            span_c3,
             right_boundary_value_row,
         })
     }
 
     // ── public field accessors ──
-
-    pub fn knots(&self) -> &Array1<f64> {
-        &self.knots
-    }
 
     pub fn degree(&self) -> usize {
         self.degree
@@ -366,8 +351,20 @@ impl DeviationRuntime {
         self.monotonicity_eps
     }
 
-    pub fn basis_transform(&self) -> &Array2<f64> {
-        &self.basis_transform
+    pub fn span_c0(&self) -> &Array2<f64> {
+        &self.span_c0
+    }
+
+    pub fn span_c1(&self) -> &Array2<f64> {
+        &self.span_c1
+    }
+
+    pub fn span_c2(&self) -> &Array2<f64> {
+        &self.span_c2
+    }
+
+    pub fn span_c3(&self) -> &Array2<f64> {
+        &self.span_c3
     }
 
     // ── design evaluation ──
@@ -383,63 +380,90 @@ impl DeviationRuntime {
         Ok(())
     }
 
+    fn evaluate_span_polynomial_design(
+        &self,
+        values: &Array1<f64>,
+        derivative_order: usize,
+    ) -> Result<Array2<f64>, String> {
+        let (left_ep, right_ep) = self.support_interval()?;
+        let mut out = Array2::<f64>::zeros((values.len(), self.basis_dim));
+        for (row_idx, &value) in values.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "deviation runtime design value at row {row_idx} is non-finite ({value})"
+                ));
+            }
+            if value < left_ep {
+                if derivative_order == 0 {
+                    out.row_mut(row_idx).assign(&self.span_c0.row(0));
+                }
+                continue;
+            }
+            if value > right_ep {
+                if derivative_order == 0 {
+                    out.row_mut(row_idx)
+                        .assign(&self.right_boundary_value_row.view());
+                }
+                continue;
+            }
+            let span_idx = self.span_index_for(value)?;
+            let left = self.endpoint_points[span_idx];
+            let t = value - left;
+            for basis_idx in 0..self.basis_dim {
+                let c0 = self.span_c0[[span_idx, basis_idx]];
+                let c1 = self.span_c1[[span_idx, basis_idx]];
+                let c2 = self.span_c2[[span_idx, basis_idx]];
+                let c3 = self.span_c3[[span_idx, basis_idx]];
+                out[[row_idx, basis_idx]] = match derivative_order {
+                    0 => c0 + c1 * t + c2 * t * t + c3 * t * t * t,
+                    1 => c1 + 2.0 * c2 * t + 3.0 * c3 * t * t,
+                    2 => 2.0 * c2 + 6.0 * c3 * t,
+                    3 => 6.0 * c3,
+                    4 => 0.0,
+                    other => {
+                        return Err(format!(
+                            "deviation runtime only supports derivative orders up to 4, got {other}"
+                        ));
+                    }
+                };
+            }
+        }
+        Ok(out)
+    }
+
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        anchored_deviation_basis_with_transform(
-            values.view(),
-            &self.knots,
-            self.degree,
-            &self.basis_transform,
-            BasisOptions::value().derivative_order,
-        )
+        self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)
     }
 
     pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        anchored_deviation_basis_with_transform(
-            values.view(),
-            &self.knots,
-            self.degree,
-            &self.basis_transform,
+        self.evaluate_span_polynomial_design(
+            values,
             BasisOptions::first_derivative().derivative_order,
         )
     }
 
     pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        anchored_deviation_basis_with_transform(
-            values.view(),
-            &self.knots,
-            self.degree,
-            &self.basis_transform,
+        self.evaluate_span_polynomial_design(
+            values,
             BasisOptions::second_derivative().derivative_order,
         )
     }
 
     pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        anchored_deviation_basis_with_transform(
-            values.view(),
-            &self.knots,
-            self.degree,
-            &self.basis_transform,
-            3,
-        )
+        self.evaluate_span_polynomial_design(values, 3)
     }
 
     pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        anchored_deviation_basis_with_transform(
-            values.view(),
-            &self.knots,
-            self.degree,
-            &self.basis_transform,
-            4,
-        )
+        self.evaluate_span_polynomial_design(values, 4)
     }
 
     // ── span geometry ──
 
     fn span_count(&self) -> usize {
-        self.span_left_points.len()
+        self.endpoint_points.len().saturating_sub(1)
     }
 
-    pub(crate) fn breakpoints(&self) -> &Array1<f64> {
+    pub fn breakpoints(&self) -> &Array1<f64> {
         &self.endpoint_points
     }
 
@@ -452,8 +476,8 @@ impl DeviationRuntime {
             ));
         }
         Ok((
-            self.span_left_points[span_idx],
-            self.span_right_points[span_idx],
+            self.endpoint_points[span_idx],
+            self.endpoint_points[span_idx + 1],
         ))
     }
 
@@ -476,11 +500,14 @@ impl DeviationRuntime {
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
         self.validate_beta_shape(beta, "deviation local cubic coefficients")?;
         let (left, right) = self.span_interval(span_idx)?;
-        let span_points = sampled_span_points(left, right);
-        let values = self.design(&span_points)?.dot(beta);
-        local_cubic_from_uniform_span_samples(
-            left, right, values[0], values[1], values[2], values[3],
-        )
+        Ok(exact_kernel::LocalSpanCubic {
+            left,
+            right,
+            c0: self.span_c0.row(span_idx).dot(beta),
+            c1: self.span_c1.row(span_idx).dot(beta),
+            c2: self.span_c2.row(span_idx).dot(beta),
+            c3: self.span_c3.row(span_idx).dot(beta),
+        })
     }
 
     pub fn basis_span_cubic(
@@ -495,16 +522,14 @@ impl DeviationRuntime {
             ));
         }
         let (left, right) = self.span_interval(span_idx)?;
-        let span_points = sampled_span_points(left, right);
-        let values = self.design(&span_points)?;
-        local_cubic_from_uniform_span_samples(
+        Ok(exact_kernel::LocalSpanCubic {
             left,
             right,
-            values[[0, basis_idx]],
-            values[[1, basis_idx]],
-            values[[2, basis_idx]],
-            values[[3, basis_idx]],
-        )
+            c0: self.span_c0[[span_idx, basis_idx]],
+            c1: self.span_c1[[span_idx, basis_idx]],
+            c2: self.span_c2[[span_idx, basis_idx]],
+            c3: self.span_c3[[span_idx, basis_idx]],
+        })
     }
 
     /// Return the correct per-basis `LocalSpanCubic` for any evaluation
@@ -527,7 +552,7 @@ impl DeviationRuntime {
             return Ok(exact_kernel::LocalSpanCubic {
                 left: left_ep,
                 right: left_ep + 1.0,
-                c0: self.span_left_value_design[[0, basis_idx]],
+                c0: self.span_c0[[0, basis_idx]],
                 c1: 0.0,
                 c2: 0.0,
                 c3: 0.0,
@@ -586,7 +611,7 @@ impl DeviationRuntime {
     /// Left-tail constant: deviation value at the leftmost breakpoint.
     /// For anchored I-spline bases this is the anchor value (typically 0).
     fn left_tail_value(&self, beta: &Array1<f64>) -> f64 {
-        self.span_left_value_design.row(0).dot(beta)
+        self.span_c0.row(0).dot(beta)
     }
 
     /// Right-tail constant: deviation value at the rightmost breakpoint.
@@ -622,31 +647,29 @@ impl DeviationRuntime {
             return Err(bad);
         }
 
-        let d1_left = self.span_left_d1_design.dot(beta);
-        let d1_right = self.span_right_d1_design.dot(beta);
-        let d2_left = self.span_left_d2_design.dot(beta);
-        let d3_mid = self.span_mid_d3_design.dot(beta);
-
         let mut min_slack = f64::INFINITY;
-        for span_idx in 0..self.span_left_points.len() {
-            let left = self.span_left_points[span_idx];
-            let right = self.span_right_points[span_idx];
+        for span_idx in 0..self.span_count() {
+            let left = self.endpoint_points[span_idx];
+            let right = self.endpoint_points[span_idx + 1];
             let width = right - left;
             if !width.is_finite() || width <= 0.0 {
                 continue;
             }
-            let left_slack = 1.0 + d1_left[span_idx] - self.monotonicity_eps;
-            let right_slack = 1.0 + d1_right[span_idx] - self.monotonicity_eps;
+            let c1 = self.span_c1.row(span_idx).dot(beta);
+            let c2 = self.span_c2.row(span_idx).dot(beta);
+            let c3 = self.span_c3.row(span_idx).dot(beta);
+            let d1_left = c1;
+            let d1_right = c1 + 2.0 * c2 * width + 3.0 * c3 * width * width;
+            let d2_left = 2.0 * c2;
+            let d3 = 6.0 * c3;
+            let left_slack = 1.0 + d1_left - self.monotonicity_eps;
+            let right_slack = 1.0 + d1_right - self.monotonicity_eps;
             min_slack = min_slack.min(left_slack.min(right_slack));
 
-            let curvature = d3_mid[span_idx];
-            if curvature > 0.0 {
-                let t_star = -d2_left[span_idx] / curvature;
+            if d3 > 0.0 {
+                let t_star = -d2_left / d3;
                 if t_star > 0.0 && t_star < width {
-                    let interior = 1.0
-                        + d1_left[span_idx]
-                        + d2_left[span_idx] * t_star
-                        + 0.5 * curvature * t_star * t_star
+                    let interior = 1.0 + d1_left + d2_left * t_star + 0.5 * d3 * t_star * t_star
                         - self.monotonicity_eps;
                     min_slack = min_slack.min(interior);
                 }
