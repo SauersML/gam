@@ -36,12 +36,8 @@ use std::sync::Arc;
 
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
-pub use deviation_runtime::{
-    DeviationRuntime, local_cubic_from_uniform_span_samples, sampled_span_points,
-};
-pub(crate) use deviation_runtime::{
-    anchored_deviation_basis_with_transform, derive_deviation_basis_transform,
-};
+pub use deviation_runtime::DeviationRuntime;
+pub(crate) use deviation_runtime::derive_deviation_basis_transform;
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -1872,6 +1868,25 @@ impl BernoulliMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
         probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
+    #[inline]
+    fn exact_newton_score_component_from_objective_gradient(
+        objective_gradient_component: f64,
+    ) -> f64 {
+        -objective_gradient_component
+    }
+
+    #[inline]
+    fn exact_newton_score_from_objective_gradient(objective_gradient: Array1<f64>) -> Array1<f64> {
+        -objective_gradient
+    }
+
+    #[inline]
+    fn exact_newton_observed_information_from_objective_hessian(
+        objective_hessian: Array2<f64>,
+    ) -> Array2<f64> {
+        objective_hessian
     }
 
     #[inline]
@@ -5841,14 +5856,19 @@ impl BernoulliMarginalSlopeFamily {
         // ── Joint-then-slice path (rigid, p < 512) ──────────────────────
         //
         // Block Hessians are principal blocks of the joint Hessian—never
-        // independently derived.  The RowKernel<2> is the single source of
-        // truth for gradient, Hessian, and log-likelihood.
+        // independently derived. The RowKernel<2> is the single source of
+        // truth in objective space (negative log-likelihood), and the family
+        // score/observed-information convention is applied once here.
         if !flex_active && slices.total < 512 {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern)?;
             let ll = row_kernel_log_likelihood(&cache);
-            let joint_gradient = -row_kernel_gradient(&kern, &cache);
-            let joint_hessian = row_kernel_hessian_dense(&kern, &cache);
+            let joint_gradient = Self::exact_newton_score_from_objective_gradient(
+                row_kernel_gradient(&kern, &cache),
+            );
+            let joint_hessian = Self::exact_newton_observed_information_from_objective_hessian(
+                row_kernel_hessian_dense(&kern, &cache),
+            );
             let mut block_gradients = vec![
                 joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
                 joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
@@ -5902,22 +5922,32 @@ impl BernoulliMarginalSlopeFamily {
                 ll -= row_neglog;
                 {
                     let mut m = grad_marginal.view_mut();
-                    self.marginal_design
-                        .axpy_row_into(row, -scratch.grad[0], &mut m)?;
+                    self.marginal_design.axpy_row_into(
+                        row,
+                        Self::exact_newton_score_component_from_objective_gradient(scratch.grad[0]),
+                        &mut m,
+                    )?;
                 }
                 {
                     let mut g = grad_logslope.view_mut();
-                    self.logslope_design
-                        .axpy_row_into(row, -scratch.grad[1], &mut g)?;
+                    self.logslope_design.axpy_row_into(
+                        row,
+                        Self::exact_newton_score_component_from_objective_gradient(scratch.grad[1]),
+                        &mut g,
+                    )?;
                 }
                 if let (Some(ph), Some(gh)) = (primary.h.as_ref(), grad_h.as_mut()) {
                     for idx in 0..ph.len() {
-                        gh[idx] -= scratch.grad[ph.start + idx];
+                        gh[idx] += Self::exact_newton_score_component_from_objective_gradient(
+                            scratch.grad[ph.start + idx],
+                        );
                     }
                 }
                 if let (Some(pw), Some(gw)) = (primary.w.as_ref(), grad_w.as_mut()) {
                     for idx in 0..pw.len() {
-                        gw[idx] -= scratch.grad[pw.start + idx];
+                        gw[idx] += Self::exact_newton_score_component_from_objective_gradient(
+                            scratch.grad[pw.start + idx],
+                        );
                     }
                 }
             }
@@ -5991,13 +6021,19 @@ impl BernoulliMarginalSlopeFamily {
 
                 {
                     let mut marginal = grad_marginal.view_mut();
-                    self.marginal_design
-                        .axpy_row_into(row, -(u1 * deta_dq), &mut marginal)?;
+                    self.marginal_design.axpy_row_into(
+                        row,
+                        Self::exact_newton_score_component_from_objective_gradient(u1 * deta_dq),
+                        &mut marginal,
+                    )?;
                 }
                 {
                     let mut logslope = grad_logslope.view_mut();
-                    self.logslope_design
-                        .axpy_row_into(row, -(u1 * deta_dg), &mut logslope)?;
+                    self.logslope_design.axpy_row_into(
+                        row,
+                        Self::exact_newton_score_component_from_objective_gradient(u1 * deta_dg),
+                        &mut logslope,
+                    )?;
                 }
                 self.marginal_design.syr_row_into(
                     row,
@@ -6074,8 +6110,10 @@ impl BernoulliMarginalSlopeFamily {
                         &mut scratch,
                     )?;
                     acc.ll -= row_neglog;
-                    grad_marginal_weights[local_row] = -scratch.grad[0];
-                    grad_logslope_weights[local_row] = -scratch.grad[1];
+                    grad_marginal_weights[local_row] =
+                        Self::exact_newton_score_component_from_objective_gradient(scratch.grad[0]);
+                    grad_logslope_weights[local_row] =
+                        Self::exact_newton_score_component_from_objective_gradient(scratch.grad[1]);
                     hess_marginal_weights[local_row] = scratch.hess[[0, 0]];
                     hess_logslope_weights[local_row] = scratch.hess[[1, 1]];
 
@@ -6083,7 +6121,10 @@ impl BernoulliMarginalSlopeFamily {
                         (primary.h.as_ref(), acc.grad_h.as_mut(), acc.hess_h.as_mut())
                     {
                         for idx in 0..primary_h.len() {
-                            grad_h[idx] -= scratch.grad[primary_h.start + idx];
+                            grad_h[idx] +=
+                                Self::exact_newton_score_component_from_objective_gradient(
+                                    scratch.grad[primary_h.start + idx],
+                                );
                         }
                         for row_h in 0..primary_h.len() {
                             for col_h in 0..primary_h.len() {
@@ -6096,7 +6137,10 @@ impl BernoulliMarginalSlopeFamily {
                         (primary.w.as_ref(), acc.grad_w.as_mut(), acc.hess_w.as_mut())
                     {
                         for idx in 0..primary_w.len() {
-                            grad_w[idx] -= scratch.grad[primary_w.start + idx];
+                            grad_w[idx] +=
+                                Self::exact_newton_score_component_from_objective_gradient(
+                                    scratch.grad[primary_w.start + idx],
+                                );
                         }
                         for row_w in 0..primary_w.len() {
                             for col_w in 0..primary_w.len() {
@@ -8256,16 +8300,22 @@ mod tests {
         let (_, primary_grad, primary_hess) = family
             .compute_row_primary_gradient_hessian(0, &block_states, &cache.primary, &row_ctx)
             .expect("rigid exact row derivatives");
+        let expected_score_q =
+            BernoulliMarginalSlopeFamily::exact_newton_score_component_from_objective_gradient(
+                primary_grad[0],
+            );
+        let expected_score_g =
+            BernoulliMarginalSlopeFamily::exact_newton_score_component_from_objective_gradient(
+                primary_grad[1],
+            );
 
         assert!(
-            (grad_q + primary_grad[0]).abs() < 1e-10,
-            "marginal gradient mismatch: fast={grad_q:.12e}, exact={:.12e}",
-            -primary_grad[0]
+            (grad_q - expected_score_q).abs() < 1e-10,
+            "marginal gradient mismatch: fast={grad_q:.12e}, exact={expected_score_q:.12e}"
         );
         assert!(
-            (grad_g + primary_grad[1]).abs() < 1e-10,
-            "logslope gradient mismatch: fast={grad_g:.12e}, exact={:.12e}",
-            -primary_grad[1]
+            (grad_g - expected_score_g).abs() < 1e-10,
+            "logslope gradient mismatch: fast={grad_g:.12e}, exact={expected_score_g:.12e}"
         );
         assert!(
             (hess_qq - primary_hess[[0, 0]]).abs() < 1e-10,

@@ -1287,6 +1287,245 @@ impl HyperOperator for BlockHessianOperator {
         let v_m = v.slice(s![self.slices.marginal.clone()]);
         let v_g = v.slice(s![self.slices.logslope.clone()]);
         let v_h = self
+            /*
+            // This file contains the lifted pullback methods for BlockHessianAccumulator.
+            // It will be included via a separate impl block.
+            // The methods implement eq (15), (47) terms 1-5 from the unified row-primary
+            // pullback framework for flexible survival with timewiggle.
+            impl BlockHessianAccumulator {
+                /// Lifted pullback: J^T H J + Σ_a f_a K_a using actual Jacobians from
+                /// q-geometry. Handles timewiggle T'(h) factors and K ≠ 0 correctly.
+                fn add_pullback_with_q_geometry(
+                    &mut self, family: &SurvivalMarginalSlopeFamily, row: usize,
+                    qg: &SurvivalMarginalSlopeDynamicRow, fg: &Array1<f64>, ph: &Array2<f64>,
+                ) {
+                    let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
+                    let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
+                    let ktt = [&qg.d2q0_time_time, &qg.d2q1_time_time, &qg.d2qd1_time_time];
+                    let ktm = [&qg.d2q0_time_marginal, &qg.d2q1_time_marginal, &qg.d2qd1_time_marginal];
+                    let kmm = [&qg.d2q0_marginal_marginal, &qg.d2q1_marginal_marginal, &qg.d2qd1_marginal_marginal];
+                    let pt = jt[0].len();
+                    let pm = jm[0].len();
+                    for a in 0..pt { for b in 0..pt {
+                        let mut v = 0.0;
+                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * jt[u][a] * jt[w][b]; } }
+                        for u in 0..3 { v += fg[u] * ktt[u][[a,b]]; }
+                        self.h_tt[[a,b]] += v;
+                    }}
+                    for a in 0..pm { for b in 0..pm {
+                        let mut v = 0.0;
+                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * jm[u][a] * jm[w][b]; } }
+                        for u in 0..3 { v += fg[u] * kmm[u][[a,b]]; }
+                        self.h_mm[[a,b]] += v;
+                    }}
+                    family.logslope_design.syr_row_into(row, ph[[3,3]], &mut self.h_gg).expect("gg syr");
+                    for a in 0..pt { for b in 0..pm {
+                        let mut v = 0.0;
+                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * jt[u][a] * jm[w][b]; } }
+                        for u in 0..3 { v += fg[u] * ktm[u][[a,b]]; }
+                        self.h_tm[[a,b]] += v;
+                    }}
+                    let gc = family.logslope_design.row_chunk(row..row+1);
+                    let gr = gc.row(0);
+                    for a in 0..pt {
+                        let mut w = 0.0; for u in 0..3 { w += ph[[u,3]] * jt[u][a]; }
+                        if w != 0.0 { for b in 0..gr.len() { self.h_tg[[a,b]] += w * gr[b]; } }
+                    }
+                    for a in 0..pm {
+                        let mut w = 0.0; for u in 0..3 { w += ph[[u,3]] * jm[u][a]; }
+                        if w != 0.0 { for b in 0..gr.len() { self.h_mg[[a,b]] += w * gr[b]; } }
+                    }
+                    let pl = flex_primary_slices(family);
+                    if let Some(hr) = pl.h.as_ref() {
+                        for li in 0..hr.len() { let ix = hr.start+li;
+                            for a in 0..pt { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*jt[u][a]; } self.h_th[[a,li]] += w; }
+                            for a in 0..pm { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*jm[u][a]; } self.h_mh[[a,li]] += w; }
+                            let gw = ph[[3,ix]]; if gw!=0.0 { for b in 0..gr.len() { self.h_gh[[b,li]] += gw*gr[b]; } }
+                        }
+                        for l in 0..hr.len() { for r in 0..hr.len() { self.h_hh[[l,r]] += ph[[hr.start+l,hr.start+r]]; } }
+                    }
+                    if let Some(wr) = pl.w.as_ref() {
+                        for li in 0..wr.len() { let ix = wr.start+li;
+                            for a in 0..pt { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*jt[u][a]; } self.h_tw[[a,li]] += w; }
+                            for a in 0..pm { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*jm[u][a]; } self.h_mw[[a,li]] += w; }
+                            let gw = ph[[3,ix]]; if gw!=0.0 { for b in 0..gr.len() { self.h_gw[[b,li]] += gw*gr[b]; } }
+                        }
+                        for l in 0..wr.len() { for r in 0..wr.len() { self.h_ww[[l,r]] += ph[[wr.start+l,wr.start+r]]; } }
+                    }
+                    if let (Some(hr),Some(wr)) = (pl.h.as_ref(),pl.w.as_ref()) {
+                        for hl in 0..hr.len() { for wl in 0..wr.len() { self.h_hw[[hl,wl]] += ph[[hr.start+hl,wr.start+wl]]; } }
+                    }
+                }
+                /// U^α cross terms (eq 47, terms 1+2): (U_B^α)^T H J_C + J_B^T H U_C^α
+                fn add_timewiggle_psi_u_cross(&mut self, family: &SurvivalMarginalSlopeFamily, row: usize,
+                    qg: &SurvivalMarginalSlopeDynamicRow, lift: &TimewiggleMarginalPsiRowLift, ph: &Array2<f64>)
+                {
+                    let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
+                    let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
+                    let ut = [&lift.u_q0_time, &lift.u_q1_time, &lift.u_qd1_time];
+                    let um = [&lift.u_q0_marginal, &lift.u_q1_marginal, &lift.u_qd1_marginal];
+                    let pt = jt[0].len(); let pm = jm[0].len();
+                    for a in 0..pt { for b in 0..pt {
+                        let mut v = 0.0;
+                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * (ut[u][a]*jt[w][b] + jt[u][a]*ut[w][b]); } }
+                        self.h_tt[[a,b]] += v;
+                    }}
+                    for a in 0..pm { for b in 0..pm {
+                        let mut v = 0.0;
+                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * (um[u][a]*jm[w][b] + jm[u][a]*um[w][b]); } }
+                        self.h_mm[[a,b]] += v;
+                    }}
+                    for a in 0..pt { for b in 0..pm {
+                        let mut v = 0.0;
+                        for u in 0..3 { for w in 0..3 { v += ph[[u,w]] * (ut[u][a]*jm[w][b] + jt[u][a]*um[w][b]); } }
+                        self.h_tm[[a,b]] += v;
+                    }}
+                    let gc = family.logslope_design.row_chunk(row..row+1); let gr = gc.row(0);
+                    for a in 0..pt {
+                        let mut wt = 0.0; for u in 0..3 { wt += ph[[u,3]] * ut[u][a]; }
+                        if wt != 0.0 { for b in 0..gr.len() { self.h_tg[[a,b]] += wt*gr[b]; } }
+                    }
+                    for a in 0..pm {
+                        let mut wt = 0.0; for u in 0..3 { wt += ph[[u,3]] * um[u][a]; }
+                        if wt != 0.0 { for b in 0..gr.len() { self.h_mg[[a,b]] += wt*gr[b]; } }
+                    }
+                    let pl = flex_primary_slices(family);
+                    if let Some(hr) = pl.h.as_ref() { for li in 0..hr.len() { let ix = hr.start+li;
+                        for a in 0..pt { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*ut[u][a]; } self.h_th[[a,li]] += w; }
+                        for a in 0..pm { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*um[u][a]; } self.h_mh[[a,li]] += w; }
+                    }}
+                    if let Some(wr) = pl.w.as_ref() { for li in 0..wr.len() { let ix = wr.start+li;
+                        for a in 0..pt { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*ut[u][a]; } self.h_tw[[a,li]] += w; }
+                        for a in 0..pm { let mut w=0.0; for u in 0..3 { w += ph[[u,ix]]*um[u][a]; } self.h_mw[[a,li]] += w; }
+                    }}
+                }
+                /// K^{BC,α} terms (eq 47, term 5): Σ_a f_a K_a^{BC,α}
+                fn add_timewiggle_psi_kappa_alpha(&mut self, family: &SurvivalMarginalSlopeFamily,
+                    lift: &TimewiggleMarginalPsiRowLift, fg: &Array1<f64>)
+                {
+                    let tw = family.time_wiggle_range();
+                    let pb = lift.x_entry_base.len();
+                    let pm = lift.marginal_row.len();
+                    let mu = lift.mu;
+                    // q0 (entry)
+                    let fq0 = fg[0];
+                    if fq0 != 0.0 {
+                        let (m3,m2) = (lift.entry_m3, lift.entry_m2);
+                        for i in 0..pb { for j in 0..pb { self.h_tt[[i,j]] += fq0*m3*mu*lift.x_entry_base[i]*lift.x_entry_base[j]; } }
+                        for loc in 0..tw.len() { let ti=tw.start+loc; for i in 0..pb {
+                            let v = fq0*lift.entry_basis_d2[loc]*mu*lift.x_entry_base[i]; self.h_tt[[i,ti]] += v; self.h_tt[[ti,i]] += v;
+                        }}
+                        for i in 0..pb { for j in 0..pm {
+                            self.h_tm[[i,j]] += fq0*(m3*mu*lift.x_entry_base[i]*lift.marginal_row[j] + m2*lift.x_entry_base[i]*lift.psi_row[j]);
+                        }}
+                        for loc in 0..tw.len() { let ti=tw.start+loc; for j in 0..pm {
+                            self.h_tm[[ti,j]] += fq0*(lift.entry_basis_d2[loc]*mu*lift.marginal_row[j] + lift.entry_basis_d1[loc]*lift.psi_row[j]);
+                        }}
+                        for i in 0..pm { for j in 0..pm {
+                            self.h_mm[[i,j]] += fq0*(m3*mu*lift.marginal_row[i]*lift.marginal_row[j]
+                                + m2*(lift.psi_row[i]*lift.marginal_row[j]+lift.marginal_row[i]*lift.psi_row[j]));
+                        }}
+                    }
+                    // q1 (exit)
+                    let fq1 = fg[1];
+                    if fq1 != 0.0 {
+                        let (m3,m2) = (lift.exit_m3, lift.exit_m2);
+                        for i in 0..pb { for j in 0..pb { self.h_tt[[i,j]] += fq1*m3*mu*lift.x_exit_base[i]*lift.x_exit_base[j]; } }
+                        for loc in 0..tw.len() { let ti=tw.start+loc; for i in 0..pb {
+                            let v = fq1*lift.exit_basis_d2[loc]*mu*lift.x_exit_base[i]; self.h_tt[[i,ti]] += v; self.h_tt[[ti,i]] += v;
+                        }}
+                        for i in 0..pb { for j in 0..pm {
+                            self.h_tm[[i,j]] += fq1*(m3*mu*lift.x_exit_base[i]*lift.marginal_row[j] + m2*lift.x_exit_base[i]*lift.psi_row[j]);
+                        }}
+                        for loc in 0..tw.len() { let ti=tw.start+loc; for j in 0..pm {
+                            self.h_tm[[ti,j]] += fq1*(lift.exit_basis_d2[loc]*mu*lift.marginal_row[j] + lift.exit_basis_d1[loc]*lift.psi_row[j]);
+                        }}
+                        for i in 0..pm { for j in 0..pm {
+                            self.h_mm[[i,j]] += fq1*(m3*mu*lift.marginal_row[i]*lift.marginal_row[j]
+                                + m2*(lift.psi_row[i]*lift.marginal_row[j]+lift.marginal_row[i]*lift.psi_row[j]));
+                        }}
+                    }
+                    // qd1 (exit, includes d_raw)
+                    let fqd = fg[2];
+                    if fqd != 0.0 {
+                        let (m4,m3,m2,dr) = (lift.exit_m4, lift.exit_m3, lift.exit_m2, lift.d_raw);
+                        for i in 0..pb { for j in 0..pb {
+                            self.h_tt[[i,j]] += fqd*(m4*mu*dr*lift.x_exit_base[i]*lift.x_exit_base[j]
+                                + m3*mu*(lift.x_exit_base[i]*lift.x_deriv_base[j]+lift.x_deriv_base[i]*lift.x_exit_base[j]));
+                        }}
+                        for loc in 0..tw.len() { let ti=tw.start+loc; for i in 0..pb {
+                            let v = fqd*(lift.exit_basis_d3[loc]*mu*dr*lift.x_exit_base[i] + lift.exit_basis_d2[loc]*mu*lift.x_deriv_base[i]);
+                            self.h_tt[[i,ti]] += v; self.h_tt[[ti,i]] += v;
+                        }}
+                        for i in 0..pb { for j in 0..pm {
+                            self.h_tm[[i,j]] += fqd*(m4*mu*dr*lift.x_exit_base[i]*lift.marginal_row[j]
+                                + m3*dr*lift.x_exit_base[i]*lift.psi_row[j]
+                                + m3*mu*lift.x_deriv_base[i]*lift.marginal_row[j]
+                                + m2*lift.x_deriv_base[i]*lift.psi_row[j]);
+                        }}
+                        for loc in 0..tw.len() { let ti=tw.start+loc; for j in 0..pm {
+                            self.h_tm[[ti,j]] += fqd*(lift.exit_basis_d3[loc]*mu*dr*lift.marginal_row[j] + lift.exit_basis_d2[loc]*dr*lift.psi_row[j]);
+                        }}
+                        for i in 0..pm { for j in 0..pm {
+                            self.h_mm[[i,j]] += fqd*(m4*mu*dr*lift.marginal_row[i]*lift.marginal_row[j]
+                                + m3*dr*(lift.psi_row[i]*lift.marginal_row[j]+lift.marginal_row[i]*lift.psi_row[j]));
+                        }}
+                    }
+                }
+                /// Σ_a w_a K_a^{BC}: second-pullback weighted by arbitrary vector (eq 47, term 4)
+                fn add_second_pullback_weighted(&mut self, qg: &SurvivalMarginalSlopeDynamicRow, w: &Array1<f64>) {
+                    let ktt = [&qg.d2q0_time_time, &qg.d2q1_time_time, &qg.d2qd1_time_time];
+                    let ktm = [&qg.d2q0_time_marginal, &qg.d2q1_time_marginal, &qg.d2qd1_time_marginal];
+                    let kmm = [&qg.d2q0_marginal_marginal, &qg.d2q1_marginal_marginal, &qg.d2qd1_marginal_marginal];
+                    let pt = ktt[0].nrows(); let pm = kmm[0].nrows();
+                    for q in 0..3 { let wq = w[q]; if wq == 0.0 { continue; }
+                        for a in 0..pt { for b in 0..pt { self.h_tt[[a,b]] += wq * ktt[q][[a,b]]; } }
+                        for a in 0..pt { for b in 0..pm { self.h_tm[[a,b]] += wq * ktm[q][[a,b]]; } }
+                        for a in 0..pm { for b in 0..pm { self.h_mm[[a,b]] += wq * kmm[q][[a,b]]; } }
+                    }
+                }
+                /// Rank-1 psi cross with actual Jacobians from q-geometry
+                fn add_rank1_psi_cross_with_q_geometry(&mut self, family: &SurvivalMarginalSlopeFamily,
+                    row: usize, qg: &SurvivalMarginalSlopeDynamicRow, psi_block: usize,
+                    psi_row: &Array1<f64>, rp: &Array1<f64>)
+                {
+                    let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
+                    let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
+                    let pt = jt[0].len(); let pm = jm[0].len();
+                    for a in 0..pt {
+                        let mut w = 0.0; for q in 0..3 { w += rp[q]*jt[q][a]; }
+                        if w == 0.0 { continue; }
+                        let tgt = match psi_block { 1 => &mut self.h_tm, 2 => &mut self.h_tg, _ => continue };
+                        for b in 0..psi_row.len() { tgt[[a,b]] += w*psi_row[b]; }
+                    }
+                    for a in 0..pm {
+                        let mut w = 0.0; for q in 0..3 { w += rp[q]*jm[q][a]; }
+                        if w == 0.0 { continue; }
+                        match psi_block {
+                            1 => { for b in 0..psi_row.len() { self.h_mm[[a,b]] += w*psi_row[b]; self.h_mm[[b,a]] += w*psi_row[b]; } }
+                            2 => { for b in 0..psi_row.len() { self.h_mg[[a,b]] += w*psi_row[b]; } }
+                            _ => {}
+                        }
+                    }
+                    let gc = family.logslope_design.row_chunk(row..row+1); let gr = gc.row(0);
+                    let gw = rp[3];
+                    if gw != 0.0 { match psi_block {
+                        1 => { for a in 0..gr.len() { for b in 0..psi_row.len() { self.h_mg[[b,a]] += gw*gr[a]*psi_row[b]; } } }
+                        2 => { for a in 0..gr.len() { for b in 0..psi_row.len() { self.h_gg[[a,b]] += gw*gr[a]*psi_row[b]; self.h_gg[[b,a]] += gw*gr[a]*psi_row[b]; } } }
+                        _ => {}
+                    }}
+                    let pl = flex_primary_slices(family);
+                    if let Some(hr) = pl.h.as_ref() { for li in 0..hr.len() { let hw = rp[hr.start+li]; if hw==0.0 { continue; }
+                        match psi_block { 1 => { for b in 0..psi_row.len() { self.h_mh[[b,li]] += hw*psi_row[b]; } }
+                                          2 => { for b in 0..psi_row.len() { self.h_gh[[b,li]] += hw*psi_row[b]; } } _ => {} }
+                    }}
+                    if let Some(wr) = pl.w.as_ref() { for li in 0..wr.len() { let ww = rp[wr.start+li]; if ww==0.0 { continue; }
+                        match psi_block { 1 => { for b in 0..psi_row.len() { self.h_mw[[b,li]] += ww*psi_row[b]; } }
+                                          2 => { for b in 0..psi_row.len() { self.h_gw[[b,li]] += ww*psi_row[b]; } } _ => {} }
+                    }}
+                }
+            }
+                        */
             .slices
             .score_warp
             .as_ref()
@@ -1943,6 +2182,481 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         Ok(out)
+    }
+
+    fn timewiggle_marginal_psi_row_lift(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &FlexPrimarySlices,
+        psi_row: &Array1<f64>,
+        beta_marginal: &Array1<f64>,
+    ) -> Result<TimewiggleMarginalPsiRowLift, String> {
+        let beta_time = &block_states[0].beta;
+        let p_time = beta_time.len();
+        let time_tail = self.time_wiggle_range();
+        let p_base = time_tail.start;
+        let beta_time_w = beta_time.slice(s![time_tail.clone()]);
+        let entry_chunk = self.design_entry.row_chunk(row..row + 1);
+        let exit_chunk = self.design_exit.row_chunk(row..row + 1);
+        let deriv_chunk = self.design_derivative_exit.row_chunk(row..row + 1);
+        let x_entry_base = entry_chunk.row(0).slice(s![..p_base]).to_owned();
+        let x_exit_base = exit_chunk.row(0).slice(s![..p_base]).to_owned();
+        let x_deriv_base = deriv_chunk.row(0).slice(s![..p_base]).to_owned();
+        let marginal_chunk = self.marginal_design.row_chunk(row..row + 1);
+        let marginal_row = marginal_chunk.row(0).to_owned();
+
+        let base_marginal = block_states[1].eta[row];
+        let h0 = x_entry_base.dot(&beta_time.slice(s![..p_base]))
+            + self.offset_entry[row]
+            + base_marginal;
+        let h1 =
+            x_exit_base.dot(&beta_time.slice(s![..p_base])) + self.offset_exit[row] + base_marginal;
+        let d_raw =
+            x_deriv_base.dot(&beta_time.slice(s![..p_base])) + self.derivative_offset_exit[row];
+        let entry_geom = self
+            .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
+            .ok_or_else(|| "missing entry timewiggle geometry for marginal psi lift".to_string())?;
+        let exit_geom = self
+            .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
+            .ok_or_else(|| "missing exit timewiggle geometry for marginal psi lift".to_string())?;
+
+        let mu = psi_row.dot(beta_marginal);
+        let mut dir = Array1::<f64>::zeros(primary.total);
+        dir[primary.q0] = entry_geom.dq_dq0[0] * mu;
+        dir[primary.q1] = exit_geom.dq_dq0[0] * mu;
+        dir[primary.qd1] = exit_geom.d2q_dq02[0] * d_raw * mu;
+
+        let mut u_q0_time = Array1::<f64>::zeros(p_time);
+        let mut u_q1_time = Array1::<f64>::zeros(p_time);
+        let mut u_qd1_time = Array1::<f64>::zeros(p_time);
+        for j in 0..p_base {
+            u_q0_time[j] = entry_geom.d2q_dq02[0] * mu * x_entry_base[j];
+            u_q1_time[j] = exit_geom.d2q_dq02[0] * mu * x_exit_base[j];
+            u_qd1_time[j] = mu
+                * (exit_geom.d3q_dq03[0] * d_raw * x_exit_base[j]
+                    + exit_geom.d2q_dq02[0] * x_deriv_base[j]);
+        }
+        for local_idx in 0..time_tail.len() {
+            let coeff_idx = time_tail.start + local_idx;
+            u_q0_time[coeff_idx] = entry_geom.basis_d1[[0, local_idx]] * mu;
+            u_q1_time[coeff_idx] = exit_geom.basis_d1[[0, local_idx]] * mu;
+            u_qd1_time[coeff_idx] = exit_geom.basis_d2[[0, local_idx]] * d_raw * mu;
+        }
+
+        let u_q0_marginal =
+            psi_row * entry_geom.dq_dq0[0] + &marginal_row * (entry_geom.d2q_dq02[0] * mu);
+        let u_q1_marginal =
+            psi_row * exit_geom.dq_dq0[0] + &marginal_row * (exit_geom.d2q_dq02[0] * mu);
+        let u_qd1_marginal = psi_row * (exit_geom.d2q_dq02[0] * d_raw)
+            + &marginal_row * (exit_geom.d3q_dq03[0] * d_raw * mu);
+
+        Ok(TimewiggleMarginalPsiRowLift {
+            dir,
+            u_q0_time,
+            u_q1_time,
+            u_qd1_time,
+            u_q0_marginal,
+            u_q1_marginal,
+            u_qd1_marginal,
+            x_entry_base,
+            x_exit_base,
+            x_deriv_base,
+            marginal_row,
+            entry_basis_d1: entry_geom.basis_d1.row(0).to_owned(),
+            entry_basis_d2: entry_geom.basis_d2.row(0).to_owned(),
+            exit_basis_d1: exit_geom.basis_d1.row(0).to_owned(),
+            exit_basis_d2: exit_geom.basis_d2.row(0).to_owned(),
+            exit_basis_d3: exit_geom.basis_d3.row(0).to_owned(),
+            entry_m2: entry_geom.d2q_dq02[0],
+            entry_m3: entry_geom.d3q_dq03[0],
+            exit_m2: exit_geom.d2q_dq02[0],
+            exit_m3: exit_geom.d3q_dq03[0],
+            exit_m4: exit_geom.d4q_dq04[0],
+            d_raw,
+            mu,
+            psi_row: psi_row.clone(),
+        })
+    }
+
+    fn pullback_dynamic_primary_vector_positive(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary: ndarray::ArrayView1<'_, f64>,
+        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+    ) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(slices.total);
+        for coeff_idx in 0..slices.time.len() {
+            out[slices.time.start + coeff_idx] += primary[0] * q_geom.dq0_time[coeff_idx]
+                + primary[1] * q_geom.dq1_time[coeff_idx]
+                + primary[2] * q_geom.dqd1_time[coeff_idx];
+        }
+        for coeff_idx in 0..slices.marginal.len() {
+            out[slices.marginal.start + coeff_idx] += primary[0] * q_geom.dq0_marginal[coeff_idx]
+                + primary[1] * q_geom.dq1_marginal[coeff_idx]
+                + primary[2] * q_geom.dqd1_marginal[coeff_idx];
+        }
+        let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
+        let logslope_row = logslope_chunk.row(0);
+        for coeff_idx in 0..slices.logslope.len() {
+            out[slices.logslope.start + coeff_idx] += primary[3] * logslope_row[coeff_idx];
+        }
+        for (primary_range, joint_range) in identity_blocks {
+            out.slice_mut(s![joint_range.clone()])
+                .assign(&primary.slice(s![primary_range.clone()]));
+        }
+        out
+    }
+
+    fn accumulate_dynamic_q_joint_row_positive(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+        joint_gradient: &mut Array1<f64>,
+        joint_hessian: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+        for (q_idx, dq) in dq_time.iter().enumerate() {
+            for coeff_idx in 0..dq.len() {
+                joint_gradient[slices.time.start + coeff_idx] +=
+                    primary_gradient[q_idx] * dq[coeff_idx];
+            }
+        }
+        for (q_idx, dq) in dq_marginal.iter().enumerate() {
+            for coeff_idx in 0..dq.len() {
+                joint_gradient[slices.marginal.start + coeff_idx] +=
+                    primary_gradient[q_idx] * dq[coeff_idx];
+            }
+        }
+        self.logslope_design.axpy_row_into(
+            row,
+            primary_gradient[3],
+            &mut joint_gradient.slice_mut(s![slices.logslope.clone()]),
+        )?;
+        self.accumulate_dynamic_q_core_hessian(
+            row,
+            slices,
+            q_geom,
+            primary_gradient.slice(s![0..N_PRIMARY]),
+            primary_hessian.slice(s![0..N_PRIMARY, 0..N_PRIMARY]),
+            joint_hessian,
+        );
+        for (primary_range, joint_range) in identity_blocks {
+            for local in 0..primary_range.len() {
+                joint_gradient[joint_range.start + local] +=
+                    primary_gradient[primary_range.start + local];
+                self.accumulate_identity_primary_cross_hessian(
+                    row,
+                    slices,
+                    q_geom,
+                    primary_hessian.slice(s![0..N_PRIMARY, primary_range.start + local]),
+                    joint_range,
+                    local,
+                    joint_hessian,
+                );
+            }
+            self.add_dense_submatrix(
+                joint_hessian,
+                joint_range,
+                joint_range,
+                primary_hessian.slice(s![primary_range.clone(), primary_range.clone()]),
+            );
+        }
+        if identity_blocks.len() == 2 {
+            self.add_dense_symmetric_cross_submatrix(
+                joint_hessian,
+                &identity_blocks[0].1,
+                &identity_blocks[1].1,
+                primary_hessian.slice(s![
+                    identity_blocks[0].0.clone(),
+                    identity_blocks[1].0.clone()
+                ]),
+            );
+        }
+        Ok(())
+    }
+
+    fn add_symmetric_outer_dense(
+        &self,
+        joint_hessian: &mut Array2<f64>,
+        left: &Array1<f64>,
+        right: &Array1<f64>,
+    ) {
+        for i in 0..left.len() {
+            if left[i] == 0.0 {
+                continue;
+            }
+            for j in 0..right.len() {
+                let value = left[i] * right[j] + right[i] * left[j];
+                if value != 0.0 {
+                    joint_hessian[[i, j]] += value;
+                }
+            }
+        }
+    }
+
+    fn timewiggle_marginal_psi_left_joint(
+        &self,
+        slices: &BlockSlices,
+        q_idx: usize,
+        lift: &TimewiggleMarginalPsiRowLift,
+    ) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(slices.total);
+        match q_idx {
+            0 => {
+                out.slice_mut(s![slices.time.clone()])
+                    .assign(&lift.u_q0_time);
+                out.slice_mut(s![slices.marginal.clone()])
+                    .assign(&lift.u_q0_marginal);
+            }
+            1 => {
+                out.slice_mut(s![slices.time.clone()])
+                    .assign(&lift.u_q1_time);
+                out.slice_mut(s![slices.marginal.clone()])
+                    .assign(&lift.u_q1_marginal);
+            }
+            2 => {
+                out.slice_mut(s![slices.time.clone()])
+                    .assign(&lift.u_qd1_time);
+                out.slice_mut(s![slices.marginal.clone()])
+                    .assign(&lift.u_qd1_marginal);
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn add_timewiggle_marginal_psi_kappa_dense(
+        &self,
+        slices: &BlockSlices,
+        lift: &TimewiggleMarginalPsiRowLift,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        joint_hessian: &mut Array2<f64>,
+    ) {
+        let time_tail = self.time_wiggle_range();
+        let p_base = lift.x_entry_base.len();
+        let p_marginal = lift.marginal_row.len();
+        let t0 = slices.time.start;
+        let m0 = slices.marginal.start;
+
+        let add_tt_sym = |joint_hessian: &mut Array2<f64>, i: usize, j: usize, value: f64| {
+            if value == 0.0 {
+                return;
+            }
+            joint_hessian[[i, j]] += value;
+            if i != j {
+                joint_hessian[[j, i]] += value;
+            }
+        };
+        let add_tm_sym = |joint_hessian: &mut Array2<f64>, i: usize, j: usize, value: f64| {
+            if value == 0.0 {
+                return;
+            }
+            joint_hessian[[i, j]] += value;
+            joint_hessian[[j, i]] += value;
+        };
+
+        let fq0 = primary_gradient[0];
+        if fq0 != 0.0 {
+            for i in 0..p_base {
+                for j in i..p_base {
+                    add_tt_sym(
+                        joint_hessian,
+                        t0 + i,
+                        t0 + j,
+                        fq0 * lift.entry_m3 * lift.mu * lift.x_entry_base[i] * lift.x_entry_base[j],
+                    );
+                }
+            }
+            for local in 0..time_tail.len() {
+                let tw = t0 + time_tail.start + local;
+                for i in 0..p_base {
+                    add_tt_sym(
+                        joint_hessian,
+                        t0 + i,
+                        tw,
+                        fq0 * lift.entry_basis_d2[local] * lift.mu * lift.x_entry_base[i],
+                    );
+                }
+            }
+            for i in 0..p_base {
+                for j in 0..p_marginal {
+                    add_tm_sym(
+                        joint_hessian,
+                        t0 + i,
+                        m0 + j,
+                        fq0 * (lift.entry_m3
+                            * lift.mu
+                            * lift.x_entry_base[i]
+                            * lift.marginal_row[j]
+                            + lift.entry_m2 * lift.x_entry_base[i] * lift.psi_row[j]),
+                    );
+                }
+            }
+            for local in 0..time_tail.len() {
+                let tw = t0 + time_tail.start + local;
+                for j in 0..p_marginal {
+                    add_tm_sym(
+                        joint_hessian,
+                        tw,
+                        m0 + j,
+                        fq0 * (lift.entry_basis_d2[local] * lift.mu * lift.marginal_row[j]
+                            + lift.entry_basis_d1[local] * lift.psi_row[j]),
+                    );
+                }
+            }
+            for i in 0..p_marginal {
+                for j in 0..p_marginal {
+                    joint_hessian[[m0 + i, m0 + j]] += fq0
+                        * (lift.entry_m3 * lift.mu * lift.marginal_row[i] * lift.marginal_row[j]
+                            + lift.entry_m2
+                                * (lift.psi_row[i] * lift.marginal_row[j]
+                                    + lift.marginal_row[i] * lift.psi_row[j]));
+                }
+            }
+        }
+
+        let fq1 = primary_gradient[1];
+        if fq1 != 0.0 {
+            for i in 0..p_base {
+                for j in i..p_base {
+                    add_tt_sym(
+                        joint_hessian,
+                        t0 + i,
+                        t0 + j,
+                        fq1 * lift.exit_m3 * lift.mu * lift.x_exit_base[i] * lift.x_exit_base[j],
+                    );
+                }
+            }
+            for local in 0..time_tail.len() {
+                let tw = t0 + time_tail.start + local;
+                for i in 0..p_base {
+                    add_tt_sym(
+                        joint_hessian,
+                        t0 + i,
+                        tw,
+                        fq1 * lift.exit_basis_d2[local] * lift.mu * lift.x_exit_base[i],
+                    );
+                }
+            }
+            for i in 0..p_base {
+                for j in 0..p_marginal {
+                    add_tm_sym(
+                        joint_hessian,
+                        t0 + i,
+                        m0 + j,
+                        fq1 * (lift.exit_m3 * lift.mu * lift.x_exit_base[i] * lift.marginal_row[j]
+                            + lift.exit_m2 * lift.x_exit_base[i] * lift.psi_row[j]),
+                    );
+                }
+            }
+            for local in 0..time_tail.len() {
+                let tw = t0 + time_tail.start + local;
+                for j in 0..p_marginal {
+                    add_tm_sym(
+                        joint_hessian,
+                        tw,
+                        m0 + j,
+                        fq1 * (lift.exit_basis_d2[local] * lift.mu * lift.marginal_row[j]
+                            + lift.exit_basis_d1[local] * lift.psi_row[j]),
+                    );
+                }
+            }
+            for i in 0..p_marginal {
+                for j in 0..p_marginal {
+                    joint_hessian[[m0 + i, m0 + j]] += fq1
+                        * (lift.exit_m3 * lift.mu * lift.marginal_row[i] * lift.marginal_row[j]
+                            + lift.exit_m2
+                                * (lift.psi_row[i] * lift.marginal_row[j]
+                                    + lift.marginal_row[i] * lift.psi_row[j]));
+                }
+            }
+        }
+
+        let fqd1 = primary_gradient[2];
+        if fqd1 != 0.0 {
+            for i in 0..p_base {
+                for j in i..p_base {
+                    let value = fqd1
+                        * (lift.exit_m4
+                            * lift.mu
+                            * lift.d_raw
+                            * lift.x_exit_base[i]
+                            * lift.x_exit_base[j]
+                            + lift.exit_m3
+                                * lift.mu
+                                * (lift.x_exit_base[i] * lift.x_deriv_base[j]
+                                    + lift.x_deriv_base[i] * lift.x_exit_base[j]));
+                    add_tt_sym(joint_hessian, t0 + i, t0 + j, value);
+                }
+            }
+            for local in 0..time_tail.len() {
+                let tw = t0 + time_tail.start + local;
+                for i in 0..p_base {
+                    let value = fqd1
+                        * (lift.exit_basis_d3[local] * lift.mu * lift.d_raw * lift.x_exit_base[i]
+                            + lift.exit_basis_d2[local] * lift.mu * lift.x_deriv_base[i]);
+                    add_tt_sym(joint_hessian, t0 + i, tw, value);
+                }
+            }
+            for i in 0..p_base {
+                for j in 0..p_marginal {
+                    add_tm_sym(
+                        joint_hessian,
+                        t0 + i,
+                        m0 + j,
+                        fqd1 * (lift.exit_m4
+                            * lift.mu
+                            * lift.d_raw
+                            * lift.x_exit_base[i]
+                            * lift.marginal_row[j]
+                            + lift.exit_m3 * lift.d_raw * lift.x_exit_base[i] * lift.psi_row[j]
+                            + lift.exit_m3 * lift.mu * lift.x_deriv_base[i] * lift.marginal_row[j]
+                            + lift.exit_m2 * lift.x_deriv_base[i] * lift.psi_row[j]),
+                    );
+                }
+            }
+            for local in 0..time_tail.len() {
+                let tw = t0 + time_tail.start + local;
+                for j in 0..p_marginal {
+                    add_tm_sym(
+                        joint_hessian,
+                        tw,
+                        m0 + j,
+                        fqd1 * (lift.exit_basis_d3[local]
+                            * lift.mu
+                            * lift.d_raw
+                            * lift.marginal_row[j]
+                            + lift.exit_basis_d2[local] * lift.d_raw * lift.psi_row[j]),
+                    );
+                }
+            }
+            for i in 0..p_marginal {
+                for j in 0..p_marginal {
+                    joint_hessian[[m0 + i, m0 + j]] += fqd1
+                        * (lift.exit_m4
+                            * lift.mu
+                            * lift.d_raw
+                            * lift.marginal_row[i]
+                            * lift.marginal_row[j]
+                            + lift.exit_m3
+                                * lift.d_raw
+                                * (lift.psi_row[i] * lift.marginal_row[j]
+                                    + lift.marginal_row[i] * lift.psi_row[j]));
+                }
+            }
+        }
     }
 
     fn time_derivative_lower_bound(&self) -> f64 {
@@ -3962,6 +4676,91 @@ impl SurvivalMarginalSlopeFamily {
         second_psi_linear_map(action.as_ref(), dense, total_rows, p).row_vector(row)
     }
 
+    fn shifted_marginal_psi_context(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        local_idx_shift: usize,
+        step: f64,
+    ) -> Result<
+        (
+            Self,
+            Vec<ParameterBlockState>,
+            Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+        ),
+        String,
+    > {
+        let deriv_block = derivative_blocks
+            .get(1)
+            .ok_or_else(|| "missing marginal psi derivative block".to_string())?;
+        let deriv_shift = deriv_block.get(local_idx_shift).ok_or_else(|| {
+            format!("missing marginal psi derivative at local index {local_idx_shift}")
+        })?;
+
+        let mut shifted_family = self.clone();
+        let mut shifted_design = self.marginal_design.to_dense();
+        shifted_design.scaled_add(step, &deriv_shift.x_psi);
+        if let Some(second) = deriv_shift
+            .x_psi_psi
+            .as_ref()
+            .and_then(|rows| rows.get(local_idx_shift))
+        {
+            shifted_design.scaled_add(0.5 * step * step, second);
+        }
+        shifted_family.marginal_design = DesignMatrix::from(shifted_design.clone());
+
+        let mut shifted_states = block_states.to_vec();
+        shifted_states[1].eta = shifted_design.dot(&shifted_states[1].beta);
+
+        let mut shifted_derivatives = derivative_blocks.to_vec();
+        for deriv in shifted_derivatives
+            .get_mut(1)
+            .ok_or_else(|| "missing marginal psi derivative block".to_string())?
+        {
+            if let Some(cross) = deriv
+                .x_psi_psi
+                .as_ref()
+                .and_then(|rows| rows.get(local_idx_shift))
+            {
+                deriv.x_psi.scaled_add(step, cross);
+            }
+        }
+
+        Ok((shifted_family, shifted_states, shifted_derivatives))
+    }
+
+    fn shifted_block_states_along_direction(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        step: f64,
+    ) -> Vec<ParameterBlockState> {
+        let slices = block_slices(self, block_states);
+        let mut shifted_states = block_states.to_vec();
+
+        shifted_states[0].beta = &shifted_states[0].beta
+            + &(d_beta_flat.slice(s![slices.time.clone()]).to_owned() * step);
+        shifted_states[1].beta = &shifted_states[1].beta
+            + &(d_beta_flat.slice(s![slices.marginal.clone()]).to_owned() * step);
+        shifted_states[1].eta = self.marginal_design.dot(&shifted_states[1].beta);
+        shifted_states[2].beta = &shifted_states[2].beta
+            + &(d_beta_flat.slice(s![slices.logslope.clone()]).to_owned() * step);
+        shifted_states[2].eta = self.logslope_design.dot(&shifted_states[2].beta);
+
+        if let Some(range) = slices.score_warp.as_ref() {
+            let block_idx = 3;
+            shifted_states[block_idx].beta = &shifted_states[block_idx].beta
+                + &(d_beta_flat.slice(s![range.clone()]).to_owned() * step);
+        }
+        if let Some(range) = slices.link_dev.as_ref() {
+            let block_idx = if self.score_warp.is_some() { 4 } else { 3 };
+            shifted_states[block_idx].beta = &shifted_states[block_idx].beta
+                + &(d_beta_flat.slice(s![range.clone()]).to_owned() * step);
+        }
+
+        shifted_states
+    }
+
     // ── Psi terms (first and second order) ────────────────────────────
     //
     // All three psi methods (first-order, second-order, directional derivative)
@@ -4047,6 +4846,58 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    /// Score pullback using actual Jacobians from q-geometry (timewiggle-correct).
+    fn accumulate_score_with_q_geometry(
+        &self,
+        row: usize,
+        qg: &SurvivalMarginalSlopeDynamicRow,
+        primary: &Array1<f64>,
+        score_t: &mut Array1<f64>,
+        score_m: &mut Array1<f64>,
+        score_g: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
+        let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
+        for q in 0..3 {
+            if primary[q] != 0.0 {
+                score_t.scaled_add(primary[q], jt[q]);
+            }
+        }
+        for q in 0..3 {
+            if primary[q] != 0.0 {
+                score_m.scaled_add(primary[q], jm[q]);
+            }
+        }
+        self.logslope_design
+            .axpy_row_into(row, primary[3], &mut score_g.view_mut())?;
+        Ok(())
+    }
+
+    /// U_{iB}^α contribution to score (eq 46, term 1) for timewiggle + marginal ψ.
+    fn accumulate_score_timewiggle_psi_u(
+        lift: &TimewiggleMarginalPsiRowLift,
+        f_pi: &Array1<f64>,
+        score_t: &mut Array1<f64>,
+        score_m: &mut Array1<f64>,
+    ) {
+        let ut = [&lift.u_q0_time, &lift.u_q1_time, &lift.u_qd1_time];
+        let um = [
+            &lift.u_q0_marginal,
+            &lift.u_q1_marginal,
+            &lift.u_qd1_marginal,
+        ];
+        for q in 0..3 {
+            if f_pi[q] != 0.0 {
+                score_t.scaled_add(f_pi[q], ut[q]);
+            }
+        }
+        for q in 0..3 {
+            if f_pi[q] != 0.0 {
+                score_m.scaled_add(f_pi[q], um[q]);
+            }
+        }
+    }
+
     fn psi_terms_inner(
         &self,
         block_states: &[ParameterBlockState],
@@ -4073,6 +4924,89 @@ impl SurvivalMarginalSlopeFamily {
             _ => &block_states[2].beta,
         };
 
+        if self.flex_timewiggle_active() && block_idx == 1 {
+            let primary = flex_primary
+                .as_ref()
+                .ok_or_else(|| "timewiggle psi lift requires flex primary layout".to_string())?;
+            let identity_blocks = flex_identity_block_pairs(primary, &slices);
+            let make_acc = || {
+                (
+                    0.0,
+                    Array1::zeros(slices.total),
+                    Array2::zeros((slices.total, slices.total)),
+                )
+            };
+            let (objective_psi, score_psi, hessian_psi) = (0..self.n)
+                .into_par_iter()
+                .try_fold(make_acc, |mut a, row| -> Result<_, String> {
+                    let psi_row =
+                        self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let lift = self.timewiggle_marginal_psi_row_lift(
+                        row,
+                        block_states,
+                        primary,
+                        &psi_row,
+                        beta_psi,
+                    )?;
+                    let (_, f_pi, f_pipi) = self.compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        primary,
+                    )?;
+                    let third =
+                        self.row_primary_third_contracted_general(row, block_states, &lift.dir)?;
+
+                    a.0 += f_pi.dot(&lift.dir);
+
+                    let pseudo_grad = f_pipi.dot(&lift.dir);
+                    self.accumulate_dynamic_q_joint_row_positive(
+                        row,
+                        &slices,
+                        &q_geom,
+                        pseudo_grad.view(),
+                        third.view(),
+                        &identity_blocks,
+                        &mut a.1,
+                        &mut a.2,
+                    )?;
+
+                    for q_idx in 0..3 {
+                        let left_joint =
+                            self.timewiggle_marginal_psi_left_joint(&slices, q_idx, &lift);
+                        a.1 += &(left_joint.clone() * f_pi[q_idx]);
+                        let right_joint = self.pullback_dynamic_primary_vector_positive(
+                            row,
+                            &slices,
+                            &q_geom,
+                            f_pipi.row(q_idx),
+                            &identity_blocks,
+                        );
+                        self.add_symmetric_outer_dense(&mut a.2, &left_joint, &right_joint);
+                    }
+                    self.add_timewiggle_marginal_psi_kappa_dense(
+                        &slices,
+                        &lift,
+                        f_pi.view(),
+                        &mut a.2,
+                    );
+                    Ok(a)
+                })
+                .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                    left.0 += right.0;
+                    left.1 += &right.1;
+                    left.2 += &right.2;
+                    Ok(left)
+                })?;
+
+            return Ok(Some(ExactNewtonJointPsiTerms {
+                objective_psi,
+                score_psi,
+                hessian_psi,
+                hessian_psi_operator: None,
+            }));
+        }
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
@@ -4104,8 +5038,8 @@ impl SurvivalMarginalSlopeFamily {
         let (objective_psi, score_t, score_m, score_g, score_h, score_w, acc) = (0..self.n)
             .into_par_iter()
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
-                // Compute psi design row once; derive direction from it.
                 let psi_row = self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+
                 let dir = if let Some(primary) = flex_primary.as_ref() {
                     primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
                 } else {
@@ -4129,17 +5063,18 @@ impl SurvivalMarginalSlopeFamily {
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                     (g, h)
                 };
+
+                // Third contracted derivative T_i[u^α].
                 let third = self.row_primary_third_contracted_general(row, block_states, &dir)?;
 
+                // ── Eq (45): objective_psi += f_i^T u_i^α ──
                 a.0 += f_pi.dot(&dir);
 
-                // Score: psi block gets scalar × psi_row
                 let s1 = f_pi.dot(&loading);
                 match block_idx {
                     1 => a.2.scaled_add(s1, &psi_row),
                     _ => a.3.scaled_add(s1, &psi_row),
                 }
-                // Score: pullback of f_pipi·dir into all 3 blocks
                 let pb = f_pipi.dot(&dir);
                 self.accumulate_score_blockwise(row, &pb, &mut a.1, &mut a.2, &mut a.3)?;
                 self.accumulate_score_identity_blocks(
@@ -4149,11 +5084,9 @@ impl SurvivalMarginalSlopeFamily {
                     Some(&mut a.5),
                 );
 
-                // Hessian: rank-1 from psi_row × pullback(f_pipi·loading)
+                a.6.add_pullback(self, row, &third);
                 let right_primary = f_pipi.dot(&loading);
                 a.6.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
-                // Hessian: pullback of third derivative
-                a.6.add_pullback(self, row, &third);
 
                 Ok(a)
             })
@@ -4244,6 +5177,54 @@ impl SurvivalMarginalSlopeFamily {
             1 => &block_states[1].beta,
             _ => &block_states[2].beta,
         };
+
+        // When timewiggle is active and any psi coordinate is marginal, the
+        // exact pair-lift is still unfinished. Differentiate the corrected
+        // first-order joint psi map along the marginal coordinate instead of
+        // using the old block-local formulas.
+        if self.flex_timewiggle_active() && (block_idx_i == 1 || block_idx_j == 1) {
+            let step = 1e-6;
+            let (target_psi, shift_local_idx) = if block_idx_j == 1 {
+                (psi_i, local_idx_j)
+            } else {
+                (psi_j, local_idx_i)
+            };
+            let (family_plus, states_plus, derivs_plus) = self.shifted_marginal_psi_context(
+                block_states,
+                derivative_blocks,
+                shift_local_idx,
+                step,
+            )?;
+            let (family_minus, states_minus, derivs_minus) = self.shifted_marginal_psi_context(
+                block_states,
+                derivative_blocks,
+                shift_local_idx,
+                -step,
+            )?;
+
+            let plus = family_plus
+                .psi_terms_inner(&states_plus, &derivs_plus, target_psi, None)?
+                .ok_or_else(|| format!("missing psi terms for psi index {target_psi}"))?;
+            let minus = family_minus
+                .psi_terms_inner(&states_minus, &derivs_minus, target_psi, None)?
+                .ok_or_else(|| format!("missing psi terms for psi index {target_psi}"))?;
+
+            // psi_terms_inner now returns operator-backed Hessians; materialize.
+            let plus_dense = match plus.hessian_psi_operator.as_ref() {
+                Some(op) => op.to_dense(),
+                None => plus.hessian_psi,
+            };
+            let minus_dense = match minus.hessian_psi_operator.as_ref() {
+                Some(op) => op.to_dense(),
+                None => minus.hessian_psi,
+            };
+            return Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+                objective_psi_psi: (plus.objective_psi - minus.objective_psi) / (2.0 * step),
+                score_psi_psi: (plus.score_psi - minus.score_psi) / (2.0 * step),
+                hessian_psi_psi: (plus_dense - minus_dense) / (2.0 * step),
+                hessian_psi_psi_operator: None,
+            }));
+        }
 
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
@@ -4479,6 +5460,37 @@ impl SurvivalMarginalSlopeFamily {
             1 => d_beta_flat.slice(s![slices.marginal.clone()]),
             _ => d_beta_flat.slice(s![slices.logslope.clone()]),
         };
+
+        // When timewiggle is active, the block path uses raw design rows that
+        // miss T'(h) factors in the pullback. Fall back to FD of the (now
+        // correct) block-path psi Hessian until the block path is fully lifted.
+        if self.flex_timewiggle_active() {
+            let norm = d_beta_flat
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max);
+            let step = (1e-6 / norm.max(1.0)).max(1e-8);
+            let plus_states =
+                self.shifted_block_states_along_direction(block_states, d_beta_flat, step);
+            let minus_states =
+                self.shifted_block_states_along_direction(block_states, d_beta_flat, -step);
+            let plus = self
+                .psi_terms_inner(&plus_states, derivative_blocks, psi_index, None)?
+                .ok_or_else(|| format!("missing psi terms for psi index {psi_index}"))?;
+            let minus = self
+                .psi_terms_inner(&minus_states, derivative_blocks, psi_index, None)?
+                .ok_or_else(|| format!("missing psi terms for psi index {psi_index}"))?;
+            // psi_terms_inner now returns operator-backed Hessians; materialize.
+            let plus_dense = match plus.hessian_psi_operator.as_ref() {
+                Some(op) => op.to_dense(),
+                None => plus.hessian_psi,
+            };
+            let minus_dense = match minus.hessian_psi_operator.as_ref() {
+                Some(op) => op.to_dense(),
+                None => minus.hessian_psi,
+            };
+            return Ok(Some((plus_dense - minus_dense) / (2.0 * step)));
+        }
 
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
@@ -7396,6 +8408,357 @@ mod tests {
         assert!(
             hw_signal > 1e-8,
             "expected nonzero marginal-psi drift into score/link blocks, got {hw_signal:.3e}"
+        );
+    }
+
+    #[test]
+    fn timewiggle_marginal_psi_hessian_matches_joint_hessian_drift() {
+        let score_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2]];
+        let marginal_beta = array![0.35, -0.1];
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
+            design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
+            design_derivative_exit: DesignMatrix::from(array![[1.0, 0.0, 0.0, 0.0, 0.0]]),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(array![[1.0]]),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+            time_wiggle_degree: Some(3),
+            time_wiggle_ncols: 4,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: array![0.2],
+                eta: array![0.2],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+        ];
+        let derivative_blocks = vec![
+            Vec::new(),
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[1.0, -0.4]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+            Vec::new(),
+        ];
+
+        let psi_terms = family
+            .psi_terms(&block_states, &derivative_blocks, 0)
+            .expect("psi terms")
+            .expect("marginal psi terms");
+        let analytic = psi_terms.hessian_psi;
+
+        let step = 1e-6;
+        let psi_row = derivative_blocks[1][0].x_psi.row(0).to_owned();
+        let design_plus = &marginal_design + &(psi_row.clone().insert_axis(Axis(0)) * step);
+        let design_minus = &marginal_design - &(psi_row.insert_axis(Axis(0)) * step);
+
+        let mut family_plus = family.clone();
+        family_plus.marginal_design = DesignMatrix::from(design_plus.clone());
+        let mut states_plus = block_states.clone();
+        states_plus[1].eta = design_plus.dot(&states_plus[1].beta);
+
+        let mut family_minus = family.clone();
+        family_minus.marginal_design = DesignMatrix::from(design_minus.clone());
+        let mut states_minus = block_states.clone();
+        states_minus[1].eta = design_minus.dot(&states_minus[1].beta);
+
+        let h_plus = family_plus
+            .exact_newton_joint_hessian(&states_plus)
+            .expect("plus joint hessian")
+            .expect("plus matrix");
+        let h_minus = family_minus
+            .exact_newton_joint_hessian(&states_minus)
+            .expect("minus joint hessian")
+            .expect("minus matrix");
+        let finite_diff = (h_plus - h_minus) / (2.0 * step);
+
+        let diff = &analytic - &finite_diff;
+        let max_abs = diff.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            max_abs < 1e-4,
+            "timewiggle marginal psi drift mismatch: max_abs={max_abs:.3e}\nanalytic={analytic:?}\nfinite_diff={finite_diff:?}"
+        );
+    }
+
+    #[test]
+    fn timewiggle_marginal_logslope_psi_second_order_matches_shifted_first_order() {
+        let score_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_design = array![[1.2, -0.3]];
+        let logslope_beta = array![0.2, -0.05];
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
+            design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
+            design_derivative_exit: DesignMatrix::from(array![[1.0, 0.0, 0.0, 0.0, 0.0]]),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(logslope_design.clone()),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+            time_wiggle_degree: Some(3),
+            time_wiggle_ncols: 4,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_design.dot(&logslope_beta),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+        ];
+        let derivative_blocks = vec![
+            Vec::new(),
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[1.0, -0.4]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[0.3, 0.8]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        ];
+
+        let terms = family
+            .psi_second_order_terms(&block_states, &derivative_blocks, 0, 1)
+            .expect("psi second-order terms")
+            .expect("mixed psi second-order terms");
+        let analytic = terms.hessian_psi_psi;
+
+        let step = 1e-6;
+        let marginal_psi_row = derivative_blocks[1][0].x_psi.row(0).to_owned();
+        let design_plus =
+            &marginal_design + &(marginal_psi_row.clone().insert_axis(Axis(0)) * step);
+        let design_minus = &marginal_design - &(marginal_psi_row.insert_axis(Axis(0)) * step);
+
+        let mut family_plus = family.clone();
+        family_plus.marginal_design = DesignMatrix::from(design_plus.clone());
+        let mut states_plus = block_states.clone();
+        states_plus[1].eta = design_plus.dot(&states_plus[1].beta);
+
+        let mut family_minus = family.clone();
+        family_minus.marginal_design = DesignMatrix::from(design_minus.clone());
+        let mut states_minus = block_states.clone();
+        states_minus[1].eta = design_minus.dot(&states_minus[1].beta);
+
+        let plus = family_plus
+            .psi_terms(&states_plus, &derivative_blocks, 1)
+            .expect("plus psi terms")
+            .expect("plus logslope psi terms");
+        let minus = family_minus
+            .psi_terms(&states_minus, &derivative_blocks, 1)
+            .expect("minus psi terms")
+            .expect("minus logslope psi terms");
+        let plus_dense = match plus.hessian_psi_operator.as_ref() {
+            Some(op) => op.to_dense(),
+            None => plus.hessian_psi,
+        };
+        let minus_dense = match minus.hessian_psi_operator.as_ref() {
+            Some(op) => op.to_dense(),
+            None => minus.hessian_psi,
+        };
+        let finite_diff = (plus_dense - minus_dense) / (2.0 * step);
+
+        let diff = &analytic - &finite_diff;
+        let max_abs = diff.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            max_abs < 1e-4,
+            "timewiggle marginal/logslope psi second-order mismatch: max_abs={max_abs:.3e}\nanalytic={analytic:?}\nfinite_diff={finite_diff:?}"
+        );
+    }
+
+    #[test]
+    fn timewiggle_marginal_psi_hessian_directional_matches_shifted_first_order_hessian() {
+        let score_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2]];
+        let marginal_beta = array![0.35, -0.1];
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
+            design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
+            design_derivative_exit: DesignMatrix::from(array![[1.0, 0.0, 0.0, 0.0, 0.0]]),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(array![[1.0]]),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+            time_wiggle_degree: Some(3),
+            time_wiggle_ncols: 4,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: array![0.2],
+                eta: array![0.2],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+        ];
+        let derivative_blocks = vec![
+            Vec::new(),
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[1.0, -0.4]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+            Vec::new(),
+        ];
+        let slices = block_slices(&family, &block_states);
+        let mut d_beta_flat = Array1::zeros(slices.total);
+        d_beta_flat[slices.time.start] = 0.07;
+        d_beta_flat[slices.time.start + 1] = -0.03;
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+        if let Some(h_range) = slices.score_warp.as_ref() {
+            d_beta_flat[h_range.start] = 0.02;
+        }
+
+        let analytic = family
+            .psi_hessian_directional_derivative(&block_states, &derivative_blocks, 0, &d_beta_flat)
+            .expect("psi hessian directional derivative")
+            .expect("marginal psi hessian directional derivative");
+
+        let norm = d_beta_flat
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let step = (1e-6 / norm.max(1.0)).max(1e-8);
+
+        let mut plus_states = block_states.clone();
+        plus_states[0].beta =
+            &plus_states[0].beta + &(d_beta_flat.slice(s![slices.time.clone()]).to_owned() * step);
+        plus_states[1].beta = &plus_states[1].beta
+            + &(d_beta_flat.slice(s![slices.marginal.clone()]).to_owned() * step);
+        plus_states[1].eta = marginal_design.dot(&plus_states[1].beta);
+        plus_states[2].beta = &plus_states[2].beta
+            + &(d_beta_flat.slice(s![slices.logslope.clone()]).to_owned() * step);
+        plus_states[2].eta = family.logslope_design.to_dense().dot(&plus_states[2].beta);
+        if let Some(h_range) = slices.score_warp.as_ref() {
+            plus_states[3].beta =
+                &plus_states[3].beta + &(d_beta_flat.slice(s![h_range.clone()]).to_owned() * step);
+        }
+
+        let mut minus_states = block_states.clone();
+        minus_states[0].beta =
+            &minus_states[0].beta - &(d_beta_flat.slice(s![slices.time.clone()]).to_owned() * step);
+        minus_states[1].beta = &minus_states[1].beta
+            - &(d_beta_flat.slice(s![slices.marginal.clone()]).to_owned() * step);
+        minus_states[1].eta = marginal_design.dot(&minus_states[1].beta);
+        minus_states[2].beta = &minus_states[2].beta
+            - &(d_beta_flat.slice(s![slices.logslope.clone()]).to_owned() * step);
+        minus_states[2].eta = family.logslope_design.to_dense().dot(&minus_states[2].beta);
+        if let Some(h_range) = slices.score_warp.as_ref() {
+            minus_states[3].beta =
+                &minus_states[3].beta - &(d_beta_flat.slice(s![h_range.clone()]).to_owned() * step);
+        }
+
+        let plus = family
+            .psi_terms(&plus_states, &derivative_blocks, 0)
+            .expect("plus psi terms")
+            .expect("plus marginal psi terms");
+        let minus = family
+            .psi_terms(&minus_states, &derivative_blocks, 0)
+            .expect("minus psi terms")
+            .expect("minus marginal psi terms");
+        let plus_dense = match plus.hessian_psi_operator.as_ref() {
+            Some(op) => op.to_dense(),
+            None => plus.hessian_psi,
+        };
+        let minus_dense = match minus.hessian_psi_operator.as_ref() {
+            Some(op) => op.to_dense(),
+            None => minus.hessian_psi,
+        };
+        let finite_diff = (plus_dense - minus_dense) / (2.0 * step);
+
+        let diff = &analytic - &finite_diff;
+        let max_abs = diff.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            max_abs < 1e-4,
+            "timewiggle marginal psi hessian directional mismatch: max_abs={max_abs:.3e}\nanalytic={analytic:?}\nfinite_diff={finite_diff:?}"
         );
     }
 
