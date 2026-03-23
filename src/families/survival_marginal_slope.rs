@@ -278,6 +278,13 @@ fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
 }
 
 #[inline]
+fn add_scaled_coeff4(target: &mut [f64; 4], source: &[f64; 4], scale: f64) {
+    for j in 0..4 {
+        target[j] += scale * source[j];
+    }
+}
+
+#[inline]
 fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
     [
         source[0] * scale,
@@ -310,6 +317,7 @@ struct ObservedDenestedCellPartials {
     dc_daaa: [f64; 4],
     dc_daab: [f64; 4],
     dc_dabb: [f64; 4],
+    dc_dbbb: [f64; 4],
 }
 
 struct DenestedCellPrimaryFixedPartials {
@@ -321,6 +329,292 @@ struct DenestedCellPrimaryFixedPartials {
     coeff_bu: Vec<[f64; 4]>,
     coeff_aau: Vec<[f64; 4]>,
     coeff_abu: Vec<[f64; 4]>,
+    coeff_bbu: Vec<[f64; 4]>,
+    coeff_aaau: Vec<[f64; 4]>,
+    coeff_aabu: Vec<[f64; 4]>,
+    coeff_abbu: Vec<[f64; 4]>,
+    coeff_bbbu: Vec<[f64; 4]>,
+}
+
+#[derive(Clone, Copy)]
+struct CoeffSupport {
+    include_g: bool,
+    include_h: bool,
+    include_w: bool,
+}
+
+impl CoeffSupport {
+    #[inline]
+    fn without_g(self) -> Self {
+        Self {
+            include_g: false,
+            ..self
+        }
+    }
+}
+
+const COEFF_SUPPORT_GHW: CoeffSupport = CoeffSupport {
+    include_g: true,
+    include_h: true,
+    include_w: true,
+};
+const COEFF_SUPPORT_GW: CoeffSupport = CoeffSupport {
+    include_g: true,
+    include_h: false,
+    include_w: true,
+};
+
+struct SparsePrimaryCoeffJetView<'a> {
+    g_index: usize,
+    h_range: Option<std::ops::Range<usize>>,
+    w_range: Option<std::ops::Range<usize>>,
+    a_first: &'a [[f64; 4]],
+    b_first: &'a [[f64; 4]],
+    aa_first: &'a [[f64; 4]],
+    ab_first: &'a [[f64; 4]],
+    bb_first: &'a [[f64; 4]],
+    aaa_first: &'a [[f64; 4]],
+    aab_first: &'a [[f64; 4]],
+    abb_first: &'a [[f64; 4]],
+    bbb_first: &'a [[f64; 4]],
+}
+
+impl<'a> SparsePrimaryCoeffJetView<'a> {
+    fn new(
+        primary: &FlexPrimarySlices,
+        a_first: &'a [[f64; 4]],
+        b_first: &'a [[f64; 4]],
+        aa_first: &'a [[f64; 4]],
+        ab_first: &'a [[f64; 4]],
+        bb_first: &'a [[f64; 4]],
+        aaa_first: &'a [[f64; 4]],
+        aab_first: &'a [[f64; 4]],
+        abb_first: &'a [[f64; 4]],
+        bbb_first: &'a [[f64; 4]],
+    ) -> Self {
+        Self {
+            g_index: primary.g,
+            h_range: primary.h.clone(),
+            w_range: primary.w.clone(),
+            a_first,
+            b_first,
+            aa_first,
+            ab_first,
+            bb_first,
+            aaa_first,
+            aab_first,
+            abb_first,
+            bbb_first,
+        }
+    }
+
+    #[inline]
+    fn in_h_range(&self, idx: usize) -> bool {
+        self.h_range
+            .as_ref()
+            .map(|range| range.contains(&idx))
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn in_w_range(&self, idx: usize) -> bool {
+        self.w_range
+            .as_ref()
+            .map(|range| range.contains(&idx))
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn param_supported(&self, idx: usize, support: CoeffSupport) -> bool {
+        (support.include_g && idx == self.g_index)
+            || (support.include_h && self.in_h_range(idx))
+            || (support.include_w && self.in_w_range(idx))
+    }
+
+    fn directional_family(
+        &self,
+        family: &[[f64; 4]],
+        dir: &Array1<f64>,
+        support: CoeffSupport,
+    ) -> [f64; 4] {
+        let mut out = [0.0; 4];
+        if support.include_g {
+            add_scaled_coeff4(&mut out, &family[self.g_index], dir[self.g_index]);
+        }
+        if support.include_h {
+            if let Some(h_range) = self.h_range.as_ref() {
+                for idx in h_range.clone() {
+                    add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
+                }
+            }
+        }
+        if support.include_w {
+            if let Some(w_range) = self.w_range.as_ref() {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
+                }
+            }
+        }
+        out
+    }
+
+    fn mixed_directional_from_b_family(
+        &self,
+        family: &[[f64; 4]],
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+        support: CoeffSupport,
+    ) -> [f64; 4] {
+        let mut out = [0.0; 4];
+        let dir_u_g = dir_u[self.g_index];
+        let dir_v_g = dir_v[self.g_index];
+        if support.include_g {
+            add_scaled_coeff4(&mut out, &family[self.g_index], dir_u_g * dir_v_g);
+        }
+        if support.include_h {
+            if let Some(h_range) = self.h_range.as_ref() {
+                for idx in h_range.clone() {
+                    add_scaled_coeff4(
+                        &mut out,
+                        &family[idx],
+                        dir_u_g * dir_v[idx] + dir_v_g * dir_u[idx],
+                    );
+                }
+            }
+        }
+        if support.include_w {
+            if let Some(w_range) = self.w_range.as_ref() {
+                for idx in w_range.clone() {
+                    add_scaled_coeff4(
+                        &mut out,
+                        &family[idx],
+                        dir_u_g * dir_v[idx] + dir_v_g * dir_u[idx],
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    fn param_directional_from_b_family(
+        &self,
+        family: &[[f64; 4]],
+        param: usize,
+        dir: &Array1<f64>,
+        support: CoeffSupport,
+    ) -> [f64; 4] {
+        if param == self.g_index {
+            return self.directional_family(family, dir, support);
+        }
+        if self.param_supported(param, support.without_g()) {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &family[param], dir[self.g_index]);
+            return out;
+        }
+        [0.0; 4]
+    }
+
+    fn param_mixed_from_bb_family(
+        &self,
+        family: &[[f64; 4]],
+        param: usize,
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+        support: CoeffSupport,
+    ) -> [f64; 4] {
+        if param == self.g_index {
+            return self.mixed_directional_from_b_family(family, dir_u, dir_v, support);
+        }
+        if self.param_supported(param, support.without_g()) {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(
+                &mut out,
+                &family[param],
+                dir_u[self.g_index] * dir_v[self.g_index],
+            );
+            return out;
+        }
+        [0.0; 4]
+    }
+
+    fn pair_from_b_family(
+        &self,
+        family: &[[f64; 4]],
+        u: usize,
+        v: usize,
+        support: CoeffSupport,
+    ) -> [f64; 4] {
+        if u == self.g_index && v == self.g_index {
+            if support.include_g {
+                return family[self.g_index];
+            }
+            return [0.0; 4];
+        }
+        if u == self.g_index && self.param_supported(v, support.without_g()) {
+            return family[v];
+        }
+        if v == self.g_index && self.param_supported(u, support.without_g()) {
+            return family[u];
+        }
+        [0.0; 4]
+    }
+
+    fn pair_directional_from_bb_family(
+        &self,
+        family: &[[f64; 4]],
+        u: usize,
+        v: usize,
+        dir: &Array1<f64>,
+        support: CoeffSupport,
+    ) -> [f64; 4] {
+        if u == self.g_index && v == self.g_index {
+            return self.directional_family(family, dir, support);
+        }
+        if u == self.g_index && self.param_supported(v, support.without_g()) {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &family[v], dir[self.g_index]);
+            return out;
+        }
+        if v == self.g_index && self.param_supported(u, support.without_g()) {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(&mut out, &family[u], dir[self.g_index]);
+            return out;
+        }
+        [0.0; 4]
+    }
+
+    fn pair_mixed_from_bbb_family(
+        &self,
+        family: &[[f64; 4]],
+        u: usize,
+        v: usize,
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+        support: CoeffSupport,
+    ) -> [f64; 4] {
+        if u == self.g_index && v == self.g_index {
+            return self.mixed_directional_from_b_family(family, dir_u, dir_v, support);
+        }
+        if u == self.g_index && self.param_supported(v, support.without_g()) {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(
+                &mut out,
+                &family[v],
+                dir_u[self.g_index] * dir_v[self.g_index],
+            );
+            return out;
+        }
+        if v == self.g_index && self.param_supported(u, support.without_g()) {
+            let mut out = [0.0; 4];
+            add_scaled_coeff4(
+                &mut out,
+                &family[u],
+                dir_u[self.g_index] * dir_v[self.g_index],
+            );
+            return out;
+        }
+        [0.0; 4]
+    }
 }
 
 /// Pre-computed partition cell data for a single timepoint evaluation.
@@ -357,6 +651,12 @@ struct SurvivalFlexTimepointDirectionalExact {
     chi_uv_dir: Array2<f64>,
     d_u_dir: Array1<f64>,
     d_uv_dir: Array2<f64>,
+}
+
+struct SurvivalFlexTimepointBiDirectionalExact {
+    eta_uv_uv: Array2<f64>,
+    chi_uv_uv: Array2<f64>,
+    d_uv_uv: Array2<f64>,
 }
 
 #[derive(Clone)]
@@ -522,6 +822,12 @@ impl MultiDirJet {
         out
     }
 
+    fn bilinear(base: f64, d1: f64, d2: f64, d12: f64) -> Self {
+        Self {
+            coeffs: vec![base, d1, d2, d12],
+        }
+    }
+
     fn full_mask(&self) -> usize {
         self.coeffs.len() - 1
     }
@@ -586,24 +892,109 @@ impl MultiDirJet {
         }
         Self { coeffs: out }
     }
-
-    /// Two-direction jet: base + du·ε₁ + dv·ε₂ + duv·ε₁ε₂
-    fn bilinear(base: f64, du: f64, dv: f64, duv: f64) -> Self {
-        Self {
-            coeffs: vec![base, du, dv, duv],
-        }
-    }
 }
 
-fn bilinear_jet_vec(
+fn scalar_composite_bilinear(
+    base: f64,
+    da: f64,
+    daa: f64,
+    fixed_d1: f64,
+    fixed_d2: f64,
+    fixed_d12: f64,
+    da_d1: f64,
+    da_d2: f64,
+    ad1: f64,
+    ad2: f64,
+    ad12: f64,
+) -> MultiDirJet {
+    MultiDirJet::bilinear(
+        base,
+        da * ad1 + fixed_d1,
+        da * ad2 + fixed_d2,
+        da * ad12 + daa * ad1 * ad2 + da_d1 * ad2 + da_d2 * ad1 + fixed_d12,
+    )
+}
+
+fn coeff4_fixed_bilinear(
     base: &[f64; 4],
-    du: &[f64; 4],
-    dv: &[f64; 4],
-    duv: &[f64; 4],
+    d1: &[f64; 4],
+    d2: &[f64; 4],
+    d12: &[f64; 4],
 ) -> Vec<MultiDirJet> {
     (0..4)
-        .map(|k| MultiDirJet::bilinear(base[k], du[k], dv[k], duv[k]))
+        .map(|k| MultiDirJet::bilinear(base[k], d1[k], d2[k], d12[k]))
         .collect()
+}
+
+fn coeff4_composite_bilinear(
+    base: &[f64; 4],
+    da: &[f64; 4],
+    daa: &[f64; 4],
+    fixed_d1: &[f64; 4],
+    fixed_d2: &[f64; 4],
+    fixed_d12: &[f64; 4],
+    da_d1: &[f64; 4],
+    da_d2: &[f64; 4],
+    ad1: f64,
+    ad2: f64,
+    ad12: f64,
+) -> Vec<MultiDirJet> {
+    (0..4)
+        .map(|k| {
+            scalar_composite_bilinear(
+                base[k],
+                da[k],
+                daa[k],
+                fixed_d1[k],
+                fixed_d2[k],
+                fixed_d12[k],
+                da_d1[k],
+                da_d2[k],
+                ad1,
+                ad2,
+                ad12,
+            )
+        })
+        .collect()
+}
+
+fn poly_add_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
+    let count = lhs.len().max(rhs.len());
+    let mut out = Vec::with_capacity(count);
+    for idx in 0..count {
+        let left = lhs
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| MultiDirJet::zero(2));
+        let right = rhs
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| MultiDirJet::zero(2));
+        out.push(left.add(&right));
+    }
+    out
+}
+
+fn poly_scale_jets(poly: &[MultiDirJet], scale: &MultiDirJet) -> Vec<MultiDirJet> {
+    poly.iter().map(|coeff| coeff.mul(scale)).collect()
+}
+
+fn poly_mul_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
+    if lhs.is_empty() || rhs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![MultiDirJet::zero(2); lhs.len() + rhs.len() - 1];
+    for (i, left) in lhs.iter().enumerate() {
+        for (j, right) in rhs.iter().enumerate() {
+            let prod = left.mul(right);
+            out[i + j] = out[i + j].add(&prod);
+        }
+    }
+    out
+}
+
+fn poly_coeff_mask(poly: &[MultiDirJet], mask: usize) -> Vec<f64> {
+    poly.iter().map(|coeff| coeff.coeff(mask)).collect()
 }
 
 /// Derive a primary-space direction from a precomputed psi design row and beta,
@@ -2997,7 +3388,7 @@ impl SurvivalMarginalSlopeFamily {
             exact_kernel::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
         let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact_kernel::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
-        let (dc_daaa, dc_daab, dc_dabb, ..) =
+        let (dc_daaa, dc_daab, dc_dabb, dc_dbbb) =
             exact_kernel::denested_cell_third_partials(link_span_obs);
         Ok(ObservedDenestedCellPartials {
             coeff,
@@ -3009,6 +3400,7 @@ impl SurvivalMarginalSlopeFamily {
             dc_daaa: scale_coeff4(dc_daaa, scale),
             dc_daab: scale_coeff4(dc_daab, scale),
             dc_dabb: scale_coeff4(dc_dabb, scale),
+            dc_dbbb: scale_coeff4(dc_dbbb, scale),
         })
     }
 
@@ -3029,12 +3421,17 @@ impl SurvivalMarginalSlopeFamily {
         let mut coeff_bu = vec![[0.0; 4]; r];
         let mut coeff_aau = vec![[0.0; 4]; r];
         let mut coeff_abu = vec![[0.0; 4]; r];
+        let mut coeff_bbu = vec![[0.0; 4]; r];
+        let mut coeff_aaau = vec![[0.0; 4]; r];
+        let mut coeff_aabu = vec![[0.0; 4]; r];
+        let mut coeff_abbu = vec![[0.0; 4]; r];
+        let mut coeff_bbbu = vec![[0.0; 4]; r];
 
         let (dc_da_raw, dc_db_raw) =
             exact_kernel::denested_cell_coefficient_partials(score_span, link_span, a, b);
         let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
             exact_kernel::denested_cell_second_partials(score_span, link_span, a, b);
-        let (dc_daaa_raw, dc_daab_raw, dc_dabb_raw, _) =
+        let (dc_daaa_raw, dc_daab_raw, dc_dabb_raw, dc_dbbb_raw) =
             exact_kernel::denested_cell_third_partials(link_span);
         let dc_da = scale_coeff4(dc_da_raw, scale);
         let dc_db = scale_coeff4(dc_db_raw, scale);
@@ -3044,12 +3441,17 @@ impl SurvivalMarginalSlopeFamily {
         let dc_daaa = scale_coeff4(dc_daaa_raw, scale);
         let dc_daab = scale_coeff4(dc_daab_raw, scale);
         let dc_dabb = scale_coeff4(dc_dabb_raw, scale);
+        let dc_dbbb = scale_coeff4(dc_dbbb_raw, scale);
 
         coeff_u[primary.g] = dc_db;
         coeff_au[primary.g] = dc_dab;
         coeff_bu[primary.g] = dc_dbb;
         coeff_aau[primary.g] = dc_daab;
         coeff_abu[primary.g] = dc_dabb;
+        coeff_bbu[primary.g] = dc_dbbb;
+        coeff_aaau[primary.g] = dc_daab;
+        coeff_aabu[primary.g] = dc_dabb;
+        coeff_abbu[primary.g] = dc_dbbb;
 
         if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
             for local_idx in 0..h_range.len() {
@@ -3077,11 +3479,19 @@ impl SurvivalMarginalSlopeFamily {
                 let (dc_aw_raw, dc_bw_raw) =
                     exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
                 let link_second = exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                let (dc_aaw_raw, dc_abw_raw) = (link_second.0, link_second.1);
+                let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
+                    (link_second.0, link_second.1, link_second.2);
+                let (dc_aaaw_raw, dc_aabw_raw, dc_abbw_raw, dc_bbbw_raw) =
+                    exact_kernel::link_basis_cell_third_partials(basis_span);
                 coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
                 coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
                 coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
                 coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
+                coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
+                coeff_aaau[idx] = scale_coeff4(dc_aaaw_raw, scale);
+                coeff_aabu[idx] = scale_coeff4(dc_aabw_raw, scale);
+                coeff_abbu[idx] = scale_coeff4(dc_abbw_raw, scale);
+                coeff_bbbu[idx] = scale_coeff4(dc_bbbw_raw, scale);
             }
         }
 
@@ -3094,6 +3504,11 @@ impl SurvivalMarginalSlopeFamily {
             coeff_bu,
             coeff_aau,
             coeff_abu,
+            coeff_bbu,
+            coeff_aaau,
+            coeff_aabu,
+            coeff_abbu,
+            coeff_bbbu,
         })
     }
 
@@ -3293,7 +3708,7 @@ impl SurvivalMarginalSlopeFamily {
             };
             let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = exact_kernel::evaluate_cell_moments(cell, 15)?;
+            let state = exact_kernel::evaluate_cell_moments(cell, 24)?;
             let fixed = self.denested_cell_primary_fixed_partials(
                 primary,
                 a,
@@ -4359,6 +4774,150 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    #[inline]
+    fn primary_param_supported(&self, primary: &FlexPrimarySlices, idx: usize) -> bool {
+        idx == primary.g
+            || primary
+                .h
+                .as_ref()
+                .map(|range| range.contains(&idx))
+                .unwrap_or(false)
+            || primary
+                .w
+                .as_ref()
+                .map(|range| range.contains(&idx))
+                .unwrap_or(false)
+    }
+
+    fn cell_directional_coeff_family(
+        &self,
+        primary: &FlexPrimarySlices,
+        family: &[[f64; 4]],
+        dir: &Array1<f64>,
+    ) -> [f64; 4] {
+        let mut out = [0.0; 4];
+        add_scaled_coeff4(&mut out, &family[primary.g], dir[primary.g]);
+        if let Some(h_range) = primary.h.as_ref() {
+            for idx in h_range.clone() {
+                add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
+            }
+        }
+        if let Some(w_range) = primary.w.as_ref() {
+            for idx in w_range.clone() {
+                add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
+            }
+        }
+        out
+    }
+
+    fn cell_mixed_directional_from_b_family(
+        &self,
+        primary: &FlexPrimarySlices,
+        family: &[[f64; 4]],
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> [f64; 4] {
+        let mut out = [0.0; 4];
+        add_scaled_coeff4(
+            &mut out,
+            &family[primary.g],
+            dir_u[primary.g] * dir_v[primary.g],
+        );
+        if let Some(h_range) = primary.h.as_ref() {
+            for idx in h_range.clone() {
+                add_scaled_coeff4(
+                    &mut out,
+                    &family[idx],
+                    dir_u[primary.g] * dir_v[idx] + dir_v[primary.g] * dir_u[idx],
+                );
+            }
+        }
+        if let Some(w_range) = primary.w.as_ref() {
+            for idx in w_range.clone() {
+                add_scaled_coeff4(
+                    &mut out,
+                    &family[idx],
+                    dir_u[primary.g] * dir_v[idx] + dir_v[primary.g] * dir_u[idx],
+                );
+            }
+        }
+        out
+    }
+
+    fn cell_param_directional_from_b_family(
+        &self,
+        primary: &FlexPrimarySlices,
+        family: &[[f64; 4]],
+        param: usize,
+        dir: &Array1<f64>,
+    ) -> [f64; 4] {
+        if param == primary.g {
+            return self.cell_directional_coeff_family(primary, family, dir);
+        }
+        if self.primary_param_supported(primary, param) {
+            return scale_coeff4(family[param], dir[primary.g]);
+        }
+        [0.0; 4]
+    }
+
+    fn cell_param_mixed_from_bb_family(
+        &self,
+        primary: &FlexPrimarySlices,
+        family: &[[f64; 4]],
+        param: usize,
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> [f64; 4] {
+        if param == primary.g {
+            return self.cell_mixed_directional_from_b_family(primary, family, dir_u, dir_v);
+        }
+        if self.primary_param_supported(primary, param) {
+            return scale_coeff4(family[param], dir_u[primary.g] * dir_v[primary.g]);
+        }
+        [0.0; 4]
+    }
+
+    fn cell_pair_directional_from_bb_family(
+        &self,
+        primary: &FlexPrimarySlices,
+        family: &[[f64; 4]],
+        u: usize,
+        v: usize,
+        dir: &Array1<f64>,
+    ) -> [f64; 4] {
+        if u == primary.g && v == primary.g {
+            return self.cell_directional_coeff_family(primary, family, dir);
+        }
+        if u == primary.g && self.primary_param_supported(primary, v) {
+            return scale_coeff4(family[v], dir[primary.g]);
+        }
+        if v == primary.g && self.primary_param_supported(primary, u) {
+            return scale_coeff4(family[u], dir[primary.g]);
+        }
+        [0.0; 4]
+    }
+
+    fn cell_pair_mixed_from_bbb_family(
+        &self,
+        primary: &FlexPrimarySlices,
+        family: &[[f64; 4]],
+        u: usize,
+        v: usize,
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> [f64; 4] {
+        if u == primary.g && v == primary.g {
+            return self.cell_mixed_directional_from_b_family(primary, family, dir_u, dir_v);
+        }
+        if u == primary.g && self.primary_param_supported(primary, v) {
+            return scale_coeff4(family[v], dir_u[primary.g] * dir_v[primary.g]);
+        }
+        if v == primary.g && self.primary_param_supported(primary, u) {
+            return scale_coeff4(family[u], dir_u[primary.g] * dir_v[primary.g]);
+        }
+        [0.0; 4]
+    }
+
     /// Directional derivative of the fixed eta second partial r_uv w.r.t.
     /// a contraction direction.  Only (g,g), (g,h), (g,w) entries are nonzero.
     fn observed_fixed_eta_second_partial_dir(
@@ -4676,8 +5235,29 @@ impl SurvivalMarginalSlopeFamily {
         let eta_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
         let scale = self.probit_frailty_scale();
 
+        let mut g_u_fixed = vec![[0.0; 4]; p];
         let mut tau = Array1::<f64>::zeros(p);
+        let mut g_au_fixed = vec![[0.0; 4]; p];
         let mut tau_a = Array1::<f64>::zeros(p);
+        let mut g_bu_fixed = vec![[0.0; 4]; p];
+        let mut g_aau_fixed = vec![[0.0; 4]; p];
+        let mut g_abu_fixed = vec![[0.0; 4]; p];
+        let mut g_bbu_fixed = vec![[0.0; 4]; p];
+        let mut g_aaau_fixed = vec![[0.0; 4]; p];
+        let mut g_aabu_fixed = vec![[0.0; 4]; p];
+        let mut g_abbu_fixed = vec![[0.0; 4]; p];
+        let mut g_bbbu_fixed = vec![[0.0; 4]; p];
+
+        g_u_fixed[primary.g] = obs.dc_db;
+        g_au_fixed[primary.g] = obs.dc_dab;
+        g_bu_fixed[primary.g] = obs.dc_dbb;
+        g_aau_fixed[primary.g] = obs.dc_daab;
+        g_abu_fixed[primary.g] = obs.dc_dabb;
+        g_bbu_fixed[primary.g] = obs.dc_dbbb;
+        g_aaau_fixed[primary.g] = obs.dc_daab;
+        g_aabu_fixed[primary.g] = obs.dc_dabb;
+        g_abbu_fixed[primary.g] = obs.dc_dbbb;
+
         tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
         tau_a[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs);
         if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
@@ -4686,31 +5266,82 @@ impl SurvivalMarginalSlopeFamily {
                 let idx = w_range.start + local_idx;
                 let (dc_aw, _) =
                     exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
-                let (dc_aaw, _, _) =
+                let (dc_aaw, dc_abw, dc_bbw) =
                     exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
+                    exact_kernel::link_basis_cell_third_partials(basis_span);
+                g_u_fixed[idx] = scale_coeff4(
+                    exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+                    scale,
+                );
+                g_au_fixed[idx] = scale_coeff4(dc_aw, scale);
+                g_bu_fixed[idx] = scale_coeff4(
+                    exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b).1,
+                    scale,
+                );
+                g_aau_fixed[idx] = scale_coeff4(dc_aaw, scale);
+                g_abu_fixed[idx] = scale_coeff4(dc_abw, scale);
+                g_bbu_fixed[idx] = scale_coeff4(dc_bbw, scale);
+                g_aaau_fixed[idx] = scale_coeff4(dc_aaaw, scale);
+                g_aabu_fixed[idx] = scale_coeff4(dc_aabw, scale);
+                g_abbu_fixed[idx] = scale_coeff4(dc_abbw, scale);
+                g_bbbu_fixed[idx] = scale_coeff4(dc_bbbw, scale);
                 tau[idx] = eval_coeff4_at(&scale_coeff4(dc_aw, scale), z_obs);
                 tau_a[idx] = eval_coeff4_at(&scale_coeff4(dc_aaw, scale), z_obs);
             }
         }
 
+        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+            for local_idx in 0..h_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                let idx = h_range.start + local_idx;
+                g_u_fixed[idx] = scale_coeff4(
+                    exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                    scale,
+                );
+                g_bu_fixed[idx] = scale_coeff4(
+                    exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                    scale,
+                );
+            }
+        }
+
+        let g_jet = SparsePrimaryCoeffJetView::new(
+            primary,
+            &g_au_fixed,
+            &g_bu_fixed,
+            &g_aau_fixed,
+            &g_abu_fixed,
+            &g_bbu_fixed,
+            &g_aaau_fixed,
+            &g_aabu_fixed,
+            &g_abbu_fixed,
+            &g_bbbu_fixed,
+        );
+
         let chi_dir = eta_aa * a_dir + tau.dot(dir);
-        let eta_aa_dir = eta_aaa * a_dir + eval_coeff4_at(&obs.dc_daab, z_obs) * dir[primary.g];
-        // eta_aaa_dir and tau_a_dir: 4th-order cell partials vanish for cubic
-        let eta_aaa_dir = 0.0;
-        let tau_a_dir = Array1::<f64>::zeros(p);
+        let eta_aa_dir = eta_aaa * a_dir
+            + eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aa_first, dir, COEFF_SUPPORT_GW),
+                z_obs,
+            );
+        let eta_aaa_dir = eval_coeff4_at(
+            &g_jet.directional_family(g_jet.aaa_first, dir, COEFF_SUPPORT_GW),
+            z_obs,
+        );
 
         let mut tau_dir = Array1::<f64>::zeros(p);
-        tau_dir[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs) * a_dir
-            + eval_coeff4_at(&obs.dc_dabb, z_obs) * dir[primary.g];
-        if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
-            for local_idx in 0..w_range.len() {
-                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                let idx = w_range.start + local_idx;
-                let (dc_aaw, dc_abw, _) =
-                    exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                tau_dir[idx] = eval_coeff4_at(&scale_coeff4(dc_aaw, scale), z_obs) * a_dir
-                    + eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * dir[primary.g];
-            }
+        let mut tau_a_dir = Array1::<f64>::zeros(p);
+        for u in 0..p {
+            let fixed_tau_dir =
+                g_jet.param_directional_from_b_family(g_jet.ab_first, u, dir, COEFF_SUPPORT_GW);
+            tau_dir[u] = eval_coeff4_at(&g_jet.aa_first[u], z_obs) * a_dir
+                + eval_coeff4_at(&fixed_tau_dir, z_obs);
+
+            let fixed_tau_a_dir =
+                g_jet.param_directional_from_b_family(g_jet.aab_first, u, dir, COEFF_SUPPORT_GW);
+            tau_a_dir[u] = eval_coeff4_at(&g_jet.aaa_first[u], z_obs) * a_dir
+                + eval_coeff4_at(&fixed_tau_a_dir, z_obs);
         }
 
         let mut eta_uv_dir = Array2::<f64>::zeros((p, p));
@@ -5173,6 +5804,1130 @@ impl SurvivalMarginalSlopeFamily {
         })
     }
 
+    /// Exact mixed bidirectional extension D_{d1} D_{d2} of the timepoint
+    /// quantities. This carries the calibration solve, observed eta/chi
+    /// transport, and density-normalization transport analytically.
+    fn compute_survival_timepoint_bidirectional_exact(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        dir1: &Array1<f64>,
+        dir2: &Array1<f64>,
+    ) -> Result<SurvivalFlexTimepointBiDirectionalExact, String> {
+        self.compute_survival_timepoint_bidirectional_exact_full(
+            row, primary, q, q_index, a, b, beta_h, beta_w, dir1, dir2,
+        )
+    }
+
+    fn compute_survival_timepoint_bidirectional_exact_full(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        dir1: &Array1<f64>,
+        dir2: &Array1<f64>,
+    ) -> Result<SurvivalFlexTimepointBiDirectionalExact, String> {
+        let p = primary.total;
+        let zero4 = [0.0; 4];
+        let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
+
+        let mut f_a = 0.0f64;
+        let mut f_aa = 0.0f64;
+        let mut f_u = Array1::<f64>::zeros(p);
+        let mut f_au = Array1::<f64>::zeros(p);
+        let mut f_uv = Array2::<f64>::zeros((p, p));
+        let mut f_a_d1 = 0.0f64;
+        let mut f_aa_d1 = 0.0f64;
+        let mut f_au_d1 = Array1::<f64>::zeros(p);
+        let mut f_uv_d1 = Array2::<f64>::zeros((p, p));
+        let mut f_a_d2 = 0.0f64;
+        let mut f_aa_d2 = 0.0f64;
+        let mut f_au_d2 = Array1::<f64>::zeros(p);
+        let mut f_uv_d2 = Array2::<f64>::zeros((p, p));
+        let mut f_a_d12 = 0.0f64;
+        let mut f_aa_d12 = 0.0f64;
+        let mut f_au_d12 = Array1::<f64>::zeros(p);
+        let mut f_uv_d12 = Array2::<f64>::zeros((p, p));
+
+        for ce in &cached.cells {
+            let nc = ce.neg_cell;
+            let st = &ce.state;
+            let fx = &ce.fixed;
+            let da = fx.dc_da.map(|v| -v);
+            let daa = fx.dc_daa.map(|v| -v);
+
+            f_a += exact_kernel::cell_first_derivative_from_moments(&da, &st.moments)?;
+            f_aa +=
+                exact_kernel::cell_second_derivative_from_moments(nc, &da, &da, &daa, &st.moments)?;
+
+            let mut cd1 = [0.0; 4];
+            let mut ca1 = [0.0; 4];
+            let mut caa1 = [0.0; 4];
+            let mut cd2 = [0.0; 4];
+            let mut ca2 = [0.0; 4];
+            let mut caa2 = [0.0; 4];
+            let mut cd12 = [0.0; 4];
+            let mut ca12 = [0.0; 4];
+            for c in 0..p {
+                for k in 0..4 {
+                    if dir1[c] != 0.0 {
+                        cd1[k] -= fx.coeff_u[c][k] * dir1[c];
+                        ca1[k] -= fx.coeff_au[c][k] * dir1[c];
+                        caa1[k] -= fx.coeff_aau[c][k] * dir1[c];
+                    }
+                    if dir2[c] != 0.0 {
+                        cd2[k] -= fx.coeff_u[c][k] * dir2[c];
+                        ca2[k] -= fx.coeff_au[c][k] * dir2[c];
+                        caa2[k] -= fx.coeff_aau[c][k] * dir2[c];
+                    }
+                }
+            }
+            for c1 in 0..p {
+                if dir1[c1] == 0.0 {
+                    continue;
+                }
+                for c2 in 0..p {
+                    if dir2[c2] == 0.0 {
+                        continue;
+                    }
+                    let sc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, c1, c2);
+                    let sca = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, c1, c2);
+                    for k in 0..4 {
+                        cd12[k] -= sc[k] * dir1[c1] * dir2[c2];
+                        ca12[k] -= sca[k] * dir1[c1] * dir2[c2];
+                    }
+                }
+            }
+
+            f_a_d1 += exact_kernel::cell_second_derivative_from_moments(
+                nc,
+                &da,
+                &cd1,
+                &ca1,
+                &st.moments,
+            )?;
+            f_a_d2 += exact_kernel::cell_second_derivative_from_moments(
+                nc,
+                &da,
+                &cd2,
+                &ca2,
+                &st.moments,
+            )?;
+            f_a_d12 += exact_kernel::cell_third_derivative_from_moments(
+                nc,
+                &da,
+                &cd1,
+                &cd2,
+                &ca1,
+                &ca2,
+                &cd12,
+                &ca12,
+                &st.moments,
+            )?;
+            f_aa_d1 += exact_kernel::cell_third_derivative_from_moments(
+                nc,
+                &da,
+                &da,
+                &cd1,
+                &daa,
+                &ca1,
+                &ca1,
+                &caa1,
+                &st.moments,
+            )?;
+            f_aa_d2 += exact_kernel::cell_third_derivative_from_moments(
+                nc,
+                &da,
+                &da,
+                &cd2,
+                &daa,
+                &ca2,
+                &ca2,
+                &caa2,
+                &st.moments,
+            )?;
+            f_aa_d12 += exact_kernel::cell_fourth_derivative_from_moments(
+                nc,
+                &da,
+                &da,
+                &cd1,
+                &cd2,
+                &daa,
+                &ca1,
+                &ca2,
+                &ca1,
+                &ca2,
+                &cd12,
+                &caa1,
+                &caa2,
+                &[0.0; 4],
+                &[0.0; 4],
+                &[0.0; 4],
+                &st.moments,
+            )?;
+
+            for u in 0..p {
+                let cu = fx.coeff_u[u].map(|v| -v);
+                let cau = fx.coeff_au[u].map(|v| -v);
+                f_u[u] += exact_kernel::cell_first_derivative_from_moments(&cu, &st.moments)?;
+                f_au[u] += exact_kernel::cell_second_derivative_from_moments(
+                    nc,
+                    &da,
+                    &cu,
+                    &cau,
+                    &st.moments,
+                )?;
+                let mut cu1 = [0.0; 4];
+                let mut cau1 = [0.0; 4];
+                let mut cu2 = [0.0; 4];
+                let mut cau2 = [0.0; 4];
+                for c in 0..p {
+                    let sc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
+                    let sca = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, c);
+                    for k in 0..4 {
+                        if dir1[c] != 0.0 {
+                            cu1[k] -= sc[k] * dir1[c];
+                            cau1[k] -= sca[k] * dir1[c];
+                        }
+                        if dir2[c] != 0.0 {
+                            cu2[k] -= sc[k] * dir2[c];
+                            cau2[k] -= sca[k] * dir2[c];
+                        }
+                    }
+                }
+                f_au_d1[u] += exact_kernel::cell_third_derivative_from_moments(
+                    nc,
+                    &da,
+                    &cu,
+                    &cd1,
+                    &cau,
+                    &ca1,
+                    &cu1,
+                    &cau1,
+                    &st.moments,
+                )?;
+                f_au_d2[u] += exact_kernel::cell_third_derivative_from_moments(
+                    nc,
+                    &da,
+                    &cu,
+                    &cd2,
+                    &cau,
+                    &ca2,
+                    &cu2,
+                    &cau2,
+                    &st.moments,
+                )?;
+                f_au_d12[u] += exact_kernel::cell_fourth_derivative_from_moments(
+                    nc,
+                    &da,
+                    &cu,
+                    &cd1,
+                    &cd2,
+                    &cau,
+                    &ca1,
+                    &ca2,
+                    &cu1,
+                    &cu2,
+                    &cd12,
+                    &[0.0; 4],
+                    &[0.0; 4],
+                    &[0.0; 4],
+                    &[0.0; 4],
+                    &[0.0; 4],
+                    &st.moments,
+                )?;
+            }
+            for u in 0..p {
+                for v in u..p {
+                    let cu = fx.coeff_u[u].map(|x| -x);
+                    let cv = fx.coeff_u[v].map(|x| -x);
+                    let sc = self
+                        .cell_pair_second_coeff(primary, &fx.coeff_bu, u, v)
+                        .map(|x| -x);
+                    let bv = exact_kernel::cell_second_derivative_from_moments(
+                        nc,
+                        &cu,
+                        &cv,
+                        &sc,
+                        &st.moments,
+                    )?;
+                    f_uv[[u, v]] += bv;
+                    if u != v {
+                        f_uv[[v, u]] += bv;
+                    }
+                    let mut cu1 = [0.0; 4];
+                    let mut cv1 = [0.0; 4];
+                    let mut cu2 = [0.0; 4];
+                    let mut cv2 = [0.0; 4];
+                    for c in 0..p {
+                        let suc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
+                        let svc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, v, c);
+                        for k in 0..4 {
+                            if dir1[c] != 0.0 {
+                                cu1[k] -= suc[k] * dir1[c];
+                                cv1[k] -= svc[k] * dir1[c];
+                            }
+                            if dir2[c] != 0.0 {
+                                cu2[k] -= suc[k] * dir2[c];
+                                cv2[k] -= svc[k] * dir2[c];
+                            }
+                        }
+                    }
+                    let d1v = exact_kernel::cell_third_derivative_from_moments(
+                        nc,
+                        &cu,
+                        &cv,
+                        &cd1,
+                        &sc,
+                        &cu1,
+                        &cv1,
+                        &[0.0; 4],
+                        &st.moments,
+                    )?;
+                    f_uv_d1[[u, v]] += d1v;
+                    if u != v {
+                        f_uv_d1[[v, u]] += d1v;
+                    }
+                    let d2v = exact_kernel::cell_third_derivative_from_moments(
+                        nc,
+                        &cu,
+                        &cv,
+                        &cd2,
+                        &sc,
+                        &cu2,
+                        &cv2,
+                        &[0.0; 4],
+                        &st.moments,
+                    )?;
+                    f_uv_d2[[u, v]] += d2v;
+                    if u != v {
+                        f_uv_d2[[v, u]] += d2v;
+                    }
+                    let d12v = exact_kernel::cell_fourth_derivative_from_moments(
+                        nc,
+                        &cu,
+                        &cv,
+                        &cd1,
+                        &cd2,
+                        &sc,
+                        &cu1,
+                        &cu2,
+                        &cv1,
+                        &cv2,
+                        &cd12,
+                        &[0.0; 4],
+                        &[0.0; 4],
+                        &[0.0; 4],
+                        &[0.0; 4],
+                        &[0.0; 4],
+                        &st.moments,
+                    )?;
+                    f_uv_d12[[u, v]] += d12v;
+                    if u != v {
+                        f_uv_d12[[v, u]] += d12v;
+                    }
+                }
+            }
+        }
+
+        let phi_q = crate::probability::normal_pdf(q);
+        f_u[q_index] += phi_q;
+        f_uv[[q_index, q_index]] += -q * phi_q;
+        f_uv_d1[[q_index, q_index]] += dir1[q_index] * (1.0 - q * q) * phi_q;
+        f_uv_d2[[q_index, q_index]] += dir2[q_index] * (1.0 - q * q) * phi_q;
+        f_uv_d12[[q_index, q_index]] += dir1[q_index] * dir2[q_index] * q * (q * q - 3.0) * phi_q;
+
+        let inv = 1.0 / f_a;
+        let mut au = Array1::<f64>::zeros(p);
+        for u in 0..p {
+            au[u] = -f_u[u] * inv;
+        }
+        let mut auv = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let val =
+                    -(f_uv[[u, v]] + f_au[u] * au[v] + f_au[v] * au[u] + f_aa * au[u] * au[v])
+                        * inv;
+                auv[[u, v]] = val;
+                auv[[v, u]] = val;
+            }
+        }
+        let ad1 = au.dot(dir1);
+        let ad2 = au.dot(dir2);
+        let aud1 = auv.dot(dir1);
+        let aud2 = auv.dot(dir2);
+
+        let mut auvd1 = Array2::<f64>::zeros((p, p));
+        let mut auvd2 = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let n1 = f_uv_d1[[u, v]]
+                    + f_au_d1[u] * au[v]
+                    + f_au[u] * aud1[v]
+                    + f_au_d1[v] * au[u]
+                    + f_au[v] * aud1[u]
+                    + f_aa_d1 * au[u] * au[v]
+                    + f_aa * (aud1[u] * au[v] + au[u] * aud1[v]);
+                let v1 = -(n1 + f_a_d1 * auv[[u, v]]) * inv;
+                auvd1[[u, v]] = v1;
+                auvd1[[v, u]] = v1;
+
+                let n2 = f_uv_d2[[u, v]]
+                    + f_au_d2[u] * au[v]
+                    + f_au[u] * aud2[v]
+                    + f_au_d2[v] * au[u]
+                    + f_au[v] * aud2[u]
+                    + f_aa_d2 * au[u] * au[v]
+                    + f_aa * (aud2[u] * au[v] + au[u] * aud2[v]);
+                let v2 = -(n2 + f_a_d2 * auv[[u, v]]) * inv;
+                auvd2[[u, v]] = v2;
+                auvd2[[v, u]] = v2;
+            }
+        }
+
+        let ad12 = aud2.dot(dir1);
+        let aud12 = auvd2.dot(dir1);
+        let mut auvd12 = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in u..p {
+                let n = f_uv_d12[[u, v]]
+                    + f_au_d12[u] * au[v]
+                    + f_au_d1[u] * aud2[v]
+                    + f_au_d2[u] * aud1[v]
+                    + f_au[u] * aud12[v]
+                    + f_au_d12[v] * au[u]
+                    + f_au_d1[v] * aud2[u]
+                    + f_au_d2[v] * aud1[u]
+                    + f_au[v] * aud12[u]
+                    + f_aa_d12 * au[u] * au[v]
+                    + f_aa_d1 * (aud2[u] * au[v] + au[u] * aud2[v])
+                    + f_aa_d2 * (aud1[u] * au[v] + au[u] * aud1[v])
+                    + f_aa
+                        * (aud12[u] * au[v]
+                            + aud1[u] * aud2[v]
+                            + aud2[u] * aud1[v]
+                            + au[u] * aud12[v]);
+                let val =
+                    -(n + f_a_d12 * auv[[u, v]] + f_a_d1 * auvd2[[u, v]] + f_a_d2 * auvd1[[u, v]])
+                        * inv;
+                auvd12[[u, v]] = val;
+                auvd12[[v, u]] = val;
+            }
+        }
+
+        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+        let z_obs = self.z[row];
+        let u_obs = a + b * z_obs;
+        let scale = self.probit_frailty_scale();
+
+        let mut g_u_fixed = vec![[0.0; 4]; p];
+        let mut g_au_fixed = vec![[0.0; 4]; p];
+        let mut g_bu_fixed = vec![[0.0; 4]; p];
+        let mut g_aau_fixed = vec![[0.0; 4]; p];
+        let mut g_abu_fixed = vec![[0.0; 4]; p];
+        let mut g_bbu_fixed = vec![[0.0; 4]; p];
+        let mut g_aaau_fixed = vec![[0.0; 4]; p];
+        let mut g_aabu_fixed = vec![[0.0; 4]; p];
+        let mut g_abbu_fixed = vec![[0.0; 4]; p];
+        let mut g_bbbu_fixed = vec![[0.0; 4]; p];
+
+        g_u_fixed[primary.g] = obs.dc_db;
+        g_au_fixed[primary.g] = obs.dc_dab;
+        g_bu_fixed[primary.g] = obs.dc_dbb;
+        g_aau_fixed[primary.g] = obs.dc_daab;
+        g_abu_fixed[primary.g] = obs.dc_dabb;
+        g_bbu_fixed[primary.g] = obs.dc_dbbb;
+        g_aaau_fixed[primary.g] = obs.dc_daab;
+        g_aabu_fixed[primary.g] = obs.dc_dabb;
+        g_abbu_fixed[primary.g] = obs.dc_dbbb;
+
+        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+            for local_idx in 0..h_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+                let idx = h_range.start + local_idx;
+                g_u_fixed[idx] = scale_coeff4(
+                    exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                    scale,
+                );
+                g_bu_fixed[idx] = scale_coeff4(
+                    exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                    scale,
+                );
+            }
+        }
+        if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), self.link_dev.as_ref()) {
+            for local_idx in 0..w_range.len() {
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let idx = w_range.start + local_idx;
+                let (dc_aw, dc_bw) =
+                    exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+                let (dc_aaw, dc_abw, dc_bbw) =
+                    exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
+                    exact_kernel::link_basis_cell_third_partials(basis_span);
+                g_u_fixed[idx] = scale_coeff4(
+                    exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+                    scale,
+                );
+                g_au_fixed[idx] = scale_coeff4(dc_aw, scale);
+                g_bu_fixed[idx] = scale_coeff4(dc_bw, scale);
+                g_aau_fixed[idx] = scale_coeff4(dc_aaw, scale);
+                g_abu_fixed[idx] = scale_coeff4(dc_abw, scale);
+                g_bbu_fixed[idx] = scale_coeff4(dc_bbw, scale);
+                g_aaau_fixed[idx] = scale_coeff4(dc_aaaw, scale);
+                g_aabu_fixed[idx] = scale_coeff4(dc_aabw, scale);
+                g_abbu_fixed[idx] = scale_coeff4(dc_abbw, scale);
+                g_bbbu_fixed[idx] = scale_coeff4(dc_bbbw, scale);
+            }
+        }
+
+        let g_jet = SparsePrimaryCoeffJetView::new(
+            primary,
+            &g_au_fixed,
+            &g_bu_fixed,
+            &g_aau_fixed,
+            &g_abu_fixed,
+            &g_bbu_fixed,
+            &g_aaau_fixed,
+            &g_aabu_fixed,
+            &g_abbu_fixed,
+            &g_bbbu_fixed,
+        );
+
+        let chi = eval_coeff4_at(&obs.dc_da, z_obs);
+        let eta_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
+        let eta_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
+        let chi_jet = scalar_composite_bilinear(
+            chi,
+            eta_aa,
+            eta_aaa,
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.a_first, dir1, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.a_first, dir2, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.mixed_directional_from_b_family(
+                    g_jet.ab_first,
+                    dir1,
+                    dir2,
+                    COEFF_SUPPORT_GW,
+                ),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aa_first, dir1, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aa_first, dir2, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            ad1,
+            ad2,
+            ad12,
+        );
+        let eta_aa_jet = scalar_composite_bilinear(
+            eta_aa,
+            eta_aaa,
+            0.0,
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aa_first, dir1, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aa_first, dir2, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.mixed_directional_from_b_family(
+                    g_jet.aab_first,
+                    dir1,
+                    dir2,
+                    COEFF_SUPPORT_GW,
+                ),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aaa_first, dir1, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aaa_first, dir2, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            ad1,
+            ad2,
+            ad12,
+        );
+        let eta_aaa_jet = MultiDirJet::bilinear(
+            eta_aaa,
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aaa_first, dir1, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.directional_family(g_jet.aaa_first, dir2, COEFF_SUPPORT_GW),
+                z_obs,
+            ),
+            eval_coeff4_at(
+                &g_jet.mixed_directional_from_b_family(
+                    g_jet.aab_first,
+                    dir1,
+                    dir2,
+                    COEFF_SUPPORT_GW,
+                ),
+                z_obs,
+            ),
+        );
+
+        let mut a_u_jets = Vec::with_capacity(p);
+        let mut tau_jets = Vec::with_capacity(p);
+        let mut tau_a_jets = Vec::with_capacity(p);
+        for u in 0..p {
+            a_u_jets.push(MultiDirJet::bilinear(au[u], aud1[u], aud2[u], aud12[u]));
+            tau_jets.push(scalar_composite_bilinear(
+                eval_coeff4_at(&g_au_fixed[u], z_obs),
+                eval_coeff4_at(&g_aau_fixed[u], z_obs),
+                eval_coeff4_at(&g_aaau_fixed[u], z_obs),
+                eval_coeff4_at(
+                    &g_jet.param_directional_from_b_family(
+                        g_jet.ab_first,
+                        u,
+                        dir1,
+                        COEFF_SUPPORT_GW,
+                    ),
+                    z_obs,
+                ),
+                eval_coeff4_at(
+                    &g_jet.param_directional_from_b_family(
+                        g_jet.ab_first,
+                        u,
+                        dir2,
+                        COEFF_SUPPORT_GW,
+                    ),
+                    z_obs,
+                ),
+                eval_coeff4_at(
+                    &g_jet.param_mixed_from_bb_family(
+                        g_jet.abb_first,
+                        u,
+                        dir1,
+                        dir2,
+                        COEFF_SUPPORT_GW,
+                    ),
+                    z_obs,
+                ),
+                eval_coeff4_at(
+                    &g_jet.param_directional_from_b_family(
+                        g_jet.aab_first,
+                        u,
+                        dir1,
+                        COEFF_SUPPORT_GW,
+                    ),
+                    z_obs,
+                ),
+                eval_coeff4_at(
+                    &g_jet.param_directional_from_b_family(
+                        g_jet.aab_first,
+                        u,
+                        dir2,
+                        COEFF_SUPPORT_GW,
+                    ),
+                    z_obs,
+                ),
+                ad1,
+                ad2,
+                ad12,
+            ));
+            tau_a_jets.push(scalar_composite_bilinear(
+                eval_coeff4_at(&g_aau_fixed[u], z_obs),
+                eval_coeff4_at(&g_aaau_fixed[u], z_obs),
+                0.0,
+                eval_coeff4_at(
+                    &g_jet.param_directional_from_b_family(
+                        g_jet.aab_first,
+                        u,
+                        dir1,
+                        COEFF_SUPPORT_GW,
+                    ),
+                    z_obs,
+                ),
+                eval_coeff4_at(
+                    &g_jet.param_directional_from_b_family(
+                        g_jet.aab_first,
+                        u,
+                        dir2,
+                        COEFF_SUPPORT_GW,
+                    ),
+                    z_obs,
+                ),
+                eval_coeff4_at(
+                    &g_jet.param_mixed_from_bb_family(
+                        g_jet.abb_first,
+                        u,
+                        dir1,
+                        dir2,
+                        COEFF_SUPPORT_GW,
+                    ),
+                    z_obs,
+                ),
+                0.0,
+                0.0,
+                ad1,
+                ad2,
+                ad12,
+            ));
+        }
+
+        let mut eta_uv_uv = Array2::<f64>::zeros((p, p));
+        let mut chi_uv_uv = Array2::<f64>::zeros((p, p));
+        let mut d_uv_uv = Array2::<f64>::zeros((p, p));
+
+        for u in 0..p {
+            for v in u..p {
+                let a_uv_jet = MultiDirJet::bilinear(
+                    auv[[u, v]],
+                    auvd1[[u, v]],
+                    auvd2[[u, v]],
+                    auvd12[[u, v]],
+                );
+                let a_u_prod = a_u_jets[u].mul(&a_u_jets[v]);
+                let r_uv_jet = scalar_composite_bilinear(
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_GHW),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_GW),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.aab_first, u, v, COEFF_SUPPORT_GW),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_directional_from_bb_family(
+                            g_jet.bb_first,
+                            u,
+                            v,
+                            dir1,
+                            COEFF_SUPPORT_GHW,
+                        ),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_directional_from_bb_family(
+                            g_jet.bb_first,
+                            u,
+                            v,
+                            dir2,
+                            COEFF_SUPPORT_GHW,
+                        ),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_mixed_from_bbb_family(
+                            g_jet.bbb_first,
+                            u,
+                            v,
+                            dir1,
+                            dir2,
+                            COEFF_SUPPORT_GHW,
+                        ),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_directional_from_bb_family(
+                            g_jet.abb_first,
+                            u,
+                            v,
+                            dir1,
+                            COEFF_SUPPORT_GW,
+                        ),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_directional_from_bb_family(
+                            g_jet.abb_first,
+                            u,
+                            v,
+                            dir2,
+                            COEFF_SUPPORT_GW,
+                        ),
+                        z_obs,
+                    ),
+                    ad1,
+                    ad2,
+                    ad12,
+                );
+                let chi_uv_fixed_jet = scalar_composite_bilinear(
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_GW),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.aab_first, u, v, COEFF_SUPPORT_GW),
+                        z_obs,
+                    ),
+                    0.0,
+                    eval_coeff4_at(
+                        &g_jet.pair_directional_from_bb_family(
+                            g_jet.abb_first,
+                            u,
+                            v,
+                            dir1,
+                            COEFF_SUPPORT_GW,
+                        ),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_directional_from_bb_family(
+                            g_jet.abb_first,
+                            u,
+                            v,
+                            dir2,
+                            COEFF_SUPPORT_GW,
+                        ),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_mixed_from_bbb_family(
+                            g_jet.bbb_first,
+                            u,
+                            v,
+                            dir1,
+                            dir2,
+                            COEFF_SUPPORT_GW,
+                        ),
+                        z_obs,
+                    ),
+                    0.0,
+                    0.0,
+                    ad1,
+                    ad2,
+                    ad12,
+                );
+
+                let eta_uv_jet = chi_jet
+                    .mul(&a_uv_jet)
+                    .add(&eta_aa_jet.mul(&a_u_prod))
+                    .add(&tau_jets[u].mul(&a_u_jets[v]))
+                    .add(&tau_jets[v].mul(&a_u_jets[u]))
+                    .add(&r_uv_jet);
+                let chi_uv_jet = eta_aa_jet
+                    .mul(&a_uv_jet)
+                    .add(&eta_aaa_jet.mul(&a_u_prod))
+                    .add(&tau_a_jets[u].mul(&a_u_jets[v]))
+                    .add(&tau_a_jets[v].mul(&a_u_jets[u]))
+                    .add(&chi_uv_fixed_jet);
+
+                eta_uv_uv[[u, v]] = eta_uv_jet.coeff(3);
+                eta_uv_uv[[v, u]] = eta_uv_uv[[u, v]];
+                chi_uv_uv[[u, v]] = chi_uv_jet.coeff(3);
+                chi_uv_uv[[v, u]] = chi_uv_uv[[u, v]];
+            }
+        }
+
+        for ce in &cached.cells {
+            let cell = ce.partition_cell.cell;
+            let st = &ce.state;
+            let fx = &ce.fixed;
+            let eta_base = [cell.c0, cell.c1, cell.c2, cell.c3];
+
+            let coeff_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_u, dir1);
+            let coeff_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_u, dir2);
+            let coeff_dir12 =
+                self.cell_mixed_directional_from_b_family(primary, &fx.coeff_bu, dir1, dir2);
+            let coeff_a_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_au, dir1);
+            let coeff_a_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_au, dir2);
+            let coeff_a_dir12 =
+                self.cell_mixed_directional_from_b_family(primary, &fx.coeff_abu, dir1, dir2);
+            let coeff_aa_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_aau, dir1);
+            let coeff_aa_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_aau, dir2);
+            let coeff_aa_dir12 =
+                self.cell_mixed_directional_from_b_family(primary, &fx.coeff_aabu, dir1, dir2);
+            let coeff_aaa_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_aaau, dir1);
+            let coeff_aaa_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_aaau, dir2);
+            let coeff_aaa_dir12 =
+                self.cell_mixed_directional_from_b_family(primary, &fx.coeff_aabu, dir1, dir2);
+
+            let eta_poly_jet = coeff4_composite_bilinear(
+                &eta_base,
+                &fx.dc_da,
+                &fx.dc_daa,
+                &coeff_dir1,
+                &coeff_dir2,
+                &coeff_dir12,
+                &coeff_a_dir1,
+                &coeff_a_dir2,
+                ad1,
+                ad2,
+                ad12,
+            );
+            let chi_poly_jet = coeff4_composite_bilinear(
+                &fx.dc_da,
+                &fx.dc_daa,
+                &fx.dc_daaa,
+                &coeff_a_dir1,
+                &coeff_a_dir2,
+                &coeff_a_dir12,
+                &coeff_aa_dir1,
+                &coeff_aa_dir2,
+                ad1,
+                ad2,
+                ad12,
+            );
+            let eta_aa_poly_jet = coeff4_composite_bilinear(
+                &fx.dc_daa,
+                &fx.dc_daaa,
+                &zero4,
+                &coeff_aa_dir1,
+                &coeff_aa_dir2,
+                &coeff_aa_dir12,
+                &coeff_aaa_dir1,
+                &coeff_aaa_dir2,
+                ad1,
+                ad2,
+                ad12,
+            );
+            let eta_aaa_poly_jet = coeff4_fixed_bilinear(
+                &fx.dc_daaa,
+                &coeff_aaa_dir1,
+                &coeff_aaa_dir2,
+                &coeff_aaa_dir12,
+            );
+
+            let mut eta_u_poly_jets = Vec::with_capacity(p);
+            let mut chi_u_poly_jets = Vec::with_capacity(p);
+            let mut coeff_au_fixed_jets = Vec::with_capacity(p);
+            let mut coeff_aau_fixed_jets = Vec::with_capacity(p);
+            for u in 0..p {
+                let coeff_u_dir1 =
+                    self.cell_param_directional_from_b_family(primary, &fx.coeff_bu, u, dir1);
+                let coeff_u_dir2 =
+                    self.cell_param_directional_from_b_family(primary, &fx.coeff_bu, u, dir2);
+                let coeff_u_dir12 =
+                    self.cell_param_mixed_from_bb_family(primary, &fx.coeff_bbu, u, dir1, dir2);
+                let coeff_au_dir1 =
+                    self.cell_param_directional_from_b_family(primary, &fx.coeff_abu, u, dir1);
+                let coeff_au_dir2 =
+                    self.cell_param_directional_from_b_family(primary, &fx.coeff_abu, u, dir2);
+                let coeff_au_dir12 =
+                    self.cell_param_mixed_from_bb_family(primary, &fx.coeff_abbu, u, dir1, dir2);
+                let coeff_aau_dir1 =
+                    self.cell_param_directional_from_b_family(primary, &fx.coeff_aabu, u, dir1);
+                let coeff_aau_dir2 =
+                    self.cell_param_directional_from_b_family(primary, &fx.coeff_aabu, u, dir2);
+                let coeff_aau_dir12 =
+                    self.cell_param_mixed_from_bb_family(primary, &fx.coeff_abbu, u, dir1, dir2);
+
+                let coeff_u_fixed_jet = coeff4_fixed_bilinear(
+                    &fx.coeff_u[u],
+                    &coeff_u_dir1,
+                    &coeff_u_dir2,
+                    &coeff_u_dir12,
+                );
+                let coeff_au_fixed_jet = coeff4_fixed_bilinear(
+                    &fx.coeff_au[u],
+                    &coeff_au_dir1,
+                    &coeff_au_dir2,
+                    &coeff_au_dir12,
+                );
+                let coeff_aau_fixed_jet = coeff4_fixed_bilinear(
+                    &fx.coeff_aau[u],
+                    &coeff_aau_dir1,
+                    &coeff_aau_dir2,
+                    &coeff_aau_dir12,
+                );
+
+                eta_u_poly_jets.push(poly_add_jets(
+                    &poly_scale_jets(&chi_poly_jet, &a_u_jets[u]),
+                    &coeff_u_fixed_jet,
+                ));
+                chi_u_poly_jets.push(poly_add_jets(
+                    &poly_scale_jets(&eta_aa_poly_jet, &a_u_jets[u]),
+                    &coeff_au_fixed_jet,
+                ));
+                coeff_au_fixed_jets.push(coeff_au_fixed_jet);
+                coeff_aau_fixed_jets.push(coeff_aau_fixed_jet);
+            }
+
+            for u in 0..p {
+                for v in u..p {
+                    let a_uv_jet = MultiDirJet::bilinear(
+                        auv[[u, v]],
+                        auvd1[[u, v]],
+                        auvd2[[u, v]],
+                        auvd12[[u, v]],
+                    );
+                    let a_u_prod = a_u_jets[u].mul(&a_u_jets[v]);
+                    let r_uv_fixed_jet = coeff4_fixed_bilinear(
+                        &self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, v),
+                        &self.cell_pair_directional_from_bb_family(
+                            primary,
+                            &fx.coeff_bbu,
+                            u,
+                            v,
+                            dir1,
+                        ),
+                        &self.cell_pair_directional_from_bb_family(
+                            primary,
+                            &fx.coeff_bbu,
+                            u,
+                            v,
+                            dir2,
+                        ),
+                        &self.cell_pair_mixed_from_bbb_family(
+                            primary,
+                            &fx.coeff_bbbu,
+                            u,
+                            v,
+                            dir1,
+                            dir2,
+                        ),
+                    );
+                    let chi_uv_fixed_jet = coeff4_fixed_bilinear(
+                        &self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, v),
+                        &self.cell_pair_directional_from_bb_family(
+                            primary,
+                            &fx.coeff_abbu,
+                            u,
+                            v,
+                            dir1,
+                        ),
+                        &self.cell_pair_directional_from_bb_family(
+                            primary,
+                            &fx.coeff_abbu,
+                            u,
+                            v,
+                            dir2,
+                        ),
+                        &self.cell_pair_mixed_from_bbb_family(
+                            primary,
+                            &fx.coeff_bbbu,
+                            u,
+                            v,
+                            dir1,
+                            dir2,
+                        ),
+                    );
+
+                    let eta_uv_poly_jet = poly_add_jets(
+                        &poly_add_jets(
+                            &poly_scale_jets(&chi_poly_jet, &a_uv_jet),
+                            &poly_scale_jets(&eta_aa_poly_jet, &a_u_prod),
+                        ),
+                        &poly_add_jets(
+                            &poly_scale_jets(&coeff_au_fixed_jets[u], &a_u_jets[v]),
+                            &poly_add_jets(
+                                &poly_scale_jets(&coeff_au_fixed_jets[v], &a_u_jets[u]),
+                                &r_uv_fixed_jet,
+                            ),
+                        ),
+                    );
+                    let chi_uv_poly_jet = poly_add_jets(
+                        &poly_add_jets(
+                            &poly_scale_jets(&eta_aa_poly_jet, &a_uv_jet),
+                            &poly_scale_jets(&eta_aaa_poly_jet, &a_u_prod),
+                        ),
+                        &poly_add_jets(
+                            &poly_scale_jets(&coeff_aau_fixed_jets[u], &a_u_jets[v]),
+                            &poly_add_jets(
+                                &poly_scale_jets(&coeff_aau_fixed_jets[v], &a_u_jets[u]),
+                                &chi_uv_fixed_jet,
+                            ),
+                        ),
+                    );
+
+                    let t1 = chi_uv_poly_jet.clone();
+                    let t2 = poly_scale_jets(
+                        &poly_mul_jets(
+                            &poly_mul_jets(&chi_u_poly_jets[v], &eta_poly_jet),
+                            &eta_u_poly_jets[u],
+                        ),
+                        &MultiDirJet::constant(2, -1.0),
+                    );
+                    let t3 = poly_scale_jets(
+                        &poly_mul_jets(
+                            &poly_mul_jets(&chi_u_poly_jets[u], &eta_poly_jet),
+                            &eta_u_poly_jets[v],
+                        ),
+                        &MultiDirJet::constant(2, -1.0),
+                    );
+                    let t4 = poly_scale_jets(
+                        &poly_mul_jets(
+                            &chi_poly_jet,
+                            &poly_add_jets(
+                                &poly_mul_jets(&eta_u_poly_jets[u], &eta_u_poly_jets[v]),
+                                &poly_mul_jets(&eta_poly_jet, &eta_uv_poly_jet),
+                            ),
+                        ),
+                        &MultiDirJet::constant(2, -1.0),
+                    );
+                    let t5 = poly_mul_jets(
+                        &chi_poly_jet,
+                        &poly_mul_jets(
+                            &poly_mul_jets(&eta_poly_jet, &eta_poly_jet),
+                            &poly_mul_jets(&eta_u_poly_jets[u], &eta_u_poly_jets[v]),
+                        ),
+                    );
+                    let i_base_jet = poly_add_jets(
+                        &poly_add_jets(&poly_add_jets(&t1, &t2), &t3),
+                        &poly_add_jets(&t4, &t5),
+                    );
+
+                    let i_base = poly_coeff_mask(&i_base_jet, 0);
+                    let i_base_d2 = poly_coeff_mask(&i_base_jet, 2);
+                    let i_base_d12 = poly_coeff_mask(&i_base_jet, 3);
+                    let eta_poly = poly_coeff_mask(&eta_poly_jet, 0);
+                    let eta_d1_poly = poly_coeff_mask(&eta_poly_jet, 1);
+                    let eta_d2_poly = poly_coeff_mask(&eta_poly_jet, 2);
+                    let eta_d12_poly = poly_coeff_mask(&eta_poly_jet, 3);
+
+                    let correction = poly_add(
+                        &poly_mul(
+                            &poly_add(
+                                &poly_mul(&eta_d2_poly, &eta_d1_poly),
+                                &poly_mul(&eta_poly, &eta_d12_poly),
+                            ),
+                            &i_base,
+                        ),
+                        &poly_mul(&poly_mul(&eta_poly, &eta_d1_poly), &i_base_d2),
+                    );
+                    let full_integrand = poly_sub(&i_base_d12, &correction);
+                    let value = exact_kernel::cell_polynomial_integral_from_moments(
+                        &full_integrand,
+                        &st.moments,
+                        "survival D_t second derivative bidirectional",
+                    )?;
+                    d_uv_uv[[u, v]] += value;
+                    d_uv_uv[[v, u]] = d_uv_uv[[u, v]];
+                }
+            }
+        }
+
+        Ok(SurvivalFlexTimepointBiDirectionalExact {
+            eta_uv_uv,
+            chi_uv_uv,
+            d_uv_uv,
+        })
+    }
+
     /// Exact third-order directional contraction for the flexible survival
     /// path.  Returns D_dir H[u,v] where H is the primary-space NLL Hessian.
     fn row_flex_primary_third_contracted_exact(
@@ -5325,11 +7080,9 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Fourth-order directional contraction for the flexible survival path.
     ///
-    /// This path is analytic for the pieces currently implemented, but it
-    /// still omits the mixed second-directional extensions of `eta_uv`,
-    /// `chi_uv`, and `d_uv` further below. That is why the exact outer path is
-    /// still gated to first order when both timewiggle and flexible score/link
-    /// warps are active.
+    /// The mixed second-directional timepoint transport is carried exactly
+    /// through the implicit intercept solve, the observed-point eta/chi jets,
+    /// and the cellwise density-normalization integrand.
     fn row_flex_primary_fourth_contracted_exact(
         &self,
         row: usize,
@@ -5394,6 +7147,15 @@ impl SurvivalMarginalSlopeFamily {
             row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir_v, true,
         )?;
 
+        // Bidirectional extensions D_{d1} D_{d2} (η_uv, χ_uv, D_uv) via exact
+        // IFT second-order recursion through the cell kernel.
+        let entry_bi = self.compute_survival_timepoint_bidirectional_exact(
+            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir_u, dir_v,
+        )?;
+        let exit_bi = self.compute_survival_timepoint_bidirectional_exact(
+            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir_u, dir_v,
+        )?;
+
         let ordered_uv = self.compute_survival_fourth_contracted_ordered(
             row,
             &primary,
@@ -5404,6 +7166,8 @@ impl SurvivalMarginalSlopeFamily {
             &entry_ext_v,
             &exit_ext_u,
             &exit_ext_v,
+            &entry_bi,
+            &exit_bi,
             dir_u,
             dir_v,
         )?;
@@ -5417,6 +7181,8 @@ impl SurvivalMarginalSlopeFamily {
             &entry_ext_u,
             &exit_ext_v,
             &exit_ext_u,
+            &entry_bi,
+            &exit_bi,
             dir_v,
             dir_u,
         )?;
@@ -5442,6 +7208,8 @@ impl SurvivalMarginalSlopeFamily {
         entry_ext2: &SurvivalFlexTimepointDirectionalExact,
         exit_ext1: &SurvivalFlexTimepointDirectionalExact,
         exit_ext2: &SurvivalFlexTimepointDirectionalExact,
+        entry_bi: &SurvivalFlexTimepointBiDirectionalExact,
+        exit_bi: &SurvivalFlexTimepointBiDirectionalExact,
         dir1: &Array1<f64>,
         dir2: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
@@ -5502,11 +7270,10 @@ impl SurvivalMarginalSlopeFamily {
             .collect::<Vec<_>>()
             .into();
 
-        // The mixed second-directional extensions eta_uv_d12 / chi_uv_d12 /
-        // d_uv_d12 are still missing here. Keep the zero placeholders explicit
-        // rather than silently claiming a fully exact fourth-order transport.
-        let entry_eta_uv_d12 = Array2::<f64>::zeros((p, p));
-        let exit_eta_uv_d12 = Array2::<f64>::zeros((p, p));
+        // Mixed second-directional D_{d1} D_{d2} η_uv etc. computed by the
+        // caller and passed via entry_bi / exit_bi (BiDirectionalExact).
+        let entry_eta_uv_d12 = &entry_bi.eta_uv_uv;
+        let exit_eta_uv_d12 = &exit_bi.eta_uv_uv;
 
         let chi = exit_base.chi;
         let chi_inv = 1.0 / chi;
@@ -5602,7 +7369,8 @@ impl SurvivalMarginalSlopeFamily {
                 let chi_u_d12v = exit_chi_u_d12[u];
                 let chi_v_d12v = exit_chi_u_d12[v];
 
-                let d2_r_chi = 0.0 * chi_inv // chi_uv_d12 term (zeroed)
+                let chi_uv_d12_val = exit_bi.chi_uv_uv[[u, v]];
+                let d2_r_chi = chi_uv_d12_val * chi_inv
                     - chi_uv_d1 * exit_chi_d2 * chi_inv2
                     - chi_uv_d2 * exit_chi_d1 * chi_inv2
                     - chi_uv_val * exit_chi_d12 * chi_inv2
@@ -5632,7 +7400,8 @@ impl SurvivalMarginalSlopeFamily {
                 let d_u_d12v = exit_d_u_d12[u];
                 let d_v_d12v = exit_d_u_d12[v];
 
-                let d2_r_d = 0.0 * d_inv // d_uv_d12 term (zeroed)
+                let d_uv_d12_val = exit_bi.d_uv_uv[[u, v]];
+                let d2_r_d = d_uv_d12_val * d_inv
                     - d_uv_d1 * exit_d_d2 * d_inv2
                     - d_uv_d2 * exit_d_d1 * d_inv2
                     - d_uv_val * exit_d_d12 * d_inv2
@@ -6136,12 +7905,6 @@ impl SurvivalMarginalSlopeFamily {
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
-        if flex_active && self.link_dev.is_some() {
-            return Err(
-                "survival exact psi terms are not implemented for flexible link wiggles"
-                    .to_string(),
-            );
-        }
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
         let Some((block_idx, local_idx, p_psi, psi_label)) =
@@ -6361,12 +8124,6 @@ impl SurvivalMarginalSlopeFamily {
         cache: Option<&EvalCache>,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
-        if flex_active {
-            return Err(
-                "survival exact second-order psi terms are not implemented for flexible score/link warps"
-                    .to_string(),
-            );
-        }
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
         let Some((block_idx_i, local_idx_i, p_psi_i, label_i)) =
@@ -6741,18 +8498,6 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
-        if flex_active && self.link_dev.is_some() {
-            return Err(
-                "survival exact psi-Hessian directional derivatives are not implemented for flexible link wiggles"
-                    .to_string(),
-            );
-        }
-        if flex_active {
-            return Err(
-                "survival exact psi-Hessian directional derivatives are not implemented for flexible score/link warps"
-                    .to_string(),
-            );
-        }
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
         let Some((block_idx, local_idx, p_psi, psi_label)) =
@@ -9308,12 +11053,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        if self.link_dev.is_some() {
-            return ExactOuterDerivativeOrder::Zeroth;
-        }
-        if self.flex_active() {
-            return ExactOuterDerivativeOrder::First;
-        }
         // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
@@ -9412,13 +11151,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.effective_flex_active(block_states)? {
-            if self.link_dev.is_some() {
-                return Err(
-                    "survival marginal-slope exact beta-Hessian directional derivatives are not implemented for flexible link wiggles"
-                        .to_string(),
-                )
-                .map(Some);
-            }
             return if self.flex_timewiggle_active() {
                 self.exact_newton_joint_hessian_directional_derivative_timewiggle_flex(
                     block_states,
@@ -10802,7 +12534,7 @@ mod tests {
     }
 
     #[test]
-    fn link_flex_family_does_not_expose_exact_outer_path() {
+    fn link_flex_family_supports_second_order_exact_outer_path() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let family = SurvivalMarginalSlopeFamily {
@@ -10836,12 +12568,12 @@ mod tests {
         ];
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::Zeroth
+            ExactOuterDerivativeOrder::Second
         );
     }
 
     #[test]
-    fn timewiggle_flex_family_limits_exact_outer_path_to_first_order() {
+    fn timewiggle_scorewarp_family_supports_second_order_exact_outer_path() {
         let score_runtime = test_deviation_runtime();
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
@@ -10873,12 +12605,12 @@ mod tests {
         ];
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
         );
     }
 
     #[test]
-    fn timewiggle_flex_beta_hessian_directional_derivative_returns_finite_matrix() {
+    fn timewiggle_scorewarp_beta_hessian_directional_derivative_returns_finite_matrix() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -10942,7 +12674,7 @@ mod tests {
     }
 
     #[test]
-    fn timewiggle_flex_beta_hessian_second_directional_derivative_returns_finite_matrix() {
+    fn timewiggle_scorewarp_beta_hessian_second_directional_derivative_returns_finite_matrix() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -11015,7 +12747,113 @@ mod tests {
     }
 
     #[test]
-    fn link_flex_marginal_psi_terms_are_rejected() {
+    fn link_flex_bidirectional_timepoint_returns_finite_transport() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(array![[1.0]]),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.2],
+                eta: array![0.2],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+        ];
+
+        let q_geom = family
+            .row_dynamic_q_geometry(0, &block_states)
+            .expect("row geometry");
+        let primary = flex_primary_slices(&family);
+        let g = block_states[2].eta[0];
+        let beta_h = family
+            .flex_score_beta(&block_states)
+            .expect("score beta");
+        let beta_w = family.flex_link_beta(&block_states).expect("link beta");
+        let (a1, _) = family
+            .solve_row_survival_intercept(q_geom.q1, g, beta_h, beta_w)
+            .expect("solve intercept");
+
+        let mut dir_u = Array1::zeros(primary.total);
+        let mut dir_v = Array1::zeros(primary.total);
+        dir_u[primary.q1] = 0.07;
+        dir_u[primary.g] = -0.04;
+        dir_v[primary.q0] = 0.03;
+        if let Some(h_range) = primary.h.as_ref() {
+            dir_u[h_range.start] = 0.02;
+        }
+        if let Some(w_range) = primary.w.as_ref() {
+            dir_v[w_range.start] = -0.01;
+        }
+
+        let active = family
+            .compute_survival_timepoint_bidirectional_exact(
+                0,
+                &primary,
+                q_geom.q1,
+                primary.q1,
+                a1,
+                g,
+                beta_h,
+                beta_w,
+                &dir_u,
+                &dir_v,
+            )
+            .expect("active bidirectional transport");
+        assert!(active.eta_uv_uv.iter().all(|value| value.is_finite()));
+        assert!(active.chi_uv_uv.iter().all(|value| value.is_finite()));
+        assert!(active.d_uv_uv.iter().all(|value| value.is_finite()));
+        assert_eq!(active.eta_uv_uv.nrows(), primary.total);
+        assert_eq!(active.eta_uv_uv.ncols(), primary.total);
+        assert_eq!(active.chi_uv_uv.nrows(), primary.total);
+        assert_eq!(active.chi_uv_uv.ncols(), primary.total);
+        assert_eq!(active.d_uv_uv.nrows(), primary.total);
+        assert_eq!(active.d_uv_uv.ncols(), primary.total);
+        for u in 0..primary.total {
+            for v in 0..primary.total {
+                assert_eq!(active.eta_uv_uv[[u, v]], active.eta_uv_uv[[v, u]]);
+                assert_eq!(active.chi_uv_uv[[u, v]], active.chi_uv_uv[[v, u]]);
+                assert_eq!(active.d_uv_uv[[u, v]], active.d_uv_uv[[v, u]]);
+            }
+        }
+    }
+
+    #[test]
+    fn link_flex_marginal_psi_terms_return_finite_joint_terms() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
@@ -11081,10 +12919,188 @@ mod tests {
             Vec::new(),
         ];
 
-        let err = family
+        let slices = block_slices(&family, &block_states);
+        let terms = family
             .psi_terms(&block_states, &derivative_blocks, 0)
-            .expect_err("link flex psi terms should be rejected");
-        assert!(err.contains("flexible link wiggles"));
+            .expect("link flex psi terms should evaluate")
+            .expect("psi terms should exist");
+        assert!(terms.objective_psi.is_finite());
+        assert_eq!(terms.score_psi.len(), slices.total);
+        assert!(terms.score_psi.iter().all(|value| value.is_finite()));
+        assert!(terms.hessian_psi_operator.is_some());
+    }
+
+    #[test]
+    fn link_flex_marginal_psi_second_order_returns_finite_joint_terms() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_design = array![[1.2, -0.3]];
+        let logslope_beta = array![0.2, -0.05];
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(logslope_design.clone()),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_design.dot(&logslope_beta),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+        ];
+        let derivative_blocks = vec![
+            Vec::new(),
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[1.0, -0.4]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[0.3, 0.8]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+            Vec::new(),
+        ];
+
+        let slices = block_slices(&family, &block_states);
+        let terms = family
+            .psi_second_order_terms(&block_states, &derivative_blocks, 0, 1)
+            .expect("link flex psi second-order path should evaluate")
+            .expect("psi second-order terms should exist");
+        assert!(terms.objective_psi_psi.is_finite());
+        assert_eq!(terms.score_psi_psi.len(), slices.total);
+        assert!(terms.score_psi_psi.iter().all(|value| value.is_finite()));
+        assert!(terms.hessian_psi_psi_operator.is_some());
+    }
+
+    #[test]
+    fn link_flex_marginal_psi_hessian_directional_returns_finite_matrix() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2]];
+        let marginal_beta = array![0.35, -0.1];
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(array![[1.0]]),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: array![0.2],
+                eta: array![0.2],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+        ];
+        let derivative_blocks = vec![
+            Vec::new(),
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[1.0, -0.4]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ];
+        let slices = block_slices(&family, &block_states);
+        let mut d_beta_flat = Array1::zeros(slices.total);
+        d_beta_flat[slices.time.start] = 0.07;
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.logslope.start] = -0.04;
+        if let Some(h_range) = slices.score_warp.as_ref() {
+            d_beta_flat[h_range.start] = 0.02;
+        }
+        if let Some(w_range) = slices.link_dev.as_ref() {
+            d_beta_flat[w_range.start] = -0.03;
+        }
+
+        let hess_dir = family
+            .psi_hessian_directional_derivative(&block_states, &derivative_blocks, 0, &d_beta_flat)
+            .expect("link flex psi-Hessian directional path should evaluate")
+            .expect("psi-Hessian directional derivative should exist");
+        assert_eq!(hess_dir.nrows(), slices.total);
+        assert_eq!(hess_dir.ncols(), slices.total);
+        assert!(hess_dir.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -11159,7 +13175,7 @@ mod tests {
     }
 
     #[test]
-    fn timewiggle_marginal_logslope_psi_second_order_is_rejected_for_flex_path() {
+    fn timewiggle_marginal_logslope_psi_second_order_returns_finite_joint_terms() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -11228,14 +13244,19 @@ mod tests {
             Vec::new(),
         ];
 
-        let err = family
+        let slices = block_slices(&family, &block_states);
+        let terms = family
             .psi_second_order_terms(&block_states, &derivative_blocks, 0, 1)
-            .expect_err("timewiggle flex psi second-order path should be rejected");
-        assert!(err.contains("not implemented for flexible score/link warps"));
+            .expect("timewiggle scorewarp psi second-order path should evaluate")
+            .expect("psi second-order terms should exist");
+        assert!(terms.objective_psi_psi.is_finite());
+        assert_eq!(terms.score_psi_psi.len(), slices.total);
+        assert!(terms.score_psi_psi.iter().all(|value| value.is_finite()));
+        assert!(terms.hessian_psi_psi_operator.is_some());
     }
 
     #[test]
-    fn timewiggle_marginal_psi_hessian_directional_is_rejected_for_flex_path() {
+    fn timewiggle_marginal_psi_hessian_directional_returns_finite_matrix() {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
@@ -11303,10 +13324,14 @@ mod tests {
             d_beta_flat[h_range.start] = 0.02;
         }
 
-        let err = family
+        let slices = block_slices(&family, &block_states);
+        let hess_dir = family
             .psi_hessian_directional_derivative(&block_states, &derivative_blocks, 0, &d_beta_flat)
-            .expect_err("timewiggle flex psi-Hessian directional path should be rejected");
-        assert!(err.contains("not implemented for flexible score/link warps"));
+            .expect("timewiggle scorewarp psi-Hessian directional path should evaluate")
+            .expect("psi-Hessian directional derivative should exist");
+        assert_eq!(hess_dir.nrows(), slices.total);
+        assert_eq!(hess_dir.ncols(), slices.total);
+        assert!(hess_dir.iter().all(|value| value.is_finite()));
     }
 
     #[test]

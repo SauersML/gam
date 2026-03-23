@@ -13802,9 +13802,7 @@ mod tests {
     #[test]
     fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
         let saved_runtime = SavedAnchoredDeviationRuntime {
-            kernel:
-                gam::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                    .to_string(),
+            kernel: gam::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
             breakpoints: vec![-1.0, 1.0],
             basis_dim: 1,
             span_c0: vec![vec![0.0]],
