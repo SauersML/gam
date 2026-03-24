@@ -3822,6 +3822,25 @@ fn lower_bound_active_coeffs_to_rows(
     active_rows
 }
 
+fn lower_bound_active_coeffs_from_solution(
+    bounds: &SimpleLowerBounds,
+    beta: &Array1<f64>,
+) -> Vec<usize> {
+    let mut active_coeffs = Vec::new();
+    for coeff in 0..beta.len() {
+        let lower = bounds.lower_bounds[coeff];
+        if !lower.is_finite() {
+            continue;
+        }
+        let scale = beta[coeff].abs().max(lower.abs()).max(1.0);
+        let tol = 1e-6 * scale + 1e-10;
+        if beta[coeff] <= lower + tol {
+            active_coeffs.push(coeff);
+        }
+    }
+    active_coeffs
+}
+
 fn project_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
     for i in 0..beta.len() {
         let lower = lower_bounds[i];
@@ -3852,8 +3871,17 @@ fn solve_quadratic_with_simple_lower_bounds(
     .map_err(|e| format!("lower-bound Newton solve failed: {e}"))?;
     let mut beta_new = beta_start + &delta;
     project_to_lower_bounds(&mut beta_new, &bounds.lower_bounds);
+    active_coeffs = lower_bound_active_coeffs_from_solution(bounds, &beta_new);
     let active = lower_bound_active_coeffs_to_rows(bounds, &active_coeffs);
     Ok((beta_new, active))
+}
+
+fn normalize_active_set(active_set: Vec<usize>) -> Option<Vec<usize>> {
+    if active_set.is_empty() {
+        None
+    } else {
+        Some(active_set)
+    }
 }
 
 struct BlockUpdateContext<'a> {
@@ -3957,7 +3985,7 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
                 })?;
                 Ok(BlockUpdateResult {
                     beta_new_raw: beta_constrained,
-                    active_set: Some(active_set),
+                    active_set: normalize_active_set(active_set),
                 })
             })
         } else {
@@ -4076,7 +4104,7 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             })?;
             Ok(BlockUpdateResult {
                 beta_new_raw,
-                active_set: Some(active_set),
+                active_set: normalize_active_set(active_set),
             })
         } else {
             // Solve for the Newton step, not the next beta directly.

@@ -9,14 +9,11 @@ lake exe cache get >/dev/null
 
 files=()
 while IFS= read -r file; do
-  rs="${file%.lean}.rs"
-  if [ -f "$rs" ]; then
-    files+=("$file")
-  fi
+  files+=("$file")
 done < <(find "$ROOT/src" -type f -name '*.lean' | sort)
 
 if [ "${#files[@]}" -eq 0 ]; then
-  echo "No Rust-matched .lean files found under src/."
+  echo "No .lean files found under src/."
   exit 0
 fi
 

@@ -98,12 +98,12 @@ def main():
 
     # ── Bernoulli marginal-slope ─────────────────────────────────────
     bern("bern_rigid",
-         ["--disable-score-warp", "--disable-link-dev"])
+         ["--disable-link-dev"])
     bern("bern_scorewarp",
          ["--disable-link-dev"])
     bern("bern_frailty",
          ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.3",
-          "--disable-score-warp", "--disable-link-dev"])
+          "--disable-link-dev"])
     bern("bern_sw_frailty",
          ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.2",
           "--disable-link-dev"])

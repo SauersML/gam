@@ -46,6 +46,9 @@ scripts/scripts/latest_benchmark_summary.md
 *.png
 src/rust_digest.txt
 
+# Codex temp working directories
+.tmp-codex/
+
 # macOS metadata
 .DS_Store
 

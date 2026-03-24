@@ -94,6 +94,10 @@ def merge_z_into_study(study_csv, pred_csv, out_csv):
     """Read predict output (eta column = PIT z), merge as 'z' into study data."""
     study = read_csv(study_csv)
     preds = read_csv(pred_csv)
+    if len(preds) != len(study):
+        raise RuntimeError(
+            f"PIT prediction row mismatch: got {len(preds)} rows for {len(study)} study rows"
+        )
     for s, p in zip(study, preds):
         s["z"] = p["eta"]
     write_csv(study, out_csv)
@@ -128,6 +132,12 @@ def run(args, label, timeout=300):
     for line in stdout[-3:]:
         print(f"  {line}")
     return True, elapsed
+
+
+def skip(label, reason):
+    print(f"\n{'=' * 70}\n{label}\n{'=' * 70}")
+    print(f"  SKIP ({reason})")
+    return False, 0.0
 
 
 def main():
@@ -168,46 +178,64 @@ def main():
 
     # ── Predict: PIT z-scores on study data ──────────────────────────
     fit1_pred_csv = os.path.join(tmpdir, "fit1_pred.csv")
-    ok, elapsed = run([
-        "predict", fit1_model, study_csv,
-        "--out", fit1_pred_csv,
-    ], "Predict: PIT z-scores on study data")
+    if results["fit1_pit"]:
+        ok, elapsed = run([
+            "predict", fit1_model, study_csv,
+            "--out", fit1_pred_csv,
+        ], "Predict: PIT z-scores on study data")
+    else:
+        ok, elapsed = skip(
+            "Predict: PIT z-scores on study data",
+            "transformation-normal fit failed",
+        )
     results["pred_pit"] = ok
     timings["pred_pit"] = elapsed
 
     # ── Merge z into study CSV ───────────────────────────────────────
     enriched_csv = os.path.join(tmpdir, "study_with_z.csv")
-    merge_z_into_study(study_csv, fit1_pred_csv, enriched_csv)
+    if not results["pred_pit"]:
+        fit2_model = os.path.join(tmpdir, "bernoulli.json")
+        fit4_model = os.path.join(tmpdir, "survival.json")
+        results["fit2_bern_ms"], timings["fit2_bern_ms"] = skip(
+            "Fit 2: Bernoulli marginal-slope",
+            "PIT z-scores were not produced",
+        )
+        results["fit4_surv_ms"], timings["fit4_surv_ms"] = skip(
+            "Fit 4: Survival marginal-slope (Gompertz-Makeham + timewiggle)",
+            "PIT z-scores were not produced",
+        )
+    else:
+        merge_z_into_study(study_csv, fit1_pred_csv, enriched_csv)
 
-    # ── Fit 2: Bernoulli marginal-slope (Duchon + linkwiggle) ────────
-    fit2_model = os.path.join(tmpdir, "bernoulli.json")
-    ok, elapsed = run([
-        "fit", enriched_csv,
-        "case ~ duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
-        "--logslope-formula",
-        "duchon(pc1, pc2, pc3, pc4, centers=20)",
-        "--z-column", "z",
-        "--scale-dimensions",
-        "--out", fit2_model,
-    ], "Fit 2: Bernoulli marginal-slope")
-    results["fit2_bern_ms"] = ok
-    timings["fit2_bern_ms"] = elapsed
+        # ── Fit 2: Bernoulli marginal-slope (Duchon + linkwiggle) ────────
+        fit2_model = os.path.join(tmpdir, "bernoulli.json")
+        ok, elapsed = run([
+            "fit", enriched_csv,
+            "case ~ duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
+            "--logslope-formula",
+            "duchon(pc1, pc2, pc3, pc4, centers=20)",
+            "--z-column", "z",
+            "--scale-dimensions",
+            "--out", fit2_model,
+        ], "Fit 2: Bernoulli marginal-slope")
+        results["fit2_bern_ms"] = ok
+        timings["fit2_bern_ms"] = elapsed
 
-    # ── Fit 4: Survival marginal-slope (Duchon + linkwiggle + timewiggle)
-    fit4_model = os.path.join(tmpdir, "survival.json")
-    ok, elapsed = run([
-        "fit", enriched_csv,
-        "Surv(age0, age1, event) ~ duchon(pc1, pc2, pc3, pc4, centers=20) + survmodel(spec=net, distribution=gaussian) + linkwiggle(knots=8) + timewiggle(knots=8)",
-        "--survival-likelihood", "marginal-slope",
-        "--baseline-target", "gompertz-makeham",
-        "--logslope-formula",
-        "duchon(pc1, pc2, pc3, pc4, centers=20)",
-        "--z-column", "z",
-        "--scale-dimensions",
-        "--out", fit4_model,
-    ], "Fit 4: Survival marginal-slope (Gompertz-Makeham + timewiggle)")
-    results["fit4_surv_ms"] = ok
-    timings["fit4_surv_ms"] = elapsed
+        # ── Fit 4: Survival marginal-slope (Duchon + linkwiggle + timewiggle)
+        fit4_model = os.path.join(tmpdir, "survival.json")
+        ok, elapsed = run([
+            "fit", enriched_csv,
+            "Surv(age0, age1, event) ~ duchon(pc1, pc2, pc3, pc4, centers=20) + survmodel(spec=net, distribution=gaussian) + linkwiggle(knots=8) + timewiggle(knots=8)",
+            "--survival-likelihood", "marginal-slope",
+            "--baseline-target", "gompertz-makeham",
+            "--logslope-formula",
+            "duchon(pc1, pc2, pc3, pc4, centers=20)",
+            "--z-column", "z",
+            "--scale-dimensions",
+            "--out", fit4_model,
+        ], "Fit 4: Survival marginal-slope (Gompertz-Makeham + timewiggle)")
+        results["fit4_surv_ms"] = ok
+        timings["fit4_surv_ms"] = elapsed
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 70}\nSUMMARY\n{'=' * 70}")

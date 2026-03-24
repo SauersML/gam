@@ -23,31 +23,29 @@ DEFAULT_GAM_BIN = REPO_ROOT / "target" / "release" / "gam"
 
 @dataclass(frozen=True)
 class FitSpec:
-    engine: str
     power: int
     color: str
     linestyle: str
 
     @property
     def label(self) -> str:
-        return f"{self.engine} power={self.power}"
+        return f"mgcv power={self.power}"
 
 
 FIT_SPECS: list[FitSpec] = [
-    FitSpec(engine="mgcv", power=0, color="#6A4C93", linestyle="-"),
-    FitSpec(engine="mgcv", power=1, color="#00798C", linestyle="-"),
-    FitSpec(engine="mgcv", power=2, color="#D1495B", linestyle="-"),
+    FitSpec(power=0, color="#6A4C93", linestyle="-"),
+    FitSpec(power=1, color="#00798C", linestyle="-"),
+    FitSpec(power=2, color="#D1495B", linestyle="-"),
 ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare 1D Duchon fits across mgcv and Rust for power=1 and power=2 "
+            "Compare 1D Duchon fits across mgcv Duchon-spline powers "
             "using the same synthetic training data."
         )
     )
-    parser.add_argument("--gam-bin", type=Path, default=DEFAULT_GAM_BIN)
     parser.add_argument(
         "--out",
         type=Path,
@@ -102,35 +100,6 @@ def read_prediction_mean(path: Path, expected_rows: int) -> np.ndarray:
             f"prediction row mismatch for {path.name}: got {len(mean)}, expected {expected_rows}"
         )
     return np.asarray(mean)
-
-
-def fit_rust_curve(
-    gam_bin: Path,
-    workdir: Path,
-    train_csv: Path,
-    grid_csv: Path,
-    expected_rows: int,
-    centers: int,
-    power: int,
-) -> np.ndarray:
-    slug = f"rust_power{power}"
-    model_path = workdir / f"{slug}.json"
-    pred_path = workdir / f"{slug}.csv"
-    formula = f"y ~ s(x, type=duchon, centers={centers}, order=0, power={power})"
-    run(
-        [
-            gam_bin,
-            "fit",
-            train_csv,
-            formula,
-            "--adaptive-regularization",
-            "false",
-            "--out",
-            model_path,
-        ]
-    )
-    run([gam_bin, "predict", model_path, grid_csv, "--out", pred_path])
-    return read_prediction_mean(pred_path, expected_rows)
 
 
 def fit_mgcv_curve(
@@ -189,7 +158,7 @@ def make_plot(
     if not isinstance(axes, np.ndarray):
         axes = np.asarray([axes])
 
-    curve_lookup = {(spec.engine, spec.power): y_hat for spec, y_hat in curves}
+    curve_lookup = {spec.power: y_hat for spec, y_hat in curves}
 
     for ax, power in zip(axes, power_values):
         ax.set_facecolor("#FFF9F1")
@@ -211,16 +180,14 @@ def make_plot(
             alpha=0.95,
             label="true curve",
         )
-        for engine in ("mgcv",):
-            spec = next(item for item in FIT_SPECS if item.engine == engine and item.power == power)
-            y_hat = curve_lookup.get((engine, power))
-            if y_hat is None:
-                continue
+        spec = next(item for item in FIT_SPECS if item.power == power)
+        y_hat = curve_lookup.get(power)
+        if y_hat is not None:
             ax.plot(
                 x_grid,
                 y_hat,
                 color=spec.color,
-                linewidth=3.0 if spec.engine == "rust" else 2.4,
+                linewidth=2.4,
                 linestyle=spec.linestyle,
                 alpha=0.88,
                 label=spec.label,
@@ -234,7 +201,7 @@ def make_plot(
             ax.spines[spine].set_color("#7D746D")
             ax.spines[spine].set_linewidth(1.0)
         ax.tick_params(colors="#534B45")
-        missing = [f"{engine} power={power}" for engine in ("mgcv",) if (engine, power) not in curve_lookup]
+        missing = [f"mgcv power={power}" for _ in [power] if power not in curve_lookup]
         if missing:
             ax.text(
                 0.98,
@@ -268,9 +235,6 @@ def make_plot(
 
 def main() -> int:
     args = parse_args()
-    if not args.gam_bin.is_file():
-        raise FileNotFoundError(f"gam binary not found at {args.gam_bin}")
-
     with tempfile.TemporaryDirectory(prefix="duchon_1d_power_compare_") as tmpdir:
         workdir = Path(tmpdir)
         train_csv, grid_csv, x_train, y_train, x_grid, y_true = build_demo_data(
@@ -280,25 +244,14 @@ def main() -> int:
         skipped: list[str] = []
         for spec in FIT_SPECS:
             try:
-                if spec.engine == "rust":
-                    y_hat = fit_rust_curve(
-                        args.gam_bin,
-                        workdir,
-                        train_csv,
-                        grid_csv,
-                        args.n_grid,
-                        args.centers,
-                        spec.power,
-                    )
-                else:
-                    y_hat = fit_mgcv_curve(
-                        workdir,
-                        train_csv,
-                        grid_csv,
-                        args.n_grid,
-                        args.centers,
-                        spec.power,
-                    )
+                y_hat = fit_mgcv_curve(
+                    workdir,
+                    train_csv,
+                    grid_csv,
+                    args.n_grid,
+                    args.centers,
+                    spec.power,
+                )
             except subprocess.CalledProcessError:
                 skipped.append(spec.label)
                 continue

@@ -391,6 +391,11 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
         groups_out[out_idx].extend_from_slice(&groups[dropped_idx]);
     }
 
+    for group in &mut groups_out {
+        group.sort_unstable();
+        group.dedup();
+    }
+
     if rank < k {
         log::debug!(
             "rank-reduced active constraints from {} to {} rows (rank deficiency {})",
