@@ -376,12 +376,21 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
     }
 
     for &dropped_idx in &dropped_orig {
+        let dropped_row = a.row(dropped_idx);
+        let dropped_norm = dropped_row.dot(&dropped_row).sqrt();
         let mut best_align = -1.0_f64;
         let mut best_target = kept_orig[0];
         for &kept_idx in &kept_orig {
-            let dot = a.row(kept_idx).dot(&a.row(dropped_idx)).abs();
-            if dot > best_align {
-                best_align = dot;
+            let kept_row = a.row(kept_idx);
+            let kept_norm = kept_row.dot(&kept_row).sqrt();
+            let dot = kept_row.dot(&dropped_row).abs();
+            let align = if kept_norm > 0.0 && dropped_norm > 0.0 {
+                dot / (kept_norm * dropped_norm)
+            } else {
+                dot
+            };
+            if align > best_align {
+                best_align = align;
                 best_target = kept_idx;
             }
         }
