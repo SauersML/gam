@@ -3297,17 +3297,7 @@ fn run_predict_survival(
     }
     let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
-        let beta_time = Array1::from_vec(model.survival_beta_time.clone().ok_or_else(|| {
-            "saved location-scale survival model missing survival_beta_time".to_string()
-        })?);
-        let beta_threshold =
-            Array1::from_vec(model.survival_beta_threshold.clone().ok_or_else(|| {
-                "saved location-scale survival model missing survival_beta_threshold".to_string()
-            })?);
-        let beta_log_sigma =
-            Array1::from_vec(model.survival_beta_log_sigma.clone().ok_or_else(|| {
-                "saved location-scale survival model missing survival_beta_log_sigma".to_string()
-            })?);
+        let saved_fit = saved_survival_location_scale_fit_result(model)?;
         let survival_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
         let thresholdspec = resolve_termspec_for_prediction(
             &model.resolved_termspec,
@@ -3356,10 +3346,6 @@ fn run_predict_survival(
         } else {
             dense_raw_sigma
         };
-        let beta_link_wiggle = model
-            .beta_link_wiggle
-            .as_ref()
-            .map(|v| Array1::from_vec(v.clone()));
         let link_wiggle_knots = model
             .linkwiggle_knots
             .as_ref()
@@ -3386,31 +3372,7 @@ fn run_predict_survival(
             link_wiggle_degree,
             inverse_link: survival_inverse_link.clone(),
         };
-        let fit_stub = gam::survival_location_scale::survival_fit_from_parts(
-            gam::survival_location_scale::SurvivalLocationScaleFitResultParts {
-                beta_time: beta_time.clone(),
-                beta_threshold: beta_threshold.clone(),
-                beta_log_sigma: beta_log_sigma.clone(),
-                beta_link_wiggle: beta_link_wiggle.clone(),
-                link_wiggle_knots,
-                link_wiggle_degree,
-                lambdas_time: Array1::zeros(0),
-                lambdas_threshold: Array1::zeros(0),
-                lambdas_log_sigma: Array1::zeros(0),
-                lambdas_linkwiggle: beta_link_wiggle.as_ref().map(|_| Array1::zeros(0)),
-                log_likelihood: 0.0,
-                reml_score: 0.0,
-                stable_penalty_term: 0.0,
-                penalized_objective: 0.0,
-                outer_iterations: 0,
-                outer_gradient_norm: 0.0,
-                outer_converged: true,
-                covariance_conditional: None,
-                geometry: None,
-            },
-        )
-        .map_err(|e| format!("invalid survival location-scale fit stub: {e}"))?;
-        let pred = predict_survival_location_scale(&pred_input, &fit_stub)
+        let pred = predict_survival_location_scale(&pred_input, &saved_fit)
             .map_err(|e| format!("survival location-scale predict failed: {e}"))?;
         let posterior_or_uncertainty = if args.mode == PredictModeArg::PosteriorMean
             || args.uncertainty
@@ -3419,7 +3381,7 @@ fn run_predict_survival(
             Some(
                 gam::survival_location_scale::predict_survival_location_scalewith_uncertainty(
                     &pred_input,
-                    &fit_stub,
+                    &saved_fit,
                     &cov_mat,
                     args.mode == PredictModeArg::PosteriorMean,
                     args.uncertainty,
@@ -4827,12 +4789,12 @@ where
     };
     let dim = seed.len();
     let mut seed_config = gam::seeding::SeedConfig::default();
-    seed_config.max_seeds = 8;
-    seed_config.screening_budget = 3;
+    seed_config.max_seeds = 4;
+    seed_config.screening_budget = 2;
     seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
     let problem = gam::solver::outer_strategy::OuterProblem::new(dim)
-        .with_tolerance(1e-4)
-        .with_max_iter(30)
+        .with_tolerance(1e-3)
+        .with_max_iter(12)
         .with_fd_step(1e-3)
         .with_seed_config(seed_config)
         .with_heuristic_lambdas(seed.to_vec());
@@ -5683,8 +5645,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         progress.advance_workflow(3);
         if let Some(out) = args.out {
             progress.set_stage("fit", "writing survival model");
-            let mut fit_result = fit.fit.fit.clone();
-            apply_inverse_link_state_to_fit_result(&mut fit_result, &fitted_inverse_link);
+            let fit_result = compact_saved_survival_location_scale_fit_result(
+                &fit.fit.fit,
+                &fitted_inverse_link,
+            )?;
             let mut payload = FittedModelPayload::new(
                 MODEL_VERSION,
                 formula,
@@ -5952,12 +5916,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         effective_timewiggle.as_ref(),
                         None,
                     )?;
+                    // Disable kappa optimization during baseline search so each
+                    // candidate evaluation is cheap (inner solve only, no spatial
+                    // length-scale outer loop).
+                    let mut baseline_kappa = SpatialLengthScaleOptimizationOptions::default();
+                    baseline_kappa.enabled = false;
                     let fit = match fit_model(FitRequest::SurvivalMarginalSlope(
                         SurvivalMarginalSlopeFitRequest {
                             data: ds.values.view(),
                             spec: buildspec(&prepared),
                             options: options.clone(),
-                            kappa_options: kappa_options.clone(),
+                            kappa_options: baseline_kappa,
                         },
                     )) {
                         Ok(FitResult::SurvivalMarginalSlope(result)) => result,
@@ -9808,6 +9777,22 @@ fn compact_saved_multiblock_fit_result(
     fit_result
 }
 
+fn compact_saved_survival_location_scale_fit_result(
+    fit: &UnifiedFitResult,
+    inverse_link: &InverseLink,
+) -> Result<UnifiedFitResult, String> {
+    let mut fit_result = compact_saved_multiblock_fit_result(
+        fit.blocks.clone(),
+        fit.lambdas.clone(),
+        1.0,
+        fit.covariance_conditional.clone(),
+        fit.covariance_corrected.clone(),
+        SavedFitSummary::from_blockwise_fit(fit)?,
+    );
+    apply_inverse_link_state_to_fit_result(&mut fit_result, inverse_link);
+    Ok(fit_result)
+}
+
 fn saved_gaussian_location_scale_mean_beta(fit: &UnifiedFitResult) -> Result<Array1<f64>, String> {
     fit.block_by_role(BlockRole::Location)
         .or_else(|| fit.block_by_role(BlockRole::Mean))
@@ -10502,6 +10487,23 @@ fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<Invers
         }
         other => Ok(InverseLink::Standard(other)),
     }
+}
+
+fn saved_survival_location_scale_fit_result(
+    model: &SavedModel,
+) -> Result<UnifiedFitResult, String> {
+    model.saved_prediction_runtime()?;
+    let mut fit = model
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| {
+            "saved location-scale survival model is missing canonical fit_result payload"
+                .to_string()
+        })?
+        .clone();
+    let inverse_link = resolve_survival_inverse_link_from_saved(model)?;
+    apply_inverse_link_state_to_fit_result(&mut fit, &inverse_link);
+    Ok(fit)
 }
 
 fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
@@ -12212,6 +12214,61 @@ mod tests {
                 "posterior-mean survival prediction output missing {required} column: {header}"
             );
         }
+    }
+
+    #[test]
+    fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
+        let blocks = vec![
+            gam::estimate::FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Time,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            gam::estimate::FittedBlock {
+                beta: array![0.2],
+                role: BlockRole::Threshold,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            gam::estimate::FittedBlock {
+                beta: array![-0.3],
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ];
+        let fit_result = compact_saved_multiblock_fit_result(
+            blocks,
+            Array1::zeros(0),
+            1.0,
+            Some(Array2::<f64>::eye(3)),
+            None,
+            saved_fit_summary_stub(),
+        );
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ 1",
+            ModelKind::Survival,
+            FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("location-scale".to_string()),
+                survival_distribution: Some("probit".to_string()),
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            },
+            "survival",
+        );
+        payload.fit_result = Some(fit_result.clone());
+        payload.unified = Some(fit_result);
+        payload.survival_likelihood = Some("location-scale".to_string());
+        payload.survival_beta_time = Some(vec![9.9]);
+        payload.survival_beta_threshold = Some(vec![0.2]);
+        payload.survival_beta_log_sigma = Some(vec![-0.3]);
+        let model = SavedModel::from_payload(payload);
+
+        let err = model
+            .saved_prediction_runtime()
+            .expect_err("payload drift should be rejected");
+        assert!(err.contains("saved time coefficients disagree with fit_result"));
     }
 
     #[test]

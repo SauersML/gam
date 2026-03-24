@@ -439,6 +439,100 @@ fn validate_location_scale_saved_fit(
     Ok(())
 }
 
+fn validate_survival_saved_block_matches_payload(
+    fit: &UnifiedFitResult,
+    role: BlockRole,
+    payload_beta: Option<&Vec<f64>>,
+    label: &str,
+) -> Result<usize, String> {
+    let block = fit
+        .block_by_role(role)
+        .ok_or_else(|| format!("location-scale survival saved fit is missing {label} block"))?;
+    if let Some(saved) = payload_beta
+        && block.beta.to_vec() != *saved
+    {
+        return Err(format!(
+            "location-scale survival saved {label} coefficients disagree with fit_result"
+        ));
+    }
+    Ok(block.beta.len())
+}
+
+fn validate_survival_location_scale_saved_fit(
+    payload: &FittedModelPayload,
+    link_wiggle: Option<&SavedLinkWiggleRuntime>,
+) -> Result<(), String> {
+    let fit = payload.fit_result.as_ref().ok_or_else(|| {
+        "location-scale survival model is missing canonical fit_result payload".to_string()
+    })?;
+    let p_time = validate_survival_saved_block_matches_payload(
+        fit,
+        BlockRole::Time,
+        payload.survival_beta_time.as_ref(),
+        "time",
+    )?;
+    let p_threshold = validate_survival_saved_block_matches_payload(
+        fit,
+        BlockRole::Threshold,
+        payload.survival_beta_threshold.as_ref(),
+        "threshold",
+    )?;
+    let p_log_sigma = validate_survival_saved_block_matches_payload(
+        fit,
+        BlockRole::Scale,
+        payload.survival_beta_log_sigma.as_ref(),
+        "log-sigma",
+    )?;
+    let p_wiggle = match link_wiggle {
+        Some(runtime) => {
+            let block = fit.block_by_role(BlockRole::LinkWiggle).ok_or_else(|| {
+                "location-scale survival saved fit is missing link-wiggle block".to_string()
+            })?;
+            if block.beta.to_vec() != runtime.beta {
+                return Err(
+                    "location-scale survival saved link-wiggle coefficients disagree with fit_result"
+                        .to_string(),
+                );
+            }
+            runtime.beta.len()
+        }
+        None => {
+            if fit.block_by_role(BlockRole::LinkWiggle).is_some() {
+                return Err(
+                    "location-scale survival saved fit has a LinkWiggle block without payload metadata"
+                        .to_string(),
+                );
+            }
+            0
+        }
+    };
+    let expected = p_time + p_threshold + p_log_sigma + p_wiggle;
+
+    if let Some(cov) = fit.beta_covariance()
+        && (cov.nrows() != expected || cov.ncols() != expected)
+    {
+        return Err(format!(
+            "location-scale survival saved conditional covariance shape mismatch: got {}x{}, expected {}x{}",
+            cov.nrows(),
+            cov.ncols(),
+            expected,
+            expected
+        ));
+    }
+    if let Some(cov) = fit.beta_covariance_corrected()
+        && (cov.nrows() != expected || cov.ncols() != expected)
+    {
+        return Err(format!(
+            "location-scale survival saved corrected covariance shape mismatch: got {}x{}, expected {}x{}",
+            cov.nrows(),
+            cov.ncols(),
+            expected,
+            expected
+        ));
+    }
+    Ok(())
+}
+
 impl SavedLinkWiggleRuntime {
     fn validate_global_monotonicity(&self) -> Result<(), String> {
         validate_monotone_wiggle_beta_nonnegative(&self.beta, "saved link-wiggle")
@@ -1222,6 +1316,17 @@ impl FittedModel {
                 runtime.model_class,
                 runtime.link_wiggle.as_ref(),
             )?;
+        } else if matches!(runtime.model_class, PredictModelClass::Survival)
+            && self
+                .payload()
+                .survival_likelihood
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("location-scale"))
+        {
+            validate_survival_location_scale_saved_fit(
+                self.payload(),
+                runtime.link_wiggle.as_ref(),
+            )?;
         }
         Ok(runtime)
     }
@@ -1753,20 +1858,6 @@ impl FittedModel {
                     .to_string(),
             );
         }
-        if self
-            .survival_likelihood
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("location-scale"))
-            && (self.survival_beta_time.is_none()
-                || self.survival_beta_threshold.is_none()
-                || self.survival_beta_log_sigma.is_none())
-        {
-            return Err(
-                "saved location-scale survival model is missing block coefficients; refit with current CLI"
-                    .to_string(),
-            );
-        }
-
         let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
             || self.linkwiggle_degree.is_some()
             || self.beta_link_wiggle.is_some()
@@ -1775,7 +1866,8 @@ impl FittedModel {
                 .as_ref()
                 .and_then(|fit| fit.block_by_role(BlockRole::LinkWiggle))
                 .is_some();
-        if has_any_saved_link_wiggle && self.saved_link_wiggle()?.is_none() {
+        let saved_link_wiggle = self.saved_link_wiggle()?;
+        if has_any_saved_link_wiggle && saved_link_wiggle.is_none() {
             return Err(
                 "saved model has incomplete link-wiggle state; expected metadata and coefficients"
                     .to_string(),
@@ -1791,6 +1883,13 @@ impl FittedModel {
                 "saved model has incomplete baseline-timewiggle state; expected metadata and coefficients"
                     .to_string(),
             );
+        }
+        if self
+            .survival_likelihood
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("location-scale"))
+        {
+            validate_survival_location_scale_saved_fit(self.payload(), saved_link_wiggle.as_ref())?;
         }
 
         // Structural invariant: nonlinear saved models must retain a usable

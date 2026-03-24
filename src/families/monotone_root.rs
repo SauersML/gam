@@ -116,7 +116,7 @@ pub fn solve_monotone_root(
 
     for _ in 0..max_refine_iters {
         let mid = 0.5 * (lo + hi);
-        let (f_mid, f_a_mid, _) = eval(mid)?;
+        let (f_mid, f_a_mid, f_aa_mid) = eval(mid)?;
         update_best(
             &mut best_a,
             &mut best_f,
@@ -130,8 +130,31 @@ pub fn solve_monotone_root(
             break;
         }
 
-        // Newton step from midpoint (works for either sign of F').
-        let probe = if f_a_mid.is_finite() && f_a_mid.abs() > 1e-30 {
+        // Prefer a safeguarded Halley step when the second derivative is
+        // available and well-conditioned. The caller already computed F''(a),
+        // so using it here reduces expensive calibration evaluations for the
+        // exact denested likelihood paths without changing the objective.
+        let halley_probe = if f_a_mid.is_finite() && f_a_mid.abs() > 1e-30 {
+            let halley_denom = 2.0 * f_a_mid * f_a_mid - f_mid * f_aa_mid;
+            if halley_denom.is_finite() && halley_denom.abs() > 1e-30 {
+                let cand = mid - (2.0 * f_mid * f_a_mid) / halley_denom;
+                if cand > lo && cand < hi {
+                    Some(cand)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Fall back to the monotone Newton step if Halley is unavailable or
+        // would leave the current bracket.
+        let probe = if let Some(cand) = halley_probe {
+            cand
+        } else if f_a_mid.is_finite() && f_a_mid.abs() > 1e-30 {
             let cand = mid - f_mid / f_a_mid;
             if cand > lo && cand < hi { cand } else { mid }
         } else {

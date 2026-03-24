@@ -20,7 +20,6 @@ use crate::types::{
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
-use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::sparse::linalg::matmul::{
     SparseMatMulInfo, sparse_sparse_matmul_numeric, sparse_sparse_matmul_numeric_scratch,
     sparse_sparse_matmul_symbolic,
@@ -39,7 +38,6 @@ use statrs::function::gamma::{digamma, ln_gamma};
 use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::{Auto, Spec};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2469,34 +2467,6 @@ fn solve_subsystem_direction(
     Ok(())
 }
 
-fn solve_symmetric_system(
-    matrix: &Array2<f64>,
-    rhs: &Array1<f64>,
-    out: &mut Array1<f64>,
-) -> Result<(), EstimationError> {
-    if out.len() != rhs.len() {
-        // Use uninit — immediately overwritten by assign below.
-        unsafe {
-            *out = Array1::uninit(rhs.len()).assume_init();
-        }
-    }
-    out.assign(rhs);
-    let factor = StableSolver::new("pirls symmetric system")
-        .factorize(matrix)
-        .map_err(|_| {
-            EstimationError::InvalidInput("symmetric system factorization failed".to_string())
-        })?;
-    out.assign(rhs);
-    let mut rhsview = array1_to_col_matmut(out);
-    factor.solve_in_place(rhsview.as_mut());
-    if array1_is_finite(out) {
-        return Ok(());
-    }
-    Err(EstimationError::InvalidInput(
-        "symmetric system solve produced non-finite values".to_string(),
-    ))
-}
-
 fn linear_constraints_from_lower_bounds(
     lower_bounds: &Array1<f64>,
 ) -> Option<LinearInequalityConstraints> {
@@ -2522,28 +2492,6 @@ fn compute_constraint_kkt_diagnostics(
     constraints: &LinearInequalityConstraints,
 ) -> ConstraintKktDiagnostics {
     active_set::compute_constraint_kkt_diagnostics(beta, gradient, constraints)
-}
-
-fn max_linear_constraintviolation(
-    beta: &Array1<f64>,
-    constraints: &LinearInequalityConstraints,
-) -> (f64, usize) {
-    let diag = active_set::compute_constraint_kkt_diagnostics(
-        beta,
-        &Array1::zeros(constraints.a.ncols()),
-        constraints,
-    );
-    if diag.primal_feasibility <= 0.0 {
-        return (0.0, 0);
-    }
-    for row in 0..constraints.a.nrows() {
-        let slack = constraints.a.row(row).dot(beta) - constraints.b[row];
-        let viol = (-slack).max(0.0);
-        if (viol - diag.primal_feasibility).abs() <= 1e-15 {
-            return (viol, row);
-        }
-    }
-    (diag.primal_feasibility, 0)
 }
 
 fn solve_newton_directionwith_lower_bounds(
@@ -2752,25 +2700,6 @@ fn solve_newton_directionwith_lower_bounds(
     Ok(())
 }
 
-fn solve_kkt_direction(
-    hessian: &Array2<f64>,
-    gradient: &Array1<f64>,
-    active_a: &Array2<f64>,
-    active_residual: Option<&Array1<f64>>,
-) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
-    active_set::solve_kkt_direction(hessian, gradient, active_a, active_residual)
-}
-
-type CompressedActiveWorkingSet = active_set::CompressedActiveWorkingSet;
-
-fn compress_activeworking_set(
-    x: &Array1<f64>,
-    constraints: &LinearInequalityConstraints,
-    active: &[usize],
-) -> Result<CompressedActiveWorkingSet, EstimationError> {
-    active_set::compress_active_working_set(x, constraints, active)
-}
-
 /// Reduce a constraint matrix to full row rank using column-pivoted QR on A^T.
 ///
 /// Given k constraint rows in R^p, computes the numerical row rank r via
@@ -2782,24 +2711,6 @@ fn compress_activeworking_set(
 ///
 /// This is a shared numerical primitive used by both the PIRLS and
 /// custom-family active-set solvers.
-pub(crate) use active_set::rank_reduce_rows_pivoted_qr;
-
-fn working_set_kkt_diagnostics_frommultipliers(
-    x: &Array1<f64>,
-    gradient: &Array1<f64>,
-    working_constraints: &LinearInequalityConstraints,
-    lambda_active_true: &Array1<f64>,
-    n_total_constraints: usize,
-) -> Result<ConstraintKktDiagnostics, EstimationError> {
-    active_set::working_set_kkt_diagnostics_from_multipliers(
-        x,
-        gradient,
-        working_constraints,
-        lambda_active_true,
-        n_total_constraints,
-    )
-}
-
 fn solve_newton_directionwith_linear_constraints(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -7723,7 +7634,7 @@ mod tests {
         let lambda_true = array![1.0, 0.5, 2.0];
         let gradient = working_constraints.a.t().dot(&lambda_true);
 
-        let kkt = working_set_kkt_diagnostics_frommultipliers(
+        let kkt = active_set::working_set_kkt_diagnostics_from_multipliers(
             &x,
             &gradient,
             &working_constraints,
@@ -7752,8 +7663,8 @@ mod tests {
         let x = array![0.0, 0.0, 0.0];
         let active = vec![0, 1, 2];
 
-        let compressed =
-            compress_activeworking_set(&x, &constraints, &active).expect("compress working set");
+        let compressed = active_set::compress_active_working_set(&x, &constraints, &active)
+            .expect("compress working set");
 
         assert_eq!(compressed.constraints.a.nrows(), 2);
         assert_eq!(compressed.groups.len(), 2);

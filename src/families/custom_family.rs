@@ -1,17 +1,16 @@
 use crate::faer_ndarray::FaerCholesky;
-use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
-use crate::linalg::utils::{
-    StableSolver, default_slq_parameters, stochastic_lanczos_logdet_spd,
-};
+use crate::faer_ndarray::FaerEigh;
+use crate::faer_ndarray::FaerSvd;
+use crate::linalg::utils::{StableSolver, default_slq_parameters, stochastic_lanczos_logdet_spd};
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::active_set::solve_quadratic_with_linear_constraints;
 use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, spatial_length_scale_term_indices,
     try_build_spatial_log_kappa_derivativeinfo_list,
 };
+use crate::solver::active_set::solve_quadratic_with_linear_constraints;
 use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, DriftDerivResult, EvalMode, FixedDriftDerivFn,
@@ -22,12 +21,10 @@ use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 use crate::types::{RidgeDeterminantMode, RidgePolicy};
-use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2, ArrayView1, s};
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
@@ -5284,6 +5281,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b]
                         .beta
                         .scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
+                    // Project to feasible region (e.g. monotonicity for deviation blocks).
+                    let projected =
+                        family.post_update_block_beta(&states, b, &specs[b], states[b].beta.clone())?;
+                    states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_ll = family.log_likelihood_only(&states)?;
@@ -10193,9 +10194,14 @@ mod tests {
             b: array![0.0, -0.1],
         };
 
-        let (beta, active) =
-            solve_quadraticwith_linear_constraints(&hessian, &rhs, &beta_start, &constraints, None)
-                .expect("constrained quadratic solve should succeed");
+        let (beta, active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("constrained quadratic solve should succeed");
 
         assert!(
             (beta[0] - 0.1).abs() <= 1e-10,
@@ -10215,9 +10221,14 @@ mod tests {
             b: array![-1.0],
         };
 
-        let (beta, active) =
-            solve_quadraticwith_linear_constraints(&hessian, &rhs, &beta_start, &constraints, None)
-                .expect("near-tangential inactive row should not block the quadratic step");
+        let (beta, active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("near-tangential inactive row should not block the quadratic step");
 
         assert!(
             (beta[0] - 1.0).abs() <= 1e-12,
@@ -10242,7 +10253,7 @@ mod tests {
             b: array![0.0],
         };
 
-        let (beta, active) = solve_quadraticwith_linear_constraints(
+        let (beta, active) = solve_quadratic_with_linear_constraints(
             &hessian,
             &rhs,
             &beta_start,
@@ -10274,7 +10285,7 @@ mod tests {
             b: array![0.0, 0.0, 0.0],
         };
 
-        let (beta, active) = solve_quadraticwith_linear_constraints(
+        let (beta, active) = solve_quadratic_with_linear_constraints(
             &hessian,
             &rhs,
             &beta_start,
@@ -10297,54 +10308,6 @@ mod tests {
     }
 
     #[test]
-    fn compressed_active_constraint_set_preserves_constraint_ids_not_active_positions() {
-        let mut a = Array2::<f64>::zeros((20, 2));
-        a[[11, 0]] = 1.0;
-        a[[7, 0]] = 2.0;
-        a[[19, 1]] = 1.0;
-        a[[3, 1]] = 3.0;
-        let constraints = LinearInequalityConstraints {
-            a,
-            b: Array1::zeros(20),
-        };
-        let active = vec![11, 7, 19, 3];
-        let compressed = compress_active_constraint_set(&constraints, &active)
-            .expect("compressed active-set should succeed");
-
-        let mut members = compressed.member_constraint_ids.clone();
-        for group in &mut members {
-            group.sort_unstable();
-        }
-        members.sort();
-
-        assert_eq!(
-            members,
-            vec![vec![3, 19], vec![7, 11]],
-            "compressed groups must track original constraint ids, not active positions"
-        );
-    }
-
-    #[test]
-    fn remove_active_constraints_by_id_handles_out_of_order_active_positions() {
-        let mut active = vec![31, 7, 44, 12, 28, 3];
-        let mut is_active = vec![false; 50];
-        for &constraint_id in &active {
-            is_active[constraint_id] = true;
-        }
-
-        remove_active_constraints_by_id(&mut active, &mut is_active, &[3, 44, 7])
-            .expect("active-set release by constraint id should succeed");
-
-        assert_eq!(active, vec![31, 12, 28]);
-        assert!(is_active[31]);
-        assert!(is_active[12]);
-        assert!(is_active[28]);
-        assert!(!is_active[3]);
-        assert!(!is_active[44]);
-        assert!(!is_active[7]);
-    }
-
-    #[test]
     fn quadratic_linear_constraints_release_merged_constraint_group_by_id() {
         // Two redundant lower-bound rows compress into one active KKT row.
         // Releasing that merged row must drop both original constraint ids,
@@ -10357,7 +10320,7 @@ mod tests {
             b: array![0.0, 0.0, -0.1],
         };
 
-        let (beta, active) = solve_quadraticwith_linear_constraints(
+        let (beta, active) = solve_quadratic_with_linear_constraints(
             &hessian,
             &rhs,
             &beta_start,
@@ -10375,13 +10338,40 @@ mod tests {
     }
 
     #[test]
+    fn quadratic_linear_constraints_accept_boundary_kkt_after_rank_reduction() {
+        let hessian = array![[2.0]];
+        let rhs = array![0.0];
+        let beta_start = array![1e-9];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0], [1.0 + 1e-13], [2.0], [3.0]],
+            b: array![0.0, 0.0, 0.0, 0.0],
+        };
+
+        let (beta, active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            Some(&[0, 1, 2, 3]),
+        )
+        .expect("degenerate boundary KKT point should be accepted");
+
+        assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
+        assert!(
+            active.len() <= 1,
+            "rank-reduced boundary solution should keep at most one representative, got {:?}",
+            active
+        );
+    }
+
+    #[test]
     fn rank_reduce_drops_exactly_dependent_row() {
         // Row 3 = Row 1 + Row 2 exactly. Rank reduction should drop it.
         let a = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],];
         let b = array![0.0, 0.0, 0.0];
         let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
         let (a_out, b_out, member_constraint_ids_out) =
-            crate::pirls::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
+            crate::solver::active_set::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
         assert_eq!(
             a_out.nrows(),
             2,
@@ -10403,7 +10393,7 @@ mod tests {
         let b = array![0.0, 0.0, 0.0];
         let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
         let (a_out, b_out, member_constraint_ids_out) =
-            crate::pirls::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
+            crate::solver::active_set::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
         // All three rows are independent in R^2 (but we only have rank 2).
         // The first two span R^2, so row 3 = row 1 + row 2 is dependent.
         assert_eq!(a_out.nrows(), 2);

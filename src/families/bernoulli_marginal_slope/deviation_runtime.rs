@@ -1,149 +1,19 @@
-use crate::basis::BasisOptions;
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::gamlss::{
-    MonotoneWiggleStructure, monotone_wiggle_basis_with_derivative_order,
-};
-use crate::linalg::utils::matrix_inversewith_regularization;
-use crate::matrix::DesignMatrix;
+use crate::pirls::LinearInequalityConstraints;
 use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use ndarray::{Array1, Array2};
 
-const UNIFORM_CUBIC_SPAN_STEP_DENOM: f64 = 3.0;
-
-/// Evaluate the monotone wiggle basis (or a derivative) at `values`, then
-/// right-multiply by `basis_transform` to map from the raw I-spline columns
-/// into the (possibly constrained) column space used at training time.
-pub(crate) fn anchored_deviation_basis_with_transform(
-    values: ndarray::ArrayView1<'_, f64>,
-    knots: &Array1<f64>,
-    degree: usize,
-    basis_transform: &Array2<f64>,
-    derivative_order: usize,
-) -> Result<Array2<f64>, String> {
-    let raw = monotone_wiggle_basis_with_derivative_order(values, knots, degree, derivative_order)?;
-    if raw.ncols() != basis_transform.nrows() {
-        return Err(format!(
-            "anchored deviation raw basis mismatch: transform expects {} rows but raw basis has {} columns",
-            basis_transform.nrows(),
-            raw.ncols()
-        ));
-    }
-    Ok(raw.dot(basis_transform))
-}
-
-fn max_abs_matrix_diff(lhs: &Array2<f64>, rhs: &Array2<f64>) -> f64 {
-    if lhs.dim() != rhs.dim() {
-        return f64::INFINITY;
-    }
-    let mut max_diff = 0.0_f64;
-    for i in 0..lhs.nrows() {
-        for j in 0..lhs.ncols() {
-            max_diff = max_diff.max((lhs[[i, j]] - rhs[[i, j]]).abs());
-        }
-    }
-    max_diff
-}
-
-pub fn sampled_span_points(left: f64, right: f64) -> Array1<f64> {
-    let width = right - left;
-    Array1::from_vec(vec![
-        left,
-        left + width / UNIFORM_CUBIC_SPAN_STEP_DENOM,
-        left + 2.0 * width / UNIFORM_CUBIC_SPAN_STEP_DENOM,
-        right,
-    ])
-}
-
-pub fn local_cubic_from_uniform_span_samples(
-    left: f64,
-    right: f64,
-    y0: f64,
-    y1: f64,
-    y2: f64,
-    y3: f64,
-) -> Result<exact_kernel::LocalSpanCubic, String> {
-    let width = right - left;
-    if !width.is_finite() || width <= 0.0 {
-        return Err(format!(
-            "cannot build sampled span cubic on non-positive interval [{left}, {right}]"
-        ));
-    }
-
-    // Interpolate the unique cubic through the four equally spaced samples
-    // u in {0, 1, 2, 3}, where x = left + (width / 3) * u.
-    let delta1 = y1 - y0;
-    let delta2 = y2 - 2.0 * y1 + y0;
-    let delta3 = y3 - 3.0 * y2 + 3.0 * y1 - y0;
-    let scale = UNIFORM_CUBIC_SPAN_STEP_DENOM / width;
-    let scale2 = scale * scale;
-    let scale3 = scale2 * scale;
-
-    Ok(exact_kernel::LocalSpanCubic {
-        left,
-        right,
-        c0: y0,
-        c1: scale * (delta1 - 0.5 * delta2 + delta3 / 3.0),
-        c2: scale2 * (4.5 * delta2 - 4.5 * delta3),
-        c3: scale3 * (4.5 * delta3),
-    })
-}
-
-/// Recover the exact raw-basis-to-trained-basis replay map used for saved
-/// anchored deviations. This must reproduce the training design exactly.
-pub(crate) fn derive_deviation_basis_transform(
-    seed: &Array1<f64>,
-    knots: &Array1<f64>,
-    degree: usize,
-    constrained_design: &DesignMatrix,
-) -> Result<Array2<f64>, String> {
-    let raw_design = monotone_wiggle_basis_with_derivative_order(seed.view(), knots, degree, 0)?;
-    let constrained_dense = constrained_design.to_dense();
-    if raw_design.nrows() != constrained_dense.nrows() {
-        return Err(format!(
-            "anchored deviation design row mismatch while deriving replay transform: raw rows={}, constrained rows={}",
-            raw_design.nrows(),
-            constrained_dense.nrows()
-        ));
-    }
-    if raw_design.ncols() == constrained_dense.ncols()
-        && max_abs_matrix_diff(&raw_design, &constrained_dense) <= 1e-12
-    {
-        return Ok(Array2::<f64>::eye(raw_design.ncols()));
-    }
-
-    let gram = raw_design.t().dot(&raw_design);
-    let rhs = raw_design.t().dot(&constrained_dense);
-    let gram_inv = matrix_inversewith_regularization(&gram, "anchored deviation basis replay")
-        .ok_or_else(|| {
-            "failed to derive anchored deviation replay transform from training design".to_string()
-        })?;
-    let basis_transform = gram_inv.dot(&rhs);
-    let replayed = raw_design.dot(&basis_transform);
-    let replay_error = max_abs_matrix_diff(&replayed, &constrained_dense);
-    if !replay_error.is_finite() || replay_error > 1e-8 {
-        return Err(format!(
-            "anchored deviation replay transform does not exactly reproduce the training design (max abs error {replay_error:.3e})"
-        ));
-    }
-    Ok(basis_transform)
-}
-
-/// Precomputed per-span cubic coefficient matrices for a monotone deviation basis.
+/// Precomputed per-span polynomial coefficient matrices for a structurally
+/// monotone anchored deviation basis.
 ///
-/// **Structural invariant:** the value basis must have a structurally zero
-/// fourth derivative on every knot span (`value_span_degree <= 3`). This
-/// allows the runtime to build one authoritative span-local cubic
-/// `c₀ + c₁t + c₂t² + c₃t³` per basis function and then derive value, d1, d2,
-/// and d3 from that same polynomial everywhere in fit and prediction.
+/// Free coefficients are the interior nodal values of the deviation derivative
+/// `w'(x)`; the left and right endpoint node values are fixed at `0`, so
+/// `w(x)` has constant tails and zero still means the identity map.
 ///
-/// The invariant is enforced at construction time in [`DeviationRuntime::try_new`]:
-/// both a type-level check ([`MonotoneWiggleStructure::fourth_derivative_is_structurally_zero`])
-/// and a numerical verification (max |d⁴/dx⁴| at span midpoints) must pass.
-///
-/// Because all fields are private to this submodule, `try_new` is the **sole
-/// construction path** — no code outside this file can build a
-/// `DeviationRuntime` via struct-literal syntax, so the invariant cannot be
-/// bypassed.
+/// On each knot span `w'(x)` is linearly interpolated between adjacent node
+/// values, so `w(x)` is piecewise quadratic. Exact monotonicity of the full
+/// transform `x + w(x)` is therefore equivalent to simple lower bounds on the
+/// interior nodal coefficients: `beta_j >= monotonicity_eps - 1`.
 #[derive(Clone, Debug)]
 pub struct DeviationRuntime {
     degree: usize,
@@ -162,166 +32,72 @@ pub struct DeviationRuntime {
 }
 
 impl DeviationRuntime {
-    /// Construct a `DeviationRuntime`, enforcing the zero-fourth-derivative invariant.
-    ///
-    /// Derives breakpoints and span intervals from `knots` internally — callers
-    /// cannot supply inconsistent span geometry.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if:
-    /// - `structure.fourth_derivative_is_structurally_zero()` is false
-    ///   (type-level rejection based on basis family and degree), OR
-    /// - the numerically evaluated fourth-derivative design at span midpoints
-    ///   has any entry with `|value| > 1e-10` (belt-and-suspenders), OR
-    /// - the knot vector has fewer than two distinct breakpoints.
-    pub(crate) fn try_new(
-        knots: Array1<f64>,
-        degree: usize,
-        structure: &MonotoneWiggleStructure,
-        basis_dim: usize,
-        monotonicity_eps: f64,
-        basis_transform: Array2<f64>,
-    ) -> Result<Self, String> {
-        if degree < 2 {
-            return Err(format!(
-                "DeviationRuntime requires a monotone wiggle degree >= 2, got {}",
-                degree
-            ));
-        }
-        if basis_dim == 0 {
-            return Err("DeviationRuntime requires at least one deviation coefficient".to_string());
-        }
+    pub(crate) fn try_new(knots: Array1<f64>, monotonicity_eps: f64) -> Result<Self, String> {
         if !monotonicity_eps.is_finite() || monotonicity_eps < 0.0 {
             return Err(format!(
                 "DeviationRuntime monotonicity_eps must be finite and non-negative, got {monotonicity_eps}"
             ));
         }
-        if basis_transform.ncols() != basis_dim {
-            return Err(format!(
-                "DeviationRuntime basis transform width mismatch: transform has {} columns but basis_dim is {}",
-                basis_transform.ncols(),
-                basis_dim
-            ));
-        }
-        if basis_transform.nrows() == 0 {
-            return Err(
-                "DeviationRuntime basis transform must have at least one raw column".to_string(),
-            );
-        }
-        if basis_transform.iter().any(|value| !value.is_finite()) {
-            return Err("DeviationRuntime basis transform contains non-finite entries".to_string());
-        }
 
-        // ── gate 1: structural / type-level ──
-        if !structure.fourth_derivative_is_structurally_zero() {
-            return Err(format!(
-                "DeviationRuntime requires a value basis whose fourth derivative \
-                 is structurally zero on every span, but the monotone wiggle \
-                 basis has per-span polynomial degree {} (from public degree {})",
-                structure.value_span_degree, degree
-            ));
-        }
-
-        // ── derive breakpoints and span geometry from knots ──
         let bkpts = breakpoints_from_knots(
             knots
                 .as_slice()
                 .ok_or_else(|| "DeviationRuntime knots are not contiguous".to_string())?,
             "DeviationRuntime breakpoints",
         )?;
-        let mut span_left = Vec::new();
-        let mut span_right = Vec::new();
-        let mut span_mid = Vec::new();
-        for window in bkpts.windows(2) {
-            let left = window[0];
-            let right = window[1];
-            if right - left > 1e-12 {
-                span_left.push(left);
-                span_right.push(right);
-                span_mid.push(0.5 * (left + right));
-            }
-        }
-        if span_left.is_empty() {
-            return Err("DeviationRuntime requires at least one active knot span".to_string());
-        }
         let endpoint_points = Array1::from_vec(bkpts);
-        let span_left_points = Array1::from_vec(span_left);
-        let span_right_points = Array1::from_vec(span_right);
-        let span_mid_points = Array1::from_vec(span_mid);
-
-        // ── gate 2: numerical fourth-derivative verification ──
-        let d4_design = anchored_deviation_basis_with_transform(
-            span_mid_points.view(),
-            &knots,
-            degree,
-            &basis_transform,
-            4,
-        )?;
-        let d4_max = d4_design
-            .iter()
-            .copied()
-            .fold(0.0_f64, |a, b| a.max(b.abs()));
-        if d4_max > 1e-10 {
-            return Err(format!(
-                "DeviationRuntime numerical fourth-derivative check failed: \
-                 max |d⁴/dx⁴| at span midpoints = {d4_max:.6e} (expected 0)"
-            ));
+        if endpoint_points.len() < 3 {
+            return Err(
+                "DeviationRuntime requires at least two active knot spans and one interior node"
+                    .to_string(),
+            );
         }
-
-        // ── build design matrices ──
-        let sampled_points = span_left_points
-            .iter()
-            .zip(span_right_points.iter())
-            .flat_map(|(&left, &right)| sampled_span_points(left, right).into_iter())
-            .collect::<Vec<_>>();
-        let sampled_points = Array1::from_vec(sampled_points);
-        let sampled_value_design = anchored_deviation_basis_with_transform(
-            sampled_points.view(),
-            &knots,
-            degree,
-            &basis_transform,
-            0,
-        )?;
-        let n_spans = span_left_points.len();
+        let n_spans = endpoint_points.len() - 1;
+        let basis_dim = endpoint_points.len() - 2;
         let mut span_c0 = Array2::<f64>::zeros((n_spans, basis_dim));
         let mut span_c1 = Array2::<f64>::zeros((n_spans, basis_dim));
         let mut span_c2 = Array2::<f64>::zeros((n_spans, basis_dim));
-        let mut span_c3 = Array2::<f64>::zeros((n_spans, basis_dim));
-        for span_idx in 0..n_spans {
-            let left = span_left_points[span_idx];
-            let right = span_right_points[span_idx];
-            let sample_row = 4 * span_idx;
-            for basis_idx in 0..basis_dim {
-                let cubic = local_cubic_from_uniform_span_samples(
-                    left,
-                    right,
-                    sampled_value_design[[sample_row, basis_idx]],
-                    sampled_value_design[[sample_row + 1, basis_idx]],
-                    sampled_value_design[[sample_row + 2, basis_idx]],
-                    sampled_value_design[[sample_row + 3, basis_idx]],
-                )?;
-                span_c0[[span_idx, basis_idx]] = cubic.c0;
-                span_c1[[span_idx, basis_idx]] = cubic.c1;
-                span_c2[[span_idx, basis_idx]] = cubic.c2;
-                span_c3[[span_idx, basis_idx]] = cubic.c3;
-            }
-        }
-        let last_span_idx = n_spans
-            .checked_sub(1)
-            .ok_or_else(|| "DeviationRuntime requires at least one active knot span".to_string())?;
-        let right_width = span_right_points[last_span_idx] - span_left_points[last_span_idx];
+        let span_c3 = Array2::<f64>::zeros((n_spans, basis_dim));
         let mut right_boundary_value_row = Array1::<f64>::zeros(basis_dim);
         for basis_idx in 0..basis_dim {
-            right_boundary_value_row[basis_idx] = span_c0[[last_span_idx, basis_idx]]
-                + span_c1[[last_span_idx, basis_idx]] * right_width
-                + span_c2[[last_span_idx, basis_idx]] * right_width * right_width
-                + span_c3[[last_span_idx, basis_idx]] * right_width * right_width * right_width;
+            let node_idx = basis_idx + 1;
+            let left = endpoint_points[node_idx - 1];
+            let center = endpoint_points[node_idx];
+            let right = endpoint_points[node_idx + 1];
+            let left_width = center - left;
+            let right_width = right - center;
+            if !left_width.is_finite()
+                || !right_width.is_finite()
+                || left_width <= 0.0
+                || right_width <= 0.0
+            {
+                return Err(format!(
+                    "DeviationRuntime requires strictly increasing interior support around node {node_idx}: left_width={left_width}, right_width={right_width}"
+                ));
+            }
+            let right_tail_value = 0.5 * (left_width + right_width);
+            right_boundary_value_row[basis_idx] = right_tail_value;
+            for span_idx in 0..n_spans {
+                if span_idx + 1 < node_idx {
+                    continue;
+                }
+                if span_idx == node_idx - 1 {
+                    span_c2[[span_idx, basis_idx]] = 0.5 / left_width;
+                    continue;
+                }
+                if span_idx == node_idx {
+                    span_c0[[span_idx, basis_idx]] = 0.5 * left_width;
+                    span_c1[[span_idx, basis_idx]] = 1.0;
+                    span_c2[[span_idx, basis_idx]] = -0.5 / right_width;
+                    continue;
+                }
+                span_c0[[span_idx, basis_idx]] = right_tail_value;
+            }
         }
 
         Ok(Self {
-            degree,
-            value_span_degree: structure.value_span_degree,
+            degree: 2,
+            value_span_degree: 2,
             basis_dim,
             monotonicity_eps,
             endpoint_points,
@@ -432,21 +208,15 @@ impl DeviationRuntime {
     }
 
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)
+        self.evaluate_span_polynomial_design(values, 0)
     }
 
     pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design(
-            values,
-            BasisOptions::first_derivative().derivative_order,
-        )
+        self.evaluate_span_polynomial_design(values, 1)
     }
 
     pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design(
-            values,
-            BasisOptions::second_derivative().derivative_order,
-        )
+        self.evaluate_span_polynomial_design(values, 2)
     }
 
     pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -455,6 +225,17 @@ impl DeviationRuntime {
 
     pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
         self.evaluate_span_polynomial_design(values, 4)
+    }
+
+    pub(crate) fn structural_monotonicity_constraints(&self) -> LinearInequalityConstraints {
+        let mut a = Array2::<f64>::zeros((self.basis_dim, self.basis_dim));
+        for idx in 0..self.basis_dim {
+            a[[idx, idx]] = 1.0;
+        }
+        LinearInequalityConstraints {
+            a,
+            b: Array1::from_elem(self.basis_dim, self.monotonicity_eps - 1.0),
+        }
     }
 
     // ── span geometry ──

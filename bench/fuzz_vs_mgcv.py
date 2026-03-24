@@ -648,7 +648,15 @@ def generate_data(sc: FuzzScenario):
 # FORMULA GENERATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _rust_terms(cols, sc):
+def _rhs_from_terms(terms):
+    return " + ".join(terms) if terms else "1"
+
+
+def _formula_from_terms(response, terms):
+    return f"{response} ~ {_rhs_from_terms(terms)}"
+
+
+def _rust_mean_terms(cols, sc):
     dp = "true" if sc.double_penalty else "false"
     if sc.basis_type == "duchon":
         d_cols = cols[:sc.n_duchon_dims]
@@ -661,17 +669,25 @@ def _rust_terms(cols, sc):
         return [f"s({c}, type=ps, knots={sc.knots}, double_penalty={dp})" for c in cols]
 
 
-def rust_formula(cols, sc):
-    return "y ~ " + " + ".join(_rust_terms(cols, sc))
+def rust_mean_formula(cols, sc):
+    return _formula_from_terms("y", _rust_mean_terms(cols, sc))
 
 
-def rust_noise_formula(cols, sc):
-    """Noise formula for GAMLSS — smooth on first feature + intercept."""
+def rust_noise_terms(cols, sc):
+    """Noise terms for GAMLSS; --predict-noise expects only the RHS."""
     dp = "true" if sc.double_penalty else "false"
     if sc.basis_type == "duchon" and len(cols) >= 2:
         d_cols = cols[:min(sc.n_duchon_dims, len(cols))]
-        return f"y ~ duchon({', '.join(d_cols)}, centers={max(3, sc.knots // 2)}, order={sc.duchon_order}, power={sc.duchon_power}, double_penalty={dp})"
-    return f"y ~ s({cols[0]}, type=ps, knots={max(3, sc.knots // 2)}, double_penalty={dp})"
+        return f"duchon({', '.join(d_cols)}, centers={max(3, sc.knots // 2)}, order={sc.duchon_order}, power={sc.duchon_power}, double_penalty={dp})"
+    return f"s({cols[0]}, type=ps, knots={max(3, sc.knots // 2)}, double_penalty={dp})"
+
+
+def build_rust_fit_cmd(sc, train_csv, model_json, cols):
+    fit_cmd = [str(RUST_BINARY), "fit", "--out", model_json]
+    if sc.model_type == "gamlss":
+        fit_cmd += ["--predict-noise", rust_noise_terms(cols, sc)]
+    fit_cmd += [train_csv, rust_mean_formula(cols, sc)]
+    return fit_cmd
 
 
 def mgcv_formula(cols, sc):
@@ -713,16 +729,12 @@ def run_rust(sc, train_df, test_df, cols, tmpdir):
     train_df.to_csv(train_csv, index=False)
     test_df.to_csv(test_csv, index=False)
 
-    formula = rust_formula(cols, sc)
     y_test = test_df["y"].to_numpy(float)
     y_train = train_df["y"].to_numpy(float)
 
     t0 = time.time()
     try:
-        fit_cmd = [str(RUST_BINARY), "fit", "--out", model_json]
-        if sc.model_type == "gamlss":
-            fit_cmd += ["--predict-noise", rust_noise_formula(cols, sc)]
-        fit_cmd += [train_csv, formula]
+        fit_cmd = build_rust_fit_cmd(sc, train_csv, model_json, cols)
 
         r = subprocess.run(fit_cmd, capture_output=True, text=True, timeout=RUST_TIMEOUT)
         if r.returncode != 0:

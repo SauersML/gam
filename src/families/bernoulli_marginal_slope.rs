@@ -1,3 +1,4 @@
+use crate::basis::create_difference_penalty_matrix;
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
@@ -13,7 +14,7 @@ use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{
     ParameterBlockInput, WiggleBlockConfig, append_selected_wiggle_penalty_orders,
-    buildwiggle_block_input_from_knots, select_wiggle_basis_from_seed, split_wiggle_penalty_orders,
+    select_wiggle_basis_from_seed, split_wiggle_penalty_orders,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
@@ -38,7 +39,6 @@ use std::sync::Arc;
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
-pub(crate) use deviation_runtime::derive_deviation_basis_transform;
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -148,67 +148,73 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
         double_penalty: cfg.double_penalty,
     };
     let selected = select_wiggle_basis_from_seed(knot_seed.view(), &effective_cfg, &extra_orders)?;
-    let structure = selected.structure;
     let knots = selected.knots;
-    let degree = selected.degree;
-    let mut block = buildwiggle_block_input_from_knots(
-        design_seed.view(),
-        &knots,
-        degree,
-        primary_order,
-        cfg.double_penalty,
-    )?;
+    let runtime = DeviationRuntime::try_new(knots, cfg.monotonicity_eps)?;
+    let design = runtime.design(design_seed)?;
+    let p = design.ncols();
+    if p == 0 {
+        return Err("structural deviation basis has no free interior derivative nodes".to_string());
+    }
+    let mut block = ParameterBlockInput {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        offset: Array1::zeros(design_seed.len()),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: None,
+        initial_beta: Some(Array1::zeros(p)),
+    };
+    if p == 1 {
+        block
+            .penalties
+            .push(crate::solver::estimate::PenaltySpec::Dense(
+                Array2::<f64>::eye(1),
+            ));
+        block.nullspace_dims.push(0);
+    } else {
+        let effective_order = primary_order.max(1).min(p - 1);
+        let diff_penalty = create_difference_penalty_matrix(p, effective_order, None)
+            .map_err(|e| e.to_string())?;
+        block
+            .penalties
+            .push(crate::solver::estimate::PenaltySpec::Dense(diff_penalty));
+        block.nullspace_dims.push(effective_order);
+    }
+    if cfg.double_penalty {
+        block
+            .penalties
+            .push(crate::solver::estimate::PenaltySpec::Dense(
+                Array2::<f64>::eye(p),
+            ));
+        block.nullspace_dims.push(0);
+    }
     append_selected_wiggle_penalty_orders(&mut block, &extra_orders)?;
-    let dim = block.design.ncols();
-    let basis_transform =
-        derive_deviation_basis_transform(design_seed, &knots, degree, &block.design)?;
-
-    // Structural exact-runtime validation + span derivation all inside try_new.
-    let runtime = DeviationRuntime::try_new(
-        knots,
-        degree,
-        &structure,
-        dim,
-        cfg.monotonicity_eps,
-        basis_transform,
-    )?;
     Ok(DeviationPrepared { block, runtime })
 }
 
 pub(crate) fn project_monotone_feasible_beta(
     runtime: &DeviationRuntime,
-    current: &Array1<f64>,
+    _current: &Array1<f64>,
     proposed: &Array1<f64>,
     label: &str,
 ) -> Result<Array1<f64>, String> {
-    if current.len() != proposed.len() {
+    if proposed.len() != runtime.basis_dim() {
         return Err(format!(
-            "{label} monotone projection length mismatch: current={}, proposed={}",
-            current.len(),
-            proposed.len()
+            "{label} monotone projection length mismatch: proposed={}, expected={}",
+            proposed.len(),
+            runtime.basis_dim()
         ));
     }
-    if runtime.monotonicity_feasible(proposed, label).is_ok() {
-        return Ok(proposed.clone());
-    }
-    let delta = proposed - current;
-    let Some(mut alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
-        return Ok(current.clone());
-    };
-    if !alpha.is_finite() || alpha <= 0.0 {
-        return Ok(current.clone());
-    }
-    let min_alpha = 1e-12;
-    loop {
-        let candidate = current + &(delta.clone() * alpha);
-        if runtime.monotonicity_feasible(&candidate, label).is_ok() {
-            return Ok(candidate);
+    let lower_bound = runtime.monotonicity_eps() - 1.0;
+    let mut projected = proposed.clone();
+    for (idx, value) in projected.iter_mut().enumerate() {
+        if !value.is_finite() {
+            return Err(format!("{label} coefficient {idx} is non-finite"));
         }
-        alpha *= 0.5;
-        if alpha < min_alpha {
-            return Ok(current.clone());
+        if *value < lower_bound {
+            *value = lower_bound;
         }
     }
+    Ok(projected)
 }
 
 fn validate_spec(
@@ -6411,18 +6417,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
         self.validate_exact_block_state_shapes(block_states)?;
-        if self.score_block_index().is_some_and(|idx| block_idx == idx) {
-            if let (Some(runtime), Some(score)) =
-                (&self.score_warp, self.score_block_state(block_states)?)
-            {
-                return runtime.max_feasible_monotone_step(&score.beta, delta);
-            }
-        }
-        if self.link_block_index().is_some_and(|idx| block_idx == idx) {
-            if let (Some(runtime), Some(beta_w)) = (&self.link_dev, self.link_beta(block_states)?) {
-                return runtime.max_feasible_monotone_step(beta_w, delta);
-            }
-        }
+        let _ = (block_idx, delta);
         Ok(None)
     }
 
@@ -6600,9 +6595,18 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         {
             return Err("unreachable bernoulli marginal-slope constraint state".to_string());
         }
-        // The de-nested cubic transport path does not expose the old endpoint-only
-        // linearized derivative constraints. Monotonicity is enforced by the
-        // exact cubic feasibility runtime and step-size limiter instead.
+        if self.score_block_index().is_some_and(|idx| block_idx == idx) {
+            return Ok(self
+                .score_warp
+                .as_ref()
+                .map(DeviationRuntime::structural_monotonicity_constraints));
+        }
+        if self.link_block_index().is_some_and(|idx| block_idx == idx) {
+            return Ok(self
+                .link_dev
+                .as_ref()
+                .map(DeviationRuntime::structural_monotonicity_constraints));
+        }
         Ok(None)
     }
 
@@ -7342,7 +7346,7 @@ mod tests {
     }
 
     #[test]
-    fn link_dev_without_score_warp_uses_w_block_without_linear_constraint_shortcut() {
+    fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
         let prepared = build_deviation_block_from_seed(
             &seed,
@@ -7431,14 +7435,16 @@ mod tests {
                 .block_linear_constraints(&block_states, 1, &dummy_spec)
                 .expect("non-link constraint lookup")
                 .is_none(),
-            "non-link block should not expose linearized monotonicity constraints"
+            "non-link block should not expose auxiliary monotonicity constraints"
         );
-        assert!(
-            family
-                .block_linear_constraints(&block_states, 2, &dummy_spec)
-                .expect("link constraint lookup")
-                .is_none(),
-            "link block should use exact monotonicity runtime rather than endpoint-only linear constraints"
+        let constraints = family
+            .block_linear_constraints(&block_states, 2, &dummy_spec)
+            .expect("link constraint lookup")
+            .expect("link constraints");
+        assert_eq!(constraints.a, Array2::<f64>::eye(link_dim));
+        assert_eq!(
+            constraints.b,
+            Array1::<f64>::from_elem(link_dim, prepared.runtime.monotonicity_eps() - 1.0)
         );
     }
 
@@ -7509,7 +7515,7 @@ mod tests {
     }
 
     #[test]
-    fn score_warp_block_uses_exact_monotonicity_runtime_without_linear_constraints() {
+    fn score_warp_block_exposes_structural_derivative_lower_bounds() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
         let prepared = build_deviation_block_from_seed(
             &seed,
@@ -7546,12 +7552,14 @@ mod tests {
         ];
 
         let dummy_spec = dummy_blockspec(score_dim, seed.len());
-        assert!(
-            family
-                .block_linear_constraints(&block_states, 2, &dummy_spec)
-                .expect("constraint lookup")
-                .is_none(),
-            "score-warp block should rely on exact monotonicity checks, not endpoint-only linear constraints"
+        let constraints = family
+            .block_linear_constraints(&block_states, 2, &dummy_spec)
+            .expect("constraint lookup")
+            .expect("score-warp constraints");
+        assert_eq!(constraints.a, Array2::<f64>::eye(score_dim));
+        assert_eq!(
+            constraints.b,
+            Array1::<f64>::from_elem(score_dim, prepared.runtime.monotonicity_eps() - 1.0)
         );
     }
 
@@ -7659,16 +7667,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_monotonicity_accepts_lower_degree_when_fourth_derivative_is_structurally_zero() {
+    fn structural_deviation_runtime_is_piecewise_quadratic() {
         let seed = array![-1.0, 0.0, 1.0];
         let prepared = build_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
-                degree: 2,
+                degree: 4,
                 ..DeviationBlockConfig::default()
             },
         )
-        .expect("quadratic deviation basis should remain exact");
+        .expect("structural deviation basis");
         assert_eq!(prepared.runtime.degree(), 2);
         assert_eq!(prepared.runtime.value_span_degree(), 2);
     }
@@ -7698,19 +7706,24 @@ mod tests {
     }
 
     #[test]
-    fn exact_monotonicity_rejects_deviation_basis_with_nonzero_fourth_derivative() {
-        let seed = array![-1.0, 0.0, 1.0];
-        let err = match build_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                degree: 4,
-                ..DeviationBlockConfig::default()
-            },
-        ) {
-            Ok(_) => panic!("quartic deviation basis should be rejected"),
-            Err(err) => err,
-        };
-        assert!(err.contains("fourth derivative is structurally zero"));
+    fn structural_constraints_match_exact_monotonicity_guard() {
+        let seed = array![-1.0, 0.0, 1.0, 2.0];
+        let prepared = build_deviation_block_from_seed(&seed, &DeviationBlockConfig::default())
+            .expect("build deviation block");
+        let constraints = prepared.runtime.structural_monotonicity_constraints();
+        let dim = constraints.a.ncols();
+        let feasible = Array1::<f64>::from_elem(dim, prepared.runtime.monotonicity_eps() - 1.0);
+        prepared
+            .runtime
+            .monotonicity_feasible(&feasible, "feasible structural beta")
+            .expect("boundary point should be feasible");
+        let infeasible = &feasible - 1e-3;
+        assert!(
+            prepared
+                .runtime
+                .monotonicity_feasible(&infeasible, "infeasible structural beta")
+                .is_err()
+        );
     }
 
     #[test]
