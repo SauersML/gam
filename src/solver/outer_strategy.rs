@@ -48,6 +48,126 @@ pub enum Derivative {
 /// selects the optimizer and Hessian strategy.
 const SMALL_OUTER_FD_HESSIAN_MAX_PARAMS: usize = 8;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OuterThetaLayout {
+    pub n_params: usize,
+    pub psi_dim: usize,
+}
+
+impl OuterThetaLayout {
+    pub fn new(n_params: usize, psi_dim: usize) -> Self {
+        Self { n_params, psi_dim }
+    }
+
+    pub fn rho_dim(&self) -> usize {
+        self.n_params.saturating_sub(self.psi_dim)
+    }
+
+    fn validate_capability(&self, context: &str) -> Result<(), EstimationError> {
+        if self.psi_dim > self.n_params {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "{context}: invalid outer theta layout (psi_dim={} exceeds n_params={})",
+                self.psi_dim, self.n_params
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_point_len(
+        &self,
+        theta: &Array1<f64>,
+        context: &str,
+    ) -> Result<(), ObjectiveEvalError> {
+        if theta.len() != self.n_params {
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "{context}: outer theta length mismatch: got {}, expected {} (rho_dim={}, psi_dim={})",
+                theta.len(),
+                self.n_params,
+                self.rho_dim(),
+                self.psi_dim
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_gradient_len(
+        &self,
+        gradient: &Array1<f64>,
+        context: &str,
+    ) -> Result<(), ObjectiveEvalError> {
+        if gradient.len() != self.n_params {
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "{context}: outer gradient length mismatch: got {}, expected {} (rho_dim={}, psi_dim={})",
+                gradient.len(),
+                self.n_params,
+                self.rho_dim(),
+                self.psi_dim
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_hessian_shape(
+        &self,
+        hessian: &Array2<f64>,
+        context: &str,
+    ) -> Result<(), ObjectiveEvalError> {
+        if hessian.nrows() != self.n_params || hessian.ncols() != self.n_params {
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "{context}: outer Hessian shape mismatch: got {}x{}, expected {}x{} (rho_dim={}, psi_dim={})",
+                hessian.nrows(),
+                hessian.ncols(),
+                self.n_params,
+                self.n_params,
+                self.rho_dim(),
+                self.psi_dim
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_efs_eval(
+        &self,
+        eval: &EfsEval,
+        context: &str,
+    ) -> Result<(), ObjectiveEvalError> {
+        if eval.steps.len() != self.n_params {
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "{context}: outer EFS step length mismatch: got {}, expected {} (rho_dim={}, psi_dim={})",
+                eval.steps.len(),
+                self.n_params,
+                self.rho_dim(),
+                self.psi_dim
+            )));
+        }
+        if let Some(ref psi_gradient) = eval.psi_gradient {
+            if psi_gradient.len() != self.psi_dim {
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "{context}: outer EFS psi-gradient length mismatch: got {}, expected {}",
+                    psi_gradient.len(),
+                    self.psi_dim
+                )));
+            }
+        }
+        if let Some(ref psi_indices) = eval.psi_indices {
+            if psi_indices.len() != self.psi_dim {
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "{context}: outer EFS psi-index count mismatch: got {}, expected {}",
+                    psi_indices.len(),
+                    self.psi_dim
+                )));
+            }
+            if psi_indices.iter().any(|&idx| idx >= self.n_params) {
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "{context}: outer EFS psi index out of range for n_params={}",
+                    self.n_params
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OuterCapability {
     pub gradient: Derivative,
@@ -98,6 +218,14 @@ pub struct OuterCapability {
 }
 
 impl OuterCapability {
+    pub fn theta_layout(&self) -> OuterThetaLayout {
+        OuterThetaLayout::new(self.n_params, self.psi_dim)
+    }
+
+    pub fn validate_layout(&self, context: &str) -> Result<(), EstimationError> {
+        self.theta_layout().validate_capability(context)
+    }
+
     /// True when all coordinates are penalty-like (no ψ coords).
     pub fn all_penalty_like(&self) -> bool {
         self.psi_dim == 0
@@ -579,8 +707,10 @@ fn finite_cost_or_error(context: &str, cost: f64) -> Result<f64, ObjectiveEvalEr
 
 fn finite_outer_eval_or_error(
     context: &str,
+    layout: OuterThetaLayout,
     eval: OuterEval,
 ) -> Result<OuterEval, ObjectiveEvalError> {
+    layout.validate_gradient_len(&eval.gradient, context)?;
     if !eval.cost.is_finite() {
         return Err(ObjectiveEvalError::recoverable(format!(
             "{context}: objective returned a non-finite cost"
@@ -592,11 +722,14 @@ fn finite_outer_eval_or_error(
         )));
     }
     if let HessianResult::Analytic(ref hessian) = eval.hessian
-        && !hessian.iter().all(|v| v.is_finite())
     {
-        return Err(ObjectiveEvalError::recoverable(format!(
-            "{context}: objective returned a non-finite Hessian"
-        )));
+        layout.validate_hessian_shape(hessian, context)?;
+        if !hessian.iter().all(|v| v.is_finite())
+        {
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "{context}: objective returned a non-finite Hessian"
+            )));
+        }
     }
     Ok(eval)
 }
@@ -606,18 +739,25 @@ fn finite_outer_eval_for_seed(
     rho: &Array1<f64>,
     context: &str,
 ) -> Result<(), ObjectiveEvalError> {
+    let cap = obj.capability();
+    cap.validate_layout(context)
+        .map_err(|err| into_objective_error(context, err))?;
+    let layout = cap.theta_layout();
+    layout.validate_point_len(rho, context)?;
     let eval = obj
         .eval(rho)
         .map_err(|err| into_objective_error(context, err))?;
-    finite_outer_eval_or_error(context, eval).map(|_| ())
+    finite_outer_eval_or_error(context, layout, eval).map(|_| ())
 }
 
 struct OuterCostBridge<'a> {
     obj: &'a mut dyn OuterObjective,
+    layout: OuterThetaLayout,
 }
 
 impl ZerothOrderObjective for OuterCostBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
             .obj
             .eval_cost(x)
@@ -628,10 +768,12 @@ impl ZerothOrderObjective for OuterCostBridge<'_> {
 
 struct OuterFirstOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
+    layout: OuterThetaLayout,
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
             .obj
             .eval_cost(x)
@@ -642,11 +784,12 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
 
 impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer eval failed")?;
         let eval = self
             .obj
             .eval(x)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
-        let eval = finite_outer_eval_or_error("outer eval failed", eval)?;
+        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -656,11 +799,13 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
 
 struct OuterSecondOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
+    layout: OuterThetaLayout,
     hessian_source: HessianSource,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
             .obj
             .eval_cost(x)
@@ -671,11 +816,12 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
 
 impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer eval failed")?;
         let eval = self
             .obj
             .eval(x)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
-        let eval = finite_outer_eval_or_error("outer eval failed", eval)?;
+        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -685,11 +831,12 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
 
 impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer eval failed")?;
         let eval = self
             .obj
             .eval(x)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
-        let eval = finite_outer_eval_or_error("outer eval failed", eval)?;
+        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         let hessian = match self.hessian_source {
             HessianSource::Analytic => eval.hessian.into_option(),
             HessianSource::FiniteDifference
@@ -707,6 +854,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 
 struct OuterFixedPointBridge<'a> {
     obj: &'a mut dyn OuterObjective,
+    layout: OuterThetaLayout,
     barrier_config: Option<BarrierConfig>,
 }
 
@@ -721,10 +869,12 @@ const MAX_PSI_BACKTRACK: usize = 8;
 
 impl FixedPointObjective for OuterFixedPointBridge<'_> {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
+        self.layout.validate_point_len(x, "outer EFS eval failed")?;
         let eval = self
             .obj
             .eval_efs(x)
             .map_err(|err| into_objective_error("outer EFS eval failed", err))?;
+        self.layout.validate_efs_eval(&eval, "outer EFS eval failed")?;
         if !eval.cost.is_finite() {
             return Err(ObjectiveEvalError::recoverable(
                 "outer EFS eval failed: objective returned a non-finite cost".to_string(),
@@ -1155,6 +1305,7 @@ fn run_outer(
     context: &str,
 ) -> Result<OuterResult, EstimationError> {
     let cap = obj.capability();
+    cap.validate_layout(context)?;
 
     if cap.n_params == 0 {
         let cost = obj.eval_cost(&Array1::zeros(0))?;
@@ -1376,6 +1527,7 @@ fn run_outer_with_plan(
 
     let mut best: Option<OuterResult> = None;
     let mut last_seed_error: Option<String> = None;
+    let layout = cap.theta_layout();
 
     for seed in &screened {
         obj.reset();
@@ -1385,6 +1537,7 @@ fn run_outer_with_plan(
                 let hessian_source = the_plan.hessian_source;
                 let objective = OuterSecondOrderBridge {
                     obj,
+                    layout,
                     hessian_source,
                 };
 
@@ -1436,7 +1589,7 @@ fn run_outer_with_plan(
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 if gradient_available {
-                    let objective = OuterFirstOrderBridge { obj };
+                    let objective = OuterFirstOrderBridge { obj, layout };
                     let mut optimizer = Bfgs::new(seed.clone(), objective)
                         .with_bounds(bounds)
                         .with_tolerance(tol)
@@ -1454,8 +1607,8 @@ fn run_outer_with_plan(
                         ))),
                     }
                 } else {
-                    let objective =
-                        FiniteDiffGradient::new(OuterCostBridge { obj }).with_step(config.fd_step);
+                    let objective = FiniteDiffGradient::new(OuterCostBridge { obj, layout })
+                        .with_step(config.fd_step);
                     let mut optimizer = Bfgs::new(seed.clone(), objective)
                         .with_bounds(bounds)
                         .with_tolerance(tol)
@@ -1483,6 +1636,7 @@ fn run_outer_with_plan(
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let objective = OuterFixedPointBridge {
                     obj,
+                    layout,
                     barrier_config: cap.barrier_config.clone(),
                 };
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
@@ -1530,6 +1684,7 @@ fn run_outer_with_plan(
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let objective = OuterFixedPointBridge {
                     obj,
+                    layout,
                     barrier_config: cap.barrier_config.clone(),
                 };
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
@@ -2037,5 +2192,64 @@ mod tests {
         assert_eq!(attempts[0].hessian, Derivative::Unavailable);
         assert_eq!(attempts[1].gradient, Derivative::FiniteDifference);
         assert_eq!(attempts[1].hessian, Derivative::Unavailable);
+    }
+
+    #[test]
+    fn run_rejects_gradient_length_mismatch_before_optimizer_panic() {
+        let problem = OuterProblem::new(2)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable)
+            .with_initial_rho(Array1::zeros(2))
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), _: &Array1<f64>| Ok(0.0),
+            |_: &mut (), _: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.0,
+                    gradient: Array1::zeros(1),
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let err = problem
+            .run(&mut obj, "test gradient mismatch")
+            .expect_err("mismatched gradient length should fail cleanly");
+        assert!(
+            err.to_string().contains("outer gradient length mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_rejects_invalid_theta_layout() {
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable)
+            .with_psi_dim(2)
+            .with_initial_rho(Array1::zeros(1))
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), _: &Array1<f64>| Ok(0.0),
+            |_: &mut (), _: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.0,
+                    gradient: Array1::zeros(1),
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let err = problem
+            .run(&mut obj, "test invalid layout")
+            .expect_err("invalid theta layout should fail cleanly");
+        assert!(
+            err.to_string().contains("invalid outer theta layout"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -2992,8 +2992,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // plan for REML optimization instead of the downgraded gradient-only
     // outer strategies.
     //
-    // Note: auxiliary coords are NOT design-moving (psi_dim=0). The seed
-    // config still needs num_auxiliary_trailing for proper multi-start seeding.
+    // Spatial log-kappa coordinates are ψ (design-moving) dimensions because
+    // they rebuild the spatial basis and penalties at each outer proposal.
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
@@ -3005,6 +3005,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         } else {
             Derivative::Unavailable
         })
+        .with_psi_dim(theta_dim - rho_dim)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
         .with_fd_step(1e-4)
@@ -16046,6 +16047,33 @@ mod tests {
         }
     }
 
+    fn simple_aniso_matern_term_collection(
+        feature_cols: &[usize],
+        length_scale: f64,
+    ) -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![SmoothTermSpec {
+                name: "spatial".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: feature_cols.to_vec(),
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
+                        length_scale,
+                        nu: MaternNu::ThreeHalves,
+                        include_intercept: false,
+                        double_penalty: false,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: Some(vec![0.0; feature_cols.len()]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        }
+    }
+
     fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
         SpatialLengthScaleOptimizationOptions {
             enabled: true,
@@ -16343,6 +16371,7 @@ mod tests {
             .expect("exact spatial joint hyper path should return a full [rho, psi] hessian");
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
         let theta_dim = rho.len() + psi_dim;
+        assert_eq!(eval.gradient.len(), theta_dim);
         assert_eq!(hess.nrows(), theta_dim);
         assert_eq!(hess.ncols(), theta_dim);
     }
@@ -16430,6 +16459,7 @@ mod tests {
         );
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
         let theta_dim = rho.len() + psi_dim;
+        assert_eq!(eval.gradient.len(), theta_dim);
         assert_eq!(hess.nrows(), theta_dim);
         assert_eq!(hess.ncols(), theta_dim);
     }
@@ -16508,9 +16538,68 @@ mod tests {
             .expect("exact spatial joint hyper path should return a full [rho, psi] hessian");
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
         let theta_dim = rho.len() + psi_dim;
+        assert_eq!(eval.gradient.len(), theta_dim);
         assert_eq!(hess.nrows(), theta_dim);
         assert_eq!(hess.ncols(), theta_dim);
         assert!(hess.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn binomial_mean_wiggle_selected_basis_exact_spatial_path_succeeds_end_to_end() {
+        let n = 24usize;
+        let mut data = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+            data[[i, 2]] = (2.5 * std::f64::consts::PI * t).cos();
+        }
+        let y = Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 7 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let offset = Array1::zeros(n);
+        let pilot_spec = simple_aniso_matern_term_collection(&[0, 1, 2], 0.45);
+        let pilot = crate::smooth::fit_term_collection_forspec(
+            data.view(),
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &pilot_spec,
+            LikelihoodFamily::BinomialLogit,
+            &crate::estimate::FitOptions::default(),
+        )
+        .expect("pilot fit");
+        let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(
+            &pilot.design,
+            &pilot.fit,
+            &WiggleBlockConfig {
+                degree: 2,
+                num_internal_knots: 4,
+                penalty_order: 1,
+                double_penalty: false,
+            },
+            &[1, 2],
+        )
+        .expect("selected wiggle basis");
+        let solved = fit_binomial_mean_wiggle_terms_with_selected_basis(
+            data.view(),
+            &pilot_spec,
+            &pilot.design,
+            &pilot.fit,
+            &y,
+            &weights,
+            InverseLink::Standard(LinkFunction::Logit),
+            selected_wiggle_basis,
+            &BlockwiseFitOptions {
+                use_remlobjective: true,
+                outer_max_iter: 4,
+                ..BlockwiseFitOptions::default()
+            },
+            &spatial_kappa_options(),
+        )
+        .expect("exact spatial mean-wiggle fit");
+        assert_eq!(solved.design.design.nrows(), n);
+        assert!(solved.fit.beta.iter().all(|v| v.is_finite()));
+        assert!(solved.fit.lambdas.iter().all(|v| v.is_finite()));
     }
 
     #[test]
