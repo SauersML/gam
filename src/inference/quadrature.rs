@@ -2474,7 +2474,7 @@ pub fn integrated_inverse_link_jet(
                 |x| component_point_jet(LinkComponent::Logit, x),
             )?;
             let ghq = integrated_logit_jet_ghq(quadctx, mu, sigma);
-            if integrated_jet_drift_exceeds(&candidate, &ghq, 2e-8, 2e-5) {
+            if integrated_jet_drift_exceeds(&candidate, &ghq, 1e-5, 1e-3) {
                 Ok(ghq)
             } else {
                 Ok(candidate)
