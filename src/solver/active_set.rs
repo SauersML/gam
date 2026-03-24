@@ -5,7 +5,6 @@ use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::{Side, Unbind};
 use ndarray::{Array1, Array2, s};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct LinearInequalityConstraints {
@@ -279,6 +278,14 @@ pub(crate) fn solve_kkt_direction(
 pub(crate) struct CompressedActiveWorkingSet {
     pub(crate) constraints: LinearInequalityConstraints,
     pub(crate) groups: Vec<Vec<usize>>,
+    pub(crate) original_active_count: usize,
+}
+
+impl CompressedActiveWorkingSet {
+    fn is_degenerate_face(&self) -> bool {
+        self.constraints.a.nrows() < self.original_active_count
+            || self.groups.iter().any(|group| group.len() > 1)
+    }
 }
 
 pub(crate) fn compress_active_working_set(
@@ -286,9 +293,6 @@ pub(crate) fn compress_active_working_set(
     constraints: &LinearInequalityConstraints,
     active: &[usize],
 ) -> Result<CompressedActiveWorkingSet, EstimationError> {
-    const SCALE_TOL: f64 = 1e-14;
-    const KEY_TOL: f64 = 1e-10;
-
     let p = constraints.a.ncols();
     if x.len() != p {
         return Err(EstimationError::InvalidInput(
@@ -296,9 +300,9 @@ pub(crate) fn compress_active_working_set(
         ));
     }
 
-    let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64, Vec<usize>)> = BTreeMap::new();
-    let mut fallback_rows: Vec<(Vec<f64>, f64, Vec<usize>)> = Vec::new();
-
+    let mut a_out = Array2::<f64>::zeros((active.len(), p));
+    let mut b_out = Array1::<f64>::zeros(active.len());
+    let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(active.len());
     for (pos, &idx) in active.iter().enumerate() {
         if idx >= constraints.a.nrows() {
             return Err(EstimationError::InvalidInput(format!(
@@ -307,62 +311,9 @@ pub(crate) fn compress_active_working_set(
                 constraints.a.nrows()
             )));
         }
-        let row = constraints.a.row(idx);
-        let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        if !scale.is_finite() || scale <= SCALE_TOL {
-            let rhs = constraints.b[idx];
-            fallback_rows.push((row.to_vec(), rhs, vec![pos]));
-            continue;
-        }
-
-        let normalized_row: Vec<f64> = row
-            .iter()
-            .map(|&v| {
-                let scaled = v / scale;
-                if scaled.abs() <= KEY_TOL { 0.0 } else { scaled }
-            })
-            .collect();
-        let normalized_rhs = constraints.b[idx] / scale;
-        let key: Vec<i64> = normalized_row
-            .iter()
-            .map(|&v| (v / KEY_TOL).round() as i64)
-            .collect();
-
-        match grouped.get_mut(&key) {
-            Some((row_rep, rhs_max, group_positions)) => {
-                if normalized_rhs > *rhs_max {
-                    *row_rep = normalized_row;
-                    *rhs_max = normalized_rhs;
-                }
-                group_positions.push(pos);
-            }
-            None => {
-                grouped.insert(key, (normalized_row, normalized_rhs, vec![pos]));
-            }
-        }
-    }
-
-    let nrows = grouped.len() + fallback_rows.len();
-    let mut a_out = Array2::<f64>::zeros((nrows, p));
-    let mut b_out = Array1::<f64>::zeros(nrows);
-    let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(nrows);
-
-    let mut out_row = 0usize;
-    for (_, (row, rhs, positions)) in grouped {
-        for (j, value) in row.into_iter().enumerate() {
-            a_out[[out_row, j]] = value;
-        }
-        b_out[out_row] = rhs;
-        groups_out.push(positions);
-        out_row += 1;
-    }
-    for (row, rhs, positions) in fallback_rows {
-        for (j, value) in row.into_iter().enumerate() {
-            a_out[[out_row, j]] = value;
-        }
-        b_out[out_row] = rhs;
-        groups_out.push(positions);
-        out_row += 1;
+        a_out.row_mut(pos).assign(&constraints.a.row(idx));
+        b_out[pos] = constraints.b[idx];
+        groups_out.push(vec![pos]);
     }
 
     let (a_out, b_out, groups_out) = rank_reduce_rows_pivoted_qr(a_out, b_out, groups_out);
@@ -370,6 +321,7 @@ pub(crate) fn compress_active_working_set(
     Ok(CompressedActiveWorkingSet {
         constraints: LinearInequalityConstraints { a: a_out, b: b_out },
         groups: groups_out,
+        original_active_count: active.len(),
     })
 }
 
@@ -523,6 +475,82 @@ fn canonicalize_active_constraint_ids(
     Ok(canonical)
 }
 
+fn reset_active_flags(is_active: &mut [bool], active: &[usize]) {
+    is_active.fill(false);
+    for &idx in active {
+        if idx < is_active.len() {
+            is_active[idx] = true;
+        }
+    }
+}
+
+fn fallback_projected_gradient_direction(
+    x: &Array1<f64>,
+    d_total: &Array1<f64>,
+    gradient: &Array1<f64>,
+    working_constraints: &LinearInequalityConstraints,
+    constraints: &LinearInequalityConstraints,
+) -> Result<Option<(Array1<f64>, Vec<usize>)>, EstimationError> {
+    let p = gradient.len();
+    if x.len() != p || d_total.len() != p || constraints.a.ncols() != p {
+        return Err(EstimationError::InvalidInput(
+            "projected-gradient fallback dimension mismatch".to_string(),
+        ));
+    }
+
+    let tangent_direction = if working_constraints.a.nrows() == 0 {
+        -gradient
+    } else {
+        let identity = Array2::<f64>::eye(p);
+        let residual = &working_constraints.b - &working_constraints.a.dot(x);
+        let (direction, _) =
+            solve_kkt_direction(&identity, gradient, &working_constraints.a, Some(&residual))?;
+        direction
+    };
+
+    if !array1_is_finite(&tangent_direction) {
+        return Ok(None);
+    }
+
+    let step_inf = tangent_direction
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    if step_inf <= 1e-12 {
+        let active = canonicalize_active_constraint_ids(x, constraints, &[])?;
+        return Ok(Some((d_total.clone(), active)));
+    }
+
+    let directional_derivative = gradient.dot(&tangent_direction);
+    if !directional_derivative.is_finite() || directional_derivative >= 0.0 {
+        return Ok(None);
+    }
+
+    let mut alpha = 1.0_f64;
+    for i in 0..constraints.a.nrows() {
+        let ai = constraints.a.row(i);
+        let slack = ai.dot(x) - constraints.b[i];
+        let ai_d = ai.dot(&tangent_direction);
+        if let Some(candidate) = boundary_hit_step_fraction(slack, ai_d, alpha) {
+            alpha = candidate;
+        }
+    }
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return Ok(None);
+    }
+
+    let fallback_step = tangent_direction * alpha;
+    let new_x = x + &fallback_step;
+    let (worst, _) = max_linear_constraint_violation(&new_x, constraints);
+    if worst > 1e-8 {
+        return Ok(None);
+    }
+    let active = (0..constraints.a.nrows())
+        .filter(|&i| constraints.a.row(i).dot(&new_x) - constraints.b[i] <= 1e-10)
+        .collect::<Vec<_>>();
+    let active = canonicalize_active_constraint_ids(&new_x, constraints, &active)?;
+    Ok(Some((d_total + &fallback_step, active)))
+}
+
 pub(crate) fn solve_newton_direction_with_linear_constraints(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -589,6 +617,8 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
             is_active[i] = true;
         }
     }
+    active = canonicalize_active_constraint_ids(&x, constraints, &active)?;
+    reset_active_flags(&mut is_active, &active);
     let mut last_working_x = x.clone();
     let mut last_working_direction = d_total.clone();
     let mut last_working_gradient = g_cur.clone();
@@ -598,6 +628,7 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
         b: Array1::<f64>::zeros(0),
     };
     let mut last_working_lambda_true = Array1::<f64>::zeros(0);
+    let mut last_working_degenerate = false;
 
     for _ in 0..((p + m + 8) * 4) {
         let compressed_working = compress_active_working_set(&x, constraints, &active)?;
@@ -622,6 +653,7 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
             b: compressed_working.constraints.b.clone(),
         };
         last_working_lambda_true = lambdaw.mapv(|lam_sys| -lam_sys);
+        last_working_degenerate = compressed_working.is_degenerate_face();
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
             if compressed_working.groups.is_empty() {
@@ -693,6 +725,10 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
                 added_new_active = true;
             }
         }
+        if added_new_active {
+            active = canonicalize_active_constraint_ids(&x, constraints, &active)?;
+            reset_active_flags(&mut is_active, &active);
+        }
 
         if active.is_empty() && !added_new_active {
             if let Some(hint) = active_hint {
@@ -732,9 +768,15 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
         && working_kkt.complementarity <= 1e-6;
     let model_descent_ok = predicted_delta <= -1e-10 * (1.0 + grad_inf * step_inf);
     let near_null_step_ok = step_inf <= 1e-10;
+    let degenerate_boundary_ok = last_working_degenerate
+        && worst <= 1e-8
+        && working_kkt.primal_feasibility <= 1e-8
+        && working_kkt.complementarity <= 1e-6
+        && (working_kkt.stationarity <= 1e-3 || stationarity_rel <= 2e-6 || near_null_step_ok);
     if worst <= 1e-8
-        && working_kkt.dual_feasibility <= 1e-8
-        && (kkt_strong_ok || model_descent_ok || near_null_step_ok)
+        && ((working_kkt.dual_feasibility <= 1e-8
+            && (kkt_strong_ok || model_descent_ok || near_null_step_ok))
+            || degenerate_boundary_ok)
     {
         if let Some(hint) = active_hint {
             hint.clear();
@@ -745,6 +787,20 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
             )?);
         }
         direction_out.assign(&last_working_direction);
+        return Ok(());
+    }
+    if let Some((fallback_direction, fallback_active)) = fallback_projected_gradient_direction(
+        &last_working_x,
+        &last_working_direction,
+        &last_working_gradient,
+        &last_working_constraints,
+        constraints,
+    )? {
+        if let Some(hint) = active_hint {
+            hint.clear();
+            hint.extend(fallback_active);
+        }
+        direction_out.assign(&fallback_direction);
         return Ok(());
     }
     Err(EstimationError::ParameterConstraintViolation(format!(
