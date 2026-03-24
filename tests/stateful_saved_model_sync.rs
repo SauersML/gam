@@ -1,7 +1,10 @@
 use gam::estimate::{
     BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
 };
-use gam::inference::model::{FittedFamily, FittedModel, FittedModelPayload, ModelKind};
+use gam::families::lognormal_kernel::FrailtySpec;
+use gam::inference::model::{
+    FittedFamily, FittedModel, FittedModelPayload, ModelKind, PredictModelClass,
+};
 use gam::pirls::PirlsStatus;
 use gam::types::{
     LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization,
@@ -48,6 +51,54 @@ fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
         inner_cycles: 0,
     })
     .expect("minimal fit result must be valid")
+}
+
+fn minimal_survival_fit_result() -> UnifiedFitResult {
+    UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+        blocks: vec![
+            FittedBlock {
+                beta: Array1::from_vec(vec![0.0]),
+                role: BlockRole::Threshold,
+                edf: 0.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: Array1::from_vec(vec![0.0]),
+                role: BlockRole::Scale,
+                edf: 0.0,
+                lambdas: Array1::zeros(0),
+            },
+        ],
+        log_lambdas: Array1::zeros(0),
+        lambdas: Array1::zeros(0),
+        likelihood_family: Some(LikelihoodFamily::RoystonParmar),
+        likelihood_scale: LikelihoodScaleMetadata::Unspecified,
+        log_likelihood_normalization: LogLikelihoodNormalization::Full,
+        log_likelihood: 0.0,
+        deviance: 0.0,
+        reml_score: 0.0,
+        stable_penalty_term: 0.0,
+        penalized_objective: 0.0,
+        outer_iterations: 1,
+        outer_converged: true,
+        outer_gradient_norm: 0.0,
+        standard_deviation: 1.0,
+        covariance_conditional: None,
+        covariance_corrected: None,
+        inference: None,
+        fitted_link: FittedLinkState::Standard(None),
+        geometry: None,
+        block_states: Vec::new(),
+        pirls_status: PirlsStatus::Converged,
+        max_abs_eta: 0.0,
+        constraint_kkt: None,
+        artifacts: FitArtifacts {
+            pirls: None,
+            ..Default::default()
+        },
+        inner_cycles: 0,
+    })
+    .expect("minimal survival fit result must be valid")
 }
 
 #[test]
@@ -118,5 +169,33 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     assert_eq!(
         payload.sas_param_covariance,
         Some(vec![vec![0.1, 0.02], vec![0.02, 0.2]])
+    );
+}
+
+#[test]
+fn survival_marginal_slope_saved_models_require_special_predict_handling() {
+    let mut payload = FittedModelPayload::new(
+        1,
+        "Surv(t0, t1, event) ~ s(x)".to_string(),
+        ModelKind::Survival,
+        FittedFamily::Survival {
+            likelihood: LikelihoodFamily::RoystonParmar,
+            survival_likelihood: Some("marginal-slope".to_string()),
+            survival_distribution: Some("gaussian".to_string()),
+            frailty: FrailtySpec::None,
+        },
+        "survival".to_string(),
+    );
+    payload.unified = Some(minimal_survival_fit_result());
+    let model = FittedModel::from_payload(payload);
+
+    assert_eq!(model.predict_model_class(), PredictModelClass::Survival);
+    assert!(
+        model.predictor().is_none(),
+        "saved survival marginal-slope models should bypass the generic predictor path"
+    );
+    assert!(
+        model.block_roles().is_none(),
+        "saved survival marginal-slope models should not advertise incorrect generic block roles"
     );
 }
