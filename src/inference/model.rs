@@ -1509,6 +1509,15 @@ impl FittedModel {
                 }))
             }
             PredictModelClass::Survival => {
+                if matches!(
+                    self.family_state,
+                    FittedFamily::Survival {
+                        survival_likelihood: Some(ref survival_likelihood),
+                        ..
+                    } if survival_likelihood == "marginal-slope"
+                ) {
+                    return None;
+                }
                 let unified = self.unified()?;
                 // Default to probit inverse link for survival models.
                 let inverse_link = self
