@@ -816,7 +816,7 @@ pub fn parse_matching_auxiliary_formula(
     let rhs = formula.trim();
     if top_level_formula_separator(rhs)?.is_some() {
         return Err(format!(
-            "{flag_name} accepts only RHS terms; remove the response and pass terms like 'smooth(x)' or '1'"
+            "{flag_name} expects only the terms after '~', not a full 'response ~ terms' formula; use {flag_name} 's(x)' instead of {flag_name} 'y ~ s(x)' (or pass '1' for an intercept-only noise model)"
         ));
     }
     let parsed_formula = parse_formula(&format!("{response} ~ {rhs}"))?;

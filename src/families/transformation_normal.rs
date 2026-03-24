@@ -24,10 +24,10 @@ use crate::basis::{
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
-    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper, fit_custom_family,
+    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -458,6 +458,23 @@ impl TransformationNormalFamily {
     }
 }
 
+fn weighted_crossprod_dense(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+) -> Array2<f64> {
+    debug_assert_eq!(left.nrows(), weights.len());
+    debug_assert_eq!(right.nrows(), weights.len());
+    let mut weighted_right = right.clone();
+    for i in 0..weighted_right.nrows() {
+        let wi = weights[i];
+        for j in 0..weighted_right.ncols() {
+            weighted_right[[i, j]] *= wi;
+        }
+    }
+    fast_atb(left, &weighted_right)
+}
+
 // ---------------------------------------------------------------------------
 // CustomFamily implementation
 // ---------------------------------------------------------------------------
@@ -543,18 +560,10 @@ impl CustomFamily for TransformationNormalFamily {
 
     fn exact_outer_derivative_order(
         &self,
-        _: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        let n = self.n_obs();
-        let p = self.p_total();
-        // Downgrade to first-order if the Hessian directional derivative is too
-        // expensive (O(n·p²)).
-        if (n as u64) * (p as u64) * (p as u64) > 2_000_000 {
-            ExactOuterDerivativeOrder::First
-        } else {
-            ExactOuterDerivativeOrder::Second
-        }
+        crate::custom_family::cost_gated_outer_order(specs)
     }
 
     fn max_feasible_step_size(
@@ -743,6 +752,235 @@ impl CustomFamily for TransformationNormalFamily {
             hessian_psi,
             hessian_psi_operator: None,
         }))
+    }
+
+    fn exact_newton_joint_psisecond_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if psi_derivs.is_empty() || psi_i >= psi_derivs[0].len() || psi_j >= psi_derivs[0].len() {
+            return Ok(None);
+        }
+        let deriv_i = &psi_derivs[0][psi_i];
+        let deriv_j = &psi_derivs[0][psi_j];
+        let beta = &block_states[0].beta;
+        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let n = h.len();
+        let inv_h_prime = h_prime.mapv(|v| 1.0 / v);
+        let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
+        let inv_h_prime_cu = h_prime.mapv(|v| 1.0 / (v * v * v));
+        let inv_h_prime_qu = h_prime.mapv(|v| 1.0 / (v * v * v * v));
+        let weighted_h = &h * self.weights.as_ref();
+        let weighted_inv_h_prime = &inv_h_prime * self.weights.as_ref();
+        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
+
+        let op = deriv_i
+            .implicit_operator
+            .as_ref()
+            .and_then(|op| op.as_any().downcast_ref::<TensorKroneckerPsiOperator>())
+            .ok_or_else(|| {
+                "TransformationNormalFamily requires tensor psi derivatives to remain operator-backed"
+                    .to_string()
+            })?;
+        let axis_i = deriv_i.implicit_axis;
+        let axis_j = deriv_j.implicit_axis;
+
+        let v_i_val = op
+            .forward_mul(axis_i, &beta.view())
+            .map_err(|e| format!("tensor psi second-order forward_mul(i) failed: {e}"))?;
+        let v_j_val = op
+            .forward_mul(axis_j, &beta.view())
+            .map_err(|e| format!("tensor psi second-order forward_mul(j) failed: {e}"))?;
+        let v_ij_val = if axis_i == axis_j {
+            op.forward_mul_second_diag(axis_i, &beta.view())
+        } else {
+            op.forward_mul_second_cross(axis_i, axis_j, &beta.view())
+        }
+        .map_err(|e| format!("tensor psi second-order forward_mul(value second) failed: {e}"))?;
+
+        let v_i_deriv = op
+            .forward_mul_deriv(axis_i, beta)
+            .map_err(|e| format!("tensor psi second-order forward_mul_deriv(i) failed: {e}"))?;
+        let v_j_deriv = op
+            .forward_mul_deriv(axis_j, beta)
+            .map_err(|e| format!("tensor psi second-order forward_mul_deriv(j) failed: {e}"))?;
+        let v_ij_deriv = op
+            .forward_mul_second_deriv(axis_i, axis_j, &beta.view())
+            .map_err(|e| {
+                format!("tensor psi second-order forward_mul(derivative second) failed: {e}")
+            })?;
+
+        let mut objective_psi_psi = 0.0;
+        for row in 0..n {
+            objective_psi_psi += self.weights[row]
+                * (v_i_val[row] * v_j_val[row] + h[row] * v_ij_val[row]
+                    - inv_h_prime[row] * v_ij_deriv[row]
+                    + inv_h_prime_sq[row] * v_i_deriv[row] * v_j_deriv[row]);
+        }
+
+        let score_psi_psi = {
+            let term1 = op
+                .transpose_mul(axis_i, &(&v_j_val * self.weights.as_ref()).view())
+                .map_err(|e| format!("tensor psi second-order transpose_mul(i) failed: {e}"))?;
+            let term2 = op
+                .transpose_mul(axis_j, &(&v_i_val * self.weights.as_ref()).view())
+                .map_err(|e| format!("tensor psi second-order transpose_mul(j) failed: {e}"))?;
+            let term3 = if axis_i == axis_j {
+                op.transpose_mul_second_diag(axis_i, &weighted_h.view())
+            } else {
+                op.transpose_mul_second_cross(axis_i, axis_j, &weighted_h.view())
+            }
+            .map_err(|e| {
+                format!("tensor psi second-order transpose_mul(value second) failed: {e}")
+            })?;
+            let term4 = self
+                .x_val_kron
+                .transpose_mul(&(&v_ij_val * self.weights.as_ref()));
+            let term5 = op
+                .transpose_mul_deriv(axis_i, &(&v_j_deriv * &weighted_inv_h_prime_sq))
+                .map_err(|e| {
+                    format!("tensor psi second-order transpose_mul_deriv(i) failed: {e}")
+                })?;
+            let term6 = op
+                .transpose_mul_deriv(axis_j, &(&v_i_deriv * &weighted_inv_h_prime_sq))
+                .map_err(|e| {
+                    format!("tensor psi second-order transpose_mul_deriv(j) failed: {e}")
+                })?;
+            let term7 = op
+                .transpose_mul_second_deriv(axis_i, axis_j, &weighted_inv_h_prime.view())
+                .map_err(|e| {
+                    format!("tensor psi second-order transpose_mul(derivative second) failed: {e}")
+                })?
+                .mapv(|v| -v);
+            let term8 = self
+                .x_deriv_kron
+                .transpose_mul(&(&v_ij_deriv * &weighted_inv_h_prime_sq));
+            let cubic = ((&v_i_deriv * &v_j_deriv) * &inv_h_prime_cu * self.weights.as_ref())
+                .mapv(|v| -2.0 * v);
+            let term9 = self.x_deriv_kron.transpose_mul(&cubic);
+            term1 + &term2 + &term3 + &term4 + &term5 + &term6 + &term7 + &term8 + &term9
+        };
+
+        let hessian_psi_psi = {
+            let x_val = self.x_val_kron.to_dense();
+            let x_deriv = self.x_deriv_kron.to_dense();
+            let x_i_val = op
+                .materialize_first(axis_i)
+                .map_err(|e| format!("tensor psi second-order materialize_first(i) failed: {e}"))?;
+            let x_j_val = op
+                .materialize_first(axis_j)
+                .map_err(|e| format!("tensor psi second-order materialize_first(j) failed: {e}"))?;
+            let x_ij_val = if axis_i == axis_j {
+                op.materialize_second_diag(axis_i)
+            } else {
+                op.materialize_second_cross(axis_i, axis_j)
+            }
+            .map_err(|e| {
+                format!("tensor psi second-order materialize_second(value) failed: {e}")
+            })?;
+            let x_i_deriv = op.materialize_first_deriv(axis_i).map_err(|e| {
+                format!("tensor psi second-order materialize_first_deriv(i) failed: {e}")
+            })?;
+            let x_j_deriv = op.materialize_first_deriv(axis_j).map_err(|e| {
+                format!("tensor psi second-order materialize_first_deriv(j) failed: {e}")
+            })?;
+            let x_ij_deriv = op.materialize_second_deriv(axis_i, axis_j).map_err(|e| {
+                format!("tensor psi second-order materialize_second_deriv failed: {e}")
+            })?;
+
+            let mut hess = weighted_crossprod_dense(&x_i_val, self.weights.as_ref(), &x_j_val);
+            hess += &weighted_crossprod_dense(&x_j_val, self.weights.as_ref(), &x_i_val);
+            hess += &weighted_crossprod_dense(&x_ij_val, self.weights.as_ref(), &x_val);
+            hess += &weighted_crossprod_dense(&x_val, self.weights.as_ref(), &x_ij_val);
+            hess += &weighted_crossprod_dense(&x_i_deriv, &weighted_inv_h_prime_sq, &x_j_deriv);
+            hess += &weighted_crossprod_dense(&x_j_deriv, &weighted_inv_h_prime_sq, &x_i_deriv);
+            hess += &weighted_crossprod_dense(&x_ij_deriv, &weighted_inv_h_prime_sq, &x_deriv);
+            hess += &weighted_crossprod_dense(&x_deriv, &weighted_inv_h_prime_sq, &x_ij_deriv);
+
+            let cubic_i =
+                ((&v_j_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+            hess += &weighted_crossprod_dense(&x_i_deriv, &cubic_i, &x_deriv);
+            hess += &weighted_crossprod_dense(&x_deriv, &cubic_i, &x_i_deriv);
+
+            let cubic_j =
+                ((&v_i_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+            hess += &weighted_crossprod_dense(&x_j_deriv, &cubic_j, &x_deriv);
+            hess += &weighted_crossprod_dense(&x_deriv, &cubic_j, &x_j_deriv);
+
+            let cubic_second =
+                ((&v_ij_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+            hess += &self.x_deriv_kron.weighted_gram(&cubic_second);
+
+            let quartic = ((&v_i_deriv * &v_j_deriv) * &inv_h_prime_qu * self.weights.as_ref())
+                .mapv(|v| 6.0 * v);
+            hess += &self.x_deriv_kron.weighted_gram(&quartic);
+            0.5 * (&hess + &hess.t())
+        };
+
+        Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi,
+            hessian_psi_psi_operator: None,
+        }))
+    }
+
+    fn exact_newton_joint_psihessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
+            return Ok(None);
+        }
+        let deriv = &psi_derivs[0][psi_index];
+        let beta = &block_states[0].beta;
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let d_h_prime = self.x_deriv_kron.forward_mul(d_beta_flat);
+        let inv_h_prime_cu = h_prime.mapv(|v| 1.0 / (v * v * v));
+        let inv_h_prime_qu = h_prime.mapv(|v| 1.0 / (v * v * v * v));
+
+        let op = deriv
+            .implicit_operator
+            .as_ref()
+            .and_then(|op| op.as_any().downcast_ref::<TensorKroneckerPsiOperator>())
+            .ok_or_else(|| {
+                "TransformationNormalFamily requires tensor psi derivatives to remain operator-backed"
+                    .to_string()
+            })?;
+        let axis = deriv.implicit_axis;
+
+        let v_deriv = op
+            .forward_mul_deriv(axis, beta)
+            .map_err(|e| format!("tensor psi hessian drift forward_mul_deriv failed: {e}"))?;
+        let d_v_deriv = op.forward_mul_deriv(axis, d_beta_flat).map_err(|e| {
+            format!("tensor psi hessian drift directional forward_mul_deriv failed: {e}")
+        })?;
+
+        let x_deriv = self.x_deriv_kron.to_dense();
+        let x_psi_deriv = op
+            .materialize_first_deriv(axis)
+            .map_err(|e| format!("tensor psi hessian drift materialize_first_deriv failed: {e}"))?;
+
+        let cubic_h = ((&d_h_prime * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+        let mut hess = weighted_crossprod_dense(&x_psi_deriv, &cubic_h, &x_deriv)
+            + &weighted_crossprod_dense(&x_deriv, &cubic_h, &x_psi_deriv);
+
+        let cubic_v = ((&d_v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+        hess += &self.x_deriv_kron.weighted_gram(&cubic_v);
+
+        let quartic =
+            ((&v_deriv * &d_h_prime) * &inv_h_prime_qu * self.weights.as_ref()).mapv(|v| 6.0 * v);
+        hess += &self.x_deriv_kron.weighted_gram(&quartic);
+
+        Ok(Some(0.5 * (&hess + &hess.t())))
     }
 }
 
@@ -1693,6 +1931,238 @@ impl TensorKroneckerPsiOperator {
             }
         }
         Ok(out)
+    }
+
+    fn forward_mul_second_deriv(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        self.lifted_forward_second(&self.response_deriv_basis, axis_d, axis_e, u)
+    }
+
+    fn transpose_mul_second_deriv(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        self.lifted_transpose_second(&self.response_deriv_basis, axis_d, axis_e, v)
+    }
+
+    fn materialize_first_deriv(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(self.materialize_lifted(
+            &self.response_deriv_basis,
+            &self.materialize_cov_first(axis)?,
+        ))
+    }
+
+    fn materialize_second_deriv(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(self.materialize_lifted(
+            &self.response_deriv_basis,
+            &self.materialize_cov_second(axis_d, axis_e)?,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::assert_matrix_derivativefd;
+    use ndarray::array;
+
+    fn toy_covariate_design_and_derivs(
+        psi: &Array1<f64>,
+    ) -> (Array2<f64>, Vec<CustomFamilyBlockPsiDerivative>) {
+        let x0 = array![[1.00, 0.40], [1.10, 0.35], [1.20, 0.45], [0.95, 0.50],];
+        let x_a = array![[0.10, -0.02], [0.08, 0.01], [0.12, -0.01], [0.09, 0.03],];
+        let x_b = array![[-0.04, 0.06], [-0.02, 0.05], [-0.03, 0.04], [-0.01, 0.07],];
+        let x_aa = array![[0.02, 0.00], [0.01, 0.01], [0.02, -0.01], [0.01, 0.02],];
+        let x_ab = array![[0.01, -0.01], [0.00, 0.02], [0.01, 0.01], [0.00, -0.01],];
+        let x_bb = array![[-0.01, 0.02], [-0.02, 0.01], [-0.01, 0.00], [-0.02, 0.02],];
+        let design = &x0
+            + &(x_a.clone() * psi[0])
+            + &(x_b.clone() * psi[1])
+            + &(x_aa.clone() * (0.5 * psi[0] * psi[0]))
+            + &(x_ab.clone() * (psi[0] * psi[1]))
+            + &(x_bb.clone() * (0.5 * psi[1] * psi[1]));
+        let d_a = &x_a + &(x_aa.clone() * psi[0]) + &(x_ab.clone() * psi[1]);
+        let d_b = &x_b + &(x_ab.clone() * psi[0]) + &(x_bb.clone() * psi[1]);
+        let deriv_a = CustomFamilyBlockPsiDerivative::new(
+            None,
+            d_a,
+            Array2::zeros((0, 0)),
+            None,
+            Some(vec![x_aa.clone(), x_ab.clone()]),
+            None,
+            None,
+        );
+        let deriv_b = CustomFamilyBlockPsiDerivative::new(
+            None,
+            d_b,
+            Array2::zeros((0, 0)),
+            None,
+            Some(vec![x_ab, x_bb]),
+            None,
+            None,
+        );
+        (design, vec![deriv_a, deriv_b])
+    }
+
+    fn toy_family_and_derivatives(
+        psi: &Array1<f64>,
+    ) -> (
+        TransformationNormalFamily,
+        Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+        ParameterBlockState,
+        ParameterBlockSpec,
+    ) {
+        let response_val_basis = array![[1.0, -1.0], [1.0, -0.2], [1.0, 0.6], [1.0, 1.3],];
+        let response_deriv_basis = array![[0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0],];
+        let weights = Array1::from_elem(response_val_basis.nrows(), 1.0);
+        let offset = Array1::zeros(response_val_basis.nrows());
+        let (cov_design, cov_derivs) = toy_covariate_design_and_derivs(psi);
+        let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            response_val_basis,
+            response_deriv_basis,
+            vec![],
+            Array1::zeros(0),
+            1,
+            Array2::zeros((0, 0)),
+            &weights,
+            &offset,
+            DesignMatrix::Dense(DenseDesignMatrix::from(cov_design)),
+            vec![],
+            &TransformationNormalConfig {
+                double_penalty: false,
+                ..TransformationNormalConfig::default()
+            },
+            None,
+        )
+        .expect("toy transformation family");
+        let derivative_blocks =
+            vec![build_tensor_psi_derivatives(&family, &cov_derivs).expect("tensor psi derivs")];
+        let beta = array![0.15, -0.05, 0.80, 0.30];
+        let h_prime = family.x_deriv_kron.forward_mul(&beta);
+        assert!(
+            h_prime.iter().all(|v| *v > 0.25),
+            "toy beta must keep h' positive, got {h_prime:?}"
+        );
+        let state = ParameterBlockState {
+            beta,
+            eta: Array1::zeros(h_prime.len()),
+        };
+        let spec = family.block_spec();
+        (family, derivative_blocks, state, spec)
+    }
+
+    #[test]
+    fn transformation_normal_joint_psi_second_order_terms_match_fd() {
+        let psi = array![0.15, -0.10];
+        let h = 1e-6;
+        let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let states = vec![state.clone()];
+        let specs = vec![spec];
+
+        let analytic = family
+            .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 1)
+            .expect("analytic psi second-order terms")
+            .expect("psi second-order terms should be present");
+
+        let eval_first = |psi_eval: &Array1<f64>| {
+            let (f_eval, deriv_eval, state_eval, spec_eval) = toy_family_and_derivatives(psi_eval);
+            let states_eval = vec![state_eval];
+            let specs_eval = vec![spec_eval];
+            f_eval
+                .exact_newton_joint_psi_terms(&states_eval, &specs_eval, &deriv_eval, 0)
+                .expect("first-order psi terms")
+                .expect("first-order terms should be present")
+        };
+
+        let mut psi_plus = psi.clone();
+        psi_plus[1] += h;
+        let plus = eval_first(&psi_plus);
+        let mut psi_minus = psi.clone();
+        psi_minus[1] -= h;
+        let minus = eval_first(&psi_minus);
+
+        let objective_fd = (plus.objective_psi - minus.objective_psi) / (2.0 * h);
+        assert!(
+            (analytic.objective_psi_psi - objective_fd).abs() < 1e-5,
+            "objective psi second-order mismatch: analytic={}, fd={objective_fd}",
+            analytic.objective_psi_psi
+        );
+
+        let score_fd = (&plus.score_psi - &minus.score_psi) / (2.0 * h);
+        for idx in 0..score_fd.len() {
+            assert!(
+                (analytic.score_psi_psi[idx] - score_fd[idx]).abs() < 1e-5,
+                "score psi second-order mismatch at {idx}: analytic={}, fd={}",
+                analytic.score_psi_psi[idx],
+                score_fd[idx]
+            );
+        }
+
+        let hess_fd = (&plus.hessian_psi - &minus.hessian_psi) / (2.0 * h);
+        assert_matrix_derivativefd(
+            &hess_fd,
+            &analytic.hessian_psi_psi,
+            2e-4,
+            "transformation normal psi second-order Hessian",
+        );
+    }
+
+    #[test]
+    fn transformation_normal_joint_psihessian_directional_derivative_matches_fd() {
+        let psi = array![0.15, -0.10];
+        let h = 1e-6;
+        let direction = array![0.02, -0.01, 0.03, 0.015];
+        let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let specs = vec![spec];
+
+        let analytic = family
+            .exact_newton_joint_psihessian_directional_derivative(
+                std::slice::from_ref(&state),
+                &specs,
+                &derivative_blocks,
+                0,
+                &direction,
+            )
+            .expect("analytic psi hessian directional derivative")
+            .expect("psi hessian directional derivative should be present");
+
+        let eval_hess = |beta: &Array1<f64>| {
+            let mut shifted_state = state.clone();
+            shifted_state.beta = beta.clone();
+            family
+                .exact_newton_joint_psi_terms(
+                    std::slice::from_ref(&shifted_state),
+                    &specs,
+                    &derivative_blocks,
+                    0,
+                )
+                .expect("first-order psi terms at shifted beta")
+                .expect("shifted first-order terms should be present")
+                .hessian_psi
+        };
+
+        let beta_plus = &state.beta + &(direction.clone() * h);
+        let beta_minus = &state.beta - &(direction * h);
+        let fd = (eval_hess(&beta_plus) - eval_hess(&beta_minus)) / (2.0 * h);
+        assert_matrix_derivativefd(
+            &fd,
+            &analytic,
+            2e-4,
+            "transformation normal psi hessian directional derivative",
+        );
     }
 }
 

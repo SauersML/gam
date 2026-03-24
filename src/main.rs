@@ -570,7 +570,10 @@ fn blockwise_options_from_fit_args(
     _: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
-    options.compute_covariance = false;
+    // User-facing nonlinear blockwise fits should persist explicit covariance so
+    // posterior-mean and uncertainty prediction do not need to reconstruct it
+    // from the saved Hessian on every load.
+    options.compute_covariance = true;
     Ok(options)
 }
 
@@ -5680,31 +5683,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         progress.advance_workflow(3);
         if let Some(out) = args.out {
             progress.set_stage("fit", "writing survival model");
-            let mut lambdas = fit.fit.fit.lambdas_time().to_vec();
-            lambdas.extend(fit.fit.fit.lambdas_threshold().iter().copied());
-            lambdas.extend(fit.fit.fit.lambdas_log_sigma().iter().copied());
-            if let Some(lw) = fit.fit.fit.lambdas_linkwiggle() {
-                lambdas.extend(lw.iter().copied());
-            }
-            let beta_time = fit.fit.fit.beta_time();
-            let p_time = beta_time.len();
-            // The joint covariance covers all blocks (time + threshold + log_sigma + linkwiggle).
-            // Extract the time-block submatrix (top-left p_time × p_time)
-            // so that the saved fit result dimensions are consistent.
-            let covariance_time = fit
-                .fit
-                .fit
-                .covariance_conditional
-                .as_ref()
-                .map(|cov| cov.slice(ndarray::s![..p_time, ..p_time]).to_owned());
-            let mut fit_result = core_saved_fit_result(
-                beta_time,
-                Array1::from_vec(lambdas.clone()),
-                1.0,
-                covariance_time.clone(),
-                covariance_time,
-                SavedFitSummary::from_survival_location_scale_fit(&fit.fit.fit)?,
-            );
+            let mut fit_result = fit.fit.fit.clone();
             apply_inverse_link_state_to_fit_result(&mut fit_result, &fitted_inverse_link);
             let mut payload = FittedModelPayload::new(
                 MODEL_VERSION,
@@ -5919,7 +5898,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             opts
         };
         let options = gam::families::custom_family::BlockwiseFitOptions {
-            compute_covariance: false,
+            compute_covariance: true,
             ..Default::default()
         };
         let buildspec = |prepared: &PreparedSurvivalTimeStack| SurvivalMarginalSlopeTermSpec {
@@ -9547,29 +9526,6 @@ impl SavedFitSummary {
         self.validated()
     }
 
-    fn from_survival_location_scale_fit(
-        fit: &gam::estimate::UnifiedFitResult,
-    ) -> Result<Self, String> {
-        Self {
-            likelihood_family: fit.likelihood_family,
-            likelihood_scale: fit.likelihood_scale,
-            log_likelihood_normalization: fit.log_likelihood_normalization,
-            log_likelihood: fit.log_likelihood,
-            iterations: fit.outer_iterations,
-            finalgrad_norm: fit.outer_gradient_norm,
-            pirls_status: if fit.outer_converged {
-                gam::pirls::PirlsStatus::Converged
-            } else {
-                gam::pirls::PirlsStatus::StalledAtValidMinimum
-            },
-            deviance: fit.deviance,
-            stable_penalty_term: fit.stable_penalty_term,
-            max_abs_eta: 0.0,
-            reml_score: fit.reml_score,
-        }
-        .validated()
-    }
-
     fn from_survivalworking_summary(
         summary: &gam::pirls::WorkingModelPirlsResult,
         state: &gam::pirls::WorkingState,
@@ -11573,10 +11529,10 @@ mod tests {
         apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_saved_multiblock_fit_result,
-        compute_probit_q0_from_eta, core_saved_fit_result, effectivelinkwiggle_formulaspec,
-        evaluate_survival_baseline, family_to_string, linkname, load_dataset_projected,
-        parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
-        parse_survival_baseline_config, parse_survival_inverse_link,
+        compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
+        effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
+        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
+        parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
         required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
         run_predict_binomial_location_scale, saved_linkwiggle_derivative_q0,
@@ -11590,6 +11546,7 @@ mod tests {
         BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
         MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
+    use gam::estimate::{FitGeometry, FittedBlock, FittedLinkState, UnifiedFitResultParts};
     use gam::gamlss::buildwiggle_block_input_from_knots;
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
@@ -11960,6 +11917,14 @@ mod tests {
         .expect("write training csv");
     }
 
+    fn write_bernoulli_marginal_slope_train_csv(path: &std::path::Path) {
+        fs::write(
+            path,
+            "x,z,y\n-1.4,-1.2816,0\n-1.1,-0.8416,0\n-0.9,-0.5244,0\n-0.6,-0.2533,0\n-0.3,0.0000,1\n0.0,0.2533,0\n0.2,0.5244,1\n0.5,0.8416,1\n0.8,1.2816,1\n1.0,-0.5244,0\n1.2,0.5244,1\n1.4,0.8416,1\n",
+        )
+        .expect("write marginal-slope training csv");
+    }
+
     fn location_scale_fit_args(
         data: PathBuf,
         out: PathBuf,
@@ -12144,6 +12109,7 @@ mod tests {
         let td = tempdir().expect("tempdir");
         let train_path = td.path().join("survival_train.csv");
         let model_path = td.path().join("survival.model.json");
+        let pred_path = td.path().join("survival.pred.csv");
         fs::write(
             &train_path,
             "entry,exit,event\n\
@@ -12157,7 +12123,7 @@ mod tests {
         .expect("write survival training csv");
 
         run_fit(FitArgs {
-            data: train_path,
+            data: train_path.clone(),
             formula_positional: "Surv(entry, exit, event) ~ 1".to_string(),
             predict_noise: Some("1".to_string()),
             logslope_formula: None,
@@ -12201,6 +12167,51 @@ mod tests {
         assert_eq!(saved.survival_likelihood.as_deref(), Some("location-scale"));
         assert!(saved.survival_beta_log_sigma.is_some());
         assert!(saved.resolved_termspec_noise.is_some());
+        let fit_result = saved.fit_result.as_ref().expect("saved fit_result");
+        let covariance = fit_result
+            .beta_covariance()
+            .or(fit_result.beta_covariance_corrected())
+            .expect("saved survival fit covariance");
+        let expected_p = saved
+            .survival_beta_time
+            .as_ref()
+            .expect("saved beta_time")
+            .len()
+            + saved
+                .survival_beta_threshold
+                .as_ref()
+                .expect("saved beta_threshold")
+                .len()
+            + saved
+                .survival_beta_log_sigma
+                .as_ref()
+                .expect("saved beta_log_sigma")
+                .len()
+            + saved.beta_link_wiggle.as_ref().map_or(0, Vec::len);
+        assert_eq!(covariance.nrows(), expected_p);
+        assert_eq!(covariance.ncols(), expected_p);
+
+        run_predict(PredictArgs {
+            model: model_path,
+            new_data: train_path,
+            out: pred_path.clone(),
+            offset_column: None,
+            noise_offset_column: None,
+            uncertainty: false,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::PosteriorMean,
+        })
+        .expect("saved survival posterior-mean predict should succeed");
+
+        let pred_text = fs::read_to_string(&pred_path).expect("read survival prediction csv");
+        let header = pred_text.lines().next().unwrap_or("");
+        for required in ["mean", "effective_se", "mean_lower", "mean_upper"] {
+            assert!(
+                header.contains(required),
+                "posterior-mean survival prediction output missing {required} column: {header}"
+            );
+        }
     }
 
     #[test]
@@ -12233,6 +12244,171 @@ mod tests {
             }
             other => panic!("expected location-scale family state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds() {
+        let td = tempdir().expect("tempdir");
+        let train_path = td.path().join("train.csv");
+        let model_path = td.path().join("model.json");
+        let pred_path = td.path().join("pred.csv");
+        write_bernoulli_marginal_slope_train_csv(&train_path);
+
+        run_fit(FitArgs {
+            data: train_path.clone(),
+            formula_positional: "y ~ x".to_string(),
+            predict_noise: None,
+            logslope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+            disable_score_warp: false,
+            disable_link_dev: false,
+            transformation_normal: false,
+            firth: false,
+            survival_likelihood: "transformation".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            adaptive_regularization: false,
+            scale_dimensions: false,
+            pilot_subsample_threshold: 0,
+            out: Some(model_path.clone()),
+        })
+        .expect("bernoulli marginal-slope fit should succeed");
+
+        let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
+        let fit_result = saved
+            .fit_result
+            .as_ref()
+            .expect("fit_result should be saved");
+        assert!(
+            fit_result.beta_covariance().is_some()
+                || fit_result.beta_covariance_corrected().is_some(),
+            "CLI marginal-slope fit should save covariance for default posterior-mean prediction",
+        );
+
+        run_predict(PredictArgs {
+            model: model_path,
+            new_data: train_path,
+            out: pred_path.clone(),
+            offset_column: None,
+            noise_offset_column: None,
+            uncertainty: false,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::PosteriorMean,
+        })
+        .expect("default posterior-mean marginal-slope predict should succeed");
+
+        let pred_text = fs::read_to_string(&pred_path).expect("read prediction csv");
+        let header = pred_text.lines().next().unwrap_or("");
+        for required in ["mean", "effective_se", "mean_lower", "mean_upper"] {
+            assert!(
+                header.contains(required),
+                "posterior-mean marginal-slope prediction output missing {required} column: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable() {
+        let td = tempdir().expect("tempdir");
+        let model_path = td.path().join("model.json");
+        let fit_result = gam::estimate::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: array![0.25],
+                role: BlockRole::Mean,
+                edf: 0.0,
+                lambdas: Array1::zeros(0),
+            }],
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            likelihood_family: Some(LikelihoodFamily::BinomialLogit),
+            likelihood_scale: LikelihoodScaleMetadata::Unspecified,
+            log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
+            log_likelihood: -1.0,
+            deviance: 2.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 1.0,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: Some(FitGeometry {
+                penalized_hessian: array![[2.0]],
+                working_weights: Array1::zeros(0),
+                working_response: Array1::zeros(0),
+            }),
+            block_states: Vec::new(),
+            pirls_status: gam::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: Default::default(),
+            inner_cycles: 0,
+        })
+        .expect("construct hessian-only fit result");
+
+        let mut payload = FittedModelPayload::new(
+            MODEL_VERSION,
+            "y ~ x".to_string(),
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: LikelihoodFamily::BinomialLogit,
+                link: Some(LinkFunction::Logit),
+                latent_cloglog_state: None,
+                mixture_state: None,
+                sas_state: None,
+            },
+            "binomial-logit".to_string(),
+        );
+        payload.fit_result = Some(fit_result.clone());
+        payload.unified = Some(fit_result);
+        payload.data_schema = Some(DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                },
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Binary,
+                },
+            ],
+        });
+        payload.training_headers = Some(vec!["x".to_string(), "y".to_string()]);
+        payload.resolved_termspec = Some(empty_termspec());
+
+        let model = SavedModel::from_payload(payload);
+        model
+            .save_to_path(&model_path)
+            .expect("hessian-only nonlinear model should save");
+        let loaded = SavedModel::load_from_path(&model_path).expect("reload hessian-only model");
+        let covariance = covariance_from_model(&loaded, CovarianceModeArg::Conditional)
+            .expect("recover covariance from saved penalized Hessian");
+        assert_eq!(covariance.dim(), (1, 1));
+        assert!((covariance[[0, 0]] - 0.5).abs() < 1e-12);
     }
 
     #[test]
@@ -15922,7 +16098,7 @@ mod tests {
             .expect_err("explicit response should fail");
         assert_eq!(
             err,
-            "--predict-noise accepts only RHS terms; remove the response and pass terms like 'smooth(x)' or '1'"
+            "--predict-noise expects only the terms after '~', not a full 'response ~ terms' formula; use --predict-noise 's(x)' instead of --predict-noise 'y ~ s(x)' (or pass '1' for an intercept-only noise model)"
         );
     }
 
@@ -15936,7 +16112,7 @@ mod tests {
         .expect_err("explicit survival response should fail");
         assert_eq!(
             err,
-            "--predict-noise accepts only RHS terms; remove the response and pass terms like 'smooth(x)' or '1'"
+            "--predict-noise expects only the terms after '~', not a full 'response ~ terms' formula; use --predict-noise 's(x)' instead of --predict-noise 'y ~ s(x)' (or pass '1' for an intercept-only noise model)"
         );
     }
 

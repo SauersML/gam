@@ -1793,19 +1793,22 @@ impl FittedModel {
             );
         }
 
-        // Structural invariant: nonlinear models MUST have beta covariance
-        // stored so that posterior-mean prediction (the default) works.
-        // Gaussian identity is the only linear family exempt from this.
+        // Structural invariant: nonlinear saved models must retain a usable
+        // posterior-mean backend. We prefer persisted covariance, but a saved
+        // penalized Hessian is also sufficient because prediction can
+        // reconstruct covariance on demand.
         let needs_covariance = !matches!(
             self.family_state.likelihood(),
             LikelihoodFamily::GaussianIdentity
         );
         if needs_covariance {
             if let Some(fit) = self.fit_result.as_ref() {
-                if fit.beta_covariance().is_none() {
-                    return Err("nonlinear model is missing beta_covariance in fit_result; \
-                         posterior-mean prediction requires covariance at save time"
-                        .to_string());
+                if fit.beta_covariance().is_none() && fit.penalized_hessian().is_none() {
+                    return Err(
+                        "nonlinear model is missing both beta_covariance and a saved penalized Hessian in fit_result; \
+                         posterior-mean prediction requires one of them at save time"
+                            .to_string(),
+                    );
                 }
             }
         }
