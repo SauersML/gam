@@ -573,14 +573,14 @@ pub struct TimeBlockInput {
     pub initial_beta: Option<Array1<f64>>,
 }
 
-pub(crate) fn time_derivative_lower_bound_constraints(
+pub(crate) fn structural_time_coefficient_constraints(
     design_derivative_exit: &Array2<f64>,
     derivative_offset_exit: &Array1<f64>,
-    lower_bound: f64,
+    derivative_guard: f64,
 ) -> Result<Option<LinearInequalityConstraints>, String> {
     if design_derivative_exit.nrows() != derivative_offset_exit.len() {
         return Err(format!(
-            "time derivative constraints require matching rows/offsets: rows={}, offsets={}",
+            "structural time constraints require matching rows/offsets: rows={}, offsets={}",
             design_derivative_exit.nrows(),
             derivative_offset_exit.len()
         ));
@@ -588,15 +588,43 @@ pub(crate) fn time_derivative_lower_bound_constraints(
     if design_derivative_exit.ncols() == 0 {
         return Ok(None);
     }
-    if !lower_bound.is_finite() {
+    if !derivative_guard.is_finite() || derivative_guard <= 0.0 {
         return Err(format!(
-            "time derivative lower bound must be finite, got {lower_bound}"
+            "structural time derivative guard must be finite and > 0, got {derivative_guard}"
         ));
     }
-    Ok(Some(LinearInequalityConstraints {
-        a: design_derivative_exit.clone(),
-        b: derivative_offset_exit.mapv(|offset| lower_bound - offset),
-    }))
+
+    const DERIVATIVE_NONNEG_TOL: f64 = 1e-12;
+    for i in 0..design_derivative_exit.nrows() {
+        let offset = derivative_offset_exit[i];
+        if !offset.is_finite() {
+            return Err(format!(
+                "structural time derivative offset must be finite at row {i}, found {offset}"
+            ));
+        }
+        if offset + DERIVATIVE_NONNEG_TOL < derivative_guard {
+            return Err(format!(
+                "structural time derivative offset must encode the derivative guard at row {i}: offset={offset:.3e} < guard={derivative_guard:.3e}"
+            ));
+        }
+        for j in 0..design_derivative_exit.ncols() {
+            let value = design_derivative_exit[[i, j]];
+            if !value.is_finite() {
+                return Err(format!(
+                    "structural time derivative design must be finite at row {i}, column {j}"
+                ));
+            }
+            if value < -DERIVATIVE_NONNEG_TOL {
+                return Err(format!(
+                    "structural time derivative design must be non-negative at row {i}, column {j}; found {value:.3e}"
+                ));
+            }
+        }
+    }
+
+    Ok(monotone_wiggle_nonnegative_constraints(
+        design_derivative_exit.ncols(),
+    ))
 }
 
 #[derive(Clone)]
@@ -1082,6 +1110,7 @@ struct SurvivalLocationScaleFamily {
     time_wiggle_knots: Option<Array1<f64>>,
     time_wiggle_degree: Option<usize>,
     time_wiggle_ncols: usize,
+    time_coefficient_lower_bounds: Option<Array1<f64>>,
     time_linear_constraints: Option<LinearInequalityConstraints>,
     /// Exit design for threshold block (always present; used as main design).
     x_threshold: DesignMatrix,
@@ -1365,6 +1394,38 @@ impl SurvivalLocationScaleFamily {
         beta: &Array1<f64>,
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
+        if let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref() {
+            if beta.len() != lower_bounds.len() || delta.len() != lower_bounds.len() {
+                return Err(format!(
+                    "survival location-scale time-step lower-bound dimension mismatch: beta={}, delta={}, bounds={}",
+                    beta.len(),
+                    delta.len(),
+                    lower_bounds.len()
+                ));
+            }
+            let mut alpha = 1.0f64;
+            for j in 0..lower_bounds.len() {
+                let lower_bound = lower_bounds[j];
+                if !lower_bound.is_finite() {
+                    continue;
+                }
+                let slack = beta[j] - lower_bound;
+                if slack < -1e-10 {
+                    return Err(format!(
+                        "survival location-scale current time coefficient violates structural lower bound at coefficient {j}: slack={slack:.3e}"
+                    ));
+                }
+                let drift = delta[j];
+                if drift < 0.0 {
+                    alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
+                }
+            }
+            return if alpha >= 1.0 {
+                Ok(Some(1.0))
+            } else {
+                Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
+            };
+        }
         let Some(constraints) = self.time_linear_constraints.as_ref() else {
             return Ok(None);
         };
@@ -3367,7 +3428,7 @@ fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Re
             spec.derivative_guard
         ));
     }
-    validate_time_block(n, &spec.time_block)?;
+    validate_time_block(n, &spec.time_block, spec.derivative_guard)?;
     validate_cov_block_kind("threshold_block", n, &spec.threshold_block)?;
     validate_cov_block_kind("log_sigma_block", n, &spec.log_sigma_block)?;
     if let Some(w) = spec.timewiggle_block.as_ref() {
@@ -3656,7 +3717,7 @@ fn prepare_survival_location_scale_model(
         time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
         time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
         time_wiggle_ncols: protected_timewiggle_cols,
-
+        time_coefficient_lower_bounds: time_prepared.coefficient_lower_bounds.clone(),
         time_linear_constraints: time_prepared.linear_constraints.clone(),
         x_threshold: threshold_prep.design_exit.clone(),
         x_threshold_entry: threshold_prep.design_entry.clone(),
@@ -3846,7 +3907,7 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), String
     Ok(())
 }
 
-fn validate_time_block(n: usize, b: &TimeBlockInput) -> Result<(), String> {
+fn validate_time_block(n: usize, b: &TimeBlockInput, derivative_guard: f64) -> Result<(), String> {
     if b.design_entry.nrows() != n
         || b.design_exit.nrows() != n
         || b.design_derivative_exit.nrows() != n
@@ -3866,6 +3927,11 @@ fn validate_time_block(n: usize, b: &TimeBlockInput) -> Result<(), String> {
                 .to_string(),
         );
     }
+    structural_time_coefficient_lower_bounds(
+        &b.design_derivative_exit.to_dense(),
+        &b.derivative_offset_exit,
+        derivative_guard,
+    )?;
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
@@ -3907,19 +3973,103 @@ fn stack_offsets(parts: &[&Array1<f64>]) -> Array1<f64> {
 }
 
 #[derive(Clone)]
+#[derive(Debug)]
 struct TimeIdentifiabilityTransform {
     z: Array2<f64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct TimeBlockPrepared {
     design_entry: Array2<f64>,
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
+    coefficient_lower_bounds: Option<Array1<f64>>,
     linear_constraints: Option<LinearInequalityConstraints>,
     penalties: Vec<Array2<f64>>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
+}
+
+fn lower_bound_constraints(lower_bounds: &Array1<f64>) -> Option<LinearInequalityConstraints> {
+    let active_rows: Vec<usize> = (0..lower_bounds.len())
+        .filter(|&i| lower_bounds[i].is_finite())
+        .collect();
+    if active_rows.is_empty() {
+        return None;
+    }
+    let p = lower_bounds.len();
+    let mut a = Array2::<f64>::zeros((active_rows.len(), p));
+    let mut b = Array1::<f64>::zeros(active_rows.len());
+    for (row, &idx) in active_rows.iter().enumerate() {
+        a[[row, idx]] = 1.0;
+        b[row] = lower_bounds[idx];
+    }
+    Some(LinearInequalityConstraints { a, b })
+}
+
+fn structural_time_coefficient_lower_bounds(
+    design_derivative_exit: &Array2<f64>,
+    derivative_offset_exit: &Array1<f64>,
+    lower_bound: f64,
+) -> Result<Option<Array1<f64>>, String> {
+    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
+        return Err(format!(
+            "structural time coefficient bounds require matching rows/offsets: rows={}, offsets={}",
+            design_derivative_exit.nrows(),
+            derivative_offset_exit.len()
+        ));
+    }
+    if design_derivative_exit.ncols() == 0 {
+        return Ok(None);
+    }
+    if !lower_bound.is_finite() || lower_bound <= 0.0 {
+        return Err(format!(
+            "structural time coefficient lower bound must be finite and > 0, got {lower_bound}"
+        ));
+    }
+
+    const DERIVATIVE_TOL: f64 = 1e-12;
+    const FEASIBILITY_TOL: f64 = 1e-12;
+
+    let p = design_derivative_exit.ncols();
+    let mut lower_bounds = Array1::from_elem(p, f64::NEG_INFINITY);
+    let mut has_structural_support = false;
+    for (row, &offset) in derivative_offset_exit.iter().enumerate() {
+        if !offset.is_finite() {
+            return Err(format!(
+                "structural time coefficient bounds require finite derivative offsets; found offset[{row}]={offset}"
+            ));
+        }
+        if lower_bound - offset > FEASIBILITY_TOL {
+            return Ok(None);
+        }
+    }
+    for col in 0..p {
+        let mut has_positive_support = false;
+        for row in 0..design_derivative_exit.nrows() {
+            let value = design_derivative_exit[[row, col]];
+            if !value.is_finite() {
+                return Err(format!(
+                    "structural time coefficient bounds require finite derivative design entries; found row {row}, column {col}"
+                ));
+            }
+            if value < -DERIVATIVE_TOL {
+                return Ok(None);
+            }
+            if value > DERIVATIVE_TOL {
+                has_positive_support = true;
+            }
+        }
+        if has_positive_support {
+            lower_bounds[col] = 0.0;
+            has_structural_support = true;
+        }
+    }
+
+    if !has_structural_support {
+        return Ok(None);
+    }
+    Ok(Some(lower_bounds))
 }
 
 pub(crate) fn project_onto_linear_constraints(
@@ -3976,11 +4126,14 @@ fn prepare_identified_time_block(
     let design_exit = input.design_exit.to_dense();
     let design_derivative_exit = input.design_derivative_exit.to_dense();
     let penalties = input.penalties.clone();
-    let linear_constraints = time_derivative_lower_bound_constraints(
+    let coefficient_lower_bounds = structural_time_coefficient_lower_bounds(
         &design_derivative_exit,
         &input.derivative_offset_exit,
         derivative_guard,
     )?;
+    let linear_constraints = coefficient_lower_bounds
+        .as_ref()
+        .and_then(lower_bound_constraints);
     let initial_beta = linear_constraints.as_ref().map(|constraints| {
         project_onto_linear_constraints(p, constraints, input.initial_beta.as_ref())
     });
@@ -3989,6 +4142,7 @@ fn prepare_identified_time_block(
         design_entry,
         design_exit,
         design_derivative_exit,
+        coefficient_lower_bounds,
         linear_constraints,
         penalties,
         initial_beta,
@@ -8731,7 +8885,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if block_idx != Self::BLOCK_TIME {
             return Ok(None);
         }
-        Ok(self.time_linear_constraints.clone())
+        Ok(self
+            .time_coefficient_lower_bounds
+            .as_ref()
+            .and_then(lower_bound_constraints)
+            .or_else(|| self.time_linear_constraints.clone()))
     }
 
     fn max_feasible_step_size(
@@ -9318,12 +9476,13 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_linear_constraints: time_derivative_lower_bound_constraints(
+            time_coefficient_lower_bounds: Some(array![0.0]),
+            time_linear_constraints: structural_time_coefficient_constraints(
                 &array![[1.0], [1.0], [1.0]],
-                &Array1::zeros(3),
+                &Array1::from_elem(3, 1e-8),
                 1e-8,
             )
-            .expect("time derivative constraints"),
+            .expect("time coefficient constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
                 [1.0],
                 [0.4],
@@ -9397,12 +9556,7 @@ mod tests {
             .expect("time step should be bounded");
         assert!(alpha > 0.0 && alpha < 1.0);
         let feasible = states[0].beta[0] + alpha * -2.0;
-        let constraints = family
-            .time_linear_constraints
-            .as_ref()
-            .expect("constraints");
-        let slack = constraints.a[[0, 0]] * feasible - constraints.b[0];
-        assert!(slack >= 0.0);
+        assert!(feasible >= 0.0);
     }
 
     #[test]
@@ -9719,7 +9873,7 @@ mod tests {
             design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
-            derivative_offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::from_elem(3, 1e-6),
             structural_monotonicity: true,
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
@@ -9744,7 +9898,7 @@ mod tests {
             design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
-            derivative_offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::from_elem(3, 1e-6),
             structural_monotonicity: true,
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
@@ -9780,7 +9934,45 @@ mod tests {
     }
 
     #[test]
-    fn identified_time_block_uses_derivative_lower_bound_constraints() {
+    fn identified_time_block_uses_structural_coefficient_constraints() {
+        let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
+        let time_block = TimeBlockInput {
+            design_entry: DesignMatrix::from(array![
+                [1.0, 0.0, 0.2],
+                [1.0, 1.0, 0.5],
+                [1.0, 2.0, 1.0]
+            ]),
+            design_exit: DesignMatrix::from(array![
+                [1.0, 0.5, 0.3],
+                [1.0, 1.5, 0.8],
+                [1.0, 2.5, 1.4]
+            ]),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::from_elem(3, 1e-6),
+            structural_monotonicity: true,
+            penalties: vec![Array2::eye(3)],
+            nullspace_dims: vec![],
+            initial_log_lambdas: None,
+            initial_beta: Some(array![-0.5, 0.2, -1.5]),
+        };
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
+        assert_eq!(
+            prepared.coefficient_lower_bounds,
+            Some(array![f64::NEG_INFINITY, 0.0, 0.0])
+        );
+        let constraints = prepared
+            .linear_constraints
+            .expect("time coefficient constraints");
+        assert_eq!(constraints.a, array![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        assert_eq!(constraints.b, Array1::<f64>::zeros(2));
+        assert_eq!(prepared.initial_beta, Some(array![-0.5, 0.2, 0.0]));
+    }
+
+    #[test]
+    fn identified_time_block_rejects_offsets_below_derivative_guard() {
         let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
             design_entry: DesignMatrix::from(array![
@@ -9803,13 +9995,14 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
-        let constraints = prepared
-            .linear_constraints
-            .expect("time derivative constraints");
-        assert_eq!(constraints.a, design_derivative_exit);
-        assert_eq!(constraints.b, Array1::<f64>::from_elem(3, 1e-6));
+        let err = match prepare_identified_time_block(&time_block, 1e-6) {
+            Ok(_) => panic!("offsets below the guard must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("derivative offset must encode the derivative guard"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -9823,7 +10016,7 @@ mod tests {
             design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
             offset_entry: Array1::zeros(3),
             offset_exit: Array1::zeros(3),
-            derivative_offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::from_elem(3, 1e-6),
             structural_monotonicity: true,
             penalties: vec![Array2::eye(3)],
             nullspace_dims: vec![],
@@ -11537,11 +11730,10 @@ mod tests {
         }
     }
 
-    /// Full-path reproducer: runs fit_survival_location_scale with zero
-    /// derivative offsets, mimicking the heart_failure_survival scenario
-    /// where the linear baseline produces d_raw=0 at initialization.
+    /// Full-path structural monotonicity regression for the
+    /// heart_failure_survival workflow setup.
     #[test]
-    fn heart_failure_full_fit_zero_deriv_offset() {
+    fn heart_failure_full_fit_structural_time_coefficients() {
         // 20 rows with realistic-ish I-spline-like structure.
         let n = 20;
         let p_time = 8; // 8 time basis columns
@@ -11592,8 +11784,10 @@ mod tests {
             }
         }
 
-        // Zero derivative offsets (linear baseline → (0,0)).
-        let derivative_offset_exit = Array1::<f64>::zeros(n);
+        // The workflow carries the derivative floor in the offsets, so the
+        // structural time coefficients only need to stay non-negative.
+        let derivative_offset_exit =
+            Array1::from_elem(n, DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD);
         let offset_entry = Array1::<f64>::zeros(n);
         let offset_exit = Array1::<f64>::zeros(n);
 
@@ -11668,13 +11862,10 @@ mod tests {
         }
     }
 
-    /// Reproducer for heart_failure_survival NaN crash.
-    ///
-    /// Mimics the real scenario: zero derivative offsets (linear baseline),
-    /// zero initial beta, probit link (Gaussian residual distribution),
-    /// multiple event/non-event rows.
+    /// Small structural-monotonicity regression for the
+    /// heart_failure_survival workflow setup.
     #[test]
-    fn heart_failure_zero_offset_nan_small() {
+    fn heart_failure_structural_time_small() {
         // 6 rows: 3 events, 3 non-events.  Single time column for simplicity.
         let n = 6;
         // I-spline-like designs: entry is all zero (left truncation at t=0),
@@ -11696,8 +11887,7 @@ mod tests {
             [0.2, 0.3],
             [0.1, 0.2],
         ];
-        // Zero derivative offsets (linear baseline)
-        let offset_deriv = Array1::<f64>::zeros(n);
+        let offset_deriv = Array1::from_elem(n, DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD);
 
         let family = SurvivalLocationScaleFamily {
             n,
@@ -11711,12 +11901,13 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_linear_constraints: time_derivative_lower_bound_constraints(
+            time_coefficient_lower_bounds: Some(array![0.0, 0.0]),
+            time_linear_constraints: structural_time_coefficient_constraints(
                 &x_deriv,
                 &offset_deriv,
                 DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
             )
-            .expect("time derivative constraints"),
+            .expect("time coefficient constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),
@@ -11860,12 +12051,13 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_linear_constraints: time_derivative_lower_bound_constraints(
+            time_coefficient_lower_bounds: Some(array![0.0]),
+            time_linear_constraints: structural_time_coefficient_constraints(
                 &Array2::ones((n, 1)),
-                &Array1::zeros(n),
+                &Array1::from_elem(n, DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD),
                 DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
             )
-            .expect("time derivative constraints"),
+            .expect("time coefficient constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),

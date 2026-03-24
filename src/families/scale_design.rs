@@ -9,6 +9,13 @@ use std::ops::Range;
 
 const COLUMN_TOL: f64 = 1e-12;
 const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+// Explicit replay of the sigma orthogonalization on new rows is much more
+// sensitive than fitting on the training rows: near-null QR directions can
+// yield enormous projection coefficients that reconstruct the training design
+// but catastrophically amplify modest prediction rows. Use a stronger cutoff
+// than the generic RRQR epsilon rule and add a last-resort coefficient cap.
+const SCALE_PROJECTION_REPLAY_RCOND_FLOOR: f64 = 1e-8;
+const SCALE_PROJECTION_MAX_ABS_COEF: f64 = 1e6;
 
 #[derive(Clone, Debug)]
 pub struct ScaleDeviationTransform {
@@ -207,39 +214,38 @@ fn build_weighted_primary_design(
 }
 
 fn scale_projection_rank_tolerance(leading_diag: f64, major_dim: usize) -> f64 {
-    default_rrqr_rank_alpha() * f64::EPSILON * (major_dim.max(1) as f64) * leading_diag.max(1.0)
+    let leading_diag = leading_diag.max(1.0);
+    let generic =
+        default_rrqr_rank_alpha() * f64::EPSILON * (major_dim.max(1) as f64) * leading_diag;
+    let replay_safe = SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading_diag;
+    generic.max(replay_safe)
 }
 
-fn solve_scale_projection(
+fn scale_projection_effective_rank(r_diag: &[f64], leading_diag: f64, major_dim: usize) -> usize {
+    let tol = scale_projection_rank_tolerance(leading_diag, major_dim);
+    r_diag.iter().take_while(|&&d| d.abs() > tol).count()
+}
+
+fn solve_scale_projection_for_rank(
     primary_design: ScaleDesignMatrixRef<'_>,
     noise_design: ScaleDesignMatrixRef<'_>,
-    weights: &Array1<f64>,
+    sqrtw: &Array1<f64>,
+    qr: &faer::linalg::solvers::ColPivQr<f64>,
+    r_diag: &[f64],
+    perm_fwd: &[usize],
+    rank: usize,
     first_active: usize,
     chunk_rows: usize,
-) -> Result<Array2<f64>, String> {
+) -> Array2<f64> {
     let n = primary_design.nrows();
     let p_primary = primary_design.ncols();
     let p_noise = noise_design.ncols();
     let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
     let active_cols = p_noise.saturating_sub(first_active);
-
-    if active_cols == 0 || p_primary == 0 {
-        return Ok(projection_coef);
+    if active_cols == 0 || p_primary == 0 || rank == 0 {
+        return projection_coef;
     }
-
-    let sqrtw = weights.mapv(f64::sqrt);
-    let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows);
-    let wx_faer = FaerArrayView::new(&wx);
-    // Keep one explicit RRQR factorization and one explicit rank policy for all
-    // projection coefficients so dense and operator-backed paths reuse the same solve.
-    let qr = wx_faer.as_ref().col_piv_qr();
     let r = qr.thin_R();
-    let diag_len = r.nrows().min(r.ncols());
-    let leading_diag = if diag_len > 0 { r[(0, 0)].abs() } else { 0.0 };
-    let tol = scale_projection_rank_tolerance(leading_diag, n.max(p_primary));
-    let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
-    let (perm_fwd, _) = qr.P().arrays();
-    let perm_fwd: Vec<usize> = perm_fwd.iter().map(|idx| idx.unbound()).collect();
     let chunk_cols = (SCALE_DESIGN_TARGET_CHUNK_BYTES / (n.max(1) * std::mem::size_of::<f64>()))
         .max(1)
         .min(active_cols);
@@ -275,14 +281,17 @@ fn solve_scale_projection(
             )),
         );
 
-        let mut pivoted_solution = Array2::<f64>::zeros((p_primary, width));
+        let mut pivoted_solution = Array2::<f64>::zeros((rank, width));
         for col in 0..width {
             for i in (0..rank).rev() {
                 let mut accum = rhs[[i, col]];
                 for k in (i + 1)..rank {
                     accum -= r[(i, k)] * pivoted_solution[[k, col]];
                 }
-                pivoted_solution[[i, col]] = accum / r[(i, i)];
+                let rii = r_diag[i];
+                if rii != 0.0 {
+                    pivoted_solution[[i, col]] = accum / rii;
+                }
             }
         }
         for pivoted_col in 0..rank {
@@ -292,6 +301,64 @@ fn solve_scale_projection(
                     pivoted_solution[[pivoted_col, rhs_col]];
             }
         }
+    }
+
+    projection_coef
+}
+
+fn solve_scale_projection(
+    primary_design: ScaleDesignMatrixRef<'_>,
+    noise_design: ScaleDesignMatrixRef<'_>,
+    weights: &Array1<f64>,
+    first_active: usize,
+    chunk_rows: usize,
+) -> Result<Array2<f64>, String> {
+    let n = primary_design.nrows();
+    let p_primary = primary_design.ncols();
+    let p_noise = noise_design.ncols();
+    let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
+    let active_cols = p_noise.saturating_sub(first_active);
+
+    if active_cols == 0 || p_primary == 0 {
+        return Ok(projection_coef);
+    }
+
+    let sqrtw = weights.mapv(f64::sqrt);
+    let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows);
+    let wx_faer = FaerArrayView::new(&wx);
+    // Keep one explicit RRQR factorization and one explicit rank policy for all
+    // projection coefficients so dense and operator-backed paths reuse the same solve.
+    let qr = wx_faer.as_ref().col_piv_qr();
+    let r = qr.thin_R();
+    let diag_len = r.nrows().min(r.ncols());
+    let r_diag = (0..diag_len).map(|i| r[(i, i)]).collect::<Vec<_>>();
+    let leading_diag = r_diag.first().copied().map(f64::abs).unwrap_or(0.0);
+    let mut rank = scale_projection_effective_rank(&r_diag, leading_diag, n.max(p_primary));
+    let (perm_fwd, _) = qr.P().arrays();
+    let perm_fwd: Vec<usize> = perm_fwd.iter().map(|idx| idx.unbound()).collect();
+    loop {
+        projection_coef = solve_scale_projection_for_rank(
+            primary_design,
+            noise_design,
+            &sqrtw,
+            &qr,
+            &r_diag,
+            &perm_fwd,
+            rank,
+            first_active,
+            chunk_rows,
+        );
+        let max_abs_coef = projection_coef
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        if !max_abs_coef.is_finite() || (max_abs_coef > SCALE_PROJECTION_MAX_ABS_COEF && rank > 0) {
+            rank -= 1;
+            if rank == 0 {
+                return Ok(Array2::<f64>::zeros((p_primary, p_noise)));
+            }
+            continue;
+        }
+        break;
     }
 
     Ok(projection_coef)
@@ -720,5 +787,28 @@ mod tests {
             1e-8,
             "ill-conditioned transformed design",
         );
+    }
+
+    #[test]
+    fn scale_projection_rank_uses_replay_safe_cutoff() {
+        let leading = 4.0;
+        let diag = vec![
+            leading,
+            1e-4 * leading,
+            2.0 * SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading,
+            0.5 * SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading,
+        ];
+        let rank = scale_projection_effective_rank(&diag, leading, 18);
+        assert_eq!(
+            rank, 3,
+            "replay-safe scale projection rank should drop diagonals below the replay cutoff"
+        );
+
+        let dropped = scale_projection_effective_rank(
+            &[leading, 1e-4 * leading, 0.5 * SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading],
+            leading,
+            18,
+        );
+        assert_eq!(dropped, 2);
     }
 }

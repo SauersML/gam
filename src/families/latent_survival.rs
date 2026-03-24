@@ -24,7 +24,7 @@ use crate::families::lognormal_kernel::{
     log_kernel_bundle,
 };
 use crate::families::survival_location_scale::{
-    TimeBlockInput, project_onto_linear_constraints, time_derivative_lower_bound_constraints,
+    TimeBlockInput, project_onto_linear_constraints, structural_time_coefficient_constraints,
 };
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -649,7 +649,7 @@ fn prepare_latent_time_block(
     let design_entry = input.design_entry.to_dense();
     let design_exit = input.design_exit.to_dense();
     let design_derivative_exit = input.design_derivative_exit.to_dense();
-    let linear_constraints = time_derivative_lower_bound_constraints(
+    let linear_constraints = structural_time_coefficient_constraints(
         &design_derivative_exit,
         &input.derivative_offset_exit,
         derivative_guard,
