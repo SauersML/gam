@@ -578,53 +578,18 @@ pub(crate) fn structural_time_coefficient_constraints(
     derivative_offset_exit: &Array1<f64>,
     derivative_guard: f64,
 ) -> Result<Option<LinearInequalityConstraints>, String> {
-    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
-        return Err(format!(
-            "structural time constraints require matching rows/offsets: rows={}, offsets={}",
-            design_derivative_exit.nrows(),
-            derivative_offset_exit.len()
-        ));
-    }
     if design_derivative_exit.ncols() == 0 {
         return Ok(None);
     }
-    if !derivative_guard.is_finite() || derivative_guard <= 0.0 {
-        return Err(format!(
-            "structural time derivative guard must be finite and > 0, got {derivative_guard}"
-        ));
-    }
-
-    const DERIVATIVE_NONNEG_TOL: f64 = 1e-12;
-    for i in 0..design_derivative_exit.nrows() {
-        let offset = derivative_offset_exit[i];
-        if !offset.is_finite() {
-            return Err(format!(
-                "structural time derivative offset must be finite at row {i}, found {offset}"
-            ));
-        }
-        if offset + DERIVATIVE_NONNEG_TOL < derivative_guard {
-            return Err(format!(
-                "structural time derivative offset must encode the derivative guard at row {i}: offset={offset:.3e} < guard={derivative_guard:.3e}"
-            ));
-        }
-        for j in 0..design_derivative_exit.ncols() {
-            let value = design_derivative_exit[[i, j]];
-            if !value.is_finite() {
-                return Err(format!(
-                    "structural time derivative design must be finite at row {i}, column {j}"
-                ));
-            }
-            if value < -DERIVATIVE_NONNEG_TOL {
-                return Err(format!(
-                    "structural time derivative design must be non-negative at row {i}, column {j}; found {value:.3e}"
-                ));
-            }
-        }
-    }
-
-    Ok(monotone_wiggle_nonnegative_constraints(
-        design_derivative_exit.ncols(),
-    ))
+    let lower_bounds = structural_time_coefficient_lower_bounds(
+        design_derivative_exit,
+        derivative_offset_exit,
+        derivative_guard,
+    )?
+    .ok_or_else(|| {
+        "structural time coefficient constraints require derivative offsets to encode the derivative guard and a non-negative derivative basis".to_string()
+    })?;
+    Ok(lower_bound_constraints(&lower_bounds))
 }
 
 #[derive(Clone)]
@@ -10007,7 +9972,7 @@ mod tests {
     }
 
     #[test]
-    fn identified_time_block_rejects_offsets_below_derivative_guard() {
+    fn identified_time_block_falls_back_to_rowwise_constraints_when_offsets_below_guard() {
         let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
             design_entry: DesignMatrix::from(array![
@@ -10030,14 +9995,14 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let err = match prepare_identified_time_block(&time_block, 1e-6) {
-            Ok(_) => panic!("offsets below the guard must be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.contains("derivative offset must encode the derivative guard"),
-            "unexpected error: {err}"
-        );
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
+        assert_eq!(prepared.coefficient_lower_bounds, None);
+        let constraints = prepared
+            .linear_constraints
+            .expect("rowwise derivative constraints");
+        assert_eq!(constraints.a, design_derivative_exit);
+        assert_eq!(constraints.b, Array1::<f64>::from_elem(3, 1e-6));
     }
 
     #[test]
