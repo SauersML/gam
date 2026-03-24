@@ -15,9 +15,7 @@ use crate::families::bernoulli_marginal_slope::{
     unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::gamlss::{
-    monotone_wiggle_basis_with_derivative_order, monotone_wiggle_structure,
-};
+use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -11111,32 +11109,49 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         let flex_active = self.effective_flex_active(block_states)?;
         if flex_active {
             self.validate_exact_monotonicity(block_states)?;
-            let mut ll = 0.0;
-            for i in 0..self.n {
-                ll -= self.row_neglog_flex_value(i, block_states)?;
-            }
-            return Ok(ll);
+            return (0..self.n)
+                .into_par_iter()
+                .try_fold(
+                    || 0.0,
+                    |mut ll, i| -> Result<_, String> {
+                        ll -= self.row_neglog_flex_value(i, block_states)?;
+                        Ok(ll)
+                    },
+                )
+                .try_reduce(
+                    || 0.0,
+                    |left, right| -> Result<_, String> { Ok(left + right) },
+                );
         }
         // True fast path: closed-form scalar NLL, no jets, no Vecs, no gradients.
         let guard = self.derivative_guard;
-        let mut ll = 0.0;
-        for i in 0..self.n {
-            let q_geom = self.row_dynamic_q_geometry(i, block_states)?;
-            let g = block_states[2].eta[i];
-            let (nll, _, _) = row_primary_closed_form(
-                q_geom.q0,
-                q_geom.q1,
-                q_geom.qd1,
-                g,
-                self.z[i],
-                self.weights[i],
-                self.event[i],
-                guard,
-                self.probit_frailty_scale(),
-            )?;
-            ll -= nll;
-        }
-        Ok(ll)
+        let probit_scale = self.probit_frailty_scale();
+        (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || 0.0,
+                |mut ll, i| -> Result<_, String> {
+                    let q_geom = self.row_dynamic_q_geometry(i, block_states)?;
+                    let g = block_states[2].eta[i];
+                    let (nll, _, _) = row_primary_closed_form(
+                        q_geom.q0,
+                        q_geom.q1,
+                        q_geom.qd1,
+                        g,
+                        self.z[i],
+                        self.weights[i],
+                        self.event[i],
+                        guard,
+                        probit_scale,
+                    )?;
+                    ll -= nll;
+                    Ok(ll)
+                },
+            )
+            .try_reduce(
+                || 0.0,
+                |left, right| -> Result<_, String> { Ok(left + right) },
+            )
     }
 
     fn exact_newton_joint_hessian(
@@ -11298,10 +11313,22 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
         if block_idx == 0 {
-            Ok(self.time_linear_constraints.clone())
-        } else {
-            Ok(None)
+            return Ok(self.time_linear_constraints.clone());
         }
+        if self.score_warp.is_some() && block_idx == 3 {
+            return Ok(self
+                .score_warp
+                .as_ref()
+                .map(DeviationRuntime::structural_monotonicity_constraints));
+        }
+        let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
+        if self.link_dev.is_some() && block_idx == link_block_idx {
+            return Ok(self
+                .link_dev
+                .as_ref()
+                .map(DeviationRuntime::structural_monotonicity_constraints));
+        }
+        Ok(None)
     }
 
     fn max_feasible_step_size(
@@ -11313,21 +11340,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         if block_idx == 0 {
             return self.max_feasible_time_step(&block_states[0].beta, delta);
         }
-        if self.score_warp.is_some() && block_idx == 3 {
-            if let Some(runtime) = &self.score_warp {
-                return runtime.max_feasible_monotone_step(&block_states[3].beta, delta);
-            }
-        }
-        let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
-        if self.link_dev.is_some() && block_idx == link_block_idx {
-            if let Some(runtime) = &self.link_dev {
-                let current = block_states
-                    .get(link_block_idx)
-                    .map(|state| &state.beta)
-                    .ok_or_else(|| "missing survival link-deviation block state".to_string())?;
-                return runtime.max_feasible_monotone_step(current, delta);
-            }
-        }
+        let _ = delta;
         Ok(None)
     }
 
@@ -11647,24 +11660,6 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
                 "survival-marginal-slope timewiggle requests {} tail columns but time block only has {} columns",
                 timewiggle.ncols,
                 spec.time_block.design_exit.ncols()
-            ));
-        }
-    }
-    if let Some(cfg) = spec.score_warp.as_ref() {
-        let structure = monotone_wiggle_structure(cfg.degree)?;
-        if !structure.fourth_derivative_is_structurally_zero() {
-            return Err(format!(
-                "survival-marginal-slope score-warp requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {} from public degree={}",
-                structure.value_span_degree, cfg.degree
-            ));
-        }
-    }
-    if let Some(cfg) = spec.link_dev.as_ref() {
-        let structure = monotone_wiggle_structure(cfg.degree)?;
-        if !structure.fourth_derivative_is_structurally_zero() {
-            return Err(format!(
-                "survival-marginal-slope link deviation requires a value basis whose fourth derivative is structurally zero on every span, got piecewise degree {} from public degree={}",
-                structure.value_span_degree, cfg.degree
             ));
         }
     }

@@ -662,6 +662,29 @@ impl CustomFamily for TransformationNormalFamily {
         self.exact_newton_hessian_directional_derivative(block_states, 0, d_beta_flat)
     }
 
+    fn exact_newton_joint_hessiansecond_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let beta = &block_states[0].beta;
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let d_h_prime_u = self.x_deriv_kron.forward_mul(d_beta_u_flat);
+        let d_h_prime_v = self.x_deriv_kron.forward_mul(d_beta_v_flat);
+
+        // H(β) = X_valᵀ W X_val + X_derivᵀ diag(w / h'²) X_deriv
+        // so D²H[u,v] = 6 X_derivᵀ diag(w (X_deriv u)(X_deriv v) / h'⁴) X_deriv.
+        let n = h_prime.len();
+        let mut weight = Array1::zeros(n);
+        for i in 0..n {
+            let hp = h_prime[i];
+            weight[i] =
+                6.0 * self.weights[i] * d_h_prime_u[i] * d_h_prime_v[i] / (hp * hp * hp * hp);
+        }
+        Ok(Some(self.x_deriv_kron.weighted_gram(&weight)))
+    }
+
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
@@ -2163,6 +2186,43 @@ mod tests {
             2e-4,
             "transformation normal psi hessian directional derivative",
         );
+    }
+
+    #[test]
+    fn transformation_normal_joint_hessian_second_directional_derivative_matches_fd() {
+        let psi = array![0.15, -0.10];
+        let h = 1e-6;
+        let dir_u = array![0.02, -0.01, 0.03, 0.015];
+        let dir_v = array![-0.01, 0.02, 0.01, -0.025];
+        let (family, _, state, _) = toy_family_and_derivatives(&psi);
+
+        let analytic = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                std::slice::from_ref(&state),
+                &dir_u,
+                &dir_v,
+            )
+            .expect("analytic second directional derivative")
+            .expect("second directional derivative should be present");
+
+        let eval_dh = |beta: &Array1<f64>| {
+            let shifted_state = ParameterBlockState {
+                beta: beta.clone(),
+                eta: state.eta.clone(),
+            };
+            family
+                .exact_newton_joint_hessian_directional_derivative(
+                    std::slice::from_ref(&shifted_state),
+                    &dir_u,
+                )
+                .expect("first directional derivative at shifted beta")
+                .expect("shifted first directional derivative should be present")
+        };
+
+        let beta_plus = &state.beta + &(dir_v.clone() * h);
+        let beta_minus = &state.beta - &(dir_v * h);
+        let fd = (eval_dh(&beta_plus) - eval_dh(&beta_minus)) / (2.0 * h);
+        assert_matrix_derivativefd(&fd, &analytic, 2e-4, "transformation normal joint d2H");
     }
 }
 
