@@ -5,7 +5,7 @@ use csv::WriterBuilder;
 use faer::Mat as FaerMat;
 use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_fit;
-use gam::basis::{BasisOptions, create_difference_penalty_matrix};
+use gam::basis::create_difference_penalty_matrix;
 use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus, EstimationError,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
@@ -2006,6 +2006,17 @@ fn needs_special_predict_handling(model: &SavedModel) -> bool {
     }
 }
 
+fn pretty_predict_model_class(class: PredictModelClass) -> &'static str {
+    match class {
+        PredictModelClass::Standard => "standard",
+        PredictModelClass::GaussianLocationScale => "gaussian location-scale",
+        PredictModelClass::BinomialLocationScale => "binomial location-scale",
+        PredictModelClass::BernoulliMarginalSlope => "bernoulli marginal-slope",
+        PredictModelClass::TransformationNormal => "transformation-normal",
+        PredictModelClass::Survival => "survival",
+    }
+}
+
 fn needs_special_generate_handling(model: &SavedModel) -> bool {
     match model.predict_model_class() {
         PredictModelClass::Survival | PredictModelClass::BinomialLocationScale => true,
@@ -2400,9 +2411,16 @@ fn run_predict_unified(
             | LikelihoodFamily::BinomialMixture
     ) || model.has_link_wiggle()
         || model.has_baseline_time_wiggle();
+    let sigma_opt = if model_class == PredictModelClass::GaussianLocationScale {
+        predictor
+            .predict_noise_scale(pred_input)
+            .map_err(|e| format!("predict_noise_scale failed: {e}"))?
+    } else {
+        None
+    };
 
     // --- Compute prediction ---
-    let (eta, mean, se_opt, mean_lo, mean_hi, sigma_opt) = if args.uncertainty {
+    let (eta, mean, se_opt, mean_lo, mean_hi) = if args.uncertainty {
         let options = gam::estimate::PredictUncertaintyOptions {
             confidence_level: args.level,
             covariance_mode: infer_covariance_mode(args.covariance_mode),
@@ -2412,61 +2430,30 @@ fn run_predict_unified(
         let pred = predictor
             .predict_full_uncertainty(pred_input, &fit_for_predict, &options)
             .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
-
-        // For Gaussian LS, extract sigma from the predictor separately.
-        let sigma = if model_class == PredictModelClass::GaussianLocationScale {
-            let with_se = predictor
-                .predict_with_uncertainty(pred_input)
-                .map_err(|e| format!("predict_with_uncertainty (sigma) failed: {e}"))?;
-            with_se.mean_se
-        } else {
-            None
-        };
-
         (
             pred.eta,
             pred.mean,
             Some(pred.eta_standard_error),
             Some(pred.mean_lower),
             Some(pred.mean_upper),
-            sigma,
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
         let pm = predictor
             .predict_posterior_mean(pred_input, &fit_for_predict, Some(args.level))
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-        let sigma = if model_class == PredictModelClass::GaussianLocationScale {
-            let with_se = predictor
-                .predict_with_uncertainty(pred_input)
-                .map_err(|e| format!("predict_with_uncertainty (sigma) failed: {e}"))?;
-            with_se.mean_se
-        } else {
-            None
-        };
         (
             pm.eta,
             pm.mean,
             Some(pm.eta_standard_error),
             pm.mean_lower,
             pm.mean_upper,
-            sigma,
         )
     } else {
         let pred = predictor
             .predict_plugin_response(pred_input)
             .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
 
-        // For Gaussian LS, always compute sigma even without uncertainty.
-        let sigma = if model_class == PredictModelClass::GaussianLocationScale {
-            let with_se = predictor
-                .predict_with_uncertainty(pred_input)
-                .map_err(|e| format!("predict_with_uncertainty (sigma) failed: {e}"))?;
-            with_se.mean_se
-        } else {
-            None
-        };
-
-        (pred.eta, pred.mean, None, None, None, sigma)
+        (pred.eta, pred.mean, None, None, None)
     };
 
     // --- Write CSV output ---
@@ -2555,35 +2542,36 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     // Standard, GaussianLocationScale, BinomialLocationScale (with or without
     // link wiggles), BernoulliMarginalSlope, and TransformationNormal.
     if !needs_special_predict_handling(&model) {
-        if let Some(predictor) = model.predictor() {
-            let pred_input = build_predict_input_for_model(
-                &model,
-                ds.values.view(),
-                &col_map,
-                training_headers,
-                &predict_offset,
-                &predict_noise_offset,
-                effective_noise_offset_column.is_some(),
-            )?;
-            progress.advance_workflow(3);
-            let result =
-                run_predict_unified(&mut progress, &args, &model, &pred_input, &*predictor);
-            if result.is_ok() {
-                progress.advance_workflow(5);
-                progress.finish_progress("prediction complete");
-            }
-            return result;
+        let predictor = model.predictor().ok_or_else(|| {
+            format!(
+                "{} prediction requires a unified predictor, but the saved model could not construct one",
+                pretty_predict_model_class(model.predict_model_class())
+            )
+        })?;
+        let pred_input = build_predict_input_for_model(
+            &model,
+            ds.values.view(),
+            &col_map,
+            training_headers,
+            &predict_offset,
+            &predict_noise_offset,
+            effective_noise_offset_column.is_some(),
+        )?;
+        progress.advance_workflow(3);
+        let result = run_predict_unified(&mut progress, &args, &model, &pred_input, &*predictor);
+        if result.is_ok() {
+            progress.advance_workflow(5);
+            progress.finish_progress("prediction complete");
         }
-        // predictor() returned None (e.g. missing UnifiedFitResult) — fall
-        // through to the specialized model-specific paths below.
+        return result;
     }
 
     // ── Special-case dispatch ──────────────────────────────────────────────
     //
-    // These branches handle genuinely model-specific prediction logic that
-    // PredictableModel does not (yet) cover:
-    // - Survival: time basis construction, entry/exit columns, baseline offsets,
-    //   time wiggles, and the LocationScale sub-branch.
+    // This branch handles the genuinely model-specific survival prediction
+    // logic that `PredictableModel` does not cover: time basis construction,
+    // entry/exit columns, baseline offsets, time wiggles, and the
+    // location-scale sub-branch.
     let result = match model.predict_model_class() {
         PredictModelClass::Survival => run_predict_survival(
             &mut progress,
@@ -2600,18 +2588,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             saved_mixture_param_cov.as_ref(),
             saved_sas_param_cov.as_ref(),
         ),
-        PredictModelClass::GaussianLocationScale => run_predict_gaussian_location_scale(
-            &mut progress,
-            &args,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            &predict_offset,
-            &predict_noise_offset,
-        ),
         PredictModelClass::BinomialLocationScale => Err(
             "binomial location-scale model unexpectedly bypassed the unified prediction path"
+                .to_string(),
+        ),
+        PredictModelClass::GaussianLocationScale => Err(
+            "gaussian location-scale model unexpectedly bypassed the unified prediction path"
                 .to_string(),
         ),
         PredictModelClass::BernoulliMarginalSlope => Err(
@@ -2626,21 +2608,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     .to_string(),
             )
         }
-        PredictModelClass::Standard => run_predict_standard(
-            &mut progress,
-            &args,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            &predict_offset,
-            effective_noise_offset_column.is_some(),
-            saved_link_kind.as_ref(),
-            saved_mixture.as_ref(),
-            saved_sas.as_ref(),
-            saved_mixture_param_cov.as_ref(),
-            saved_sas_param_cov.as_ref(),
-        ),
+        PredictModelClass::Standard => {
+            Err("standard model unexpectedly bypassed the unified prediction path".to_string())
+        }
     };
     if result.is_ok() {
         progress.advance_workflow(5);
@@ -3680,322 +3650,6 @@ fn run_predict_survival(
     Ok(())
 }
 
-/// Special-case Gaussian location-scale prediction with saved link wiggles.
-///
-/// Plain Gaussian location-scale models are handled by
-/// `GaussianLocationScalePredictor`. This path exists only for saved models
-/// whose mean block carries a learned link-wiggle correction
-/// `eta = q0 + wiggle(q0)`, with `q0 = X_mu beta_mu`.
-fn run_predict_gaussian_location_scale(
-    progress: &mut gam::visualizer::VisualizerSession,
-    args: &PredictArgs,
-    model: &SavedModel,
-    data: ndarray::ArrayView2<'_, f64>,
-    col_map: &HashMap<String, usize>,
-    training_headers: Option<&Vec<String>>,
-    mean_offset: &Array1<f64>,
-    log_sigma_offset: &Array1<f64>,
-) -> Result<(), String> {
-    progress.set_stage(
-        "predict",
-        "building gaussian location-scale prediction design",
-    );
-    let spec_mu = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        col_map,
-        "resolved_termspec",
-    )?;
-    let design_mu = build_term_collection_design(data, &spec_mu)
-        .map_err(|e| format!("failed to build gaussian mean prediction design: {e}"))?;
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let beta_mu = saved_gaussian_location_scale_mean_beta(&fit_saved)?;
-    if beta_mu.len() != design_mu.design.ncols() {
-        return Err(format!(
-            "gaussian mean model/design mismatch: beta has {} coefficients but design has {} columns",
-            beta_mu.len(),
-            design_mu.design.ncols()
-        ));
-    }
-    let spec_noise = resolve_termspec_for_prediction(
-        &model.resolved_termspec_noise,
-        training_headers,
-        col_map,
-        "resolved_termspec_noise",
-    )?;
-    let design_noise = build_term_collection_design(data, &spec_noise)
-        .map_err(|e| format!("failed to build gaussian noise prediction design: {e}"))?;
-    progress.advance_workflow(3);
-    let beta_noise = saved_location_scale_noise_beta(
-        model,
-        &fit_saved,
-        "gaussian-location-scale model is missing beta_noise",
-    )?;
-    if beta_noise.len() != design_noise.design.ncols() {
-        return Err(format!(
-            "gaussian noise model/design mismatch: beta has {} coefficients but design has {} columns",
-            beta_noise.len(),
-            design_noise.design.ncols()
-        ));
-    }
-
-    let noise_transform = scale_transform_from_payload(
-        &model.noise_projection,
-        &model.noise_center,
-        &model.noise_scale,
-        model.noise_non_intercept_start,
-    )?;
-    let dense_design_mu = design_mu.design.to_dense();
-    let dense_design_noise_gauss = design_noise.design.to_dense();
-    let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
-        apply_scale_deviation_transform(&dense_design_mu, &dense_design_noise_gauss, transform)?
-    } else {
-        dense_design_noise_gauss.clone()
-    };
-
-    if mean_offset.len() != data.nrows() || log_sigma_offset.len() != data.nrows() {
-        return Err(format!(
-            "gaussian location-scale prediction offset length mismatch: rows={}, mean_offset={}, log_sigma_offset={}",
-            data.nrows(),
-            mean_offset.len(),
-            log_sigma_offset.len()
-        ));
-    }
-    let eta_mu_base = dense_design_mu.dot(&beta_mu) + mean_offset;
-    let eta_noise = prepared_noise_design.dot(&beta_noise) + log_sigma_offset;
-    let response_scale = gaussian_response_scale_from_saved_model(model)?;
-    let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
-    let eta = apply_saved_linkwiggle(&eta_mu_base, model)?;
-
-    let mut mean_lo = None;
-    let mut mean_hi = None;
-    if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
-        let wiggle_design = saved_linkwiggle_design(&eta_mu_base, model)?;
-        let dq_dq0 = saved_linkwiggle_derivative_q0(&eta_mu_base, model)?;
-        let p_mu = beta_mu.len();
-        let p_sigma = beta_noise.len();
-        let p_w = wiggle_design.as_ref().map(|m| m.ncols()).unwrap_or(0);
-        let p_total = p_mu + p_sigma + p_w;
-        let backend = prediction_backend_from_model(model, args.covariance_mode)?;
-        if backend.nrows() != p_total {
-            return Err(format!(
-                "covariance/backend mismatch for gaussian-location-scale wiggle: got dimension {}, expected {}",
-                backend.nrows(),
-                p_total,
-            ));
-        }
-        let eta_se = linear_predictor_se_from_backend(&backend, eta.len(), |rows| {
-            let x_mu = dense_design_mu.slice(s![rows.clone(), ..]).to_owned();
-            let dq_chunk = dq_dq0.slice(s![rows.clone()]).to_owned();
-            let wiggle_chunk = wiggle_design
-                .as_ref()
-                .map(|wd| wd.slice(s![rows, ..]).to_owned());
-            let rows_in_chunk = x_mu.nrows();
-            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-            for i in 0..rows_in_chunk {
-                let scale = dq_chunk[i];
-                for j in 0..p_mu {
-                    grad[[i, j]] = scale * x_mu[[i, j]];
-                }
-                if let Some(wd) = wiggle_chunk.as_ref() {
-                    for j in 0..p_w {
-                        grad[[i, p_mu + p_sigma + j]] = wd[[i, j]];
-                    }
-                }
-            }
-            Ok(grad)
-        })?;
-        if args.uncertainty {
-            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-                return Err(format!("--level must be in (0,1), got {}", args.level));
-            }
-            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-            mean_lo = Some(&eta - &eta_se.mapv(|s| z * s));
-            mean_hi = Some(&eta + &eta_se.mapv(|s| z * s));
-        }
-    }
-
-    progress.advance_workflow(4);
-    progress.set_stage("predict", "writing gaussian location-scale predictions");
-    write_gaussian_location_scale_prediction_csv(
-        &args.out,
-        eta.view(),
-        eta.view(),
-        sigma.view(),
-        mean_lo.as_ref().map(|a| a.view()),
-        mean_hi.as_ref().map(|a| a.view()),
-    )?;
-    println!(
-        "wrote predictions: {} (rows={})",
-        args.out.display(),
-        eta.len()
-    );
-    Ok(())
-}
-
-/// Special-case standard prediction.
-///
-/// This handles the standard case that cannot go through `PredictableModel`:
-/// - **Link wiggles**: standard models with a saved `LinkWiggle` use a
-///   hand-rolled path through `predict_standard_linkwiggle`.
-///
-/// For plain standard models (no wiggle), the unified path in
-/// `run_predict` handles prediction via `StandardPredictor`.
-fn run_predict_standard(
-    progress: &mut gam::visualizer::VisualizerSession,
-    args: &PredictArgs,
-    model: &SavedModel,
-    data: ndarray::ArrayView2<'_, f64>,
-    col_map: &HashMap<String, usize>,
-    training_headers: Option<&Vec<String>>,
-    offset: &Array1<f64>,
-    noise_offset_supplied: bool,
-    saved_link_kind: Option<&InverseLink>,
-    saved_mixture: Option<&MixtureLinkState>,
-    saved_sas: Option<&SasLinkState>,
-    saved_mixture_param_cov: Option<&Array2<f64>>,
-    saved_sas_param_cov: Option<&Array2<f64>>,
-) -> Result<(), String> {
-    if noise_offset_supplied {
-        return Err("--noise-offset-column is not supported for standard prediction".to_string());
-    }
-    progress.set_stage("predict", "building prediction design");
-    let spec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        col_map,
-        "resolved_termspec",
-    )?;
-    let design = build_term_collection_design(data, &spec)
-        .map_err(|e| format!("failed to build prediction design: {e}"))?;
-    progress.advance_workflow(3);
-
-    let family = model.likelihood();
-    if is_standard_linkwiggle_model(model, saved_link_kind) {
-        let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-        let saved_link_kind = saved_link_kind
-            .ok_or_else(|| "standard link-wiggle model is missing link metadata".to_string())?;
-        let dense_design_for_wiggle = design.design.to_dense();
-        let (eta, mean, eta_se, mean_lo, mean_hi) = predict_standard_linkwiggle(
-            args,
-            model,
-            family,
-            &fit_saved,
-            &dense_design_for_wiggle,
-            offset,
-            saved_link_kind,
-            saved_mixture,
-            saved_sas,
-            saved_mixture_param_cov,
-            saved_sas_param_cov,
-        )?;
-        progress.advance_workflow(4);
-        progress.set_stage("predict", "writing predictions");
-        write_prediction_csv(
-            &args.out,
-            eta.view(),
-            mean.view(),
-            eta_se.as_ref().map(|a| a.view()),
-            mean_lo.as_ref().map(|a| a.view()),
-            mean_hi.as_ref().map(|a| a.view()),
-        )?;
-        println!(
-            "wrote predictions: {} (rows={})",
-            args.out.display(),
-            mean.len()
-        );
-        return Ok(());
-    }
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let beta = fit_saved.beta.clone();
-    if beta.len() != design.design.ncols() {
-        return Err(format!(
-            "model/design mismatch: model beta has {} coefficients but new-data design has {} columns",
-            beta.len(),
-            design.design.ncols()
-        ));
-    }
-
-    // Standard (no-wiggle) path: delegate to PredictableModel trait.
-    let predictor = model
-        .predictor()
-        .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
-    let pred_input = PredictInput {
-        design: design.design.clone(),
-        offset: offset.clone(),
-        design_noise: None,
-        offset_noise: None,
-        auxiliary_scalar: None,
-    };
-    let nonlinear = matches!(
-        family,
-        LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture
-    );
-    let (eta, mean, se_opt, mean_lo, mean_hi) = if args.uncertainty {
-        let options = gam::estimate::PredictUncertaintyOptions {
-            confidence_level: args.level,
-            covariance_mode: infer_covariance_mode(args.covariance_mode),
-            mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
-            includeobservation_interval: false,
-        };
-        let pred = predictor
-            .predict_full_uncertainty(&pred_input, &fit_saved, &options)
-            .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
-        (
-            pred.eta,
-            pred.mean,
-            Some(pred.eta_standard_error),
-            Some(pred.mean_lower),
-            Some(pred.mean_upper),
-        )
-    } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
-        let pm = predictor
-            .predict_posterior_mean(&pred_input, &fit_saved, Some(args.level))
-            .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-        (
-            pm.eta,
-            pm.mean,
-            Some(pm.eta_standard_error),
-            pm.mean_lower,
-            pm.mean_upper,
-        )
-    } else {
-        let pred = predictor
-            .predict_plugin_response(&pred_input)
-            .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
-        (pred.eta, pred.mean, None, None, None)
-    };
-
-    let eta_se = if args.uncertainty || se_opt.is_some() {
-        se_opt.clone()
-    } else {
-        None
-    };
-
-    progress.advance_workflow(4);
-    progress.set_stage("predict", "writing predictions");
-    write_prediction_csv(
-        &args.out,
-        eta.view(),
-        mean.view(),
-        eta_se.as_ref().map(|a| a.view()),
-        mean_lo.as_ref().map(|a| a.view()),
-        mean_hi.as_ref().map(|a| a.view()),
-    )?;
-
-    println!(
-        "wrote predictions: {} (rows={})",
-        args.out.display(),
-        mean.len()
-    );
-    Ok(())
-}
-
 fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Diagnose", 5);
@@ -4655,37 +4309,6 @@ fn apply_saved_linkwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1
     match model.saved_link_wiggle()? {
         None => Ok(q0.clone()),
         Some(runtime) => runtime.apply(q0),
-    }
-}
-
-fn saved_linkwiggle_design(
-    q0: &Array1<f64>,
-    model: &SavedModel,
-) -> Result<Option<Array2<f64>>, String> {
-    saved_linkwiggle_basis(q0, model, BasisOptions::value())
-}
-
-fn saved_linkwiggle_basis(
-    q0: &Array1<f64>,
-    model: &SavedModel,
-    basis_options: BasisOptions,
-) -> Result<Option<Array2<f64>>, String> {
-    match model.saved_link_wiggle()? {
-        None => Ok(None),
-        Some(runtime) => {
-            runtime.derivative_q0(q0).map(|_| ())?;
-            runtime.constrained_basis(q0, basis_options).map(Some)
-        }
-    }
-}
-
-fn saved_linkwiggle_derivative_q0(
-    q0: &Array1<f64>,
-    model: &SavedModel,
-) -> Result<Array1<f64>, String> {
-    match model.saved_link_wiggle()? {
-        Some(runtime) => runtime.derivative_q0(q0),
-        None => Ok(Array1::ones(q0.len())),
     }
 }
 
@@ -7170,20 +6793,6 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 &generate_offset,
                 &generate_noise_offset,
             )?,
-            PredictModelClass::Standard => run_generate_standard(
-                &mut progress,
-                &model,
-                ds.values.view(),
-                &col_map,
-                training_headers,
-                &generate_offset,
-                saved_noise_offset_column.is_some(),
-            )?,
-            PredictModelClass::BernoulliMarginalSlope => {
-                return Err(
-                    "generate is not available for bernoulli marginal-slope models yet".to_string(),
-                );
-            }
             PredictModelClass::Survival => {
                 return Err(
                     "generate is not available for survival models in this command; \
@@ -7191,20 +6800,15 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            PredictModelClass::TransformationNormal => {
-                return Err(
-                    "generate is not available for transformation-normal models yet".to_string(),
-                );
+            PredictModelClass::Standard
+            | PredictModelClass::GaussianLocationScale
+            | PredictModelClass::BernoulliMarginalSlope
+            | PredictModelClass::TransformationNormal => {
+                return Err(format!(
+                    "{} model unexpectedly bypassed the unified generation path",
+                    pretty_predict_model_class(model.predict_model_class())
+                ));
             }
-            PredictModelClass::GaussianLocationScale => run_generate_gaussian_location_scale(
-                &mut progress,
-                &model,
-                ds.values.view(),
-                &col_map,
-                training_headers,
-                &generate_offset,
-                &generate_noise_offset,
-            )?,
         }
     } else {
         run_generate_unified(
@@ -7292,17 +6896,16 @@ fn run_generate_unified(
 
     if model_class == PredictModelClass::GaussianLocationScale {
         // Gaussian LS needs the per-observation sigma for its GenerativeSpec.
-        // predict_with_uncertainty stashes sigma in mean_se for this model class.
         let pred = predictor
             .predict_plugin_response(&pred_input)
             .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
-        let with_se = predictor
-            .predict_with_uncertainty(&pred_input)
-            .map_err(|e| format!("predict_with_uncertainty (sigma) failed: {e}"))?;
-        let sigma = with_se.mean_se.ok_or_else(|| {
-            "gaussian location-scale predictor did not produce sigma via predict_with_uncertainty"
-                .to_string()
-        })?;
+        let sigma = predictor
+            .predict_noise_scale(&pred_input)
+            .map_err(|e| format!("predict_noise_scale failed: {e}"))?
+            .ok_or_else(|| {
+                "gaussian location-scale predictor did not produce sigma via predict_noise_scale"
+                    .to_string()
+            })?;
         Ok(gam::generative::GenerativeSpec {
             mean: pred.mean,
             noise: gam::generative::NoiseModel::Gaussian { sigma },
@@ -7318,74 +6921,6 @@ fn run_generate_unified(
         generativespec_from_predict(pred, family, family_noise_parameter(&fit_saved, family))
             .map_err(|e| format!("failed to build generative spec: {e}"))
     }
-}
-
-fn run_generate_gaussian_location_scale(
-    progress: &mut gam::visualizer::VisualizerSession,
-    model: &SavedModel,
-    data: ndarray::ArrayView2<'_, f64>,
-    col_map: &HashMap<String, usize>,
-    training_headers: Option<&Vec<String>>,
-    mean_offset: &Array1<f64>,
-    log_sigma_offset: &Array1<f64>,
-) -> Result<gam::generative::GenerativeSpec, String> {
-    progress.set_stage(
-        "generate",
-        "building gaussian location-scale generation design",
-    );
-    let spec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        col_map,
-        "resolved_termspec",
-    )?;
-    if termspec_has_bounded_terms(&spec) {
-        return Err(
-            "sample is not yet supported for models with bounded() coefficients".to_string(),
-        );
-    }
-    let design = build_term_collection_design(data, &spec)
-        .map_err(|e| format!("failed to build design: {e}"))?;
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let betamu = saved_gaussian_location_scale_mean_beta(&fit_saved)?;
-    let spec_noise = resolve_termspec_for_prediction(
-        &model.resolved_termspec_noise,
-        training_headers,
-        col_map,
-        "resolved_termspec_noise",
-    )?;
-    let design_noise = build_term_collection_design(data, &spec_noise)
-        .map_err(|e| format!("failed to build noise design: {e}"))?;
-    let beta_noise = saved_location_scale_noise_beta(
-        model,
-        &fit_saved,
-        "gaussian-location-scale model is missing beta_noise",
-    )?;
-    if betamu.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols() {
-        return Err("location-scale model/design dimension mismatch".to_string());
-    }
-    let noise_transform = scale_transform_from_payload(
-        &model.noise_projection,
-        &model.noise_center,
-        &model.noise_scale,
-        model.noise_non_intercept_start,
-    )?;
-    let mean_base = design.design.dot(&betamu) + mean_offset;
-    let dense_gen_mean = design.design.to_dense();
-    let dense_gen_noise = design_noise.design.to_dense();
-    let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
-        apply_scale_deviation_transform(&dense_gen_mean, &dense_gen_noise, transform)?
-    } else {
-        dense_gen_noise
-    };
-    let eta_noise = preparednoise_design.dot(&beta_noise) + log_sigma_offset;
-    let response_scale = gaussian_response_scale_from_saved_model(model)?;
-    let sigma = eta_noise.mapv(|eta| eta.exp() * response_scale);
-    let mean = apply_saved_linkwiggle(&mean_base, model)?;
-    Ok(gam::generative::GenerativeSpec {
-        mean,
-        noise: gam::generative::NoiseModel::Gaussian { sigma },
-    })
 }
 
 fn run_generate_binomial_location_scale(
@@ -7464,91 +6999,6 @@ fn run_generate_binomial_location_scale(
         mean,
         noise: gam::generative::NoiseModel::Bernoulli,
     })
-}
-
-fn run_generate_standard(
-    progress: &mut gam::visualizer::VisualizerSession,
-    model: &SavedModel,
-    data: ndarray::ArrayView2<'_, f64>,
-    col_map: &HashMap<String, usize>,
-    training_headers: Option<&Vec<String>>,
-    offset: &Array1<f64>,
-    noise_offset_supplied: bool,
-) -> Result<gam::generative::GenerativeSpec, String> {
-    if noise_offset_supplied {
-        return Err("--noise-offset-column is not supported for standard generation".to_string());
-    }
-    progress.set_stage("generate", "building generation design");
-    let spec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        col_map,
-        "resolved_termspec",
-    )?;
-    if termspec_has_bounded_terms(&spec) {
-        return Err(
-            "sample is not yet supported for models with bounded() coefficients".to_string(),
-        );
-    }
-    let design = build_term_collection_design(data, &spec)
-        .map_err(|e| format!("failed to build design: {e}"))?;
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let family = model.likelihood();
-    if is_standard_linkwiggle_model(model, model.resolved_inverse_link()?.as_ref()) {
-        let saved_link_kind = model
-            .resolved_inverse_link()?
-            .ok_or_else(|| "standard link-wiggle model is missing link metadata".to_string())?;
-        let beta_eta = fit_saved
-            .block_by_role(BlockRole::Mean)
-            .ok_or_else(|| "standard wiggle model is missing Mean coefficient block".to_string())?
-            .beta
-            .clone();
-        if beta_eta.len() != design.design.ncols() {
-            return Err(format!(
-                "model/design mismatch: standard wiggle mean block has {} coefficients but design has {} columns",
-                beta_eta.len(),
-                design.design.ncols()
-            ));
-        }
-        let eta_base = design.design.dot(&beta_eta) + offset;
-        let eta = apply_saved_linkwiggle(&eta_base, model)?;
-        let mean = Array1::from_iter(
-            eta.iter()
-                .map(|&v| inverse_link_mean_scalar(&saved_link_kind, v))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let pred = gam::predict::PredictResult { eta, mean };
-        return generativespec_from_predict(
-            pred,
-            family,
-            family_noise_parameter(&fit_saved, family),
-        )
-        .map_err(|e| format!("failed to build generative spec for link-wiggle model: {e}"));
-    }
-    // Standard (no-wiggle) path: delegate to PredictableModel.
-    let predictor = model
-        .predictor()
-        .ok_or_else(|| "failed to build predictor for standard model".to_string())?;
-    let beta = fit_saved.beta.clone();
-    if beta.len() != design.design.ncols() {
-        return Err(format!(
-            "model/design mismatch: model beta has {} coefficients but design has {} columns",
-            beta.len(),
-            design.design.ncols()
-        ));
-    }
-    let pred_input = PredictInput {
-        design: design.design.clone(),
-        offset: offset.clone(),
-        design_noise: None,
-        offset_noise: None,
-        auxiliary_scalar: None,
-    };
-    let pred = predictor
-        .predict_plugin_response(&pred_input)
-        .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
-    generativespec_from_predict(pred, family, family_noise_parameter(&fit_saved, family))
-        .map_err(|e| format!("failed to build generative spec: {e}"))
 }
 
 fn run_report(args: ReportArgs) -> Result<(), String> {
@@ -8041,199 +7491,6 @@ fn summarizewiggle_domain(
         outside_count,
         outside_fraction,
     })
-}
-
-fn is_standard_linkwiggle_model(model: &SavedModel, saved_link_kind: Option<&InverseLink>) -> bool {
-    model.has_link_wiggle()
-        && model.predict_model_class() == PredictModelClass::Standard
-        && saved_link_kind.is_some()
-}
-
-/// Family-appropriate response-scale clamp bounds for prediction intervals.
-fn response_clamp_bounds_for_family(family: LikelihoodFamily) -> (f64, f64) {
-    match family {
-        LikelihoodFamily::GaussianIdentity => (f64::NEG_INFINITY, f64::INFINITY),
-        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => (0.0, f64::INFINITY),
-        _ => (1e-10, 1.0 - 1e-10), // binomial variants: probability in (0, 1)
-    }
-}
-
-fn inverse_link_mean_scalar(saved_link_kind: &InverseLink, eta: f64) -> Result<f64, String> {
-    inverse_link_jet_for_inverse_link(saved_link_kind, eta)
-        .map(|jet| jet.mu)
-        .map_err(|e| format!("inverse-link evaluation failed: {e}"))
-}
-
-fn integrated_inverse_link_mean_scalar(
-    quadctx: &gam::quadrature::QuadratureContext,
-    saved_link_kind: &InverseLink,
-    eta: f64,
-    eta_sd: f64,
-) -> Result<f64, String> {
-    let eta_sd = eta_sd.max(0.0);
-    if !eta.is_finite() || !eta_sd.is_finite() {
-        return Err(format!(
-            "integrated inverse-link evaluation requires finite eta/eta_sd, got eta={eta}, eta_sd={eta_sd}"
-        ));
-    }
-    if eta_sd <= 1e-12 {
-        return inverse_link_mean_scalar(saved_link_kind, eta);
-    }
-    gam::quadrature::integrated_inverse_link_jetwith_state(
-        quadctx,
-        saved_link_kind.link_function(),
-        eta,
-        eta_sd,
-        saved_link_kind.mixture_state(),
-        saved_link_kind.sas_state(),
-    )
-    .map(|jet| jet.mean.clamp(0.0, 1.0))
-    .map_err(|e| format!("integrated inverse-link evaluation failed: {e}"))
-}
-
-fn predict_standard_linkwiggle(
-    args: &PredictArgs,
-    model: &SavedModel,
-    family: LikelihoodFamily,
-    fit_saved: &UnifiedFitResult,
-    design: &Array2<f64>,
-    offset: &Array1<f64>,
-    saved_link_kind: &InverseLink,
-    saved_mixture: Option<&MixtureLinkState>,
-    saved_sas: Option<&SasLinkState>,
-    saved_mixture_param_cov: Option<&Array2<f64>>,
-    saved_sas_param_cov: Option<&Array2<f64>>,
-) -> Result<
-    (
-        Array1<f64>,
-        Array1<f64>,
-        Option<Array1<f64>>,
-        Option<Array1<f64>>,
-        Option<Array1<f64>>,
-    ),
-    String,
-> {
-    let beta = fit_saved
-        .block_by_role(BlockRole::Mean)
-        .ok_or_else(|| "standard wiggle model is missing Mean coefficient block".to_string())?
-        .beta
-        .clone();
-    if beta.len() != design.ncols() {
-        return Err(format!(
-            "model/design mismatch: standard wiggle mean block has {} coefficients but new-data design has {} columns",
-            beta.len(),
-            design.ncols()
-        ));
-    }
-    if offset.len() != design.nrows() {
-        return Err(format!(
-            "standard wiggle offset length mismatch: rows={}, offset={}",
-            design.nrows(),
-            offset.len()
-        ));
-    }
-    let eta_base = design.dot(&beta) + offset;
-    let eta = apply_saved_linkwiggle(&eta_base, model)?;
-    let mean_mode = Array1::from_iter(
-        eta.iter()
-            .map(|&v| inverse_link_mean_scalar(saved_link_kind, v))
-            .collect::<Result<Vec<_>, _>>()?,
-    );
-    let wiggle_runtime = model
-        .saved_link_wiggle()?
-        .ok_or_else(|| "wiggle model is missing saved link-wiggle runtime".to_string())?;
-    let wiggle_design = saved_linkwiggle_design(&eta_base, model)?
-        .ok_or_else(|| "wiggle model is missing realized wiggle basis".to_string())?;
-    let dq_dq0 = saved_linkwiggle_derivative_q0(&eta_base, model)?;
-    let pw = wiggle_runtime.beta.len();
-    let p_main = beta.len();
-    let p_total = p_main + pw;
-    let eta_se = if args.mode == PredictModeArg::PosteriorMean || args.uncertainty {
-        let backend = prediction_backend_from_model(model, args.covariance_mode)?;
-        if backend.nrows() != p_total {
-            return Err(format!(
-                "covariance/backend mismatch for standard link-wiggle model: got dimension {}, expected {}",
-                backend.nrows(),
-                p_total,
-            ));
-        }
-        Some(linear_predictor_se_from_backend(
-            &backend,
-            eta.len(),
-            |rows| {
-                let q0_chunk = eta_base.slice(s![rows.clone()]).to_owned();
-                let x_main = design.slice(s![rows.clone(), ..]).to_owned();
-                let wiggle_chunk = wiggle_design.slice(s![rows.clone(), ..]).to_owned();
-                let dq_chunk = dq_dq0.slice(s![rows]).to_owned();
-                let rows_in_chunk = q0_chunk.len();
-                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-                for i in 0..rows_in_chunk {
-                    for j in 0..p_main {
-                        grad[[i, j]] = dq_chunk[i] * x_main[[i, j]];
-                    }
-                    for j in 0..pw {
-                        grad[[i, p_main + j]] = wiggle_chunk[[i, j]];
-                    }
-                }
-                Ok(grad)
-            },
-        )?)
-    } else {
-        None
-    };
-    let mean = if args.mode == PredictModeArg::PosteriorMean {
-        let se = eta_se
-            .as_ref()
-            .ok_or_else(|| "internal error: eta SE unavailable for posterior mean".to_string())?;
-        let quadctx = gam::quadrature::QuadratureContext::new();
-        let means: Result<Vec<f64>, String> = (0..eta.len())
-            .map(|i| integrated_inverse_link_mean_scalar(&quadctx, saved_link_kind, eta[i], se[i]))
-            .collect();
-        Array1::from_vec(means?)
-    } else {
-        mean_mode.clone()
-    };
-    let (mean_lo, mean_hi) = if args.uncertainty {
-        let se = eta_se.as_ref().ok_or_else(|| {
-            "internal error: eta SE unavailable for uncertainty interval".to_string()
-        })?;
-        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-        let response_sd = response_sd_from_eta_for_family(
-            family,
-            eta.view(),
-            se.view(),
-            saved_mixture,
-            saved_sas,
-            saved_mixture_param_cov,
-            saved_sas_param_cov,
-        )?;
-        let (clamp_lo, clamp_hi) = response_clamp_bounds_for_family(family);
-        let (lo, hi) =
-            response_interval_from_mean_sd(mean.view(), response_sd.view(), z, clamp_lo, clamp_hi);
-        (Some(lo), Some(hi))
-    } else if args.mode == PredictModeArg::PosteriorMean {
-        let mut pm = gam::predict::PredictPosteriorMeanResult {
-            eta: eta.clone(),
-            eta_standard_error: eta_se
-                .as_ref()
-                .ok_or_else(|| "internal error: eta SE unavailable for posterior mean".to_string())?
-                .clone(),
-            mean: mean.clone(),
-            mean_lower: None,
-            mean_upper: None,
-        };
-        gam::predict::enrich_posterior_mean_bounds(
-            &mut pm,
-            args.level,
-            family,
-            Some(saved_link_kind),
-        )
-        .map_err(|e| format!("enrich_posterior_mean_bounds failed: {e}"))?;
-        (pm.mean_lower, pm.mean_upper)
-    } else {
-        (None, None)
-    };
-    Ok((eta, mean, eta_se, mean_lo, mean_hi))
 }
 
 fn remap_term_collectionspec_columns(
@@ -8917,18 +8174,6 @@ fn scale_transform_from_payload(
     }))
 }
 
-fn gaussian_response_scale_from_saved_model(model: &SavedModel) -> Result<f64, String> {
-    let scale = model.gaussian_response_scale.ok_or_else(|| {
-        "gaussian-location-scale model is missing gaussian_response_scale; refit with the current CLI".to_string()
-    })?;
-    if scale <= 0.0 {
-        return Err(format!(
-            "gaussian-location-scale model has non-positive gaussian_response_scale={scale}"
-        ));
-    }
-    Ok(scale)
-}
-
 fn core_saved_fit_result(
     beta: Array1<f64>,
     lambdas: Array1<f64>,
@@ -9393,15 +8638,6 @@ fn compact_saved_survival_location_scale_fit_result(
     );
     apply_inverse_link_state_to_fit_result(&mut fit_result, inverse_link);
     Ok(fit_result)
-}
-
-fn saved_gaussian_location_scale_mean_beta(fit: &UnifiedFitResult) -> Result<Array1<f64>, String> {
-    fit.block_by_role(BlockRole::Location)
-        .or_else(|| fit.block_by_role(BlockRole::Mean))
-        .map(|block| block.beta.clone())
-        .ok_or_else(|| {
-            "gaussian-location-scale fit_result is missing the mean/location block".to_string()
-        })
 }
 
 fn saved_binomial_location_scale_threshold_beta(
@@ -10476,18 +9712,6 @@ fn parse_optional_covariance(
         .transpose()
 }
 
-fn linear_predictor_se_from_backend<F>(
-    backend: &PredictionCovarianceBackend<'_>,
-    n_rows: usize,
-    mut build_chunk: F,
-) -> Result<Array1<f64>, String>
-where
-    F: FnMut(std::ops::Range<usize>) -> Result<Array2<f64>, String>,
-{
-    let local = rowwise_local_covariances(backend, n_rows, 1, |rows| Ok(vec![build_chunk(rows)?]))?;
-    Ok(local[0][0].mapv(|v| v.max(0.0).sqrt()))
-}
-
 fn covariance_from_model(
     model: &SavedModel,
     mode: CovarianceModeArg,
@@ -10564,86 +9788,6 @@ fn fit_result_from_saved_model_for_prediction(
     model.fit_result.clone().ok_or_else(|| {
         "model is missing canonical fit_result payload; refit with current CLI".to_string()
     })
-}
-
-fn response_sd_from_eta_for_family(
-    family: LikelihoodFamily,
-    eta: ArrayView1<'_, f64>,
-    eta_se: ArrayView1<'_, f64>,
-    _: Option<&gam::types::MixtureLinkState>,
-    _: Option<&gam::types::SasLinkState>,
-    _: Option<&Array2<f64>>,
-    _: Option<&Array2<f64>>,
-) -> Result<Array1<f64>, String> {
-    if matches!(
-        family,
-        LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture
-            | LikelihoodFamily::BinomialLatentCLogLog
-    ) {
-        return Err(
-            "stateful link response uncertainty must be computed via library prediction APIs"
-                .to_string(),
-        );
-    }
-    let quadctx = gam::quadrature::QuadratureContext::new();
-    Ok(Array1::from_iter((0..eta.len()).map(|i| {
-        let var = match family {
-            LikelihoodFamily::BinomialLogit => {
-                let (_, v) =
-                    gam::quadrature::logit_posterior_meanvariance(&quadctx, eta[i], eta_se[i]);
-                v
-            }
-            LikelihoodFamily::BinomialProbit => {
-                let (_, v) =
-                    gam::quadrature::probit_posterior_meanvariance(&quadctx, eta[i], eta_se[i]);
-                v
-            }
-            LikelihoodFamily::BinomialCLogLog => {
-                let (_, v) =
-                    gam::quadrature::cloglog_posterior_meanvariance(&quadctx, eta[i], eta_se[i]);
-                v
-            }
-            LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture
-            | LikelihoodFamily::BinomialLatentCLogLog => unreachable!(),
-            LikelihoodFamily::RoystonParmar => {
-                let (_, v) =
-                    gam::quadrature::survival_posterior_meanvariance(&quadctx, eta[i], eta_se[i]);
-                v
-            }
-            LikelihoodFamily::GaussianIdentity => 0.0,
-            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
-                let sigma2 = eta_se[i] * eta_se[i];
-                if !sigma2.is_finite() || sigma2 <= 0.0 {
-                    0.0
-                } else {
-                    let expm1_sigma2 = sigma2.exp_m1();
-                    if !expm1_sigma2.is_finite() || expm1_sigma2 <= 0.0 {
-                        0.0
-                    } else {
-                        let log_var = 2.0 * eta[i] + sigma2 + expm1_sigma2.ln();
-                        if !log_var.is_finite() {
-                            f64::MAX
-                        } else {
-                            let max_log = f64::MAX.ln();
-                            let min_log = f64::MIN_POSITIVE.ln();
-                            if log_var >= max_log {
-                                f64::MAX
-                            } else if log_var <= min_log {
-                                0.0
-                            } else {
-                                log_var.exp()
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        var.max(0.0).sqrt()
-    })))
 }
 
 fn response_interval_from_mean_sd(
@@ -11069,11 +10213,10 @@ mod tests {
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
         load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
         parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
-        parse_survival_time_basis_config, predict_standard_linkwiggle, pretty_familyname,
-        required_columns_for_fit, run_generate_gaussian_location_scale, run_generate_standard,
-        saved_linkwiggle_derivative_q0, saved_linkwiggle_design, summarizewiggle_domain,
-        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
-        write_survival_binary_prediction_csv, write_survival_prediction_csv,
+        parse_survival_time_basis_config, pretty_familyname, required_columns_for_fit,
+        summarizewiggle_domain, validate_cli_firth_configuration,
+        write_gaussian_location_scale_prediction_csv, write_survival_binary_prediction_csv,
+        write_survival_prediction_csv,
     };
     use super::{
         CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, needs_special_generate_handling,
@@ -11114,6 +10257,37 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
+
+    fn test_saved_linkwiggle_design(
+        q0: &Array1<f64>,
+        model: &SavedModel,
+    ) -> Result<Option<Array2<f64>>, String> {
+        test_saved_linkwiggle_basis(q0, model, BasisOptions::value())
+    }
+
+    fn test_saved_linkwiggle_basis(
+        q0: &Array1<f64>,
+        model: &SavedModel,
+        basis_options: BasisOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
+        match model.saved_link_wiggle()? {
+            None => Ok(None),
+            Some(runtime) => {
+                runtime.derivative_q0(q0).map(|_| ())?;
+                runtime.constrained_basis(q0, basis_options).map(Some)
+            }
+        }
+    }
+
+    fn test_saved_linkwiggle_derivative_q0(
+        q0: &Array1<f64>,
+        model: &SavedModel,
+    ) -> Result<Array1<f64>, String> {
+        match model.saved_link_wiggle()? {
+            Some(runtime) => runtime.derivative_q0(q0),
+            None => Ok(Array1::ones(q0.len())),
+        }
+    }
 
     fn empty_termspec() -> TermCollectionSpec {
         TermCollectionSpec {
@@ -12308,15 +11482,18 @@ mod tests {
         wiggle_knots: Vec<f64>,
         wiggle_degree: usize,
     ) -> SavedModel {
+        let beta_wiggle = Array1::from_vec(beta_link_wiggle.clone());
+        let mut beta_joint = Array1::zeros(1 + beta_wiggle.len());
+        beta_joint[0] = beta_eta;
+        beta_joint.slice_mut(s![1..]).assign(&beta_wiggle);
         let mut fit_result = core_saved_fit_result(
-            array![beta_eta],
+            beta_joint.clone(),
             Array1::zeros(0),
             1.0,
             Some(covariance.clone()),
             Some(covariance),
             saved_fit_summary_stub(),
         );
-        let beta_wiggle = Array1::from_vec(beta_link_wiggle.clone());
         fit_result.blocks = vec![
             gam::estimate::FittedBlock {
                 beta: array![beta_eta],
@@ -12331,9 +11508,6 @@ mod tests {
                 lambdas: Array1::zeros(0),
             },
         ];
-        let mut beta_joint = Array1::zeros(1 + beta_wiggle.len());
-        beta_joint[0] = beta_eta;
-        beta_joint.slice_mut(s![1..]).assign(&beta_wiggle);
         fit_result.beta = beta_joint;
         let mut payload = test_payload(
             "y ~ 1",
@@ -12396,49 +11570,35 @@ mod tests {
             2,
         );
 
-        let args = PredictArgs {
-            model: PathBuf::from("unused_model.json"),
-            new_data: PathBuf::from("unused_data.csv"),
-            out: PathBuf::from("unused_pred.csv"),
-            offset_column: None,
-            noise_offset_column: None,
-            uncertainty: false,
-            level: 0.95,
-            covariance_mode: CovarianceModeArg::Corrected,
-            mode: PredictModeArg::PosteriorMean,
+        let predictor = model.predictor().expect("predictor");
+        let fit = super::fit_result_from_saved_model_for_prediction(&model).expect("fit result");
+        let input = super::PredictInput {
+            design: super::DesignMatrix::from(Array2::<f64>::ones((3, 1))),
+            offset: Array1::zeros(3),
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
         };
-        let design = Array2::<f64>::ones((3, 1));
-        let (eta, mean, eta_se, mean_lo, mean_hi) = predict_standard_linkwiggle(
-            &args,
-            &model,
-            LikelihoodFamily::BinomialLogit,
-            model.fit_result.as_ref().expect("fit result"),
-            &design,
-            &Array1::zeros(design.nrows()),
-            &InverseLink::Standard(LinkFunction::Logit),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("predict standard binomial wiggle");
-        assert_eq!(eta.len(), 3);
+        let out = predictor
+            .predict_posterior_mean(&input, &fit, Some(0.95))
+            .expect("predict standard binomial wiggle");
+        assert_eq!(out.eta.len(), 3);
         assert_eq!(
-            eta_se.as_ref().map(|v| v.len()),
+            Some(out.eta_standard_error.len()),
             Some(3),
             "posterior-mean wiggle path should emit effective SE"
         );
         assert_eq!(
-            mean_lo.as_ref().map(|v| v.len()),
+            out.mean_lower.as_ref().map(|v| v.len()),
             Some(3),
             "posterior-mean wiggle path should emit lower bounds"
         );
         assert_eq!(
-            mean_hi.as_ref().map(|v| v.len()),
+            out.mean_upper.as_ref().map(|v| v.len()),
             Some(3),
             "posterior-mean wiggle path should emit upper bounds"
         );
-        for &m in &mean {
+        for &m in &out.mean {
             assert!(m.is_finite());
             assert!(m > 0.0 && m < 1.0);
         }
@@ -12461,13 +11621,16 @@ mod tests {
             knots.to_vec(),
             2,
         );
+        let data = ndarray::Array2::<f64>::zeros((3, 0));
+        let headers = vec![];
         let mut progress = gam::visualizer::VisualizerSession::new(false);
-        let spec = run_generate_standard(
+        let spec = super::run_generate_unified(
             &mut progress,
             &model,
-            ndarray::Array2::<f64>::zeros((3, 0)).view(),
+            data.view(),
             &HashMap::new(),
-            Some(&vec![]),
+            Some(&headers),
+            &Array1::zeros(3),
             &Array1::zeros(3),
             false,
         )
@@ -12531,7 +11694,7 @@ mod tests {
                 beta_draws[[i, j]] = beta_link_wiggle[j] + cov_diag[2 + j].max(0.0).sqrt() * zw;
             }
         }
-        let wiggle_design = saved_linkwiggle_design(&q0_draws, model)
+        let wiggle_design = test_saved_linkwiggle_design(&q0_draws, model)
             .expect("wiggle design")
             .expect("wiggle model should produce basis");
         let mut acc = 0.0;
@@ -13482,7 +12645,7 @@ mod tests {
         let headers = vec![];
         let col_map = HashMap::new();
         let mut progress = gam::visualizer::VisualizerSession::new(false);
-        let spec = run_generate_gaussian_location_scale(
+        let spec = super::run_generate_unified(
             &mut progress,
             &model,
             data.view(),
@@ -13490,6 +12653,7 @@ mod tests {
             Some(&headers),
             &Array1::zeros(data.nrows()),
             &Array1::zeros(data.nrows()),
+            false,
         )
         .expect("generate gaussian location-scale");
         assert_eq!(spec.mean.to_vec(), vec![-3.0, -3.0]);
@@ -15630,14 +14794,14 @@ mod tests {
         payload.beta_link_wiggle = Some(beta_link_wiggle.clone());
         let model = SavedModel::from_payload(payload);
 
-        let exact = saved_linkwiggle_derivative_q0(&q0, &model).expect("exact derivative");
-        let constrained_deriv = saved_linkwiggle_design(&q0, &model)
+        let exact = test_saved_linkwiggle_derivative_q0(&q0, &model).expect("exact derivative");
+        let constrained_deriv = test_saved_linkwiggle_design(&q0, &model)
             .expect("design path should succeed")
             .expect("wiggle design")
             .ncols();
         assert_eq!(constrained_deriv, beta_link_wiggle.len());
 
-        let d_basis = super::saved_linkwiggle_basis(&q0, &model, BasisOptions::first_derivative())
+        let d_basis = test_saved_linkwiggle_basis(&q0, &model, BasisOptions::first_derivative())
             .expect("derivative basis")
             .expect("wiggle derivative basis");
         let expected = d_basis.dot(&Array1::from_vec(beta_link_wiggle)) + 1.0;
@@ -15808,7 +14972,7 @@ mod tests {
         );
         payload.link = Some("probit".to_string());
         let model = SavedModel::from_payload(payload);
-        let design = saved_linkwiggle_design(&q0, &model).expect("wiggle design");
+        let design = test_saved_linkwiggle_design(&q0, &model).expect("wiggle design");
         assert!(design.is_none());
     }
 
