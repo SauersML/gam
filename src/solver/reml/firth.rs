@@ -85,7 +85,7 @@ impl<'a> RemlState<'a> {
 
     #[inline]
     fn logit_fisher_weight_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
-        let jet = logit_inverse_link_jet5(eta.clamp(-700.0, 700.0));
+        let jet = logit_inverse_link_jet5(eta);
         (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
     }
 
@@ -1090,7 +1090,7 @@ mod tests {
     use ndarray::{Array1, Array2, array};
 
     fn logisticweight(eta: f64) -> f64 {
-        logit_inverse_link_jet5(eta.clamp(-700.0, 700.0)).d1
+        logit_inverse_link_jet5(eta).d1
     }
 
     fn d1fd(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {

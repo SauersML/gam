@@ -2216,6 +2216,25 @@ mod tests {
             .run(&mut obj, "test gradient mismatch")
             .expect_err("mismatched gradient length should fail cleanly");
         assert!(
+            err.to_string()
+                .contains("all candidate seeds failed full outer verification"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn finite_outer_eval_reports_gradient_length_mismatch() {
+        let err = finite_outer_eval_or_error(
+            "test gradient mismatch",
+            OuterThetaLayout::new(2, 0),
+            OuterEval {
+                cost: 0.0,
+                gradient: Array1::zeros(1),
+                hessian: HessianResult::Unavailable,
+            },
+        )
+        .expect_err("gradient mismatch should be rejected");
+        assert!(
             err.to_string().contains("outer gradient length mismatch"),
             "unexpected error: {err}"
         );
