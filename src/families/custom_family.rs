@@ -10617,6 +10617,33 @@ mod tests {
     }
 
     #[test]
+    fn quadratic_linear_constraints_release_merged_group_with_unsorted_active_positions() {
+        let hessian = array![[1.0]];
+        let rhs = array![1.0];
+        let beta_start = array![0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0], [2.0], [-1.0]],
+            b: array![0.0, 0.0, -0.1],
+        };
+
+        let (beta, active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            Some(&[2, 0, 1]),
+        )
+        .expect("merged active group release should handle unsorted active positions");
+
+        assert!(
+            (beta[0] - 0.1).abs() <= 1e-10,
+            "expected constrained optimum at upper bound 0.1, got {}",
+            beta[0]
+        );
+        assert_eq!(active, vec![2]);
+    }
+
+    #[test]
     fn quadratic_linear_constraints_accept_boundary_kkt_after_rank_reduction() {
         let hessian = array![[2.0]];
         let rhs = array![0.0];

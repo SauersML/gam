@@ -1728,11 +1728,15 @@ struct BernoulliMarginalSlopeExactEvalCache {
 }
 
 /// Maximum exact outer-Hessian row work proxy before downgrading to
-/// first-order. The rho-only exact Hessian path pays for repeated
-/// coefficient-space pullbacks, first-order rho drifts, and second-order
-/// rho/rho directional derivatives, so the gate needs to account for more
-/// than just primary-space width.
-const EXACT_OUTER_MAX_ROW_WORK: u64 = 1_000_000;
+/// first-order.
+///
+/// Rigid models still pay dense coefficient-space pullbacks and need a tight
+/// budget. Flexible score/link deviation models use row-local directional
+/// kernels whose coefficient transport is linear in realized block width, so
+/// they can sustain a meaningfully larger budget before second-order becomes a
+/// bad trade.
+const EXACT_OUTER_MAX_ROW_WORK_RIGID: u64 = 1_000_000;
+const EXACT_OUTER_MAX_ROW_WORK_FLEX: u64 = 20_000_000;
 
 /// Row-loop gate for Bernoulli marginal-slope.  The memory gate is handled
 /// by [`cost_gated_outer_order`] at the call site.
@@ -1747,6 +1751,7 @@ fn bernoulli_row_work_order(
     let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
     let k_directional = k.saturating_add(k_pairs).saturating_add(k_pairs);
     let total_coeffs: u64 = specs.iter().map(|s| s.design.ncols() as u64).sum();
+    let rigid = score_warp_dim == 0 && link_dev_dim == 0;
     let primary_total = 2u64
         .saturating_add(score_warp_dim as u64)
         .saturating_add(link_dev_dim as u64);
@@ -1754,16 +1759,26 @@ fn bernoulli_row_work_order(
     // rho-directional derivative; the cheap part is only the per-row primary
     // derivatives. Flexible models pay both coefficient-space and
     // primary-space tensor work.
-    let effective_primary_cost = if score_warp_dim == 0 && link_dev_dim == 0 {
+    let effective_primary_cost = if rigid {
         1u64
     } else {
         primary_total.saturating_mul(primary_total)
     };
+    let coefficient_cost = if rigid {
+        total_coeffs.saturating_mul(total_coeffs)
+    } else {
+        total_coeffs
+    };
     let row_work = n
-        .saturating_mul(total_coeffs.saturating_mul(total_coeffs))
+        .saturating_mul(coefficient_cost)
         .saturating_mul(k_directional)
         .saturating_mul(effective_primary_cost);
-    if row_work > EXACT_OUTER_MAX_ROW_WORK {
+    let budget = if rigid {
+        EXACT_OUTER_MAX_ROW_WORK_RIGID
+    } else {
+        EXACT_OUTER_MAX_ROW_WORK_FLEX
+    };
+    if row_work > budget {
         ExactOuterDerivativeOrder::First
     } else {
         ExactOuterDerivativeOrder::Second
@@ -8312,7 +8327,7 @@ mod tests {
             dummy_penalized_blockspec(2, 8, 1),
             dummy_penalized_blockspec(1, 8, 1),
         ];
-        // n=2_000 × p²=9 × directional terms=8 = 144_000 < 1M.
+        // Rigid gate: n=2_000 × p²=9 × directional terms=8 = 144_000 < 1M.
         assert_eq!(
             bernoulli_row_work_order(&rigid_specs, 2_000, 0, 0),
             ExactOuterDerivativeOrder::Second
@@ -8323,7 +8338,7 @@ mod tests {
             dummy_penalized_blockspec(1, 8, 0),
             dummy_penalized_blockspec(2, 8, 0),
         ];
-        // n=200 × p²=36 × directional terms=3 × primary²=16 = 345_600 < 1M.
+        // Flex gate: n=200 × p=6 × directional terms=3 × primary²=16 = 57_600 < 20M.
         assert_eq!(
             bernoulli_row_work_order(&flex_specs, 200, 2, 0),
             ExactOuterDerivativeOrder::Second
@@ -8347,7 +8362,7 @@ mod tests {
             dummy_penalized_blockspec(4, 8, 1),
             dummy_penalized_blockspec(8, 8, 1),
         ];
-        // n=1_000 × p²=324 × directional terms=15 × primary²=100 = 486M > 1M.
+        // Flex gate: n=1_000 × p=18 × directional terms=15 × primary²=100 = 27M > 20M.
         assert_eq!(
             bernoulli_row_work_order(&rich_specs, 1_000, 8, 0),
             ExactOuterDerivativeOrder::First

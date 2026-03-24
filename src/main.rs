@@ -570,6 +570,7 @@ fn blockwise_options_from_fit_args(
     _: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
+    options.use_outer_hessian = true;
     // User-facing nonlinear blockwise fits should persist explicit covariance so
     // posterior-mean and uncertainty prediction do not need to reconstruct it
     // from the saved Hessian on every load.

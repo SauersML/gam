@@ -11046,10 +11046,15 @@ impl SurvivalMarginalSlopeFamily {
 // ── CustomFamily impl ─────────────────────────────────────────────────
 
 /// Maximum exact outer-Hessian row work proxy before downgrading to
-/// first-order. Survival pays for repeated coefficient-space pullbacks and
-/// rho-directional Hessian transports, so the gate needs to account for more
-/// than just primary-space width.
-const EXACT_OUTER_MAX_ROW_WORK: u64 = 2_000_000;
+/// first-order.
+///
+/// Rigid survival fits still pay dense coefficient pullbacks and keep a tight
+/// budget. Flexible time/link/score models use row-local directional kernels
+/// whose coefficient transport is linear in realized block width, so they can
+/// afford a larger exact second-order window before BFGS becomes the better
+/// trade.
+const EXACT_OUTER_MAX_ROW_WORK_RIGID: u64 = 2_000_000;
+const EXACT_OUTER_MAX_ROW_WORK_FLEX: u64 = 40_000_000;
 
 fn survival_row_work_order(
     family: &SurvivalMarginalSlopeFamily,
@@ -11060,21 +11065,32 @@ fn survival_row_work_order(
     let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
     let k_directional = k.saturating_add(k_pairs).saturating_add(k_pairs);
     let total_coeffs: u64 = specs.iter().map(|s| s.design.ncols() as u64).sum();
+    let rigid = !family.flex_active() && !family.flex_timewiggle_active();
     let primary_total = if family.flex_active() {
         flex_primary_slices(family).total as u64
     } else {
         N_PRIMARY as u64
     };
-    let effective_primary_cost = if !family.flex_active() && !family.flex_timewiggle_active() {
+    let effective_primary_cost = if rigid {
         1u64
     } else {
         primary_total.saturating_mul(primary_total)
     };
+    let coefficient_cost = if rigid {
+        total_coeffs.saturating_mul(total_coeffs)
+    } else {
+        total_coeffs
+    };
     let row_work = n
-        .saturating_mul(total_coeffs.saturating_mul(total_coeffs))
+        .saturating_mul(coefficient_cost)
         .saturating_mul(k_directional)
         .saturating_mul(effective_primary_cost);
-    if row_work > EXACT_OUTER_MAX_ROW_WORK {
+    let budget = if rigid {
+        EXACT_OUTER_MAX_ROW_WORK_RIGID
+    } else {
+        EXACT_OUTER_MAX_ROW_WORK_FLEX
+    };
+    if row_work > budget {
         ExactOuterDerivativeOrder::First
     } else {
         ExactOuterDerivativeOrder::Second
@@ -12679,7 +12695,7 @@ mod tests {
     fn exact_outer_row_work_gate_downgrades_large_timewiggle_link_models() {
         let link_runtime = test_deviation_runtime();
         let family = SurvivalMarginalSlopeFamily {
-            n: 40,
+            n: 80,
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0]),
