@@ -12447,10 +12447,12 @@ mod tests {
                 SchemaColumn {
                     name: "x".to_string(),
                     kind: ColumnKindTag::Continuous,
+                    levels: Vec::new(),
                 },
                 SchemaColumn {
                     name: "y".to_string(),
                     kind: ColumnKindTag::Binary,
+                    levels: Vec::new(),
                 },
             ],
         });

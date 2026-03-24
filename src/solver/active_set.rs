@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerArrayView, FaerLinalgError, array1_to_col_matmut};
+use crate::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col_matmut};
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::{Side, Unbind};
@@ -89,6 +89,53 @@ fn solve_symmetric_system(
     Err(EstimationError::InvalidInput(
         "symmetric system solve produced non-finite values".to_string(),
     ))
+}
+
+fn solve_dense_system_via_pseudoinverse(
+    matrix: &Array2<f64>,
+    rhs: &Array1<f64>,
+    out: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
+    if matrix.nrows() != matrix.ncols() || rhs.len() != matrix.nrows() {
+        return Err(EstimationError::InvalidInput(
+            "dense pseudoinverse solve dimension mismatch".to_string(),
+        ));
+    }
+
+    let (u_opt, singular, vt_opt) = matrix.svd(true, true).map_err(|_| {
+        EstimationError::InvalidInput("dense pseudoinverse solve SVD failed".to_string())
+    })?;
+    let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
+        return Err(EstimationError::InvalidInput(
+            "dense pseudoinverse solve missing singular vectors".to_string(),
+        ));
+    };
+
+    let max_singular = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let tol = 100.0
+        * f64::EPSILON
+        * (matrix.nrows().max(matrix.ncols()).max(1) as f64)
+        * max_singular.max(1.0);
+    let mut coeff = u.t().dot(rhs);
+    for (idx, value) in coeff.iter_mut().enumerate() {
+        let sigma = singular[idx];
+        if sigma.abs() > tol {
+            *value /= sigma;
+        } else {
+            *value = 0.0;
+        }
+    }
+    let solution = vt.t().dot(&coeff);
+    if !array1_is_finite(&solution) {
+        return Err(EstimationError::InvalidInput(
+            "dense pseudoinverse solve produced non-finite values".to_string(),
+        ));
+    }
+    if out.len() != solution.len() {
+        *out = Array1::zeros(solution.len());
+    }
+    out.assign(&solution);
+    Ok(())
 }
 
 pub(crate) fn compute_constraint_kkt_diagnostics(
@@ -214,15 +261,14 @@ pub(crate) fn solve_kkt_direction(
             rhs[p + i] = residual[i];
         }
     }
+    let rhs_target = rhs.clone();
 
     let kkt_view = FaerArrayView::new(&kkt);
     let factor = FaerLblt::new(kkt_view.as_ref(), Side::Lower);
     let mut rhs_col = array1_to_col_matmut(&mut rhs);
     factor.solve_in_place(rhs_col.as_mut());
     if !rhs.iter().all(|v| v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "KKT solve produced non-finite values".to_string(),
-        ));
+        solve_dense_system_via_pseudoinverse(&kkt, &rhs_target, &mut rhs)?;
     }
     let d = rhs.slice(s![0..p]).to_owned();
     let lambda = rhs.slice(s![p..(p + m)]).to_owned();
@@ -459,6 +505,24 @@ pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
     })
 }
 
+fn canonicalize_active_constraint_ids(
+    x: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    active: &[usize],
+) -> Result<Vec<usize>, EstimationError> {
+    if active.is_empty() {
+        return Ok(Vec::new());
+    }
+    let compressed_working = compress_active_working_set(x, constraints, active)?;
+    let mut canonical = Vec::with_capacity(compressed_working.groups.len());
+    for group in &compressed_working.groups {
+        if let Some(&active_pos) = group.first() {
+            canonical.push(active[active_pos]);
+        }
+    }
+    Ok(canonical)
+}
+
 pub(crate) fn solve_newton_direction_with_linear_constraints(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -582,7 +646,11 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
             }
             if let Some(hint) = active_hint {
                 hint.clear();
-                hint.extend(active.iter().copied());
+                hint.extend(canonicalize_active_constraint_ids(
+                    &x,
+                    constraints,
+                    &active,
+                )?);
             }
             direction_out.assign(&d_total);
             return Ok(());
@@ -664,7 +732,11 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
     {
         if let Some(hint) = active_hint {
             hint.clear();
-            hint.extend(last_working_active.iter().copied());
+            hint.extend(canonicalize_active_constraint_ids(
+                &last_working_x,
+                constraints,
+                &last_working_active,
+            )?);
         }
         direction_out.assign(&last_working_direction);
         return Ok(());
