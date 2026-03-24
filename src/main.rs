@@ -14586,7 +14586,7 @@ mod tests {
             rate: None,
             makeham: None,
         };
-        let (eta_entry, eta_exit, _) =
+        let (eta_entry, eta_exit, derivative_exit) =
             super::build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)
                 .expect("baseline offsets");
         let wiggle_cfg = parse_linkwiggle_formulaspec(
@@ -14600,7 +14600,7 @@ mod tests {
         let built = super::build_survival_timewiggle_from_baseline(
             &eta_entry,
             &eta_exit,
-            &Array1::ones(eta_exit.len()),
+            &derivative_exit,
             &wiggle_cfg,
         )
         .expect("baseline-timewiggle build");
