@@ -1225,33 +1225,6 @@ pub fn affine_anchor_moment_vector(
     out
 }
 
-fn affine_zero_moment(alpha: f64, beta: f64, left: f64, right: f64) -> f64 {
-    let s = (1.0 + beta * beta).sqrt();
-    let mu = -alpha * beta / (1.0 + beta * beta);
-    let y_left = if left.is_infinite() {
-        if left.is_sign_positive() {
-            f64::INFINITY
-        } else {
-            f64::NEG_INFINITY
-        }
-    } else {
-        s * (left - mu)
-    };
-    let y_right = if right.is_infinite() {
-        if right.is_sign_positive() {
-            f64::INFINITY
-        } else {
-            f64::NEG_INFINITY
-        }
-    } else {
-        s * (right - mu)
-    };
-    let anchor = (-alpha * alpha / (2.0 * s * s)).exp() / s;
-    let span_mass =
-        (2.0 * std::f64::consts::PI).sqrt() * (normal_cdf(y_right) - normal_cdf(y_left));
-    anchor * span_mass
-}
-
 fn affine_value_from_moment_primitive(alpha: f64, beta: f64, left: f64, right: f64) -> f64 {
     // Exact formula via bivariate normal CDF.
     //

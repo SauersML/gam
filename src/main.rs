@@ -59,7 +59,7 @@ use gam::mixture_link::{
 use gam::predict::{
     PredictableModel, predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
-use gam::probability::{normal_cdf, standard_normal_quantile, try_inverse_link_array};
+use gam::probability::{normal_cdf, standard_normal_quantile};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
     SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
@@ -4677,38 +4677,6 @@ fn saved_linkwiggle_basis(
             runtime.constrained_basis(q0, basis_options).map(Some)
         }
     }
-}
-
-fn saved_linkwiggle_basisrow_scalar(q0: f64, model: &SavedModel) -> Result<Array1<f64>, String> {
-    model
-        .saved_link_wiggle()?
-        .ok_or_else(|| {
-            "saved model is missing link-wiggle metadata while wiggle path requested".to_string()
-        })?
-        .basis_row_scalar(q0)
-}
-
-fn invert_2x2with_jitter(a11: f64, a12: f64, a22: f64) -> [[f64; 2]; 2] {
-    let mut d11 = a11.max(0.0);
-    let mut d22 = a22.max(0.0);
-    let mut d12 = a12;
-    for retry in 0..8 {
-        let jitter = if retry == 0 {
-            0.0
-        } else {
-            1e-12 * 10f64.powi((retry - 1) as i32)
-        };
-        let e11 = d11 + jitter;
-        let e22 = d22 + jitter;
-        let det = e11 * e22 - d12 * d12;
-        if det.is_finite() && det > 1e-24 {
-            return [[e22 / det, -d12 / det], [-d12 / det, e11 / det]];
-        }
-        d12 *= 0.999;
-        d11 = d11.max(1e-16);
-        d22 = d22.max(1e-16);
-    }
-    [[1.0 / d11.max(1e-8), 0.0], [0.0, 1.0 / d22.max(1e-8)]]
 }
 
 fn saved_linkwiggle_derivative_q0(
@@ -10518,74 +10486,6 @@ where
 {
     let local = rowwise_local_covariances(backend, n_rows, 1, |rows| Ok(vec![build_chunk(rows)?]))?;
     Ok(local[0][0].mapv(|v| v.max(0.0).sqrt()))
-}
-
-fn projected_two_block_covariance_from_backend(
-    design_first: &Array2<f64>,
-    design_second: &Array2<f64>,
-    backend: &PredictionCovarianceBackend<'_>,
-    p_first: usize,
-    p_second: usize,
-    label: &str,
-) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
-    let p_total = p_first + p_second;
-    if backend.nrows() != p_total {
-        return Err(format!(
-            "{label} covariance/backend dimension mismatch: expected parameter dimension {}, got {}",
-            p_total,
-            backend.nrows()
-        ));
-    }
-    if design_first.ncols() != p_first || design_second.ncols() != p_second {
-        return Err(format!(
-            "{label} design dimension mismatch: first block has {} columns (expected {}), second block has {} columns (expected {})",
-            design_first.ncols(),
-            p_first,
-            design_second.ncols(),
-            p_second
-        ));
-    }
-    let local = rowwise_local_covariances(backend, design_first.nrows(), 2, |rows| {
-        let first = design_first.slice(s![rows.clone(), ..]).to_owned();
-        let second = design_second.slice(s![rows, ..]).to_owned();
-        let rows_in_chunk = first.nrows();
-        let mut first_embed = Array2::<f64>::zeros((rows_in_chunk, p_total));
-        let mut second_embed = Array2::<f64>::zeros((rows_in_chunk, p_total));
-        first_embed.slice_mut(s![.., 0..p_first]).assign(&first);
-        second_embed
-            .slice_mut(s![.., p_first..p_total])
-            .assign(&second);
-        Ok(vec![first_embed, second_embed])
-    })?;
-    Ok((
-        local[0][0].mapv(|v| v.max(0.0)),
-        local[1][1].mapv(|v| v.max(0.0)),
-        local[0][1].clone(),
-    ))
-}
-
-fn backend_covariance_columns(
-    backend: &PredictionCovarianceBackend<'_>,
-    total_dim: usize,
-    start: usize,
-    width: usize,
-    label: &str,
-) -> Result<Array2<f64>, String> {
-    if start + width > total_dim {
-        return Err(format!(
-            "{label} block request {}..{} exceeds parameter dimension {}",
-            start,
-            start + width,
-            total_dim
-        ));
-    }
-    let mut rhs = Array2::<f64>::zeros((total_dim, width));
-    for j in 0..width {
-        rhs[[start + j, j]] = 1.0;
-    }
-    backend
-        .apply_columns(&rhs)
-        .map_err(|e| format!("{label} covariance application failed: {e}"))
 }
 
 fn covariance_from_model(
