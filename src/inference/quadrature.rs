@@ -1199,8 +1199,14 @@ fn logit_posterior_meanwith_deriv_controlled(
     }
     match logit_posterior_meanwith_deriv_exact(mu, sigma) {
         Ok(out) => {
+            // Safety-net drift check: the analytic backends are already
+            // validated within their regime, so we only override when the
+            // result is catastrophically wrong (not for sub-1e-6 precision
+            // differences).  GHQ itself has finite accuracy, so comparing
+            // at 5e-11 produces false positives that silently change the
+            // backend to QuadratureFallback.
             let ghq = logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
-            if integrated_mean_derivative_drift_exceeds(&out, &ghq, 5e-11, 5e-8, 5e-11, 5e-7) {
+            if integrated_mean_derivative_drift_exceeds(&out, &ghq, 1e-6, 1e-4, 1e-5, 1e-3) {
                 Ok(ghq)
             } else {
                 Ok(out)
@@ -2372,8 +2378,9 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
             mode,
         }
     };
+    // Safety-net drift check with loose tolerances — see logit comment.
     let ghq = cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
-    if integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 5e-11, 5e-8, 5e-11, 5e-7) {
+    if integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 1e-6, 1e-4, 1e-5, 1e-3) {
         ghq
     } else {
         candidate
