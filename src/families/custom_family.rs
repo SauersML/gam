@@ -5282,8 +5282,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         .beta
                         .scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
                     // Project to feasible region (e.g. monotonicity for deviation blocks).
-                    let projected =
-                        family.post_update_block_beta(&states, b, &specs[b], states[b].beta.clone())?;
+                    let projected = family.post_update_block_beta(
+                        &states,
+                        b,
+                        &specs[b],
+                        states[b].beta.clone(),
+                    )?;
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;

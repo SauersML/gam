@@ -2494,6 +2494,32 @@ fn compute_constraint_kkt_diagnostics(
     active_set::compute_constraint_kkt_diagnostics(beta, gradient, constraints)
 }
 
+#[cfg(test)]
+fn compress_activeworking_set(
+    x: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    active: &[usize],
+) -> Result<active_set::CompressedActiveWorkingSet, EstimationError> {
+    active_set::compress_active_working_set(x, constraints, active)
+}
+
+#[cfg(test)]
+fn working_set_kkt_diagnostics_frommultipliers(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    working_constraints: &LinearInequalityConstraints,
+    lambda_active_true: &Array1<f64>,
+    n_total_constraints: usize,
+) -> Result<ConstraintKktDiagnostics, EstimationError> {
+    active_set::working_set_kkt_diagnostics_from_multipliers(
+        x,
+        gradient,
+        working_constraints,
+        lambda_active_true,
+        n_total_constraints,
+    )
+}
+
 fn solve_newton_directionwith_lower_bounds(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -6857,12 +6883,13 @@ mod tests {
     use super::{
         InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet,
-        calculate_deviance, compress_activeworking_set, compute_constraint_kkt_diagnostics,
+        calculate_deviance, compute_constraint_kkt_diagnostics,
         compute_observed_hessian_curvature_arrays, default_beta_guess_external,
         fit_model_for_fixed_rho, should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        update_glmvectors, working_set_kkt_diagnostics_frommultipliers,
+        update_glmvectors,
     };
+    use crate::solver::active_set;
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
     use crate::types::{
