@@ -6447,6 +6447,12 @@ fn joint_outer_evaluate(
             )
         };
 
+    let expected_theta_dim = rho.len()
+        + ext_bundle
+            .as_ref()
+            .map(|bundle| bundle.coords.len())
+            .unwrap_or(0);
+
     let (objective, grad, outer_hessian) = unified_joint_cost_gradient(
         inner,
         specs,
@@ -6472,11 +6478,30 @@ fn joint_outer_evaluate(
     if grad.iter().any(|value| !value.is_finite()) {
         return Err("joint outer evaluation produced a non-finite gradient".to_string());
     }
+    if grad.len() != expected_theta_dim {
+        return Err(format!(
+            "joint outer evaluation returned gradient length {}, expected {}",
+            grad.len(),
+            expected_theta_dim
+        ));
+    }
     if outer_hessian
         .as_ref()
         .is_some_and(|hessian| hessian.iter().any(|value| !value.is_finite()))
     {
         return Err("joint outer evaluation produced a non-finite Hessian".to_string());
+    }
+    if outer_hessian.as_ref().is_some_and(|hessian| {
+        hessian.nrows() != expected_theta_dim || hessian.ncols() != expected_theta_dim
+    }) {
+        let hessian = outer_hessian.as_ref().expect("checked is_some above");
+        return Err(format!(
+            "joint outer evaluation returned Hessian shape {}x{}, expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            expected_theta_dim,
+            expected_theta_dim
+        ));
     }
 
     let warm = ConstrainedWarmStart {
