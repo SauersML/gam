@@ -7763,12 +7763,18 @@ mod tests {
                     .runtime
                     .local_cubic_at(&beta, x)
                     .expect("lookup cubic at x");
-                if x <= support_left || x >= support_right {
+                if x < support_left || x > support_right {
+                    // Strictly outside support: tail saturation — constant
+                    // value, zero slope and curvature.
                     assert!(selected.c1.abs() < 1e-12);
                     assert!(selected.c2.abs() < 1e-12);
                     assert!(selected.c3.abs() < 1e-12);
                     assert!((selected.evaluate(x) - expected[i]).abs() < 1e-10);
                 } else {
+                    // Interior or exact boundary point: uses the interior
+                    // span polynomial (value is correct, but c2 may be
+                    // nonzero at the boundary — that is continuity, not
+                    // saturation).
                     let expected_span_idx = if i + 1 == x_eval.len() && span_idx + 1 < n_spans {
                         span_idx + 1
                     } else {
@@ -7818,7 +7824,8 @@ mod tests {
                 .runtime
                 .basis_cubic_at(basis_idx, x)
                 .expect("basis cubic at x");
-            if x <= support_left || x >= support_right {
+            if x < support_left || x > support_right {
+                // Strictly outside support: tail saturation.
                 assert!(selected.c1.abs() < 1e-12);
                 assert!(selected.c2.abs() < 1e-12);
                 assert!(selected.c3.abs() < 1e-12);
@@ -8041,12 +8048,8 @@ mod tests {
         .expect("microcells");
 
         for cell in &cells {
-            let z = match (cell.cell.left.is_finite(), cell.cell.right.is_finite()) {
-                (true, true) => 0.5 * (cell.cell.left + cell.cell.right),
-                (false, true) => cell.cell.right - 1.0,
-                (true, false) => cell.cell.left + 1.0,
-                (false, false) => panic!("microcell cannot be infinite on both sides"),
-            };
+            let z = exact_kernel::interval_probe_point(cell.cell.left, cell.cell.right)
+                .expect("finite microcell probe");
             let h = score_prepared
                 .runtime
                 .design(&array![z])

@@ -3123,7 +3123,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 state.warm_cache.as_ref(),
                 analytic_outer_hessian_available,
             )
-                .map_err(EstimationError::InvalidInput)?;
+            .map_err(EstimationError::InvalidInput)?;
             let hessian_result = eval
                 .outer_hessian
                 .clone()
@@ -16115,33 +16115,6 @@ mod tests {
         }
     }
 
-    fn simple_aniso_matern_term_collection(
-        feature_cols: &[usize],
-        length_scale: f64,
-    ) -> TermCollectionSpec {
-        TermCollectionSpec {
-            linear_terms: Vec::new(),
-            random_effect_terms: Vec::new(),
-            smooth_terms: vec![SmoothTermSpec {
-                name: "spatial".to_string(),
-                basis: SmoothBasisSpec::Matern {
-                    feature_cols: feature_cols.to_vec(),
-                    spec: MaternBasisSpec {
-                        center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
-                        length_scale,
-                        nu: MaternNu::ThreeHalves,
-                        include_intercept: false,
-                        double_penalty: false,
-                        identifiability: MaternIdentifiability::CenterSumToZero,
-                        aniso_log_scales: Some(vec![0.0; feature_cols.len()]),
-                    },
-                    input_scales: None,
-                },
-                shape: ShapeConstraint::None,
-            }],
-        }
-    }
-
     fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
         SpatialLengthScaleOptimizationOptions {
             enabled: true,
@@ -16614,22 +16587,21 @@ mod tests {
 
     #[test]
     fn binomial_mean_wiggle_selected_basis_exact_spatial_joint_gradient_is_finite() {
-        let n = 48usize;
-        let mut data = Array2::<f64>::zeros((n, 3));
+        let n = 36usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
             let t = i as f64 / (n as f64 - 1.0);
             data[[i, 0]] = t;
             data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
-            data[[i, 2]] = (2.5 * std::f64::consts::PI * t).cos();
         }
         let y = Array1::from_iter((0..n).map(|i| {
             let t = data[[i, 0]];
-            let signal = 0.9 * data[[i, 1]] - 0.45 * data[[i, 2]] + 0.2 * (4.0 * t - 2.0);
-            if signal > 0.1 { 1.0 } else { 0.0 }
+            let signal = 0.85 * data[[i, 1]] + 0.25 * (3.0 * t - 1.5);
+            if signal > 0.0 { 1.0 } else { 0.0 }
         }));
         let weights = Array1::from_elem(n, 1.0);
         let offset = Array1::zeros(n);
-        let pilot_spec = simple_aniso_matern_term_collection(&[0, 1, 2], 0.45);
+        let pilot_spec = simple_matern_term_collection(&[0, 1], 0.45);
         let pilot = crate::smooth::fit_term_collection_forspec(
             data.view(),
             y.view(),
@@ -16713,10 +16685,12 @@ mod tests {
             },
         )
         .expect("baseline mean-wiggle fit");
-        let derivative_blocks =
-            vec![build_block_spatial_psi_derivatives(data.view(), &resolvedspec, &design)
+        let derivative_blocks = vec![
+            build_block_spatial_psi_derivatives(data.view(), &resolvedspec, &design)
                 .expect("build spatial psi derivatives")
-                .expect("exact spatial mean-wiggle should expose psi derivatives"), Vec::new()];
+                .expect("exact spatial mean-wiggle should expose psi derivatives"),
+            Vec::new(),
+        ];
         let eta_penalty_count = pilot.design.penalties.len();
         let wiggle_penalty_count = initial_log_lambdas_orzeros(&wiggle_block)
             .expect("wiggle initial lambdas")

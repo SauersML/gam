@@ -405,6 +405,22 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
         group.dedup();
     }
 
+    let mut row_order: Vec<usize> = (0..groups_out.len()).collect();
+    row_order.sort_by_key(|&idx| groups_out[idx].first().copied().unwrap_or(usize::MAX));
+    if row_order.iter().enumerate().any(|(idx, &orig)| idx != orig) {
+        let mut a_sorted = Array2::<f64>::zeros((rank, p));
+        let mut b_sorted = Array1::<f64>::zeros(rank);
+        let mut groups_sorted = Vec::with_capacity(rank);
+        for (out_idx, orig_idx) in row_order.into_iter().enumerate() {
+            a_sorted.row_mut(out_idx).assign(&a_out.row(orig_idx));
+            b_sorted[out_idx] = b_out[orig_idx];
+            groups_sorted.push(groups_out[orig_idx].clone());
+        }
+        a_out = a_sorted;
+        b_out = b_sorted;
+        groups_out = groups_sorted;
+    }
+
     if rank < k {
         log::debug!(
             "rank-reduced active constraints from {} to {} rows (rank deficiency {})",

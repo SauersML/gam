@@ -14597,6 +14597,13 @@ mod tests {
             "timewiggle(degree=3, internal_knots=4)",
         )
         .expect("baseline-timewiggle cfg");
+        let built = super::build_survival_timewiggle_from_baseline(
+            &eta_entry,
+            &eta_exit,
+            &Array1::ones(eta_exit.len()),
+            &wiggle_cfg,
+        )
+        .expect("baseline-timewiggle build");
         let mut payload = test_payload(
             "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
             ModelKind::Survival,
@@ -14616,12 +14623,11 @@ mod tests {
             None,
             saved_fit_summary_stub(),
         ));
-        payload.baseline_timewiggle_knots =
-            Some(vec![-2.0, -2.0, -2.0, -2.0, -0.5, 0.5, 2.0, 2.0, 2.0, 2.0]);
-        payload.baseline_timewiggle_degree = Some(3);
+        payload.baseline_timewiggle_knots = Some(built.knots.to_vec());
+        payload.baseline_timewiggle_degree = Some(built.degree);
         payload.baseline_timewiggle_penalty_orders = Some(vec![1, 2, 3]);
         payload.baseline_timewiggle_double_penalty = Some(false);
-        payload.beta_baseline_timewiggle = Some(vec![0.0; 6]);
+        payload.beta_baseline_timewiggle = Some(vec![0.0; built.ncols]);
         payload.survival_entry = Some("entry".to_string());
         payload.survival_exit = Some("exit".to_string());
         payload.survival_event = Some("event".to_string());

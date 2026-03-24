@@ -9677,31 +9677,14 @@ fn duchon_radial_jets(
     // logarithmically and the Taylor carrier cannot represent t(r) accurately.
     // In that regime, keep the generic-path values at r_eval = r_floor.
     let smoothness_order = 2 * (p_order + s_order);
+    let collision_q_exists = smoothness_order > k_dim + 2;
     let collision_t_exists = smoothness_order > k_dim + 4;
     let collision_t_rr_exists = smoothness_order > k_dim + 6;
 
     if r < r_floor && collision_t_exists {
-        // When r is below the derivative evaluation floor the generic formulas
-        // were evaluated at the clamped r_eval = r_floor, not at the true r.
-        // Rather than trusting those surrogate values we switch entirely to the
-        // collision-limit Taylor expansion which is exact at r = 0 and stays
-        // accurate throughout the tiny-r region (r < r_floor ≈ 1e-5 * ℓ).
-        //
-        // This eliminates the jump discontinuity that previously existed at the
-        // boundary of the collision zone: the generic derivative path is used
-        // for all r >= r_floor (where r_eval == r), and the collision Taylor
-        // path is used for all r < r_floor, so both sides meet continuously at
-        // r = r_floor.
-        //
-        // Collision limits used:
-        //   phi_r(0)   = 0
-        //   q(0)       = phi_rr(0)
-        //   Delta phi(0) = d * phi_rr(0)
-        //   t(0)      = φ''''(0) / 3
-        //   q_rr(0)   = t(0)
-        //   lap_rr(0) = (d + 2) t(0)
-        //   t_r(0)    = 0
-        //   t_rr(0)   = φ⁽⁶⁾(0) / 15
+        // Tier 2+: full collision Taylor expansion using φ''(0), φ''''(0)/3,
+        // and optionally φ⁽⁶⁾(0)/15.  Replaces the generic r_floor path for
+        // all radial scalars in the near-origin region.
         let (analytic_phi_rr, _, _) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
         let analytic_t_collision =
@@ -9745,6 +9728,30 @@ fn duchon_radial_jets(
             out.lap = d * analytic_phi_rr;
             out.lap_r = 0.0;
             out.lap_rr = (d + 2.0) * analytic_t_collision;
+        }
+    } else if r < r_floor && collision_q_exists {
+        // Tier 1: only lower-order collision identities exist.  φ''(0) is
+        // finite but φ''''(0) diverges logarithmically at this smoothness
+        // order.  Override phi_r, phi_rr, q, q_r, lap, lap_r with exact
+        // values; leave t, t_r, t_rr, q_rr, lap_rr at their generic-path
+        // values from r_eval = r_floor (best available for the divergent tier).
+        let (analytic_phi_rr, _, _) =
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
+        if r == 0.0 {
+            out.phi_r = 0.0;
+            out.phi_rr = analytic_phi_rr;
+            out.q = analytic_phi_rr;
+            out.q_r = 0.0;
+            out.lap = d * analytic_phi_rr;
+            out.lap_r = 0.0;
+        } else {
+            // 0 < r < r_floor: leading-order Taylor phi_r ≈ φ''(0)·r.
+            out.phi_r = analytic_phi_rr * r;
+            out.phi_rr = analytic_phi_rr;
+            out.q = analytic_phi_rr;
+            out.q_r = 0.0;
+            out.lap = d * analytic_phi_rr;
+            out.lap_r = 0.0;
         }
     }
     if !out.phi_r.is_finite()
@@ -16660,7 +16667,7 @@ mod tests {
     #[test]
     fn test_duchon_radial_jets_use_collision_limits_at_origin() {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
-        let s_order = 3usize;
+        let s_order = 4usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
@@ -16683,6 +16690,26 @@ mod tests {
         // t(0) should be finite (= φ''''(0) / 3) and is checked more
         // thoroughly in the dedicated t-field tests below.
         assert!((jets.t - t_collision).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_duchon_radial_jets_use_lower_order_collision_limits_at_origin() {
+        let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
+        let s_order = 3usize;
+        let k_dim = 4usize;
+        let length_scale = 0.85;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let jets = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
+            .expect("jets at origin");
+        let (phi_rr, _, _) =
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
+                .expect("collision phi_rr");
+
+        assert!(jets.phi_r.abs() < 1e-12);
+        assert!((jets.q - phi_rr).abs() < 1e-12);
+        assert!((jets.lap - k_dim as f64 * phi_rr).abs() < 1e-12);
+        assert!(jets.q_r.abs() < 1e-12);
+        assert!(jets.lap_r.abs() < 1e-12);
     }
 
     #[test]
@@ -16796,7 +16823,7 @@ mod tests {
     fn test_duchon_radial_jets_t_collision_matches_nearby() {
         // The collision limit t(0) should be close to t at small r.
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
-        let s_order = 3usize;
+        let s_order = 4usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
@@ -16825,7 +16852,7 @@ mod tests {
     #[test]
     fn test_duchon_radial_jets_t_derivative_collision_limits_are_exact() {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
-        let s_order = 3usize;
+        let s_order = 5usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
