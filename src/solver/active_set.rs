@@ -638,7 +638,9 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
                 }
             }
             if let Some(group_pos) = remove_pos {
-                for &active_pos in compressed_working.groups[group_pos].iter().rev() {
+                let mut removal_positions = compressed_working.groups[group_pos].clone();
+                removal_positions.sort_unstable_by(|left, right| right.cmp(left));
+                for active_pos in removal_positions {
                     let idx = active.remove(active_pos);
                     is_active[idx] = false;
                 }
