@@ -147,8 +147,7 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
         penalty_order: primary_order,
         double_penalty: cfg.double_penalty,
     };
-    let selected =
-        select_wiggle_basis_from_seed(knot_seed.view(), &effective_cfg, &extra_orders)?;
+    let selected = select_wiggle_basis_from_seed(knot_seed.view(), &effective_cfg, &extra_orders)?;
     let structure = selected.structure;
     let knots = selected.knots;
     let degree = selected.degree;
@@ -12286,7 +12285,9 @@ mod tests {
 
     #[test]
     fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
-        let z = array![-0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67];
+        let z = array![
+            -0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67
+        ];
         let weights = Array1::from_elem(12, 1.0);
         let standardized =
             standardize_latent_z(&z, &weights, "bernoulli-marginal-slope").expect("normalize z");
