@@ -475,15 +475,6 @@ fn canonicalize_active_constraint_ids(
     Ok(canonical)
 }
 
-fn reset_active_flags(is_active: &mut [bool], active: &[usize]) {
-    is_active.fill(false);
-    for &idx in active {
-        if idx < is_active.len() {
-            is_active[idx] = true;
-        }
-    }
-}
-
 fn fallback_projected_gradient_direction(
     x: &Array1<f64>,
     d_total: &Array1<f64>,
@@ -618,8 +609,6 @@ fn solve_newton_direction_with_linear_constraints_impl(
             is_active[i] = true;
         }
     }
-    active = canonicalize_active_constraint_ids(&x, constraints, &active)?;
-    reset_active_flags(&mut is_active, &active);
 
     for _ in 0..max_iterations {
         let compressed_working = compress_active_working_set(&x, constraints, &active)?;
@@ -704,10 +693,6 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 is_active[i] = true;
                 added_new_active = true;
             }
-        }
-        if added_new_active {
-            active = canonicalize_active_constraint_ids(&x, constraints, &active)?;
-            reset_active_flags(&mut is_active, &active);
         }
 
         if active.is_empty() && !added_new_active {
