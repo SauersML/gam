@@ -44,10 +44,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityConstraints};
 
-// Local alias used by internal tests/helpers.
-#[cfg(test)]
-type InverseLinkJet = MixtureInverseLinkJet;
-
 #[inline]
 fn array1_is_finite(values: &Array1<f64>) -> bool {
     values.iter().all(|v| v.is_finite())
@@ -2311,10 +2307,6 @@ pub(crate) fn sparse_reml_penalized_hessian(
     workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge)
 }
 
-// Phase 2 hook for targeted tests.
-#[cfg(test)]
-use sparse_reml_penalized_hessian as assemble_sparse_penalized_hessian;
-
 fn ensure_sparse_positive_definitewithridge<F>(
     mut assemble: F,
 ) -> Result<(SparseColMat<usize, f64>, f64), EstimationError>
@@ -2492,32 +2484,6 @@ fn compute_constraint_kkt_diagnostics(
     constraints: &LinearInequalityConstraints,
 ) -> ConstraintKktDiagnostics {
     active_set::compute_constraint_kkt_diagnostics(beta, gradient, constraints)
-}
-
-#[cfg(test)]
-fn compress_activeworking_set(
-    x: &Array1<f64>,
-    constraints: &LinearInequalityConstraints,
-    active: &[usize],
-) -> Result<active_set::CompressedActiveWorkingSet, EstimationError> {
-    active_set::compress_active_working_set(x, constraints, active)
-}
-
-#[cfg(test)]
-fn working_set_kkt_diagnostics_frommultipliers(
-    x: &Array1<f64>,
-    gradient: &Array1<f64>,
-    working_constraints: &LinearInequalityConstraints,
-    lambda_active_true: &Array1<f64>,
-    n_total_constraints: usize,
-) -> Result<ConstraintKktDiagnostics, EstimationError> {
-    active_set::working_set_kkt_diagnostics_from_multipliers(
-        x,
-        gradient,
-        working_constraints,
-        lambda_active_true,
-        n_total_constraints,
-    )
 }
 
 fn solve_newton_directionwith_lower_bounds(
@@ -3041,7 +3007,7 @@ where
         };
         let current_penalized = penalizedobjective(&state);
         #[cfg(test)]
-        record_penalized_deviance(current_penalized);
+        test_support::record_penalized_deviance(current_penalized);
 
         // Early exit: if the current state has non-finite gradient, the
         // model evaluation has overflowed (eta too extreme).  No Newton
@@ -3500,31 +3466,32 @@ where
 }
 
 #[cfg(test)]
-thread_local! {
-    static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
-        const { std::cell::RefCell::new(None) };
-}
+mod test_support {
+    thread_local! {
+        static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
-#[cfg(test)]
-pub fn capture_pirls_penalized_deviance<F, R>(run: F) -> (R, Vec<f64>)
-where
-    F: FnOnce() -> R,
-{
-    PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
-        *trace.borrow_mut() = Some(Vec::new());
-    });
-    let result = run();
-    let captured = PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| trace.borrow_mut().take().unwrap());
-    (result, captured)
-}
+    pub(super) fn capture_pirls_penalized_deviance<F, R>(run: F) -> (R, Vec<f64>)
+    where
+        F: FnOnce() -> R,
+    {
+        PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
+            *trace.borrow_mut() = Some(Vec::new());
+        });
+        let result = run();
+        let captured =
+            PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| trace.borrow_mut().take().unwrap());
+        (result, captured)
+    }
 
-#[cfg(test)]
-fn record_penalized_deviance(value: f64) {
-    PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
-        if let Some(ref mut buf) = *trace.borrow_mut() {
-            buf.push(value);
-        }
-    });
+    pub(super) fn record_penalized_deviance(value: f64) {
+        PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
+            if let Some(ref mut buf) = *trace.borrow_mut() {
+                buf.push(value);
+            }
+        });
+    }
 }
 
 /// The status of the P-IRLS convergence.
@@ -6881,17 +6848,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
-        PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet,
-        calculate_deviance, compute_constraint_kkt_diagnostics,
-        compute_observed_hessian_curvature_arrays, default_beta_guess_external,
-        fit_model_for_fixed_rho, should_log_pirls_decision_summary, should_use_sparse_native_pirls,
-        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        update_glmvectors,
+        LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
+        PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet, calculate_deviance,
+        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
+        default_beta_guess_external, fit_model_for_fixed_rho, should_log_pirls_decision_summary,
+        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
+        solve_newton_directionwith_lower_bounds, update_glmvectors,
     };
-    use crate::solver::active_set;
     use crate::matrix::DesignMatrix;
+    use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
     use crate::probability::standard_normal_quantile;
+    use crate::solver::active_set;
     use crate::types::{
         Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction,
         LogSmoothingParamsView,
@@ -7197,14 +7164,9 @@ mod tests {
         let s_lambda = array![[4.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 8.0]];
         let ridge = 1e-8;
         let mut workspace = PirlsWorkspace::new(3, 3, 0, 0);
-        let assembled = super::assemble_sparse_penalized_hessian(
-            &mut workspace,
-            &x,
-            &weights,
-            &s_lambda,
-            ridge,
-        )
-        .expect("sparse penalized assembly should succeed");
+        let assembled =
+            super::sparse_reml_penalized_hessian(&mut workspace, &x, &weights, &s_lambda, ridge)
+                .expect("sparse penalized assembly should succeed");
         let dense = DesignMatrix::from(x.clone()).to_dense();
         let mut expected = dense.t().dot(&Array2::from_diag(&weights)).dot(&dense);
         expected += &s_lambda;
@@ -7296,7 +7258,7 @@ mod tests {
                 fit.final_eta[i].clamp(-700.0, 700.0),
                 y[i],
                 w[i],
-                InverseLinkJet {
+                MixtureInverseLinkJet {
                     mu: jet.mean,
                     d1: jet.d1,
                     d2: jet.d2,
@@ -7919,7 +7881,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
         };
 
-        let (result, trace) = super::capture_pirls_penalized_deviance(|| {
+        let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
             fit_model_for_fixed_rho(
                 LogSmoothingParamsView::new(rho.view()),
                 PirlsProblem {
@@ -7995,7 +7957,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
         };
 
-        let (result, trace) = super::capture_pirls_penalized_deviance(|| {
+        let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
             fit_model_for_fixed_rho(
                 LogSmoothingParamsView::new(rho.view()),
                 PirlsProblem {
@@ -8091,7 +8053,7 @@ mod root_cause_tests {
                 firth_bias_reduction: false,
             };
 
-            let (result, trace) = super::capture_pirls_penalized_deviance(|| {
+            let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
                 fit_model_for_fixed_rho(
                     LogSmoothingParamsView::new(rho.view()),
                     PirlsProblem {

@@ -291,19 +291,7 @@ pub struct WiggleBlockConfig {
 pub(crate) struct SelectedWiggleBasis {
     pub knots: Array1<f64>,
     pub degree: usize,
-    pub structure: MonotoneWiggleStructure,
     pub block: ParameterBlockInput,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MonotoneWiggleStructure {
-    pub value_span_degree: usize,
-}
-
-impl MonotoneWiggleStructure {
-    pub(crate) fn fourth_derivative_is_structurally_zero(&self) -> bool {
-        self.value_span_degree < 4
-    }
 }
 
 impl ParameterBlockInput {
@@ -469,22 +457,6 @@ fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, String> {
         .checked_sub(1)
         .filter(|&internal_degree| internal_degree >= 1)
         .ok_or_else(|| "monotone wiggle degree must be >= 2".to_string())
-}
-
-#[inline]
-pub(crate) fn monotone_wiggle_structure(degree: usize) -> Result<MonotoneWiggleStructure, String> {
-    let internal_degree = monotone_wiggle_internal_degree(degree)?;
-    let value_span_degree =
-        basis_family_value_span_polynomial_degree(BasisFamily::ISpline, internal_degree)
-            .map_err(|e| e.to_string())?;
-    let fourth_derivative_zero = basis_family_value_derivative_is_structurally_zero(
-        BasisFamily::ISpline,
-        internal_degree,
-        4,
-    )
-    .map_err(|e| e.to_string())?;
-    debug_assert_eq!(fourth_derivative_zero, value_span_degree < 4);
-    Ok(MonotoneWiggleStructure { value_span_degree })
 }
 
 #[inline]
@@ -695,11 +667,9 @@ pub(crate) fn select_wiggle_basis_from_seed(
     };
     let (mut block, knots) = buildwiggle_block_input_from_seed(seed, &effective_cfg)?;
     append_selected_wiggle_penalty_orders(&mut block, &extra_orders)?;
-    let structure = monotone_wiggle_structure(cfg.degree)?;
     Ok(SelectedWiggleBasis {
         knots,
         degree: cfg.degree,
-        structure,
         block,
     })
 }
@@ -18608,21 +18578,6 @@ mod tests {
             domain_max >= 2.9,
             "unexpected right fallback boundary: {domain_max}"
         );
-    }
-
-    #[test]
-    fn monotone_wiggle_structure_encodes_value_span_degree() {
-        let quadratic = monotone_wiggle_structure(2).expect("quadratic wiggle structure");
-        assert_eq!(quadratic.value_span_degree, 2);
-        assert!(quadratic.fourth_derivative_is_structurally_zero());
-
-        let cubic = monotone_wiggle_structure(3).expect("cubic wiggle structure");
-        assert_eq!(cubic.value_span_degree, 3);
-        assert!(cubic.fourth_derivative_is_structurally_zero());
-
-        let quartic = monotone_wiggle_structure(4).expect("quartic wiggle structure");
-        assert_eq!(quartic.value_span_degree, 4);
-        assert!(!quartic.fourth_derivative_is_structurally_zero());
     }
 
     #[test]
