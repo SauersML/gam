@@ -322,6 +322,31 @@ where
     Ok(local[0][0].mapv(|v| v.max(0.0).sqrt()))
 }
 
+fn padded_design_standard_errors_from_backend(
+    design: &DesignMatrix,
+    backend: &PredictionCovarianceBackend<'_>,
+    leading_zeros: usize,
+    trailing_zeros: usize,
+    label: &str,
+) -> Result<Array1<f64>, EstimationError> {
+    let p_design = design.ncols();
+    let p_total = leading_zeros + p_design + trailing_zeros;
+    if backend.nrows() != p_total {
+        return Err(EstimationError::InvalidInput(format!(
+            "{label} covariance dimension mismatch: expected parameter dimension {p_total}, got {}",
+            backend.nrows()
+        )));
+    }
+    linear_predictor_se_from_backend(backend, design.nrows(), |rows| {
+        let x = design_row_chunk(design, rows)?;
+        let rows_in_chunk = x.nrows();
+        let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+        grad.slice_mut(ndarray::s![.., leading_zeros..leading_zeros + p_design])
+            .assign(&x);
+        Ok(vec![grad])
+    })
+}
+
 fn projected_bivariate_posterior_mean_result<F>(
     quadctx: &crate::quadrature::QuadratureContext,
     mu: [f64; 2],
@@ -739,14 +764,12 @@ impl PredictableModel for StandardPredictor {
             })?;
             let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
             let quadctx = crate::quadrature::QuadratureContext::new();
-            let mean = Array1::from_iter((0..plugin.eta.len()).map(|i| {
-                crate::quadrature::normal_expectation_1d_adaptive(
-                    &quadctx,
-                    plugin.eta[i],
-                    eta_se[i],
-                    |x| strategy.inverse_link(x).unwrap_or(plugin.mean[i]),
-                )
-            }));
+            let mean = plugin
+                .eta
+                .iter()
+                .zip(eta_se.iter())
+                .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
+                .collect::<Result<Array1<f64>, _>>()?;
             PredictPosteriorMeanResult {
                 eta: plugin.eta,
                 eta_standard_error: eta_se,
@@ -1790,11 +1813,25 @@ pub struct GaussianLocationScalePredictor {
 }
 
 impl GaussianLocationScalePredictor {
-    /// Compute sigma = exp(eta_noise) * response_scale for each observation.
-    /// Clamps eta_noise to [-500, 500] to prevent overflow/underflow in exp().
-    fn compute_sigma(&self, design_noise: &DesignMatrix) -> Array1<f64> {
-        let eta_noise = design_noise.dot(&self.beta_noise);
-        eta_noise.mapv(|eta| eta.clamp(-500.0, 500.0).exp() * self.response_scale)
+    /// Compute sigma = exp(eta_noise + offset_noise) * response_scale for each observation.
+    /// Clamps the linear predictor to [-500, 500] to prevent overflow/underflow in exp().
+    fn compute_sigma(
+        &self,
+        design_noise: &DesignMatrix,
+        offset_noise: Option<&Array1<f64>>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let mut eta_noise = design_noise.dot(&self.beta_noise);
+        if let Some(offset_noise) = offset_noise {
+            if offset_noise.len() != eta_noise.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "gaussian location-scale noise offset length mismatch: expected {}, got {}",
+                    eta_noise.len(),
+                    offset_noise.len()
+                )));
+            }
+            eta_noise += offset_noise;
+        }
+        Ok(eta_noise.mapv(|eta| eta.clamp(-500.0, 500.0).exp() * self.response_scale))
     }
 
     fn eta_standard_error(
@@ -1841,7 +1878,13 @@ impl GaussianLocationScalePredictor {
                 Ok(vec![grad])
             })
         } else {
-            eta_standard_errors_from_backend(&input.design, &backend)
+            padded_design_standard_errors_from_backend(
+                &input.design,
+                &backend,
+                0,
+                p_sigma + p_w,
+                "gaussian location-scale posterior mean",
+            )
         }
     }
 }
@@ -1874,7 +1917,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
                 "Gaussian location-scale prediction requires noise design matrix".to_string(),
             )
         })?;
-        let sigma = self.compute_sigma(design_noise);
+        let sigma = self.compute_sigma(design_noise, input.offset_noise.as_ref())?;
         // For Gaussian LS, the "SE" on the mean scale is sigma (the distribution parameter).
         // This is an observation-level interval, not an estimator interval.
         Ok(PredictionWithSE {
@@ -1897,7 +1940,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
                 "Gaussian location-scale prediction requires noise design matrix".to_string(),
             )
         })?;
-        let sigma = self.compute_sigma(design_noise);
+        let sigma = self.compute_sigma(design_noise, input.offset_noise.as_ref())?;
         let eta_se = self.eta_standard_error(input, fit, pred.eta.len())?;
         let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
             .map_err(|e| EstimationError::InvalidInput(e))?;
@@ -2533,7 +2576,13 @@ impl PredictableModel for SurvivalPredictor {
             let p_s = self.beta_log_sigma.len();
             let backend = PredictionCovarianceBackend::from_dense(cov.view());
 
-            let eta_se = eta_standard_errors_from_backend(&input.design, &backend)?;
+            let eta_se = padded_design_standard_errors_from_backend(
+                &input.design,
+                &backend,
+                0,
+                p_s,
+                "survival threshold uncertainty",
+            )?;
 
             // Delta-method SE for survival probability.
             let strategy = strategy_for_family(
@@ -2659,7 +2708,13 @@ impl PredictableModel for SurvivalPredictor {
             "survival posterior mean",
         )?;
 
-        let eta_se = eta_standard_errors_from_backend(&input.design, &backend)?;
+        let eta_se = padded_design_standard_errors_from_backend(
+            &input.design,
+            &backend,
+            0,
+            p_s,
+            "survival posterior mean",
+        )?;
         let (var_t, var_s, cov_ts) = project_two_block_linear_predictor_covariance(
             &input.design,
             design_noise,
@@ -3582,6 +3637,58 @@ mod tests {
         .expect("test fit")
     }
 
+    fn gaussian_location_scale_fit_with_covariance(
+        beta_mu: Array1<f64>,
+        beta_noise: Array1<f64>,
+        covariance: Array2<f64>,
+    ) -> UnifiedFitResult {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![
+                FittedBlock {
+                    beta: beta_mu,
+                    role: BlockRole::Location,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: beta_noise,
+                    role: BlockRole::Scale,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+            ],
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            likelihood_family: Some(crate::types::LikelihoodFamily::GaussianIdentity),
+            likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: Some(covariance),
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts {
+                pirls: None,
+                ..Default::default()
+            },
+            inner_cycles: 0,
+        })
+        .expect("gaussian location-scale fit")
+    }
+
     #[test]
     fn predict_posterior_mean_probit_matches_closed_form_reference() {
         let x = array![[1.0], [1.0]];
@@ -3908,5 +4015,81 @@ mod tests {
         assert!(out.mean_lower[0] <= out.mean_upper[0]);
         assert!((0.0..=1.0).contains(&out.mean_lower[0]));
         assert!((0.0..=1.0).contains(&out.mean_upper[0]));
+    }
+
+    #[test]
+    fn gaussian_location_scale_sigma_includes_noise_offset() {
+        let predictor = GaussianLocationScalePredictor {
+            beta_mu: array![0.0],
+            beta_noise: array![0.0],
+            response_scale: 2.0,
+            covariance: None,
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0], [1.0]]),
+            offset: array![0.0, 0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0], [1.0]])),
+            offset_noise: Some(array![(3.0f64).ln(), (5.0f64).ln()]),
+            auxiliary_scalar: None,
+        };
+
+        let out = predictor
+            .predict_with_uncertainty(&input)
+            .expect("gaussian location-scale sigma");
+        let sigma = out.mean_se.expect("sigma should be returned");
+        assert!((sigma[0] - 6.0).abs() <= 1e-12);
+        assert!((sigma[1] - 10.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn gaussian_location_scale_eta_se_pads_scale_block_without_wiggle() {
+        let predictor = GaussianLocationScalePredictor {
+            beta_mu: array![0.5],
+            beta_noise: array![0.1],
+            response_scale: 1.0,
+            covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
+            link_wiggle: None,
+        };
+        let fit = gaussian_location_scale_fit_with_covariance(
+            array![0.5],
+            array![0.1],
+            array![[4.0, 0.0], [0.0, 9.0]],
+        );
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: None,
+            auxiliary_scalar: None,
+        };
+
+        let out = predictor
+            .predict_posterior_mean(&input, &fit, None)
+            .expect("gaussian location-scale posterior mean");
+        assert!((out.eta_standard_error[0] - 2.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn survival_eta_se_pads_log_sigma_block() {
+        let predictor = SurvivalPredictor {
+            beta_threshold: array![0.5],
+            beta_log_sigma: array![0.0],
+            inverse_link: InverseLink::Standard(LinkFunction::Probit),
+            covariance: Some(array![[9.0, 0.0], [0.0, 16.0]]),
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: Some(array![0.0]),
+            auxiliary_scalar: None,
+        };
+
+        let out = predictor
+            .predict_with_uncertainty(&input)
+            .expect("survival uncertainty");
+        let eta_se = out.eta_se.expect("eta_se should be present");
+        assert!((eta_se[0] - 3.0).abs() <= 1e-12);
     }
 }
