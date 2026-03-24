@@ -1841,6 +1841,16 @@ fn main() {
     emit_stage_detail(&opt_import_report);
     allviolations.extend(opt_importviolations);
 
+    // Scan for dead #[cfg(test)] items outside mod tests {}
+    update_stage("scan dead cfg(test) items");
+    let dead_cfgtest_violations = scan_for_dead_cfg_test_items(&file_contents_cache);
+    let dead_cfgtest_report = format!(
+        "dead cfg(test) item scan identified {} violation groups",
+        dead_cfgtest_violations.len()
+    );
+    emit_stage_detail(&dead_cfgtest_report);
+    allviolations.extend(dead_cfgtest_violations);
+
     // Write lint violations to a generated source file so they surface as
     // compile_error! alongside real compiler errors, rather than blocking
     // compilation entirely.  This means real type/borrow/syntax errors are
@@ -6295,6 +6305,274 @@ fn scan_for_dead_public_items(cache: &[StrippedFile]) -> Vec<String> {
     }
 
     allviolations
+}
+
+// ---------------------------------------------------------------------------
+// Dead #[cfg(test)] item detection
+//
+// Finds private `#[cfg(test)]` fn/type/use items defined OUTSIDE `mod tests {}`
+// that are never referenced from anywhere.  These are leftovers from
+// refactoring (e.g., wrappers that delegated to code that has since moved).
+//
+// Legitimate test helpers (tracing utilities, fixture builders, type aliases
+// used by tests) are NOT flagged because they have real references from
+// `#[test]` functions.
+//
+// Two tiers:
+//   Tier 1 (error): zero references beyond the definition itself.
+//   Tier 2 (error): body is a single delegation call to another function
+//          (thin wrapper), meaning the test should call the target directly.
+// ---------------------------------------------------------------------------
+
+fn scan_for_dead_cfg_test_items(cache: &[StrippedFile]) -> Vec<String> {
+    let mut allviolations = Vec::new();
+
+    // Git-tiered enforcement: skip uncommitted files (WIP grace period).
+    let uncommitted_files: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["diff", "--name-only", "HEAD"])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if !line.is_empty() {
+                    set.insert(format!("./{line}"));
+                }
+            }
+        }
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if !line.is_empty() {
+                    set.insert(format!("./{line}"));
+                }
+            }
+        }
+        set
+    };
+
+    struct CfgTestItem {
+        name: String,
+        kind: &'static str, // "fn", "type", "use"
+        file: String,
+        line: usize,
+        is_thin_wrapper: bool,
+    }
+
+    let mut items: Vec<CfgTestItem> = Vec::new();
+
+    // Phase 1: find #[cfg(test)] items outside mod tests {}
+    for sf in cache {
+        if sf.is_test_file {
+            continue;
+        }
+        let file_str = sf.path.to_string_lossy().to_string();
+        if uncommitted_files.contains(&file_str) {
+            continue;
+        }
+
+        let lines: Vec<&str> = sf.stripped.lines().collect();
+        let mut brace_depth: i32 = 0;
+        let mut in_mod_tests = false;
+        let mut mod_tests_depth: i32 = 0;
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            // Track brace depth
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => {
+                        brace_depth += 1;
+                        if in_mod_tests && mod_tests_depth == 0 {
+                            mod_tests_depth = brace_depth;
+                        }
+                    }
+                    '}' => {
+                        if in_mod_tests && brace_depth == mod_tests_depth {
+                            in_mod_tests = false;
+                            mod_tests_depth = 0;
+                        }
+                        brace_depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Detect `mod tests {`
+            if trimmed.starts_with("mod tests") && trimmed.contains('{') {
+                in_mod_tests = true;
+                // mod_tests_depth will be set when we hit the '{' above
+            }
+
+            // Skip anything inside mod tests {}
+            if in_mod_tests {
+                continue;
+            }
+
+            // Look for #[cfg(test)] on previous line
+            if i == 0 {
+                continue;
+            }
+            let prev = lines[i - 1].trim();
+            if prev != "#[cfg(test)]" {
+                continue;
+            }
+
+            // Extract item name and kind
+            let (kind, name) = if let Some(rest) = trimmed.strip_prefix("fn ") {
+                let name = rest.split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("");
+                ("fn", name)
+            } else if let Some(rest) = trimmed.strip_prefix("type ") {
+                let name = rest.split(|c: char| c == '=' || c == '<' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("");
+                ("type", name)
+            } else if let Some(rest) = trimmed.strip_prefix("use ") {
+                // `use foo as bar;` → name is bar
+                // `use foo;` → name is foo (last segment)
+                let clean = rest.trim_end_matches(';').trim();
+                let name = if let Some(pos) = clean.rfind(" as ") {
+                    clean[pos + 4..].trim()
+                } else {
+                    clean.rsplit("::").next().unwrap_or("")
+                };
+                ("use", name)
+            } else {
+                continue;
+            };
+
+            if name.is_empty() || name.len() < 3 {
+                continue;
+            }
+
+            // Check if this is a thin wrapper (fn only):
+            // Look ahead for the body — single expression that's a function call
+            let is_thin_wrapper = if kind == "fn" {
+                is_thin_wrapper_fn(&lines, i)
+            } else {
+                false
+            };
+
+            items.push(CfgTestItem {
+                name: name.to_string(),
+                kind,
+                file: file_str.clone(),
+                line: i + 1,
+                is_thin_wrapper,
+            });
+        }
+    }
+
+    // Phase 2: count references
+    for item in &items {
+        let mut total_refs: usize = 0;
+        for sf in cache {
+            total_refs += count_real_references(&sf.stripped, &item.name);
+        }
+
+        // Subtract 1 for the definition itself
+        let external_refs = total_refs.saturating_sub(1);
+
+        if external_refs == 0 {
+            // Tier 1: completely dead
+            allviolations.push(format!(
+                "\n\u{274c} ERROR: DEAD #[cfg(test)] ITEM \u{2014} `{kind}` '{name}' at {file}:{line}\n   \
+                 This #[cfg(test)] {kind} has zero references anywhere in the codebase.\n   \
+                 It is dead code gated behind #[cfg(test)] — invisible to production builds\n   \
+                 and never called from any test.\n   \
+                 Delete it.\n   \
+                 Do not suppress, hide, no-op, stub, or work around this lint in any other way.",
+                kind = item.kind,
+                name = item.name,
+                file = item.file,
+                line = item.line,
+            ));
+        } else if item.is_thin_wrapper {
+            // Tier 2: thin wrapper called from tests
+            allviolations.push(format!(
+                "\n\u{274c} ERROR: THIN #[cfg(test)] WRAPPER \u{2014} `fn` '{name}' at {file}:{line}\n   \
+                 This #[cfg(test)] fn is a single-expression delegation to another function.\n   \
+                 Tests should call the target function directly instead of going through\n   \
+                 this wrapper. Delete the wrapper and update its callers.\n   \
+                 Do not suppress, hide, no-op, stub, or work around this lint in any other way.",
+                name = item.name,
+                file = item.file,
+                line = item.line,
+            ));
+        }
+    }
+
+    allviolations
+}
+
+/// Heuristic: is this `fn` a thin wrapper whose body is a single function call?
+/// Looks at lines starting from the fn signature, finds the body, checks if it's
+/// one expression (possibly with a module path prefix) passing through all args.
+fn is_thin_wrapper_fn(lines: &[&str], fn_line_idx: usize) -> bool {
+    // Find the opening brace
+    let mut brace_start = None;
+    for i in fn_line_idx..lines.len().min(fn_line_idx + 3) {
+        if lines[i].contains('{') {
+            brace_start = Some(i);
+            break;
+        }
+    }
+    let brace_start = match brace_start {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Collect body lines (between { and })
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    for i in brace_start..lines.len() {
+        for ch in lines[i].chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if i > brace_start {
+            let trimmed = lines[i].trim();
+            if !trimmed.is_empty() && trimmed != "}" {
+                body_lines.push(trimmed);
+            }
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+
+    // A thin wrapper has exactly one non-empty body line that looks like a function call
+    if body_lines.len() != 1 {
+        return false;
+    }
+    let body = body_lines[0];
+
+    // Must look like `something::func(args)` or `func(args)`
+    // and NOT start with `let`, `if`, `match`, `for`, `while`, `loop`, `return` (complex logic)
+    let starts_with_keyword = body.starts_with("let ")
+        || body.starts_with("if ")
+        || body.starts_with("match ")
+        || body.starts_with("for ")
+        || body.starts_with("while ")
+        || body.starts_with("loop ")
+        || body.starts_with("return ")
+        || body.starts_with("self.")
+        || body.starts_with("Self::");
+
+    if starts_with_keyword {
+        return false;
+    }
+
+    // Should contain a `(` (function call)
+    body.contains('(')
 }
 
 /// Enforce that `use opt::` imports only appear in strategy.rs.
