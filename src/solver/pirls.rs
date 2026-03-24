@@ -2486,7 +2486,7 @@ fn compute_constraint_kkt_diagnostics(
     active_set::compute_constraint_kkt_diagnostics(beta, gradient, constraints)
 }
 
-fn solve_newton_directionwith_lower_bounds(
+pub(crate) fn solve_newton_directionwith_lower_bounds(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     beta: &Array1<f64>,

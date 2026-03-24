@@ -1292,7 +1292,32 @@ struct TransportCellState {
     lambda: f64,
     cell: DenestedCubicCell,
     value: f64,
-    basis_moments: Vec<f64>,
+    basis_len: usize,
+    basis_moments: [f64; MAX_TRANSPORT_BASIS_LEN],
+}
+
+const TRANSPORT_ORDER: usize = 10;
+const MAX_TRANSPORT_POLY_LEN: usize = 6 * TRANSPORT_ORDER + 1;
+const MAX_TRANSPORT_SERIES_LEN: usize = TRANSPORT_ORDER + 1;
+const MAX_TRANSPORT_BASIS_LEN: usize = 5;
+
+#[derive(Clone, Copy, Debug)]
+struct FixedPoly {
+    len: usize,
+    coeffs: [f64; MAX_TRANSPORT_POLY_LEN],
+}
+
+impl FixedPoly {
+    const fn zero() -> Self {
+        Self {
+            len: 0,
+            coeffs: [0.0; MAX_TRANSPORT_POLY_LEN],
+        }
+    }
+
+    fn as_slice(&self) -> &[f64] {
+        &self.coeffs[..self.len]
+    }
 }
 
 #[inline]
@@ -1324,14 +1349,15 @@ fn alternating_sign(n: usize) -> f64 {
     }
 }
 
-fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
-    let mut out = vec![0.0; lhs.len() + rhs.len() - 1];
-    for (i, &lv) in lhs.iter().enumerate() {
-        for (j, &rv) in rhs.iter().enumerate() {
-            out[i + j] += lv * rv;
+fn poly_mul_fixed(lhs: &FixedPoly, rhs: &FixedPoly, out: &mut FixedPoly) {
+    out.len = lhs.len + rhs.len - 1;
+    out.coeffs[..out.len].fill(0.0);
+    for i in 0..lhs.len {
+        let lv = lhs.coeffs[i];
+        for j in 0..rhs.len {
+            out.coeffs[i + j] += lv * rhs.coeffs[j];
         }
     }
-    out
 }
 
 #[inline]
@@ -1348,36 +1374,68 @@ fn build_transport_series_polynomials(
     delta_c2: f64,
     delta_c3: f64,
     order: usize,
-) -> Vec<Vec<f64>> {
-    let eta = [current.c0, current.c1, current.c2, current.c3];
-    let delta = [0.0, 0.0, delta_c2, delta_c3];
-    let a_poly = poly_mul(&eta, &delta);
-    let b_poly = poly_mul(&delta, &delta);
+) -> [FixedPoly; MAX_TRANSPORT_SERIES_LEN] {
+    assert!(order <= TRANSPORT_ORDER);
+    let eta = FixedPoly {
+        len: 4,
+        coeffs: {
+            let mut coeffs = [0.0; MAX_TRANSPORT_POLY_LEN];
+            coeffs[0] = current.c0;
+            coeffs[1] = current.c1;
+            coeffs[2] = current.c2;
+            coeffs[3] = current.c3;
+            coeffs
+        },
+    };
+    let delta = FixedPoly {
+        len: 4,
+        coeffs: {
+            let mut coeffs = [0.0; MAX_TRANSPORT_POLY_LEN];
+            coeffs[2] = delta_c2;
+            coeffs[3] = delta_c3;
+            coeffs
+        },
+    };
 
-    let mut a_powers = Vec::with_capacity(order + 1);
-    a_powers.push(vec![1.0]);
+    let mut a_poly = FixedPoly::zero();
+    poly_mul_fixed(&eta, &delta, &mut a_poly);
+    let mut b_poly = FixedPoly::zero();
+    poly_mul_fixed(&delta, &delta, &mut b_poly);
+
+    let mut a_powers = [FixedPoly::zero(); MAX_TRANSPORT_SERIES_LEN];
+    a_powers[0].len = 1;
+    a_powers[0].coeffs[0] = 1.0;
     for p in 1..=order {
-        a_powers.push(poly_mul(&a_powers[p - 1], &a_poly));
+        let (left, right) = a_powers.split_at_mut(p);
+        poly_mul_fixed(&left[p - 1], &a_poly, &mut right[0]);
     }
 
     let max_q = order / 2;
-    let mut b_powers = Vec::with_capacity(max_q + 1);
-    b_powers.push(vec![1.0]);
+    let mut b_powers = [FixedPoly::zero(); (MAX_TRANSPORT_SERIES_LEN / 2) + 1];
+    b_powers[0].len = 1;
+    b_powers[0].coeffs[0] = 1.0;
     for q in 1..=max_q {
-        b_powers.push(poly_mul(&b_powers[q - 1], &b_poly));
+        let (left, right) = b_powers.split_at_mut(q);
+        poly_mul_fixed(&left[q - 1], &b_poly, &mut right[0]);
     }
 
-    let mut coeffs = Vec::with_capacity(order + 1);
-    coeffs.push(vec![1.0]);
+    let mut coeffs = [FixedPoly::zero(); MAX_TRANSPORT_SERIES_LEN];
+    coeffs[0].len = 1;
+    coeffs[0].coeffs[0] = 1.0;
     for m in 1..=order {
-        let mut poly = vec![0.0; 6 * m + 1];
+        coeffs[m].len = 6 * m + 1;
+        coeffs[m].coeffs[..coeffs[m].len].fill(0.0);
         for q in 0..=m / 2 {
             let p = m - 2 * q;
             let scale =
                 alternating_sign(p + q) * recip_factorial(p) * recip_factorial(q) * recip_pow2(q);
-            add_scaled_poly_product(&mut poly, &a_powers[p], &b_powers[q], scale);
+            add_scaled_poly_product(
+                &mut coeffs[m].coeffs[..coeffs[m].len],
+                a_powers[p].as_slice(),
+                b_powers[q].as_slice(),
+                scale,
+            );
         }
-        coeffs.push(poly);
     }
     coeffs
 }
@@ -1453,7 +1511,7 @@ fn evaluate_non_affine_transport_step(
         reduced_moments_from_basis(
             state.cell,
             target_branch,
-            &state.basis_moments,
+            &state.basis_moments[..state.basis_len],
             required_degree,
         )?
     };
@@ -1463,17 +1521,16 @@ fn evaluate_non_affine_transport_step(
         ExactCellBranch::Affine => 5,
     };
     let n_eval = basis_len.max(4);
-    let series_len = order + 1;
     let transport_polys = build_transport_series_polynomials(state.cell, delta_c2, delta_c3, order);
-    let mut moment_series = vec![0.0; n_eval * series_len];
+    let mut moment_series = [[0.0; MAX_TRANSPORT_SERIES_LEN]; MAX_TRANSPORT_BASIS_LEN];
     for n in 0..n_eval {
         for m in 0..=order {
             let poly = &transport_polys[m];
             let mut coeff = 0.0;
-            for (deg, poly_coeff) in poly.iter().enumerate() {
+            for (deg, poly_coeff) in poly.as_slice().iter().enumerate() {
                 coeff += poly_coeff * current_full[n + deg];
             }
-            moment_series[n * series_len + m] = coeff;
+            moment_series[n][m] = coeff;
         }
     }
 
@@ -1482,9 +1539,7 @@ fn evaluate_non_affine_transport_step(
     let mut value_tail_prev = if order == 1 { state.value.abs() } else { 0.0 };
     let mut value_tail_last = if order == 0 { state.value.abs() } else { 0.0 };
     for m in 0..order {
-        let coeff = (delta_c2 * moment_series[2 * series_len + m]
-            + delta_c3 * moment_series[3 * series_len + m])
-            * INV_TWO_PI
+        let coeff = (delta_c2 * moment_series[2][m] + delta_c3 * moment_series[3][m]) * INV_TWO_PI
             / (m as f64 + 1.0);
         next_value += coeff * step_pow;
         if m + 1 == order.saturating_sub(1) {
@@ -1496,14 +1551,14 @@ fn evaluate_non_affine_transport_step(
         step_pow *= step;
     }
 
-    let mut next_basis = vec![0.0; basis_len];
+    let mut next_basis = [0.0; MAX_TRANSPORT_BASIS_LEN];
     let mut basis_tail_prev = [0.0; 5];
     let mut basis_tail_last = [0.0; 5];
     for n in 0..basis_len {
-        let row = &moment_series[(n * series_len)..((n + 1) * series_len)];
         let mut acc = 0.0;
         let mut pow = 1.0;
-        for (m, coeff) in row.iter().enumerate() {
+        for m in 0..=order {
+            let coeff = moment_series[n][m];
             acc += coeff * pow;
             if m == order.saturating_sub(1) {
                 basis_tail_prev[n] = coeff.abs() * pow;
@@ -1545,6 +1600,7 @@ fn evaluate_non_affine_transport_step(
             c3: state.cell.c3 + step * delta_c3,
         },
         value: next_value,
+        basis_len,
         basis_moments: next_basis,
     }))
 }
@@ -1554,7 +1610,7 @@ fn evaluate_non_affine_cell_state(
     branch: ExactCellBranch,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
-    let order = 10usize;
+    let order = TRANSPORT_ORDER;
     let abs_tol = 1e-14;
     let rel_tol = 1e-12;
     let affine_cell = DenestedCubicCell {
@@ -1582,7 +1638,12 @@ fn evaluate_non_affine_cell_state(
         lambda: 0.0,
         cell: affine_cell,
         value: affine_state.value,
-        basis_moments: affine_state.moments[..basis_len].to_vec(),
+        basis_len,
+        basis_moments: {
+            let mut basis = [0.0; MAX_TRANSPORT_BASIS_LEN];
+            basis[..basis_len].copy_from_slice(&affine_state.moments[..basis_len]);
+            basis
+        },
     };
 
     let delta_c2 = cell.c2;
@@ -1612,7 +1673,12 @@ fn evaluate_non_affine_cell_state(
         }
     }
 
-    let moments = reduced_moments_from_basis(cell, branch, &state.basis_moments, max_degree)?;
+    let moments = reduced_moments_from_basis(
+        cell,
+        branch,
+        &state.basis_moments[..state.basis_len],
+        max_degree,
+    )?;
     Ok(CellMomentState {
         branch,
         value: state.value,

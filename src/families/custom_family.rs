@@ -5,7 +5,7 @@ use crate::linalg::utils::{StableSolver, default_slq_parameters, stochastic_lanc
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
 };
-use crate::pirls::LinearInequalityConstraints;
+use crate::pirls::{LinearInequalityConstraints, solve_newton_directionwith_lower_bounds};
 use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, spatial_length_scale_term_indices,
     try_build_spatial_log_kappa_derivativeinfo_list,
@@ -3741,6 +3741,121 @@ fn scatter_joint_active_set(
     per_block
 }
 
+struct SimpleLowerBounds {
+    lower_bounds: Array1<f64>,
+    row_to_coeff: Vec<usize>,
+    coeff_to_row: Vec<Option<usize>>,
+}
+
+fn extract_simple_lower_bounds(
+    constraints: &LinearInequalityConstraints,
+    p: usize,
+) -> Result<Option<SimpleLowerBounds>, String> {
+    if constraints.a.ncols() != p || constraints.a.nrows() != constraints.b.len() {
+        return Err("linear constraints: shape mismatch".to_string());
+    }
+    let mut lower_bounds = Array1::from_elem(p, f64::NEG_INFINITY);
+    let mut coeff_to_row = vec![None; p];
+    let mut row_to_coeff = Vec::with_capacity(constraints.a.nrows());
+    for row in 0..constraints.a.nrows() {
+        let mut coeff_idx = None;
+        let mut coeff_value = 0.0;
+        for col in 0..p {
+            let value = constraints.a[[row, col]];
+            if value.abs() <= 1e-12 {
+                continue;
+            }
+            if coeff_idx.is_some() {
+                return Ok(None);
+            }
+            coeff_idx = Some(col);
+            coeff_value = value;
+        }
+        let Some(col) = coeff_idx else {
+            return Ok(None);
+        };
+        if coeff_value <= 0.0 {
+            return Ok(None);
+        }
+        let bound = constraints.b[row] / coeff_value;
+        if bound > lower_bounds[col] {
+            lower_bounds[col] = bound;
+            coeff_to_row[col] = Some(row);
+        }
+        row_to_coeff.push(col);
+    }
+    Ok(Some(SimpleLowerBounds {
+        lower_bounds,
+        row_to_coeff,
+        coeff_to_row,
+    }))
+}
+
+fn lower_bound_active_rows_to_coeffs(
+    bounds: &SimpleLowerBounds,
+    active_rows: Option<&[usize]>,
+) -> Vec<usize> {
+    let Some(active_rows) = active_rows else {
+        return Vec::new();
+    };
+    let mut active_coeffs = active_rows
+        .iter()
+        .copied()
+        .filter_map(|row| bounds.row_to_coeff.get(row).copied())
+        .collect::<Vec<_>>();
+    active_coeffs.sort_unstable();
+    active_coeffs.dedup();
+    active_coeffs
+}
+
+fn lower_bound_active_coeffs_to_rows(
+    bounds: &SimpleLowerBounds,
+    active_coeffs: &[usize],
+) -> Vec<usize> {
+    let mut active_rows = active_coeffs
+        .iter()
+        .copied()
+        .filter_map(|coeff| bounds.coeff_to_row.get(coeff).and_then(|row| *row))
+        .collect::<Vec<_>>();
+    active_rows.sort_unstable();
+    active_rows.dedup();
+    active_rows
+}
+
+fn project_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
+    for i in 0..beta.len() {
+        let lower = lower_bounds[i];
+        if lower.is_finite() && beta[i] < lower {
+            beta[i] = lower;
+        }
+    }
+}
+
+fn solve_quadratic_with_simple_lower_bounds(
+    lhs: &Array2<f64>,
+    rhs: &Array1<f64>,
+    beta_start: &Array1<f64>,
+    bounds: &SimpleLowerBounds,
+    active_rows: Option<&[usize]>,
+) -> Result<(Array1<f64>, Vec<usize>), String> {
+    let gradient = lhs.dot(beta_start) - rhs;
+    let mut delta = Array1::zeros(beta_start.len());
+    let mut active_coeffs = lower_bound_active_rows_to_coeffs(bounds, active_rows);
+    solve_newton_directionwith_lower_bounds(
+        lhs,
+        &gradient,
+        beta_start,
+        &bounds.lower_bounds,
+        &mut delta,
+        Some(&mut active_coeffs),
+    )
+    .map_err(|e| format!("lower-bound Newton solve failed: {e}"))?;
+    let mut beta_new = beta_start + &delta;
+    project_to_lower_bounds(&mut beta_new, &bounds.lower_bounds);
+    let active = lower_bound_active_coeffs_to_rows(bounds, &active_coeffs);
+    Ok((beta_new, active))
+}
+
 struct BlockUpdateContext<'a> {
     family: &'a dyn CustomFamily,
     states: &'a [ParameterBlockState],
@@ -3815,13 +3930,25 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
                     "missing weighted RHS in constrained diagonal solve".to_string()
                 })?;
                 lhs += ctx.s_lambda;
-                let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
-                    &lhs,
-                    &rhs,
-                    &ctx.states[ctx.block_idx].beta,
-                    constraints,
-                    ctx.cached_active_set,
-                )
+                let lower_bounds = extract_simple_lower_bounds(constraints, lhs.ncols())?;
+                let (beta_constrained, active_set) = if let Some(bounds) = lower_bounds.as_ref() {
+                    solve_quadratic_with_simple_lower_bounds(
+                        &lhs,
+                        &rhs,
+                        &ctx.states[ctx.block_idx].beta,
+                        bounds,
+                        ctx.cached_active_set,
+                    )
+                } else {
+                    solve_quadratic_with_linear_constraints(
+                        &lhs,
+                        &rhs,
+                        &ctx.states[ctx.block_idx].beta,
+                        constraints,
+                        ctx.cached_active_set,
+                    )
+                    .map_err(|e| e.to_string())
+                }
                 .map_err(|e| {
                     format!(
                         "block {} ({}) constrained diagonal solve failed: {e}",
@@ -3906,22 +4033,41 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                     )
                 },
             )?;
-            let delta_constraints =
-                shift_linear_constraints_to_delta(constraints, &ctx.states[ctx.block_idx].beta)
-                    .map_err(|e| {
-                        format!(
-                            "block {} ({}) constrained exact-newton solve: {e}",
-                            ctx.block_idx, ctx.spec.name
-                        )
-                    })?;
-            let delta_start = Array1::zeros(p);
-            let (delta, active_set) = solve_quadratic_with_linear_constraints(
-                &lhs_dense,
-                &rhs_step,
-                &delta_start,
-                &delta_constraints,
-                ctx.cached_active_set,
-            )
+            let lower_bounds = extract_simple_lower_bounds(constraints, p).map_err(|e| {
+                format!(
+                    "block {} ({}) constrained exact-newton solve: {e}",
+                    ctx.block_idx, ctx.spec.name
+                )
+            })?;
+            let (beta_new_raw, active_set) = if let Some(bounds) = lower_bounds.as_ref() {
+                let rhs_beta = &lhs_dense.dot(&ctx.states[ctx.block_idx].beta) + &rhs_step;
+                solve_quadratic_with_simple_lower_bounds(
+                    &lhs_dense,
+                    &rhs_beta,
+                    &ctx.states[ctx.block_idx].beta,
+                    bounds,
+                    ctx.cached_active_set,
+                )
+            } else {
+                let delta_constraints =
+                    shift_linear_constraints_to_delta(constraints, &ctx.states[ctx.block_idx].beta)
+                        .map_err(|e| {
+                            format!(
+                                "block {} ({}) constrained exact-newton solve: {e}",
+                                ctx.block_idx, ctx.spec.name
+                            )
+                        })?;
+                let delta_start = Array1::zeros(p);
+                let (delta, active_set) = solve_quadratic_with_linear_constraints(
+                    &lhs_dense,
+                    &rhs_step,
+                    &delta_start,
+                    &delta_constraints,
+                    ctx.cached_active_set,
+                )
+                .map_err(|e| e.to_string())?;
+                Ok((&ctx.states[ctx.block_idx].beta + &delta, active_set))
+            }
             .map_err(|e| {
                 format!(
                     "block {} ({}) constrained exact-newton solve failed: {e}",
@@ -3929,7 +4075,7 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 )
             })?;
             Ok(BlockUpdateResult {
-                beta_new_raw: &ctx.states[ctx.block_idx].beta + &delta,
+                beta_new_raw,
                 active_set: Some(active_set),
             })
         } else {
@@ -5294,13 +5440,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
                 let warm_joint_active =
                     flatten_joint_active_set(&cached_active_sets, &block_constraints);
-                match solve_quadratic_with_linear_constraints(
-                    &lhs,
-                    &grad_joint,
-                    &beta_joint,
-                    constraints,
-                    warm_joint_active.as_deref(),
-                ) {
+                let lower_bounds = match extract_simple_lower_bounds(constraints, total_p) {
+                    Ok(bounds) => bounds,
+                    Err(_) => break,
+                };
+                let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
+                    solve_quadratic_with_simple_lower_bounds(
+                        &lhs,
+                        &grad_joint,
+                        &beta_joint,
+                        bounds,
+                        warm_joint_active.as_deref(),
+                    )
+                } else {
+                    solve_quadratic_with_linear_constraints(
+                        &lhs,
+                        &grad_joint,
+                        &beta_joint,
+                        constraints,
+                        warm_joint_active.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                };
+                match solve_result {
                     Ok((beta_new, active_set)) => (beta_new, Some(active_set)),
                     Err(_) => break,
                 }
@@ -10415,6 +10577,34 @@ mod tests {
         assert!(
             (beta - 1.0).abs() < 1e-8,
             "expected constrained optimum at lower bound, got {beta}"
+        );
+    }
+
+    #[test]
+    fn extract_simple_lower_bounds_accepts_axis_aligned_rows() {
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]],
+            b: array![0.25, 1.0, 1.5],
+        };
+        let bounds = extract_simple_lower_bounds(&constraints, 2)
+            .expect("lower-bound extraction should succeed")
+            .expect("axis-aligned rows should map to lower bounds");
+        assert_relative_eq!(bounds.lower_bounds[0], 0.5, epsilon = 1e-12);
+        assert_relative_eq!(bounds.lower_bounds[1], 0.5, epsilon = 1e-12);
+        assert_eq!(bounds.coeff_to_row, vec![Some(2), Some(1)]);
+    }
+
+    #[test]
+    fn extract_simple_lower_bounds_rejects_coupled_rows() {
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 1.0]],
+            b: array![0.0],
+        };
+        assert!(
+            extract_simple_lower_bounds(&constraints, 2)
+                .expect("lower-bound extraction should not error on valid shapes")
+                .is_none(),
+            "coupled rows must stay on the generic linear-constraint path"
         );
     }
 
