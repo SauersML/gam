@@ -3619,6 +3619,128 @@ fn shift_linear_constraints_to_delta(
     })
 }
 
+fn collect_block_linear_constraints<F: CustomFamily + ?Sized>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+) -> Result<Vec<Option<LinearInequalityConstraints>>, String> {
+    let mut constraints = Vec::with_capacity(specs.len());
+    for (block_idx, spec) in specs.iter().enumerate() {
+        constraints.push(family.block_linear_constraints(states, block_idx, spec)?);
+    }
+    Ok(constraints)
+}
+
+fn assemble_joint_linear_constraints(
+    block_constraints: &[Option<LinearInequalityConstraints>],
+    ranges: &[(usize, usize)],
+    total_p: usize,
+) -> Result<Option<LinearInequalityConstraints>, String> {
+    if block_constraints.len() != ranges.len() {
+        return Err(format!(
+            "joint linear constraint assembly mismatch: {} blocks but {} ranges",
+            block_constraints.len(),
+            ranges.len()
+        ));
+    }
+    let total_rows = block_constraints
+        .iter()
+        .map(|constraints| constraints.as_ref().map_or(0, |c| c.a.nrows()))
+        .sum::<usize>();
+    if total_rows == 0 {
+        return Ok(None);
+    }
+    let mut a = Array2::<f64>::zeros((total_rows, total_p));
+    let mut b = Array1::<f64>::zeros(total_rows);
+    let mut row_offset = 0usize;
+    for (block_idx, constraints_opt) in block_constraints.iter().enumerate() {
+        let Some(constraints) = constraints_opt else {
+            continue;
+        };
+        let (start, end) = ranges[block_idx];
+        let block_p = end - start;
+        if constraints.a.ncols() != block_p || constraints.a.nrows() != constraints.b.len() {
+            return Err(format!(
+                "joint linear constraint assembly mismatch for block {block_idx}: A is {}x{}, b is {}, block width is {}",
+                constraints.a.nrows(),
+                constraints.a.ncols(),
+                constraints.b.len(),
+                block_p
+            ));
+        }
+        let rows = constraints.a.nrows();
+        a.slice_mut(s![row_offset..(row_offset + rows), start..end])
+            .assign(&constraints.a);
+        b.slice_mut(s![row_offset..(row_offset + rows)])
+            .assign(&constraints.b);
+        row_offset += rows;
+    }
+    Ok(Some(LinearInequalityConstraints { a, b }))
+}
+
+fn flatten_joint_active_set(
+    block_active_sets: &[Option<Vec<usize>>],
+    block_constraints: &[Option<LinearInequalityConstraints>],
+) -> Option<Vec<usize>> {
+    if block_active_sets.len() != block_constraints.len() {
+        return None;
+    }
+    let mut offset = 0usize;
+    let mut joint_active = Vec::new();
+    for (active_opt, constraints_opt) in block_active_sets.iter().zip(block_constraints.iter()) {
+        let rows = constraints_opt
+            .as_ref()
+            .map_or(0, |constraints| constraints.a.nrows());
+        if let Some(active) = active_opt {
+            joint_active.extend(
+                active
+                    .iter()
+                    .copied()
+                    .filter(|&idx| idx < rows)
+                    .map(|idx| offset + idx),
+            );
+        }
+        offset += rows;
+    }
+    if joint_active.is_empty() {
+        None
+    } else {
+        Some(joint_active)
+    }
+}
+
+fn scatter_joint_active_set(
+    joint_active: &[usize],
+    block_constraints: &[Option<LinearInequalityConstraints>],
+) -> Vec<Option<Vec<usize>>> {
+    let mut per_block = Vec::with_capacity(block_constraints.len());
+    let mut offset = 0usize;
+    for constraints_opt in block_constraints {
+        let rows = constraints_opt
+            .as_ref()
+            .map_or(0, |constraints| constraints.a.nrows());
+        if rows == 0 {
+            per_block.push(None);
+            continue;
+        }
+        let mut local = joint_active
+            .iter()
+            .copied()
+            .filter(|&idx| idx >= offset && idx < offset + rows)
+            .map(|idx| idx - offset)
+            .collect::<Vec<_>>();
+        offset += rows;
+        if local.is_empty() {
+            per_block.push(None);
+            continue;
+        }
+        local.sort_unstable();
+        local.dedup();
+        per_block.push(Some(local));
+    }
+    per_block
+}
+
 struct BlockUpdateContext<'a> {
     family: &'a dyn CustomFamily,
     states: &'a [ParameterBlockState],
