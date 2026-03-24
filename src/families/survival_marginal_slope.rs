@@ -11662,7 +11662,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             }
         }
     }
-    let derived_time_wiggle_ncols = if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
+    if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
         if timewiggle.degree != 3 {
             return Err(format!(
                 "survival-marginal-slope timewiggle requires cubic degree=3, got {}",
@@ -11689,10 +11689,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
                 spec.time_block.design_exit.ncols()
             ));
         }
-        Some(derived_ncols)
-    } else {
-        None
-    };
+    }
     Ok(())
 }
 
