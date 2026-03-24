@@ -2276,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn run_rejects_gradient_length_mismatch_before_optimizer_panic() {
+    fn run_malformed_gradient_seed_can_fall_back_to_cost_only_plan() {
         let problem = OuterProblem::new(2)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Unavailable)
@@ -2295,14 +2295,11 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
-        let err = problem
+        let result = problem
             .run(&mut obj, "test gradient mismatch")
-            .expect_err("mismatched gradient length should fail cleanly");
-        assert!(
-            err.to_string()
-                .contains("all candidate seeds failed full outer verification"),
-            "unexpected error: {err}"
-        );
+            .expect("finite-difference fallback should recover from malformed analytic gradients");
+        assert_eq!(result.plan_used.solver, Solver::Bfgs);
+        assert_eq!(result.plan_used.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -2405,7 +2402,10 @@ mod tests {
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
         let result = problem
-            .run(&mut obj, "fd seed verification should not require analytic eval")
+            .run(
+                &mut obj,
+                "fd seed verification should not require analytic eval",
+            )
             .expect("finite-difference plans should verify seeds from cost only");
         assert!((result.rho[0] - target[0]).abs() < 1e-3);
     }

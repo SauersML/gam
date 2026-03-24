@@ -3876,12 +3876,21 @@ fn solve_quadratic_with_simple_lower_bounds(
     Ok((beta_new, active))
 }
 
-fn normalize_active_set(active_set: Vec<usize>) -> Option<Vec<usize>> {
+fn normalize_active_set(mut active_set: Vec<usize>) -> Option<Vec<usize>> {
+    active_set.sort_unstable();
+    active_set.dedup();
     if active_set.is_empty() {
         None
     } else {
         Some(active_set)
     }
+}
+
+fn normalize_active_sets(active_sets: Vec<Option<Vec<usize>>>) -> Vec<Option<Vec<usize>>> {
+    active_sets
+        .into_iter()
+        .map(|active_set| active_set.and_then(normalize_active_set))
+        .collect()
 }
 
 struct BlockUpdateContext<'a> {
@@ -5696,7 +5705,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
-                active_sets: cached_active_sets,
+                active_sets: normalize_active_sets(cached_active_sets),
                 log_likelihood: cached_eval.log_likelihood,
                 penalty_value,
                 cycles: cycles_done,
@@ -5985,7 +5994,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     Ok(BlockwiseInnerResult {
         block_states: states,
-        active_sets: cached_active_sets,
+        active_sets: normalize_active_sets(cached_active_sets),
         log_likelihood: cached_eval.log_likelihood,
         penalty_value,
         cycles: cycles_done,
