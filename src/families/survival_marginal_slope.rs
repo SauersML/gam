@@ -23,7 +23,7 @@ use crate::families::row_kernel::{
 };
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
-    time_derivative_lower_bound_constraints,
+    structural_time_coefficient_constraints,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -11630,7 +11630,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         );
     }
     if let Some(beta0) = &spec.time_block.initial_beta {
-        let derivative_constraints = time_derivative_lower_bound_constraints(
+        let derivative_constraints = structural_time_coefficient_constraints(
             &spec.time_block.design_derivative_exit.to_dense(),
             &spec.time_block.derivative_offset_exit,
             spec.derivative_guard,
@@ -11647,7 +11647,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
                 let slack = constraints.a.row(row).dot(beta0) - constraints.b[row];
                 if slack < -1e-10 {
                     return Err(format!(
-                        "survival-marginal-slope time_block initial_beta violates derivative guard at row {row}: slack={slack:.3e}"
+                        "survival-marginal-slope time_block initial_beta violates structural coefficient non-negativity at row {row}: slack={slack:.3e}"
                     ));
                 }
             }
@@ -11931,7 +11931,7 @@ pub fn fit_survival_marginal_slope_terms(
     let time_block_ref = spec.time_block.clone();
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
-    let time_linear_constraints = time_derivative_lower_bound_constraints(
+    let time_linear_constraints = structural_time_coefficient_constraints(
         &design_derivative_exit.to_dense(),
         derivative_offset_exit.as_ref(),
         derivative_guard,
@@ -12303,7 +12303,10 @@ mod tests {
             design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
             offset_entry: Array1::zeros(1),
             offset_exit: Array1::zeros(1),
-            derivative_offset_exit: Array1::zeros(1),
+            derivative_offset_exit: Array1::from_elem(
+                1,
+                DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+            ),
             structural_monotonicity: true,
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
@@ -12381,7 +12384,7 @@ mod tests {
             design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
             offset_entry: Arc::new(Array1::zeros(1)),
             offset_exit: Arc::new(Array1::zeros(1)),
-            derivative_offset_exit: Arc::new(Array1::zeros(1)),
+            derivative_offset_exit: Arc::new(Array1::from_elem(1, 1e-6)),
             marginal_design: DesignMatrix::from(Array2::zeros((1, 2))),
             logslope_design: DesignMatrix::from(Array2::zeros((1, 3))),
             score_warp,
@@ -13458,7 +13461,7 @@ mod tests {
             )),
             offset_entry: Arc::new(Array1::zeros(1)),
             offset_exit: Arc::new(Array1::zeros(1)),
-            derivative_offset_exit: Arc::new(Array1::zeros(1)),
+            derivative_offset_exit: Arc::new(Array1::from_elem(1, 1e-6)),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
@@ -13704,7 +13707,7 @@ mod tests {
             )),
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
-            derivative_offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![1e-6]),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
@@ -13769,12 +13772,12 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((2, 0)),
             )),
-            time_linear_constraints: time_derivative_lower_bound_constraints(
+            time_linear_constraints: structural_time_coefficient_constraints(
                 &array![[1.0, 2.0], [3.0, 4.0]],
                 &array![0.25, 0.5],
                 1e-4,
             )
-            .expect("time derivative constraints"),
+            .expect("time coefficient constraints"),
             score_warp: None,
             link_dev: None,
             time_wiggle_knots: None,
@@ -13797,8 +13800,8 @@ mod tests {
             .block_linear_constraints(&[], 0, &spec)
             .expect("constraint lookup")
             .expect("time constraints");
-        assert_eq!(constraints.a, array![[1.0, 2.0], [3.0, 4.0]]);
-        assert_eq!(constraints.b, array![-0.2499, -0.4999]);
+        assert_eq!(constraints.a, Array2::<f64>::eye(2));
+        assert_eq!(constraints.b, Array1::<f64>::zeros(2));
     }
 
     #[test]
@@ -13828,12 +13831,12 @@ mod tests {
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
-            time_linear_constraints: time_derivative_lower_bound_constraints(
+            time_linear_constraints: structural_time_coefficient_constraints(
                 &array![[1.0, 0.0]],
                 &array![1e-6],
                 1e-6,
             )
-            .expect("time derivative constraints"),
+            .expect("time coefficient constraints"),
             score_warp: None,
             link_dev: None,
             time_wiggle_knots: None,
@@ -13892,12 +13895,12 @@ mod tests {
             )),
             score_warp: None,
             link_dev: None,
-            time_linear_constraints: time_derivative_lower_bound_constraints(
+            time_linear_constraints: structural_time_coefficient_constraints(
                 &array![[1.0, 0.0]],
                 &array![0.2],
                 1e-4,
             )
-            .expect("time derivative constraints"),
+            .expect("time coefficient constraints"),
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,

@@ -16564,8 +16564,24 @@ mod tests {
             weights.view(),
             offset.view(),
             &pilot_spec,
-            LikelihoodFamily::BinomialLogit,
-            &crate::estimate::FitOptions::default(),
+            crate::types::LikelihoodFamily::BinomialLogit,
+            &crate::estimate::FitOptions {
+                latent_cloglog: None,
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
+                compute_inference: true,
+                max_iter: 40,
+                tol: 1e-6,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+                adaptive_regularization: None,
+                penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
+            },
         )
         .expect("pilot fit");
         let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(

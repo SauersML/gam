@@ -126,11 +126,7 @@ impl OuterThetaLayout {
         Ok(())
     }
 
-    fn validate_efs_eval(
-        &self,
-        eval: &EfsEval,
-        context: &str,
-    ) -> Result<(), ObjectiveEvalError> {
+    fn validate_efs_eval(&self, eval: &EfsEval, context: &str) -> Result<(), ObjectiveEvalError> {
         if eval.steps.len() != self.n_params {
             return Err(ObjectiveEvalError::recoverable(format!(
                 "{context}: outer EFS step length mismatch: got {}, expected {} (rho_dim={}, psi_dim={})",
@@ -721,11 +717,9 @@ fn finite_outer_eval_or_error(
             "{context}: objective returned a non-finite gradient"
         )));
     }
-    if let HessianResult::Analytic(ref hessian) = eval.hessian
-    {
+    if let HessianResult::Analytic(ref hessian) = eval.hessian {
         layout.validate_hessian_shape(hessian, context)?;
-        if !hessian.iter().all(|v| v.is_finite())
-        {
+        if !hessian.iter().all(|v| v.is_finite()) {
             return Err(ObjectiveEvalError::recoverable(format!(
                 "{context}: objective returned a non-finite Hessian"
             )));
@@ -757,7 +751,8 @@ struct OuterCostBridge<'a> {
 
 impl ZerothOrderObjective for OuterCostBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        self.layout.validate_point_len(x, "outer eval_cost failed")?;
+        self.layout
+            .validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
             .obj
             .eval_cost(x)
@@ -773,7 +768,8 @@ struct OuterFirstOrderBridge<'a> {
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        self.layout.validate_point_len(x, "outer eval_cost failed")?;
+        self.layout
+            .validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
             .obj
             .eval_cost(x)
@@ -805,7 +801,8 @@ struct OuterSecondOrderBridge<'a> {
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        self.layout.validate_point_len(x, "outer eval_cost failed")?;
+        self.layout
+            .validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
             .obj
             .eval_cost(x)
@@ -874,7 +871,8 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             .obj
             .eval_efs(x)
             .map_err(|err| into_objective_error("outer EFS eval failed", err))?;
-        self.layout.validate_efs_eval(&eval, "outer EFS eval failed")?;
+        self.layout
+            .validate_efs_eval(&eval, "outer EFS eval failed")?;
         if !eval.cost.is_finite() {
             return Err(ObjectiveEvalError::recoverable(
                 "outer EFS eval failed: objective returned a non-finite cost".to_string(),

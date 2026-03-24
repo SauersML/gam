@@ -975,9 +975,22 @@ pub fn build_survival_time_basis(
                 }
                 let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
                 for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                    let v = d_i_log_full[j_old] * chain;
+                    let raw_v = d_i_log_full[j_old] * chain;
+                    let v = if raw_v < 0.0 && raw_v >= -1e-12 {
+                        0.0
+                    } else {
+                        raw_v
+                    };
                     if !v.is_finite() {
                         found_nonfinite = Some((i, j_new));
+                    }
+                    if v < -1e-12 {
+                        return Err(format!(
+                            "survival ispline derivative basis must stay non-negative at row {}, column {}; found {:.3e}",
+                            i + 1,
+                            j_new + 1,
+                            v
+                        ));
                     }
                     if v.abs() > 1e-15 {
                         deriv_triplets.push(faer::sparse::Triplet::new(i, j_new, v));
