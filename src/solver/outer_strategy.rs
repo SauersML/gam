@@ -107,10 +107,6 @@ impl OuterCapability {
         self.psi_dim > 0
     }
 
-    fn prefers_fd_hessian_newton(&self) -> bool {
-        self.gradient == Derivative::Analytic && self.n_params <= SMALL_OUTER_FD_HESSIAN_MAX_PARAMS
-    }
-
     fn efs_plan_eligible(&self) -> bool {
         self.fixed_point_available
             && self.all_penalty_like()
@@ -269,17 +265,9 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             hessian_source: H::HybridEfsFixedPoint,
         },
 
-        // Small analytic-gradient problems should still use a real second-order
-        // method even when the Hessian must be approximated numerically.
-        // This restores the documented/tested boundary policy:
-        //   n_params <= small_outer_fd_hessian_max_params => Newton trust-region + FD Hessian
-        //   n_params  > small_outer_fd_hessian_max_params => BFGS
-        (Analytic, Unavailable) if cap.prefers_fd_hessian_newton() => OuterPlan {
-            solver: S::NewtonTrustRegion,
-            hessian_source: H::FiniteDifference,
-        },
-
-        // With many params, FD Hessian is too expensive; fall back to BFGS.
+        // Gradient-only problems should use a gradient-only optimizer.
+        // Finite-differencing a Hessian multiplies objective cost by ~2p per
+        // outer step and is a bad default for expensive likelihoods.
         (Analytic, Unavailable) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
@@ -1612,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_no_hessian_few_params_selects_fd_hessian() {
+    fn plan_no_hessian_few_params_selects_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -1622,8 +1610,8 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
-        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -1673,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_boundary_8_params_uses_fd_hessian() {
+    fn plan_boundary_8_params_uses_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -1683,8 +1671,8 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
-        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -1743,9 +1731,8 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        // Few params: prefer Newton + FD Hessian over both EFS and BFGS.
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
-        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -1974,7 +1961,6 @@ mod tests {
 
     #[test]
     fn plan_hybrid_efs_not_selected_few_params() {
-        // With few params, Newton + FD Hessian is preferred over hybrid EFS.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -1984,8 +1970,8 @@ mod tests {
             barrier_config: None,
         };
         let p = plan(&cap);
-        assert_eq!(p.solver, Solver::NewtonTrustRegion);
-        assert_eq!(p.hessian_source, HessianSource::FiniteDifference);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]

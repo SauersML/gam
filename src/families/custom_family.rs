@@ -5613,7 +5613,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     {
         for (b, beta_seed) in seed.block_beta.iter().enumerate() {
             if beta_seed.len() == states[b].beta.len() {
-                states[b].beta.assign(beta_seed);
+                let beta_projected =
+                    family.post_update_block_beta(&states, b, &specs[b], beta_seed.clone())?;
+                states[b].beta.assign(&beta_projected);
             }
         }
         cached_active_sets = seed.active_sets.clone();
@@ -6028,7 +6030,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     refresh_single_block_eta(family, specs, &mut states, b)?;
                 }
-                let trial_ll = family.log_likelihood_only(&states)?;
+                let trial_ll = match family.log_likelihood_only(&states) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        states[b].beta.assign(&beta_old);
+                        eta_checkpoint.restore_eta(&mut states[b]);
+                        continue;
+                    }
+                };
                 let trial_block_penalty =
                     block_quadratic_penalty(&states[b].beta, s_lambda, ridge, options.ridge_policy);
                 let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
@@ -6082,7 +6091,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             } else {
                                 refresh_single_block_eta(family, specs, &mut states, b)?;
                             }
-                            let trial_ll = family.log_likelihood_only(&states)?;
+                            let trial_ll = match family.log_likelihood_only(&states) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    states[b].beta.assign(&beta_old);
+                                    eta_checkpoint.restore_eta(&mut states[b]);
+                                    continue;
+                                }
+                            };
                             let trial_block_penalty = block_quadratic_penalty(
                                 &states[b].beta,
                                 s_lambda,

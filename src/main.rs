@@ -1371,8 +1371,13 @@ fn run_fit_bernoulli_marginal_slope(
         .linkwiggle
         .as_ref()
         .map(deviation_block_config_from_formula_linkwiggle);
-    let requested_score_warp = parsed.linkwiggle.is_some() && !args.disable_score_warp;
-    let requested_flex = requested_score_warp || routed_link_dev.is_some();
+    if args.disable_score_warp {
+        return Err(
+            "--disable-score-warp is no longer supported; bernoulli marginal-slope linkwiggle(...) only creates the anchored link-deviation block"
+                .to_string(),
+        );
+    }
+    let requested_flex = routed_link_dev.is_some();
     inference_notes.push(
         "bernoulli marginal-slope expects z to already be PIT-probit standardized to latent N(0,1) upstream".to_string(),
     );
@@ -1411,7 +1416,7 @@ fn run_fit_bernoulli_marginal_slope(
                 marginal_offset,
                 logslope_offset,
                 frailty: frailty.clone(),
-                score_warp: requested_score_warp.then(DeviationBlockConfig::default),
+                score_warp: None,
                 link_dev: routed_link_dev,
             },
             options,
@@ -5888,7 +5893,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             .linkwiggle
             .as_ref()
             .map(deviation_block_config_from_formula_linkwiggle);
-        let requested_score_warp = parsed.linkwiggle.is_some();
         if parsed.linkwiggle.is_some() {
             inference_notes.push(
                 "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
@@ -5951,7 +5955,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             timewiggle_block: prepared.timewiggle_block.clone(),
             logslopespec: logslopespec.clone(),
             logslope_offset: log_sigma_offset.clone(),
-            score_warp: requested_score_warp.then(DeviationBlockConfig::default),
+            score_warp: None,
             link_dev: routed_link_dev.clone(),
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {

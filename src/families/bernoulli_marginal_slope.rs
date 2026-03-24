@@ -12,7 +12,8 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{
-    ParameterBlockInput, WiggleBlockConfig, select_wiggle_basis_from_seed,
+    ParameterBlockInput, WiggleBlockConfig, append_selected_wiggle_penalty_orders,
+    buildwiggle_block_input_from_knots, select_wiggle_basis_from_seed, split_wiggle_penalty_orders,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
@@ -130,22 +131,38 @@ pub(crate) fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    let selected = select_wiggle_basis_from_seed(
-        seed.view(),
-        &WiggleBlockConfig {
-            degree: cfg.degree,
-            num_internal_knots: cfg.num_internal_knots,
-            penalty_order: cfg.penalty_order,
-            double_penalty: cfg.double_penalty,
-        },
-        &cfg.penalty_orders,
-    )?;
+    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
+}
+
+pub(crate) fn build_deviation_block_from_knots_and_design_seed(
+    knot_seed: &Array1<f64>,
+    design_seed: &Array1<f64>,
+    cfg: &DeviationBlockConfig,
+) -> Result<DeviationPrepared, String> {
+    let (primary_order, extra_orders) =
+        split_wiggle_penalty_orders(cfg.penalty_order, &cfg.penalty_orders);
+    let effective_cfg = WiggleBlockConfig {
+        degree: cfg.degree,
+        num_internal_knots: cfg.num_internal_knots,
+        penalty_order: primary_order,
+        double_penalty: cfg.double_penalty,
+    };
+    let selected =
+        select_wiggle_basis_from_seed(knot_seed.view(), &effective_cfg, &extra_orders)?;
     let structure = selected.structure;
-    let block = selected.block;
-    let dim = block.design.ncols();
     let knots = selected.knots;
     let degree = selected.degree;
-    let basis_transform = derive_deviation_basis_transform(seed, &knots, degree, &block.design)?;
+    let mut block = buildwiggle_block_input_from_knots(
+        design_seed.view(),
+        &knots,
+        degree,
+        primary_order,
+        cfg.double_penalty,
+    )?;
+    append_selected_wiggle_penalty_orders(&mut block, &extra_orders)?;
+    let dim = block.design.ncols();
+    let basis_transform =
+        derive_deviation_basis_transform(design_seed, &knots, degree, &block.design)?;
 
     // Structural exact-runtime validation + span derivation all inside try_new.
     let runtime = DeviationRuntime::try_new(
@@ -157,6 +174,42 @@ pub(crate) fn build_deviation_block_from_seed(
         basis_transform,
     )?;
     Ok(DeviationPrepared { block, runtime })
+}
+
+pub(crate) fn project_monotone_feasible_beta(
+    runtime: &DeviationRuntime,
+    current: &Array1<f64>,
+    proposed: &Array1<f64>,
+    label: &str,
+) -> Result<Array1<f64>, String> {
+    if current.len() != proposed.len() {
+        return Err(format!(
+            "{label} monotone projection length mismatch: current={}, proposed={}",
+            current.len(),
+            proposed.len()
+        ));
+    }
+    if runtime.monotonicity_feasible(proposed, label).is_ok() {
+        return Ok(proposed.clone());
+    }
+    let delta = proposed - current;
+    let Some(mut alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
+        return Ok(current.clone());
+    };
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return Ok(current.clone());
+    }
+    let min_alpha = 1e-12;
+    loop {
+        let candidate = current + &(delta.clone() * alpha);
+        if runtime.monotonicity_feasible(&candidate, label).is_ok() {
+            return Ok(candidate);
+        }
+        alpha *= 0.5;
+        if alpha < min_alpha {
+            return Ok(current.clone());
+        }
+    }
 }
 
 fn validate_spec(
@@ -6581,11 +6634,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         beta.len()
                     ));
                 }
-                let delta = &beta - current;
-                let Some(alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
-                    return Ok(current.clone());
-                };
-                return Ok(current + &(delta * alpha));
+                return project_monotone_feasible_beta(runtime, current, &beta, "score_warp_dev");
             }
         }
         if self.link_block_index().is_some_and(|idx| block_idx == idx) {
@@ -6600,11 +6649,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         beta.len()
                     ));
                 }
-                let delta = &beta - current;
-                let Some(alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
-                    return Ok(current.clone());
-                };
-                return Ok(current + &(delta * alpha));
+                return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
             }
         }
         Ok(beta)
@@ -6756,7 +6801,13 @@ fn build_aux_blockspec(
 ) -> Result<ParameterBlockSpec, String> {
     let mut block = prepared.block.clone();
     block.initial_log_lambdas = Some(rho);
-    block.initial_beta = beta_hint.or_else(|| block.initial_beta.clone());
+    let candidate_beta = beta_hint.or_else(|| Some(Array1::<f64>::zeros(block.design.ncols())));
+    block.initial_beta = candidate_beta
+        .map(|beta| {
+            let zero = Array1::<f64>::zeros(beta.len());
+            project_monotone_feasible_beta(&prepared.runtime, &zero, &beta, name)
+        })
+        .transpose()?;
     block.intospec(name)
 }
 
@@ -6849,10 +6900,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     padded.push(hi);
                     Array1::from_vec(padded)
                 } else {
-                    q0_seed
+                    q0_seed.clone()
                 }
             };
-            build_deviation_block_from_seed(&link_dev_seed, cfg)
+            build_deviation_block_from_knots_and_design_seed(&link_dev_seed, &q0_seed, cfg)
         })
         .transpose()?;
     let extra_rho0 = {
@@ -12236,7 +12287,7 @@ mod tests {
     #[test]
     fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
         let z = array![-0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67];
-        let weights = array![1.0; 12];
+        let weights = Array1::from_elem(12, 1.0);
         let standardized =
             standardize_latent_z(&z, &weights, "bernoulli-marginal-slope").expect("normalize z");
         let mean = standardized.sum() / standardized.len() as f64;
@@ -12248,7 +12299,7 @@ mod tests {
     #[test]
     fn latent_z_normalization_rejects_extreme_non_gaussian_scores() {
         let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
-        let weights = array![1.0; 6];
+        let weights = Array1::from_elem(6, 1.0);
         let err = standardize_latent_z(&z, &weights, "bernoulli-marginal-slope")
             .expect_err("expected non-gaussian rejection");
         assert!(err.contains("approximately Gaussian"));

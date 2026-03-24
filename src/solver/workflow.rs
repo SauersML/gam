@@ -1662,15 +1662,6 @@ fn materialize_survival<'a>(
     } else {
         None
     };
-    let marginal_slope_score_warp = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        parsed
-            .linkwiggle
-            .as_ref()
-            .map(|_| DeviationBlockConfig::default())
-    } else {
-        None
-    };
-
     match survival_mode {
         SurvivalLikelihoodMode::LocationScale if config.frailty.is_some() => {
             return Err(
@@ -1792,7 +1783,7 @@ fn materialize_survival<'a>(
                         "marginal-slope survival is missing logslope spec".to_string()
                     })?,
                     logslope_offset: log_sigma_offset.clone(),
-                    score_warp: marginal_slope_score_warp.clone(),
+                    score_warp: None,
                     link_dev: marginal_slope_link_dev.clone(),
                 },
                 options: BlockwiseFitOptions {
