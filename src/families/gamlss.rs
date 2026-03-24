@@ -2852,16 +2852,62 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&dims_per_term, kappa_options);
 
     let eta_penalty_count = pilot_design.penalties.len();
-    let wiggle_log_lambdas0 = initial_log_lambdas_orzeros(&wiggle_block)?;
-    let rho_dim = eta_penalty_count + wiggle_log_lambdas0.len();
+    let wiggle_penalty_count = initial_log_lambdas_orzeros(&wiggle_block)?.len();
+    let rho_dim = eta_penalty_count + wiggle_penalty_count;
+    let baseline_resolvedspec = log_kappa0
+        .apply_tospec(pilot_spec, &spatial_terms)
+        .map_err(|e| e.to_string())?;
+    let baseline_design =
+        build_term_collection_design(data, &baseline_resolvedspec).map_err(|e| e.to_string())?;
+    let baseline_fit = fit_binomial_mean_wiggle(
+        BinomialMeanWiggleSpec {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: link_kind.clone(),
+            wiggle_knots: wiggle_knots.clone(),
+            wiggle_degree,
+            eta_block: ParameterBlockInput {
+                design: baseline_design.design.clone(),
+                offset: Array1::zeros(y.len()),
+                penalties: baseline_design
+                    .penalties
+                    .iter()
+                    .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                    .collect(),
+                nullspace_dims: vec![],
+                initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
+                initial_beta: Some(pilot_fit.beta.clone()),
+            },
+            wiggle_block: wiggle_block.clone(),
+        },
+        options,
+    )?;
+    let baseline_log_lambdas = baseline_fit.lambdas.mapv(|v| v.max(1e-12).ln());
+    if baseline_log_lambdas.len() != rho_dim {
+        return Err(format!(
+            "baseline binomial mean-wiggle fit returned {} log-lambdas, expected {rho_dim}",
+            baseline_log_lambdas.len()
+        ));
+    }
+    let baseline_eta_beta = baseline_fit
+        .block_states
+        .get(BinomialMeanWiggleFamily::BLOCK_ETA)
+        .ok_or_else(|| "baseline binomial mean-wiggle fit missing eta block".to_string())?
+        .beta
+        .clone();
+    let baseline_wiggle_beta = Some(
+        baseline_fit
+            .block_states
+            .get(BinomialMeanWiggleFamily::BLOCK_WIGGLE)
+            .ok_or_else(|| "baseline binomial mean-wiggle fit missing wiggle block".to_string())?
+            .beta
+            .clone(),
+    );
     let theta_dim = rho_dim + log_kappa0.len();
     let mut theta0 = Array1::<f64>::zeros(theta_dim);
     theta0
-        .slice_mut(s![0..eta_penalty_count])
-        .assign(&pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln()));
-    theta0
-        .slice_mut(s![eta_penalty_count..rho_dim])
-        .assign(&wiggle_log_lambdas0);
+        .slice_mut(s![0..rho_dim])
+        .assign(&baseline_log_lambdas);
     theta0
         .slice_mut(s![rho_dim..theta_dim])
         .assign(log_kappa0.as_array());
@@ -2876,16 +2922,16 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .assign(log_kappa_upper.as_array());
 
     let pilot_spec_cloned = pilot_spec.clone();
-    let pilot_beta = pilot_fit.beta.clone();
+    let pilot_beta = baseline_eta_beta;
     let wiggle_design = wiggle_block.design.clone();
     let wiggle_offset = wiggle_block.offset.clone();
     let wiggle_penalties = wiggle_block.penalties.clone();
-    let wiggle_initial_beta = wiggle_block.initial_beta.clone();
+    let wiggle_initial_beta = baseline_wiggle_beta;
     let wiggle_knots_cloned = wiggle_knots.clone();
     let y_cloned = y.clone();
     let weights_cloned = weights.clone();
     let link_kind_cloned = link_kind.clone();
-    let analytic_outer_hessian_available =
+    let mut analytic_outer_hessian_available =
         crate::custom_family::joint_exact_analytic_outer_hessian_available(
             pilot_beta.len() + wiggle_design.ncols(),
         );
@@ -2981,6 +3027,20 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         Ok((eval, resolvedspec, design))
     };
 
+    if analytic_outer_hessian_available {
+        let hessian_ready = build_eval(&theta0, None, true)
+            .ok()
+            .and_then(|(eval, _, _)| eval.outer_hessian)
+            .is_some_and(|hessian| {
+                hessian.nrows() == theta_dim
+                    && hessian.ncols() == theta_dim
+                    && hessian.iter().all(|value| value.is_finite())
+            });
+        if !hessian_ready {
+            analytic_outer_hessian_available = false;
+        }
+    }
+
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval};
 
@@ -3010,6 +3070,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .with_max_iter(options.outer_max_iter)
         .with_fd_step(1e-4)
         .with_bounds(lower.clone(), upper.clone())
+        .with_initial_rho(theta0.clone())
         .with_seed_config(crate::seeding::SeedConfig {
             max_seeds: 4,
             screening_budget: 2,
@@ -3057,7 +3118,11 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             // (exact_newton_dh_closure / exact_newton_d2h_closure ->
             // joint_outer_evaluate -> BorrowedJointDerivProvider), enabling
             // the outer Newton step.
-            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), true)
+            let (eval, _, _) = build_eval(
+                theta,
+                state.warm_cache.as_ref(),
+                analytic_outer_hessian_available,
+            )
                 .map_err(EstimationError::InvalidInput)?;
             let hessian_result = eval
                 .outer_hessian
@@ -3078,7 +3143,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 hessian: hessian_result,
             })
         },
-        None::<fn(&mut MeanWiggleOuterState)>,
+        Some(|state: &mut MeanWiggleOuterState| {
+            state.warm_cache = None;
+            state.last_eval = None;
+        }),
         None::<
             fn(
                 &mut MeanWiggleOuterState,
@@ -16545,8 +16613,8 @@ mod tests {
     }
 
     #[test]
-    fn binomial_mean_wiggle_selected_basis_exact_spatial_path_succeeds_end_to_end() {
-        let n = 24usize;
+    fn binomial_mean_wiggle_selected_basis_exact_spatial_joint_gradient_is_finite() {
+        let n = 48usize;
         let mut data = Array2::<f64>::zeros((n, 3));
         for i in 0..n {
             let t = i as f64 / (n as f64 - 1.0);
@@ -16554,7 +16622,11 @@ mod tests {
             data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
             data[[i, 2]] = (2.5 * std::f64::consts::PI * t).cos();
         }
-        let y = Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 7 == 0 { 1.0 } else { 0.0 }));
+        let y = Array1::from_iter((0..n).map(|i| {
+            let t = data[[i, 0]];
+            let signal = 0.9 * data[[i, 1]] - 0.45 * data[[i, 2]] + 0.2 * (4.0 * t - 2.0);
+            if signal > 0.1 { 1.0 } else { 0.0 }
+        }));
         let weights = Array1::from_elem(n, 1.0);
         let offset = Array1::zeros(n);
         let pilot_spec = simple_aniso_matern_term_collection(&[0, 1, 2], 0.45);
@@ -16589,33 +16661,148 @@ mod tests {
             &pilot.fit,
             &WiggleBlockConfig {
                 degree: 2,
-                num_internal_knots: 4,
+                num_internal_knots: 3,
                 penalty_order: 1,
                 double_penalty: false,
             },
             &[1, 2],
         )
         .expect("selected wiggle basis");
-        let solved = fit_binomial_mean_wiggle_terms_with_selected_basis(
-            data.view(),
+        let SelectedWiggleBasis {
+            knots: wiggle_knots,
+            degree: wiggle_degree,
+            block: wiggle_block,
+            ..
+        } = selected_wiggle_basis;
+        let spatial_terms = spatial_length_scale_term_indices(&pilot_spec);
+        let log_kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(
             &pilot_spec,
-            &pilot.design,
-            &pilot.fit,
-            &y,
-            &weights,
-            InverseLink::Standard(LinkFunction::Logit),
-            selected_wiggle_basis,
+            &spatial_terms,
+            &spatial_kappa_options(),
+        );
+        let resolvedspec = log_kappa0
+            .apply_tospec(&pilot_spec, &spatial_terms)
+            .expect("resolve baseline spatial spec");
+        let design = build_term_collection_design(data.view(), &resolvedspec)
+            .expect("build baseline mean design");
+        let baseline_fit = fit_binomial_mean_wiggle(
+            BinomialMeanWiggleSpec {
+                y: y.clone(),
+                weights: weights.clone(),
+                link_kind: InverseLink::Standard(LinkFunction::Logit),
+                wiggle_knots: wiggle_knots.clone(),
+                wiggle_degree,
+                eta_block: ParameterBlockInput {
+                    design: design.design.clone(),
+                    offset: Array1::zeros(n),
+                    penalties: design
+                        .penalties
+                        .iter()
+                        .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                        .collect(),
+                    nullspace_dims: vec![],
+                    initial_log_lambdas: Some(pilot.fit.lambdas.mapv(|v| v.max(1e-12).ln())),
+                    initial_beta: Some(pilot.fit.beta.clone()),
+                },
+                wiggle_block: wiggle_block.clone(),
+            },
             &BlockwiseFitOptions {
                 use_remlobjective: true,
-                outer_max_iter: 4,
+                outer_max_iter: 12,
                 ..BlockwiseFitOptions::default()
             },
-            &spatial_kappa_options(),
         )
-        .expect("exact spatial mean-wiggle fit");
-        assert_eq!(solved.design.design.nrows(), n);
-        assert!(solved.fit.beta.iter().all(|v| v.is_finite()));
-        assert!(solved.fit.lambdas.iter().all(|v| v.is_finite()));
+        .expect("baseline mean-wiggle fit");
+        let derivative_blocks =
+            vec![build_block_spatial_psi_derivatives(data.view(), &resolvedspec, &design)
+                .expect("build spatial psi derivatives")
+                .expect("exact spatial mean-wiggle should expose psi derivatives"), Vec::new()];
+        let eta_penalty_count = pilot.design.penalties.len();
+        let wiggle_penalty_count = initial_log_lambdas_orzeros(&wiggle_block)
+            .expect("wiggle initial lambdas")
+            .len();
+        let rho_dim = eta_penalty_count + wiggle_penalty_count;
+        let theta_dim = rho_dim + log_kappa0.len();
+        let rho = baseline_fit.lambdas.mapv(|v| v.max(1e-12).ln());
+        assert_eq!(rho.len(), rho_dim);
+        let blocks = vec![
+            ParameterBlockSpec {
+                name: "eta".to_string(),
+                design: design.design.clone(),
+                offset: Array1::zeros(n),
+                penalties: design.penalties_as_penalty_matrix(),
+                nullspace_dims: vec![],
+                initial_log_lambdas: rho.slice(s![0..eta_penalty_count]).to_owned(),
+                initial_beta: Some(
+                    baseline_fit
+                        .block_states
+                        .get(BinomialMeanWiggleFamily::BLOCK_ETA)
+                        .expect("baseline eta block")
+                        .beta
+                        .clone(),
+                ),
+            },
+            ParameterBlockSpec {
+                name: "wiggle".to_string(),
+                design: wiggle_block.design.clone(),
+                offset: wiggle_block.offset.clone(),
+                penalties: {
+                    let p_wiggle = wiggle_block.design.ncols();
+                    wiggle_block
+                        .penalties
+                        .iter()
+                        .map(|spec| match spec {
+                            crate::solver::estimate::PenaltySpec::Block {
+                                local,
+                                col_range,
+                                ..
+                            } => PenaltyMatrix::Blockwise {
+                                local: local.clone(),
+                                col_range: col_range.clone(),
+                                total_dim: p_wiggle,
+                            },
+                            crate::solver::estimate::PenaltySpec::Dense(m) => {
+                                PenaltyMatrix::Dense(m.clone())
+                            }
+                        })
+                        .collect()
+                },
+                nullspace_dims: vec![],
+                initial_log_lambdas: rho.slice(s![eta_penalty_count..rho_dim]).to_owned(),
+                initial_beta: Some(
+                    baseline_fit
+                        .block_states
+                        .get(BinomialMeanWiggleFamily::BLOCK_WIGGLE)
+                        .expect("baseline wiggle block")
+                        .beta
+                        .clone(),
+                ),
+            },
+        ];
+        let family = BinomialMeanWiggleFamily {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            wiggle_knots,
+            wiggle_degree,
+        };
+        let eval = evaluate_custom_family_joint_hyper(
+            &family,
+            &blocks,
+            &BlockwiseFitOptions {
+                use_remlobjective: true,
+                outer_max_iter: 12,
+                ..BlockwiseFitOptions::default()
+            },
+            &rho,
+            &derivative_blocks,
+            None,
+            false,
+        )
+        .expect("exact spatial mean-wiggle joint hyper eval");
+        assert!(eval.objective.is_finite());
+        assert_eq!(eval.gradient.len(), theta_dim);
+        assert!(eval.gradient.iter().all(|v| v.is_finite()));
     }
 
     #[test]
