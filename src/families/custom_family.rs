@@ -6273,7 +6273,10 @@ fn unified_joint_cost_gradient(
 
     let evaluator = InnerAssembly {
         log_likelihood: inner.log_likelihood,
-        penalty_quadratic: inner.penalty_value,
+        // inner.penalty_value includes the 0.5 factor (= 0.5 β̂ᵀSβ̂), but the
+        // unified evaluator convention expects the FULL quadratic β̂ᵀSβ̂ and
+        // applies 0.5 itself.  Double to match the convention.
+        penalty_quadratic: 2.0 * inner.penalty_value,
         beta: beta_flat.clone(),
         n_observations,
         hessian_op,
@@ -8831,6 +8834,56 @@ mod tests {
                 .zip(expected_s_cross_10.iter())
                 .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
             "generic psi builder should embed the psi1->psi0 cross penalties into the symmetric off-diagonal row"
+        );
+    }
+
+    #[test]
+    fn build_block_spatial_psi_derivatives_reproduces_3d_aniso_radial_eval_failure() {
+        let n = 24usize;
+        let mut data = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+            data[[i, 2]] = (2.5 * std::f64::consts::PI * t).cos();
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![SmoothTermSpec {
+                name: "spatial".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1, 2],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
+                        length_scale: 0.45,
+                        nu: MaternNu::ThreeHalves,
+                        include_intercept: false,
+                        double_penalty: false,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: Some(vec![0.0, 0.0, 0.0]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let base_design =
+            build_term_collection_design(data.view(), &spec).expect("build base spatial design");
+        let resolvedspec = freeze_term_collection_from_design(&spec, &base_design)
+            .expect("freeze spatial term spec");
+        let resolved_design = build_term_collection_design(data.view(), &resolvedspec)
+            .expect("rebuild frozen spatial design");
+        let err = match build_block_spatial_psi_derivatives(data.view(), &resolvedspec, &resolved_design) {
+            Ok(_) => panic!(
+                "3D anisotropic Matern setup should reproduce the lower-level radial evaluation failure"
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("radial scalar evaluation failed during aniso derivative construction"),
+            "unexpected error: {err}"
         );
     }
 

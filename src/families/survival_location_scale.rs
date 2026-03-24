@@ -7210,8 +7210,16 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta_flat
             .slice_mut(s![offsets[block_idx]..offsets[block_idx + 1]])
             .assign(d_beta);
+        // The block-level directional derivative must differentiate the
+        // UNRESCALED Hessian (from exact_newton_joint_hessian / evaluate()),
+        // not the rescaled one used in the outer curvature path.  Pass
+        // log_rescale = 0 so quantities match what evaluate() returns.
         let d_joint = self
-            .exact_newton_joint_hessian_directional_derivative(block_states, &d_beta_flat)?
+            .exact_newton_joint_hessian_directional_derivative_with_rescale(
+                block_states,
+                &d_beta_flat,
+                0.0,
+            )?
             .ok_or_else(|| {
                 "missing survival location-scale exact joint directional Hessian".to_string()
             })?;
@@ -7254,9 +7262,23 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        // The trait method uses the full rescale for the outer curvature path.
+        self.exact_newton_joint_hessian_directional_derivative_with_rescale(
+            block_states,
+            d_beta_flat,
+            self.hessian_deriv_log_rescale(block_states),
+        )
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_with_rescale(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        log_rescale: f64,
+    ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities_rescaled(
             block_states,
-            self.hessian_deriv_log_rescale(block_states),
+            log_rescale,
         )?;
         let offsets = self.joint_block_offsets();
         let p_total = *offsets

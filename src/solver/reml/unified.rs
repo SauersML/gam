@@ -3103,11 +3103,15 @@ pub fn reml_laml_evaluate(
         }
     }
 
-    // Firth gradient: ∂Φ/∂ρ_k = −0.5 tr(H⁻¹ D(H_φ)[B_k])
+    // Firth gradient: ∂Φ/∂ρ_k = −0.5 tr(G_ε(H) D(H_φ)[B_k])
     //
-    // Computed internally from the FirthDenseOperator when present. The mode
-    // response v_k = H⁻¹(A_k β̂) is re-derived here (cheap relative to the
-    // trace computation) to avoid storing intermediate vectors.
+    // The Firth contribution is part of dH_total/dρ_k inside 0.5 log|H|.
+    // The cost uses the regularized logdet Σ ln(r_ε(σ_j)), so the derivative
+    // must use the matching kernel φ'(σ) = 1/√(σ²+4ε²) via
+    // trace_logdet_gradient, NOT the plain inverse kernel 1/r_ε(σ) via
+    // trace_hinv_product.  Mixing kernels causes a systematic gradient
+    // mismatch on ill-conditioned or rank-deficient designs where ε is
+    // non-negligible.
     if let Some(ref firth) = solution.firth {
         let firth_op = firth.operator();
         for idx in 0..k {
@@ -3117,7 +3121,7 @@ pub fn reml_laml_evaluate(
             let deta_k: Array1<f64> = firth_op.x_dense.dot(v_k).mapv(|v| -v);
             let dir_k = firth_op.direction_from_deta(deta_k);
             let dhphi_k = firth_op.hphi_direction(&dir_k);
-            grad[idx] += -0.5 * hop.trace_hinv_product(&dhphi_k);
+            grad[idx] += -0.5 * hop.trace_logdet_gradient(&dhphi_k);
         }
     }
 
@@ -3217,19 +3221,14 @@ pub fn compute_firth_hessian_contribution(
         dhphi_ks.push(dhphi_k);
     }
 
-    // Precompute Y_k^F = H⁻¹ D(H_φ)[B_k] for cross-trace terms.
-    let mut y_firth_ks: Vec<Array2<f64>> = Vec::with_capacity(k);
-    for idx in 0..k {
-        y_firth_ks.push(hop.solve_multi(&dhphi_ks[idx]));
-    }
-
     for kk in 0..k {
         for ll in kk..k {
-            // ── Cross-trace: tr(H⁻¹ İ_l H⁻¹ İ_k) = tr(Y_l^F · Y_k^F) ──
-            // where İ_k = D(H_φ)[B_k] and Y_k^F = H⁻¹ İ_k.
-            let cross_trace = (&y_firth_ks[ll].t() * &y_firth_ks[kk]).sum();
+            // ── Cross-trace: −tr(G_ε(H)Ḣ_l G_ε(H)Ḣ_k) via divided-difference ──
+            // The cost logdet uses Σ ln(r_ε(σ)), so the Hessian cross term
+            // must use the Γ kernel, not the plain H⁻¹⊗H⁻¹ kernel.
+            let cross_trace = -hop.trace_logdet_hessian_cross(&dhphi_ks[ll], &dhphi_ks[kk]);
 
-            // ── Second drift: tr(H⁻¹ Ï_{kl}) ──
+            // ── Second drift: tr(G_ε(H) Ï_{kl}) ──
             // Ï_{kl} = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
             //
             // B_{kl} = −β_{kl} where β_{kl} = H⁻¹(Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂)
@@ -3254,12 +3253,12 @@ pub fn compute_firth_hessian_contribution(
 
             // Ï_{kl} = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
             let ddot_kl = &dhphi_kl + &d2hphi_kl;
-            let second_drift_trace = hop.trace_hinv_product(&ddot_kl);
+            let second_drift_trace = hop.trace_logdet_gradient(&ddot_kl);
 
             // J_{kl} = −½ [second_drift_trace − cross_trace]
             //
             // The sign is negative because the Firth gradient uses
-            // ∂Φ/∂ρ_k = −½ tr(H⁻¹ D(H_φ)[B_k]), so the second derivative
+            // ∂Φ/∂ρ_k = −½ tr(G_ε D(H_φ)[B_k]), so the second derivative
             // inherits the same overall negative sign.
             let j_kl = -0.5 * (second_drift_trace - cross_trace);
 

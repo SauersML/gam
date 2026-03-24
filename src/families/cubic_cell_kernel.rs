@@ -1253,17 +1253,35 @@ fn affine_zero_moment(alpha: f64, beta: f64, left: f64, right: f64) -> f64 {
 }
 
 fn affine_value_from_moment_primitive(alpha: f64, beta: f64, left: f64, right: f64) -> f64 {
-    let mut acc = 0.0;
-    for (&node, &weight) in BVN_GL_NODES_20.iter().zip(BVN_GL_WEIGHTS_20.iter()) {
-        let s = 0.5 * (node + 1.0);
-        let angle = std::f64::consts::FRAC_PI_2 * s;
-        let tail = angle.tan();
-        let alpha_prime = alpha - tail;
-        let jacobian = std::f64::consts::FRAC_PI_2 * (1.0 + tail * tail);
-        let deriv = INV_TWO_PI * affine_zero_moment(alpha_prime, beta, left, right);
-        acc += weight * deriv * jacobian;
-    }
-    (0.5 * acc).clamp(0.0, 1.0)
+    // Exact formula via bivariate normal CDF.
+    //
+    // V(α,β,l,r) = ∫_l^r Φ(α+βz)φ(z)dz
+    //            = P(U ≤ α+βZ, l ≤ Z ≤ r)    where U,Z iid N(0,1)
+    //            = Φ₂(h, r; ρ) − Φ₂(h, l; ρ)
+    //
+    // with h = α/√(1+β²) and ρ = −β/√(1+β²).
+    //
+    // This is exact to floating-point precision via the high-accuracy
+    // Drezner-Wesolowsky BVN routine, replacing the previous fixed 20-point
+    // Gauss-Legendre numerical integration of the derivative primitive.
+    let s = (1.0 + beta * beta).sqrt();
+    let h = alpha / s;
+    let rho = -beta / s;
+    let bvn_right = if right == f64::INFINITY {
+        normal_cdf(h)
+    } else if right == f64::NEG_INFINITY {
+        0.0
+    } else {
+        bivariate_normal_cdf(h, right, rho).unwrap_or(0.0)
+    };
+    let bvn_left = if left == f64::NEG_INFINITY {
+        0.0
+    } else if left == f64::INFINITY {
+        normal_cdf(h)
+    } else {
+        bivariate_normal_cdf(h, left, rho).unwrap_or(0.0)
+    };
+    (bvn_right - bvn_left).clamp(0.0, 1.0)
 }
 
 /// Evaluate an affine cell (c2=c3=0) with a value/moment-consistent primitive.
