@@ -551,13 +551,14 @@ fn fallback_projected_gradient_direction(
     Ok(Some((d_total + &fallback_step, active)))
 }
 
-pub(crate) fn solve_newton_direction_with_linear_constraints(
+fn solve_newton_direction_with_linear_constraints_impl(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
     direction_out: &mut Array1<f64>,
     active_hint: Option<&mut Vec<usize>>,
+    max_iterations: usize,
 ) -> Result<(), EstimationError> {
     let p = gradient.len();
     if direction_out.len() != p {
@@ -619,18 +620,8 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
     }
     active = canonicalize_active_constraint_ids(&x, constraints, &active)?;
     reset_active_flags(&mut is_active, &active);
-    let mut last_working_x = x.clone();
-    let mut last_working_direction = d_total.clone();
-    let mut last_working_gradient = g_cur.clone();
-    let mut last_working_active = active.clone();
-    let mut last_working_constraints = LinearInequalityConstraints {
-        a: Array2::<f64>::zeros((0, p)),
-        b: Array1::<f64>::zeros(0),
-    };
-    let mut last_working_lambda_true = Array1::<f64>::zeros(0);
-    let mut last_working_degenerate = false;
 
-    for _ in 0..((p + m + 8) * 4) {
+    for _ in 0..max_iterations {
         let compressed_working = compress_active_working_set(&x, constraints, &active)?;
         let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
         for r in 0..compressed_working.constraints.a.nrows() {
@@ -643,17 +634,6 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
             &compressed_working.constraints.a,
             Some(&residualw),
         )?;
-        last_working_x.assign(&x);
-        last_working_direction.assign(&d_total);
-        last_working_gradient.assign(&g_cur);
-        last_working_active.clear();
-        last_working_active.extend(active.iter().copied());
-        last_working_constraints = LinearInequalityConstraints {
-            a: compressed_working.constraints.a.clone(),
-            b: compressed_working.constraints.b.clone(),
-        };
-        last_working_lambda_true = lambdaw.mapv(|lam_sys| -lam_sys);
-        last_working_degenerate = compressed_working.is_degenerate_face();
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
             if compressed_working.groups.is_empty() {
@@ -739,27 +719,35 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
         }
     }
 
-    let (worst, row) = max_linear_constraint_violation(&last_working_x, constraints);
+    let compressed_working = compress_active_working_set(&x, constraints, &active)?;
+    let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
+    for r in 0..compressed_working.constraints.a.nrows() {
+        residualw[r] =
+            compressed_working.constraints.b[r] - compressed_working.constraints.a.row(r).dot(&x);
+    }
+    let (_, lambdaw) = solve_kkt_direction(
+        hessian,
+        &g_cur,
+        &compressed_working.constraints.a,
+        Some(&residualw),
+    )?;
+    let lambda_true = lambdaw.mapv(|lam_sys| -lam_sys);
+    let (worst, row) = max_linear_constraint_violation(&x, constraints);
     let working_kkt = working_set_kkt_diagnostics_from_multipliers(
-        &last_working_x,
-        &last_working_gradient,
-        &last_working_constraints,
-        &last_working_lambda_true,
+        &x,
+        &g_cur,
+        &compressed_working.constraints,
+        &lambda_true,
         m,
     )?;
-    let kkt =
-        compute_constraint_kkt_diagnostics(&last_working_x, &last_working_gradient, constraints);
-    let grad_inf = last_working_gradient
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
+    let grad_inf = g_cur.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let stationarity_rel = working_kkt.stationarity / grad_inf.max(1.0);
-    let step_inf = last_working_direction
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let hd_total = hessian.dot(&last_working_direction);
-    let predicted_delta = gradient.dot(&last_working_direction)
+    let step_inf = d_total.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let hd_total = hessian.dot(&d_total);
+    let predicted_delta = gradient.dot(&d_total)
         + 0.5
-            * last_working_direction
+            * d_total
                 .iter()
                 .zip(hd_total.iter())
                 .map(|(a, b)| a * b)
@@ -768,7 +756,7 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
         && working_kkt.complementarity <= 1e-6;
     let model_descent_ok = predicted_delta <= -1e-10 * (1.0 + grad_inf * step_inf);
     let near_null_step_ok = step_inf <= 1e-10;
-    let degenerate_boundary_ok = last_working_degenerate
+    let degenerate_boundary_ok = compressed_working.is_degenerate_face()
         && worst <= 1e-8
         && working_kkt.primal_feasibility <= 1e-8
         && working_kkt.complementarity <= 1e-6
@@ -781,19 +769,19 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
         if let Some(hint) = active_hint {
             hint.clear();
             hint.extend(canonicalize_active_constraint_ids(
-                &last_working_x,
+                &x,
                 constraints,
-                &last_working_active,
+                &active,
             )?);
         }
-        direction_out.assign(&last_working_direction);
+        direction_out.assign(&d_total);
         return Ok(());
     }
     if let Some((fallback_direction, fallback_active)) = fallback_projected_gradient_direction(
-        &last_working_x,
-        &last_working_direction,
-        &last_working_gradient,
-        &last_working_constraints,
+        &x,
+        &d_total,
+        &g_cur,
+        &compressed_working.constraints,
         constraints,
     )? {
         if let Some(hint) = active_hint {
@@ -814,6 +802,26 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
         kkt.dual_feasibility,
         kkt.stationarity
     )))
+}
+
+pub(crate) fn solve_newton_direction_with_linear_constraints(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    direction_out: &mut Array1<f64>,
+    active_hint: Option<&mut Vec<usize>>,
+) -> Result<(), EstimationError> {
+    let max_iterations = (gradient.len() + constraints.a.nrows() + 8) * 4;
+    solve_newton_direction_with_linear_constraints_impl(
+        hessian,
+        gradient,
+        beta,
+        constraints,
+        direction_out,
+        active_hint,
+        max_iterations,
+    )
 }
 
 pub(crate) fn solve_quadratic_with_linear_constraints(
@@ -844,4 +852,38 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
         Some(&mut active_hint),
     )?;
     Ok((beta_start + &delta, active_hint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinearInequalityConstraints, solve_newton_direction_with_linear_constraints_impl};
+    use approx::assert_relative_eq;
+    use ndarray::{Array1, array};
+
+    #[test]
+    fn maxiter_accepts_current_boundary_solution() {
+        let hessian = array![[1.0]];
+        let gradient = array![-1.0];
+        let beta = array![0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[-1.0]],
+            b: array![-0.1],
+        };
+        let mut direction = Array1::zeros(1);
+        let mut active_hint = Vec::new();
+
+        solve_newton_direction_with_linear_constraints_impl(
+            &hessian,
+            &gradient,
+            &beta,
+            &constraints,
+            &mut direction,
+            Some(&mut active_hint),
+            1,
+        )
+        .expect("solver should accept the current boundary solution at the iteration limit");
+
+        assert_relative_eq!(direction[0], 0.1, epsilon = 1e-12);
+        assert_eq!(active_hint, vec![0]);
+    }
 }
