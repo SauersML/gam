@@ -34,8 +34,8 @@ pub enum Derivative {
     /// Derivative is available only via finite differences computed inside
     /// `opt` from a lower-order objective interface. This is a real capability
     /// for gradients; Hessians are normalized to `Unavailable` at planning time
-    /// because the choice to synthesize an FD Hessian is owned centrally by
-    /// `plan()`, not by callers.
+    /// because finite-differenced Hessians are a last resort and should not be
+    /// selected ahead of a gradient-only solver.
     FiniteDifference,
     /// No analytic derivative; must be approximated or skipped.
     Unavailable,
@@ -221,11 +221,6 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             solver: S::Arc,
             hessian_source: H::Analytic,
         },
-        (Analytic, FiniteDifference) => OuterPlan {
-            solver: S::NewtonTrustRegion,
-            hessian_source: H::FiniteDifference,
-        },
-
         // EFS: all penalty-like coords, no analytic Hessian, many params.
         // Multiplicative fixed-point needs only traces — no gradient evals.
         // Much cheaper than BFGS for k=10-50 smoothing parameters.
@@ -1604,6 +1599,21 @@ mod tests {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
+            n_params: 3,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn plan_fd_hessian_still_selects_bfgs() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::FiniteDifference,
             n_params: 3,
             psi_dim: 0,
             fixed_point_available: false,

@@ -7618,11 +7618,42 @@ mod tests {
             }
         }
         let direction = found.expect("expected an infeasible full step");
-        let alpha = prepared
+        let mut trial = beta0.clone();
+        trial += &direction;
+        let alpha = if prepared
             .runtime
-            .max_feasible_monotone_step(&beta0, &direction)
-            .expect("max feasible step")
-            .expect("step ceiling");
+            .exact_monotonicity_min_slack(&trial)
+            .expect("full-step monotonicity slack")
+            >= 0.0
+        {
+            1.0
+        } else {
+            let mut alpha_lo = 0.0f64;
+            let mut alpha_hi = 1.0f64;
+            for _ in 0..48 {
+                let alpha_mid = 0.5 * (alpha_lo + alpha_hi);
+                for idx in 0..trial.len() {
+                    trial[idx] = beta0[idx] + alpha_mid * direction[idx];
+                }
+                if prepared
+                    .runtime
+                    .exact_monotonicity_min_slack(&trial)
+                    .expect("midpoint monotonicity slack")
+                    >= 0.0
+                {
+                    alpha_lo = alpha_mid;
+                } else {
+                    alpha_hi = alpha_mid;
+                }
+            }
+            if alpha_lo >= 1.0 {
+                1.0
+            } else if alpha_lo <= 0.0 {
+                0.0
+            } else {
+                (alpha_lo * 0.999_999).clamp(0.0, 1.0)
+            }
+        };
         assert!(
             alpha > 0.0 && alpha < 1.0,
             "expected strict step ceiling, got {alpha}"
