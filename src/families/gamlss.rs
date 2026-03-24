@@ -1,7 +1,6 @@
 use crate::basis::{
-    BasisFamily, BasisOptions, Dense, KnotSource, PenaltyInfo, PenaltySource,
-    basis_family_value_derivative_is_structurally_zero, basis_family_value_span_polynomial_degree,
-    create_basis, create_difference_penalty_matrix, create_ispline_derivative_dense,
+    BasisOptions, Dense, KnotSource, PenaltyInfo, PenaltySource, create_basis,
+    create_difference_penalty_matrix, create_ispline_derivative_dense,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,

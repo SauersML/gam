@@ -5012,14 +5012,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     } else {
         family.exact_newton_joint_hessian(&states)?.is_some()
     };
-    let has_constraints = specs.iter().enumerate().any(|(b, s)| {
-        family
-            .block_linear_constraints(&states, b, s)
-            .ok()
-            .flatten()
-            .is_some()
-    });
-    let use_joint_newton = has_joint_exacthessian && !has_constraints && specs.len() >= 2;
+    let use_joint_newton = has_joint_exacthessian && specs.len() >= 2;
     // Tighten tolerance and raise cycle cap only when the joint Newton
     // path will actually be used.  Joint Newton converges quadratically
     // (5-10 steps), so 1e-10 tolerance and 4000 cap are safe.  The
@@ -5079,9 +5072,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // per cycle instead of iterating between blocks. This converges quadratically
     // (5-10 steps) instead of linearly (20-100+ blockwise cycles).
     //
-    // Falls back to blockwise iteration if the joint Hessian is unavailable,
-    // the joint solve fails, or constraints are present.
-    // (has_constraints and use_joint_newton already computed above for tol/cap gating.)
+    // Falls back to blockwise iteration if the joint Hessian is unavailable
+    // or the joint solve fails. Linear constraints are handled directly in the
+    // joint step whenever they can be assembled blockwise.
 
     if use_joint_newton {
         // Build block ranges for the joint system.
@@ -5106,6 +5099,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             };
 
         for cycle in 0..inner_max_cycles {
+            let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+            let joint_constraints =
+                assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // Get joint Hessian and block gradients from the current evaluation.
             let joint_hessian_source = if use_joint_matrix_free_path(total_p, false) {
                 family
@@ -5158,64 +5154,64 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .assign(&states[b].beta);
             }
 
-            // Stationarity residual: r = S*beta - gradient (for penalized NLL)
-            let penalty_beta = apply_joint_block_penalty(
-                &ranges,
-                &s_lambdas,
-                &beta_joint,
-                joint_mode_diagonal_ridge,
-            );
-            let rhs = &grad_joint - &penalty_beta;
-
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
-            let mut delta = if use_joint_matrix_free_path(total_p, false) {
-                let preconditioner_diag = match &joint_hessian_source {
-                    JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
-                        &h_joint.diag().to_owned(),
-                        &ranges,
-                        &s_lambdas,
-                        trace_diagonal_ridge,
-                    ),
-                    JointHessianSource::Operator { diagonal, .. } => {
-                        joint_penalty_preconditioner_diag(
-                            diagonal,
+            let mut lhs = match materialize_joint_hessian_source(
+                &joint_hessian_source,
+                total_p,
+                "joint Newton inner Hessian materialization",
+            ) {
+                Ok(matrix) => matrix,
+                Err(_) => break,
+            };
+            add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, trace_diagonal_ridge);
+
+            let (candidate_beta, joint_active_set) = if let Some(constraints) =
+                joint_constraints.as_ref()
+            {
+                check_linear_feasibility(&beta_joint, constraints, 1e-8)
+                    .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
+                let warm_joint_active =
+                    flatten_joint_active_set(&cached_active_sets, &block_constraints);
+                match solve_quadratic_with_linear_constraints(
+                    &lhs,
+                    &grad_joint,
+                    &beta_joint,
+                    constraints,
+                    warm_joint_active.as_deref(),
+                ) {
+                    Ok((beta_new, active_set)) => (beta_new, Some(active_set)),
+                    Err(_) => break,
+                }
+            } else {
+                // Stationarity residual: r = S*beta - gradient (for penalized NLL)
+                let penalty_beta = apply_joint_block_penalty(
+                    &ranges,
+                    &s_lambdas,
+                    &beta_joint,
+                    joint_mode_diagonal_ridge,
+                );
+                let rhs = &grad_joint - &penalty_beta;
+                let mut delta = if use_joint_matrix_free_path(total_p, false) {
+                    let preconditioner_diag = match &joint_hessian_source {
+                        JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
+                            &h_joint.diag().to_owned(),
                             &ranges,
                             &s_lambdas,
                             trace_diagonal_ridge,
-                        )
-                    }
-                };
-                match &joint_hessian_source {
-                    JointHessianSource::Dense(h_joint) => crate::linalg::utils::solve_spd_pcg(
-                        |v| {
-                            let mut out = h_joint.dot(v);
-                            let penalty = apply_joint_block_penalty(
+                        ),
+                        JointHessianSource::Operator { diagonal, .. } => {
+                            joint_penalty_preconditioner_diag(
+                                diagonal,
                                 &ranges,
                                 &s_lambdas,
-                                v,
                                 trace_diagonal_ridge,
-                            );
-                            out += &penalty;
-                            out
-                        },
-                        &rhs,
-                        &preconditioner_diag,
-                        JOINT_PCG_REL_TOL,
-                        JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                    ),
-                    JointHessianSource::Operator { apply, .. } => {
-                        let apply_h = Arc::clone(apply);
-                        crate::linalg::utils::solve_spd_pcg(
+                            )
+                        }
+                    };
+                    match &joint_hessian_source {
+                        JointHessianSource::Dense(h_joint) => crate::linalg::utils::solve_spd_pcg(
                             |v| {
-                                let mut out = match apply_h(v) {
-                                    Ok(out) => out,
-                                    Err(error) => {
-                                        log::warn!(
-                                            "joint Newton inner operator matvec failed: {error}"
-                                        );
-                                        Array1::<f64>::zeros(total_p)
-                                    }
-                                };
+                                let mut out = h_joint.dot(v);
                                 let penalty = apply_joint_block_penalty(
                                     &ranges,
                                     &s_lambdas,
@@ -5229,33 +5225,57 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &preconditioner_diag,
                             JOINT_PCG_REL_TOL,
                             JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                        )
+                        ),
+                        JointHessianSource::Operator { apply, .. } => {
+                            let apply_h = Arc::clone(apply);
+                            crate::linalg::utils::solve_spd_pcg(
+                                |v| {
+                                    let mut out = match apply_h(v) {
+                                        Ok(out) => out,
+                                        Err(error) => {
+                                            log::warn!(
+                                                "joint Newton inner operator matvec failed: {error}"
+                                            );
+                                            Array1::<f64>::zeros(total_p)
+                                        }
+                                    };
+                                    let penalty = apply_joint_block_penalty(
+                                        &ranges,
+                                        &s_lambdas,
+                                        v,
+                                        trace_diagonal_ridge,
+                                    );
+                                    out += &penalty;
+                                    out
+                                },
+                                &rhs,
+                                &preconditioner_diag,
+                                JOINT_PCG_REL_TOL,
+                                JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                            )
+                        }
                     }
-                }
-            } else {
-                None
-            };
-            if delta.is_none() {
-                let mut lhs = match materialize_joint_hessian_source(
-                    &joint_hessian_source,
-                    total_p,
-                    "joint Newton inner Hessian materialization",
-                ) {
-                    Ok(matrix) => matrix,
-                    Err(_) => break,
+                } else {
+                    None
                 };
-                add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, trace_diagonal_ridge);
-                let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
-                delta =
-                    solver.solvevectorwithridge_retries(&lhs, &rhs, JOINT_TRACE_STABILITY_RIDGE);
-            }
+                if delta.is_none() {
+                    let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
+                    delta = solver.solvevectorwithridge_retries(
+                        &lhs,
+                        &rhs,
+                        JOINT_TRACE_STABILITY_RIDGE,
+                    );
+                }
 
-            let Some(mut delta) = delta else {
-                break; // Fall back to blockwise
+                let Some(delta) = delta else {
+                    break; // Fall back to blockwise
+                };
+                if !delta.iter().all(|v| v.is_finite()) {
+                    break; // Fall back to blockwise
+                }
+                (beta_joint.clone() + &delta, None)
             };
-            if !delta.iter().all(|v| v.is_finite()) {
-                break; // Fall back to blockwise
-            }
+            let mut delta = &candidate_beta - &beta_joint;
 
             // Trust region: cap step size
             let step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
@@ -5273,31 +5293,54 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Line search: try full step, then halve
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let mut accepted = false;
+            let mut barrier_ceiling = 1.0_f64;
+            for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
+                let block_delta = delta.slice(s![start..end]).to_owned();
+                if let Some(alpha_max) =
+                    family.max_feasible_step_size(&states, block_idx, &block_delta)?
+                {
+                    barrier_ceiling = barrier_ceiling.min(alpha_max);
+                }
+            }
+            if !barrier_ceiling.is_finite() || barrier_ceiling <= 0.0 {
+                for (b, old) in old_beta.iter().enumerate() {
+                    states[b].beta.assign(old);
+                }
+                refresh_all_block_etas(family, specs, &mut states)?;
+                break;
+            }
             for bt in 0..8 {
-                let alpha = 0.5f64.powi(bt);
+                let alpha = (0.5f64.powi(bt)).min(barrier_ceiling);
                 for b in 0..specs.len() {
                     let (start, end) = ranges[b];
-                    states[b].beta.assign(&old_beta[b]);
-                    states[b]
-                        .beta
-                        .scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
+                    let mut trial_beta = old_beta[b].clone();
+                    trial_beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
                     // Project to feasible region (e.g. monotonicity for deviation blocks).
-                    let projected = family.post_update_block_beta(
-                        &states,
-                        b,
-                        &specs[b],
-                        states[b].beta.clone(),
-                    )?;
+                    let projected =
+                        family.post_update_block_beta(&states, b, &specs[b], trial_beta)?;
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
-                let trial_ll = family.log_likelihood_only(&states)?;
+                let trial_ll = match family.log_likelihood_only(&states) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        for (b, old) in old_beta.iter().enumerate() {
+                            states[b].beta.assign(old);
+                        }
+                        refresh_all_block_etas(family, specs, &mut states)?;
+                        continue;
+                    }
+                };
                 let trial_penalty =
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
                 let trialobjective = -trial_ll + trial_penalty;
                 if trialobjective.is_finite() && trialobjective <= lastobjective + 1e-10 {
                     lastobjective = trialobjective;
                     current_penalty = trial_penalty;
+                    if let Some(joint_active_set) = joint_active_set.as_ref() {
+                        cached_active_sets =
+                            scatter_joint_active_set(joint_active_set, &block_constraints);
+                    }
                     accepted = true;
                     break;
                 }
@@ -8638,6 +8681,69 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct TwoBlockJointConstrainedFamily {
+        coupling: f64,
+    }
+
+    impl CustomFamily for TwoBlockJointConstrainedFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let beta0 = block_states[0].beta[0];
+            let beta1 = block_states[1].beta[0];
+            let g0 = 1.0 - beta0 - self.coupling * beta1;
+            let g1 = 1.0 - beta1 - self.coupling * beta0;
+            Ok(FamilyEvaluation {
+                log_likelihood: -0.5
+                    * (beta0 * beta0 + beta1 * beta1 + 2.0 * self.coupling * beta0 * beta1)
+                    + beta0
+                    + beta1,
+                blockworking_sets: vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: array![g0],
+                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: array![g1],
+                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                    },
+                ],
+            })
+        }
+
+        fn exact_newton_joint_hessian(
+            &self,
+            _: &[ParameterBlockState],
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(array![[1.0, self.coupling], [self.coupling, 1.0]]))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative(
+            &self,
+            _: &[ParameterBlockState],
+            _: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(Array2::zeros((2, 2))))
+        }
+
+        fn block_linear_constraints(
+            &self,
+            _: &[ParameterBlockState],
+            block_idx: usize,
+            _: &ParameterBlockSpec,
+        ) -> Result<Option<LinearInequalityConstraints>, String> {
+            if block_idx >= 2 {
+                return Ok(None);
+            }
+            Ok(Some(LinearInequalityConstraints {
+                a: array![[1.0]],
+                b: array![0.0],
+            }))
+        }
+    }
+
+    #[derive(Clone)]
     struct TwoBlockJointSurrogateFamily;
 
     impl CustomFamily for TwoBlockJointSurrogateFamily {
@@ -9106,6 +9212,53 @@ mod tests {
             "joint exact path should be preferred over blockwise fallback: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn innerfit_uses_joint_exact_path_for_multiblock_constraints() {
+        let spec0 = ParameterBlockSpec {
+            name: "block0".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+        };
+        let spec1 = ParameterBlockSpec {
+            name: "block1".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+        };
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            inner_tol: 1e-10,
+            ridge_floor: 1e-12,
+            ..BlockwiseFitOptions::default()
+        };
+        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+
+        let result = inner_blockwise_fit(
+            &TwoBlockJointConstrainedFamily { coupling: 0.25 },
+            &[spec0, spec1],
+            &per_block,
+            &options,
+            None,
+        )
+        .expect("joint constrained inner fit should succeed");
+
+        assert!(
+            result.converged,
+            "joint constrained inner fit should converge in one cycle"
+        );
+        assert_eq!(result.cycles, 1);
+        assert!((result.block_states[0].beta[0] - 0.8).abs() < 1e-8);
+        assert!((result.block_states[1].beta[0] - 0.8).abs() < 1e-8);
+        assert_eq!(result.active_sets, vec![None, None]);
     }
 
     #[test]
@@ -10366,6 +10519,31 @@ mod tests {
             "rank-reduced boundary solution should keep at most one representative, got {:?}",
             active
         );
+    }
+
+    #[test]
+    fn quadratic_linear_constraints_singular_kkt_uses_pseudoinverse_fallback() {
+        let hessian = Array2::<f64>::zeros((2, 2));
+        let rhs = array![0.0, 0.0];
+        let beta_start = array![0.0, 0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 1.0]],
+            b: array![0.0],
+        };
+
+        let (beta, active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            Some(&[0]),
+        )
+        .expect("singular KKT system should fall back to a finite pseudoinverse solve");
+
+        assert!(beta.iter().all(|value| value.is_finite()));
+        assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
+        assert_relative_eq!(beta[1], 0.0, epsilon = 1e-14);
+        assert_eq!(active, vec![0]);
     }
 
     #[test]

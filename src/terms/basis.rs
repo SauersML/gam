@@ -194,36 +194,6 @@ pub enum BasisFamily {
     ISpline,
 }
 
-/// Return the polynomial degree of a basis family's value basis on each active
-/// knot span.
-///
-/// For I-splines this is the degree of the integrated value basis itself, not
-/// the public degree of the underlying B-spline recurrence.
-pub fn basis_family_value_span_polynomial_degree(
-    basis_family: BasisFamily,
-    degree: usize,
-) -> Result<usize, BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    match basis_family {
-        BasisFamily::BSpline | BasisFamily::MSpline => Ok(degree),
-        BasisFamily::ISpline => degree
-            .checked_add(1)
-            .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string())),
-    }
-}
-
-/// Whether the value basis has a structurally zero derivative of the requested
-/// order on every knot span.
-pub fn basis_family_value_derivative_is_structurally_zero(
-    basis_family: BasisFamily,
-    degree: usize,
-    derivative_order: usize,
-) -> Result<bool, BasisError> {
-    Ok(derivative_order > basis_family_value_span_polynomial_degree(basis_family, degree)?)
-}
-
 /// Specifies the source of knots for basis generation.
 #[derive(Clone, Debug)]
 pub enum KnotSource<'a> {

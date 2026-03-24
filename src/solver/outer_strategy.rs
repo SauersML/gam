@@ -267,6 +267,10 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
         },
+        (Analytic, FiniteDifference) => OuterPlan {
+            solver: S::Bfgs,
+            hessian_source: H::BfgsApprox,
+        },
 
         (FiniteDifference, _) => OuterPlan {
             solver: S::Bfgs,

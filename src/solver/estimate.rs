@@ -3076,7 +3076,7 @@ pub struct FittedBlock {
 
 /// Working-set geometry at convergence needed by ALO and other post-fit
 /// diagnostics. Only populated when the inner solver provides the data.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitGeometry {
     /// Joint penalized Hessian H = X'W_HX + S(λ) at convergence.
     pub penalized_hessian: Array2<f64>,
@@ -3174,8 +3174,8 @@ pub struct UnifiedFitResult {
     pub inference: Option<FitInference>,
     /// Fitted link parameters (SAS, BetaLogistic, Mixture).
     pub fitted_link: FittedLinkState,
-    /// Working-set geometry at convergence (for ALO diagnostics).
-    #[serde(skip)]
+    /// Working-set geometry at convergence (for ALO diagnostics and
+    /// saved-model covariance reconstruction).
     pub geometry: Option<FitGeometry>,
     /// Internal block states from custom-family paths.
     #[serde(skip)]
