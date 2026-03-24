@@ -462,12 +462,12 @@ impl ResidualDistributionOps for ResidualDistribution {
                 &InverseLink::Standard(LinkFunction::CLogLog),
                 z,
             )
-            .unwrap_or(0.0),
+            .expect("standard cloglog inverse-link third derivative should evaluate"),
             ResidualDistribution::Logistic => inverse_link_pdfthird_derivative_for_inverse_link(
                 &InverseLink::Standard(LinkFunction::Logit),
                 z,
             )
-            .unwrap_or(0.0),
+            .expect("standard logit inverse-link third derivative should evaluate"),
         }
     }
 
@@ -499,12 +499,12 @@ impl ResidualDistributionOps for ResidualDistribution {
                 &InverseLink::Standard(LinkFunction::CLogLog),
                 z,
             )
-            .unwrap_or(0.0),
+            .expect("standard cloglog inverse-link fourth derivative should evaluate"),
             ResidualDistribution::Logistic => inverse_link_pdffourth_derivative_for_inverse_link(
                 &InverseLink::Standard(LinkFunction::Logit),
                 z,
             )
-            .unwrap_or(0.0),
+            .expect("standard logit inverse-link fourth derivative should evaluate"),
         }
     }
 }
@@ -534,26 +534,22 @@ pub fn residual_distribution_inverse_link(distribution: ResidualDistribution) ->
 /// For all other inverse links (SAS, BetaLogistic, Mixture), delegates
 /// to the generic `inverse_link_pdffourth_derivative_for_inverse_link`
 /// dispatcher in mixture_link.rs.
-fn inverse_link_pdffourth_derivative(inverse_link: &InverseLink, eta: f64) -> f64 {
+fn inverse_link_pdffourth_derivative(inverse_link: &InverseLink, eta: f64) -> Result<f64, String> {
     match inverse_link {
         InverseLink::Standard(LinkFunction::Probit) => {
-            ResidualDistribution::Gaussian.pdffourth_derivative(eta)
+            Ok(ResidualDistribution::Gaussian.pdffourth_derivative(eta))
         }
         InverseLink::Standard(LinkFunction::Logit) => {
-            ResidualDistribution::Logistic.pdffourth_derivative(eta)
+            Ok(ResidualDistribution::Logistic.pdffourth_derivative(eta))
         }
         InverseLink::Standard(LinkFunction::CLogLog) => {
-            ResidualDistribution::Gumbel.pdffourth_derivative(eta)
+            Ok(ResidualDistribution::Gumbel.pdffourth_derivative(eta))
         }
-        _ => {
-            // Delegate to the generic dispatcher which covers SAS,
-            // BetaLogistic, and Mixture inverse links.
-            crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                inverse_link,
-                eta,
-            )
-            .unwrap_or(0.0)
-        }
+        _ => crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+            inverse_link,
+            eta,
+        )
+        .map_err(|e| format!("inverse link fourth-derivative evaluation failed at eta={eta}: {e}")),
     }
 }
 
@@ -1076,7 +1072,6 @@ struct SurvivalLocationScaleFamily {
     time_wiggle_degree: Option<usize>,
     time_wiggle_ncols: usize,
     time_coefficient_lower_bounds: Option<Array1<f64>>,
-    time_linear_constraints: Option<LinearInequalityConstraints>,
     /// Exit design for threshold block (always present; used as main design).
     x_threshold: DesignMatrix,
     /// Entry design for threshold block when time-varying.
@@ -1359,59 +1354,33 @@ impl SurvivalLocationScaleFamily {
         beta: &Array1<f64>,
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
-        if let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref() {
-            if beta.len() != lower_bounds.len() || delta.len() != lower_bounds.len() {
-                return Err(format!(
-                    "survival location-scale time-step lower-bound dimension mismatch: beta={}, delta={}, bounds={}",
-                    beta.len(),
-                    delta.len(),
-                    lower_bounds.len()
-                ));
-            }
-            let mut alpha = 1.0f64;
-            for j in 0..lower_bounds.len() {
-                let lower_bound = lower_bounds[j];
-                if !lower_bound.is_finite() {
-                    continue;
-                }
-                let slack = beta[j] - lower_bound;
-                if slack < -1e-10 {
-                    return Err(format!(
-                        "survival location-scale current time coefficient violates structural lower bound at coefficient {j}: slack={slack:.3e}"
-                    ));
-                }
-                let drift = delta[j];
-                if drift < 0.0 {
-                    alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
-                }
-            }
-            return if alpha >= 1.0 {
-                Ok(Some(1.0))
-            } else {
-                Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
-            };
-        }
-        let Some(constraints) = self.time_linear_constraints.as_ref() else {
-            return Ok(None);
+        let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref() else {
+            return Err(
+                "survival location-scale time block missing structural coefficient lower bounds"
+                    .to_string(),
+            );
         };
-        if beta.len() != constraints.a.ncols() || delta.len() != constraints.a.ncols() {
+        if beta.len() != lower_bounds.len() || delta.len() != lower_bounds.len() {
             return Err(format!(
-                "survival location-scale time-step dimension mismatch: beta={}, delta={}, expected {}",
+                "survival location-scale time-step lower-bound dimension mismatch: beta={}, delta={}, bounds={}",
                 beta.len(),
                 delta.len(),
-                constraints.a.ncols()
+                lower_bounds.len()
             ));
         }
         let mut alpha = 1.0f64;
-        for row in 0..constraints.a.nrows() {
-            let a_row = constraints.a.row(row);
-            let slack = a_row.dot(beta) - constraints.b[row];
+        for j in 0..lower_bounds.len() {
+            let lower_bound = lower_bounds[j];
+            if !lower_bound.is_finite() {
+                continue;
+            }
+            let slack = beta[j] - lower_bound;
             if slack < -1e-10 {
                 return Err(format!(
-                    "survival location-scale current time block violates derivative guard at row {row}: slack={slack:.3e}"
+                    "survival location-scale current time coefficient violates structural lower bound at coefficient {j}: slack={slack:.3e}"
                 ));
             }
-            let drift = a_row.dot(delta);
+            let drift = delta[j];
             if drift < 0.0 {
                 alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
             }
@@ -2232,7 +2201,7 @@ impl SurvivalLocationScaleFamily {
                     .map_err(|e| {
                         format!("inverse link third-derivative evaluation failed at eta={eta}: {e}")
                     })?;
-                let fpppp = inverse_link_pdffourth_derivative(inverse_link, eta);
+                let fpppp = inverse_link_pdffourth_derivative(inverse_link, eta)?;
                 let d1 = fp / f;
                 let d2 = fpp / f - d1 * d1;
                 let d3 = fppp / f - 3.0 * fp * fpp / (f * f) + 2.0 * fp.powi(3) / f.powi(3);
@@ -3683,7 +3652,6 @@ fn prepare_survival_location_scale_model(
         time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
         time_wiggle_ncols: protected_timewiggle_cols,
         time_coefficient_lower_bounds: time_prepared.coefficient_lower_bounds.clone(),
-        time_linear_constraints: time_prepared.linear_constraints.clone(),
         x_threshold: threshold_prep.design_exit.clone(),
         x_threshold_entry: threshold_prep.design_entry.clone(),
         x_threshold_deriv: threshold_prep.design_derivative_exit.clone(),
@@ -3892,7 +3860,7 @@ fn validate_time_block(n: usize, b: &TimeBlockInput, derivative_guard: f64) -> R
                 .to_string(),
         );
     }
-    structural_time_coefficient_lower_bounds(
+    structural_time_coefficient_constraints(
         &b.design_derivative_exit.to_dense(),
         &b.derivative_offset_exit,
         derivative_guard,
@@ -4101,10 +4069,12 @@ fn prepare_identified_time_block(
         &design_derivative_exit,
         &input.derivative_offset_exit,
         derivative_guard,
-    )?;
-    let linear_constraints = coefficient_lower_bounds
-        .as_ref()
-        .and_then(lower_bound_constraints);
+    )?
+    .ok_or_else(|| {
+        "structural time block requires derivative offsets to encode the derivative guard and a non-negative derivative basis"
+            .to_string()
+    })?;
+    let linear_constraints = lower_bound_constraints(&coefficient_lower_bounds);
     let initial_beta = linear_constraints.as_ref().map(|constraints| {
         project_onto_linear_constraints(p, constraints, input.initial_beta.as_ref())
     });
@@ -4113,7 +4083,7 @@ fn prepare_identified_time_block(
         design_entry,
         design_exit,
         design_derivative_exit,
-        coefficient_lower_bounds,
+        coefficient_lower_bounds: Some(coefficient_lower_bounds),
         linear_constraints,
         penalties,
         initial_beta,
@@ -8859,8 +8829,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         Ok(self
             .time_coefficient_lower_bounds
             .as_ref()
-            .and_then(lower_bound_constraints)
-            .or_else(|| self.time_linear_constraints.clone()))
+            .and_then(lower_bound_constraints))
     }
 
     fn max_feasible_step_size(
@@ -9477,12 +9446,6 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             time_coefficient_lower_bounds: Some(array![0.0]),
-            time_linear_constraints: structural_time_coefficient_constraints(
-                &array![[1.0], [1.0], [1.0]],
-                &Array1::from_elem(3, 1e-8),
-                1e-8,
-            )
-            .expect("time coefficient constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
                 [1.0],
                 [0.4],
@@ -9972,7 +9935,7 @@ mod tests {
     }
 
     #[test]
-    fn identified_time_block_falls_back_to_rowwise_constraints_when_offsets_below_guard() {
+    fn identified_time_block_rejects_offsets_below_derivative_guard() {
         let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
             design_entry: DesignMatrix::from(array![
@@ -9995,14 +9958,14 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
-        assert_eq!(prepared.coefficient_lower_bounds, None);
-        let constraints = prepared
-            .linear_constraints
-            .expect("rowwise derivative constraints");
-        assert_eq!(constraints.a, design_derivative_exit);
-        assert_eq!(constraints.b, Array1::<f64>::from_elem(3, 1e-6));
+        let err = match prepare_identified_time_block(&time_block, 1e-6) {
+            Ok(_) => panic!("offsets below the guard must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("requires derivative offsets to encode the derivative guard"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -11902,12 +11865,6 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             time_coefficient_lower_bounds: Some(array![0.0, 0.0]),
-            time_linear_constraints: structural_time_coefficient_constraints(
-                &x_deriv,
-                &offset_deriv,
-                DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-            )
-            .expect("time coefficient constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),
@@ -12052,12 +12009,6 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             time_coefficient_lower_bounds: Some(array![0.0]),
-            time_linear_constraints: structural_time_coefficient_constraints(
-                &Array2::ones((n, 1)),
-                &Array1::from_elem(n, DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD),
-                DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-            )
-            .expect("time coefficient constraints"),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),
