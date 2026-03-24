@@ -11340,7 +11340,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         if block_idx == 0 {
             return self.max_feasible_time_step(&block_states[0].beta, delta);
         }
-        let _ = delta;
         Ok(None)
     }
 

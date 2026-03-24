@@ -6423,12 +6423,14 @@ fn scan_for_dead_cfg_test_items(cache: &[StrippedFile]) -> Vec<String> {
 
             // Extract item name and kind
             let (kind, name) = if let Some(rest) = trimmed.strip_prefix("fn ") {
-                let name = rest.split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+                let name = rest
+                    .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
                     .next()
                     .unwrap_or("");
                 ("fn", name)
             } else if let Some(rest) = trimmed.strip_prefix("type ") {
-                let name = rest.split(|c: char| c == '=' || c == '<' || c.is_whitespace())
+                let name = rest
+                    .split(|c: char| c == '=' || c == '<' || c.is_whitespace())
                     .next()
                     .unwrap_or("");
                 ("type", name)

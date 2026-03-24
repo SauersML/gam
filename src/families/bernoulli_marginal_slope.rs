@@ -193,16 +193,28 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
 
 pub(crate) fn project_monotone_feasible_beta(
     runtime: &DeviationRuntime,
-    _current: &Array1<f64>,
+    current: &Array1<f64>,
     proposed: &Array1<f64>,
     label: &str,
 ) -> Result<Array1<f64>, String> {
+    if current.len() != runtime.basis_dim() {
+        return Err(format!(
+            "{label} monotone projection current length mismatch: current={}, expected={}",
+            current.len(),
+            runtime.basis_dim()
+        ));
+    }
     if proposed.len() != runtime.basis_dim() {
         return Err(format!(
             "{label} monotone projection length mismatch: proposed={}, expected={}",
             proposed.len(),
             runtime.basis_dim()
         ));
+    }
+    for (idx, value) in current.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!("{label} current coefficient {idx} is non-finite"));
+        }
     }
     let lower_bound = runtime.monotonicity_eps() - 1.0;
     let mut projected = proposed.clone();
@@ -6417,7 +6429,19 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
         self.validate_exact_block_state_shapes(block_states)?;
-        let _ = (block_idx, delta);
+        let beta = block_states.get(block_idx).ok_or_else(|| {
+            format!(
+                "bernoulli marginal-slope block index {block_idx} is out of bounds for {} states",
+                block_states.len()
+            )
+        })?;
+        if delta.len() != beta.beta.len() {
+            return Err(format!(
+                "bernoulli marginal-slope step length mismatch for block {block_idx}: delta={}, beta={}",
+                delta.len(),
+                beta.beta.len()
+            ));
+        }
         Ok(None)
     }
 
