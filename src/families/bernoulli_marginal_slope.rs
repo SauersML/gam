@@ -8041,7 +8041,12 @@ mod tests {
         .expect("microcells");
 
         for cell in &cells {
-            let z = 0.5 * (cell.cell.left + cell.cell.right);
+            let z = match (cell.cell.left.is_finite(), cell.cell.right.is_finite()) {
+                (true, true) => 0.5 * (cell.cell.left + cell.cell.right),
+                (false, true) => cell.cell.right - 1.0,
+                (true, false) => cell.cell.left + 1.0,
+                (false, false) => panic!("microcell cannot be infinite on both sides"),
+            };
             let h = score_prepared
                 .runtime
                 .design(&array![z])
@@ -8215,7 +8220,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_denested_partials_include_nonzero_third_a_derivative() {
+    fn observed_denested_partials_zero_third_a_derivative_for_piecewise_quadratic_link() {
         let z = array![-0.8, 0.2, 1.1];
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
         let link_prepared = build_deviation_block_from_seed(
@@ -8260,8 +8265,8 @@ mod tests {
 
         assert_eq!(obs.dc_daaa, expected_daaa);
         assert!(
-            eval_coeff4_at(&obs.dc_daaa, z[row]).abs() > 1e-12,
-            "expected a nonzero observed d^3 eta / da^3 contribution for a nontrivial cubic link span"
+            eval_coeff4_at(&obs.dc_daaa, z[row]).abs() < 1e-12,
+            "piecewise-quadratic link spans should not contribute a third a-derivative"
         );
     }
 
@@ -12297,7 +12302,7 @@ mod tests {
         let weights = Array1::from_elem(6, 1.0);
         let err = standardize_latent_z(&z, &weights, "bernoulli-marginal-slope")
             .expect_err("expected non-gaussian rejection");
-        assert!(err.contains("approximately Gaussian"));
+        assert!(err.contains("approximately latent N(0,1)"));
     }
 
     #[test]

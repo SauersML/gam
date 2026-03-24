@@ -11052,6 +11052,15 @@ impl SurvivalMarginalSlopeFamily {
 const EXACT_OUTER_MAX_ROW_WORK_RIGID: u64 = 2_000_000;
 const EXACT_OUTER_MAX_ROW_WORK_FLEX: u64 = 40_000_000;
 
+fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, String> {
+    if knots.is_empty() {
+        return Err("survival-marginal-slope timewiggle requires at least one knot".to_string());
+    }
+    let probe = 0.5 * (knots[0] + knots[knots.len() - 1]);
+    let h0 = Array1::from_vec(vec![probe]);
+    Ok(monotone_wiggle_basis_with_derivative_order(h0.view(), knots, degree, 0)?.ncols())
+}
+
 fn survival_row_work_order(
     family: &SurvivalMarginalSlopeFamily,
     specs: &[ParameterBlockSpec],
@@ -11653,27 +11662,37 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             }
         }
     }
-    if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
+    let derived_time_wiggle_ncols = if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
         if timewiggle.degree != 3 {
             return Err(format!(
                 "survival-marginal-slope timewiggle requires cubic degree=3, got {}",
                 timewiggle.degree
             ));
         }
-        if timewiggle.ncols == 0 {
+        let derived_ncols = time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree)?;
+        if derived_ncols == 0 {
             return Err(
                 "survival-marginal-slope timewiggle requires at least one wiggle coefficient"
                     .to_string(),
             );
         }
-        if spec.time_block.design_exit.ncols() < timewiggle.ncols {
+        if timewiggle.ncols != derived_ncols {
+            return Err(format!(
+                "survival-marginal-slope timewiggle metadata width mismatch: metadata={}, basis={derived_ncols}",
+                timewiggle.ncols
+            ));
+        }
+        if spec.time_block.design_exit.ncols() < derived_ncols {
             return Err(format!(
                 "survival-marginal-slope timewiggle requests {} tail columns but time block only has {} columns",
-                timewiggle.ncols,
+                derived_ncols,
                 spec.time_block.design_exit.ncols()
             ));
         }
-    }
+        Some(derived_ncols)
+    } else {
+        None
+    };
     Ok(())
 }
 
@@ -11936,6 +11955,11 @@ pub fn fit_survival_marginal_slope_terms(
         derivative_offset_exit.as_ref(),
         derivative_guard,
     )?;
+    let derived_time_wiggle_ncols = spec
+        .timewiggle_block
+        .as_ref()
+        .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
+        .transpose()?;
 
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
@@ -11961,7 +11985,7 @@ pub fn fit_survival_marginal_slope_terms(
             time_linear_constraints: time_linear_constraints.clone(),
             time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
-            time_wiggle_ncols: spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols),
+            time_wiggle_ncols: derived_time_wiggle_ncols.unwrap_or(0),
         }
     };
 
@@ -12656,6 +12680,8 @@ mod tests {
     #[test]
     fn timewiggle_scorewarp_family_supports_second_order_exact_outer_path() {
         let score_runtime = test_deviation_runtime();
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![0.0]),
@@ -12674,9 +12700,9 @@ mod tests {
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
             time_linear_constraints: None,
-            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
-            time_wiggle_degree: Some(3),
-            time_wiggle_ncols: 4,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
         };
         let specs = vec![
             dummy_blockspec(5),
@@ -12691,8 +12717,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_outer_row_work_gate_downgrades_large_timewiggle_link_models() {
+    fn exact_outer_row_work_gate_keeps_large_timewiggle_link_models_under_linear_flex_budget() {
         let link_runtime = test_deviation_runtime();
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
         let family = SurvivalMarginalSlopeFamily {
             n: 80,
             event: Arc::new(array![0.0]),
@@ -12711,9 +12739,9 @@ mod tests {
             score_warp: None,
             link_dev: Some(link_runtime.clone()),
             time_linear_constraints: None,
-            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
-            time_wiggle_degree: Some(3),
-            time_wiggle_ncols: 8,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
         };
         let specs = vec![
             dummy_penalized_blockspec(12, 2),
@@ -12723,7 +12751,7 @@ mod tests {
         ];
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
         );
     }
 
@@ -12732,6 +12760,8 @@ mod tests {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),
@@ -12750,9 +12780,9 @@ mod tests {
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
             time_linear_constraints: None,
-            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
-            time_wiggle_degree: Some(3),
-            time_wiggle_ncols: 4,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -12796,6 +12826,8 @@ mod tests {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),
@@ -12814,9 +12846,9 @@ mod tests {
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
             time_linear_constraints: None,
-            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
-            time_wiggle_degree: Some(3),
-            time_wiggle_ncols: 4,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -13215,6 +13247,8 @@ mod tests {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),
@@ -13233,9 +13267,9 @@ mod tests {
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
             time_linear_constraints: None,
-            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
-            time_wiggle_degree: Some(3),
-            time_wiggle_ncols: 4,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -13288,6 +13322,8 @@ mod tests {
         let marginal_beta = array![0.35, -0.1];
         let logslope_design = array![[1.2, -0.3]];
         let logslope_beta = array![0.2, -0.05];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),
@@ -13306,9 +13342,9 @@ mod tests {
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
             time_linear_constraints: None,
-            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
-            time_wiggle_degree: Some(3),
-            time_wiggle_ncols: 4,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -13367,6 +13403,8 @@ mod tests {
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),
@@ -13385,9 +13423,9 @@ mod tests {
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
             time_linear_constraints: None,
-            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
-            time_wiggle_degree: Some(3),
-            time_wiggle_ncols: 4,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
         };
         let block_states = vec![
             ParameterBlockState {
@@ -13504,6 +13542,13 @@ mod tests {
             (lhs - rhs).abs() <= tol,
             "{label} mismatch: lhs={lhs:.12e}, rhs={rhs:.12e}, tol={tol:.3e}"
         );
+    }
+
+    fn standard_test_time_wiggle() -> (Array1<f64>, usize, usize) {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let degree = 3usize;
+        let ncols = time_wiggle_basis_ncols(&knots, degree).expect("timewiggle basis width");
+        (knots, degree, ncols)
     }
 
     fn assert_closed_form_row_matches_exact_directional_derivatives(

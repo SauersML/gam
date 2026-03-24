@@ -3972,8 +3972,7 @@ fn stack_offsets(parts: &[&Array1<f64>]) -> Array1<f64> {
     out
 }
 
-#[derive(Clone)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TimeIdentifiabilityTransform {
     z: Array2<f64>,
 }
@@ -4041,7 +4040,9 @@ fn structural_time_coefficient_lower_bounds(
             ));
         }
         if lower_bound - offset > FEASIBILITY_TOL {
-            return Ok(None);
+            return Err(format!(
+                "structural time coefficient bounds require derivative offsets to encode the derivative guard at row {row}: offset={offset:.3e} < guard={lower_bound:.3e}"
+            ));
         }
     }
     for col in 0..p {
@@ -4054,7 +4055,9 @@ fn structural_time_coefficient_lower_bounds(
                 ));
             }
             if value < -DERIVATIVE_TOL {
-                return Ok(None);
+                return Err(format!(
+                    "structural time coefficient bounds require a non-negative derivative basis at row {row}, column {col}; found {value:.3e}"
+                ));
             }
             if value > DERIVATIVE_TOL {
                 has_positive_support = true;
@@ -4067,7 +4070,10 @@ fn structural_time_coefficient_lower_bounds(
     }
 
     if !has_structural_support {
-        return Ok(None);
+        return Err(
+            "structural time coefficient bounds require at least one derivative-active column"
+                .to_string(),
+        );
     }
     Ok(Some(lower_bounds))
 }
@@ -9430,6 +9436,30 @@ mod tests {
         )
     }
 
+    fn test_link_wiggle_metadata(beta_link_wiggle: &Array1<f64>) -> (Array1<f64>, usize) {
+        let seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
+        for degree in [2usize, 3, 1] {
+            for num_internal_knots in 0..=8 {
+                let cfg = WiggleBlockConfig {
+                    degree,
+                    num_internal_knots,
+                    penalty_order: 2,
+                    double_penalty: false,
+                };
+                if let Ok((block, knots)) =
+                    crate::families::gamlss::buildwiggle_block_input_from_seed(seed.view(), &cfg)
+                    && block.design.ncols() == beta_link_wiggle.len()
+                {
+                    return (knots, degree);
+                }
+            }
+        }
+        panic!(
+            "could not synthesize valid link wiggle metadata for {} coefficients",
+            beta_link_wiggle.len()
+        );
+    }
+
     fn test_survival_fit(
         beta_time: Array1<f64>,
         beta_threshold: Array1<f64>,
@@ -9437,8 +9467,13 @@ mod tests {
         beta_link_wiggle: Option<Array1<f64>>,
     ) -> UnifiedFitResult {
         let lambdas_linkwiggle = beta_link_wiggle.as_ref().map(|_| Array1::zeros(0));
-        let link_wiggle_knots = beta_link_wiggle.as_ref().map(|_| array![-1.0, 1.0]);
-        let link_wiggle_degree = beta_link_wiggle.as_ref().map(|_| 2usize);
+        let (link_wiggle_knots, link_wiggle_degree) = beta_link_wiggle
+            .as_ref()
+            .map(|beta| {
+                let (knots, degree) = test_link_wiggle_metadata(beta);
+                (Some(knots), Some(degree))
+            })
+            .unwrap_or((None, None));
         survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
             beta_time,
             beta_threshold,

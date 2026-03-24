@@ -805,7 +805,11 @@ mod tests {
         );
 
         let dropped = scale_projection_effective_rank(
-            &[leading, 1e-4 * leading, 0.5 * SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading],
+            &[
+                leading,
+                1e-4 * leading,
+                0.5 * SCALE_PROJECTION_REPLAY_RCOND_FLOOR * leading,
+            ],
             leading,
             18,
         );
