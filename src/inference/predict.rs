@@ -475,6 +475,17 @@ pub trait PredictableModel {
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError>;
 
+    /// Optional model-specific scale/noise parameter on the response side.
+    ///
+    /// This is distinct from estimator uncertainty. Models that expose a
+    /// per-observation distribution scale (for example Gaussian
+    /// location-scale `sigma`) override this and return it explicitly instead
+    /// of smuggling it through `PredictionWithSE`.
+    fn predict_noise_scale(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError>;
+
     /// Full prediction with confidence/observation intervals.
     ///
     /// Delegates to `predict_gamwith_uncertainty` for standard models.
@@ -633,6 +644,13 @@ impl PredictableModel for StandardPredictor {
             eta_se,
             mean_se,
         })
+    }
+
+    fn predict_noise_scale(
+        &self,
+        _: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(None)
     }
 
     fn predict_full_uncertainty(
@@ -1710,6 +1728,13 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         })
     }
 
+    fn predict_noise_scale(
+        &self,
+        _: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(None)
+    }
+
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
@@ -1859,6 +1884,26 @@ impl GaussianLocationScalePredictor {
                 backend.nrows()
             )));
         }
+        self.eta_standard_error_from_backend(input, &backend, eta_len, p_mu, p_sigma, p_w)
+    }
+
+    fn eta_standard_error_from_backend(
+        &self,
+        input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
+        eta_len: usize,
+        p_mu: usize,
+        p_sigma: usize,
+        p_w: usize,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let p_total = p_mu + p_sigma + p_w;
+        if backend.nrows() != p_total {
+            return Err(EstimationError::InvalidInput(format!(
+                "gaussian location-scale covariance mismatch: expected parameter dimension {}, got {}",
+                p_total,
+                backend.nrows()
+            )));
+        }
         if let Some(runtime) = self.link_wiggle.as_ref() {
             let eta_base = input.design.dot(&self.beta_mu) + &input.offset;
             linear_predictor_se_from_backend(&backend, eta_len, |rows| {
@@ -1912,20 +1957,42 @@ impl PredictableModel for GaussianLocationScalePredictor {
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
         let result = self.predict_plugin_response(input)?;
+        let (eta_se, mean_se) = if let Some(covariance) = self.covariance.as_ref() {
+            let p_mu = self.beta_mu.len();
+            let p_sigma = self.beta_noise.len();
+            let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+            let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+            let eta_se = self.eta_standard_error_from_backend(
+                input,
+                &backend,
+                result.eta.len(),
+                p_mu,
+                p_sigma,
+                p_w,
+            )?;
+            (Some(eta_se.clone()), Some(eta_se))
+        } else {
+            (None, None)
+        };
+        Ok(PredictionWithSE {
+            eta: result.eta,
+            mean: result.mean,
+            eta_se,
+            mean_se,
+        })
+    }
+
+    fn predict_noise_scale(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "Gaussian location-scale prediction requires noise design matrix".to_string(),
             )
         })?;
-        let sigma = self.compute_sigma(design_noise, input.offset_noise.as_ref())?;
-        // For Gaussian LS, the "SE" on the mean scale is sigma (the distribution parameter).
-        // This is an observation-level interval, not an estimator interval.
-        Ok(PredictionWithSE {
-            eta: result.eta,
-            mean: result.mean,
-            eta_se: Some(sigma.clone()),
-            mean_se: Some(sigma),
-        })
+        self.compute_sigma(design_noise, input.offset_noise.as_ref())
+            .map(Some)
     }
 
     fn predict_full_uncertainty(
@@ -2161,6 +2228,13 @@ impl PredictableModel for BinomialLocationScalePredictor {
             eta_se: None,
             mean_se,
         })
+    }
+
+    fn predict_noise_scale(
+        &self,
+        _: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(None)
     }
 
     fn predict_full_uncertainty(
@@ -2625,6 +2699,13 @@ impl PredictableModel for SurvivalPredictor {
         })
     }
 
+    fn predict_noise_scale(
+        &self,
+        _: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(None)
+    }
+
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,
@@ -2805,6 +2886,13 @@ impl PredictableModel for TransformationNormalPredictor {
             eta_se: None,
             mean_se: None,
         })
+    }
+
+    fn predict_noise_scale(
+        &self,
+        _: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(None)
     }
 
     fn predict_full_uncertainty(
@@ -4034,12 +4122,17 @@ mod tests {
             auxiliary_scalar: None,
         };
 
-        let out = predictor
-            .predict_with_uncertainty(&input)
-            .expect("gaussian location-scale sigma");
-        let sigma = out.mean_se.expect("sigma should be returned");
+        let sigma = predictor
+            .predict_noise_scale(&input)
+            .expect("gaussian location-scale sigma")
+            .expect("sigma should be returned");
         assert!((sigma[0] - 6.0).abs() <= 1e-12);
         assert!((sigma[1] - 10.0).abs() <= 1e-12);
+        let out = predictor
+            .predict_with_uncertainty(&input)
+            .expect("gaussian location-scale uncertainty");
+        assert!(out.eta_se.is_none());
+        assert!(out.mean_se.is_none());
     }
 
     #[test]
