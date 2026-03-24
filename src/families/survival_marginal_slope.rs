@@ -10,6 +10,7 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, build_deviation_block_from_seed,
+    project_monotone_feasible_beta,
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
     standardize_latent_z, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
@@ -11047,9 +11048,41 @@ impl SurvivalMarginalSlopeFamily {
 
 // ── CustomFamily impl ─────────────────────────────────────────────────
 
-/// Maximum row-loop work proxy before downgrading to first-order:
-///   n × K_pairs × primary²
+/// Maximum exact outer-Hessian row work proxy before downgrading to
+/// first-order. Survival pays for repeated coefficient-space pullbacks and
+/// rho-directional Hessian transports, so the gate needs to account for more
+/// than just primary-space width.
 const EXACT_OUTER_MAX_ROW_WORK: u64 = 2_000_000;
+
+fn survival_row_work_order(
+    family: &SurvivalMarginalSlopeFamily,
+    specs: &[ParameterBlockSpec],
+) -> ExactOuterDerivativeOrder {
+    let n = family.n as u64;
+    let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
+    let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
+    let k_directional = k.saturating_add(k_pairs).saturating_add(k_pairs);
+    let total_coeffs: u64 = specs.iter().map(|s| s.design.ncols() as u64).sum();
+    let primary_total = if family.flex_active() {
+        flex_primary_slices(family).total as u64
+    } else {
+        N_PRIMARY as u64
+    };
+    let effective_primary_cost = if !family.flex_active() && !family.flex_timewiggle_active() {
+        1u64
+    } else {
+        primary_total.saturating_mul(primary_total)
+    };
+    let row_work = n
+        .saturating_mul(total_coeffs.saturating_mul(total_coeffs))
+        .saturating_mul(k_directional)
+        .saturating_mul(effective_primary_cost);
+    if row_work > EXACT_OUTER_MAX_ROW_WORK {
+        ExactOuterDerivativeOrder::First
+    } else {
+        ExactOuterDerivativeOrder::Second
+    }
+}
 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -11061,26 +11094,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
         if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
             return ExactOuterDerivativeOrder::First;
         }
-        // Family-specific row-loop gate for the largest primary dimension this
-        // family can expose on the exact outer path.
-        let n = self.n as u64;
-        let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
-        let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
-        let primary = if self.flex_active() {
-            flex_primary_slices(self).total as u64
-        } else {
-            N_PRIMARY as u64
-        };
-        let row_work = n.saturating_mul(k_pairs).saturating_mul(primary * primary);
-        if row_work > EXACT_OUTER_MAX_ROW_WORK {
-            ExactOuterDerivativeOrder::First
-        } else {
-            ExactOuterDerivativeOrder::Second
-        }
+        survival_row_work_order(self, specs)
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
@@ -11339,11 +11356,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                         beta.len()
                     ));
                 }
-                let delta = &beta - current;
-                let Some(alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
-                    return Ok(current.clone());
-                };
-                return Ok(current + &(delta * alpha));
+                return project_monotone_feasible_beta(runtime, current, &beta, "score_warp_dev");
             }
         }
         let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
@@ -11360,11 +11373,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                         beta.len()
                     ));
                 }
-                let delta = &beta - current;
-                let Some(alpha) = runtime.max_feasible_monotone_step(current, &delta)? else {
-                    return Ok(current.clone());
-                };
-                return Ok(current + &(delta * alpha));
+                return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
             }
         }
         Ok(beta)
@@ -11438,7 +11447,13 @@ fn build_aux_blockspec(
 ) -> Result<ParameterBlockSpec, String> {
     let mut block = prepared.block.clone();
     block.initial_log_lambdas = Some(rho);
-    block.initial_beta = beta_hint.or_else(|| block.initial_beta.clone());
+    let candidate_beta = beta_hint.or_else(|| Some(Array1::<f64>::zeros(block.design.ncols())));
+    block.initial_beta = candidate_beta
+        .map(|beta| {
+            let zero = Array1::<f64>::zeros(beta.len());
+            project_monotone_feasible_beta(&prepared.runtime, &zero, &beta, name)
+        })
+        .transpose()?;
     block.intospec(name)
 }
 
@@ -12319,6 +12334,16 @@ mod tests {
         }
     }
 
+    fn dummy_penalized_blockspec(cols: usize, penalties: usize) -> ParameterBlockSpec {
+        let mut spec = dummy_blockspec(cols);
+        spec.penalties = (0..penalties)
+            .map(|_| PenaltyMatrix::Dense(Array2::eye(cols)))
+            .collect();
+        spec.nullspace_dims = vec![0; penalties];
+        spec.initial_log_lambdas = Array1::zeros(penalties);
+        spec
+    }
+
     fn test_deviation_runtime() -> DeviationRuntime {
         build_deviation_block_from_seed(
             &array![-1.0, 0.0, 1.0],
@@ -12654,6 +12679,43 @@ mod tests {
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
             ExactOuterDerivativeOrder::Second
+        );
+    }
+
+    #[test]
+    fn exact_outer_row_work_gate_downgrades_large_timewiggle_link_models() {
+        let link_runtime = test_deviation_runtime();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 40,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 12))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 12))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 12))),
+            offset_entry: Arc::new(Array1::zeros(1)),
+            offset_exit: Arc::new(Array1::zeros(1)),
+            derivative_offset_exit: Arc::new(Array1::ones(1)),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 20))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 20))),
+            score_warp: None,
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+            time_wiggle_degree: Some(3),
+            time_wiggle_ncols: 8,
+        };
+        let specs = vec![
+            dummy_penalized_blockspec(12, 2),
+            dummy_penalized_blockspec(20, 2),
+            dummy_penalized_blockspec(20, 2),
+            dummy_penalized_blockspec(link_runtime.basis_dim(), 2),
+        ];
+        assert_eq!(
+            family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
+            ExactOuterDerivativeOrder::First
         );
     }
 
