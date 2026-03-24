@@ -7276,10 +7276,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         log_rescale: f64,
     ) -> Result<Option<Array2<f64>>, String> {
-        let q = self.collect_joint_quantities_rescaled(
-            block_states,
-            log_rescale,
-        )?;
+        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()

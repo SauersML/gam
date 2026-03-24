@@ -8875,7 +8875,11 @@ mod tests {
             .expect("freeze spatial term spec");
         let resolved_design = build_term_collection_design(data.view(), &resolvedspec)
             .expect("rebuild frozen spatial design");
-        let err = match build_block_spatial_psi_derivatives(data.view(), &resolvedspec, &resolved_design) {
+        let err = match build_block_spatial_psi_derivatives(
+            data.view(),
+            &resolvedspec,
+            &resolved_design,
+        ) {
             Ok(_) => panic!(
                 "3D anisotropic Matern setup should reproduce the lower-level radial evaluation failure"
             ),
