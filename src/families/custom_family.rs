@@ -7580,10 +7580,13 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
     // Generic fallback: single-block only. Extract the per-block Hessian and
     // route through joint_outer_evaluate with the single block as the "joint"
     // system.
-    assert!(
-        specs.len() == 1,
-        "generic fallback path requires exactly one block"
-    );
+    if specs.len() != 1 {
+        return Err(
+            "generic outer fallback is only valid for single-block families; multi-block families must provide a joint outer path"
+                .to_string()
+                .into(),
+        );
+    }
     let eval = family.evaluate(&inner.block_states)?;
     let b = 0;
     let spec = &specs[b];
@@ -11322,6 +11325,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn multiblock_generic_outer_fallback_returns_error_instead_of_panicking() {
+        let family = TwoBlockFiniteHessianFamily;
+        let specs = make_two_block_specs(4);
+        let penalty_counts = vec![0usize, 0usize];
+        let rho = Array1::zeros(0);
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            outer_max_iter: 1,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            outerobjectivegradienthessian(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho,
+                None,
+                true,
+            )
+        }));
+
+        let outcome = result.expect("multi-block outer fallback must return an error, not panic");
+        let err = match outcome {
+            Ok(_) => panic!("multi-block family without a joint path should fail loudly"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("multi-block families must provide a joint outer path"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

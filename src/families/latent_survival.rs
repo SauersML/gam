@@ -1161,6 +1161,10 @@ impl CustomFamily for LatentSurvivalFamily {
             Ok(None)
         }
     }
+
+    fn requires_joint_outer_hyper_path(&self) -> bool {
+        true
+    }
 }
 
 impl CustomFamily for LatentBinaryFamily {
@@ -1308,5 +1312,9 @@ impl CustomFamily for LatentBinaryFamily {
         } else {
             Ok(None)
         }
+    }
+
+    fn requires_joint_outer_hyper_path(&self) -> bool {
+        true
     }
 }

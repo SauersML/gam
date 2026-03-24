@@ -4201,18 +4201,13 @@ impl SurvivalMarginalSlopeFamily {
         let qd1_first: Vec<f64> = dirs.iter().map(|dir| dir[2]).collect();
         let g_first: Vec<f64> = dirs.iter().map(|dir| dir[3]).collect();
 
-        // Compute q0, q1, qd1 from the shared time block plus the baseline
-        // covariate block. The time block has a single beta vector but 3
-        // different design matrices (entry, exit, derivative).
-        let beta_time = &block_states[0].beta;
-        let q0_val = self.design_entry.dot_row(row, beta_time)
-            + self.offset_entry[row]
-            + block_states[1].eta[row];
-        let q1_val = self.design_exit.dot_row(row, beta_time)
-            + self.offset_exit[row]
-            + block_states[1].eta[row];
-        let qd1_val =
-            self.design_derivative_exit.dot_row(row, beta_time) + self.derivative_offset_exit[row];
+        // Reuse the realized q-geometry so exact directional derivatives stay on
+        // the same timewiggle-aware/frailty-aware manifold as the closed-form
+        // primary gradient/Hessian and the exact outer-derivative paths.
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q0_val = q_geom.q0;
+        let q1_val = q_geom.q1;
+        let qd1_val = q_geom.qd1;
         let g_val = block_states[2].eta[row];
 
         let q0_jet = MultiDirJet::linear(k, q0_val, &q0_first);
@@ -4220,10 +4215,11 @@ impl SurvivalMarginalSlopeFamily {
         let qd1_jet = MultiDirJet::linear(k, qd1_val, &qd1_first);
         let g_jet = MultiDirJet::linear(k, g_val, &g_first);
 
-        // beta = g (signed slope allowed)
-        let beta_jet = g_jet.clone();
-        // c = sqrt(1 + beta^2)
-        let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&beta_jet.mul(&beta_jet));
+        // The observed slope seen by the probit likelihood is the frailty-scaled
+        // raw logslope coefficient.
+        let observed_g_jet = g_jet.scale(self.probit_frailty_scale());
+        // c = sqrt(1 + observed_g^2)
+        let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&observed_g_jet.mul(&observed_g_jet));
         let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
 
         // a0 = q0 * c, a1 = q1 * c, ad1 = qd1 * c
@@ -4231,10 +4227,10 @@ impl SurvivalMarginalSlopeFamily {
         let a1_jet = q1_jet.mul(&c_jet);
         let ad1_jet = qd1_jet.mul(&c_jet);
 
-        // eta0 = a0 + beta * z, eta1 = a1 + beta * z
+        // eta0 = a0 + observed_g * z, eta1 = a1 + observed_g * z
         let z_jet = MultiDirJet::constant(k, zi);
-        let eta0_jet = a0_jet.add(&beta_jet.mul(&z_jet));
-        let eta1_jet = a1_jet.add(&beta_jet.mul(&z_jet));
+        let eta0_jet = a0_jet.add(&observed_g_jet.mul(&z_jet));
+        let eta1_jet = a1_jet.add(&observed_g_jet.mul(&z_jet));
 
         // NLL_i = w_i * {
         //   (1-d_i) * neglogphi(-eta1)  [exit survival for censored]
@@ -13507,6 +13503,39 @@ mod tests {
         );
     }
 
+    fn assert_closed_form_row_matches_exact_directional_derivatives(
+        family: SurvivalMarginalSlopeFamily,
+        block_states: Vec<ParameterBlockState>,
+    ) {
+        let (nll_closed, grad_closed, hess_closed) = family
+            .compute_row_primary_gradient_hessian_uncached(0, &block_states)
+            .expect("closed-form row derivatives");
+        let nll_exact = family
+            .row_neglog_directional(0, &block_states, &[])
+            .expect("exact row objective");
+        assert_close(nll_closed, nll_exact, 1e-12, "nll");
+
+        for a in 0..N_PRIMARY {
+            let dir_a = unit_primary_direction(a);
+            let grad_exact = family
+                .row_neglog_directional(0, &block_states, &[dir_a.clone()])
+                .expect("exact row gradient");
+            assert_close(grad_closed[a], grad_exact, 1e-10, &format!("grad[{a}]"));
+            for b in 0..N_PRIMARY {
+                let dir_b = unit_primary_direction(b);
+                let hess_exact = family
+                    .row_neglog_directional(0, &block_states, &[dir_a.clone(), dir_b])
+                    .expect("exact row hessian");
+                assert_close(
+                    hess_closed[[a, b]],
+                    hess_exact,
+                    1e-9,
+                    &format!("hess[{a},{b}]"),
+                );
+            }
+        }
+    }
+
     #[test]
     fn closed_form_row_matches_exact_directional_derivatives() {
         let family = SurvivalMarginalSlopeFamily {
@@ -13553,34 +13582,108 @@ mod tests {
                 eta: array![0.7],
             },
         ];
+        assert_closed_form_row_matches_exact_directional_derivatives(family, block_states);
+    }
 
-        let (nll_closed, grad_closed, hess_closed) = family
-            .compute_row_primary_gradient_hessian_uncached(0, &block_states)
-            .expect("closed-form row derivatives");
-        let nll_exact = family
-            .row_neglog_directional(0, &block_states, &[])
-            .expect("exact row objective");
-        assert_close(nll_closed, nll_exact, 1e-12, "nll");
+    #[test]
+    fn closed_form_row_matches_exact_directional_derivatives_with_gaussian_frailty() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.2]),
+            z: Arc::new(array![0.3]),
+            gaussian_frailty_sd: Some(0.65),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.8]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.4]],
+            )),
+            offset_entry: Arc::new(array![0.1]),
+            offset_exit: Arc::new(array![-0.2]),
+            derivative_offset_exit: Arc::new(array![0.05]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.4],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: array![-0.1],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.7],
+                eta: array![0.7],
+            },
+        ];
+        assert_closed_form_row_matches_exact_directional_derivatives(family, block_states);
+    }
 
-        for a in 0..N_PRIMARY {
-            let dir_a = unit_primary_direction(a);
-            let grad_exact = family
-                .row_neglog_directional(0, &block_states, &[dir_a.clone()])
-                .expect("exact row gradient");
-            assert_close(grad_closed[a], grad_exact, 1e-10, &format!("grad[{a}]"));
-            for b in 0..N_PRIMARY {
-                let dir_b = unit_primary_direction(b);
-                let hess_exact = family
-                    .row_neglog_directional(0, &block_states, &[dir_a.clone(), dir_b])
-                    .expect("exact row hessian");
-                assert_close(
-                    hess_closed[[a, b]],
-                    hess_exact,
-                    1e-9,
-                    &format!("hess[{a},{b}]"),
-                );
-            }
-        }
+    #[test]
+    fn closed_form_row_matches_exact_directional_derivatives_with_timewiggle() {
+        let time_wiggle_knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let time_wiggle_degree = 3;
+        let base_q0 = array![0.09];
+        let time_wiggle_ncols = monotone_wiggle_basis_with_derivative_order(
+            base_q0.view(),
+            &time_wiggle_knots,
+            time_wiggle_degree,
+            0,
+        )
+        .expect("timewiggle basis")
+        .ncols();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.1]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: Some(0.4),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![[0.2, 0.0, 0.0, 0.0]]),
+            design_exit: DesignMatrix::from(array![[0.35, 0.0, 0.0, 0.0]]),
+            design_derivative_exit: DesignMatrix::from(array![[1.1, 0.0, 0.0, 0.0]]),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.12]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(array![[0.6]]),
+            logslope_design: DesignMatrix::from(array![[1.0]]),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.2, 0.08, -0.03, 0.02],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.05],
+                eta: array![0.03],
+            },
+            ParameterBlockState {
+                beta: array![0.35],
+                eta: array![0.35],
+            },
+        ];
+        assert_closed_form_row_matches_exact_directional_derivatives(family, block_states);
     }
 
     #[test]
