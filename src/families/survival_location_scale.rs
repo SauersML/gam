@@ -3916,7 +3916,6 @@ struct TimeBlockPrepared {
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
     coefficient_lower_bounds: Option<Array1<f64>>,
-    linear_constraints: Option<LinearInequalityConstraints>,
     penalties: Vec<Array2<f64>>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
@@ -4084,7 +4083,6 @@ fn prepare_identified_time_block(
         design_exit,
         design_derivative_exit,
         coefficient_lower_bounds: Some(coefficient_lower_bounds),
-        linear_constraints,
         penalties,
         initial_beta,
         transform: TimeIdentifiabilityTransform { z: Array2::eye(p) },
@@ -9926,9 +9924,13 @@ mod tests {
             prepared.coefficient_lower_bounds,
             Some(array![f64::NEG_INFINITY, 0.0, 0.0])
         );
-        let constraints = prepared
-            .linear_constraints
-            .expect("time coefficient constraints");
+        let constraints = lower_bound_constraints(
+            prepared
+                .coefficient_lower_bounds
+                .as_ref()
+                .expect("time coefficient lower bounds"),
+        )
+        .expect("time coefficient constraints");
         assert_eq!(constraints.a, array![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
         assert_eq!(constraints.b, Array1::<f64>::zeros(2));
         assert_eq!(prepared.initial_beta, Some(array![-0.5, 0.2, 0.0]));
@@ -9963,7 +9965,7 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.contains("requires derivative offsets to encode the derivative guard"),
+            err.contains("require derivative offsets to encode the derivative guard"),
             "unexpected error: {err}"
         );
     }

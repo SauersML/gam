@@ -413,10 +413,6 @@ impl WorkingModelSurvival {
         Ok(base.signum() * log_abs.exp())
     }
 
-    fn row_derivative_constraint_lower_bound(&self, _: usize) -> f64 {
-        self.derivative_guard()
-    }
-
     fn coefficient_dim(&self) -> usize {
         self.design.p_total()
     }
@@ -675,11 +671,62 @@ impl WorkingModelSurvival {
         1e-10 * scale
     }
 
+    fn structural_time_coefficient_constraints(&self) -> Option<LinearInequalityConstraints> {
+        if !self.structurally_monotonic {
+            return None;
+        }
+        let p = self.coefficient_dim();
+        let time_columns = self.structural_time_columns.min(p);
+        if time_columns == 0 {
+            return None;
+        }
+        const STRUCTURAL_DERIV_TOL: f64 = 1e-12;
+        let mut active_columns = vec![false; time_columns];
+        let mut derivative_row = vec![0.0_f64; p];
+        for i in 0..self.nrows() {
+            if self.sampleweight[i] <= 0.0 {
+                continue;
+            }
+            self.fill_derivative_row(i, &mut derivative_row);
+            for j in 0..time_columns {
+                if derivative_row[j] > STRUCTURAL_DERIV_TOL {
+                    active_columns[j] = true;
+                }
+            }
+        }
+        if let Some(rows) = self.monotonicity_constraint_rows.as_ref() {
+            for i in 0..rows.nrows() {
+                for j in 0..time_columns {
+                    if rows[[i, j]] > STRUCTURAL_DERIV_TOL {
+                        active_columns[j] = true;
+                    }
+                }
+            }
+        }
+        let active_columns: Vec<usize> = active_columns
+            .into_iter()
+            .enumerate()
+            .filter_map(|(j, active)| active.then_some(j))
+            .collect();
+        if active_columns.is_empty() {
+            return None;
+        }
+        let mut a = Array2::<f64>::zeros((active_columns.len(), p));
+        let b = Array1::<f64>::zeros(active_columns.len());
+        for (row, &col) in active_columns.iter().enumerate() {
+            a[[row, col]] = 1.0;
+        }
+        Some(LinearInequalityConstraints { a, b })
+    }
+
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
         let p = self.coefficient_dim();
         const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
         if p == 0 {
             return None;
+        }
+        if self.structurally_monotonic {
+            return self.structural_time_coefficient_constraints();
         }
         if let (Some(rows), Some(offsets)) = (
             self.monotonicity_constraint_rows.as_ref(),
@@ -700,38 +747,7 @@ impl WorkingModelSurvival {
                 a.row_mut(r).assign(&rows.row(i));
                 b[r] = self.derivative_guard() - offsets[i];
             }
-            return if self.structurally_monotonic {
-                Some(LinearInequalityConstraints { a, b })
-            } else {
-                Some(compress_positive_collinear_constraints(&a, &b))
-            };
-        }
-        if self.structurally_monotonic {
-            let mut derivative_row = vec![0.0_f64; p];
-            let activerows: Vec<usize> = (0..self.nrows())
-                .filter(|&i| {
-                    self.fill_derivative_row(i, &mut derivative_row);
-                    self.sampleweight[i] > 0.0
-                        && derivative_row
-                            .iter()
-                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-                            > DERIVATIVE_ROW_NORM_TOL
-                })
-                .collect();
-            if activerows.is_empty() {
-                return None;
-            }
-            let mut a = Array2::<f64>::zeros((activerows.len(), p));
-            let mut b = Array1::<f64>::zeros(activerows.len());
-            for (r, &i) in activerows.iter().enumerate() {
-                self.fill_derivative_row(i, &mut derivative_row);
-                for j in 0..p {
-                    a[[r, j]] = derivative_row[j];
-                }
-                b[r] =
-                    self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
-            }
-            return Some(LinearInequalityConstraints { a, b });
+            return Some(compress_positive_collinear_constraints(&a, &b));
         }
         None
     }
@@ -1011,6 +1027,13 @@ impl WorkingModelSurvival {
         }
         if enabled {
             const STRUCTURAL_DERIV_TOL: f64 = 1e-12;
+            for (i, &offset) in self.offset_derivative_exit.iter().enumerate() {
+                if offset < -STRUCTURAL_DERIV_TOL {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "structural monotonicity requires nonnegative derivative offsets; found offset_derivative_exit[{i}]={offset:.3e}"
+                    )));
+                }
+            }
             let mut derivative_row = vec![0.0_f64; p];
             for i in 0..self.nrows() {
                 self.fill_derivative_row(i, &mut derivative_row);
@@ -1028,6 +1051,36 @@ impl WorkingModelSurvival {
                         return Err(EstimationError::InvalidInput(format!(
                             "structural monotonicity requires zero derivative contribution outside the time block; found x_derivative[{i},{j}]={v:.3e}"
                         )));
+                    }
+                }
+            }
+            if let (Some(rows), Some(offsets)) = (
+                self.monotonicity_constraint_rows.as_ref(),
+                self.monotonicity_constraint_offsets.as_ref(),
+            ) {
+                for (i, &offset) in offsets.iter().enumerate() {
+                    if offset < -STRUCTURAL_DERIV_TOL {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "structural monotonicity requires nonnegative collocation derivative offsets; found monotonicity_constraint_offsets[{i}]={offset:.3e}"
+                        )));
+                    }
+                }
+                for i in 0..rows.nrows() {
+                    for j in 0..time_columns {
+                        let v = rows[[i, j]];
+                        if v < -STRUCTURAL_DERIV_TOL {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "structural monotonicity requires nonnegative collocation derivative basis entries; found monotonicity_constraint_rows[{i},{j}]={v:.3e}"
+                            )));
+                        }
+                    }
+                    for j in time_columns..p {
+                        let v = rows[[i, j]];
+                        if v.abs() > STRUCTURAL_DERIV_TOL {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "structural monotonicity requires zero collocation derivative contribution outside the time block; found monotonicity_constraint_rows[{i},{j}]={v:.3e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2283,15 +2336,11 @@ mod tests {
         let constraints = model
             .monotonicity_linear_constraints()
             .expect("structural derivative constraints");
-        assert!(
-            constraints
-                .a
-                .slice(ndarray::s![.., 0..3])
-                .iter()
-                .all(|v| v.is_finite()),
-            "structural mode should keep explicit derivative-row constraints"
-        );
+        assert_eq!(constraints.a.nrows(), 2);
         assert_eq!(constraints.a.ncols(), 4);
+        assert_eq!(constraints.a.row(0).to_vec(), vec![0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(constraints.a.row(1).to_vec(), vec![0.0, 0.0, 1.0, 0.0]);
+        assert!(constraints.b.iter().all(|&v| v.abs() <= 1e-12));
 
         let beta = array![0.2, 0.2, 0.1, 0.2];
         let state = model.update_state(&beta).expect("state at structural beta");
@@ -2506,7 +2555,53 @@ mod tests {
     }
 
     #[test]
-    fn structural_monotonicity_emits_rowwise_constraints() {
+    fn structural_monotonicity_rejects_negative_derivative_offsets() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sampleweight = array![1.0];
+        let x_entry = array![[0.0]];
+        let x_exit = array![[0.2]];
+        let x_derivative = array![[1.0]];
+        let eta_entry = array![0.0];
+        let eta_exit = array![0.0];
+        let derivative_exit = array![-1e-3];
+        let offsets = SurvivalBaselineOffsets {
+            eta_entry: eta_entry.view(),
+            eta_exit: eta_exit.view(),
+            derivative_exit: derivative_exit.view(),
+        };
+
+        let mut model = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            Some(offsets),
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct structural survival model");
+        let err = model
+            .set_structural_monotonicity(true, 1)
+            .expect_err("negative derivative offsets must be rejected");
+        assert!(
+            err.to_string()
+                .contains("structural monotonicity requires nonnegative derivative offsets"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn structural_monotonicity_emits_coefficient_constraints() {
         let age_entry = array![1.0_f64, 1.5_f64];
         let age_exit = array![2.0_f64, 3.0_f64];
         let event_target = array![1u8, 0u8];
@@ -2542,9 +2637,8 @@ mod tests {
 
         assert_eq!(constraints.a.nrows(), 2);
         assert_eq!(constraints.a.ncols(), 3);
-        assert_eq!(constraints.a.row(0).to_vec(), vec![0.3, 0.2, 0.0]);
-        assert_eq!(constraints.a.row(1).to_vec(), vec![0.4, 0.1, 0.0]);
-        // Structural monotonicity uses derivative_guard() == 0.0
+        assert_eq!(constraints.a.row(0).to_vec(), vec![1.0, 0.0, 0.0]);
+        assert_eq!(constraints.a.row(1).to_vec(), vec![0.0, 1.0, 0.0]);
         assert!(constraints.b.iter().all(|&v| v.abs() <= 1e-12));
     }
 
@@ -2583,13 +2677,14 @@ mod tests {
             .monotonicity_linear_constraints()
             .expect("structural derivative constraints");
 
+        assert_eq!(constraints.a.nrows(), 1);
         assert!(
             constraints.a[[0, 0]].abs() <= 1e-12,
-            "inactive time column should remain absent from the row-wise constraint"
+            "inactive time column should remain unconstrained"
         );
         assert!(
             (constraints.a[[0, 1]] - 1.0).abs() <= 1e-12,
-            "active time column should remain in the row-wise constraint"
+            "active time column should remain constrained"
         );
     }
 
@@ -2628,14 +2723,9 @@ mod tests {
             .monotonicity_linear_constraints()
             .expect("structural derivative constraints");
 
-        assert!(
-            (constraints.a[[0, 0]] - 1.0).abs() <= 1e-12,
-            "first sparse row should constrain only column 0"
-        );
-        assert!(
-            constraints.a[[0, 1]].abs() <= 1e-12,
-            "first sparse row should leave column 1 unconstrained"
-        );
+        assert_eq!(constraints.a.nrows(), 2);
+        assert_eq!(constraints.a.row(0).to_vec(), vec![1.0, 0.0]);
+        assert_eq!(constraints.a.row(1).to_vec(), vec![0.0, 1.0]);
     }
 
     #[test]

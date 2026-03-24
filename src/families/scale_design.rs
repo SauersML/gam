@@ -815,4 +815,75 @@ mod tests {
         );
         assert_eq!(dropped, 2);
     }
+
+    #[test]
+    fn scale_projection_drops_high_gain_replay_direction() {
+        let n = 32;
+        let eps = 2e-8;
+        let mut primary = Array2::<f64>::zeros((n, 2));
+        let mut noise = Array2::<f64>::zeros((n, 2));
+        let weights = Array1::<f64>::ones(n);
+        for i in 0..n {
+            let t = i as f64;
+            primary[[i, 0]] = 1.0;
+            primary[[i, 1]] = eps * t;
+            noise[[i, 0]] = 1.0;
+            noise[[i, 1]] = (0.37 * t).sin();
+        }
+
+        let chunk_rows = scale_design_row_chunk_size(n, 2);
+        let sqrtw = weights.mapv(f64::sqrt);
+        let wx = build_weighted_primary_design(
+            ScaleDesignMatrixRef::Dense(&primary),
+            &sqrtw,
+            chunk_rows,
+        );
+        let qr = FaerArrayView::new(&wx).as_ref().col_piv_qr();
+        let r = qr.thin_R();
+        let diag_len = r.nrows().min(r.ncols());
+        let r_diag = (0..diag_len).map(|i| r[(i, i)]).collect::<Vec<_>>();
+        let leading_diag = r_diag.first().copied().map(f64::abs).unwrap_or(0.0);
+        let rank = scale_projection_effective_rank(&r_diag, leading_diag, n.max(primary.ncols()));
+        assert_eq!(
+            rank, 2,
+            "replay-safe rank floor should still keep the high-gain direction before coefficient capping"
+        );
+
+        let (perm_fwd, _) = qr.P().arrays();
+        let perm_fwd: Vec<usize> = perm_fwd.iter().map(|idx| idx.unbound()).collect();
+        let uncapped_projection = solve_scale_projection_for_rank(
+            ScaleDesignMatrixRef::Dense(&primary),
+            ScaleDesignMatrixRef::Dense(&noise),
+            &sqrtw,
+            &qr,
+            &r_diag,
+            &perm_fwd,
+            rank,
+            1,
+            chunk_rows,
+        );
+        let uncapped_max_abs = uncapped_projection
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            uncapped_max_abs > SCALE_PROJECTION_MAX_ABS_COEF,
+            "constructed replay solve should exceed the coefficient cap before fallback, got {uncapped_max_abs}"
+        );
+
+        let capped_projection = solve_scale_projection(
+            ScaleDesignMatrixRef::Dense(&primary),
+            ScaleDesignMatrixRef::Dense(&noise),
+            &weights,
+            1,
+            chunk_rows,
+        )
+        .expect("projection solve should succeed");
+        let capped_max_abs = capped_projection
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            capped_max_abs <= SCALE_PROJECTION_MAX_ABS_COEF,
+            "fallback should remove high-gain replay directions, got max coefficient {capped_max_abs}"
+        );
+    }
 }

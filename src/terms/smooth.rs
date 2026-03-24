@@ -10564,6 +10564,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_max_iter(max_iter)
         .with_fd_step(fd_step)
         .with_bounds(lower.clone(), upper.clone())
+        .with_initial_rho(theta0.clone())
         .with_seed_config(crate::seeding::SeedConfig {
             max_seeds: 4,
             screening_budget: 2,
