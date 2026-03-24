@@ -657,7 +657,6 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
         }
 
         let mut alpha = 1.0_f64;
-        let mut entering: Option<usize> = None;
         for i in 0..m {
             if is_active[i] {
                 continue;
@@ -667,7 +666,6 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
             let ai_d = ai.dot(&d);
             if let Some(cand) = boundary_hit_step_fraction(slack, ai_d, alpha) {
                 alpha = cand;
-                entering = Some(i);
             }
         }
 
@@ -681,19 +679,25 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
             });
         g_cur = gradient + &hessian.dot(&d_total);
 
-        if active.is_empty() && entering.is_none() {
+        let mut added_new_active = false;
+        for i in 0..m {
+            if is_active[i] {
+                continue;
+            }
+            let slack = constraints.a.row(i).dot(&x) - constraints.b[i];
+            if slack <= tol_active {
+                active.push(i);
+                is_active[i] = true;
+                added_new_active = true;
+            }
+        }
+
+        if active.is_empty() && !added_new_active {
             if let Some(hint) = active_hint {
                 hint.clear();
             }
             direction_out.assign(&d_total);
             return Ok(());
-        }
-
-        if let Some(idx) = entering
-            && !is_active[idx]
-        {
-            active.push(idx);
-            is_active[idx] = true;
         }
     }
 
