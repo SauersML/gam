@@ -880,6 +880,16 @@ impl SpatialLogKappaCoords {
         let mut vals = Vec::new();
         let mut dims = Vec::new();
         for &term_idx in term_indices {
+            if is_pure_duchon_aniso_term(spec, term_idx) {
+                let d = get_spatial_feature_dim(spec, term_idx).unwrap_or(1);
+                let eta =
+                    get_spatial_aniso_log_scales(spec, term_idx).unwrap_or_else(|| vec![0.0; d]);
+                for eta_a in eta.into_iter().take(d) {
+                    vals.push(eta_a);
+                }
+                dims.push(d);
+                continue;
+            }
             let length_scale = get_spatial_length_scale(spec, term_idx)
                 .unwrap_or(options.min_length_scale)
                 .clamp(options.min_length_scale, options.max_length_scale);
@@ -1041,20 +1051,14 @@ impl SpatialLogKappaCoords {
         for (slot, &term_idx) in term_indices.iter().enumerate() {
             let psi = self.term_slice(slot);
             let d = self.dims_per_term[slot];
-            if d == 1 {
-                // Isotropic: length_scale = exp(−ψ)
-                let length_scale = (-psi[0]).exp();
-                set_spatial_length_scale(&mut updated, term_idx, length_scale)?;
-            } else {
-                // Anisotropic: decompose ψ_a = ψ̄ + η_a where ψ̄ = mean(ψ_a).
-                // This is the Λ = κA decomposition (det A = 1):
-                //   κ = exp(ψ̄)     → stored as length_scale = exp(−ψ̄)
-                //   A = diag(exp(η_a)) → stored as aniso_log_scales = η
-                // The sum-to-zero constraint Ση_a = 0 is satisfied by construction.
-                let psi_bar = psi.iter().sum::<f64>() / d as f64;
-                let length_scale = (-psi_bar).exp();
-                let eta: Vec<f64> = psi.iter().map(|&p| p - psi_bar).collect();
-                set_spatial_length_scale(&mut updated, term_idx, length_scale)?;
+            let (next_length_scale, next_aniso) =
+                spatial_term_psi_to_length_scale_and_aniso(spec, term_idx, psi);
+            if d == 1 || next_length_scale.is_some() {
+                if let Some(length_scale) = next_length_scale {
+                    set_spatial_length_scale(&mut updated, term_idx, length_scale)?;
+                }
+            }
+            if let Some(eta) = next_aniso {
                 set_spatial_aniso_log_scales(&mut updated, term_idx, eta)?;
             }
         }
@@ -1077,6 +1081,47 @@ fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
             }
         })
         .collect()
+}
+
+fn is_pure_duchon_aniso_term(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+    spec.smooth_terms
+        .get(term_idx)
+        .is_some_and(|term| match &term.basis {
+            SmoothBasisSpec::Duchon {
+                feature_cols, spec, ..
+            } => {
+                spec.length_scale.is_none()
+                    && feature_cols.len() > 1
+                    && spec
+                        .aniso_log_scales
+                        .as_ref()
+                        .is_some_and(|eta| eta.len() == feature_cols.len())
+            }
+            _ => false,
+        })
+}
+
+fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+    get_spatial_length_scale(spec, term_idx).is_some() || is_pure_duchon_aniso_term(spec, term_idx)
+}
+
+fn spatial_term_psi_to_length_scale_and_aniso(
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+    psi: &[f64],
+) -> (Option<f64>, Option<Vec<f64>>) {
+    if is_pure_duchon_aniso_term(spec, term_idx) && psi.len() > 1 {
+        return (None, Some(psi.to_vec()));
+    }
+    if psi.len() <= 1 {
+        (Some((-psi.first().copied().unwrap_or(0.0)).exp()), None)
+    } else {
+        let psi_bar = psi.iter().sum::<f64>() / psi.len() as f64;
+        (
+            Some((-psi_bar).exp()),
+            Some(psi.iter().map(|&value| value - psi_bar).collect()),
+        )
+    }
 }
 
 /// Get the `aniso_log_scales` from a spatial term, if present.
@@ -3326,30 +3371,126 @@ pub fn build_term_collection_designs_and_freeze_joint(
     Ok((designs, resolved_specs))
 }
 
-fn apply_spatial_orthogonality_to_parametric(
+fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
+    match &term.basis {
+        SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
+        SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::Duchon { feature_cols, .. }
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+    }
+}
+
+fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
+    match &term.basis {
+        SmoothBasisSpec::BSpline1D { .. } => 0,
+        SmoothBasisSpec::TensorBSpline { .. } => 1,
+        SmoothBasisSpec::ThinPlate { .. } => 2,
+        SmoothBasisSpec::Matern { .. } => 3,
+        SmoothBasisSpec::Duchon { .. } => 4,
+    }
+}
+
+fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
+    match &term.basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => {
+            matches!(
+                spec.identifiability,
+                BSplineIdentifiability::FrozenTransform { .. }
+            )
+        }
+        SmoothBasisSpec::ThinPlate { spec, .. } => matches!(
+            spec.identifiability,
+            SpatialIdentifiability::FrozenTransform { .. }
+        ),
+        SmoothBasisSpec::Matern { spec, .. } => matches!(
+            spec.identifiability,
+            MaternIdentifiability::FrozenTransform { .. }
+        ),
+        SmoothBasisSpec::Duchon { spec, .. } => matches!(
+            spec.identifiability,
+            SpatialIdentifiability::FrozenTransform { .. }
+        ),
+        SmoothBasisSpec::TensorBSpline { spec, .. } => matches!(
+            spec.identifiability,
+            TensorBSplineIdentifiability::FrozenTransform { .. }
+        ),
+    }
+}
+
+fn compare_smooth_ownership_priority(
+    lhs_idx: usize,
+    lhs: &SmoothTermSpec,
+    rhs_idx: usize,
+    rhs: &SmoothTermSpec,
+) -> std::cmp::Ordering {
+    let lhs_cols = smooth_term_feature_cols(lhs);
+    let rhs_cols = smooth_term_feature_cols(rhs);
+    lhs_cols
+        .len()
+        .cmp(&rhs_cols.len())
+        .then_with(|| lhs_cols.cmp(&rhs_cols))
+        .then_with(|| smooth_basis_family_rank(lhs).cmp(&smooth_basis_family_rank(rhs)))
+        .then_with(|| lhs.name.cmp(&rhs.name))
+        .then(lhs_idx.cmp(&rhs_idx))
+}
+
+fn smooth_is_owned_by_prior_term(owner: &SmoothTermSpec, target: &SmoothTermSpec) -> bool {
+    let owner_features = smooth_term_feature_cols(owner)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let target_features = smooth_term_feature_cols(target)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    owner_features.is_subset(&target_features)
+}
+
+fn build_constraint_block(
+    n: usize,
+    parametric_block: Option<&Array2<f64>>,
+    owner_blocks: &[&DesignMatrix],
+) -> Array2<f64> {
+    let param_cols = parametric_block.map_or(0, Array2::ncols);
+    let owner_cols: usize = owner_blocks.iter().map(|design| design.ncols()).sum();
+    let mut block = Array2::<f64>::zeros((n, param_cols + owner_cols));
+    let mut col_start = 0usize;
+    if let Some(parametric) = parametric_block {
+        let col_end = col_start + parametric.ncols();
+        block
+            .slice_mut(s![.., col_start..col_end])
+            .assign(parametric);
+        col_start = col_end;
+    }
+    const CHUNK: usize = 1024;
+    for owner in owner_blocks {
+        let col_end = col_start + owner.ncols();
+        for row_start in (0..n).step_by(CHUNK) {
+            let row_end = (row_start + CHUNK).min(n);
+            let chunk = owner.row_chunk(row_start..row_end);
+            block
+                .slice_mut(s![row_start..row_end, col_start..col_end])
+                .assign(&chunk);
+        }
+        col_start = col_end;
+    }
+    block
+}
+
+fn apply_global_smooth_identifiability(
     smooth: RawSmoothDesign,
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
 ) -> Result<SmoothDesign, BasisError> {
-    // Option 5 identifiability policy:
+    // Global smooth identifiability policy:
     //
-    // Build a term-local parametric confounding block C_j = [1 | X_lin,overlap(j)],
-    // then for each spatial smooth basis B_j enforce orthogonality to C_j in the
-    // unweighted inner product:
-    //   B_con^T C = 0.
+    // 1. Each smooth is orthogonalized to the intercept plus any explicit linear
+    //    columns that reuse its feature axes.
+    // 2. Higher-order / duplicate smooths are orthogonalized to the realized
+    //    design columns of lower-order owned smooths over nested feature sets.
     //
-    // Reparameterization derivation:
-    //   M = B^T C.
-    //   If columns of Z span null(M^T), then
-    //      (B Z)^T C = Z^T (B^T C) = Z^T M = 0.
-    //
-    // So B_con = B Z has no component in the parametric column space, eliminating
-    // intercept/linear confounding without hand-picking polynomial columns.
-    //
-    // Penalties transform by congruence:
-    //   S_con = Z^T S Z.
-    // This preserves PSD and keeps curvature geometry consistent in constrained coords.
+    // This yields a deterministic hierarchical decomposition: lower-order smooths
+    // own their subspaces, and broader smooths fit only the residual structure.
     if smoothspecs.len() != smooth.terms.len() {
         return Err(BasisError::DimensionMismatch(format!(
             "smooth spec count ({}) does not match built term count ({})",
@@ -3358,73 +3499,80 @@ fn apply_spatial_orthogonality_to_parametric(
         )));
     }
 
-    // Fast-path: if no spatial term participates in Option 5 (orthogonal or frozen),
-    // return the smooth bundle unchanged and skip all matrix work.
-    let any_spatial_transform = smoothspecs.iter().any(|t| {
-        !matches!(
-            spatial_identifiability_policy(t),
-            Some(SpatialIdentifiability::None) | None
-        )
-    });
-    if !any_spatial_transform {
+    if smooth.terms.is_empty() {
         return Ok(smooth.into());
     }
 
-    let mut local_designs = Vec::<DesignMatrix>::with_capacity(smooth.terms.len());
-    let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(smooth.terms.len());
-    let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());
-    let mut local_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(smooth.terms.len());
-    let mut local_metadata = Vec::<BasisMetadata>::with_capacity(smooth.terms.len());
-    let mut local_dims = Vec::<usize>::with_capacity(smooth.terms.len());
-    let mut local_linear_constraints =
-        Vec::<Option<LinearInequalityConstraints>>::with_capacity(smooth.terms.len());
+    let mut local_designs = vec![None; smooth.terms.len()];
+    let mut local_penalties = vec![Vec::<Array2<f64>>::new(); smooth.terms.len()];
+    let mut local_nullspaces = vec![Vec::<usize>::new(); smooth.terms.len()];
+    let mut local_penaltyinfo = vec![Vec::<PenaltyInfo>::new(); smooth.terms.len()];
+    let mut local_metadata = vec![None; smooth.terms.len()];
+    let mut local_dims = vec![0usize; smooth.terms.len()];
+    let mut local_linear_constraints = vec![None; smooth.terms.len()];
 
-    for (idx, term) in smooth.terms.iter().enumerate() {
+    let mut ownership_order: Vec<usize> = (0..smooth.terms.len()).collect();
+    ownership_order.sort_by(|&lhs, &rhs| {
+        compare_smooth_ownership_priority(lhs, &smoothspecs[lhs], rhs, &smoothspecs[rhs])
+    });
+
+    let mut processed_owner_indices = Vec::<usize>::with_capacity(smooth.terms.len());
+
+    for &idx in &ownership_order {
+        let term = &smooth.terms[idx];
         let termspec = &smoothspecs[idx];
         let design_local = smooth.term_designs[idx].clone();
-        let use_frozen_transform = matches!(
-            spatial_identifiability_policy(termspec),
-            Some(SpatialIdentifiability::FrozenTransform { .. })
-        );
-        let c_local = if !use_frozen_transform
-            && matches!(
-                spatial_identifiability_policy(termspec),
-                Some(SpatialIdentifiability::OrthogonalToParametric)
-            ) {
-            Some(build_parametric_constraint_block_for_term(
-                data,
-                linear_terms,
-                termspec,
-            )?)
+        let use_frozen_transform = smooth_has_frozen_identifiability(termspec);
+        let owner_indices = if use_frozen_transform {
+            Vec::new()
         } else {
-            None
+            processed_owner_indices
+                .iter()
+                .copied()
+                .filter(|owner_idx| {
+                    smooth_is_owned_by_prior_term(&smoothspecs[*owner_idx], termspec)
+                })
+                .collect::<Vec<_>>()
         };
-        let z_opt = maybe_spatial_identifiability_transform(
+        let owner_blocks = owner_indices
+            .iter()
+            .map(|owner_idx| {
+                local_designs[*owner_idx]
+                    .as_ref()
+                    .expect("owner design must be available before dependent smooth")
+            })
+            .collect::<Vec<_>>();
+        let c_local = if use_frozen_transform {
+            None
+        } else {
+            Some(build_constraint_block(
+                data.nrows(),
+                Some(&build_parametric_constraint_block_for_term(
+                    data,
+                    linear_terms,
+                    termspec,
+                )?),
+                &owner_blocks,
+            ))
+        };
+        let z_opt = maybe_smooth_identifiability_transform(
             termspec,
             &design_local,
             c_local.as_ref().map(|mat| mat.view()),
         )?;
         let design_constrained = if let Some(z) = z_opt.as_ref() {
-            apply_spatial_transform_to_design(design_local, z, &term.name)?
+            apply_smooth_transform_to_design(design_local, z, &term.name)?
         } else {
             design_local
         };
 
-        // Mathematical acceptance criterion:
-        //   ||B_con^T C||_F / (||B_con||_F ||C||_F) <= tol.
-        if matches!(
-            spatial_identifiability_policy(termspec),
-            Some(SpatialIdentifiability::OrthogonalToParametric)
-        ) {
-            let c_ref = c_local
-                .as_ref()
-                .expect("parametric constraint block must exist for orthogonal policy");
+        if let Some(c_ref) = c_local.as_ref() {
             let rel =
                 orthogonality_relative_residual_for_design(&design_constrained, c_ref.view())?;
             let tol = 1e-8;
             if rel > tol {
                 return Err(BasisError::InvalidInput(format!(
-                    "spatial orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
+                    "smooth orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
                     term.name, rel, tol
                 )));
             }
@@ -3485,16 +3633,17 @@ fn apply_spatial_orthogonality_to_parametric(
                 None
             };
 
-        local_dims.push(design_constrained.ncols());
-        local_designs.push(design_constrained);
-        local_penalties.push(penalties_constrained);
-        local_nullspaces.push(nullspace_constrained);
-        local_penaltyinfo.push(penaltyinfo_constrained);
-        local_linear_constraints.push(linear_constraints_constrained);
-        local_metadata.push(with_spatial_identifiability_transform(
+        local_dims[idx] = design_constrained.ncols();
+        local_designs[idx] = Some(design_constrained);
+        local_penalties[idx] = penalties_constrained;
+        local_nullspaces[idx] = nullspace_constrained;
+        local_penaltyinfo[idx] = penaltyinfo_constrained;
+        local_linear_constraints[idx] = linear_constraints_constrained;
+        local_metadata[idx] = Some(with_identifiability_transform(
             &term.metadata,
             z_opt.as_ref(),
         ));
+        processed_owner_indices.push(idx);
     }
 
     let total_p: usize = local_dims.iter().sum();
@@ -3555,10 +3704,12 @@ fn apply_spatial_orthogonality_to_parametric(
             penalties_local: local_penalties[idx].clone(),
             nullspace_dims: local_nullspaces[idx].clone(),
             penaltyinfo_local: local_penaltyinfo[idx].clone(),
-            metadata: local_metadata[idx].clone(),
+            metadata: local_metadata[idx]
+                .clone()
+                .expect("local metadata must exist for every smooth term"),
             lower_bounds_local: smooth.terms[idx].lower_bounds_local.clone(),
             linear_constraints_local: local_linear_constraints[idx].clone(),
-            // Spatial orthogonality transform breaks Kronecker structure.
+            // Global orthogonality transforms break Kronecker structure.
             kronecker_factored: None,
         });
         if let Some(lin_local) = &local_linear_constraints[idx] {
@@ -3594,7 +3745,10 @@ fn apply_spatial_orthogonality_to_parametric(
     );
 
     Ok(SmoothDesign {
-        term_designs: local_designs,
+        term_designs: local_designs
+            .into_iter()
+            .map(|design| design.expect("local design must exist for every smooth term"))
+            .collect(),
         penalties: penalties_global,
         nullspace_dims: nullspace_dims_global,
         penaltyinfo: penaltyinfo_global,
@@ -3627,32 +3781,18 @@ fn build_parametric_constraint_block_for_term(
 ) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
-
-    let overlapping_linear_term_indices: Vec<usize> = match &termspec.basis {
-        SmoothBasisSpec::ThinPlate { feature_cols, .. } => linear_terms
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, linear)| {
-                if feature_cols.contains(&linear.feature_col) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        SmoothBasisSpec::Duchon { feature_cols, .. } => linear_terms
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, linear)| {
-                if feature_cols.contains(&linear.feature_col) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let feature_cols = smooth_term_feature_cols(termspec);
+    let overlapping_linear_term_indices: Vec<usize> = linear_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, linear)| {
+            if feature_cols.contains(&linear.feature_col) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let mut c = Array2::<f64>::zeros((n, 1 + overlapping_linear_term_indices.len()));
     c.column_mut(0).fill(1.0);
@@ -3669,7 +3809,7 @@ fn build_parametric_constraint_block_for_term(
     Ok(c)
 }
 
-fn apply_spatial_transform_to_design(
+fn apply_smooth_transform_to_design(
     design_local: DesignMatrix,
     transform: &Array2<f64>,
     termname: &str,
@@ -3678,16 +3818,19 @@ fn apply_spatial_transform_to_design(
         DesignMatrix::Dense(inner) => {
             let op = CoefficientTransformOperator::new(inner, transform.clone()).map_err(|e| {
                 BasisError::InvalidInput(format!(
-                    "spatial identifiability transform failed for term '{termname}': {e}"
+                    "smooth identifiability transform failed for term '{termname}': {e}"
                 ))
             })?;
             Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Arc::new(op),
             )))
         }
-        DesignMatrix::Sparse(_) => Err(BasisError::InvalidInput(format!(
-            "spatial identifiability transform requires a dense/operator-backed term for '{termname}'"
-        ))),
+        DesignMatrix::Sparse(inner) => {
+            let dense = inner.to_dense().dot(transform);
+            Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                dense,
+            )))
+        }
     }
 }
 
@@ -3725,43 +3868,36 @@ fn design_frobenius_norm(design: &DesignMatrix) -> f64 {
     sumsq.sqrt()
 }
 
-fn maybe_spatial_identifiability_transform(
+fn maybe_smooth_identifiability_transform(
     termspec: &SmoothTermSpec,
     design_local: &DesignMatrix,
-    parametric_block: Option<ArrayView2<'_, f64>>,
+    constraint_block: Option<ArrayView2<'_, f64>>,
 ) -> Result<Option<Array2<f64>>, BasisError> {
-    let maybe_policy = spatial_identifiability_policy(termspec);
-    let Some(policy) = maybe_policy else {
+    if let Some(SpatialIdentifiability::FrozenTransform { transform }) =
+        spatial_identifiability_policy(termspec)
+    {
+        if design_local.ncols() != transform.nrows() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
+                design_local.ncols(),
+                transform.nrows()
+            )));
+        }
+        return Ok(Some(transform.clone()));
+    }
+
+    let Some(c) = constraint_block else {
         return Ok(None);
     };
-
-    match policy {
-        SpatialIdentifiability::None => Ok(None),
-        SpatialIdentifiability::OrthogonalToParametric => {
-            let c = parametric_block.ok_or_else(|| {
-                BasisError::InvalidInput(
-                    "missing parametric constraint block for OrthogonalToParametric policy"
-                        .to_string(),
-                )
-            })?;
-            let z = orthogonality_transform_for_design(
-                design_local,
-                c,
-                None, // fixed subspace: do not use iteration-varying PIRLS weights
-            )?;
-            Ok(Some(z))
-        }
-        SpatialIdentifiability::FrozenTransform { transform } => {
-            if design_local.ncols() != transform.nrows() {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
-                    design_local.ncols(),
-                    transform.nrows()
-                )));
-            }
-            Ok(Some(transform.clone()))
-        }
+    if c.ncols() == 0 {
+        return Ok(None);
     }
+    let z = orthogonality_transform_for_design(
+        design_local,
+        c,
+        None, // fixed subspace: do not use iteration-varying PIRLS weights
+    )?;
+    Ok(Some(z))
 }
 
 fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialIdentifiability> {
@@ -3772,23 +3908,33 @@ fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialI
     }
 }
 
-fn orthogonality_relative_residual_for_design(
-    design: &DesignMatrix,
-    constraint_matrix: ArrayView2<'_, f64>,
-) -> Result<f64, BasisError> {
-    let cross = design_constraint_cross(design, constraint_matrix)?;
-    let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let b_norm = design_frobenius_norm(design);
-    let c_norm = constraint_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let denom = (b_norm * c_norm).max(1e-300);
-    Ok(num / denom)
+fn compose_identifiability_transforms(
+    existing: Option<&Array2<f64>>,
+    extra: Option<&Array2<f64>>,
+) -> Option<Array2<f64>> {
+    match (existing, extra) {
+        (Some(lhs), Some(rhs)) => Some(lhs.dot(rhs)),
+        (Some(lhs), None) => Some(lhs.clone()),
+        (None, Some(rhs)) => Some(rhs.clone()),
+        (None, None) => None,
+    }
 }
 
-fn with_spatial_identifiability_transform(
+fn with_identifiability_transform(
     metadata: &BasisMetadata,
     transform: Option<&Array2<f64>>,
 ) -> BasisMetadata {
     match metadata {
+        BasisMetadata::BSpline1D {
+            knots,
+            identifiability_transform,
+        } => BasisMetadata::BSpline1D {
+            knots: knots.clone(),
+            identifiability_transform: compose_identifiability_transforms(
+                identifiability_transform.as_ref(),
+                transform,
+            ),
+        },
         BasisMetadata::ThinPlate {
             centers,
             length_scale,
@@ -3797,10 +3943,31 @@ fn with_spatial_identifiability_transform(
         } => BasisMetadata::ThinPlate {
             centers: centers.clone(),
             length_scale: *length_scale,
-            identifiability_transform: transform
-                .cloned()
-                .or_else(|| identifiability_transform.clone()),
+            identifiability_transform: compose_identifiability_transforms(
+                identifiability_transform.as_ref(),
+                transform,
+            ),
             input_scales: input_scales.clone(),
+        },
+        BasisMetadata::Matern {
+            centers,
+            length_scale,
+            nu,
+            include_intercept,
+            identifiability_transform,
+            input_scales,
+            aniso_log_scales,
+        } => BasisMetadata::Matern {
+            centers: centers.clone(),
+            length_scale: *length_scale,
+            nu: *nu,
+            include_intercept: *include_intercept,
+            identifiability_transform: compose_identifiability_transforms(
+                identifiability_transform.as_ref(),
+                transform,
+            ),
+            input_scales: input_scales.clone(),
+            aniso_log_scales: aniso_log_scales.clone(),
         },
         BasisMetadata::Duchon {
             centers,
@@ -3817,12 +3984,37 @@ fn with_spatial_identifiability_transform(
             nullspace_order: *nullspace_order,
             input_scales: input_scales.clone(),
             aniso_log_scales: aniso_log_scales.clone(),
-            identifiability_transform: transform
-                .cloned()
-                .or_else(|| identifiability_transform.clone()),
+            identifiability_transform: compose_identifiability_transforms(
+                identifiability_transform.as_ref(),
+                transform,
+            ),
         },
-        _ => metadata.clone(),
+        BasisMetadata::TensorBSpline {
+            feature_cols,
+            knots,
+            degrees,
+            identifiability_transform,
+        } => BasisMetadata::TensorBSpline {
+            feature_cols: feature_cols.clone(),
+            knots: knots.clone(),
+            degrees: degrees.clone(),
+            identifiability_transform: compose_identifiability_transforms(
+                identifiability_transform.as_ref(),
+                transform,
+            ),
+        },
     }
+}
+fn orthogonality_relative_residual_for_design(
+    design: &DesignMatrix,
+    constraint_matrix: ArrayView2<'_, f64>,
+) -> Result<f64, BasisError> {
+    let cross = design_constraint_cross(design, constraint_matrix)?;
+    let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let b_norm = design_frobenius_norm(design);
+    let c_norm = constraint_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let denom = (b_norm * c_norm).max(1e-300);
+    Ok(num / denom)
 }
 
 pub fn fit_term_collection_forspec(
@@ -8153,14 +8345,14 @@ fn external_opts_for_design(
     }
 }
 
-/// Evaluate the joint REML cost, gradient, and Hessian at a given θ = [ρ, ψ]
+/// Evaluate the joint REML cost, gradient, and Hessian result at a given θ = [ρ, ψ]
 /// for a single-block term collection with spatial hyperparameters.
 ///
 /// This provides a direct evaluation of the profiled REML objective using the
 /// external-caller interface, which exposes exact cost/gradient/Hessian without
 /// running the full outer smoothing loop. The returned tuple is
 /// `(cost, gradient, hessian)` in the joint [ρ, ψ] space.
-fn evaluate_joint_reml_at_theta(
+fn evaluate_joint_reml_outer_eval_at_theta(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
@@ -8171,9 +8363,43 @@ fn evaluate_joint_reml_at_theta(
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     family: LikelihoodFamily,
     options: &FitOptions,
-) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+) -> Result<
+    (
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    ),
+    EstimationError,
+> {
     let ext_opts = external_opts_for_design(family, design, options);
-    crate::estimate::compute_external_joint_hypercostgradienthessian(
+    crate::estimate::compute_external_joint_hyper_eval(
+        y,
+        weights,
+        design.design.clone(),
+        offset,
+        design.penalties.clone(),
+        theta,
+        rho_dim,
+        hyper_dirs,
+        warm_start_beta,
+        &ext_opts,
+    )
+}
+
+fn evaluate_joint_reml_efs_at_theta(
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    design: &TermCollectionDesign,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    let ext_opts = external_opts_for_design(family, design, options);
+    crate::estimate::compute_external_joint_hyperefs(
         y,
         weights,
         design.design.clone(),
@@ -8815,7 +9041,11 @@ struct SingleBlockExactJointDesignCache<'d> {
     realizer: FrozenTermCollectionIncrementalRealizer<'d>,
     current_theta: Option<Array1<f64>>,
     last_cost: Option<f64>,
-    last_eval: Option<(f64, Array1<f64>, Array2<f64>)>,
+    last_eval: Option<(
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    )>,
     spatial_terms: Vec<usize>,
     rho_dim: usize,
     dims_per_term: Vec<usize>,
@@ -8883,7 +9113,14 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         }
     }
 
-    fn memoized_eval(&self, theta: &Array1<f64>) -> Option<(f64, Array1<f64>, Array2<f64>)> {
+    fn memoized_eval(
+        &self,
+        theta: &Array1<f64>,
+    ) -> Option<(
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    )> {
         if self
             .current_theta
             .as_ref()
@@ -8895,7 +9132,14 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         }
     }
 
-    fn store_eval(&mut self, eval: (f64, Array1<f64>, Array2<f64>)) {
+    fn store_eval(
+        &mut self,
+        eval: (
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        ),
+    ) {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
     }
@@ -9079,7 +9323,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     // Use bounds and design metadata for validation.
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{Derivative, EfsEval, HessianResult, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, OuterEval};
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -9110,7 +9354,14 @@ fn try_exact_joint_spatial_aniso_optimization(
         fn eval_full(
             &mut self,
             theta: &Array1<f64>,
-        ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+        ) -> Result<
+            (
+                f64,
+                Array1<f64>,
+                crate::solver::outer_strategy::HessianResult,
+            ),
+            EstimationError,
+        > {
             if let Some(eval) = self.cache.memoized_eval(theta) {
                 return Ok(eval);
             }
@@ -9129,7 +9380,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 )
             })?;
 
-            let eval = evaluate_joint_reml_at_theta(
+            let eval = evaluate_joint_reml_outer_eval_at_theta(
                 self.y,
                 self.weights,
                 self.offset,
@@ -9145,6 +9396,38 @@ fn try_exact_joint_spatial_aniso_optimization(
                 self.cache.store_eval(value.clone());
             }
             eval
+        }
+
+        fn eval_efs(
+            &mut self,
+            theta: &Array1<f64>,
+        ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+            self.cache
+                .ensure_theta(theta)
+                .map_err(EstimationError::InvalidInput)?;
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                self.data,
+                self.cache.spec(),
+                self.cache.design(),
+                &self.cache.spatial_terms,
+            )?
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to build aniso hyper_dirs for exact-joint EFS".to_string(),
+                )
+            })?;
+            evaluate_joint_reml_efs_at_theta(
+                self.y,
+                self.weights,
+                self.offset,
+                self.cache.design(),
+                theta,
+                self.rho_dim,
+                hyper_dirs,
+                None,
+                self.family,
+                self.options,
+            )
         }
 
         /// Cost-only evaluation — uses the same evaluator as eval_full to ensure
@@ -9163,6 +9446,13 @@ fn try_exact_joint_spatial_aniso_optimization(
             if cost < self.best_cost {
                 self.best_cost = cost;
             }
+        }
+
+        fn reset(&mut self) {
+            self.best_cost = f64::INFINITY;
+            self.cache.current_theta = None;
+            self.cache.last_cost = None;
+            self.cache.last_eval = None;
         }
     }
 
@@ -9201,33 +9491,29 @@ fn try_exact_joint_spatial_aniso_optimization(
         1e-5,
     );
 
-    let mut obj =
-        problem.build_objective(
-            &mut ctx,
-            |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
-                let cost = ctx.eval_cost(theta);
+    let mut obj = problem.build_objective(
+        &mut ctx,
+        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
+            let cost = ctx.eval_cost(theta);
+            ctx.track_best(theta, cost);
+            Ok(cost)
+        },
+        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx.eval_full(theta) {
+            Ok((cost, grad, hess)) => {
                 ctx.track_best(theta, cost);
-                Ok(cost)
-            },
-            |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx.eval_full(theta) {
-                Ok((cost, grad, hess)) => {
-                    ctx.track_best(theta, cost);
-                    Ok(OuterEval {
-                        cost,
-                        gradient: grad,
-                        hessian: HessianResult::Analytic(hess),
-                    })
-                }
-                Err(_) => Ok(OuterEval::infeasible(theta.len())),
-            },
-            None::<fn(&mut &mut AnisoJointContext<'_>)>,
-            None::<
-                fn(
-                    &mut &mut AnisoJointContext<'_>,
-                    &Array1<f64>,
-                ) -> Result<EfsEval, EstimationError>,
-            >,
-        );
+                Ok(OuterEval {
+                    cost,
+                    gradient: grad,
+                    hessian: hess,
+                })
+            }
+            Err(_) => Ok(OuterEval::infeasible(theta.len())),
+        },
+        Some(|ctx: &mut &mut AnisoJointContext<'_>| {
+            ctx.reset();
+        }),
+        Some(|ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
+    );
 
     let result = problem.run(&mut obj, "aniso-psi joint REML").map_err(|e| {
         EstimationError::InvalidInput(format!(
@@ -9278,7 +9564,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{Derivative, EfsEval, HessianResult, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, EfsEval, OuterEval};
 
     let theta_dim = theta0.len();
     let kappa_dim = theta_dim - rho_dim;
@@ -9307,7 +9593,14 @@ fn try_exact_joint_spatial_isotropic_optimization(
         fn eval_full(
             &mut self,
             theta: &Array1<f64>,
-        ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+        ) -> Result<
+            (
+                f64,
+                Array1<f64>,
+                crate::solver::outer_strategy::HessianResult,
+            ),
+            EstimationError,
+        > {
             if let Some(eval) = self.cache.memoized_eval(theta) {
                 return Ok(eval);
             }
@@ -9326,7 +9619,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 )
             })?;
 
-            let eval = evaluate_joint_reml_at_theta(
+            let eval = evaluate_joint_reml_outer_eval_at_theta(
                 self.y,
                 self.weights,
                 self.offset,
@@ -9342,6 +9635,38 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 self.cache.store_eval(value.clone());
             }
             eval
+        }
+
+        fn eval_efs(
+            &mut self,
+            theta: &Array1<f64>,
+        ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+            self.cache
+                .ensure_theta(theta)
+                .map_err(EstimationError::InvalidInput)?;
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                self.data,
+                self.cache.spec(),
+                self.cache.design(),
+                &self.cache.spatial_terms,
+            )?
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to build isotropic hyper_dirs for exact-joint EFS".to_string(),
+                )
+            })?;
+            evaluate_joint_reml_efs_at_theta(
+                self.y,
+                self.weights,
+                self.offset,
+                self.cache.design(),
+                theta,
+                self.rho_dim,
+                hyper_dirs,
+                None,
+                self.family,
+                self.options,
+            )
         }
 
         /// Cost-only evaluation — uses the same evaluator as eval_full to ensure
@@ -9360,6 +9685,13 @@ fn try_exact_joint_spatial_isotropic_optimization(
             if cost < self.best_cost {
                 self.best_cost = cost;
             }
+        }
+
+        fn reset(&mut self) {
+            self.best_cost = f64::INFINITY;
+            self.cache.current_theta = None;
+            self.cache.last_cost = None;
+            self.cache.last_eval = None;
         }
     }
 
@@ -9411,13 +9743,15 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 Ok(OuterEval {
                     cost,
                     gradient: grad,
-                    hessian: HessianResult::Analytic(hess),
+                    hessian: hess,
                 })
             }
             Err(_) => Ok(OuterEval::infeasible(theta.len())),
         },
-        None::<fn(&mut &mut IsoJointContext<'_>)>,
-        None::<fn(&mut &mut IsoJointContext<'_>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        Some(|ctx: &mut &mut IsoJointContext<'_>| {
+            ctx.reset();
+        }),
+        Some(|ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
     );
 
     let result = problem.run(&mut obj, "iso-kappa joint REML").map_err(|e| {
@@ -10448,7 +10782,11 @@ struct ExactJointDesignCache<'d> {
     block_term_indices: Vec<Vec<usize>>,
     current_theta: Option<Array1<f64>>,
     last_cost: Option<f64>,
-    last_eval: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
+    last_eval: Option<(
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    )>,
     rho_dim: usize,
     all_dims: Vec<usize>,
     block_term_counts: Vec<usize>,
@@ -10551,7 +10889,11 @@ impl<'d> ExactJointDesignCache<'d> {
     fn memoized_eval(
         &self,
         theta: &Array1<f64>,
-    ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
+    ) -> Option<(
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    )> {
         if self
             .current_theta
             .as_ref()
@@ -10563,7 +10905,14 @@ impl<'d> ExactJointDesignCache<'d> {
         }
     }
 
-    fn store_eval(&mut self, eval: (f64, Array1<f64>, Option<Array2<f64>>)) {
+    fn store_eval(
+        &mut self,
+        eval: (
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        ),
+    ) {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
     }
@@ -10658,7 +11007,14 @@ where
         &[TermCollectionSpec],
         &[TermCollectionDesign],
         bool,
-    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String>,
+    ) -> Result<
+        (
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        ),
+        String,
+    >,
 {
     let n_blocks = block_specs.len();
     if block_term_indices.len() != n_blocks {
@@ -10716,17 +11072,16 @@ where
     let all_dims = joint_setup.log_kappa_dims_per_term();
 
     // Build bootstrap designs and frozen specs for each block.
-    let (boot_designs, mut best_specs) =
-        build_term_collection_designs_and_freeze_joint(data, block_specs).map_err(|e| {
-            format!("failed to build and freeze joint block designs during exact joint kappa bootstrap: {e}")
-        })?;
-    let mut total_design_cols = 0usize;
-    for design in &boot_designs {
-        total_design_cols += design.design.ncols();
-    }
-
-    let analytic_outer_hessian_available = analytic_joint_hessian_available
-        && crate::custom_family::joint_exact_analytic_outer_hessian_available(total_design_cols);
+    let (boot_designs, mut best_specs) = build_term_collection_designs_and_freeze_joint(
+        data,
+        block_specs,
+    )
+    .map_err(|e| {
+        format!(
+            "failed to build and freeze joint block designs during exact joint kappa bootstrap: {e}"
+        )
+    })?;
+    let analytic_outer_hessian_available = analytic_joint_hessian_available;
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -10830,20 +11185,10 @@ where
                             "n-block exact-joint gradient contained non-finite values".to_string(),
                         ));
                     }
-                    let hessian_result = match hess {
-                        Some(h)
-                            if h.nrows() == theta.len()
-                                && h.ncols() == theta.len()
-                                && h.iter().all(|v| v.is_finite()) =>
-                        {
-                            HessianResult::Analytic(h)
-                        }
-                        _ => HessianResult::Unavailable,
-                    };
                     return Ok(OuterEval {
                         cost,
                         gradient: grad,
-                        hessian: hessian_result,
+                        hessian: hess,
                     });
                 }
                 if ctx.cache.ensure_theta(theta).is_err() {
@@ -10869,20 +11214,10 @@ where
                                     .to_string(),
                             ));
                         }
-                        let hessian_result = match hess {
-                            Some(h)
-                                if h.nrows() == theta.len()
-                                    && h.ncols() == theta.len()
-                                    && h.iter().all(|v| v.is_finite()) =>
-                            {
-                                HessianResult::Analytic(h)
-                            }
-                            _ => HessianResult::Unavailable,
-                        };
                         Ok(OuterEval {
                             cost,
                             gradient: grad,
-                            hessian: hessian_result,
+                            hessian: hess,
                         })
                     }
                     Err(_) => Ok(OuterEval::infeasible(theta.len())),
@@ -12897,11 +13232,9 @@ mod tests {
         let logslope_centers = extract_centers(&resolved_specs[1]);
         let separate_marginal_design =
             build_term_collection_design(data.view(), &marginalspec).expect("separate marginal");
-        let separate_marginal = freeze_term_collection_from_design(
-            &marginalspec,
-            &separate_marginal_design,
-        )
-        .expect("freeze separate marginal");
+        let separate_marginal =
+            freeze_term_collection_from_design(&marginalspec, &separate_marginal_design)
+                .expect("freeze separate marginal");
         let separate_marginal_centers = extract_centers(&separate_marginal);
 
         assert_eq!(marginal_centers, logslope_centers);

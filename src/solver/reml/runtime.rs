@@ -819,14 +819,14 @@ impl<'a> RemlState<'a> {
                 sl += &tk_grad.slice(s![..k]);
             }
         }
-        if let (Some(ref mut hess), Some(tk_hess)) = (result.hessian.as_mut(), tk_terms.hessian) {
-            let k = rho
-                .len()
-                .min(hess.nrows())
-                .min(hess.ncols())
-                .min(tk_hess.nrows());
-            let mut sl = hess.slice_mut(s![..k, ..k]);
-            sl += &tk_hess.slice(s![..k, ..k]);
+        if let Some(tk_hess) = tk_terms.hessian {
+            let k = rho.len().min(tk_hess.nrows()).min(tk_hess.ncols());
+            if k > 0 {
+                let tk_block = tk_hess.slice(s![..k, ..k]).to_owned();
+                if let Err(error) = result.hessian.add_rho_block_dense(&tk_block) {
+                    log::warn!("skipping TK Hessian correction: {error}");
+                }
+            }
         }
         result
     }

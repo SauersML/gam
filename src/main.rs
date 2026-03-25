@@ -49,7 +49,8 @@ use gam::inference::formula_dsl::{
 use gam::inference::model::{
     DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, ModelKind,
     PredictModelClass, SavedAnchoredDeviationRuntime, SavedBaselineTimeWiggleRuntime,
-    load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
+    SavedLatentZNormalization, load_survival_time_basis_config_from_model,
+    survival_baseline_config_from_model,
 };
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
@@ -1495,6 +1496,10 @@ fn run_fit_bernoulli_marginal_slope(
             solved.fit,
             solved.baseline_marginal,
             solved.baseline_logslope,
+            SavedLatentZNormalization {
+                mean: solved.z_normalization.mean,
+                sd: solved.z_normalization.sd,
+            },
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
             base_link,
@@ -5318,6 +5323,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
             payload.formula_logslope = Some(logslope_formula);
             payload.z_column = args.z_column.clone();
+            payload.latent_z_normalization = Some(SavedLatentZNormalization {
+                mean: fit.z_normalization.mean,
+                sd: fit.z_normalization.sd,
+            });
             payload.logslope_baseline = Some(fit.baseline_slope);
             payload.score_warp_runtime = fit
                 .score_warp_runtime
@@ -8133,8 +8142,13 @@ fn build_saved_survival_marginal_slope_predictor(
     let predictor = gam::predict::BernoulliMarginalSlopePredictor::from_unified(
         &predictor_fit,
         z_name.to_string(),
+        model.latent_z_normalization.ok_or_else(|| {
+            "saved survival marginal-slope model missing latent_z_normalization".to_string()
+        })?,
         0.0,
-        model.logslope_baseline.unwrap_or(0.0),
+        model.logslope_baseline.ok_or_else(|| {
+            "saved survival marginal-slope model missing logslope_baseline".to_string()
+        })?,
         model
             .resolved_inverse_link()?
             .unwrap_or(InverseLink::Standard(LinkFunction::Probit)),
@@ -8169,6 +8183,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     fit_result: UnifiedFitResult,
     baseline_marginal: f64,
     baseline_logslope: f64,
+    latent_z_normalization: SavedLatentZNormalization,
     score_warp_runtime: Option<&DeviationRuntime>,
     link_dev_runtime: Option<&DeviationRuntime>,
     base_link: InverseLink,
@@ -8190,6 +8205,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.data_schema = Some(data_schema);
     payload.formula_logslope = Some(logslope_formula);
     payload.z_column = Some(z_column);
+    payload.latent_z_normalization = Some(latent_z_normalization);
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
     payload.link = Some(inverse_link_to_saved_string(&base_link));

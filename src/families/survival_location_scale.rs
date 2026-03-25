@@ -9162,13 +9162,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             )
             .map_err(|e| e.to_string())?;
             exact_warm_start.replace(Some(eval.warm_start));
-            Ok((
-                eval.objective,
-                eval.gradient,
-                eval.outer_hessian
-                    .materialize_dense()
-                    .map_err(|e| e.to_string())?,
-            ))
+            Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
     )?;
 

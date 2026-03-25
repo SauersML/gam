@@ -37,6 +37,35 @@ pub struct SchemaColumn {
     pub levels: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedLatentZNormalization {
+    pub mean: f64,
+    pub sd: f64,
+}
+
+impl SavedLatentZNormalization {
+    pub fn validate(&self, context: &str) -> Result<(), String> {
+        if !self.mean.is_finite() {
+            return Err(format!("{context} latent z mean must be finite"));
+        }
+        if !(self.sd.is_finite() && self.sd > 1e-12) {
+            return Err(format!(
+                "{context} latent z sd must be finite and > 1e-12; got {}",
+                self.sd
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
+        self.validate(context)?;
+        if z.iter().any(|value| !value.is_finite()) {
+            return Err(format!("{context} requires finite z values"));
+        }
+        Ok(z.mapv(|zi| (zi - self.mean) / self.sd))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ColumnKindTag {
@@ -102,6 +131,8 @@ pub struct FittedModelPayload {
     pub beta_baseline_timewiggle: Option<Vec<f64>>,
     #[serde(default)]
     pub z_column: Option<String>,
+    #[serde(default)]
+    pub latent_z_normalization: Option<SavedLatentZNormalization>,
     #[serde(default)]
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
@@ -221,6 +252,7 @@ impl FittedModelPayload {
             baseline_timewiggle_double_penalty: None,
             beta_baseline_timewiggle: None,
             z_column: None,
+            latent_z_normalization: None,
             marginal_baseline: None,
             logslope_baseline: None,
             score_warp_runtime: None,
@@ -1555,6 +1587,7 @@ impl FittedModel {
                 let predictor = BernoulliMarginalSlopePredictor::from_unified(
                     unified,
                     z_column,
+                    payload.latent_z_normalization?,
                     payload.marginal_baseline?,
                     payload.logslope_baseline?,
                     self.resolved_inverse_link()?
@@ -1661,6 +1694,11 @@ impl FittedModel {
                     "marginal-slope model is missing z_column; refit with current CLI".to_string(),
                 );
             }
+            let z_normalization = self.latent_z_normalization.ok_or_else(|| {
+                "marginal-slope model is missing latent_z_normalization; refit with current CLI"
+                    .to_string()
+            })?;
+            z_normalization.validate("marginal-slope model")?;
             if self.marginal_baseline.is_none() || self.logslope_baseline.is_none() {
                 return Err(
                     "marginal-slope model is missing baseline offsets; refit with current CLI"
@@ -1715,6 +1753,35 @@ impl FittedModel {
                 );
             }
             if survival_likelihood.as_deref() == Some("marginal-slope") {
+                if self.formula_logslope.is_none() {
+                    return Err(
+                        "survival marginal-slope model is missing formula_logslope; refit with current CLI"
+                            .to_string(),
+                    );
+                }
+                if self.z_column.is_none() {
+                    return Err(
+                        "survival marginal-slope model is missing z_column; refit with current CLI"
+                            .to_string(),
+                    );
+                }
+                let z_normalization = self.latent_z_normalization.ok_or_else(|| {
+                    "survival marginal-slope model is missing latent_z_normalization; refit with current CLI"
+                        .to_string()
+                })?;
+                z_normalization.validate("survival marginal-slope model")?;
+                if self.logslope_baseline.is_none() {
+                    return Err(
+                        "survival marginal-slope model is missing logslope_baseline; refit with current CLI"
+                            .to_string(),
+                    );
+                }
+                if self.resolved_termspec_noise.is_none() {
+                    return Err(
+                        "survival marginal-slope model is missing resolved_termspec_noise for the logslope surface"
+                            .to_string(),
+                    );
+                }
                 match frailty {
                     FrailtySpec::None
                     | FrailtySpec::GaussianShift {
@@ -1970,6 +2037,9 @@ impl FittedModel {
         }
         if let Some(v) = self.beta_baseline_timewiggle.as_ref() {
             validate_all_finite("beta_baseline_timewiggle", v.iter().copied())?;
+        }
+        if let Some(v) = self.latent_z_normalization {
+            v.validate("latent_z_normalization")?;
         }
         if let Some(v) = self.survival_beta_time.as_ref() {
             validate_all_finite("survival_beta_time", v.iter().copied())?;

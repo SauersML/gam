@@ -62,6 +62,36 @@ pub trait OuterHessianOperator: Send + Sync {
     }
 }
 
+struct RhoBlockAdditiveOuterHessian {
+    base: Arc<dyn OuterHessianOperator>,
+    rho_block: Array2<f64>,
+    dim: usize,
+}
+
+impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if v.len() != self.dim {
+            return Err(format!(
+                "outer Hessian operator input length mismatch: got {}, expected {}",
+                v.len(),
+                self.dim
+            ));
+        }
+        let mut out = self.base.matvec(v)?;
+        let k = self.rho_block.nrows();
+        if k > 0 {
+            let rho_v = v.slice(ndarray::s![..k]).to_owned();
+            let rho_out = self.rho_block.dot(&rho_v);
+            out.slice_mut(ndarray::s![..k]).scaled_add(1.0, &rho_out);
+        }
+        Ok(out)
+    }
+}
+
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Derivative {
@@ -641,6 +671,51 @@ impl HessianResult {
             HessianResult::Analytic(h) => Ok(Some(h.clone())),
             HessianResult::Operator(op) => op.materialize_dense().map(Some),
             HessianResult::Unavailable => Ok(None),
+        }
+    }
+
+    pub fn add_rho_block_dense(&mut self, rho_block: &Array2<f64>) -> Result<(), String> {
+        if rho_block.nrows() != rho_block.ncols() {
+            return Err(format!(
+                "rho-block Hessian update must be square, got {}x{}",
+                rho_block.nrows(),
+                rho_block.ncols()
+            ));
+        }
+        match self {
+            HessianResult::Analytic(h) => {
+                if rho_block.nrows() > h.nrows() || rho_block.ncols() > h.ncols() {
+                    return Err(format!(
+                        "rho-block Hessian update shape mismatch: got {}x{}, outer Hessian is {}x{}",
+                        rho_block.nrows(),
+                        rho_block.ncols(),
+                        h.nrows(),
+                        h.ncols()
+                    ));
+                }
+                let k = rho_block.nrows();
+                let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
+                sl += rho_block;
+                Ok(())
+            }
+            HessianResult::Operator(op) => {
+                let dim = op.dim();
+                if rho_block.nrows() > dim {
+                    return Err(format!(
+                        "rho-block Hessian update dimension mismatch: got {}x{}, operator dim is {}",
+                        rho_block.nrows(),
+                        rho_block.ncols(),
+                        dim
+                    ));
+                }
+                *self = HessianResult::Operator(Arc::new(RhoBlockAdditiveOuterHessian {
+                    base: Arc::clone(op),
+                    rho_block: rho_block.clone(),
+                    dim,
+                }));
+                Ok(())
+            }
+            HessianResult::Unavailable => Ok(()),
         }
     }
 }

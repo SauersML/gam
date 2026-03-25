@@ -2711,13 +2711,7 @@ pub fn fit_transformation_normal(
                 );
             }
 
-            Ok((
-                eval.objective,
-                eval.gradient,
-                eval.outer_hessian
-                    .materialize_dense()
-                    .map_err(|e| e.to_string())?,
-            ))
+            Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
     )?;
 

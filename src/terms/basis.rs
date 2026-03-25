@@ -1775,6 +1775,10 @@ pub struct AnisoBasisPsiDerivatives {
     pub design_first: Vec<Array2<f64>>,
     /// d matrices, each (n x p_smooth): d2X/d psi_a^2 (diagonal second derivatives).
     pub design_second_diag: Vec<Array2<f64>>,
+    /// Cross second derivatives d2X/(d psi_a d psi_b) for a < b.
+    pub design_second_cross: Vec<Array2<f64>>,
+    /// Axis-pair indices corresponding to `design_second_cross`.
+    pub design_second_cross_pairs: Vec<(usize, usize)>,
     /// d x num_penalties: dS_m/d psi_a for each axis a and penalty m.
     pub penalties_first: Vec<Vec<Array2<f64>>>,
     /// d x num_penalties: d2S_m/d psi_a^2 for each axis a and penalty m.
@@ -3044,6 +3048,8 @@ fn build_aniso_design_psi_derivatives_shared(
         return Ok(AnisoBasisPsiDerivatives {
             design_first: Vec::new(),
             design_second_diag: Vec::new(),
+            design_second_cross: Vec::new(),
+            design_second_cross_pairs: Vec::new(),
             penalties_first: vec![Vec::new(); dim],
             penalties_second_diag: vec![Vec::new(); dim],
             penalties_cross: Vec::new(),
@@ -3136,6 +3142,8 @@ fn build_aniso_design_psi_derivatives_shared(
     Ok(AnisoBasisPsiDerivatives {
         design_first,
         design_second_diag,
+        design_second_cross: Vec::new(),
+        design_second_cross_pairs: Vec::new(),
         penalties_first: vec![Vec::new(); dim],
         penalties_second_diag: vec![Vec::new(); dim],
         penalties_cross: Vec::new(),
@@ -9311,6 +9319,179 @@ fn build_duchon_design_psi_aniso_derivatives(
     )
 }
 
+fn center_aniso_log_scales_basis(eta: &[f64]) -> Vec<f64> {
+    if eta.len() <= 1 {
+        return eta.to_vec();
+    }
+    let mean = eta.iter().sum::<f64>() / eta.len() as f64;
+    eta.iter()
+        .map(|&value| {
+            let centered = value - mean;
+            if centered.abs() <= 1e-15 {
+                0.0
+            } else {
+                centered
+            }
+        })
+        .collect()
+}
+
+fn perturb_duchon_pure_aniso(spec: &DuchonBasisSpec, delta: &[(usize, f64)]) -> DuchonBasisSpec {
+    let mut next = spec.clone();
+    let mut eta = next.aniso_log_scales.clone().unwrap_or_default();
+    for &(axis, step) in delta {
+        eta[axis] += step;
+    }
+    next.aniso_log_scales = Some(center_aniso_log_scales_basis(&eta));
+    next
+}
+
+fn fd_cross_axis_pairs(dim: usize) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::with_capacity(dim.saturating_mul(dim.saturating_sub(1)) / 2);
+    for a in 0..dim {
+        for b in (a + 1)..dim {
+            pairs.push((a, b));
+        }
+    }
+    pairs
+}
+
+fn basis_duchon_effective_aniso(metadata: &BasisMetadata) -> Option<Vec<f64>> {
+    match metadata {
+        BasisMetadata::Duchon {
+            aniso_log_scales, ..
+        } => aniso_log_scales.clone(),
+        _ => None,
+    }
+}
+
+fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+) -> Result<AnisoBasisPsiDerivatives, BasisError> {
+    let Some(raw_eta) = spec.aniso_log_scales.as_deref() else {
+        return Err(BasisError::InvalidInput(
+            "aniso derivatives require aniso_log_scales to be set".to_string(),
+        ));
+    };
+    let dim = data.ncols();
+    if raw_eta.len() != dim {
+        return Err(BasisError::DimensionMismatch(format!(
+            "aniso_log_scales length {} != data dimension {dim}",
+            raw_eta.len()
+        )));
+    }
+    if spec.length_scale.is_some() {
+        return Err(BasisError::InvalidInput(
+            "pure Duchon aniso derivative path requires length_scale=None".to_string(),
+        ));
+    }
+
+    let mut workspace = BasisWorkspace::default();
+    let base = build_duchon_basiswithworkspace(data, spec, &mut workspace)?;
+    let base_design = base.design.to_dense();
+    let base_penalties = base.penalties.clone();
+    let effective_eta = basis_duchon_effective_aniso(&base.metadata)
+        .unwrap_or_else(|| center_aniso_log_scales_basis(raw_eta));
+    let base_spec = DuchonBasisSpec {
+        aniso_log_scales: Some(effective_eta),
+        ..spec.clone()
+    };
+    let eps = 2e-5_f64;
+
+    let mut design_first = Vec::with_capacity(dim);
+    let mut design_second_diag = Vec::with_capacity(dim);
+    let mut penalties_first = Vec::with_capacity(dim);
+    let mut penalties_second_diag = Vec::with_capacity(dim);
+
+    for axis in 0..dim {
+        let plus_spec = perturb_duchon_pure_aniso(&base_spec, &[(axis, eps)]);
+        let minus_spec = perturb_duchon_pure_aniso(&base_spec, &[(axis, -eps)]);
+        let plus = build_duchon_basiswithworkspace(data, &plus_spec, &mut workspace)?;
+        let minus = build_duchon_basiswithworkspace(data, &minus_spec, &mut workspace)?;
+        let plus_design = plus.design.to_dense();
+        let minus_design = minus.design.to_dense();
+        design_first.push((&plus_design - &minus_design) / (2.0 * eps));
+        design_second_diag
+            .push((&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps));
+
+        let mut first_components = Vec::with_capacity(base_penalties.len());
+        let mut second_components = Vec::with_capacity(base_penalties.len());
+        for penalty_idx in 0..base_penalties.len() {
+            first_components
+                .push((&plus.penalties[penalty_idx] - &minus.penalties[penalty_idx]) / (2.0 * eps));
+            second_components.push(
+                (&plus.penalties[penalty_idx] - &(base_penalties[penalty_idx].clone() * 2.0)
+                    + &minus.penalties[penalty_idx])
+                    / (eps * eps),
+            );
+        }
+        penalties_first.push(first_components);
+        penalties_second_diag.push(second_components);
+    }
+
+    let mut design_second_cross = Vec::new();
+    let mut design_second_cross_pairs = Vec::new();
+    let mut penalties_cross = Vec::new();
+    let mut penalties_cross_pairs = Vec::new();
+    for (axis_a, axis_b) in fd_cross_axis_pairs(dim) {
+        let plus_plus = build_duchon_basiswithworkspace(
+            data,
+            &perturb_duchon_pure_aniso(&base_spec, &[(axis_a, eps), (axis_b, eps)]),
+            &mut workspace,
+        )?;
+        let plus_minus = build_duchon_basiswithworkspace(
+            data,
+            &perturb_duchon_pure_aniso(&base_spec, &[(axis_a, eps), (axis_b, -eps)]),
+            &mut workspace,
+        )?;
+        let minus_plus = build_duchon_basiswithworkspace(
+            data,
+            &perturb_duchon_pure_aniso(&base_spec, &[(axis_a, -eps), (axis_b, eps)]),
+            &mut workspace,
+        )?;
+        let minus_minus = build_duchon_basiswithworkspace(
+            data,
+            &perturb_duchon_pure_aniso(&base_spec, &[(axis_a, -eps), (axis_b, -eps)]),
+            &mut workspace,
+        )?;
+
+        design_second_cross.push(
+            (&plus_plus.design.to_dense()
+                - &plus_minus.design.to_dense()
+                - &minus_plus.design.to_dense()
+                + &minus_minus.design.to_dense())
+                / (4.0 * eps * eps),
+        );
+        design_second_cross_pairs.push((axis_a, axis_b));
+
+        let mut cross_components = Vec::with_capacity(base_penalties.len());
+        for penalty_idx in 0..base_penalties.len() {
+            cross_components.push(
+                (&plus_plus.penalties[penalty_idx]
+                    - &plus_minus.penalties[penalty_idx]
+                    - &minus_plus.penalties[penalty_idx]
+                    + &minus_minus.penalties[penalty_idx])
+                    / (4.0 * eps * eps),
+            );
+        }
+        penalties_cross.push(cross_components);
+        penalties_cross_pairs.push((axis_a, axis_b));
+    }
+
+    Ok(AnisoBasisPsiDerivatives {
+        design_first,
+        design_second_diag,
+        design_second_cross,
+        design_second_cross_pairs,
+        penalties_first,
+        penalties_second_diag,
+        penalties_cross,
+        penalties_cross_pairs,
+        implicit_operator: None,
+    })
+}
+
 /// Build per-axis ψ_a derivatives for anisotropic Duchon terms, including
 /// both design-matrix and penalty derivatives.
 ///
@@ -9333,11 +9514,10 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         )));
     }
 
-    let length_scale = spec.length_scale.ok_or_else(|| {
-        BasisError::InvalidInput(
-            "aniso Duchon derivatives require hybrid Duchon with length_scale".to_string(),
-        )
-    })?;
+    if spec.length_scale.is_none() {
+        return build_pure_duchon_basis_log_kappa_aniso_derivatives(data, spec);
+    }
+    let length_scale = spec.length_scale.expect("checked above");
 
     let mut workspace = BasisWorkspace::default();
     let (centers, identifiability_transform) =
