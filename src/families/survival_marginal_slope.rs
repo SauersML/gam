@@ -8803,13 +8803,17 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family.psi_hessian_directional_derivative(
-            &self.block_states,
-            &self.derivative_blocks,
-            psi_index,
-            d_beta_flat,
-        )
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
+        self.family
+            .psi_hessian_directional_derivative(
+                &self.block_states,
+                &self.derivative_blocks,
+                psi_index,
+                d_beta_flat,
+            )
+            .map(|result| {
+                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense)
+            })
     }
 }
 
@@ -12208,13 +12212,19 @@ pub fn fit_survival_marginal_slope_terms(
                     need_hessian,
                 )?;
                 exact_warm_start.replace(Some(eval.warm_start));
-                if need_hessian && eval.outer_hessian.is_none() {
+                if need_hessian && !eval.outer_hessian.is_analytic() {
                     return Err(
                         "exact survival marginal-slope joint objective did not return an outer Hessian"
                             .to_string(),
                     );
                 }
-                Ok((eval.objective, eval.gradient, eval.outer_hessian))
+                Ok((
+                    eval.objective,
+                    eval.gradient,
+                    eval.outer_hessian
+                        .materialize_dense()
+                        .map_err(|e| e.to_string())?,
+                ))
             },
         )
     };

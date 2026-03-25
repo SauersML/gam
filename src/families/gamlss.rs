@@ -1800,13 +1800,17 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         None,
                         need_hessian,
                     )?;
-                    if need_hessian && eval.outer_hessian.is_none() {
+                    if need_hessian && !eval.outer_hessian.is_analytic() {
                         return Err(
                             "exact two-block spatial objective requires a full joint [rho, psi] hessian"
                                 .to_string(),
                         );
                     }
-                    Ok((eval.objective, eval.gradient, eval.outer_hessian))
+                    Ok((
+                        eval.objective,
+                        eval.gradient,
+                        eval.outer_hessian.materialize_dense().map_err(|e| e.to_string())?,
+                    ))
                 },
             )
         }};
@@ -3030,7 +3034,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     if analytic_outer_hessian_available {
         let hessian_ready = build_eval(&theta0, None, true)
             .ok()
-            .and_then(|(eval, _, _)| eval.outer_hessian)
+            .and_then(|(eval, _, _)| eval.outer_hessian.materialize_dense().ok().flatten())
             .is_some_and(|hessian| {
                 hessian.nrows() == theta_dim
                     && hessian.ncols() == theta_dim
@@ -3124,16 +3128,14 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 analytic_outer_hessian_available,
             )
             .map_err(EstimationError::InvalidInput)?;
-            let hessian_result = eval
-                .outer_hessian
-                .clone()
-                .map(HessianResult::Analytic)
-                .unwrap_or(HessianResult::Unavailable);
+            let hessian_result = eval.outer_hessian.clone();
             state.last_eval = Some((
                 theta.clone(),
                 eval.objective,
                 eval.gradient.clone(),
-                eval.outer_hessian.clone(),
+                eval.outer_hessian
+                    .materialize_dense()
+                    .map_err(EstimationError::InvalidInput)?,
                 eval.warm_start.clone(),
             ));
             state.warm_cache = Some(eval.warm_start);
@@ -4196,19 +4198,21 @@ impl ExactNewtonJointPsiWorkspace for GaussianLocationScaleExactNewtonJointPsiWo
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         let Some(dir) = self.psi_direction(psi_index)? else {
             return Ok(None);
         };
         Ok(Some(
-            self.family
-                .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                    &self.block_states,
-                    dir.as_ref(),
-                    d_beta_flat,
-                    &self.xmu,
-                    &self.x_ls,
-                )?,
+            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
+                self.family
+                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                        &self.block_states,
+                        dir.as_ref(),
+                        d_beta_flat,
+                        &self.xmu,
+                        &self.x_ls,
+                    )?,
+            ),
         ))
     }
 }
@@ -6198,19 +6202,21 @@ impl ExactNewtonJointPsiWorkspace for GaussianLocationScaleWiggleExactNewtonJoin
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         let Some(dir) = self.psi_direction(psi_index)? else {
             return Ok(None);
         };
         Ok(Some(
-            self.family
-                .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                    &self.block_states,
-                    dir.as_ref(),
-                    d_beta_flat,
-                    &self.xmu,
-                    &self.x_ls,
-                )?,
+            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
+                self.family
+                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                        &self.block_states,
+                        dir.as_ref(),
+                        d_beta_flat,
+                        &self.xmu,
+                        &self.x_ls,
+                    )?,
+            ),
         ))
     }
 }
@@ -9758,19 +9764,21 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         let Some(dir) = self.psi_direction(psi_index)? else {
             return Ok(None);
         };
         Ok(Some(
-            self.family
-                .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                    &self.block_states,
-                    dir.as_ref(),
-                    d_beta_flat,
-                    &self.x_t,
-                    &self.x_ls,
-                )?,
+            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
+                self.family
+                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                        &self.block_states,
+                        dir.as_ref(),
+                        d_beta_flat,
+                        &self.x_t,
+                        &self.x_ls,
+                    )?,
+            ),
         ))
     }
 }
@@ -9875,19 +9883,21 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleWiggleExactNewtonJoin
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         let Some(dir) = self.psi_direction(psi_index)? else {
             return Ok(None);
         };
         Ok(Some(
-            self.family
-                .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                    &self.block_states,
-                    dir.as_ref(),
-                    d_beta_flat,
-                    &self.x_t,
-                    &self.x_ls,
-                )?,
+            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
+                self.family
+                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                        &self.block_states,
+                        dir.as_ref(),
+                        d_beta_flat,
+                        &self.x_t,
+                        &self.x_ls,
+                    )?,
+            ),
         ))
     }
 }
@@ -16409,6 +16419,8 @@ mod tests {
         assert!(eval.gradient.iter().all(|v| v.is_finite()));
         let hess = eval
             .outer_hessian
+            .materialize_dense()
+            .expect("exact spatial joint hyper path should materialize a full [rho, psi] hessian")
             .expect("exact spatial joint hyper path should return a full [rho, psi] hessian");
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
         let theta_dim = rho.len() + psi_dim;
@@ -16495,9 +16507,11 @@ mod tests {
         .expect("exact wiggle spatial joint hyper eval");
         assert!(eval.objective.is_finite());
         assert!(eval.gradient.iter().all(|v| v.is_finite()));
-        let hess = eval.outer_hessian.expect(
-            "exact wiggle spatial joint hyper path should return a full [rho, psi] hessian",
-        );
+        let hess = eval
+            .outer_hessian
+            .materialize_dense()
+            .expect("exact wiggle spatial joint hyper path should materialize a full [rho, psi] hessian")
+            .expect("exact wiggle spatial joint hyper path should return a full [rho, psi] hessian");
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
         let theta_dim = rho.len() + psi_dim;
         assert_eq!(eval.gradient.len(), theta_dim);
@@ -16576,6 +16590,8 @@ mod tests {
         assert!(eval.gradient.iter().all(|v| v.is_finite()));
         let hess = eval
             .outer_hessian
+            .materialize_dense()
+            .expect("exact spatial joint hyper path should materialize a full [rho, psi] hessian")
             .expect("exact spatial joint hyper path should return a full [rho, psi] hessian");
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
         let theta_dim = rho.len() + psi_dim;

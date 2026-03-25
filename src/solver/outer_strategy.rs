@@ -2041,8 +2041,9 @@ fn run_outer_with_plan(
     let mut last_seed_error: Option<String> = None;
     let layout = cap.theta_layout();
 
-    for seed in &screened {
+    for (seed_idx, seed) in screened.iter().enumerate() {
         obj.reset();
+        let t_seed_start = std::time::Instant::now();
 
         let result: Result<OuterResult, EstimationError> = match the_plan.solver {
             Solver::Arc | Solver::NewtonTrustRegion => {
@@ -2242,8 +2243,18 @@ fn run_outer_with_plan(
             }
         };
 
+        let seed_elapsed = t_seed_start.elapsed().as_secs_f64();
         match result {
             Ok(candidate) => {
+                log::info!(
+                    "[outer-timing] seed {}/{} ({:?}): {:.3}s  cost={:.6e}  converged={}",
+                    seed_idx + 1,
+                    screened.len(),
+                    the_plan.solver,
+                    seed_elapsed,
+                    candidate.final_value,
+                    candidate.converged,
+                );
                 let dominated = best.as_ref().is_some_and(|b| {
                     b.converged && (!candidate.converged || b.final_value <= candidate.final_value)
                 });
@@ -2255,8 +2266,15 @@ fn run_outer_with_plan(
                 }
             }
             Err(e) => {
+                log::info!(
+                    "[outer-timing] seed {}/{} ({:?}): {:.3}s  FAILED: {}",
+                    seed_idx + 1,
+                    screened.len(),
+                    the_plan.solver,
+                    seed_elapsed,
+                    e,
+                );
                 last_seed_error = Some(e.to_string());
-                log::debug!("[OUTER] {context}: seed failed: {e}");
             }
         }
     }

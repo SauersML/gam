@@ -80,15 +80,17 @@ def main():
     R = {}
     def mp(name): return os.path.join(tmpdir, f"{name}.gam")
 
-    def bern(name, extra):
+    def bern(name, logslope_formula, extra):
         R[name] = run(
             ["fit", dp, "disease ~ s(bmi)", "--z-column", "z",
-             "--logslope-formula", "1", "--out", mp(name)] + extra, name)
+             "--logslope-formula", logslope_formula, "--out", mp(name)] + extra, name)
 
-    def surv(name, rhs, extra):
-        R[name] = run(
-            ["fit", dp, f"Surv(age_entry, age_exit, event) ~ {rhs}",
-             "--out", mp(name)] + extra, name)
+    def surv(name, rhs, extra, logslope_formula=None):
+        args = ["fit", dp, f"Surv(age_entry, age_exit, event) ~ {rhs}"]
+        if logslope_formula is not None:
+            args += ["--logslope-formula", logslope_formula]
+        args += ["--out", mp(name)] + extra
+        R[name] = run(args, name)
 
     def pred(name):
         if R.get(name) and os.path.exists(mp(name)):
@@ -98,30 +100,37 @@ def main():
 
     # ── Bernoulli marginal-slope ─────────────────────────────────────
     bern("bern_rigid",
-         ["--disable-link-dev"])
+         "1",
+         ["--disable-score-warp", "--disable-link-dev"])
     bern("bern_scorewarp",
+         "1 + linkwiggle(knots=6)",
          ["--disable-link-dev"])
     bern("bern_frailty",
+         "1",
          ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.3",
-          "--disable-link-dev"])
+          "--disable-score-warp", "--disable-link-dev"])
     bern("bern_sw_frailty",
+         "1 + linkwiggle(knots=6)",
          ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.2",
           "--disable-link-dev"])
 
     # ── Survival marginal-slope ──────────────────────────────────────
     surv("surv_ms_rigid", "s(bmi)",
-         ["--z-column", "z", "--logslope-formula", "1",
+         ["--z-column", "z",
           "--survival-likelihood", "marginal-slope",
-          "--disable-score-warp", "--disable-link-dev"])
+          "--disable-score-warp", "--disable-link-dev"],
+         logslope_formula="1")
     surv("surv_ms_scorewarp", "s(bmi)",
-         ["--z-column", "z", "--logslope-formula", "1",
+         ["--z-column", "z",
           "--survival-likelihood", "marginal-slope",
-          "--disable-link-dev"])
+          "--disable-link-dev"],
+         logslope_formula="1 + linkwiggle(knots=6)")
     surv("surv_ms_frailty", "s(bmi)",
-         ["--z-column", "z", "--logslope-formula", "1",
+         ["--z-column", "z",
           "--survival-likelihood", "marginal-slope",
           "--frailty-kind", "gaussian-shift", "--frailty-sd", "0.3",
-          "--disable-score-warp", "--disable-link-dev"])
+          "--disable-score-warp", "--disable-link-dev"],
+         logslope_formula="1")
 
     # ── Latent survival (PH kernel) ──────────────────────────────────
     surv("surv_latent", "z + bmi",
@@ -131,7 +140,15 @@ def main():
           "--baseline-target", "gompertz"])
 
     # ── Predict ──────────────────────────────────────────────────────
-    for name in ["bern_rigid", "bern_frailty", "surv_ms_rigid", "surv_ms_frailty"]:
+    for name in [
+        "bern_rigid",
+        "bern_scorewarp",
+        "bern_frailty",
+        "bern_sw_frailty",
+        "surv_ms_rigid",
+        "surv_ms_scorewarp",
+        "surv_ms_frailty",
+    ]:
         pred(name)
 
     # ── Summary ──────────────────────────────────────────────────────

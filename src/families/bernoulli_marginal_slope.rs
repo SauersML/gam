@@ -6804,7 +6804,7 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         self.family
             .exact_newton_joint_psihessian_directional_derivative_from_cache(
                 &self.block_states,
@@ -6813,6 +6813,9 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
                 d_beta_flat,
                 &self.cache,
             )
+            .map(|result| {
+                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense)
+            })
     }
 }
 
@@ -7176,13 +7179,19 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     need_hessian,
                 )?;
                 exact_warm_start.replace(Some(eval.warm_start));
-                if need_hessian && eval.outer_hessian.is_none() {
+                if need_hessian && !eval.outer_hessian.is_analytic() {
                     return Err(
                         "exact bernoulli marginal-slope joint [rho, psi] objective did not return an outer Hessian"
                             .to_string(),
                     );
                 }
-                Ok((eval.objective, eval.gradient, eval.outer_hessian))
+                Ok((
+                    eval.objective,
+                    eval.gradient,
+                    eval.outer_hessian
+                        .materialize_dense()
+                        .map_err(|e| e.to_string())?,
+                ))
             },
         )
     };

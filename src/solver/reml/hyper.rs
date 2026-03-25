@@ -180,6 +180,8 @@ impl<'a> RemlState<'a> {
                 .unwrap_or_else(|| Array1::zeros(theta.len()));
             let hess = result
                 .hessian
+                .materialize_dense()
+                .map_err(EstimationError::RemlOptimizationFailed)?
                 .unwrap_or_else(|| Array2::zeros((theta.len(), theta.len())));
             log::info!(
                 "[outer-timing] compute_joint_hypercostgradienthessian (unified, rho_dim={}, psi_dim={}): {:.3}s  cost={:.6e}",
@@ -218,6 +220,7 @@ impl<'a> RemlState<'a> {
         ),
         EstimationError,
     > {
+        let t_tau = std::time::Instant::now();
         // Guard: non-sparse tau coordinate construction requires dense design.
         // Skip for large models that would blow memory.
         let n_x = self.x().nrows();
@@ -238,7 +241,9 @@ impl<'a> RemlState<'a> {
             > = Box::new(|_, _| super::unified::HyperCoordPair::zero());
             return Ok((Vec::new(), identity_pair, identity_pair2));
         }
-        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+        let backend_label;
+        let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            backend_label = "sparse_exact";
             let ext_coords = self.build_tau_hyper_coords_sparse_exact(rho, bundle, hyper_dirs)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_sparse_exact(rho, bundle, hyper_dirs)?;
@@ -250,16 +255,27 @@ impl<'a> RemlState<'a> {
             .active_constraint_free_basis(bundle.pirls_result.as_ref())
             .is_none()
         {
+            backend_label = "original_basis";
             let ext_coords = self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_original_basis(rho, bundle, hyper_dirs)?;
             Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
         } else {
+            backend_label = "generic";
             let ext_coords = self.build_tau_hyper_coords(rho, bundle, hyper_dirs)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks(rho, bundle, hyper_dirs)?;
             Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
-        }
+        };
+        log::info!(
+            "[outer-timing] build_tau_unified_objects_from_bundle ({}, n={}, p={}, psi_dim={}): {:.1}ms",
+            backend_label,
+            n_x,
+            p_x,
+            hyper_dirs.len(),
+            t_tau.elapsed().as_secs_f64() * 1000.0,
+        );
+        result
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -706,7 +722,7 @@ impl<'a> RemlState<'a> {
             coords.push(super::unified::HyperCoord {
                 a: a_j,
                 g: g_j,
-                drift: super::unified::HyperCoordDrift::from_operator(Box::new(
+                drift: super::unified::HyperCoordDrift::from_operator(std::sync::Arc::new(
                     super::unified::SparseDirectionalHyperOperator {
                         x_tau: dir.x_tau_original.clone(),
                         x_design: x_design.clone(),

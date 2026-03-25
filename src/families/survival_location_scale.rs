@@ -7364,17 +7364,19 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         let Some(dir) = self.psi_direction(psi_index)? else {
             return Ok(None);
         };
         Ok(Some(
-            self.family
-                .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                    &self.joint_quantities,
-                    dir.as_ref(),
-                    d_beta_flat,
-                )?,
+            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
+                self.family
+                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                        &self.joint_quantities,
+                        dir.as_ref(),
+                        d_beta_flat,
+                    )?,
+            ),
         ))
     }
 }
@@ -9160,7 +9162,13 @@ pub(crate) fn fit_survival_location_scale_terms(
             )
             .map_err(|e| e.to_string())?;
             exact_warm_start.replace(Some(eval.warm_start));
-            Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            Ok((
+                eval.objective,
+                eval.gradient,
+                eval.outer_hessian
+                    .materialize_dense()
+                    .map_err(|e| e.to_string())?,
+            ))
         },
     )?;
 

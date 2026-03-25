@@ -20,12 +20,20 @@ const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const MAX_DENSE_OPERATOR_TO_DENSE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 /// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
 /// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
 const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
 
 pub use crate::linalg::utils::PcgSolveInfo;
+
+fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usize, String> {
+    nrows
+        .checked_mul(ncols)
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| format!("{context}: dense size overflow for {nrows}x{ncols}"))
+}
 
 pub struct DenseRightProductView<'a> {
     base: &'a Array2<f64>,
@@ -476,14 +484,38 @@ impl DenseDesignMatrix {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Materialized(matrix) => matrix.as_ref().clone(),
-            Self::Lazy(op) => op.to_dense(),
+            Self::Lazy(_) => self
+                .try_to_dense_arc("DenseDesignMatrix::to_dense")
+                .unwrap_or_else(|msg| panic!("{msg}"))
+                .as_ref()
+                .clone(),
         }
     }
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
             Self::Materialized(matrix) => Arc::clone(matrix),
-            Self::Lazy(op) => op.to_dense_arc(),
+            Self::Lazy(_) => self
+                .try_to_dense_arc("DenseDesignMatrix::to_dense_arc")
+                .unwrap_or_else(|msg| panic!("{msg}")),
+        }
+    }
+
+    pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
+        match self {
+            Self::Materialized(matrix) => Ok(Arc::clone(matrix)),
+            Self::Lazy(op) => {
+                let dense_bytes = checked_dense_nbytes(op.nrows(), op.ncols(), context)?;
+                if dense_bytes > MAX_DENSE_OPERATOR_TO_DENSE_BYTES {
+                    let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    return Err(format!(
+                        "{context}: refusing to densify operator-backed design {}x{} (~{gib:.2} GiB); use matrix-free or chunked code",
+                        op.nrows(),
+                        op.ncols()
+                    ));
+                }
+                Ok(op.to_dense_arc())
+            }
         }
     }
 
@@ -5023,7 +5055,9 @@ impl DesignMatrix {
         match self {
             Self::Dense(matrix) => match matrix.as_dense_ref() {
                 Some(dense) => dense[[i, j]],
-                None => matrix.to_dense()[[i, j]],
+                None => matrix
+                    .try_to_dense_arc("DesignMatrix::get")
+                    .unwrap_or_else(|msg| panic!("{msg}"))[[i, j]],
             },
             Self::Sparse(sp) => {
                 let dense = sp
@@ -5083,7 +5117,13 @@ impl DesignMatrix {
         match self {
             Self::Dense(matrix) => match matrix.as_dense_ref() {
                 Some(dense) => Cow::Borrowed(dense),
-                None => Cow::Owned(matrix.to_dense()),
+                None => Cow::Owned(
+                    matrix
+                        .try_to_dense_arc("DesignMatrix::as_dense_cow")
+                        .unwrap_or_else(|msg| panic!("{msg}"))
+                        .as_ref()
+                        .clone(),
+                ),
             },
             Self::Sparse(matrix) => Cow::Owned(
                 matrix
@@ -5097,7 +5137,11 @@ impl DesignMatrix {
 
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
-            Self::Dense(matrix) => matrix.to_dense(),
+            Self::Dense(matrix) => matrix
+                .try_to_dense_arc("DesignMatrix::to_dense")
+                .unwrap_or_else(|msg| panic!("{msg}"))
+                .as_ref()
+                .clone(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense")
                 .unwrap_or_else(|msg| panic!("{msg}"))
@@ -5108,7 +5152,9 @@ impl DesignMatrix {
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
-            Self::Dense(matrix) => matrix.to_dense_arc(),
+            Self::Dense(matrix) => matrix
+                .try_to_dense_arc("DesignMatrix::to_dense_arc")
+                .unwrap_or_else(|msg| panic!("{msg}")),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense_arc")
                 .unwrap_or_else(|msg| panic!("{msg}")),
@@ -5117,7 +5163,7 @@ impl DesignMatrix {
 
     pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
         match self {
-            Self::Dense(matrix) => Ok(matrix.to_dense_arc()),
+            Self::Dense(matrix) => matrix.try_to_dense_arc(context),
             Self::Sparse(matrix) => matrix.try_to_dense_arc(context),
         }
     }

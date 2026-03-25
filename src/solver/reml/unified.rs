@@ -3176,7 +3176,12 @@ pub fn reml_laml_evaluate(
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
-        let use_operator = hop.dim() >= 512 && hessian_kernel.is_some();
+        let use_operator = hop.dim() >= 512
+            && hessian_kernel.is_some()
+            && prior_cost_gradient
+                .as_ref()
+                .and_then(|(_, _, prior_hessian)| prior_hessian.as_ref())
+                .is_none();
         if use_operator {
             crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
                 build_outer_hessian_operator(
@@ -4026,6 +4031,473 @@ fn compute_outer_hessian(
     }
 
     Ok(hess)
+}
+
+enum StoredFirstDrift {
+    Dense(Array2<f64>),
+    Operator(Arc<dyn HyperOperator>),
+}
+
+impl StoredFirstDrift {
+    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(matrix) => matrix.dot(v),
+            Self::Operator(op) => op.mul_vec(v),
+        }
+    }
+
+    fn add_scaled_dense(&self, alpha: f64, dense: &mut Array2<f64>) {
+        if alpha == 0.0 {
+            return;
+        }
+        if let Self::Dense(matrix) = self {
+            dense.scaled_add(alpha, matrix);
+        }
+    }
+}
+
+struct WeightedHyperOperator {
+    terms: Vec<(f64, Arc<dyn HyperOperator>)>,
+    dim_hint: usize,
+}
+
+impl HyperOperator for WeightedHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(v.len());
+        for (weight, op) in &self.terms {
+            if *weight != 0.0 {
+                out.scaled_add(*weight, &op.mul_vec(v));
+            }
+        }
+        out
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        self.terms
+            .iter()
+            .filter(|(weight, _)| *weight != 0.0)
+            .map(|(weight, op)| weight * op.bilinear(v, u))
+            .sum()
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.dim_hint, self.dim_hint));
+        for (weight, op) in &self.terms {
+            if *weight != 0.0 {
+                out.scaled_add(*weight, &op.to_dense());
+            }
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        self.terms.iter().any(|(_, op)| op.is_implicit())
+    }
+}
+
+struct OuterHessianCoord {
+    a: f64,
+    g: Array1<f64>,
+    v: Array1<f64>,
+    drift: StoredFirstDrift,
+    ext_index: Option<usize>,
+    b_depends_on_beta: bool,
+}
+
+struct UnifiedOuterHessianOperator {
+    hop: Arc<dyn HessianOperator>,
+    coords: Vec<OuterHessianCoord>,
+    pair_a: Array2<f64>,
+    pair_ld_s: Array2<f64>,
+    pair_g: Vec<Vec<Option<Array1<f64>>>>,
+    base_h2: Array2<f64>,
+    m_pair_trace: Array2<f64>,
+    profiled_phi: f64,
+    profiled_nu: f64,
+    is_profiled: bool,
+    incl_logdet_h: bool,
+    incl_logdet_s: bool,
+    kernel: OuterHessianDerivativeKernel,
+    firth_hessian: Option<Array2<f64>>,
+    rho_dim: usize,
+}
+
+impl UnifiedOuterHessianOperator {
+    fn combined_drift(&self, alpha: &Array1<f64>) -> (Array2<f64>, Option<WeightedHyperOperator>) {
+        let p = self.hop.dim();
+        let mut dense = Array2::<f64>::zeros((p, p));
+        let mut ops = Vec::new();
+        for (idx, coord) in self.coords.iter().enumerate() {
+            let weight = alpha[idx];
+            if weight == 0.0 {
+                continue;
+            }
+            coord.drift.add_scaled_dense(weight, &mut dense);
+            if let StoredFirstDrift::Operator(op) = &coord.drift {
+                ops.push((weight, Arc::clone(op)));
+            }
+        }
+        let operator = (!ops.is_empty()).then_some(WeightedHyperOperator {
+            terms: ops,
+            dim_hint: p,
+        });
+        (dense, operator)
+    }
+
+    fn pair_vector_combo(&self, idx: usize, alpha: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.hop.dim());
+        for j in 0..alpha.len() {
+            if alpha[j] == 0.0 {
+                continue;
+            }
+            if let Some(g) = self.pair_g[idx][j].as_ref() {
+                out.scaled_add(alpha[j], g);
+            }
+        }
+        out
+    }
+
+    fn correction_trace(
+        &self,
+        rhs: &Array1<f64>,
+        v_i: &Array1<f64>,
+        m_alpha: &Array1<f64>,
+    ) -> Result<f64, String> {
+        match &self.kernel {
+            OuterHessianDerivativeKernel::ScalarGlm {
+                c_array,
+                d_array,
+                x,
+            } => {
+                let ingredients = ScalarGlmIngredients {
+                    c_array,
+                    d_array: d_array.as_ref(),
+                    x,
+                };
+                let z_c = compute_adjoint_z_c(&ingredients, self.hop.as_ref());
+                let c_trace = rhs.dot(&z_c);
+                let d_trace =
+                    compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, self.hop.as_ref())
+                        .unwrap_or(0.0);
+                Ok(c_trace + d_trace)
+            }
+            OuterHessianDerivativeKernel::Callback { first, second } => {
+                let u = self.hop.solve(rhs);
+                let Some(term1) = first(&u)? else {
+                    return Ok(0.0);
+                };
+                let neg_m = -m_alpha;
+                let neg_v = -v_i;
+                let Some(term2) = second(&neg_m, &neg_v)? else {
+                    return Ok(0.0);
+                };
+                Ok(self.hop.trace_logdet_gradient(&(term1 + &term2)))
+            }
+        }
+    }
+}
+
+impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessianOperator {
+    fn dim(&self) -> usize {
+        self.coords.len()
+    }
+
+    fn matvec(&self, alpha: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if alpha.len() != self.coords.len() {
+            return Err(format!(
+                "outer Hessian alpha length mismatch: got {}, expected {}",
+                alpha.len(),
+                self.coords.len()
+            ));
+        }
+        let mut g_alpha = Array1::<f64>::zeros(self.hop.dim());
+        let mut a_alpha = 0.0;
+        for (idx, coord) in self.coords.iter().enumerate() {
+            if alpha[idx] != 0.0 {
+                g_alpha.scaled_add(alpha[idx], &coord.g);
+                a_alpha += alpha[idx] * coord.a;
+            }
+        }
+        let m_alpha = self.hop.solve(&g_alpha);
+        let (alpha_dense, alpha_op) = self.combined_drift(alpha);
+        let mut out = Array1::<f64>::zeros(self.coords.len());
+
+        for idx in 0..self.coords.len() {
+            let coord = &self.coords[idx];
+            let pair_a = self.pair_a.row(idx).dot(alpha);
+            let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
+            let pair_g = self.pair_vector_combo(idx, alpha);
+            let base_h2 = self.base_h2.row(idx).dot(alpha);
+            let m_terms = self.m_pair_trace.row(idx).dot(alpha);
+
+            let cross_trace = if !self.incl_logdet_h {
+                0.0
+            } else {
+                match &coord.drift {
+                    StoredFirstDrift::Dense(left) => {
+                        let mut value = if alpha_dense.is_empty() {
+                            0.0
+                        } else {
+                            self.hop.trace_logdet_hessian_cross(left, &alpha_dense)
+                        };
+                        if let Some(op) = alpha_op.as_ref() {
+                            value -= self.hop.trace_hinv_matrix_operator_cross(left, op);
+                        }
+                        value
+                    }
+                    StoredFirstDrift::Operator(left) => {
+                        let mut value = if alpha_dense.is_empty() {
+                            0.0
+                        } else {
+                            -self
+                                .hop
+                                .trace_hinv_matrix_operator_cross(&alpha_dense, left.as_ref())
+                        };
+                        if let Some(op) = alpha_op.as_ref() {
+                            value -= self.hop.trace_hinv_operator_cross(left.as_ref(), op);
+                        }
+                        value
+                    }
+                }
+            };
+
+            let mut rhs = alpha_dense.dot(&coord.v);
+            if let Some(op) = alpha_op.as_ref() {
+                rhs += &op.mul_vec(&coord.v);
+            }
+            rhs += &coord.drift.apply(&m_alpha);
+            rhs -= &pair_g;
+
+            let correction = if self.incl_logdet_h {
+                self.correction_trace(&rhs, &coord.v, &m_alpha)?
+            } else {
+                0.0
+            };
+
+            out[idx] = outer_hessian_entry(
+                coord.a,
+                a_alpha,
+                coord.g.dot(&m_alpha),
+                pair_a,
+                cross_trace,
+                base_h2 + m_terms + correction,
+                pair_ld_s,
+                self.profiled_phi,
+                self.profiled_nu,
+                self.is_profiled,
+                self.incl_logdet_h,
+                self.incl_logdet_s,
+            );
+        }
+
+        if let Some(firth_hessian) = self.firth_hessian.as_ref() {
+            let alpha_rho = alpha.slice(ndarray::s![..self.rho_dim]).to_owned();
+            let firth_out = firth_hessian.dot(&alpha_rho);
+            out.slice_mut(ndarray::s![..self.rho_dim])
+                .scaled_add(1.0, &firth_out);
+        }
+
+        Ok(out)
+    }
+}
+
+fn build_outer_hessian_operator(
+    solution: &InnerSolution<'_>,
+    rho: &[f64],
+    lambdas: &[f64],
+    effective_deriv: &dyn HessianDerivativeProvider,
+    kernel: OuterHessianDerivativeKernel,
+) -> Result<UnifiedOuterHessianOperator, String> {
+    let hop = Arc::clone(&solution.hessian_op);
+    let k = rho.len();
+    let ext_dim = solution.ext_coords.len();
+    let total = k + ext_dim;
+    let curvature_lambdas: Vec<f64> = lambdas
+        .iter()
+        .copied()
+        .map(|lambda| rho_curvature_lambda(solution, lambda))
+        .collect();
+
+    let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
+        DispersionHandling::ProfiledGaussian => (true, true),
+        DispersionHandling::Fixed {
+            include_logdet_h,
+            include_logdet_s,
+            ..
+        } => (*include_logdet_h, *include_logdet_s),
+    };
+
+    let det2 = solution.penalty_logdet.second.as_ref().ok_or_else(|| {
+        "Outer Hessian requested but penalty second derivatives not provided".to_string()
+    })?;
+
+    let (profiled_phi, profiled_nu, is_profiled) = match &solution.dispersion {
+        DispersionHandling::ProfiledGaussian => {
+            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
+            let nu = (solution.n_observations as f64 - solution.nullspace_dim).max(1.0);
+            let phi_hat = dp_raw.max(1e-30) / nu;
+            (phi_hat, nu, true)
+        }
+        _ => (1.0, 1.0, false),
+    };
+
+    let mut coords = Vec::with_capacity(total);
+    let mut rho_h_matrices = Vec::with_capacity(k);
+    let mut rho_a_k_betas = Vec::with_capacity(k);
+
+    for idx in 0..k {
+        let coord = &solution.penalty_coords[idx];
+        let a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
+        let v_k = hop.solve(&a_k_beta);
+        let mut h_k = coord.scaled_dense_matrix(curvature_lambdas[idx]);
+        if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_k)? {
+            h_k += &corr;
+        }
+        rho_h_matrices.push(h_k.clone());
+        rho_a_k_betas.push(a_k_beta.clone());
+        coords.push(OuterHessianCoord {
+            a: 0.5 * solution.beta.dot(&a_k_beta),
+            g: a_k_beta,
+            v: v_k,
+            drift: StoredFirstDrift::Dense(h_k),
+            ext_index: None,
+            b_depends_on_beta: false,
+        });
+    }
+
+    for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+        let v_i = hop.solve(&coord.g);
+        let drift = if let Some(op) =
+            coord.drift.operator.as_ref().filter(|_| {
+                coord.drift.uses_operator_fast_path() && !effective_deriv.has_corrections()
+            }) {
+            StoredFirstDrift::Operator(Arc::clone(op))
+        } else {
+            let mut h_i = coord.drift.materialize();
+            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
+                h_i += &corr;
+            }
+            StoredFirstDrift::Dense(h_i)
+        };
+        coords.push(OuterHessianCoord {
+            a: coord.a,
+            g: coord.g.clone(),
+            v: v_i,
+            drift,
+            ext_index: Some(ext_idx),
+            b_depends_on_beta: coord.b_depends_on_beta,
+        });
+    }
+
+    let mut pair_a = Array2::<f64>::zeros((total, total));
+    let mut pair_ld_s = Array2::<f64>::zeros((total, total));
+    let mut pair_g = vec![vec![None; total]; total];
+    let mut base_h2 = Array2::<f64>::zeros((total, total));
+    let mut m_pair_trace = Array2::<f64>::zeros((total, total));
+
+    for idx in 0..k {
+        pair_a[[idx, idx]] = coords[idx].a;
+        pair_ld_s[[idx, idx]] = det2[[idx, idx]];
+        pair_g[idx][idx] = Some(coords[idx].g.clone());
+        let base = if solution.penalty_coords[idx].is_block_local() {
+            let (block, start, end) = solution.penalty_coords[idx].scaled_block_local(1.0);
+            hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
+        } else {
+            let a_k = solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
+            hop.trace_logdet_gradient(&a_k)
+        };
+        base_h2[[idx, idx]] = base;
+    }
+
+    if let Some(rho_ext_fn) = solution.rho_ext_pair_fn.as_ref() {
+        for rho_idx in 0..k {
+            for ext_idx in 0..ext_dim {
+                let pair = rho_ext_fn(rho_idx, ext_idx);
+                let row = rho_idx;
+                let col = k + ext_idx;
+                pair_a[[row, col]] = pair.a;
+                pair_a[[col, row]] = pair.a;
+                pair_ld_s[[row, col]] = pair.ld_s;
+                pair_ld_s[[col, row]] = pair.ld_s;
+                pair_g[row][col] = Some(pair.g.clone());
+                pair_g[col][row] = Some(pair.g);
+                let base =
+                    compute_base_h2_trace(hop.as_ref(), &pair.b_mat, pair.b_operator.as_deref());
+                base_h2[[row, col]] = base;
+                base_h2[[col, row]] = base;
+            }
+        }
+    }
+
+    if let Some(ext_pair_fn) = solution.ext_coord_pair_fn.as_ref() {
+        for ii in 0..ext_dim {
+            for jj in ii..ext_dim {
+                let pair = ext_pair_fn(ii, jj);
+                let row = k + ii;
+                let col = k + jj;
+                pair_a[[row, col]] = pair.a;
+                pair_a[[col, row]] = pair.a;
+                pair_ld_s[[row, col]] = pair.ld_s;
+                pair_ld_s[[col, row]] = pair.ld_s;
+                let g_pair = pair.g.clone();
+                pair_g[row][col] = Some(g_pair.clone());
+                pair_g[col][row] = Some(g_pair);
+                let base =
+                    compute_base_h2_trace(hop.as_ref(), &pair.b_mat, pair.b_operator.as_deref());
+                base_h2[[row, col]] = base;
+                base_h2[[col, row]] = base;
+            }
+        }
+    }
+
+    for ii in 0..total {
+        for jj in ii..total {
+            let trace = compute_drift_deriv_traces(
+                hop.as_ref(),
+                coords[ii].b_depends_on_beta,
+                coords[jj].b_depends_on_beta,
+                coords[ii].ext_index,
+                coords[jj].ext_index,
+                &coords[ii].v,
+                &coords[jj].v,
+                solution.fixed_drift_deriv.as_ref(),
+            );
+            m_pair_trace[[ii, jj]] = trace;
+            m_pair_trace[[jj, ii]] = trace;
+        }
+    }
+
+    let firth_hessian = solution.firth.as_ref().map(|firth| {
+        let rho_v: Vec<Array1<f64>> = coords[..k].iter().map(|coord| coord.v.clone()).collect();
+        compute_firth_hessian_contribution(
+            firth.operator(),
+            hop.as_ref(),
+            &solution.beta,
+            &rho_v,
+            &rho_h_matrices,
+            &rho_a_k_betas,
+            &solution.penalty_coords,
+            &curvature_lambdas,
+        )
+    });
+
+    Ok(UnifiedOuterHessianOperator {
+        hop,
+        coords,
+        pair_a,
+        pair_ld_s,
+        pair_g,
+        base_h2,
+        m_pair_trace,
+        profiled_phi,
+        profiled_nu,
+        is_profiled,
+        incl_logdet_h,
+        incl_logdet_s,
+        kernel,
+        firth_hessian,
+        rho_dim: k,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -6882,7 +7354,7 @@ mod tests {
         let solution = InnerSolution {
             log_likelihood: -5.0, // −0.5 × deviance = −0.5 × 10
             penalty_quadratic: 2.0,
-            hessian_op: Box::new(op),
+            hessian_op: Arc::new(op),
             beta: array![1.0, 0.5],
             penalty_coords: vec![PenaltyCoordinate::from_dense_root(
                 Array2::eye(2), // S₁ = I (penalty root for param 1)
@@ -7008,7 +7480,7 @@ mod tests {
         InnerSolution {
             log_likelihood,
             penalty_quadratic: penalty_quad,
-            hessian_op: Box::new(op),
+            hessian_op: Arc::new(op),
             beta,
             penalty_coords: vec![
                 PenaltyCoordinate::from_dense_root(r1),

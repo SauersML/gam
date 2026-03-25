@@ -237,7 +237,10 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CallArgSpec, parse_formula_dsl, parse_function_call};
+    use super::{
+        CallArgSpec, parse_formula, parse_formula_dsl, parse_function_call,
+        parsed_terms_reference_column, validate_marginal_slope_z_column_exclusion,
+    };
 
     #[test]
     fn parses_nested_formula_terms() {
@@ -279,6 +282,35 @@ mod tests {
     fn parse_function_call_reports_unbalanced_parentheses() {
         let err = parse_function_call("s(x, k=10").expect_err("expected parse failure");
         assert!(err.contains("unbalanced parentheses"));
+    }
+
+    #[test]
+    fn marginal_slope_z_column_validator_detects_linear_and_smooth_reuse() {
+        let main = parse_formula("y ~ x + z").expect("parse main");
+        let logslope = parse_formula("y ~ s(z, type=duchon, centers=6)").expect("parse logslope");
+
+        assert!(parsed_terms_reference_column(&main.terms, "z"));
+        assert!(parsed_terms_reference_column(&logslope.terms, "z"));
+
+        let err = validate_marginal_slope_z_column_exclusion(
+            &main,
+            &parse_formula("y ~ 1").expect("parse clean logslope"),
+            "z",
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )
+        .expect_err("main formula should be rejected");
+        assert!(err.contains("cannot also appear in the main formula"));
+
+        let err = validate_marginal_slope_z_column_exclusion(
+            &parse_formula("y ~ x").expect("parse clean main"),
+            &logslope,
+            "z",
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )
+        .expect_err("logslope formula should be rejected");
+        assert!(err.contains("cannot also appear in --logslope-formula"));
     }
 }
 
@@ -362,6 +394,39 @@ pub enum ParsedTerm {
     SurvivalConfig {
         options: BTreeMap<String, String>,
     },
+}
+
+pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) -> bool {
+    terms.iter().any(|term| match term {
+        ParsedTerm::Linear { name, .. }
+        | ParsedTerm::BoundedLinear { name, .. }
+        | ParsedTerm::RandomEffect { name } => name == column_name,
+        ParsedTerm::Smooth { vars, .. } => vars.iter().any(|var| var == column_name),
+        ParsedTerm::LinkWiggle { .. }
+        | ParsedTerm::TimeWiggle { .. }
+        | ParsedTerm::LinkConfig { .. }
+        | ParsedTerm::SurvivalConfig { .. } => false,
+    })
+}
+
+pub fn validate_marginal_slope_z_column_exclusion(
+    main_formula: &ParsedFormula,
+    logslope_formula: &ParsedFormula,
+    z_column: &str,
+    context: &str,
+    logslope_label: &str,
+) -> Result<(), String> {
+    if parsed_terms_reference_column(&main_formula.terms, z_column) {
+        return Err(format!(
+            "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in the main formula"
+        ));
+    }
+    if parsed_terms_reference_column(&logslope_formula.terms, z_column) {
+        return Err(format!(
+            "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in {logslope_label}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

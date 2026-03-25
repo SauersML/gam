@@ -3203,14 +3203,14 @@ pub struct CustomFamilyWarmStart {
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
-    pub outer_hessian: Option<Array2<f64>>,
+    pub outer_hessian: crate::solver::outer_strategy::HessianResult,
     pub warm_start: CustomFamilyWarmStart,
 }
 
 struct OuterObjectiveEvalResult {
     objective: f64,
     gradient: Array1<f64>,
-    outer_hessian: Option<Array2<f64>>,
+    outer_hessian: crate::solver::outer_strategy::HessianResult,
     warm_start: ConstrainedWarmStart,
 }
 
@@ -4888,6 +4888,87 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily>(
     }
 }
 
+fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: F,
+    synced_states: Arc<Vec<ParameterBlockState>>,
+    specs: Vec<ParameterBlockSpec>,
+    total: usize,
+    use_outer_curvature_derivatives: bool,
+    scale: f64,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync> {
+    Arc::new(move |v_k: &Array1<f64>| {
+        let h_rho = if use_outer_curvature_derivatives {
+            family.exact_newton_outer_curvature_directional_derivative_with_specs(
+                synced_states.as_ref(),
+                &specs,
+                v_k,
+            )?
+        } else if let Some(workspace) = workspace.as_ref() {
+            workspace.directional_derivative(v_k)?
+        } else {
+            family.exact_newton_joint_hessian_directional_derivative_with_specs(
+                synced_states.as_ref(),
+                &specs,
+                v_k,
+            )?
+        };
+        match h_rho {
+            Some(h) => {
+                let mut sym =
+                    symmetrized_square_matrix(h, total, "joint exact-newton dH shape mismatch")?;
+                if scale != 1.0 {
+                    sym *= scale;
+                }
+                Ok(Some(sym))
+            }
+            None => {
+                Err("joint exact-newton dH unavailable for analytic outer gradient".to_string())
+            }
+        }
+    })
+}
+
+fn exact_newton_d2h_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: F,
+    synced_states: Arc<Vec<ParameterBlockState>>,
+    specs: Vec<ParameterBlockSpec>,
+    total: usize,
+    use_outer_curvature_derivatives: bool,
+    scale: f64,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Arc<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync> {
+    Arc::new(move |u: &Array1<f64>, v: &Array1<f64>| {
+        match if use_outer_curvature_derivatives {
+            family.exact_newton_outer_curvature_second_directional_derivative_with_specs(
+                synced_states.as_ref(),
+                &specs,
+                u,
+                v,
+            )?
+        } else if let Some(workspace) = workspace.as_ref() {
+            workspace.second_directional_derivative(u, v)?
+        } else {
+            family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                synced_states.as_ref(),
+                &specs,
+                u,
+                v,
+            )?
+        } {
+            Some(m) => {
+                let mut sym =
+                    symmetrized_square_matrix(m, total, "joint exact-newton d2H shape mismatch")?;
+                if scale != 1.0 {
+                    sym *= scale;
+                }
+                Ok(Some(sym))
+            }
+            None => Ok(None),
+        }
+    })
+}
+
 fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
@@ -6068,6 +6149,55 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
     }
 }
 
+struct OwnedJointDerivProvider {
+    compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>,
+    compute_d2h: Arc<
+        dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync,
+    >,
+}
+
+impl HessianDerivativeProvider for OwnedJointDerivProvider {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let neg_v = -v_k;
+        (self.compute_dh)(&neg_v)
+    }
+
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some(term1) = (self.compute_dh)(u_kl)? else {
+            return Ok(None);
+        };
+        let neg_v_k = -v_k;
+        let neg_v_l = -v_l;
+        let Some(term2) = (self.compute_d2h)(&neg_v_l, &neg_v_k)? else {
+            return Ok(None);
+        };
+        Ok(Some(term1 + &term2))
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
+    }
+
+    fn outer_hessian_derivative_kernel(
+        &self,
+    ) -> Option<crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel> {
+        Some(
+            crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel::Callback {
+                first: Arc::clone(&self.compute_dh),
+                second: Arc::clone(&self.compute_d2h),
+            },
+        )
+    }
+}
+
 /// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
 /// to an `InnerSolution` before calling the unified evaluator.
 struct ExtCoordBundle {
@@ -6078,7 +6208,7 @@ struct ExtCoordBundle {
 }
 
 struct ScaledHyperOperator {
-    inner: Box<dyn HyperOperator>,
+    inner: Arc<dyn HyperOperator>,
     scale: f64,
 }
 
@@ -6111,7 +6241,7 @@ fn scale_hypercoord_drift(mut drift: HyperCoordDrift, scale: f64) -> HyperCoordD
         block_local.local *= scale;
     }
     if let Some(operator) = drift.operator.take() {
-        drift.operator = Some(Box::new(ScaledHyperOperator {
+        drift.operator = Some(Arc::new(ScaledHyperOperator {
             inner: operator,
             scale,
         }));
@@ -6136,7 +6266,7 @@ fn scale_hypercoord_pair(mut pair: HyperCoordPair, scale: f64) -> HyperCoordPair
     pair.b_mat *= scale;
     if let Some(operator) = pair.b_operator.take() {
         pair.b_operator = Some(Box::new(ScaledHyperOperator {
-            inner: operator,
+            inner: Arc::from(operator),
             scale,
         }));
     }
@@ -6154,7 +6284,7 @@ fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> DriftDerivR
         }
         DriftDerivResult::Operator(operator) => {
             DriftDerivResult::Operator(Box::new(ScaledHyperOperator {
-                inner: operator,
+                inner: Arc::from(operator),
                 scale,
             }))
         }
@@ -6203,7 +6333,7 @@ fn unified_joint_cost_gradient(
     per_block: &[Array1<f64>],
     rho: &Array1<f64>,
     beta_flat: &Array1<f64>,
-    hessian_op: Box<dyn crate::solver::estimate::reml::unified::HessianOperator>,
+    hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -6215,7 +6345,14 @@ fn unified_joint_cost_gradient(
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
-) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
+) -> Result<
+    (
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    ),
+    String,
+> {
     use crate::estimate::reml::assembly::{
         InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
     };
@@ -6314,7 +6451,9 @@ fn unified_joint_cost_gradient(
         .gradient
         .unwrap_or_else(|| Array1::zeros(rho.len() + ext_dim));
 
-    Ok((cost, gradient, result.hessian))
+    let hessian = result.hessian;
+
+    Ok((cost, gradient, hessian))
 }
 
 /// Shared implementation for the joint exact-Newton and surrogate outer paths.
@@ -6349,20 +6488,35 @@ fn joint_outer_evaluate(
     options: &BlockwiseFitOptions,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    owned_compute_dh: Option<
+        Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>,
+    >,
+    owned_compute_d2h: Option<
+        Arc<
+            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync,
+        >,
+    >,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
 
     // Build derivative provider from the caller-supplied closures.
-    let compute_d2h_ref: Option<
-        &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-    > = Some(compute_d2h);
-    let provider = BorrowedJointDerivProvider {
-        compute_dh,
-        compute_d2h: compute_d2h_ref,
-    };
-    let provider_box: Box<dyn HessianDerivativeProvider + '_> = Box::new(provider);
+    let provider_box: Box<dyn HessianDerivativeProvider + '_> =
+        if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
+            Box::new(OwnedJointDerivProvider {
+                compute_dh: owned_dh,
+                compute_d2h: owned_d2h,
+            })
+        } else {
+            let compute_d2h_ref: Option<
+                &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+            > = Some(compute_d2h);
+            Box::new(BorrowedJointDerivProvider {
+                compute_dh,
+                compute_d2h: compute_d2h_ref,
+            })
+        };
 
     let eval_mode = if need_hessian {
         EvalMode::ValueGradientHessian
@@ -6381,7 +6535,7 @@ fn joint_outer_evaluate(
         })
         .collect();
 
-    let hessian_op: Box<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+    let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
         if use_joint_matrix_free_path(total, need_hessian) {
             let ranges_vec = ranges.to_vec();
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
@@ -6410,7 +6564,7 @@ fn joint_outer_evaluate(
                         out += &penalty;
                         out
                     }) {
-                        Ok(op) => Box::new(op),
+                        Ok(op) => Arc::new(op),
                         Err(_) => {
                             let mut j_for_traces = (*h_joint).clone();
                             add_joint_penalty_to_matrix(
@@ -6419,7 +6573,7 @@ fn joint_outer_evaluate(
                                 s_lambdas.as_ref(),
                                 scaled_joint_trace_diagonal_ridge,
                             );
-                            Box::new(
+                            Arc::new(
                                 BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
                                     |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
                                 )?,
@@ -6428,21 +6582,54 @@ fn joint_outer_evaluate(
                     }
                 }
                 JointHessianSource::Operator { apply, diagonal } => {
-                    let mut j_for_traces = materialize_joint_hessian_source(
-                        &JointHessianSource::Operator { apply, diagonal },
-                        total,
-                        "joint exact-newton operator materialization",
-                    )?;
-                    add_joint_penalty_to_matrix(
-                        &mut j_for_traces,
+                    let preconditioner_diag = joint_penalty_preconditioner_diag(
+                        &diagonal,
                         &ranges_vec,
                         s_lambdas.as_ref(),
-                        scaled_joint_trace_diagonal_ridge,
+                        trace_diagonal_ridge,
                     );
-                    Box::new(
-                        BlockCoupledOperator::from_joint_hessian(&j_for_traces)
-                            .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
-                    )
+                    let apply_h = Arc::clone(&apply);
+                    let apply_ranges = ranges_vec.clone();
+                    let apply_s = Arc::clone(&s_lambdas);
+                    match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
+                        let mut out = match apply_h(v) {
+                            Ok(out) => out,
+                            Err(error) => {
+                                log::warn!(
+                                    "joint exact-newton operator matvec failed during outer trace construction: {error}"
+                                );
+                                Array1::<f64>::zeros(total)
+                            }
+                        };
+                        let penalty = apply_joint_block_penalty(
+                            &apply_ranges,
+                            apply_s.as_ref(),
+                            v,
+                            trace_diagonal_ridge,
+                        );
+                        out += &penalty;
+                        out
+                    }) {
+                        Ok(op) => Arc::new(op),
+                        Err(_) => {
+                            let mut j_for_traces = materialize_joint_hessian_source(
+                                &JointHessianSource::Operator { apply, diagonal },
+                                total,
+                                "joint exact-newton operator materialization",
+                            )?;
+                            add_joint_penalty_to_matrix(
+                                &mut j_for_traces,
+                                &ranges_vec,
+                                s_lambdas.as_ref(),
+                                scaled_joint_trace_diagonal_ridge,
+                            );
+                            Arc::new(
+                                BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
+                                    |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
+                                )?,
+                            )
+                        }
+                    }
                 }
             }
         } else {
@@ -6457,7 +6644,7 @@ fn joint_outer_evaluate(
                 &scaled_s_lambdas,
                 scaled_joint_trace_diagonal_ridge,
             );
-            Box::new(
+            Arc::new(
                 BlockCoupledOperator::from_joint_hessian(&j_for_traces)
                     .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
             )
@@ -6501,23 +6688,31 @@ fn joint_outer_evaluate(
             expected_theta_dim
         ));
     }
-    if outer_hessian
-        .as_ref()
-        .is_some_and(|hessian| hessian.iter().any(|value| !value.is_finite()))
-    {
-        return Err("joint outer evaluation produced a non-finite Hessian".to_string());
-    }
-    if outer_hessian.as_ref().is_some_and(|hessian| {
-        hessian.nrows() != expected_theta_dim || hessian.ncols() != expected_theta_dim
-    }) {
-        let hessian = outer_hessian.as_ref().expect("checked is_some above");
-        return Err(format!(
-            "joint outer evaluation returned Hessian shape {}x{}, expected {}x{}",
-            hessian.nrows(),
-            hessian.ncols(),
-            expected_theta_dim,
-            expected_theta_dim
-        ));
+    match &outer_hessian {
+        crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+            if hessian.iter().any(|value| !value.is_finite()) {
+                return Err("joint outer evaluation produced a non-finite Hessian".to_string());
+            }
+            if hessian.nrows() != expected_theta_dim || hessian.ncols() != expected_theta_dim {
+                return Err(format!(
+                    "joint outer evaluation returned Hessian shape {}x{}, expected {}x{}",
+                    hessian.nrows(),
+                    hessian.ncols(),
+                    expected_theta_dim,
+                    expected_theta_dim
+                ));
+            }
+        }
+        crate::solver::outer_strategy::HessianResult::Operator(op) => {
+            if op.dim() != expected_theta_dim {
+                return Err(format!(
+                    "joint outer evaluation returned operator Hessian dim {}, expected {}",
+                    op.dim(),
+                    expected_theta_dim
+                ));
+            }
+        }
+        crate::solver::outer_strategy::HessianResult::Unavailable => {}
     }
 
     let warm = ConstrainedWarmStart {
@@ -6587,7 +6782,7 @@ fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static
     Ok((
         result.objective,
         result.gradient,
-        result.outer_hessian,
+        result.outer_hessian.materialize_dense()?,
         result.warm_start,
     ))
 }
@@ -7557,7 +7752,33 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             } else {
                 rho_curvature_scale
             },
-            hessian_workspace,
+            hessian_workspace.clone(),
+        );
+        let owned_compute_dh = exact_newton_dh_closure_owned(
+            family.clone(),
+            Arc::clone(&synced_joint_states),
+            specs.to_vec(),
+            total,
+            use_outer_curvature_derivatives,
+            if use_outer_curvature_derivatives {
+                1.0
+            } else {
+                rho_curvature_scale
+            },
+            hessian_workspace.clone(),
+        );
+        let owned_compute_d2h = exact_newton_d2h_closure_owned(
+            family.clone(),
+            Arc::clone(&synced_joint_states),
+            specs.to_vec(),
+            total,
+            use_outer_curvature_derivatives,
+            if use_outer_curvature_derivatives {
+                1.0
+            } else {
+                rho_curvature_scale
+            },
+            hessian_workspace.clone(),
         );
 
         // Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
@@ -7582,6 +7803,8 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             options,
             &compute_dh,
             &compute_d2h,
+            Some(owned_compute_dh),
+            Some(owned_compute_d2h),
             Some(ext_bundle),
         )?;
 
@@ -7628,6 +7851,8 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             options,
             compute_dh.as_ref(),
             compute_d2h.as_ref(),
+            None,
+            None,
             None, // no ext_coords when psi_dim == 0
         )?;
 
@@ -7805,6 +8030,8 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
         options,
         &compute_dh,
         &compute_d2h,
+        None,
+        None,
         None, // no ext_coords for generic single-block fallback
     )?;
 
@@ -7850,12 +8077,13 @@ const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
 const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
 
-pub(crate) fn joint_exact_analytic_outer_hessian_available(total_p: usize) -> bool {
-    total_p < JOINT_MATRIX_FREE_MIN_DIM
+pub(crate) fn joint_exact_analytic_outer_hessian_available(_total_p: usize) -> bool {
+    true
 }
 
 fn use_joint_matrix_free_path(total_p: usize, need_hessian: bool) -> bool {
-    total_p >= JOINT_MATRIX_FREE_MIN_DIM && !need_hessian
+    let _ = need_hessian;
+    total_p >= JOINT_MATRIX_FREE_MIN_DIM
 }
 
 fn apply_joint_block_penalty(
@@ -8335,15 +8563,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
 
     let n_rho = rho0.len();
-    let total_joint_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
     let (cap_gradient, cap_hessian) = custom_family_outer_derivatives(family, specs, options);
-    let hessian = if matches!(cap_hessian, Derivative::Analytic)
-        && !joint_exact_analytic_outer_hessian_available(total_joint_p)
-    {
-        Derivative::Unavailable
-    } else {
-        cap_hessian
-    };
+    let hessian = cap_hessian;
     let need_outer_hessian = matches!(hessian, Derivative::Analytic);
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
@@ -8388,7 +8609,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Always use warm cache — previous inner solution is an excellent
             // starting point, especially when rho hasn't moved far.
             let warm_ref = outer.warm_cache.as_ref();
-            let (cost, grad, hess_opt) = match outerobjectivegradienthessian(
+            let eval_result = match outerobjectivegradienthessian_internal(
                 family,
                 specs,
                 options,
@@ -8397,12 +8618,17 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 warm_ref,
                 need_outer_hessian,
             ) {
-                Ok((cost, grad, hess_opt, warm))
-                    if cost.is_finite()
-                        && grad.iter().all(|v| v.is_finite())
-                        && hess_opt
-                            .as_ref()
-                            .map(|h| h.iter().all(|v| v.is_finite()))
+                Ok(eval)
+                    if eval.objective.is_finite()
+                        && eval.gradient.iter().all(|v| v.is_finite())
+                        && eval
+                            .outer_hessian
+                            .materialize_dense()
+                            .map(|opt| {
+                                opt.as_ref()
+                                    .map(|h| h.iter().all(|v| v.is_finite()))
+                                    .unwrap_or(true)
+                            })
                             .unwrap_or(true) =>
                 {
                     // Warm-start proximity check: discard warm cache if rho
@@ -8419,14 +8645,14 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                         })
                         .unwrap_or(true);
                     if seed_ok {
-                        outer.warm_cache = Some(warm);
+                        outer.warm_cache = Some(eval.warm_start.clone());
                     } else {
                         outer.warm_cache = None;
                     }
                     outer.last_error = None;
-                    (cost, grad, hess_opt)
+                    eval
                 }
-                Ok((_, _, _, _)) => {
+                Ok(_) => {
                     outer.last_error = Some(
                         "custom-family outer objective/derivatives became non-finite".to_string(),
                     );
@@ -8439,14 +8665,10 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                     return Err(EstimationError::RemlOptimizationFailed(e));
                 }
             };
-            let hessian = match hess_opt {
-                Some(h) => HessianResult::Analytic(h),
-                None => HessianResult::Unavailable,
-            };
             Ok(OuterEval {
-                cost,
-                gradient: grad,
-                hessian,
+                cost: eval_result.objective,
+                gradient: eval_result.gradient,
+                hessian: eval_result.outer_hessian,
             })
         },
         Some(|outer: &mut CustomOuterState| {
@@ -10209,7 +10431,11 @@ mod tests {
         );
 
         let outer_hessian = outer_hessian.expect("rho-only outer Hessian");
-        let joint_hessian = joint_result.outer_hessian.expect("joint outer Hessian");
+        let joint_hessian = joint_result
+            .outer_hessian
+            .materialize_dense()
+            .expect("joint outer Hessian should materialize")
+            .expect("joint outer Hessian");
         assert_eq!(outer_hessian.dim(), joint_hessian.dim());
         let max_hessian_diff = outer_hessian
             .iter()
