@@ -567,6 +567,17 @@ impl CustomFamily for TransformationNormalFamily {
         crate::custom_family::cost_gated_outer_order(specs)
     }
 
+    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
+        crate::seeding::SeedConfig {
+            bounds: (-12.0, 12.0),
+            max_seeds: if n_params <= 8 { 4 } else { 6 },
+            seed_budget: if n_params <= 6 { 2 } else { 3 },
+            screen_max_inner_iterations: 5,
+            risk_profile: crate::seeding::SeedRiskProfile::Gaussian,
+            num_auxiliary_trailing: 0,
+        }
+    }
+
     fn max_feasible_step_size(
         &self,
         block_states: &[ParameterBlockState],
@@ -2086,6 +2097,22 @@ mod tests {
         };
         let spec = family.block_spec();
         (family, derivative_blocks, state, spec)
+    }
+
+    #[test]
+    fn transformation_normal_uses_compact_gaussian_outer_seeding() {
+        let psi = array![0.15, -0.10];
+        let (family, _, _, _) = toy_family_and_derivatives(&psi);
+        let seed_config = family.outer_seed_config(6);
+        assert_eq!(seed_config.bounds, (-12.0, 12.0));
+        assert_eq!(seed_config.max_seeds, 4);
+        assert_eq!(seed_config.seed_budget, 2);
+        assert_eq!(seed_config.screen_max_inner_iterations, 5);
+        assert_eq!(
+            seed_config.risk_profile,
+            crate::seeding::SeedRiskProfile::Gaussian
+        );
+        assert_eq!(seed_config.num_auxiliary_trailing, 0);
     }
 
     #[test]
