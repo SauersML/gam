@@ -1116,6 +1116,7 @@ pub trait HyperOperator: Send + Sync {
 /// A block-local square matrix embedded in joint p-space. Supports O(p_block²)
 /// matvec without materializing to full p×p.
 #[derive(Clone)]
+#[derive(Clone)]
 pub struct BlockLocalDrift {
     pub local: Array2<f64>,
     pub start: usize,
@@ -4035,23 +4036,39 @@ fn compute_outer_hessian(
 
 enum StoredFirstDrift {
     Dense(Array2<f64>),
-    Operator(Arc<dyn HyperOperator>),
+    Operators(Vec<Arc<dyn HyperOperator>>),
 }
 
 impl StoredFirstDrift {
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         match self {
             Self::Dense(matrix) => matrix.dot(v),
-            Self::Operator(op) => op.mul_vec(v),
+            Self::Operators(ops) => {
+                let mut out = Array1::<f64>::zeros(v.len());
+                for op in ops {
+                    out += &op.mul_vec(v);
+                }
+                out
+            }
         }
     }
 
-    fn add_scaled_dense(&self, alpha: f64, dense: &mut Array2<f64>) {
+    fn accumulate(
+        &self,
+        alpha: f64,
+        dense: &mut Array2<f64>,
+        ops: &mut Vec<(f64, Arc<dyn HyperOperator>)>,
+    ) {
         if alpha == 0.0 {
             return;
         }
-        if let Self::Dense(matrix) = self {
-            dense.scaled_add(alpha, matrix);
+        match self {
+            Self::Dense(matrix) => dense.scaled_add(alpha, matrix),
+            Self::Operators(stored_ops) => {
+                for op in stored_ops {
+                    ops.push((alpha, Arc::clone(op)));
+                }
+            }
         }
     }
 }
@@ -4118,6 +4135,7 @@ struct UnifiedOuterHessianOperator {
     incl_logdet_h: bool,
     incl_logdet_s: bool,
     kernel: OuterHessianDerivativeKernel,
+    adjoint_z_c: Option<Array1<f64>>,
     firth_hessian: Option<Array2<f64>>,
     rho_dim: usize,
 }
@@ -4132,10 +4150,7 @@ impl UnifiedOuterHessianOperator {
             if weight == 0.0 {
                 continue;
             }
-            coord.drift.add_scaled_dense(weight, &mut dense);
-            if let StoredFirstDrift::Operator(op) = &coord.drift {
-                ops.push((weight, Arc::clone(op)));
-            }
+            coord.drift.accumulate(weight, &mut dense, &mut ops);
         }
         let operator = (!ops.is_empty()).then_some(WeightedHyperOperator {
             terms: ops,
@@ -4169,13 +4184,15 @@ impl UnifiedOuterHessianOperator {
                 d_array,
                 x,
             } => {
+                let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
+                    "missing adjoint trace cache for scalar outer Hessian operator".to_string()
+                })?;
                 let ingredients = ScalarGlmIngredients {
                     c_array,
                     d_array: d_array.as_ref(),
                     x,
                 };
-                let z_c = compute_adjoint_z_c(&ingredients, self.hop.as_ref());
-                let c_trace = rhs.dot(&z_c);
+                let c_trace = rhs.dot(z_c);
                 let d_trace =
                     compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, self.hop.as_ref())
                         .unwrap_or(0.0);
@@ -4245,16 +4262,19 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                         }
                         value
                     }
-                    StoredFirstDrift::Operator(left) => {
-                        let mut value = if alpha_dense.is_empty() {
-                            0.0
-                        } else {
-                            -self
-                                .hop
-                                .trace_hinv_matrix_operator_cross(&alpha_dense, left.as_ref())
-                        };
+                    StoredFirstDrift::Operators(left_ops) => {
+                        let mut value = 0.0;
+                        if !alpha_dense.is_empty() {
+                            for left in left_ops {
+                                value -= self
+                                    .hop
+                                    .trace_hinv_matrix_operator_cross(&alpha_dense, left.as_ref());
+                            }
+                        }
                         if let Some(op) = alpha_op.as_ref() {
-                            value -= self.hop.trace_hinv_operator_cross(left.as_ref(), op);
+                            for left in left_ops {
+                                value -= self.hop.trace_hinv_operator_cross(left.as_ref(), op);
+                            }
                         }
                         value
                     }
@@ -4367,11 +4387,15 @@ fn build_outer_hessian_operator(
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let v_i = hop.solve(&coord.g);
-        let drift = if let Some(op) =
-            coord.drift.operator.as_ref().filter(|_| {
-                coord.drift.uses_operator_fast_path() && !effective_deriv.has_corrections()
-            }) {
-            StoredFirstDrift::Operator(Arc::clone(op))
+        let drift = if coord.drift.uses_operator_fast_path() && !effective_deriv.has_corrections() {
+            let mut ops: Vec<Arc<dyn HyperOperator>> = Vec::new();
+            if let Some(block_local) = coord.drift.block_local.as_ref() {
+                ops.push(Arc::new(block_local.clone()));
+            }
+            if let Some(op) = coord.drift.operator.as_ref() {
+                ops.push(Arc::clone(op));
+            }
+            StoredFirstDrift::Operators(ops)
         } else {
             let mut h_i = coord.drift.materialize();
             if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
@@ -4480,6 +4504,25 @@ fn build_outer_hessian_operator(
             &curvature_lambdas,
         )
     });
+    let adjoint_z_c = if incl_logdet_h {
+        match &kernel {
+            OuterHessianDerivativeKernel::ScalarGlm {
+                c_array,
+                d_array,
+                x,
+            } => Some(compute_adjoint_z_c(
+                &ScalarGlmIngredients {
+                    c_array,
+                    d_array: d_array.as_ref(),
+                    x,
+                },
+                hop.as_ref(),
+            )),
+            OuterHessianDerivativeKernel::Callback { .. } => None,
+        }
+    } else {
+        None
+    };
 
     Ok(UnifiedOuterHessianOperator {
         hop,
@@ -4495,6 +4538,7 @@ fn build_outer_hessian_operator(
         incl_logdet_h,
         incl_logdet_s,
         kernel,
+        adjoint_z_c,
         firth_hessian,
         rho_dim: k,
     })

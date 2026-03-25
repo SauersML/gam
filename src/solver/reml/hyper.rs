@@ -538,9 +538,10 @@ impl<'a> RemlState<'a> {
             // dominant terms and would require additional storage. For problems large
             // enough to trigger implicit operators, these corrections contribute
             // negligibly to the stochastic trace estimate.
-            let b_operator: Option<Box<dyn super::unified::HyperOperator>> = if use_implicit {
+            let b_operator: Option<std::sync::Arc<dyn super::unified::HyperOperator>> =
+                if use_implicit {
                 if let Some((implicit_deriv, axis)) = hyper_dirs[j].implicit_first_axis_info() {
-                    Some(Box::new(super::unified::ImplicitHyperOperator {
+                    Some(std::sync::Arc::new(super::unified::ImplicitHyperOperator {
                         implicit_deriv,
                         axis,
                         x_design: x_design_shared.clone().unwrap(),
