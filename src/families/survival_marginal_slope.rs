@@ -9,10 +9,11 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
-    DeviationBlockConfig, DeviationPrepared, DeviationRuntime, build_deviation_block_from_seed,
-    project_monotone_feasible_beta, signed_probit_logcdf_and_mills_ratio,
-    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z, unary_derivatives_log,
-    unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi, unary_derivatives_sqrt,
+    DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization,
+    build_deviation_block_from_seed, project_monotone_feasible_beta,
+    signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
+    standardize_latent_z, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
@@ -94,6 +95,7 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub gaussian_frailty_sd: Option<f64>,
     pub logslope_design: TermCollectionDesign,
     pub baseline_slope: f64,
+    pub z_normalization: LatentZNormalization,
     pub time_block_penalties_len: usize,
     pub score_warp_runtime: Option<DeviationRuntime>,
     pub link_dev_runtime: Option<DeviationRuntime>,
@@ -11858,7 +11860,9 @@ pub fn fit_survival_marginal_slope_terms(
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
     let mut spec = spec;
     validate_spec(&spec)?;
-    spec.z = standardize_latent_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
+    let (z_standardized, z_normalization) =
+        standardize_latent_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
+    spec.z = z_standardized;
     let n = spec.age_entry.len();
     let sigma_learnable = matches!(
         &spec.frailty,
@@ -12217,13 +12221,7 @@ pub fn fit_survival_marginal_slope_terms(
                             .to_string(),
                     );
                 }
-                Ok((
-                    eval.objective,
-                    eval.gradient,
-                    eval.outer_hessian
-                        .materialize_dense()
-                        .map_err(|e| e.to_string())?,
-                ))
+                Ok((eval.objective, eval.gradient, eval.outer_hessian))
             },
         )
     };
@@ -12304,6 +12302,7 @@ pub fn fit_survival_marginal_slope_terms(
         logslope_design: designs[1].clone(),
         gaussian_frailty_sd: final_sigma,
         baseline_slope,
+        z_normalization,
         time_block_penalties_len: time_penalties_len,
         score_warp_runtime,
         link_dev_runtime,

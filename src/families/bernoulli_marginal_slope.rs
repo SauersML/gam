@@ -101,10 +101,32 @@ pub struct BernoulliMarginalSlopeFitResult {
     pub logslope_design: TermCollectionDesign,
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
+    pub z_normalization: LatentZNormalization,
     pub score_warp_runtime: Option<DeviationRuntime>,
     pub link_dev_runtime: Option<DeviationRuntime>,
     /// Learned or fixed Gaussian-shift frailty SD.  `None` = no frailty.
     pub gaussian_frailty_sd: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LatentZNormalization {
+    pub mean: f64,
+    pub sd: f64,
+}
+
+impl LatentZNormalization {
+    pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
+        if !(self.mean.is_finite() && self.sd.is_finite() && self.sd > 1e-12) {
+            return Err(format!(
+                "{context} requires finite latent z normalization with sd > 1e-12; got mean={} sd={}",
+                self.mean, self.sd
+            ));
+        }
+        if z.iter().any(|value| !value.is_finite()) {
+            return Err(format!("{context} requires finite z values"));
+        }
+        Ok(z.mapv(|zi| (zi - self.mean) / self.sd))
+    }
 }
 
 #[derive(Clone)]
@@ -293,7 +315,7 @@ pub(crate) fn standardize_latent_z(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     context: &str,
-) -> Result<Array1<f64>, String> {
+) -> Result<(Array1<f64>, LatentZNormalization), String> {
     if z.len() != weights.len() {
         return Err(format!(
             "{context} latent-score normalization length mismatch: z={}, weights={}",
@@ -342,7 +364,8 @@ pub(crate) fn standardize_latent_z(
         ));
     }
 
-    let z_std = z.mapv(|zi| (zi - mean) / sd);
+    let normalization = LatentZNormalization { mean, sd };
+    let z_std = normalization.apply(z, context)?;
     let skew = z_std
         .iter()
         .zip(weights.iter())
@@ -366,7 +389,7 @@ pub(crate) fn standardize_latent_z(
             "{context}: z has skewness={skew:.3} and excess kurtosis={kurt:.3}; the calibrated marginal-slope model assumes latent Gaussian scores"
         );
     }
-    Ok(z_std)
+    Ok((z_std, normalization))
 }
 
 fn pooled_probit_baseline(
@@ -1727,62 +1750,13 @@ struct BernoulliMarginalSlopeExactEvalCache {
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
 }
 
-/// Maximum exact outer-Hessian row work proxy before downgrading to
-/// first-order.
-///
-/// Rigid models still pay dense coefficient-space pullbacks and need a tight
-/// budget. Flexible score/link deviation models use row-local directional
-/// kernels whose coefficient transport is linear in realized block width, so
-/// they can sustain a meaningfully larger budget before second-order becomes a
-/// bad trade.
-const EXACT_OUTER_MAX_ROW_WORK_RIGID: u64 = 1_000_000;
-const EXACT_OUTER_MAX_ROW_WORK_FLEX: u64 = 20_000_000;
-
-/// Row-loop gate for Bernoulli marginal-slope.  The memory gate is handled
-/// by [`cost_gated_outer_order`] at the call site.
 fn bernoulli_row_work_order(
-    specs: &[ParameterBlockSpec],
-    n_rows: usize,
-    score_warp_dim: usize,
-    link_dev_dim: usize,
+    _specs: &[ParameterBlockSpec],
+    _n_rows: usize,
+    _score_warp_dim: usize,
+    _link_dev_dim: usize,
 ) -> ExactOuterDerivativeOrder {
-    let n = n_rows as u64;
-    let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
-    let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
-    let k_directional = k.saturating_add(k_pairs).saturating_add(k_pairs);
-    let total_coeffs: u64 = specs.iter().map(|s| s.design.ncols() as u64).sum();
-    let rigid = score_warp_dim == 0 && link_dev_dim == 0;
-    let primary_total = 2u64
-        .saturating_add(score_warp_dim as u64)
-        .saturating_add(link_dev_dim as u64);
-    // Rigid models still need dense coefficient-space pullbacks for each
-    // rho-directional derivative; the cheap part is only the per-row primary
-    // derivatives. Flexible models pay both coefficient-space and
-    // primary-space tensor work.
-    let effective_primary_cost = if rigid {
-        1u64
-    } else {
-        primary_total.saturating_mul(primary_total)
-    };
-    let coefficient_cost = if rigid {
-        total_coeffs.saturating_mul(total_coeffs)
-    } else {
-        total_coeffs
-    };
-    let row_work = n
-        .saturating_mul(coefficient_cost)
-        .saturating_mul(k_directional)
-        .saturating_mul(effective_primary_cost);
-    let budget = if rigid {
-        EXACT_OUTER_MAX_ROW_WORK_RIGID
-    } else {
-        EXACT_OUTER_MAX_ROW_WORK_FLEX
-    };
-    if row_work > budget {
-        ExactOuterDerivativeOrder::First
-    } else {
-        ExactOuterDerivativeOrder::Second
-    }
+    ExactOuterDerivativeOrder::Second
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -6340,12 +6314,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        // Shared memory gate: K(K+1)/2 × p² dense psi Hessians.
-        if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
-            return ExactOuterDerivativeOrder::First;
-        }
-        // Family-specific row-loop gate.
-        bernoulli_row_work_order(
+        let _ = bernoulli_row_work_order(
             specs,
             self.y.len(),
             self.score_warp
@@ -6356,7 +6325,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 .as_ref()
                 .map(DeviationRuntime::basis_dim)
                 .unwrap_or(0),
-        )
+        );
+        cost_gated_outer_order(specs)
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
@@ -6872,7 +6842,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
     validate_spec(data, &spec)?;
-    spec.z = standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
+    let (z_standardized, z_normalization) =
+        standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
+    spec.z = z_standardized;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let sigma_learnable = matches!(
         &spec.frailty,
@@ -7184,9 +7156,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 Ok((
                     eval.objective,
                     eval.gradient,
-                    eval.outer_hessian
-                        .materialize_dense()
-                        .map_err(|e| e.to_string())?,
+                    eval.outer_hessian,
                 ))
             },
         )
@@ -7274,6 +7244,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         logslope_design: designs.remove(0),
         baseline_marginal: baseline.0,
         baseline_logslope: baseline.1,
+        z_normalization,
         score_warp_runtime,
         link_dev_runtime,
         gaussian_frailty_sd: final_sigma,
@@ -8335,12 +8306,11 @@ mod tests {
     }
 
     #[test]
-    fn row_work_order_keeps_small_models_second_order() {
+    fn row_work_order_keeps_exact_outer_second_order() {
         let rigid_specs = vec![
             dummy_penalized_blockspec(2, 8, 1),
             dummy_penalized_blockspec(1, 8, 1),
         ];
-        // Rigid gate: n=2_000 × p²=9 × directional terms=8 = 144_000 < 1M.
         assert_eq!(
             bernoulli_row_work_order(&rigid_specs, 2_000, 0, 0),
             ExactOuterDerivativeOrder::Second
@@ -8359,15 +8329,14 @@ mod tests {
     }
 
     #[test]
-    fn row_work_order_downgrades_large_models_to_first_order() {
+    fn row_work_order_no_longer_downgrades_large_models() {
         let rigid_specs = vec![
             dummy_penalized_blockspec(24, 8, 1),
             dummy_penalized_blockspec(1, 8, 1),
         ];
-        // n=300 × p²=625 × directional terms=8 = 1_500_000 > 1M.
         assert_eq!(
             bernoulli_row_work_order(&rigid_specs, 300, 0, 0),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
         );
 
         let rich_specs = vec![
@@ -8375,10 +8344,9 @@ mod tests {
             dummy_penalized_blockspec(4, 8, 1),
             dummy_penalized_blockspec(8, 8, 1),
         ];
-        // Flex gate: n=1_000 × p=18 × directional terms=15 × primary²=100 = 27M > 20M.
         assert_eq!(
             bernoulli_row_work_order(&rich_specs, 1_000, 8, 0),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
         );
     }
 
@@ -8421,13 +8389,11 @@ mod tests {
     }
 
     #[test]
-    fn cost_gated_outer_order_downgrades_large_p() {
+    fn cost_gated_outer_order_ignores_inner_coefficient_dimension() {
         use crate::custom_family::cost_gated_outer_order;
         use crate::matrix::DesignMatrix;
         use ndarray::Array2;
 
-        // 2 blocks × 500 cols = p=1000, each block has 10 penalties → K=20,
-        // K_pairs=210, psi_elements = 210 × 1000² = 210M > 200M limit.
         let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
             10, 500,
         ))));
@@ -8446,7 +8412,7 @@ mod tests {
             .collect();
         assert_eq!(
             cost_gated_outer_order(&specs),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
         );
     }
 
@@ -12296,10 +12262,12 @@ mod tests {
             -0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67
         ];
         let weights = Array1::from_elem(12, 1.0);
-        let standardized =
+        let (standardized, normalization) =
             standardize_latent_z(&z, &weights, "bernoulli-marginal-slope").expect("normalize z");
         let mean = standardized.sum() / standardized.len() as f64;
         let var = standardized.iter().map(|v| v * v).sum::<f64>() / standardized.len() as f64;
+        assert!((normalization.mean - 0.075).abs() < 1e-12);
+        assert!((normalization.sd - 0.762905407286885).abs() < 1e-12);
         assert!(mean.abs() < 1e-12);
         assert!((var.sqrt() - 1.0).abs() < 1e-12);
     }

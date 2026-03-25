@@ -1,7 +1,9 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::lognormal_kernel::{FrailtySpec, ProbitFrailtyScale};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
-use crate::inference::model::{SavedAnchoredDeviationRuntime, SavedLinkWiggleRuntime};
+use crate::inference::model::{
+    SavedAnchoredDeviationRuntime, SavedLatentZNormalization, SavedLinkWiggleRuntime,
+};
 use crate::inference::prediction_linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows, rowwise_local_covariances,
 };
@@ -822,6 +824,7 @@ pub struct BernoulliMarginalSlopePredictor {
     pub beta_link_dev: Option<Array1<f64>>,
     pub base_link: InverseLink,
     pub z_column: String,
+    pub latent_z_normalization: SavedLatentZNormalization,
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
     pub covariance: Option<Array2<f64>>,
@@ -1036,6 +1039,7 @@ impl BernoulliMarginalSlopePredictor {
     pub fn from_unified(
         unified: &UnifiedFitResult,
         z_column: String,
+        latent_z_normalization: SavedLatentZNormalization,
         baseline_marginal: f64,
         baseline_logslope: f64,
         base_link: InverseLink,
@@ -1071,6 +1075,11 @@ impl BernoulliMarginalSlopePredictor {
                 format!("bernoulli marginal-slope link-deviation runtime is invalid: {e}")
             })?;
         }
+        latent_z_normalization
+            .validate("bernoulli marginal-slope predictor")
+            .map_err(|e| {
+                format!("bernoulli marginal-slope predictor latent z normalization is invalid: {e}")
+            })?;
         let blocks = &unified.blocks;
         let expected_blocks = 2
             + usize::from(score_warp_runtime.is_some())
@@ -1111,6 +1120,7 @@ impl BernoulliMarginalSlopePredictor {
             beta_link_dev,
             base_link,
             z_column,
+            latent_z_normalization,
             baseline_marginal,
             baseline_logslope,
             covariance: unified.beta_covariance().cloned(),
@@ -1258,12 +1268,16 @@ impl BernoulliMarginalSlopePredictor {
         theta: &Array1<f64>,
         need_gradient: bool,
     ) -> Result<(Array1<f64>, Option<Array2<f64>>), EstimationError> {
-        let z = input.auxiliary_scalar.as_ref().ok_or_else(|| {
+        let z_raw = input.auxiliary_scalar.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(format!(
                 "bernoulli marginal-slope prediction requires auxiliary z column '{}'",
                 self.z_column
             ))
         })?;
+        let z = self
+            .latent_z_normalization
+            .apply(z_raw, "bernoulli marginal-slope prediction")
+            .map_err(EstimationError::InvalidInput)?;
         let design_logslope = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "bernoulli marginal-slope prediction requires logslope design".to_string(),
@@ -1329,7 +1343,7 @@ impl BernoulliMarginalSlopePredictor {
         if !flex_active {
             let sb_vec = logslope_eta.mapv(|b| scale * b);
             let c_vec = sb_vec.mapv(|sb| (1.0 + sb * sb).sqrt());
-            let final_eta = &c_vec * &marginal_eta + &sb_vec * z;
+            let final_eta = &c_vec * &marginal_eta + &sb_vec * &z;
 
             if !need_gradient {
                 return Ok((final_eta, None));
@@ -1366,7 +1380,7 @@ impl BernoulliMarginalSlopePredictor {
         let score_warp_obs_design = self
             .score_warp_runtime
             .as_ref()
-            .map(|runtime| runtime.design(z).map_err(EstimationError::InvalidInput))
+            .map(|runtime| runtime.design(&z).map_err(EstimationError::InvalidInput))
             .transpose()?;
         let score_dev_obs = if let (Some(design), Some(beta)) =
             (score_warp_obs_design.as_ref(), beta_score_warp.clone())
@@ -3880,6 +3894,7 @@ mod tests {
             beta_link_dev: None,
             base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
             z_column: "z".to_string(),
+            latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             baseline_marginal: 0.0,
             baseline_logslope: 0.0,
             covariance: None,
@@ -3976,6 +3991,7 @@ mod tests {
             beta_link_dev: None,
             base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
             z_column: "z".to_string(),
+            latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             baseline_marginal: 0.1,
             baseline_logslope: -0.2,
             covariance: None,

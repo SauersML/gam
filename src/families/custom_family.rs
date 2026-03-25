@@ -423,23 +423,22 @@ impl ExactOuterDerivativeOrder {
     }
 }
 
-/// Maximum dense psi-Hessian memory (f64 elements) before downgrading to
-/// first-order: K(K+1)/2 matrices of size p×p.  200M f64 ≈ 1.6 GB.
-const DEFAULT_EXACT_OUTER_MAX_PSI_ELEMENTS: u64 = 200_000_000;
+/// Maximum dense outer-Hessian size (f64 elements) before downgrading to
+/// first-order when a caller insists on materializing it. This gate is keyed
+/// to the actual outer dimension K, not the inner coefficient dimension p.
+const DEFAULT_EXACT_OUTER_MAX_ELEMENTS: u64 = 16_000_000;
 
 /// Shared cost-aware gate for second-order exact outer derivatives.
 ///
-/// Checks whether the dense psi-Hessian memory (`K(K+1)/2 × p²`) exceeds
-/// [`DEFAULT_EXACT_OUTER_MAX_PSI_ELEMENTS`].  Families that also want a
-/// row-loop cost gate should call this *and* their own row-work check.
-///
-/// Returns `Second` when affordable, `First` otherwise.
+/// This gate is intentionally based on the outer hyperparameter dimension,
+/// not the inner coefficient dimension. Matrix-free/operator Hessians already
+/// avoid the old `p²` blow-up, so the only meaningful generic affordability
+/// proxy here is the size of a dense K×K outer Hessian if one were
+/// materialized.
 pub fn cost_gated_outer_order(specs: &[ParameterBlockSpec]) -> ExactOuterDerivativeOrder {
-    let p: u64 = specs.iter().map(|s| s.design.ncols() as u64).sum();
     let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
-    let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
-    let psi_elements = k_pairs.saturating_mul(p.saturating_mul(p));
-    if psi_elements > DEFAULT_EXACT_OUTER_MAX_PSI_ELEMENTS {
+    let outer_elements = k.saturating_mul(k);
+    if outer_elements > DEFAULT_EXACT_OUTER_MAX_ELEMENTS {
         ExactOuterDerivativeOrder::First
     } else {
         ExactOuterDerivativeOrder::Second
@@ -510,10 +509,8 @@ pub trait CustomFamily {
     /// Declares how much exact outer calculus this family wants to expose for
     /// the current realized problem size.
     ///
-    /// The default uses [`cost_gated_outer_order`] to forbid second-order when
-    /// the dense psi-Hessian memory (`K(K+1)/2 × p²`) would be prohibitive.
-    /// Families with additional per-row cost knowledge should override and
-    /// combine `cost_gated_outer_order` with their own row-work check.
+    /// The default uses [`cost_gated_outer_order`], keyed to the actual outer
+    /// hyperparameter dimension rather than the inner coefficient dimension.
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
@@ -3094,7 +3091,7 @@ pub struct ExactNewtonJointPsiTerms {
     pub objective_psi: f64,
     pub score_psi: Array1<f64>,
     pub hessian_psi: Array2<f64>,
-    pub hessian_psi_operator: Option<Box<dyn HyperOperator>>,
+    pub hessian_psi_operator: Option<Arc<dyn HyperOperator>>,
 }
 
 impl ExactNewtonJointPsiTerms {
@@ -8552,7 +8549,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // based on the presence of a wiggle block.
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
+    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterProblem};
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
     // previously behind Mutex because the old optimizer bridge used `Fn`

@@ -1605,16 +1605,22 @@ fn materialize_survival<'a>(
             smooth_terms: vec![],
         }
     };
+    let marginal_z_column_name =
+        if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+            Some(config.z_column.as_deref().ok_or_else(|| {
+                "marginal-slope survival requires z_column in FitConfig".to_string()
+            })?)
+        } else {
+            None
+        };
     let marginal_z = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         if parsed.linkspec.is_some() {
             return Err(
                 "link(...) is not implemented for the survival marginal-slope family".to_string(),
             );
         }
-        let z_col_name = config
-            .z_column
-            .as_deref()
-            .ok_or_else(|| "marginal-slope survival requires z_column in FitConfig".to_string())?;
+        let z_col_name = marginal_z_column_name
+            .expect("marginal-slope z column should be validated before materialization");
         let z_idx = *col_map
             .get(z_col_name)
             .ok_or_else(|| format!("z column '{z_col_name}' not found"))?;
@@ -1649,7 +1655,7 @@ fn materialize_survival<'a>(
             validate_marginal_slope_z_column_exclusion(
                 parsed,
                 &ls_parsed,
-                z_col_name,
+                marginal_z_column_name.expect("marginal-slope z column should be available"),
                 "survival marginal-slope",
                 "logslope_formula",
             )?;
@@ -1666,6 +1672,13 @@ fn materialize_survival<'a>(
                 ),
             )
         } else {
+            validate_marginal_slope_z_column_exclusion(
+                parsed,
+                parsed,
+                marginal_z_column_name.expect("marginal-slope z column should be available"),
+                "survival marginal-slope",
+                "logslope_formula",
+            )?;
             (
                 Some(termspec.clone()),
                 route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None),
@@ -2118,8 +2131,10 @@ fn materialize_location_scale<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{FitConfig, materialize};
+    use super::*;
     use crate::inference::data::load_dataset_projected;
+    use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
     use std::fs;
     use tempfile::tempdir;
 
@@ -2173,13 +2188,20 @@ mod tests {
         assert!(err.contains("survival marginal-slope reserves z column 'z'"));
         assert!(err.contains("logslope_formula"));
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-    use ndarray::Array2;
+    #[test]
+    fn survival_marginal_slope_materialize_rejects_z_column_when_logslope_defaults_to_main_spec() {
+        let data = load_survival_dataset();
+        let mut config = FitConfig::default();
+        config.survival_likelihood = "marginal-slope".to_string();
+        config.z_column = Some("z".to_string());
+
+        let err = materialize("Surv(entry, exit, event) ~ x + z", &data, &config)
+            .expect_err("defaulted logslope spec should still reject z-column reuse");
+
+        assert!(err.contains("survival marginal-slope reserves z column 'z'"));
+        assert!(err.contains("main formula"));
+    }
 
     fn workflow_test_dataset() -> Dataset {
         Dataset {
@@ -2255,7 +2277,11 @@ mod tests {
         )
         .expect("workflow materialization should succeed");
 
-        let FitRequest::SurvivalMarginalSlope(request) = materialized.request else {
+        let MaterializedModel {
+            request,
+            inference_notes,
+        } = materialized;
+        let FitRequest::SurvivalMarginalSlope(request) = request else {
             panic!("expected survival marginal-slope request");
         };
 
@@ -2270,15 +2296,13 @@ mod tests {
         assert_eq!(score_warp.penalty_order, 2);
         assert_eq!(score_warp.penalty_orders, vec![3]);
         assert!(
-            materialized
-                .inference_notes
+            inference_notes
                 .iter()
                 .any(|note| note.contains("link-deviation block")),
             "workflow notes should mention main-formula linkwiggle routing"
         );
         assert!(
-            materialized
-                .inference_notes
+            inference_notes
                 .iter()
                 .any(|note| note.contains("score-warp block")),
             "workflow notes should mention logslope_formula linkwiggle routing"
