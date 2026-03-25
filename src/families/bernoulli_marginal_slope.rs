@@ -7501,7 +7501,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::{CustomFamily, PenaltyMatrix};
+    use crate::custom_family::CustomFamily;
     use crate::families::bernoulli_marginal_slope::exact_kernel::{
         DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
         LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,

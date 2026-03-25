@@ -533,7 +533,10 @@ pub trait CustomFamily {
     /// The default preserves the generic custom-family behavior. Families with
     /// a strong warm start can override this to keep seed screening from
     /// dominating the fit.
-    fn outer_seed_config(&self, _n_params: usize) -> crate::seeding::SeedConfig {
+    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
+        if n_params == 0 {
+            return crate::seeding::SeedConfig::default();
+        }
         crate::seeding::SeedConfig::default()
     }
 
