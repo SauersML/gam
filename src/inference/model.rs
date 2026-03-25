@@ -302,6 +302,7 @@ pub enum FittedFamily {
     },
     MarginalSlope {
         likelihood: LikelihoodFamily,
+        base_link: Option<InverseLink>,
         frailty: FrailtySpec,
     },
     Survival {
@@ -1456,7 +1457,7 @@ impl FittedModel {
             FittedFamily::Standard { link, .. } => {
                 Ok(stateful.or_else(|| link.map(InverseLink::Standard)))
             }
-            FittedFamily::MarginalSlope { .. } => Ok(None),
+            FittedFamily::MarginalSlope { base_link, .. } => Ok(base_link.clone()),
             FittedFamily::Survival { .. }
             | FittedFamily::LatentSurvival { .. }
             | FittedFamily::LatentBinary { .. } => Ok(None),
@@ -1556,6 +1557,8 @@ impl FittedModel {
                     z_column,
                     payload.marginal_baseline?,
                     payload.logslope_baseline?,
+                    self.resolved_inverse_link()?
+                        .unwrap_or(InverseLink::Standard(LinkFunction::Probit)),
                     self.family_state.frailty()?.clone(),
                     runtime.score_warp,
                     runtime.link_deviation,

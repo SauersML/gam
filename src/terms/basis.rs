@@ -8832,7 +8832,7 @@ fn build_matern_design_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
-    ) -> Result<ScalarDesignPsiDerivatives, BasisError> {
+) -> Result<ScalarDesignPsiDerivatives, BasisError> {
     let k = centers.nrows();
     let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
     let total_cols = kernel_cols + usize::from(include_intercept);

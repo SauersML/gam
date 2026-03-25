@@ -37,6 +37,33 @@ Output:
 - `benchmarks/figures/*__datapoints.png`
 - `benchmarks/figures.zip`
 
+## Biobank-scale workflow
+
+The dedicated large-cohort workflow lives in:
+- `/Users/user/gam/bench/biobank_scale/biobank_scale.yml`
+- `/Users/user/gam/bench/biobank_scale/runner.py`
+- `/Users/user/gam/.github/workflows/biobank_scale.yml`
+
+It prepares one synthetic cohort at `target_n = 400000` and then runs every method in the config via the runner's `matrix` subcommand. The current disease-side matrix includes:
+- additive Rust GAM baselines (`thinplate`, `duchon`, `matern`)
+- additive Rust binomial location-scale (`rust_gamlss_additive_duchon60`)
+- additive `mgcv` baselines
+- exact Bernoulli marginal-slope coverage via `rust_margslope_aniso_duchon16d_50`
+
+That marginal-slope lane is the 16-PC anisotropic Duchon regime:
+- `dataset = disease`
+- `family = binomial`
+- `marginal_slope = true`
+- `scale_dimensions = true`
+- `z_column = pgs_std`
+
+Rebuild the method matrix locally with:
+
+```bash
+cd /Users/user/gam
+python3 bench/biobank_scale/runner.py matrix --config bench/biobank_scale/biobank_scale.yml
+```
+
 ## Runtime knobs
 
 `bench/run_suite.py` supports the following environment variables:

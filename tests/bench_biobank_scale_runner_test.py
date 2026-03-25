@@ -25,6 +25,25 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BiobankScaleRunnerTests(unittest.TestCase):
+    def test_default_biobank_matrix_keeps_400k_binomial_marginal_slope_lane(self) -> None:
+        cfg = _RUNNER.load_config(_RUNNER.DEFAULT_CONFIG)
+
+        self.assertEqual(int(cfg["target_n"]), 400000)
+
+        payload = {"include": [spec.__dict__ for spec in _RUNNER.build_method_specs(cfg)]}
+        methods = {row["name"]: row for row in payload["include"]}
+
+        self.assertIn("rust_margslope_aniso_duchon16d_50", methods)
+        lane = methods["rust_margslope_aniso_duchon16d_50"]
+        self.assertEqual(lane["dataset"], "disease")
+        self.assertEqual(lane["family"], "binomial")
+        self.assertEqual(lane["backend"], "rust_gam")
+        self.assertEqual(lane["spatial_basis"], "duchon")
+        self.assertEqual(lane["centers"], 50)
+        self.assertTrue(lane["marginal_slope"])
+        self.assertTrue(lane["scale_dimensions"])
+        self.assertEqual(lane["z_column"], "pgs_std")
+
     def test_build_method_specs_rejects_legacy_survival_backend(self) -> None:
         cfg = {
             "methods": [

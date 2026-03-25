@@ -1125,6 +1125,10 @@ pub trait CustomFamily {
     ///     + D_beta^2 H[beta_i, beta_j].
     ///
     /// For i = psi_a this hook supplies D_beta H_{psi_a}[u].
+    ///
+    /// This direct hook is dense-only. Families that can keep the drift in an
+    /// operator-backed or block-local form should expose it through
+    /// `exact_newton_joint_psi_workspace()` instead.
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         _: &[ParameterBlockState],
@@ -3149,7 +3153,7 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String>;
+    ) -> Result<Option<DriftDerivResult>, String>;
 }
 
 pub(crate) struct ExactNewtonJointPsiDirectCache<T> {
@@ -7268,7 +7272,7 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
         move |ext_idx: usize, direction: &Array1<f64>| -> Option<DriftDerivResult> {
             // The family hook takes a psi index (0-based within ψ coordinates)
             // and a flattened coefficient direction.
-            let dense = if let Some(workspace) = psi_workspace.as_ref() {
+            if let Some(workspace) = psi_workspace.as_ref() {
                 workspace
                     .hessian_directional_derivative(ext_idx, direction)
                     .ok()
@@ -7284,8 +7288,8 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
                     )
                     .ok()
                     .flatten()
-            };
-            dense.map(DriftDerivResult::Dense)
+                    .map(DriftDerivResult::Dense)
+            }
         },
     ))
 }
@@ -8558,6 +8562,74 @@ mod tests {
         assert_eq!(floored[0], 0.0);
         assert_eq!(floored[1], 1.0e-6);
         assert_eq!(floored[2], 0.25);
+    }
+
+    #[test]
+    fn psi_drift_deriv_workspace_preserves_block_local_operator() {
+        #[derive(Clone)]
+        struct ZeroFamily;
+
+        impl CustomFamily for ZeroFamily {
+            fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+                Ok(FamilyEvaluation {
+                    log_likelihood: 0.0,
+                    blockworking_sets: vec![],
+                })
+            }
+        }
+
+        struct BlockLocalPsiWorkspace;
+
+        impl ExactNewtonJointPsiWorkspace for BlockLocalPsiWorkspace {
+            fn second_order_terms(
+                &self,
+                _: usize,
+                _: usize,
+            ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+                Ok(None)
+            }
+
+            fn hessian_directional_derivative(
+                &self,
+                psi_index: usize,
+                _: &Array1<f64>,
+            ) -> Result<Option<DriftDerivResult>, String> {
+                assert_eq!(psi_index, 0);
+                Ok(Some(DriftDerivResult::Operator(Box::new(
+                    crate::solver::estimate::reml::unified::BlockLocalDrift {
+                        local: array![[3.0, 1.0], [1.0, 2.0]],
+                        start: 1,
+                        end: 3,
+                    },
+                ))))
+            }
+        }
+
+        let callback = build_psi_drift_deriv_callback(
+            &ZeroFamily,
+            &[],
+            &[],
+            &[],
+            false,
+            Some(Arc::new(BlockLocalPsiWorkspace)),
+        )
+        .expect("non-Gaussian psi drift callback should be available");
+
+        let result = callback(0, &array![1.0, 2.0, 3.0])
+            .expect("workspace-backed psi drift derivative should be returned");
+
+        match result {
+            DriftDerivResult::Dense(_) => {
+                panic!("workspace-backed block-local psi drift derivative was densified")
+            }
+            DriftDerivResult::Operator(op) => {
+                let (local, start, end) = op
+                    .block_local_data()
+                    .expect("block-local operator metadata should be preserved");
+                assert_eq!((start, end), (1, 3));
+                assert_eq!(local, &array![[3.0, 1.0], [1.0, 2.0]]);
+            }
+        }
     }
 
     #[test]
