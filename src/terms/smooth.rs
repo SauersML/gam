@@ -8213,6 +8213,7 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         s_psi_psi_local,
         s_psi_components_local,
         s_psi_psi_components_local,
+        implicit_operator,
     )) = try_build_spatial_term_log_kappa_derivative(data, resolvedspec, design, term_idx)?
     else {
         return Ok(None);
@@ -8245,7 +8246,7 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         aniso_group_id: None,
         aniso_cross_designs: None,
         aniso_cross_penalties: None,
-        implicit_operator: None,
+        implicit_operator,
         implicit_axis: 0,
     }))
 }
@@ -8455,6 +8456,7 @@ fn try_build_spatial_term_log_kappa_derivative(
         Array2<f64>,
         Vec<Array2<f64>>,
         Vec<Array2<f64>>,
+        Option<std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>>,
     )>,
     EstimationError,
 > {
@@ -8470,6 +8472,7 @@ fn try_build_spatial_term_log_kappa_derivative(
     let BasisPsiDerivativeResult {
         design_derivative: local_x_psi,
         penalties_derivative: local_s_psi,
+        implicit_operator: local_implicit_first,
     } = match &termspec.basis {
         SmoothBasisSpec::ThinPlate {
             feature_cols,
@@ -8514,6 +8517,7 @@ fn try_build_spatial_term_log_kappa_derivative(
     let BasisPsiSecondDerivativeResult {
         designsecond_derivative: local_x_psi_psi,
         penaltiessecond_derivative: local_s_psi_psi,
+        implicit_operator: local_implicit_second,
     } = match &termspec.basis {
         SmoothBasisSpec::ThinPlate {
             feature_cols,
@@ -8555,12 +8559,21 @@ fn try_build_spatial_term_log_kappa_derivative(
             return Ok(None);
         }
     };
+    let implicit_operator = local_implicit_first
+        .or(local_implicit_second)
+        .map(std::sync::Arc::new);
 
-    if local_x_psi.ncols() != smooth_term.coeff_range.len() {
-        return Ok(None);
-    }
-    if local_x_psi_psi.ncols() != smooth_term.coeff_range.len() {
-        return Ok(None);
+    if let Some(ref op) = implicit_operator {
+        if op.p_out() != smooth_term.coeff_range.len() {
+            return Ok(None);
+        }
+    } else {
+        if local_x_psi.ncols() != smooth_term.coeff_range.len() {
+            return Ok(None);
+        }
+        if local_x_psi_psi.ncols() != smooth_term.coeff_range.len() {
+            return Ok(None);
+        }
     }
     if local_s_psi.is_empty() || local_s_psi.len() != local_s_psi_psi.len() {
         return Ok(None);
@@ -8596,6 +8609,7 @@ fn try_build_spatial_term_log_kappa_derivative(
         ),
         local_s_psi,
         local_s_psi_psi,
+        implicit_operator,
     )))
 }
 
@@ -13381,6 +13395,7 @@ mod tests {
         let BasisPsiDerivativeResult {
             design_derivative: local_x_psi,
             penalties_derivative: local_s_psi,
+            ..
         } = match &termspec.basis {
             SmoothBasisSpec::ThinPlate {
                 feature_cols, spec, ..
@@ -13395,6 +13410,7 @@ mod tests {
         let BasisPsiSecondDerivativeResult {
             designsecond_derivative: local_x_psi_psi,
             penaltiessecond_derivative: local_s_psi_psi,
+            ..
         } = match &termspec.basis {
             SmoothBasisSpec::ThinPlate {
                 feature_cols, spec, ..
@@ -13486,6 +13502,7 @@ mod tests {
         let BasisPsiDerivativeResult {
             design_derivative: local_x_psi,
             penalties_derivative: local_s_psi,
+            ..
         } = match &termspec.basis {
             SmoothBasisSpec::Duchon {
                 feature_cols, spec, ..
@@ -13500,6 +13517,7 @@ mod tests {
         let BasisPsiSecondDerivativeResult {
             designsecond_derivative: local_x_psi_psi,
             penaltiessecond_derivative: local_s_psi_psi,
+            ..
         } = match &termspec.basis {
             SmoothBasisSpec::Duchon {
                 feature_cols, spec, ..

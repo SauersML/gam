@@ -1257,15 +1257,15 @@ impl HyperCoordDrift {
 /// (n × p) matrices), and S_{ψ_d} is a dense (p × p) penalty matrix (manageable).
 ///
 /// Storage: the implicit operator holds O(n·k·D) radial jets, plus references
-/// to X (the design matrix) and W (the working weights). The penalty matrix
-/// S_{ψ_d} is stored as a dense (p × p) matrix.
+/// to an active-basis X design operator and W (the working weights). The
+/// penalty matrix S_{ψ_d} is stored as a dense (p × p) matrix.
 pub struct ImplicitHyperOperator {
     /// The implicit design-derivative operator (shared across all axes).
     pub implicit_deriv: std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
     /// Which axis this operator is for.
     pub axis: usize,
-    /// The design matrix X in dense form (n × p). Shared reference.
-    pub x_dense: std::sync::Arc<Array2<f64>>,
+    /// The active-basis design matrix X. This may be lazy / operator-backed.
+    pub x_design: std::sync::Arc<DesignMatrix>,
     /// Working weights W (diagonal, length n). Shared reference.
     pub w_diag: std::sync::Arc<Array1<f64>>,
     /// Penalty derivative matrix S_{ψ_d} (p × p), dense.
@@ -1279,7 +1279,7 @@ impl HyperOperator for ImplicitHyperOperator {
         debug_assert_eq!(v.len(), self.p);
 
         // Term 1: (∂X/∂ψ_d)^T (W · (X · v))
-        let x_v = self.x_dense.dot(v); // (n,)
+        let x_v = self.x_design.matrixvectormultiply(v); // (n,)
         let w_x_v = &*self.w_diag * &x_v; // (n,)
         let term1 = self
             .implicit_deriv
@@ -1292,7 +1292,7 @@ impl HyperOperator for ImplicitHyperOperator {
             .forward_mul(self.axis, &v.view())
             .expect("radial scalar evaluation failed during implicit hyper forward_mul"); // (n,)
         let w_dx_v = &*self.w_diag * &dx_v; // (n,)
-        let term2 = self.x_dense.t().dot(&w_dx_v); // (p,)
+        let term2 = self.x_design.transpose_vector_multiply(&w_dx_v); // (p,)
 
         // Term 3: S_{ψ_d} · v
         let term3 = self.s_psi.dot(v); // (p,)
@@ -1402,7 +1402,7 @@ impl ImplicitHyperOperator {
             .forward_mul(self.axis, &z.view())
             .expect("radial scalar evaluation failed during implicit hyper forward_mul");
         let w_dx_z = &*self.w_diag * &dx_z;
-        let term2 = self.x_dense.t().dot(&w_dx_z);
+        let term2 = self.x_design.transpose_vector_multiply(&w_dx_z);
 
         // Term 3: S_{ψ_d} · z
         let term3 = self.s_psi.dot(z);
@@ -6196,10 +6196,10 @@ impl StochasticTraceEstimator {
                     );
                 }
 
-                let x_dense = implicit_ops[0].x_dense.clone();
+                let x_design = implicit_ops[0].x_design.clone();
                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
-                    let x_vec = x_dense.dot(z);
-                    let y_vec = x_dense.dot(w);
+                    let x_vec = x_design.matrixvectormultiply(z);
+                    let y_vec = x_design.matrixvectormultiply(w);
 
                     for k in 0..dense_matrices.len() {
                         let a_w = dense_matrices[k].dot(w);
@@ -6349,8 +6349,8 @@ impl StochasticTraceEstimator {
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
 
         // Get the shared X reference from the first implicit operator.
-        let x_dense = if n_ops > 0 {
-            Some(implicit_ops[0].x_dense.clone())
+        let x_design = if n_ops > 0 {
+            Some(implicit_ops[0].x_design.clone())
         } else {
             None
         };
@@ -6366,8 +6366,8 @@ impl StochasticTraceEstimator {
             let u = hop.solve(&z);
 
             // Shared X multiplies for implicit operators.
-            let x_vec = if let Some(ref x) = x_dense {
-                x.dot(&z)
+            let x_vec = if let Some(ref x) = x_design {
+                x.matrixvectormultiply(&z)
             } else {
                 Array1::zeros(0)
             };
@@ -6394,8 +6394,8 @@ impl StochasticTraceEstimator {
             // For implicit A_d: use bilinear_with_shared_x or direct bilinear.
 
             // Precompute X u and X r_e for implicit operators.
-            let y_vec = if let Some(ref x) = x_dense {
-                x.dot(&u)
+            let y_vec = if let Some(ref x) = x_design {
+                x.matrixvectormultiply(&u)
             } else {
                 Array1::zeros(0)
             };
@@ -6407,11 +6407,12 @@ impl StochasticTraceEstimator {
             }
 
             // Precompute X r_e for all axes e (for implicit operators).
-            let x_r = if let Some(ref x) = x_dense {
-                // X * R: (n × total)
-                x.dot(&r)
+            let x_r: Vec<Array1<f64>> = if let Some(ref x) = x_design {
+                (0..total)
+                    .map(|e| x.matrixvectormultiply(&r.column(e).to_owned()))
+                    .collect()
             } else {
-                Array2::zeros((0, total))
+                Vec::new()
             };
 
             // Precompute (∂X/∂ψ_d) u for each implicit axis (reused across all e).
@@ -6441,7 +6442,7 @@ impl StochasticTraceEstimator {
                         //             + u^T S_psi r_e
                         let oi = d - n_dense;
                         let op = &implicit_ops[oi];
-                        let x_re = x_r.column(e);
+                        let x_re = &x_r[e];
 
                         let dx_u = &implicit_dx_u[oi];
                         let dx_re = op.implicit_deriv.forward_mul(op.axis, &r_e)
@@ -6471,7 +6472,7 @@ impl StochasticTraceEstimator {
                         } else {
                             let oi = e - n_dense;
                             let op = &implicit_ops[oi];
-                            let x_rd = x_r.column(d);
+                            let x_rd = &x_r[d];
 
                             let dx_u = &implicit_dx_u[oi];
                             let dx_rd = op.implicit_deriv.forward_mul(op.axis, &r_d)

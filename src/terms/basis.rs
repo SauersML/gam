@@ -1745,12 +1745,18 @@ pub struct CanonicalPenaltyBlock {
 pub struct BasisPsiDerivativeResult {
     pub design_derivative: Array2<f64>,
     pub penalties_derivative: Vec<Array2<f64>>,
+    /// Shared operator-backed design derivative. When present, callers may
+    /// avoid materializing or consuming the dense `design_derivative`.
+    pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BasisPsiSecondDerivativeResult {
     pub designsecond_derivative: Array2<f64>,
     pub penaltiessecond_derivative: Vec<Array2<f64>>,
+    /// Shared operator-backed design derivative. When present, callers may
+    /// avoid materializing or consuming the dense `designsecond_derivative`.
+    pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
 /// Per-axis psi_a derivative package for anisotropic spatial terms.
@@ -2012,13 +2018,22 @@ impl RadialScalarKind {
 /// Instead of persisting O(n*k*(d+2)) arrays, the operator stores the original
 /// data/centers/eta and recomputes q/t/s per chunk during matvec operations.
 #[derive(Debug, Clone)]
+enum StreamingAxisMode {
+    /// Per-axis anisotropic ψ_a derivatives: expose one `s_a` component per axis.
+    PerAxis { eta: Vec<f64> },
+    /// Scalar ψ derivative: expose a single component equal to the total
+    /// scaled squared radius r² = Σ_a exp(2η_a) h_a².
+    ScalarTotal { eta: Vec<f64> },
+}
+
+#[derive(Debug, Clone)]
 struct StreamingRadialState {
     /// Data matrix, shape (n, d).
     data: Array2<f64>,
     /// Center matrix, shape (k, d).
     centers: Array2<f64>,
-    /// Per-axis log-scales, length d.
-    eta: Vec<f64>,
+    /// How per-pair axis components are exposed to the derivative operator.
+    axis_mode: StreamingAxisMode,
     /// Which radial kernel family to use for recomputation.
     radial_kind: RadialScalarKind,
 }
@@ -2034,17 +2049,32 @@ impl StreamingRadialState {
         j: usize,
         s_buf: &mut [f64],
     ) -> Result<(f64, f64, f64), BasisError> {
-        let dim = self.eta.len();
-        let mut r2 = 0.0;
-        for a in 0..dim {
-            let h = self.data[[i, a]] - self.centers[[j, a]];
-            let w = (2.0 * self.eta[a].clamp(-50.0, 50.0)).exp();
-            let s_a = w * h * h;
-            s_buf[a] = s_a;
-            r2 += s_a;
+        match &self.axis_mode {
+            StreamingAxisMode::PerAxis { eta } => {
+                let dim = eta.len();
+                debug_assert_eq!(s_buf.len(), dim);
+                let mut r2 = 0.0;
+                for a in 0..dim {
+                    let h = self.data[[i, a]] - self.centers[[j, a]];
+                    let w = (2.0 * eta[a].clamp(-50.0, 50.0)).exp();
+                    let s_a = w * h * h;
+                    s_buf[a] = s_a;
+                    r2 += s_a;
+                }
+                self.radial_kind.eval_design_triplet(r2.sqrt())
+            }
+            StreamingAxisMode::ScalarTotal { eta } => {
+                debug_assert_eq!(s_buf.len(), 1);
+                let mut r2 = 0.0;
+                for a in 0..eta.len() {
+                    let h = self.data[[i, a]] - self.centers[[j, a]];
+                    let w = (2.0 * eta[a].clamp(-50.0, 50.0)).exp();
+                    r2 += w * h * h;
+                }
+                s_buf[0] = r2;
+                self.radial_kind.eval_design_triplet(r2.sqrt())
+            }
         }
-        let r = r2.sqrt();
-        self.radial_kind.eval_design_triplet(r)
     }
 }
 
@@ -2211,7 +2241,7 @@ impl ImplicitDesignPsiDerivative {
             streaming: Some(StreamingRadialState {
                 data,
                 centers,
-                eta,
+                axis_mode: StreamingAxisMode::PerAxis { eta },
                 radial_kind,
             }),
             ident_transform,
@@ -2221,6 +2251,43 @@ impl ImplicitDesignPsiDerivative {
             n_poly,
             n_axes,
             psi_scale_share,
+        }
+    }
+
+    /// Construct a streaming operator for a scalar ψ derivative. The operator
+    /// exposes a single axis component equal to the full scaled squared
+    /// distance r² under the fixed metric defined by `eta`.
+    pub(crate) fn new_streaming_scalar(
+        data: Array2<f64>,
+        centers: Array2<f64>,
+        eta: Vec<f64>,
+        radial_kind: RadialScalarKind,
+        ident_transform: Option<Array2<f64>>,
+        full_ident_transform: Option<Array2<f64>>,
+        n_poly: usize,
+    ) -> Self {
+        let n = data.nrows();
+        let n_knots = centers.nrows();
+        let dim = data.ncols();
+        assert_eq!(eta.len(), dim);
+        Self {
+            phi_values: Array1::<f64>::zeros(0),
+            axis_components: Array2::<f64>::zeros((0, 0)),
+            q_values: Array1::<f64>::zeros(0),
+            t_values: Array1::<f64>::zeros(0),
+            streaming: Some(StreamingRadialState {
+                data,
+                centers,
+                axis_mode: StreamingAxisMode::ScalarTotal { eta },
+                radial_kind,
+            }),
+            ident_transform,
+            full_ident_transform,
+            n,
+            n_knots,
+            n_poly,
+            n_axes: 1,
+            psi_scale_share: 0.0,
         }
     }
 
@@ -3073,6 +3140,142 @@ fn build_aniso_design_psi_derivatives_shared(
         penalties_second_diag: vec![Vec::new(); dim],
         penalties_cross: Vec::new(),
         penalties_cross_pairs: Vec::new(),
+        implicit_operator: Some(op),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ScalarDesignPsiDerivatives {
+    design_first: Array2<f64>,
+    design_second_diag: Array2<f64>,
+    implicit_operator: Option<ImplicitDesignPsiDerivative>,
+}
+
+fn build_scalar_design_psi_derivatives_shared(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    fixed_eta: Option<&[f64]>,
+    p_final: usize,
+    ident_transform: Option<Array2<f64>>,
+    full_ident_transform: Option<Array2<f64>>,
+    n_poly: usize,
+    radial_kind: RadialScalarKind,
+    psi_scale_share: f64,
+) -> Result<ScalarDesignPsiDerivatives, BasisError> {
+    let n = data.nrows();
+    let k = centers.nrows();
+    let dim = data.ncols();
+    if let Some(eta) = fixed_eta
+        && eta.len() != dim
+    {
+        return Err(BasisError::DimensionMismatch(format!(
+            "scalar design derivatives: eta.len()={} != data dimension {dim}",
+            eta.len()
+        )));
+    }
+
+    if should_use_implicit_operators(n, p_final, 1) {
+        let metric_eta = fixed_eta
+            .map(|eta| eta.to_vec())
+            .unwrap_or_else(|| vec![0.0; dim]);
+        let op = ImplicitDesignPsiDerivative::new_streaming_scalar(
+            data.to_owned(),
+            centers.to_owned(),
+            metric_eta,
+            radial_kind,
+            ident_transform,
+            full_ident_transform,
+            n_poly,
+        )
+        .with_psi_scale_share(psi_scale_share);
+        return Ok(ScalarDesignPsiDerivatives {
+            design_first: Array2::<f64>::zeros((0, 0)),
+            design_second_diag: Array2::<f64>::zeros((0, 0)),
+            implicit_operator: Some(op),
+        });
+    }
+
+    let nk = n * k;
+    let mut phi_values = Array1::<f64>::zeros(nk);
+    let mut q_values = Array1::<f64>::zeros(nk);
+    let mut t_values = Array1::<f64>::zeros(nk);
+    let mut axis_components = Array2::<f64>::zeros((nk, 1));
+
+    let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
+    let nc = n.div_ceil(cs);
+    let err_flag = std::sync::atomic::AtomicBool::new(false);
+    {
+        let pp = SendPtr(phi_values.as_mut_ptr());
+        let qp = SendPtr(q_values.as_mut_ptr());
+        let tp = SendPtr(t_values.as_mut_ptr());
+        let ap = SendPtr(axis_components.as_mut_ptr());
+        let ef = &err_flag;
+        (0..nc).into_par_iter().for_each(move |ci| {
+            let start = ci * cs;
+            let end = (start + cs).min(n);
+            let mut data_row_buf = vec![0.0; dim];
+            let mut center_buf = vec![0.0; dim];
+            for i in start..end {
+                for a in 0..dim {
+                    data_row_buf[a] = data[[i, a]];
+                }
+                for j in 0..k {
+                    let (r, scalar_component) = if let Some(eta) = fixed_eta {
+                        for a in 0..dim {
+                            center_buf[a] = centers[[j, a]];
+                        }
+                        let (r, components) =
+                            aniso_distance_and_components(&data_row_buf, &center_buf, eta);
+                        (r, components.into_iter().sum::<f64>())
+                    } else {
+                        let mut dist2 = 0.0;
+                        for a in 0..dim {
+                            let delta = data[[i, a]] - centers[[j, a]];
+                            dist2 += delta * delta;
+                        }
+                        (dist2.sqrt(), dist2)
+                    };
+                    let (phi, q, t) = match radial_kind.eval_design_triplet(r) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            ef.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    };
+                    let flat = i * k + j;
+                    unsafe {
+                        *pp.add(flat) = phi;
+                        *qp.add(flat) = q;
+                        *tp.add(flat) = t;
+                        *ap.add(flat) = scalar_component;
+                    }
+                }
+            }
+        });
+    }
+    if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(BasisError::InvalidInput(
+            "radial scalar evaluation failed during scalar derivative construction".into(),
+        ));
+    }
+
+    let op = ImplicitDesignPsiDerivative::new(
+        phi_values,
+        q_values,
+        t_values,
+        axis_components,
+        ident_transform,
+        full_ident_transform,
+        n,
+        k,
+        n_poly,
+        1,
+    )
+    .with_psi_scale_share(psi_scale_share);
+
+    Ok(ScalarDesignPsiDerivatives {
+        design_first: op.materialize_first(0)?,
+        design_second_diag: op.materialize_second_diag(0)?,
         implicit_operator: Some(op),
     })
 }
@@ -8629,77 +8832,21 @@ fn build_matern_design_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
-    workspace: &mut BasisWorkspace,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let n = data.nrows();
+    ) -> Result<ScalarDesignPsiDerivatives, BasisError> {
     let k = centers.nrows();
-    let d = data.ncols();
-    let mut kernel_psi = Array2::<f64>::zeros((n, k));
-    let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
-    if let Some(eta) = aniso_log_scales {
-        let par_result: Result<(), BasisError> = kernel_psi
-            .axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .zip(kernel_psi_psi.axis_iter_mut(Axis(0)).into_par_iter())
-            .enumerate()
-            .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
-                let mut data_row_buf = vec![0.0; d];
-                let mut center_buf = vec![0.0; d];
-                for a in 0..d {
-                    data_row_buf[a] = data[[i, a]];
-                }
-                for j in 0..k {
-                    for a in 0..d {
-                        center_buf[a] = centers[[j, a]];
-                    }
-                    let r = aniso_distance(&data_row_buf, &center_buf, eta);
-                    row_psi[j] =
-                        matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
-                    row_psi_psi[j] = matern_kernel_log_kappasecond_derivative_from_distance(
-                        r,
-                        length_scale,
-                        nu,
-                    )?;
-                }
-                Ok(())
-            });
-        par_result?;
-    } else {
-        let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
-        let par_result: Result<(), BasisError> = kernel_psi
-            .axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .zip(kernel_psi_psi.axis_iter_mut(Axis(0)).into_par_iter())
-            .enumerate()
-            .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
-                for j in 0..k {
-                    let r = data_center_r[[i, j]];
-                    row_psi[j] =
-                        matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
-                    row_psi_psi[j] = matern_kernel_log_kappasecond_derivative_from_distance(
-                        r,
-                        length_scale,
-                        nu,
-                    )?;
-                }
-                Ok(())
-            });
-        par_result?;
-    }
-    let (kernel_psi, kernel_psi_psi) = if let Some(z) = z_opt {
-        (fast_ab(&kernel_psi, z), fast_ab(&kernel_psi_psi, z))
-    } else {
-        (kernel_psi, kernel_psi_psi)
-    };
-    let cols = kernel_psi.ncols();
-    let total_cols = cols + usize::from(include_intercept);
-    let mut out_psi = Array2::<f64>::zeros((n, total_cols));
-    let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
-    out_psi.slice_mut(s![.., 0..cols]).assign(&kernel_psi);
-    out_psi_psi
-        .slice_mut(s![.., 0..cols])
-        .assign(&kernel_psi_psi);
-    Ok((out_psi, out_psi_psi))
+    let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
+    let total_cols = kernel_cols + usize::from(include_intercept);
+    build_scalar_design_psi_derivatives_shared(
+        data,
+        centers,
+        aniso_log_scales,
+        total_cols,
+        z_opt.cloned(),
+        None,
+        usize::from(include_intercept),
+        RadialScalarKind::Matern { length_scale, nu },
+        0.0,
+    )
 }
 
 fn build_matern_double_penalty_primarywith_psi_derivatives(
@@ -8806,7 +8953,7 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
     let aniso = spec.aniso_log_scales.as_deref();
-    let (design_derivative, _) = build_matern_design_psi_derivatives(
+    let design_derivatives = build_matern_design_psi_derivatives(
         data,
         centers.view(),
         spec.length_scale,
@@ -8814,7 +8961,6 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
         spec.include_intercept,
         z_opt.as_ref(),
         aniso,
-        workspace,
     )?;
     let penalties_derivative = if spec.double_penalty {
         let base = build_matern_basiswithworkspace(data, spec, workspace)?;
@@ -8841,8 +8987,9 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
     };
 
     Ok(BasisPsiDerivativeResult {
-        design_derivative,
+        design_derivative: design_derivatives.design_first,
         penalties_derivative,
+        implicit_operator: design_derivatives.implicit_operator,
     })
 }
 
@@ -8864,7 +9011,7 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
     let aniso = spec.aniso_log_scales.as_deref();
-    let (_, designsecond_derivative) = build_matern_design_psi_derivatives(
+    let design_derivatives = build_matern_design_psi_derivatives(
         data,
         centers.view(),
         spec.length_scale,
@@ -8872,7 +9019,6 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
         spec.include_intercept,
         z_opt.as_ref(),
         aniso,
-        workspace,
     )?;
     let penaltiessecond_derivative = if spec.double_penalty {
         let base = build_matern_basiswithworkspace(data, spec, workspace)?;
@@ -8899,8 +9045,9 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
     };
 
     Ok(BasisPsiSecondDerivativeResult {
-        designsecond_derivative,
+        designsecond_derivative: design_derivatives.design_second_diag,
         penaltiessecond_derivative,
+        implicit_operator: design_derivatives.implicit_operator,
     })
 }
 
@@ -10401,7 +10548,7 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     spec: &DuchonBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+) -> Result<ScalarDesignPsiDerivatives, BasisError> {
     let length_scale = spec.length_scale.ok_or_else(|| {
         BasisError::InvalidInput(
             "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale"
@@ -10419,75 +10566,37 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     let z_kernel =
         kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
-    let n = data.nrows();
-    let k = centers.nrows();
-    let d = data.ncols();
     let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
-    let kernel_cols = z_kernel.ncols();
-    let total_cols = kernel_cols + poly_cols;
-    let mut out_psi = Array2::<f64>::zeros((n, total_cols));
-    let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
-    let derivative_result: Result<(), BasisError> = out_psi
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(out_psi_psi.axis_iter_mut(Axis(0)).into_par_iter())
-        .enumerate()
-        .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
-            let mut local_psi = vec![0.0; k];
-            let mut local_psi_psi = vec![0.0; k];
-            let aniso = spec.aniso_log_scales.as_deref();
-            // Pre-allocate row/center buffers once per thread.
-            let mut data_row_buf = vec![0.0; d];
-            let mut center_buf = vec![0.0; d];
-            if aniso.is_some() {
-                for a in 0..d {
-                    data_row_buf[a] = data[[i, a]];
-                }
-            }
-            for j in 0..k {
-                let r = if let Some(eta) = aniso {
-                    for a in 0..d {
-                        center_buf[a] = centers[[j, a]];
-                    }
-                    aniso_distance(&data_row_buf, &center_buf, eta)
-                } else {
-                    let mut dist2 = 0.0;
-                    for axis in 0..d {
-                        let delta = data[[i, axis]] - centers[[j, axis]];
-                        dist2 += delta * delta;
-                    }
-                    dist2.sqrt()
-                };
-                let core =
-                    duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, d, &coeffs)?;
-                local_psi[j] = core.phi.psi;
-                local_psi_psi[j] = core.phi.psi_psi;
-            }
-            for col in 0..kernel_cols {
-                let mut acc_psi = 0.0;
-                let mut acc_psi_psi = 0.0;
-                for j in 0..k {
-                    let z_jc = z_kernel[[j, col]];
-                    acc_psi += local_psi[j] * z_jc;
-                    acc_psi_psi += local_psi_psi[j] * z_jc;
-                }
-                row_psi[col] = acc_psi;
-                row_psi_psi[col] = acc_psi_psi;
-            }
-            Ok(())
-        });
-    derivative_result?;
-    if let Some(zf) = identifiability_transform {
-        if total_cols != zf.nrows() {
-            return Err(BasisError::DimensionMismatch(format!(
-                "Duchon identifiability transform mismatch in design derivatives: local cols={}, transform rows={}",
-                total_cols,
-                zf.nrows()
-            )));
-        }
-        return Ok((fast_ab(&out_psi, zf), fast_ab(&out_psi_psi, zf)));
+    let p_padded = z_kernel.ncols() + poly_cols;
+    if let Some(zf) = identifiability_transform
+        && p_padded != zf.nrows()
+    {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Duchon identifiability transform mismatch in design derivatives: local cols={}, transform rows={}",
+            p_padded,
+            zf.nrows()
+        )));
     }
-    Ok((out_psi, out_psi_psi))
+    let p_final = identifiability_transform
+        .map(|zf| zf.ncols())
+        .unwrap_or(p_padded);
+    build_scalar_design_psi_derivatives_shared(
+        data,
+        centers,
+        spec.aniso_log_scales.as_deref(),
+        p_final,
+        Some(z_kernel),
+        identifiability_transform.cloned(),
+        poly_cols,
+        RadialScalarKind::Duchon {
+            length_scale,
+            p_order,
+            s_order,
+            dim: data.ncols(),
+            coeffs,
+        },
+        duchon_scaling_exponent(p_order, s_order, data.ncols()),
+    )
 }
 
 pub fn build_duchon_basis_log_kappa_derivative(
@@ -10505,7 +10614,7 @@ pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
     let (centers, identifiability_transform) =
         prepare_duchon_derivative_contextwithworkspace(data, spec, workspace)?;
-    let (design_derivative, _) = build_duchon_design_psi_derivativeswithworkspace(
+    let design_derivatives = build_duchon_design_psi_derivativeswithworkspace(
         data,
         centers.view(),
         spec,
@@ -10519,8 +10628,9 @@ pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
         workspace,
     )?;
     Ok(BasisPsiDerivativeResult {
-        design_derivative,
+        design_derivative: design_derivatives.design_first,
         penalties_derivative,
+        implicit_operator: design_derivatives.implicit_operator,
     })
 }
 
@@ -10539,7 +10649,7 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
     let (centers, identifiability_transform) =
         prepare_duchon_derivative_contextwithworkspace(data, spec, workspace)?;
-    let (_, designsecond_derivative) = build_duchon_design_psi_derivativeswithworkspace(
+    let design_derivatives = build_duchon_design_psi_derivativeswithworkspace(
         data,
         centers.view(),
         spec,
@@ -10553,8 +10663,9 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
         workspace,
     )?;
     Ok(BasisPsiSecondDerivativeResult {
-        designsecond_derivative,
+        designsecond_derivative: design_derivatives.design_second_diag,
         penaltiessecond_derivative,
+        implicit_operator: design_derivatives.implicit_operator,
     })
 }
 
@@ -11668,6 +11779,7 @@ pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
     Ok(BasisPsiDerivativeResult {
         design_derivative,
         penalties_derivative,
+        implicit_operator: None,
     })
 }
 
@@ -11715,6 +11827,7 @@ pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
     Ok(BasisPsiSecondDerivativeResult {
         designsecond_derivative,
         penaltiessecond_derivative,
+        implicit_operator: None,
     })
 }
 

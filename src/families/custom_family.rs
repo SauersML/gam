@@ -2710,21 +2710,37 @@ pub(crate) fn second_psi_linear_map<'a>(
 
 pub(crate) struct CustomFamilyJointDesignChannel {
     range: Range<usize>,
-    design: Arc<Array2<f64>>,
+    design: DesignMatrix,
     psi_derivative: Option<CustomFamilyPsiDesignAction>,
 }
 
 impl CustomFamilyJointDesignChannel {
-    pub(crate) fn new(
+    pub(crate) fn new<D>(
         range: Range<usize>,
-        design: Arc<Array2<f64>>,
+        design: D,
         psi_derivative: Option<CustomFamilyPsiDesignAction>,
-    ) -> Self {
+    ) -> Self
+    where
+        D: Into<DesignMatrix>,
+    {
         Self {
             range,
-            design,
+            design: design.into(),
             psi_derivative,
         }
+    }
+
+    fn coefficients(&self, full: &Array1<f64>) -> Array1<f64> {
+        full.slice(ndarray::s![self.range.clone()]).to_owned()
+    }
+
+    fn apply(&self, full: &Array1<f64>) -> Array1<f64> {
+        let coeffs = self.coefficients(full);
+        self.design.matrixvectormultiply(&coeffs)
+    }
+
+    fn apply_transpose(&self, values: &Array1<f64>) -> Array1<f64> {
+        self.design.transpose_vector_multiply(values)
     }
 }
 
@@ -2795,11 +2811,7 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
         let base_vals: Vec<Array1<f64>> = self
             .channels
             .iter()
-            .map(|channel| {
-                channel
-                    .design
-                    .dot(&v.slice(ndarray::s![channel.range.clone()]))
-            })
+            .map(|channel| channel.apply(v))
             .collect();
         let deriv_vals: Vec<Option<Array1<f64>>> = self
             .channels
@@ -2821,7 +2833,7 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
             let left = &self.channels[pair.left_channel];
             let right_base = &base_vals[pair.right_channel];
             let weighted_drift = &pair.drift_weights * right_base;
-            let mut contrib = left.design.t().dot(&weighted_drift);
+            let mut contrib = left.apply_transpose(&weighted_drift);
 
             if let Some(left_deriv) = left.psi_derivative.as_ref() {
                 let weighted_right = &pair.weights * right_base;
@@ -2830,7 +2842,7 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
 
             if let Some(right_deriv) = deriv_vals[pair.right_channel].as_ref() {
                 let weighted_right = &pair.weights * right_deriv;
-                contrib += &left.design.t().dot(&weighted_right);
+                contrib += &left.apply_transpose(&weighted_right);
             }
 
             let mut out_slice = out.slice_mut(ndarray::s![left.range.clone()]);
@@ -2846,20 +2858,12 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
         let base_v: Vec<Array1<f64>> = self
             .channels
             .iter()
-            .map(|channel| {
-                channel
-                    .design
-                    .dot(&v.slice(ndarray::s![channel.range.clone()]))
-            })
+            .map(|channel| channel.apply(v))
             .collect();
         let base_u: Vec<Array1<f64>> = self
             .channels
             .iter()
-            .map(|channel| {
-                channel
-                    .design
-                    .dot(&u.slice(ndarray::s![channel.range.clone()]))
-            })
+            .map(|channel| channel.apply(u))
             .collect();
         let deriv_v: Vec<Option<Array1<f64>>> = self
             .channels
@@ -2915,11 +2919,7 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
             let base_vals: Vec<Array1<f64>> = self
                 .channels
                 .iter()
-                .map(|channel| {
-                    channel
-                        .design
-                        .dot(&basis.slice(ndarray::s![channel.range.clone()]))
-                })
+                .map(|channel| channel.apply(&basis))
                 .collect();
             let deriv_vals: Vec<Option<Array1<f64>>> = self
                 .channels
@@ -2935,14 +2935,14 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
                 let left = &self.channels[pair.left_channel];
                 let right_base = &base_vals[pair.right_channel];
                 let weighted_drift = &pair.drift_weights * right_base;
-                let mut contrib = left.design.t().dot(&weighted_drift);
+                let mut contrib = left.apply_transpose(&weighted_drift);
                 if let Some(left_deriv) = left.psi_derivative.as_ref() {
                     let weighted_right = &pair.weights * right_base;
                     contrib += &left_deriv.transpose_mul(weighted_right.view());
                 }
                 if let Some(right_deriv) = deriv_vals[pair.right_channel].as_ref() {
                     let weighted_right = &pair.weights * right_deriv;
-                    contrib += &left.design.t().dot(&weighted_right);
+                    contrib += &left.apply_transpose(&weighted_right);
                 }
                 col.slice_mut(ndarray::s![left.range.clone()])
                     .scaled_add(1.0, &contrib);

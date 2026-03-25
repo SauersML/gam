@@ -26,6 +26,42 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Matrix-free outer Hessian operator.
+///
+/// This is the exact outer Hessian action `H_outer * v` evaluated at the
+/// current outer point, without requiring dense materialization.
+pub trait OuterHessianOperator: Send + Sync {
+    fn dim(&self) -> usize;
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String>;
+
+    fn materialize_dense(&self) -> Result<Array2<f64>, String> {
+        let dim = self.dim();
+        let mut dense = Array2::<f64>::zeros((dim, dim));
+        let mut basis = Array1::<f64>::zeros(dim);
+        for col in 0..dim {
+            basis[col] = 1.0;
+            let hv = self.matvec(&basis)?;
+            basis[col] = 0.0;
+            if hv.len() != dim {
+                return Err(format!(
+                    "outer Hessian operator matvec length mismatch: got {}, expected {}",
+                    hv.len(),
+                    dim
+                ));
+            }
+            dense.column_mut(col).assign(&hv);
+        }
+        for row in 0..dim {
+            for col in (row + 1)..dim {
+                let sym = 0.5 * (dense[[row, col]] + dense[[col, row]]);
+                dense[[row, col]] = sym;
+                dense[[col, row]] = sym;
+            }
+        }
+        Ok(dense)
+    }
+}
+
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Derivative {
@@ -480,7 +516,6 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
 /// The Hessian field uses [`HessianResult`] instead of `Option<Array2<f64>>`
 /// to make the presence/absence of an analytic Hessian explicit and
 /// pattern-matchable.
-#[derive(Clone, Debug)]
 pub struct OuterEval {
     pub cost: f64,
     pub gradient: Array1<f64>,
@@ -503,14 +538,61 @@ impl OuterEval {
 }
 
 /// Explicit Hessian result replacing `Option<Array2<f64>>`.
-#[derive(Clone, Debug)]
 pub enum HessianResult {
     /// Analytic Hessian was computed and returned.
     Analytic(Array2<f64>),
+    /// Analytic Hessian is available as an exact Hessian-vector product.
+    Operator(Arc<dyn OuterHessianOperator>),
     /// No analytic Hessian available for this model path.
     /// The runner must use the [`HessianSource`] from the [`OuterPlan`]
     /// to decide what to do (FD, BFGS, etc.).
     Unavailable,
+}
+
+impl Clone for OuterEval {
+    fn clone(&self) -> Self {
+        Self {
+            cost: self.cost,
+            gradient: self.gradient.clone(),
+            hessian: self.hessian.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for OuterEval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OuterEval")
+            .field("cost", &self.cost)
+            .field("gradient", &self.gradient)
+            .field("hessian", &self.hessian)
+            .finish()
+    }
+}
+
+impl Clone for HessianResult {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Analytic(h) => Self::Analytic(h.clone()),
+            Self::Operator(op) => Self::Operator(Arc::clone(op)),
+            Self::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl std::fmt::Debug for HessianResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Analytic(h) => f
+                .debug_tuple("Analytic")
+                .field(&format!("{}x{}", h.nrows(), h.ncols()))
+                .finish(),
+            Self::Operator(op) => f
+                .debug_tuple("Operator")
+                .field(&format!("dim={}", op.dim()))
+                .finish(),
+            Self::Unavailable => f.write_str("Unavailable"),
+        }
+    }
 }
 
 impl HessianResult {
@@ -520,22 +602,42 @@ impl HessianResult {
     pub fn unwrap_analytic(self) -> Array2<f64> {
         match self {
             HessianResult::Analytic(h) => h,
+            HessianResult::Operator(_) => {
+                panic!("expected dense analytic Hessian but got HessianResult::Operator")
+            }
             HessianResult::Unavailable => {
                 panic!("expected analytic Hessian but got HessianResult::Unavailable")
             }
         }
     }
 
-    /// Returns `true` if an analytic Hessian is present.
+    /// Returns `true` if an analytic Hessian is present in any exact form.
     pub fn is_analytic(&self) -> bool {
-        matches!(self, HessianResult::Analytic(_))
+        matches!(self, HessianResult::Analytic(_) | HessianResult::Operator(_))
     }
 
     /// Convert to the optional Hessian shape used by the opt bridge.
     pub fn into_option(self) -> Option<Array2<f64>> {
         match self {
             HessianResult::Analytic(h) => Some(h),
+            HessianResult::Operator(_) => None,
             HessianResult::Unavailable => None,
+        }
+    }
+
+    pub fn dim(&self) -> Option<usize> {
+        match self {
+            HessianResult::Analytic(h) => Some(h.nrows()),
+            HessianResult::Operator(op) => Some(op.dim()),
+            HessianResult::Unavailable => None,
+        }
+    }
+
+    pub fn materialize_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        match self {
+            HessianResult::Analytic(h) => Ok(Some(h.clone())),
+            HessianResult::Operator(op) => op.materialize_dense().map(Some),
+            HessianResult::Unavailable => Ok(None),
         }
     }
 }
@@ -717,13 +819,27 @@ fn finite_outer_eval_or_error(
             "{context}: objective returned a non-finite gradient"
         )));
     }
-    if let HessianResult::Analytic(ref hessian) = eval.hessian {
-        layout.validate_hessian_shape(hessian, context)?;
-        if !hessian.iter().all(|v| v.is_finite()) {
-            return Err(ObjectiveEvalError::recoverable(format!(
-                "{context}: objective returned a non-finite Hessian"
-            )));
+    match &eval.hessian {
+        HessianResult::Analytic(hessian) => {
+            layout.validate_hessian_shape(hessian, context)?;
+            if !hessian.iter().all(|v| v.is_finite()) {
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "{context}: objective returned a non-finite Hessian"
+                )));
+            }
         }
+        HessianResult::Operator(op) => {
+            if op.dim() != layout.n_params {
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "{context}: outer Hessian operator dimension mismatch: got {}, expected {} (rho_dim={}, psi_dim={})",
+                    op.dim(),
+                    layout.n_params,
+                    layout.rho_dim(),
+                    layout.psi_dim
+                )));
+            }
+        }
+        HessianResult::Unavailable => {}
     }
     Ok(eval)
 }
@@ -1331,6 +1447,322 @@ pub struct OuterResult {
     pub converged: bool,
     /// Which plan was actually used (may differ from initial if fallback fired).
     pub plan_used: OuterPlan,
+}
+
+const OPERATOR_TRUST_RADIUS_INIT: f64 = 1.0;
+const OPERATOR_TRUST_RADIUS_MAX: f64 = 1.0e6;
+const OPERATOR_ETA_ACCEPT: f64 = 1.0e-4;
+
+fn project_to_bounds(
+    x: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+) -> Array1<f64> {
+    match bounds {
+        Some((lower, upper)) => {
+            let mut out = x.clone();
+            for idx in 0..out.len() {
+                out[idx] = out[idx].clamp(lower[idx], upper[idx]);
+            }
+            out
+        }
+        None => x.clone(),
+    }
+}
+
+fn projected_gradient(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+) -> Array1<f64> {
+    let mut out = gradient.clone();
+    if let Some((lower, upper)) = bounds {
+        for idx in 0..out.len() {
+            let at_lower = x[idx] <= lower[idx] + 1e-10;
+            let at_upper = x[idx] >= upper[idx] - 1e-10;
+            if (at_lower && gradient[idx] > 0.0) || (at_upper && gradient[idx] < 0.0) {
+                out[idx] = 0.0;
+            }
+        }
+    }
+    out
+}
+
+fn active_mask(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+) -> Vec<bool> {
+    match bounds {
+        Some((lower, upper)) => (0..x.len())
+            .map(|idx| {
+                let at_lower = x[idx] <= lower[idx] + 1e-10;
+                let at_upper = x[idx] >= upper[idx] - 1e-10;
+                (at_lower && gradient[idx] > 0.0) || (at_upper && gradient[idx] < 0.0)
+            })
+            .collect(),
+        None => vec![false; x.len()],
+    }
+}
+
+fn masked_matvec(
+    op: &dyn OuterHessianOperator,
+    vector: &Array1<f64>,
+    active: &[bool],
+) -> Result<Array1<f64>, String> {
+    let mut masked = vector.clone();
+    for idx in 0..masked.len() {
+        if active[idx] {
+            masked[idx] = 0.0;
+        }
+    }
+    let mut out = op.matvec(&masked)?;
+    if out.len() != masked.len() {
+        return Err(format!(
+            "outer Hessian operator matvec length mismatch: got {}, expected {}",
+            out.len(),
+            masked.len()
+        ));
+    }
+    for idx in 0..out.len() {
+        if active[idx] {
+            out[idx] = 0.0;
+        }
+    }
+    Ok(out)
+}
+
+fn predicted_decrease_from_operator(
+    op: &dyn OuterHessianOperator,
+    gradient: &Array1<f64>,
+    step: &Array1<f64>,
+    active: &[bool],
+) -> Result<f64, String> {
+    let hs = if active.iter().copied().any(|flag| flag) {
+        masked_matvec(op, step, active)?
+    } else {
+        op.matvec(step)?
+    };
+    Ok(-(gradient.dot(step) + 0.5 * step.dot(&hs)))
+}
+
+fn steihaug_toint_step_operator(
+    op: &dyn OuterHessianOperator,
+    gradient: &Array1<f64>,
+    trust_radius: f64,
+    active: &[bool],
+) -> Result<Option<(Array1<f64>, f64)>, String> {
+    let n = gradient.len();
+    let g_norm = gradient.dot(gradient).sqrt();
+    if !g_norm.is_finite() || g_norm <= 0.0 {
+        return Ok(None);
+    }
+
+    let mut p = Array1::<f64>::zeros(n);
+    let mut r = gradient.clone();
+    for idx in 0..n {
+        if active[idx] {
+            r[idx] = 0.0;
+        }
+    }
+    let mut d = r.mapv(|value| -value);
+    let mut rtr = r.dot(&r);
+    if !rtr.is_finite() || rtr <= 0.0 {
+        return Ok(None);
+    }
+
+    let cg_tol = (1e-6 * g_norm).max(1e-12);
+    let max_iter = (2 * n).max(10);
+
+    for _ in 0..max_iter {
+        let bd = if active.iter().copied().any(|flag| flag) {
+            masked_matvec(op, &d, active)?
+        } else {
+            op.matvec(&d)?
+        };
+        let d_bd = d.dot(&bd);
+        if !d_bd.is_finite() || d_bd <= 1e-14 * d.dot(&d).max(1.0) {
+            let d_norm_sq = d.dot(&d);
+            if d_norm_sq <= 0.0 {
+                return Ok(None);
+            }
+            let p_dot_d = p.dot(&d);
+            let p_norm_sq = p.dot(&p);
+            let disc = p_dot_d * p_dot_d - d_norm_sq * (p_norm_sq - trust_radius * trust_radius);
+            if disc < 0.0 {
+                return Ok(None);
+            }
+            let tau = (-p_dot_d + disc.sqrt()) / d_norm_sq;
+            let mut boundary = p.clone();
+            boundary.scaled_add(tau, &d);
+            let pred = predicted_decrease_from_operator(op, gradient, &boundary, active)?;
+            return Ok((pred.is_finite() && pred > 0.0).then_some((boundary, pred)));
+        }
+
+        let alpha = rtr / d_bd;
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Ok(None);
+        }
+
+        let mut p_next = p.clone();
+        p_next.scaled_add(alpha, &d);
+        let p_next_norm = p_next.dot(&p_next).sqrt();
+        if p_next_norm >= trust_radius {
+            let d_norm_sq = d.dot(&d);
+            if d_norm_sq <= 0.0 {
+                return Ok(None);
+            }
+            let p_dot_d = p.dot(&d);
+            let p_norm_sq = p.dot(&p);
+            let disc = p_dot_d * p_dot_d - d_norm_sq * (p_norm_sq - trust_radius * trust_radius);
+            if disc < 0.0 {
+                return Ok(None);
+            }
+            let tau = (-p_dot_d + disc.sqrt()) / d_norm_sq;
+            let mut boundary = p.clone();
+            boundary.scaled_add(tau, &d);
+            let pred = predicted_decrease_from_operator(op, gradient, &boundary, active)?;
+            return Ok((pred.is_finite() && pred > 0.0).then_some((boundary, pred)));
+        }
+
+        r.scaled_add(alpha, &bd);
+        for idx in 0..n {
+            if active[idx] {
+                r[idx] = 0.0;
+            }
+        }
+        let rtr_next = r.dot(&r);
+        if !rtr_next.is_finite() {
+            return Ok(None);
+        }
+
+        p = p_next;
+        if rtr_next.sqrt() <= cg_tol {
+            let pred = predicted_decrease_from_operator(op, gradient, &p, active)?;
+            return Ok((pred.is_finite() && pred > 0.0).then_some((p, pred)));
+        }
+
+        let beta = rtr_next / rtr.max(1e-32);
+        if !beta.is_finite() || beta < 0.0 {
+            return Ok(None);
+        }
+        d *= beta;
+        d -= &r;
+        for idx in 0..n {
+            if active[idx] {
+                d[idx] = 0.0;
+            }
+        }
+        rtr = rtr_next;
+    }
+
+    let pred = predicted_decrease_from_operator(op, gradient, &p, active)?;
+    Ok((pred.is_finite() && pred > 0.0).then_some((p, pred)))
+}
+
+fn run_operator_trust_region(
+    obj: &mut dyn OuterObjective,
+    seed: &Array1<f64>,
+    layout: OuterThetaLayout,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+    tolerance: f64,
+    max_iter: usize,
+    initial_eval: OuterEval,
+    plan: OuterPlan,
+) -> Result<OuterResult, EstimationError> {
+    let mut x_k = project_to_bounds(seed, bounds);
+    let mut eval_k = initial_eval;
+    let mut trust_radius = OPERATOR_TRUST_RADIUS_INIT;
+
+    for iter in 0..max_iter {
+        let g_proj = projected_gradient(&x_k, &eval_k.gradient, bounds);
+        let g_norm = g_proj.dot(&g_proj).sqrt();
+        if g_norm.is_finite() && g_norm <= tolerance {
+            return Ok(OuterResult {
+                rho: x_k,
+                final_value: eval_k.cost,
+                iterations: iter,
+                final_grad_norm: g_norm,
+                final_gradient: Some(eval_k.gradient),
+                final_hessian: None,
+                converged: true,
+                plan_used: plan,
+            });
+        }
+
+        let HessianResult::Operator(op_arc) = &eval_k.hessian else {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "operator trust-region received a non-operator Hessian".to_string(),
+            ));
+        };
+        let active = active_mask(&x_k, &eval_k.gradient, bounds);
+        let Some((trial_step, pred_dec_free)) =
+            steihaug_toint_step_operator(op_arc.as_ref(), &g_proj, trust_radius, &active)
+                .map_err(EstimationError::RemlOptimizationFailed)?
+        else {
+            trust_radius = (trust_radius * 0.5).max(1e-12);
+            continue;
+        };
+
+        let x_trial_raw = &x_k + &trial_step;
+        let x_trial = project_to_bounds(&x_trial_raw, bounds);
+        let s_trial = &x_trial - &x_k;
+        let s_norm = s_trial.dot(&s_trial).sqrt();
+        if !s_norm.is_finite() || s_norm <= 1e-16 {
+            trust_radius = (trust_radius * 0.5).max(1e-12);
+            continue;
+        }
+
+        let pred_dec = if (&s_trial - &trial_step).dot(&(&s_trial - &trial_step)).sqrt()
+            > 1e-8 * (1.0 + trial_step.dot(&trial_step).sqrt())
+        {
+            predicted_decrease_from_operator(op_arc.as_ref(), &g_proj, &s_trial, &active)
+                .map_err(EstimationError::RemlOptimizationFailed)?
+        } else {
+            pred_dec_free
+        };
+        if !pred_dec.is_finite() || pred_dec <= 0.0 {
+            trust_radius = (trust_radius * 0.5).max(1e-12);
+            continue;
+        }
+
+        let eval_trial = obj.eval(&x_trial)?;
+        let eval_trial = finite_outer_eval_or_error(
+            "outer operator eval failed",
+            layout,
+            eval_trial,
+        )
+        .map_err(|err| match err {
+            ObjectiveEvalError::Recoverable { message }
+            | ObjectiveEvalError::Fatal { message } => {
+                EstimationError::RemlOptimizationFailed(message)
+            }
+        })?;
+        let act_dec = eval_k.cost - eval_trial.cost;
+        let rho = act_dec / pred_dec;
+        if rho > 0.75 && s_norm > 0.99 * trust_radius {
+            trust_radius = (trust_radius * 2.0).min(OPERATOR_TRUST_RADIUS_MAX);
+        } else if rho < 0.25 {
+            trust_radius = (trust_radius * 0.5).max(1e-12);
+        }
+
+        if rho > OPERATOR_ETA_ACCEPT {
+            x_k = x_trial;
+            eval_k = eval_trial;
+        }
+    }
+
+    let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
+    let final_grad_norm = final_grad.dot(&final_grad).sqrt();
+    Ok(OuterResult {
+        rho: x_k,
+        final_value: eval_k.cost,
+        iterations: max_iter,
+        final_grad_norm,
+        final_gradient: Some(eval_k.gradient),
+        final_hessian: None,
+        converged: false,
+        plan_used: plan,
+    })
 }
 
 /// Run the outer smoothing-parameter optimization.
