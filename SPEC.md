@@ -1,4 +1,10 @@
 - Autodiff is never used outside of tests as hand-derived derivatives enable performance optimizations.
 - Finite differences is never preferred and should only be used if all other methods (including BFGS) are not feasible.
-- Posterior mean must always be the default.
+- Posterior mean must always be the default (never MAP).
 - Analytic, closed-forms should be supported in general for all model types.
+- Penalties must always be on the final function itself, never on the model coefficients.
+- Fitting and inference must be fast on all scales of data, but especially large-scale data where it matters the most (with seamless transitions between strategies).
+- The program must never run out of memory on reasonably-resourced computers.
+- REML (or LAML) always used, never GCV.
+- Penalties (prior towards no effect) should usually be applied, except when obvious (e.g., an intercept generally should not have a penalty).
+- The default choices should give the best model for the user.

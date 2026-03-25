@@ -5247,6 +5247,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: &[f64],
+    identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<
     (
@@ -5594,6 +5595,50 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         operator_share,
     );
 
+    let poly_cols = polynomial_block_from_order(centers, nullspace_order).ncols();
+
+    let project_operator = |mat: &Array2<f64>, row_dim: usize| -> Array2<f64> {
+        let kernel_cols = mat.ncols();
+        let total_cols = kernel_cols + poly_cols;
+        let mut padded = Array2::<f64>::zeros((row_dim, total_cols));
+        padded.slice_mut(s![.., 0..kernel_cols]).assign(mat);
+        if let Some(z) = identifiability_transform {
+            fast_ab(&padded, z)
+        } else {
+            padded
+        }
+    };
+
+    let d0 = project_operator(&d0_raw, p);
+    let d1 = project_operator(&d1_raw, p * d);
+    let d2 = project_operator(&d2_raw, p);
+    let d0_eta_proj: Vec<Array2<f64>> = d0_raw_eta.iter().map(|m| project_operator(m, p)).collect();
+    let d1_eta_proj: Vec<Array2<f64>> = d1_raw_eta
+        .iter()
+        .map(|m| project_operator(m, p * d))
+        .collect();
+    let d2_eta_proj: Vec<Array2<f64>> = d2_raw_eta.iter().map(|m| project_operator(m, p)).collect();
+    let d0_eta2_proj: Vec<Array2<f64>> =
+        d0_raw_eta2.iter().map(|m| project_operator(m, p)).collect();
+    let d1_eta2_proj: Vec<Array2<f64>> = d1_raw_eta2
+        .iter()
+        .map(|m| project_operator(m, p * d))
+        .collect();
+    let d2_eta2_proj: Vec<Array2<f64>> =
+        d2_raw_eta2.iter().map(|m| project_operator(m, p)).collect();
+    let d0_cross_proj: Vec<Array2<f64>> = d0_raw_eta_cross
+        .iter()
+        .map(|m| project_operator(m, p))
+        .collect();
+    let d1_cross_proj: Vec<Array2<f64>> = d1_raw_eta_cross
+        .iter()
+        .map(|m| project_operator(m, p * d))
+        .collect();
+    let d2_cross_proj: Vec<Array2<f64>> = d2_raw_eta_cross
+        .iter()
+        .map(|m| project_operator(m, p))
+        .collect();
+
     // Build raw Gram penalties (axis-independent) and per-axis derivatives + norms,
     // using the same PerOperatorInfo pattern as the Matérn case.
     struct PerOperatorInfo {
@@ -5632,9 +5677,9 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             }
         };
 
-    let op0_info = compute_operator_info(&d0_raw, &d0_raw_eta, &d0_raw_eta2);
-    let op1_info = compute_operator_info(&d1_raw, &d1_raw_eta, &d1_raw_eta2);
-    let op2_info = compute_operator_info(&d2_raw, &d2_raw_eta, &d2_raw_eta2);
+    let op0_info = compute_operator_info(&d0, &d0_eta_proj, &d0_eta2_proj);
+    let op1_info = compute_operator_info(&d1, &d1_eta_proj, &d1_eta2_proj);
+    let op2_info = compute_operator_info(&d2, &d2_eta_proj, &d2_eta2_proj);
 
     // Build penalty candidates and determine which are active.
     let (s0_norm, c0) = if op0_info.c > 1e-12 {
@@ -5723,24 +5768,24 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
         let s0_cross = compute_cross_for_op(
             &op0_info,
-            &d0_raw,
-            &d0_raw_eta[a],
-            &d0_raw_eta[b],
-            &d0_raw_eta_cross[ci_idx],
+            &d0,
+            &d0_eta_proj[a],
+            &d0_eta_proj[b],
+            &d0_cross_proj[ci_idx],
         );
         let s1_cross = compute_cross_for_op(
             &op1_info,
-            &d1_raw,
-            &d1_raw_eta[a],
-            &d1_raw_eta[b],
-            &d1_raw_eta_cross[ci_idx],
+            &d1,
+            &d1_eta_proj[a],
+            &d1_eta_proj[b],
+            &d1_cross_proj[ci_idx],
         );
         let s2_cross = compute_cross_for_op(
             &op2_info,
-            &d2_raw,
-            &d2_raw_eta[a],
-            &d2_raw_eta[b],
-            &d2_raw_eta_cross[ci_idx],
+            &d2,
+            &d2_eta_proj[a],
+            &d2_eta_proj[b],
+            &d2_cross_proj[ci_idx],
         );
 
         let pen_cross = active_operator_penalty_derivatives(
@@ -9167,6 +9212,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         spec.power,
         spec.nullspace_order,
         eta,
+        identifiability_transform.as_ref(),
         &mut workspace,
     )?;
 
@@ -17003,6 +17049,62 @@ mod tests {
             penalty_err < 5e-3,
             "Duchon public second-derivative penalty mismatch: {penalty_err}"
         );
+    }
+
+    #[test]
+    fn test_duchon_aniso_derivative_blocks_match_realized_smooth_width() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.2],
+            [0.3, 1.1],
+            [0.9, 0.8],
+            [0.4, 0.5],
+            [0.7, 0.1]
+        ];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: Some(0.9),
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::default(),
+            aniso_log_scales: Some(vec![0.0, 0.0]),
+        };
+
+        let basis = build_duchon_basis(data.view(), &spec).expect("aniso Duchon basis");
+        let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
+            .expect("aniso Duchon derivatives");
+        let expected_cols = basis.design.ncols();
+        assert_eq!(expected_cols, basis.penalties[0].ncols());
+
+        if let Some(op) = derivs.implicit_operator.as_ref() {
+            assert_eq!(op.p_out(), expected_cols);
+        }
+        for design in &derivs.design_first {
+            assert_eq!(design.ncols(), expected_cols);
+        }
+        for design in &derivs.design_second_diag {
+            assert_eq!(design.ncols(), expected_cols);
+        }
+        for penalties in &derivs.penalties_first {
+            for penalty in penalties {
+                assert_eq!(penalty.nrows(), expected_cols);
+                assert_eq!(penalty.ncols(), expected_cols);
+            }
+        }
+        for penalties in &derivs.penalties_second_diag {
+            for penalty in penalties {
+                assert_eq!(penalty.nrows(), expected_cols);
+                assert_eq!(penalty.ncols(), expected_cols);
+            }
+        }
+        assert_eq!(derivs.penalties_cross_pairs, vec![(0, 1)]);
+        for penalties in &derivs.penalties_cross {
+            for penalty in penalties {
+                assert_eq!(penalty.nrows(), expected_cols);
+                assert_eq!(penalty.ncols(), expected_cols);
+            }
+        }
     }
 
     #[test]

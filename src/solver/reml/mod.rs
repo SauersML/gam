@@ -24,15 +24,17 @@ pub(crate) mod unified;
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectionalHyperParam, EvalShared, FirthDenseOperator, GlmLikelihoodFamily, RemlConfig,
-        RemlState,
+        DirectionalHyperParam, EvalShared, FirthDenseOperator, GlmLikelihoodFamily,
+        HyperDesignDerivative, ImplicitDerivLevel, RemlConfig, RemlState,
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
     use crate::pirls::PirlsCoordinateFrame;
+    use crate::terms::basis::ImplicitDesignPsiDerivative;
     use crate::types::GlmLikelihoodSpec;
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
+    use std::sync::Arc;
 
     fn build_logit_state<'a>(
         y: &'a Array1<f64>,
@@ -95,6 +97,90 @@ mod tests {
         let (_, gradient, _) =
             state.compute_joint_hypercostgradienthessian(&theta, rho.len(), &[hyper])?;
         Ok(gradient[rho.len()])
+    }
+
+    #[test]
+    fn implicit_hyper_design_derivative_respects_full_model_embedding() {
+        let operator = ImplicitDesignPsiDerivative::new(
+            array![1.0, 2.0, 3.0, 4.0],
+            array![0.5, -1.0, 1.5, 2.0],
+            array![0.1, 0.2, 0.3, 0.4],
+            array![[1.0, 0.2], [0.5, 0.1], [1.5, 0.3], [2.0, 0.4]],
+            None,
+            None,
+            2,
+            2,
+            1,
+            2,
+        );
+        let local = operator
+            .materialize_first(0)
+            .expect("materialized first derivative");
+        assert_eq!(
+            local.ncols(),
+            3,
+            "operator-local derivative should stay smooth-local"
+        );
+
+        let implicit = HyperDesignDerivative::from_implicit(
+            Arc::new(operator),
+            ImplicitDerivLevel::First(0),
+            1..4,
+            5,
+        );
+        let embedded = HyperDesignDerivative::from_embedded(local.clone(), 1..4, 5);
+
+        assert_eq!(implicit.nrows(), embedded.nrows());
+        assert_eq!(implicit.ncols(), 5);
+        assert_eq!(implicit.materialize(), embedded.materialize());
+
+        let u = array![7.0, 1.5, -2.0, 0.25, -3.0];
+        let v = array![0.75, -1.25];
+        assert_eq!(
+            implicit.forward_mul_original(&u).expect("implicit forward"),
+            embedded.forward_mul_original(&u).expect("embedded forward")
+        );
+        assert_eq!(
+            implicit
+                .transpose_mul_original(&v)
+                .expect("implicit transpose"),
+            embedded
+                .transpose_mul_original(&v)
+                .expect("embedded transpose")
+        );
+
+        let qs = array![
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.5, 0.5],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+        ];
+        assert_eq!(
+            implicit
+                .transformed(&qs, None)
+                .expect("implicit transformed"),
+            embedded
+                .transformed(&qs, None)
+                .expect("embedded transformed")
+        );
+        let u_transformed = array![1.0, -0.5, 2.0];
+        assert_eq!(
+            implicit
+                .transformed_forward_mul(&qs, None, &u_transformed)
+                .expect("implicit transformed forward"),
+            embedded
+                .transformed_forward_mul(&qs, None, &u_transformed)
+                .expect("embedded transformed forward")
+        );
+        assert_eq!(
+            implicit
+                .transformed_transpose_mul(&qs, None, &v)
+                .expect("implicit transformed transpose"),
+            embedded
+                .transformed_transpose_mul(&qs, None, &v)
+                .expect("embedded transformed transpose")
+        );
     }
 
     #[test]
@@ -1638,13 +1724,15 @@ pub(crate) enum ImplicitDerivLevel {
 struct ImplicitDerivativeOp {
     operator: std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
     level: ImplicitDerivLevel,
+    global_range: Range<usize>,
+    total_dim: usize,
     /// Cached dense materialization (lazy, populated on first call to ops that need the full matrix).
     cached_dense: std::sync::Arc<std::sync::OnceLock<Array2<f64>>>,
 }
 
 impl ImplicitDerivativeOp {
-    fn materialize_dense(&self) -> &Array2<f64> {
-        self.cached_dense.get_or_init(|| match self.level {
+    fn materialize_local(&self) -> Array2<f64> {
+        match self.level {
             ImplicitDerivLevel::First(axis) => self.operator.materialize_first(axis).expect(
                 "radial scalar evaluation failed during implicit derivative materialization",
             ),
@@ -1658,6 +1746,16 @@ impl ImplicitDerivativeOp {
                     "radial scalar evaluation failed during implicit derivative materialization",
                 )
             }
+        }
+    }
+
+    fn materialize_dense(&self) -> &Array2<f64> {
+        self.cached_dense.get_or_init(|| {
+            let local = self.materialize_local();
+            let mut out = Array2::<f64>::zeros((local.nrows(), self.total_dim));
+            out.slice_mut(s![.., self.global_range.clone()])
+                .assign(&local);
+            out
         })
     }
 
@@ -1666,11 +1764,11 @@ impl ImplicitDerivativeOp {
     }
 
     fn ncols(&self) -> usize {
-        self.operator.p_out()
+        self.total_dim
     }
 
     fn transpose_mul(&self, v: &Array1<f64>) -> Array1<f64> {
-        match self.level {
+        let local = match self.level {
             ImplicitDerivLevel::First(axis) => self
                 .operator
                 .transpose_mul(axis, &v.view())
@@ -1683,22 +1781,26 @@ impl ImplicitDerivativeOp {
                 .operator
                 .transpose_mul_second_cross(d, e, &v.view())
                 .expect("radial scalar evaluation failed during implicit derivative transpose_mul"),
-        }
+        };
+        let mut out = Array1::<f64>::zeros(self.total_dim);
+        out.slice_mut(s![self.global_range.clone()]).assign(&local);
+        out
     }
 
     fn forward_mul(&self, u: &Array1<f64>) -> Array1<f64> {
+        let u_local = u.slice(s![self.global_range.clone()]).to_owned();
         match self.level {
             ImplicitDerivLevel::First(axis) => self
                 .operator
-                .forward_mul(axis, &u.view())
+                .forward_mul(axis, &u_local.view())
                 .expect("radial scalar evaluation failed during implicit derivative forward_mul"),
             ImplicitDerivLevel::SecondDiag(axis) => self
                 .operator
-                .forward_mul_second_diag(axis, &u.view())
+                .forward_mul_second_diag(axis, &u_local.view())
                 .expect("radial scalar evaluation failed during implicit derivative forward_mul"),
             ImplicitDerivLevel::SecondCross(d, e) => self
                 .operator
-                .forward_mul_second_cross(d, e, &u.view())
+                .forward_mul_second_cross(d, e, &u_local.view())
                 .expect("radial scalar evaluation failed during implicit derivative forward_mul"),
         }
     }
@@ -1744,11 +1846,15 @@ impl HyperDesignDerivative {
     pub(crate) fn from_implicit(
         operator: std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
         level: ImplicitDerivLevel,
+        global_range: Range<usize>,
+        total_cols: usize,
     ) -> Self {
         Self {
             storage: DerivativeMatrixStorage::Implicit(ImplicitDerivativeOp {
                 operator,
                 level,
+                global_range,
+                total_dim: total_cols,
                 cached_dense: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         }
