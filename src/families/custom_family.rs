@@ -13,7 +13,7 @@ use crate::smooth::{
 use crate::solver::active_set::solve_quadratic_with_linear_constraints;
 use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
-    BlockCoupledOperator, DispersionHandling, DriftDerivResult, EvalMode, FixedDriftDerivFn,
+    BlockCoupledOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
     MatrixFreeSpdOperator, compute_block_penalty_logdet_derivs, exact_intersection_nullity,
 };
@@ -29,6 +29,8 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
+
+pub use crate::solver::estimate::reml::unified::EvalMode;
 
 /// A penalty matrix that may be stored in Kronecker-factored form.
 ///

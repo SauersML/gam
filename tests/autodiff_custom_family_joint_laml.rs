@@ -435,7 +435,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             &array![rho],
             &derivative_blocks,
             None,
-            false,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
         )
         .expect("exact joint hyper eval");
         let (value_nd, grad_nd) = first_derivative(
@@ -505,7 +505,7 @@ fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space()
             &array![rho],
             &derivative_blocks,
             None,
-            false,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
         )
         .expect("constrained exact joint hyper eval");
         let (value_nd, grad_nd) = first_derivative(
@@ -592,7 +592,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             &array![rho],
             &derivative_blocks,
             None,
-            false,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
         )
         .expect("exact joint hyper eval");
         let (value_nd, grad_nd) = first_derivative(

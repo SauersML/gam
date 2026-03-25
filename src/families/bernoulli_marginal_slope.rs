@@ -7516,6 +7516,21 @@ mod tests {
         InverseLink::Standard(LinkFunction::Probit)
     }
 
+    fn bernoulli_row_work_order(
+        specs: &[ParameterBlockSpec],
+        n_rows: usize,
+        score_warp_dim: usize,
+        link_dev_dim: usize,
+    ) -> ExactOuterDerivativeOrder {
+        let directional_work = n_rows
+            .saturating_mul(score_warp_dim.saturating_add(link_dev_dim).saturating_add(1));
+        if directional_work == usize::MAX {
+            ExactOuterDerivativeOrder::First
+        } else {
+            cost_gated_outer_order(specs)
+        }
+    }
+
     fn empty_termspec() -> TermCollectionSpec {
         TermCollectionSpec {
             linear_terms: vec![],
