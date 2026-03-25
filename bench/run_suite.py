@@ -99,6 +99,7 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     "r_gamlss",
     "rust_gamlss",
     "rust_gamlss_marginal_slope",
+    "rust_gamlss_marginal_slope_aniso",
     "rust_gamlss_survival_marginal_slope",
     "r_gamboostlss",
     "r_bamlss",
@@ -3035,14 +3036,6 @@ def _scenario_fit_mapping(scenario_name):
             knots=50,
         ),
         "geo_subpop16_margslope_aniso_duchon16d_k50": dict(
-            family="binomial-logit",
-            smooth_cols=[f"pc{i}" for i in range(1, 17)],
-            smooth_basis="duchon",
-            linear_cols=[],
-            knots=50,
-            scale_dimensions=True,
-        ),
-        "geo_subpop16_margslope_aniso_duchon16d_k50_biobank": dict(
             family="binomial-logit",
             smooth_cols=[f"pc{i}" for i in range(1, 17)],
             smooth_basis="duchon",

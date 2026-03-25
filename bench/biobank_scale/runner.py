@@ -53,6 +53,9 @@ class MethodSpec:
     include_sigma: bool = False
     survival_likelihood: str | None = None
     survival_distribution: str | None = None
+    marginal_slope: bool = False
+    scale_dimensions: bool = False
+    z_column: str | None = None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -900,6 +903,13 @@ def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
                 if item.get("survival_distribution") is not None
                 else None
             ),
+            marginal_slope=bool(item.get("marginal_slope", False)),
+            scale_dimensions=bool(item.get("scale_dimensions", False)),
+            z_column=(
+                str(item["z_column"])
+                if item.get("z_column") is not None
+                else None
+            ),
         )
         validate_method_spec(spec)
         out.append(spec)
@@ -943,6 +953,76 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
         *[f"pc{i}_std" for i in range(1, 5)],
     ]
     return "phenotype ~ " + " + ".join(mean_terms), " + ".join(sigma_terms)
+
+
+def rust_marginal_slope_formula_classification(spec: MethodSpec) -> tuple[str, str]:
+    """Build mean and logslope formulas for 16D marginal-slope Duchon classification."""
+    pc_cols = ", ".join(f"pc{i}_std" for i in range(1, 17))
+    centers = int(spec.centers or 50)
+    spatial = f"duchon({pc_cols}, centers={centers}, order=0, power=1)"
+    mean_terms = [
+        "pgs_std",
+        "sex",
+        "smooth(age_entry_std)",
+        spatial,
+    ]
+    logslope_terms = [
+        "smooth(age_entry_std)",
+        spatial,
+    ]
+    mean_formula = "phenotype ~ " + " + ".join(mean_terms)
+    logslope_formula = " + ".join(logslope_terms)
+    return mean_formula, logslope_formula
+
+
+def run_rust_marginal_slope_classification(
+    spec: MethodSpec,
+    train_csv: Path,
+    test_csv: Path,
+    out_dir: Path,
+) -> dict[str, Any]:
+    """Run 16D marginal-slope Duchon classification with optional anisotropy."""
+    rust_bin = load_or_build_rust_binary()
+    mean_formula, logslope_formula = rust_marginal_slope_formula_classification(spec)
+    z_column = spec.z_column or "pgs_std"
+    model_path = out_dir / f"{spec.name}.model.json"
+    pred_path = out_dir / f"{spec.name}.pred.csv"
+    fit_cmd = [
+        str(rust_bin), "fit",
+        "--logslope-formula", logslope_formula,
+        "--z-column", z_column,
+        "--out", str(model_path),
+    ]
+    if spec.scale_dimensions:
+        fit_cmd.append("--scale-dimensions")
+    fit_cmd.extend([str(train_csv), mean_formula])
+    t0 = time.perf_counter()
+    rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
+    fit_sec = time.perf_counter() - t0
+    if rc != 0:
+        raise RuntimeError(err.strip() or out.strip() or f"{spec.name} marginal-slope fit failed")
+    pred_cmd = [str(rust_bin), "predict", str(model_path), str(test_csv), "--out", str(pred_path)]
+    t1 = time.perf_counter()
+    rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
+    predict_sec = time.perf_counter() - t1
+    if rc != 0:
+        raise RuntimeError(err.strip() or out.strip() or f"{spec.name} marginal-slope predict failed")
+    pred_rows = read_csv_rows(pred_path)
+    pred = np.array([float(r["mean"]) for r in pred_rows], dtype=float)
+    y_train = csv_numeric_column(train_csv, "phenotype")
+    y_test = csv_numeric_column(test_csv, "phenotype")
+    metrics = classification_metrics(y_test, pred, float(np.mean(y_train)))
+    return {
+        "fit_sec": fit_sec,
+        "predict_sec": predict_sec,
+        "metrics": metrics,
+        "prediction_path": str(pred_path),
+        "model_spec": (
+            f"Rust 16D Duchon marginal-slope"
+            f"{' aniso' if spec.scale_dimensions else ''}"
+            f" (z={z_column}, centers={spec.centers or 50}) holdout"
+        ),
+    }
 
 
 def rust_survival_formula_rhs(spec: MethodSpec) -> str:
@@ -1257,7 +1337,9 @@ def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path) -> dict[str, Any
     survival_train = prep_dir / "survival_train.csv"
     survival_test = prep_dir / "survival_test.csv"
     if spec.dataset == "disease":
-        if spec.backend == "rust_gam":
+        if spec.backend == "rust_gam" and spec.marginal_slope:
+            result = run_rust_marginal_slope_classification(spec, disease_train, disease_test, out_dir)
+        elif spec.backend == "rust_gam":
             result = run_rust_classification(spec, disease_train, disease_test, out_dir)
         elif spec.backend == "r_mgcv":
             result = run_r_mgcv_classification(spec, disease_train, disease_test, out_dir)

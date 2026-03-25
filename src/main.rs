@@ -243,6 +243,8 @@ struct FitArgs {
     predict_noise: Option<String>,
     /// Secondary RHS-only formula for the ancestry-varying log-slope surface
     /// in the Bernoulli marginal-slope family. Pass terms only, not `y ~ ...`.
+    /// `linkwiggle(...)` here routes into the anchored score-warp block for
+    /// marginal-slope families.
     #[arg(long = "logslope-formula")]
     logslope_formula: Option<String>,
     /// Column containing the latent-N(0,1) score z for the Bernoulli
@@ -1291,12 +1293,6 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
-    if parsed.linkwiggle.is_some() && args.disable_link_dev && args.disable_score_warp {
-        return Err(
-            "linkwiggle(...) routes into the bernoulli marginal-slope score-warp and link-deviation blocks; cannot disable both simultaneously"
-                .to_string(),
-        );
-    }
     if args.predict_noise.is_some() {
         return Err(
             "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
@@ -1318,12 +1314,6 @@ fn run_fit_bernoulli_marginal_slope(
     if parsed_logslope.linkspec.is_some() {
         return Err(
             "link(...) is not supported in --logslope-formula for the bernoulli marginal-slope family"
-                .to_string(),
-        );
-    }
-    if parsed_logslope.linkwiggle.is_some() {
-        return Err(
-            "linkwiggle(...) is not supported in --logslope-formula for the bernoulli marginal-slope family"
                 .to_string(),
         );
     }
@@ -1371,29 +1361,29 @@ fn run_fit_bernoulli_marginal_slope(
         &fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?,
         "bernoulli marginal-slope",
     )?;
-    let routed_link_dev = if args.disable_link_dev {
-        None
-    } else {
-        parsed
-            .linkwiggle
-            .as_ref()
-            .map(deviation_block_config_from_formula_linkwiggle)
-    };
-    let routed_score_warp = if args.disable_score_warp {
-        None
-    } else {
-        parsed
-            .linkwiggle
-            .as_ref()
-            .map(deviation_block_config_from_formula_linkwiggle)
-    };
+    let routed_deviations = route_marginal_slope_deviation_blocks(
+        parsed.linkwiggle.as_ref(),
+        parsed_logslope.linkwiggle.as_ref(),
+        args.disable_score_warp,
+        args.disable_link_dev,
+        "bernoulli marginal-slope",
+        "--logslope-formula",
+    )?;
+    let routed_link_dev = routed_deviations.link_dev;
+    let routed_score_warp = routed_deviations.score_warp;
     let requested_flex = routed_link_dev.is_some() || routed_score_warp.is_some();
     inference_notes.push(
         "bernoulli marginal-slope expects z to already be PIT-probit standardized to latent N(0,1) upstream".to_string(),
     );
     if parsed.linkwiggle.is_some() {
         inference_notes.push(
-            "bernoulli marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation and score-warp blocks while keeping the fixed probit base link"
+            "bernoulli marginal-slope routes main-formula linkwiggle(...) into its anchored internal link-deviation block while keeping the fixed probit base link"
+                .to_string(),
+        );
+    }
+    if parsed_logslope.linkwiggle.is_some() {
+        inference_notes.push(
+            "bernoulli marginal-slope routes --logslope-formula linkwiggle(...) into its anchored internal score-warp block while keeping the fixed probit base link"
                 .to_string(),
         );
     }
@@ -5047,12 +5037,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     .to_string(),
             );
         }
-        if parsed_logslope.linkwiggle.is_some() {
-            return Err(
-                "linkwiggle(...) is not supported in --logslope-formula for the survival marginal-slope family"
-                    .to_string(),
-            );
-        }
         let mut logslopespec =
             build_termspec(&parsed_logslope.terms, &ds, &col_map, &mut inference_notes)?;
         if args.scale_dimensions {
@@ -5064,25 +5048,24 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             .ok_or_else(|| format!("z column '{z_column_name}' not found"))?;
         let z = ds.values.column(z_col).to_owned();
 
-        let routed_link_dev = if args.disable_link_dev {
-            None
-        } else {
-            parsed
-                .linkwiggle
-                .as_ref()
-                .map(deviation_block_config_from_formula_linkwiggle)
-        };
-        let routed_score_warp = if args.disable_score_warp {
-            None
-        } else {
-            parsed
-                .linkwiggle
-                .as_ref()
-                .map(deviation_block_config_from_formula_linkwiggle)
-        };
+        let routed_deviations = route_marginal_slope_deviation_blocks(
+            parsed.linkwiggle.as_ref(),
+            parsed_logslope.linkwiggle.as_ref(),
+            args.disable_score_warp,
+            args.disable_link_dev,
+            "survival marginal-slope",
+            "--logslope-formula",
+        )?;
+        let routed_link_dev = routed_deviations.link_dev;
+        let routed_score_warp = routed_deviations.score_warp;
         if parsed.linkwiggle.is_some() {
             inference_notes.push(
-                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation and score-warp blocks while keeping the probit survival base link".to_string(),
+                "survival marginal-slope routes main-formula linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
+            );
+        }
+        if parsed_logslope.linkwiggle.is_some() {
+            inference_notes.push(
+                "survival marginal-slope routes --logslope-formula linkwiggle(...) into its anchored internal score-warp block while keeping the probit survival base link".to_string(),
             );
         }
         if routed_link_dev.is_none() && routed_score_warp.is_none() {
@@ -7670,6 +7653,43 @@ fn deviation_block_config_from_formula_linkwiggle(
         double_penalty: wiggle.double_penalty,
         monotonicity_eps: 1e-4,
     }
+}
+
+struct MarginalSlopeDeviationRouting {
+    score_warp: Option<DeviationBlockConfig>,
+    link_dev: Option<DeviationBlockConfig>,
+}
+
+fn route_marginal_slope_deviation_blocks(
+    main_linkwiggle: Option<&LinkWiggleFormulaSpec>,
+    logslope_linkwiggle: Option<&LinkWiggleFormulaSpec>,
+    disable_score_warp: bool,
+    disable_link_dev: bool,
+    family_label: &str,
+    logslope_flag: &str,
+) -> Result<MarginalSlopeDeviationRouting, String> {
+    if main_linkwiggle.is_some() && disable_link_dev {
+        return Err(format!(
+            "{family_label} main-formula linkwiggle(...) routes into the anchored internal link-deviation block; remove --disable-link-dev or remove linkwiggle(...) from the main formula"
+        ));
+    }
+    if logslope_linkwiggle.is_some() && disable_score_warp {
+        return Err(format!(
+            "{family_label} {logslope_flag} linkwiggle(...) routes into the anchored internal score-warp block; remove --disable-score-warp or remove linkwiggle(...) from {logslope_flag}"
+        ));
+    }
+    Ok(MarginalSlopeDeviationRouting {
+        score_warp: if disable_score_warp {
+            None
+        } else {
+            logslope_linkwiggle.map(deviation_block_config_from_formula_linkwiggle)
+        },
+        link_dev: if disable_link_dev {
+            None
+        } else {
+            main_linkwiggle.map(deviation_block_config_from_formula_linkwiggle)
+        },
+    })
 }
 
 fn hazard_loading_from_arg(
@@ -11113,6 +11133,66 @@ mod tests {
     }
 
     #[test]
+    fn cli_bernoulli_marginal_slope_routes_main_and_logslope_linkwiggles_to_distinct_blocks() {
+        let td = tempdir().expect("tempdir");
+        let train_path = td.path().join("train.csv");
+        let model_path = td.path().join("model.json");
+        write_bernoulli_marginal_slope_train_csv(&train_path);
+
+        run_fit(FitArgs {
+            data: train_path,
+            formula_positional:
+                "y ~ x + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")".to_string(),
+            predict_noise: None,
+            logslope_formula: Some(
+                "1 + linkwiggle(degree=3, internal_knots=4, penalty_order=\"2\")".to_string(),
+            ),
+            z_column: Some("z".to_string()),
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+            disable_score_warp: false,
+            disable_link_dev: false,
+            transformation_normal: false,
+            firth: false,
+            survival_likelihood: "transformation".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            adaptive_regularization: false,
+            scale_dimensions: false,
+            pilot_subsample_threshold: 0,
+            out: Some(model_path.clone()),
+        })
+        .expect("marginal-slope fit with split deviation blocks should succeed");
+
+        let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
+        assert!(
+            saved.payload().score_warp_runtime.is_some(),
+            "logslope-formula linkwiggle should persist score-warp runtime"
+        );
+        assert!(
+            saved.payload().link_deviation_runtime.is_some(),
+            "main-formula linkwiggle should persist link-deviation runtime"
+        );
+    }
+
+    #[test]
     fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable() {
         let td = tempdir().expect("tempdir");
         let model_path = td.path().join("model.json");
@@ -12322,6 +12402,77 @@ mod tests {
         assert_eq!(routed.penalty_order, 1);
         assert_eq!(routed.penalty_orders, vec![3]);
         assert!(!routed.double_penalty);
+    }
+
+    #[test]
+    fn marginal_slope_deviation_routing_splits_main_and_logslope_linkwiggles() {
+        let parsed_main = parse_formula(
+            "y ~ x + linkwiggle(degree=4, internal_knots=9, penalty_order=\"1,3\", double_penalty=false)",
+        )
+        .expect("main formula");
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            "1 + linkwiggle(degree=5, internal_knots=7, penalty_order=\"2,3\")",
+            "y",
+            "--logslope-formula",
+        )
+        .expect("logslope formula");
+        let routed = super::route_marginal_slope_deviation_blocks(
+            parsed_main.linkwiggle.as_ref(),
+            parsed_logslope.linkwiggle.as_ref(),
+            false,
+            false,
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )
+        .expect("routing");
+        let link_dev = routed.link_dev.expect("main link-deviation config");
+        let score_warp = routed.score_warp.expect("logslope score-warp config");
+        assert_eq!(link_dev.degree, 4);
+        assert_eq!(link_dev.num_internal_knots, 9);
+        assert_eq!(link_dev.penalty_order, 1);
+        assert_eq!(link_dev.penalty_orders, vec![3]);
+        assert!(!link_dev.double_penalty);
+        assert_eq!(score_warp.degree, 5);
+        assert_eq!(score_warp.num_internal_knots, 7);
+        assert_eq!(score_warp.penalty_order, 2);
+        assert_eq!(score_warp.penalty_orders, vec![3]);
+        assert!(score_warp.double_penalty);
+    }
+
+    #[test]
+    fn marginal_slope_deviation_routing_respects_disable_flags_per_formula_side() {
+        let parsed_main =
+            parse_formula("y ~ x + linkwiggle(degree=4, internal_knots=9)").expect("main formula");
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            "1 + linkwiggle(degree=4, internal_knots=9)",
+            "y",
+            "--logslope-formula",
+        )
+        .expect("logslope formula");
+
+        let err = super::route_marginal_slope_deviation_blocks(
+            parsed_main.linkwiggle.as_ref(),
+            None,
+            false,
+            true,
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )
+        .expect_err("main-formula linkwiggle should require link-deviation block");
+        assert!(err.contains("main-formula linkwiggle(...)"));
+        assert!(err.contains("--disable-link-dev"));
+
+        let err = super::route_marginal_slope_deviation_blocks(
+            None,
+            parsed_logslope.linkwiggle.as_ref(),
+            true,
+            false,
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )
+        .expect_err("logslope linkwiggle should require score-warp block");
+        assert!(err.contains("--logslope-formula linkwiggle(...)"));
+        assert!(err.contains("--disable-score-warp"));
     }
 
     #[test]

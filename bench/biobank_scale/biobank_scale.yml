@@ -73,6 +73,19 @@
       "include_sigma": false
     },
     {
+      "name": "rust_margslope_aniso_duchon16d_50",
+      "dataset": "disease",
+      "backend": "rust_gam",
+      "family": "binomial",
+      "spatial_basis": "duchon",
+      "centers": 50,
+      "smooth_kind": "joint",
+      "include_sigma": false,
+      "marginal_slope": true,
+      "scale_dimensions": true,
+      "z_column": "pgs_std"
+    },
+    {
       "name": "r_mgcv_matern60",
       "dataset": "disease",
       "backend": "r_mgcv",

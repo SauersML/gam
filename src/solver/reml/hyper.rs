@@ -1,5 +1,7 @@
 use super::*;
-use crate::matrix::DenseRightProductView;
+use crate::matrix::{
+    CoefficientTransformOperator, DenseDesignMatrix, DenseRightProductView, DesignMatrix,
+};
 
 // ─── Binomial auxiliary terms for link-parameter ext_coord construction ───
 //
@@ -43,6 +45,24 @@ pub(crate) fn link_binomial_aux(yi: f64, wi: f64, mu: f64) -> LinkBinomialAux {
 enum TauTauDesignTerm {
     Dense(Array2<f64>),
     Implicit(HyperDesignDerivative),
+}
+
+fn build_active_design_matrix(
+    x_transformed: &DesignMatrix,
+    free_basis_opt: Option<&Array2<f64>>,
+) -> Result<DesignMatrix, String> {
+    match (x_transformed, free_basis_opt) {
+        (DesignMatrix::Dense(dense), Some(z)) => {
+            let op = CoefficientTransformOperator::new(dense.clone(), z.clone())?;
+            Ok(DesignMatrix::Dense(DenseDesignMatrix::from(std::sync::Arc::new(
+                op,
+            ))))
+        }
+        (_, None) => Ok(x_transformed.clone()),
+        (DesignMatrix::Sparse(_), Some(_)) => Err(
+            "implicit hyper-operator requires a dense/operator-backed transformed design when an active free-basis projection is present".to_string(),
+        ),
+    }
 }
 
 impl<'a> RemlState<'a> {
@@ -272,18 +292,6 @@ impl<'a> RemlState<'a> {
 
         // --- Transformed design, beta, penalty basis ---
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
-        let x_dense_arc = pirls_result
-            .x_transformed
-            .try_to_dense_arc("build_tau_hyper_coords requires dense transformed design")
-            .map_err(EstimationError::InvalidInput)?;
-        let x_dense_owned = free_basis_opt.as_ref().map(|z| {
-            DenseRightProductView::new(x_dense_arc.as_ref())
-                .with_factor(z)
-                .materialize()
-        });
-        let x_dense = x_dense_owned
-            .as_ref()
-            .unwrap_or_else(|| x_dense_arc.as_ref());
 
         let e_eval;
         if let Some(z) = free_basis_opt.as_ref() {
@@ -323,7 +331,66 @@ impl<'a> RemlState<'a> {
         // operator from the unconstrained transformed space.
         let firth_logit_active = self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit);
+
+        // --- Implicit operator activation ---
+        // Check whether any tau direction has an implicit design derivative and
+        // the problem is large enough to benefit from implicit B_j operators.
+        // When active, we keep the active-basis X design operator-backed.
+        let any_has_implicit = hyper_dirs.iter().any(|d| d.has_implicit_operator());
+        let n_obs = pirls_result.x_transformed.nrows();
+        let implicit_n_axes = if any_has_implicit {
+            hyper_dirs
+                .iter()
+                .find_map(|d| d.implicit_first_axis_info())
+                .map(|(op, _)| op.n_axes())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let use_implicit_requested = any_has_implicit
+            && crate::terms::basis::should_use_implicit_operators(n_obs, p_dim, implicit_n_axes);
+        let x_design_shared: Option<std::sync::Arc<DesignMatrix>> = if use_implicit_requested {
+            Some(std::sync::Arc::new(
+                build_active_design_matrix(&pirls_result.x_transformed, free_basis_opt.as_ref())
+                    .map_err(EstimationError::InvalidInput)?,
+            ))
+        } else {
+            None
+        };
+        let use_implicit = x_design_shared.is_some();
+        let need_x_dense = firth_logit_active || !use_implicit;
+        let x_dense_arc = if need_x_dense {
+            Some(
+                pirls_result
+                    .x_transformed
+                    .try_to_dense_arc("build_tau_hyper_coords requires dense transformed design")
+                    .map_err(EstimationError::InvalidInput)?,
+            )
+        } else {
+            None
+        };
+        let x_dense_owned = if need_x_dense {
+            free_basis_opt.as_ref().map(|z| {
+                DenseRightProductView::new(
+                    x_dense_arc.as_ref().expect("dense X should exist").as_ref(),
+                )
+                .with_factor(z)
+                .materialize()
+            })
+        } else {
+            None
+        };
+        let x_dense =
+            if need_x_dense {
+                Some(x_dense_owned.as_ref().unwrap_or_else(|| {
+                    x_dense_arc.as_ref().expect("dense X should exist").as_ref()
+                }))
+            } else {
+                None
+            };
+
         let firth_op = if firth_logit_active {
+            let x_dense = x_dense.expect("Firth hyper terms require dense active-basis design");
             if free_basis_opt.is_none() {
                 if let Some(cached) = bundle.firth_dense_operator.as_ref() {
                     Some(cached.as_ref().clone())
@@ -341,33 +408,6 @@ impl<'a> RemlState<'a> {
                     self.weights,
                 )?)
             }
-        } else {
-            None
-        };
-
-        // --- Implicit operator activation ---
-        // Check whether any tau direction has an implicit design derivative and
-        // the problem is large enough to benefit from implicit B_j operators.
-        // When active, we build ImplicitHyperOperator instances that compute
-        // B_j · v on the fly, avoiding materialization of the dense (p × p) B_j.
-        let any_has_implicit = hyper_dirs.iter().any(|d| d.has_implicit_operator());
-        let n_obs = x_dense.nrows();
-        // Determine the number of anisotropic axes from the first implicit operator.
-        let implicit_n_axes = if any_has_implicit {
-            hyper_dirs
-                .iter()
-                .find_map(|d| d.implicit_first_axis_info())
-                .map(|(op, _)| op.n_axes())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let use_implicit = any_has_implicit
-            && crate::terms::basis::should_use_implicit_operators(n_obs, p_dim, implicit_n_axes);
-
-        // Shared Arcs for the implicit operator path (only allocated when needed).
-        let x_dense_shared: Option<std::sync::Arc<Array2<f64>>> = if use_implicit {
-            Some(std::sync::Arc::new(x_dense.to_owned()))
         } else {
             None
         };
@@ -426,9 +466,15 @@ impl<'a> RemlState<'a> {
             // --- g_j: fixed-β score (the implicit-function RHS) ---
             // g_j = X_{τ_j}^T u − X^T diag(w)(X_{τ_j} β̂) − S_{τ_j} β̂  [− (g_φ)_{τ_j}]
             let weighted_x_tau_beta_j = w_diag * &x_tau_beta_j;
-            let mut g_j = x_tau_j.t().dot(&u)
-                - x_dense.t().dot(&weighted_x_tau_beta_j)
-                - s_tau_j.dot(&beta_eval);
+            let xt_weighted_x_tau_beta_j = if let Some(x_design) = x_design_shared.as_ref() {
+                x_design.transpose_vector_multiply(&weighted_x_tau_beta_j)
+            } else {
+                x_dense
+                    .expect("dense X should exist when the hyper drift is not implicit")
+                    .t()
+                    .dot(&weighted_x_tau_beta_j)
+            };
+            let mut g_j = x_tau_j.t().dot(&u) - xt_weighted_x_tau_beta_j - s_tau_j.dot(&beta_eval);
             if let Some(op) = firth_op.as_ref() {
                 let tau_bundle = Self::firth_exact_tau_kernel(op, &x_tau_j, &beta_eval, false);
                 g_j -= &tau_bundle.gphi_tau;
@@ -456,7 +502,7 @@ impl<'a> RemlState<'a> {
                     Some(Box::new(super::unified::ImplicitHyperOperator {
                         implicit_deriv,
                         axis,
-                        x_dense: x_dense_shared.clone().unwrap(),
+                        x_design: x_design_shared.clone().unwrap(),
                         w_diag: w_diag_shared.clone().unwrap(),
                         s_psi: s_tau_j.clone(),
                         p: p_dim,
@@ -474,6 +520,7 @@ impl<'a> RemlState<'a> {
             let dense_b = if b_operator.is_some() {
                 None
             } else {
+                let x_dense = x_dense.expect("dense X should exist when materializing hyper drift");
                 let mut b_j = Self::weighted_cross(&x_tau_j, x_dense, w_diag);
                 b_j += &Self::weighted_cross(x_dense, &x_tau_j, w_diag);
                 b_j += &s_tau_j;

@@ -5318,7 +5318,7 @@ impl BernoulliMarginalSlopeFamily {
             let channels = vec![
                 CustomFamilyJointDesignChannel::new(
                     slices.marginal.clone(),
-                    self.marginal_design.to_dense_arc(),
+                    self.marginal_design.clone(),
                     if block_idx == 0 {
                         psi_action.clone()
                     } else {
@@ -5327,7 +5327,7 @@ impl BernoulliMarginalSlopeFamily {
                 ),
                 CustomFamilyJointDesignChannel::new(
                     slices.logslope.clone(),
-                    self.logslope_design.to_dense_arc(),
+                    self.logslope_design.clone(),
                     if block_idx == 1 { psi_action } else { None },
                 ),
             ];

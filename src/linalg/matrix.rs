@@ -5270,9 +5270,21 @@ impl From<Array2<f64>> for DesignMatrix {
     }
 }
 
+impl From<Arc<Array2<f64>>> for DesignMatrix {
+    fn from(value: Arc<Array2<f64>>) -> Self {
+        Self::Dense(DenseDesignMatrix::from(value))
+    }
+}
+
 impl From<&Array2<f64>> for DesignMatrix {
     fn from(value: &Array2<f64>) -> Self {
         Self::Dense(DenseDesignMatrix::from(value.clone()))
+    }
+}
+
+impl From<DenseDesignMatrix> for DesignMatrix {
+    fn from(value: DenseDesignMatrix) -> Self {
+        Self::Dense(value)
     }
 }
 

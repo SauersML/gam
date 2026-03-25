@@ -469,36 +469,6 @@
       ]
     },
     {
-      "name": "geo_subpop16_margslope_aniso_duchon16d_k50_biobank",
-      "seed": 20260703,
-      "n": 400000,
-      "prevalence_min": 0.02,
-      "prevalence_max": 0.4,
-      "noise_scale_min": 0.25,
-      "noise_scale_max": 0.85,
-      "exclude_contenders": [
-        "rust_gam",
-        "rust_gam_sas",
-        "rust_gamlss",
-        "rust_gamlss_flexible",
-        "rust_gamlss_survival",
-        "rust_gamlss_survival_marginal_slope",
-        "r_mgcv",
-        "r_mgcv_gaulss",
-        "r_gamboostlss",
-        "r_bamlss",
-        "r_brms",
-        "r_mgcv_coxph",
-        "python_sksurv_rsf",
-        "python_sksurv_coxnet",
-        "python_lifelines_coxph_enet",
-        "r_glmnet_cox",
-        "python_sksurv_gb_coxph",
-        "python_lifelines_weibull_aft",
-        "python_xgboost_aft"
-      ]
-    },
-    {
       "name": "geo_latlon_superpopnoise_tp_k6",
       "seed": 20260401,
       "prevalence_min": 0.01,
