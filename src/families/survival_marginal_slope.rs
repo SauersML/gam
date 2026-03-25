@@ -30,7 +30,7 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
+    TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::reml::unified::HyperOperator;
@@ -11883,16 +11883,15 @@ pub fn fit_survival_marginal_slope_terms(
         probit_scale,
     );
 
-    let marginal_design =
-        build_term_collection_design(data, &spec.marginalspec).map_err(|e| e.to_string())?;
-    let marginalspec_boot =
-        freeze_term_collection_from_design(&spec.marginalspec, &marginal_design)
-            .map_err(|e| e.to_string())?;
-    let logslope_design =
-        build_term_collection_design(data, &spec.logslopespec).map_err(|e| e.to_string())?;
-    let logslopespec_boot =
-        freeze_term_collection_from_design(&spec.logslopespec, &logslope_design)
-            .map_err(|e| e.to_string())?;
+    let (mut joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
+        data,
+        &[spec.marginalspec.clone(), spec.logslopespec.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    let marginal_design = joint_designs.remove(0);
+    let logslope_design = joint_designs.remove(0);
+    let marginalspec_boot = joint_specs.remove(0);
+    let logslopespec_boot = joint_specs.remove(0);
 
     let time_penalties_len = spec.time_block.penalties.len();
     let score_warp_prepared = spec

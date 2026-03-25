@@ -3314,6 +3314,18 @@ pub fn build_term_collection_designs_joint(
     Ok(out)
 }
 
+pub fn build_term_collection_designs_and_freeze_joint(
+    data: ArrayView2<'_, f64>,
+    specs: &[TermCollectionSpec],
+) -> Result<(Vec<TermCollectionDesign>, Vec<TermCollectionSpec>), EstimationError> {
+    let designs = build_term_collection_designs_joint(data, specs)?;
+    let mut resolved_specs = Vec::with_capacity(specs.len());
+    for (spec, design) in specs.iter().zip(designs.iter()) {
+        resolved_specs.push(freeze_term_collection_from_design(spec, design)?);
+    }
+    Ok((designs, resolved_specs))
+}
+
 fn apply_spatial_orthogonality_to_parametric(
     smooth: RawSmoothDesign,
     data: ArrayView2<'_, f64>,
@@ -10663,20 +10675,12 @@ where
     // Fast path: kappa disabled or no spatial terms — build designs once.
     // -----------------------------------------------------------------------
     if !kappa_options.enabled || log_kappa_dim == 0 {
-        let mut resolved_specs = Vec::with_capacity(n_blocks);
-        let designs = build_term_collection_designs_joint(data, block_specs).map_err(|e| {
-            format!(
-                "failed to build joint block designs during exact joint kappa optimization: {e}"
-            )
+        let (designs, resolved_specs) = build_term_collection_designs_and_freeze_joint(
+            data, block_specs,
+        )
+        .map_err(|e| {
+            format!("failed to build and freeze joint block designs during exact joint kappa optimization: {e}")
         })?;
-        for (blk_idx, (spec, design)) in block_specs.iter().zip(designs.iter()).enumerate() {
-            let resolved = freeze_term_collection_from_design(spec, design).map_err(|e| {
-                format!(
-                    "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
-                )
-            })?;
-            resolved_specs.push(resolved);
-        }
         let rho_only = joint_setup
             .theta0()
             .slice(s![..joint_setup.rho_dim()])
@@ -10712,19 +10716,13 @@ where
     let all_dims = joint_setup.log_kappa_dims_per_term();
 
     // Build bootstrap designs and frozen specs for each block.
-    let boot_designs = build_term_collection_designs_joint(data, block_specs).map_err(|e| {
-        format!("failed to build joint block designs during exact joint kappa bootstrap: {e}")
-    })?;
-    let mut best_specs = Vec::with_capacity(n_blocks);
-    let mut total_design_cols = 0usize;
-    for (blk_idx, (spec, design)) in block_specs.iter().zip(boot_designs.iter()).enumerate() {
-        let frozen = freeze_term_collection_from_design(spec, design).map_err(|e| {
-            format!(
-                "failed to freeze block-{blk_idx} spatial basis centers during exact joint kappa bootstrap: {e}"
-            )
+    let (boot_designs, mut best_specs) =
+        build_term_collection_designs_and_freeze_joint(data, block_specs).map_err(|e| {
+            format!("failed to build and freeze joint block designs during exact joint kappa bootstrap: {e}")
         })?;
+    let mut total_design_cols = 0usize;
+    for design in &boot_designs {
         total_design_cols += design.design.ncols();
-        best_specs.push(frozen);
     }
 
     let analytic_outer_hessian_available = analytic_joint_hessian_available
@@ -12836,6 +12834,79 @@ mod tests {
                 _ => panic!("expected Matérn term"),
             }
         }
+    }
+
+    #[test]
+    fn joint_build_and_freeze_shares_auto_spatial_centers_across_blocks() {
+        let n = 400usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+            data[[i, 1]] = (i as f64 * 0.19).sin();
+        }
+
+        let matern_term = |name: &str| SmoothTermSpec {
+            name: name.to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::Auto(Box::new(
+                        CenterStrategy::FarthestPoint { num_centers: 8 },
+                    )),
+                    length_scale: 0.8,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+        };
+
+        let marginalspec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![matern_term("marginal")],
+        };
+        let logslopespec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![matern_term("logslope")],
+        };
+
+        let (designs, resolved_specs) = build_term_collection_designs_and_freeze_joint(
+            data.view(),
+            &[marginalspec.clone(), logslopespec.clone()],
+        )
+        .expect("joint build and freeze should succeed");
+
+        assert_eq!(designs.len(), 2);
+        assert_eq!(resolved_specs.len(), 2);
+
+        let extract_centers = |spec: &TermCollectionSpec| match &spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => match &spec.center_strategy {
+                CenterStrategy::UserProvided(centers) => centers.clone(),
+                other => panic!("expected frozen user-provided centers, got {other:?}"),
+            },
+            other => panic!("expected Matérn term, got {other:?}"),
+        };
+
+        let marginal_centers = extract_centers(&resolved_specs[0]);
+        let logslope_centers = extract_centers(&resolved_specs[1]);
+        let separate_marginal_design =
+            build_term_collection_design(data.view(), &marginalspec).expect("separate marginal");
+        let separate_marginal = freeze_term_collection_from_design(
+            &marginalspec,
+            &separate_marginal_design,
+        )
+        .expect("freeze separate marginal");
+        let separate_marginal_centers = extract_centers(&separate_marginal);
+
+        assert_eq!(marginal_centers, logslope_centers);
+        assert_eq!(marginal_centers.ncols(), 2);
+        assert!(marginal_centers.nrows() < separate_marginal_centers.nrows());
     }
 
     #[test]

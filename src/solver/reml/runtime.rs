@@ -3053,6 +3053,51 @@ impl<'a> RemlState<'a> {
         self.evaluate_efs(p, &bundle, Vec::new())
     }
 
+    /// EFS evaluation with anisotropic or isotropic ψ ext_coords injected.
+    pub fn compute_efs_steps_with_psi_ext(
+        &self,
+        rho: &Array1<f64>,
+        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+        let bundle = match self.obtain_eval_bundle(rho) {
+            Ok(bundle) => bundle,
+            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                self.cache_manager.invalidate_eval_bundle();
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "inner solve ill-conditioned during psi-ext EFS evaluation".to_string(),
+                ));
+            }
+            Err(e) => {
+                self.cache_manager.invalidate_eval_bundle();
+                return Err(e);
+            }
+        };
+
+        let ext_coords = if !hyper_dirs.is_empty() {
+            if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+                self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs)?
+            } else if matches!(
+                bundle.pirls_result.coordinate_frame,
+                pirls::PirlsCoordinateFrame::TransformedQs
+            ) && self
+                .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                .is_none()
+            {
+                self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?
+            } else {
+                self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?
+            }
+        } else {
+            Vec::new()
+        };
+
+        if ext_coords.is_empty() {
+            return self.compute_efs_steps(rho);
+        }
+
+        self.evaluate_efs(rho, &bundle, ext_coords)
+    }
+
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         self.arena
             .lastgradient_used_stochastic_fallback
