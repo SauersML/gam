@@ -8618,15 +8618,17 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Ok(eval)
                     if eval.objective.is_finite()
                         && eval.gradient.iter().all(|v| v.is_finite())
-                        && eval
-                            .outer_hessian
-                            .materialize_dense()
-                            .map(|opt| {
-                                opt.as_ref()
-                                    .map(|h| h.iter().all(|v| v.is_finite()))
-                                    .unwrap_or(true)
-                            })
-                            .unwrap_or(true) =>
+                        && match &eval.outer_hessian {
+                            crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+                                hessian.iter().all(|v| v.is_finite())
+                            }
+                            crate::solver::outer_strategy::HessianResult::Operator(op) => {
+                                !need_outer_hessian || op.dim() == rho.len()
+                            }
+                            crate::solver::outer_strategy::HessianResult::Unavailable => {
+                                !need_outer_hessian
+                            }
+                        } =>
                 {
                     // Warm-start proximity check: discard warm cache if rho
                     // jumped too far from the cached point.

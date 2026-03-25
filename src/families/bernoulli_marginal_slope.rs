@@ -202,7 +202,7 @@ pub(crate) fn bernoulli_marginal_slope_eta_from_probability(
         InverseLink::Standard(LinkFunction::Probit) => standard_normal_quantile(target)
             .map_err(|e| format!("{context} failed to invert probit probability {target}: {e}")),
         InverseLink::Standard(LinkFunction::Logit) => Ok((target / (1.0 - target)).ln()),
-        InverseLink::Standard(LinkFunction::CLogLog) => Ok(-((1.0 - target).ln())).ln(),
+        InverseLink::Standard(LinkFunction::CLogLog) => Ok((-((1.0 - target).ln())).ln()),
         InverseLink::Standard(LinkFunction::Identity) => Ok(target),
         InverseLink::Standard(LinkFunction::Log) => Ok(target.ln()),
         _ => {
@@ -980,7 +980,7 @@ fn rigid_transformed_fourth_contracted(
 ) -> [[f64; 2]; 2] {
     let h_q = kernel.primary_hessian(marginal.q);
     let grad_q = -kernel.u1 * kernel.eta_q;
-    let (f_qqq, f_qqg, f_qgg, f_ggg) = rigid_internal_third_components(marginal, kernel);
+    let (f_qqq, f_qqg, f_qgg, _f_ggg) = rigid_internal_third_components(marginal, kernel);
     let qq = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 1.0, 0.0);
     let qg = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 0.0, 1.0);
     let gg = kernel.fourth_contracted(marginal.q, 0.0, 1.0, 0.0, 1.0);
@@ -6571,11 +6571,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 .try_fold(
                     || 0.0,
                     |mut ll, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    for i in start..end {
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        for i in start..end {
                             let q_internal = self.marginal_link_map(block_states[0].eta[i])?.q;
-                            let eta_i = rigid_observed_eta(q_internal, b[i], self.z[i], probit_scale);
+                            let eta_i =
+                                rigid_observed_eta(q_internal, b[i], self.z[i], probit_scale);
                             let signed = (2.0 * self.y[i] - 1.0) * eta_i;
                             let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
                             ll += self.weights[i] * log_cdf;
@@ -7564,6 +7565,84 @@ mod tests {
 
     fn pair_distance(lhs: (f64, f64), rhs: (f64, f64)) -> f64 {
         (lhs.0 - rhs.0).abs() + (lhs.1 - rhs.1).abs()
+    }
+
+    #[test]
+    fn bernoulli_marginal_slope_base_link_reparameterizes_internal_probit_target() {
+        let y = Arc::new(array![0.0, 1.0]);
+        let weights = Arc::new(array![1.0, 1.0]);
+        let z = Arc::new(array![-0.4, 0.9]);
+        let design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]]));
+        let probit_family = BernoulliMarginalSlopeFamily {
+            y: Arc::clone(&y),
+            weights: Arc::clone(&weights),
+            z: Arc::clone(&z),
+            gaussian_frailty_sd: Some(0.3),
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: design.clone(),
+            logslope_design: design.clone(),
+            score_warp: None,
+            link_dev: None,
+        };
+        let logit_family = BernoulliMarginalSlopeFamily {
+            y,
+            weights,
+            z,
+            gaussian_frailty_sd: Some(0.3),
+            base_link: InverseLink::Standard(LinkFunction::Logit),
+            marginal_design: design.clone(),
+            logslope_design: design,
+            score_warp: None,
+            link_dev: None,
+        };
+        let q = array![0.25, -0.7];
+        let logit_eta = Array1::from_iter(q.iter().map(|&value| {
+            bernoulli_marginal_slope_eta_from_probability(
+                &InverseLink::Standard(LinkFunction::Logit),
+                normal_cdf(value),
+                "test logit inverse",
+            )
+            .expect("invert logit probability")
+        }));
+        let b = array![0.4, -0.3];
+        let block_states_probit = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: q.clone(),
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: b.clone(),
+            },
+        ];
+        let block_states_logit = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: logit_eta,
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: b,
+            },
+        ];
+        let ll_probit = probit_family
+            .log_likelihood_only(&block_states_probit)
+            .expect("probit log-likelihood");
+        let ll_logit = logit_family
+            .log_likelihood_only(&block_states_logit)
+            .expect("logit log-likelihood");
+        assert!((ll_probit - ll_logit).abs() <= 1e-12);
+
+        for row in 0..2 {
+            let ctx_probit = probit_family
+                .build_row_exact_context(row, &block_states_probit)
+                .expect("probit row context");
+            let ctx_logit = logit_family
+                .build_row_exact_context(row, &block_states_logit)
+                .expect("logit row context");
+            assert!((ctx_probit.intercept - ctx_logit.intercept).abs() <= 1e-12);
+        }
     }
 
     fn expand_integer_weight_rows(

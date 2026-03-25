@@ -2942,7 +2942,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             Array1<f64>,
             f64,
             Array1<f64>,
-            Option<Array2<f64>>,
+            crate::solver::outer_strategy::HessianResult,
             crate::custom_family::CustomFamilyWarmStart,
         )>,
     }
@@ -3030,11 +3030,14 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     if analytic_outer_hessian_available {
         let hessian_ready = build_eval(&theta0, None, true)
             .ok()
-            .and_then(|(eval, _, _)| eval.outer_hessian.materialize_dense().ok().flatten())
-            .is_some_and(|hessian| {
-                hessian.nrows() == theta_dim
-                    && hessian.ncols() == theta_dim
-                    && hessian.iter().all(|value| value.is_finite())
+            .is_some_and(|(eval, _, _)| match &eval.outer_hessian {
+                crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+                    hessian.nrows() == theta_dim
+                        && hessian.ncols() == theta_dim
+                        && hessian.iter().all(|value| value.is_finite())
+                }
+                crate::solver::outer_strategy::HessianResult::Operator(op) => op.dim() == theta_dim,
+                crate::solver::outer_strategy::HessianResult::Unavailable => false,
             });
         if !hessian_ready {
             analytic_outer_hessian_available = false;
@@ -3042,7 +3045,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     }
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, OuterEval};
 
     // Exact first-order AND second-order [rho, psi] calculus is available
     // for all inverse links via the shared jet formulas plus the generic
@@ -3107,10 +3110,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 return Ok(OuterEval {
                     cost: *cached_cost,
                     gradient: cached_grad.clone(),
-                    hessian: cached_hess
-                        .clone()
-                        .map(HessianResult::Analytic)
-                        .unwrap_or(HessianResult::Unavailable),
+                    hessian: cached_hess.clone(),
                 });
             }
             // Request Hessian from the unified evaluator. Exact ∂²H/∂ρ_k∂ρ_l
@@ -3129,9 +3129,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 theta.clone(),
                 eval.objective,
                 eval.gradient.clone(),
-                eval.outer_hessian
-                    .materialize_dense()
-                    .map_err(EstimationError::InvalidInput)?,
+                eval.outer_hessian.clone(),
                 eval.warm_start.clone(),
             ));
             state.warm_cache = Some(eval.warm_start);
@@ -4640,7 +4638,8 @@ fn build_two_block_custom_family_joint_psi_operator_from_actions(
     left_drift_weights: &Array1<f64>,
     cross_drift_weights: &Array1<f64>,
     right_drift_weights: &Array1<f64>,
-) -> Result<Option<Box<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String> {
+) -> Result<Option<std::sync::Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+{
     if left_action.is_none() && right_action.is_none() {
         return Ok(None);
     }
@@ -4681,11 +4680,9 @@ fn build_two_block_custom_family_joint_psi_operator_from_actions(
         ),
     ];
 
-    Ok(Some(Box::new(CustomFamilyJointPsiOperator::new(
-        total,
-        channels,
-        pair_contributions,
-    ))))
+    Ok(Some(std::sync::Arc::new(
+        CustomFamilyJointPsiOperator::new(total, channels, pair_contributions),
+    )))
 }
 
 fn gaussian_joint_psisecondhessian_fromweights(

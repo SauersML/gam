@@ -507,7 +507,7 @@ enum PredictModeArg {
     Map,
 }
 
-const MODEL_VERSION: u32 = 3;
+const MODEL_VERSION: u32 = 4;
 
 struct CliFirthValidation<'a> {
     enabled: bool,
@@ -8253,7 +8253,9 @@ fn resolve_bernoulli_marginal_slope_base_link(
             return Err("link(sas_init=...) requires link(type=sas)".to_string());
         }
         if linkspec.beta_logistic_init.is_some() {
-            return Err("link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string());
+            return Err(
+                "link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string(),
+            );
         }
         let expected = components.len().saturating_sub(1);
         let rho = if let Some(raw) = linkspec.mixture_rho.as_deref() {
@@ -11460,7 +11462,7 @@ mod tests {
         run_fit(FitArgs {
             data: train_path,
             formula_positional:
-                "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")".to_string(),
+                "y ~ x + link(type=logit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")".to_string(),
             predict_noise: None,
             logslope_formula: Some(
                 "1 + linkwiggle(degree=3, internal_knots=4, penalty_order=\"2\")".to_string(),
@@ -11512,7 +11514,7 @@ mod tests {
             saved
                 .resolved_inverse_link()
                 .expect("resolved inverse link"),
-            Some(InverseLink::Standard(LinkFunction::Probit))
+            Some(InverseLink::Standard(LinkFunction::Logit))
         );
     }
 
@@ -12826,7 +12828,7 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_marginal_slope_accepts_explicit_probit_link_only() {
+    fn bernoulli_marginal_slope_accepts_standard_and_stateful_base_links() {
         let parsed = parse_formula("y ~ x + link(type=probit)").expect("main formula");
         let resolved = super::resolve_bernoulli_marginal_slope_base_link(
             parsed.linkspec.as_ref(),
@@ -12836,12 +12838,66 @@ mod tests {
         assert_eq!(resolved, InverseLink::Standard(LinkFunction::Probit));
 
         let parsed = parse_formula("y ~ x + link(type=logit)").expect("main formula");
+        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+            "bernoulli marginal-slope",
+        )
+        .expect("explicit logit base link");
+        assert_eq!(resolved, InverseLink::Standard(LinkFunction::Logit));
+
+        let parsed =
+            parse_formula("y ~ x + link(type=sas, sas_init=\"0.1,-0.2\")").expect("sas formula");
+        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+            "bernoulli marginal-slope",
+        )
+        .expect("SAS base link");
+        assert!(matches!(resolved, InverseLink::Sas(_)));
+
+        let parsed =
+            parse_formula("y ~ x + link(type=beta-logistic, beta_logistic_init=\"0.3,0.7\")")
+                .expect("beta-logistic formula");
+        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+            "bernoulli marginal-slope",
+        )
+        .expect("beta-logistic base link");
+        assert!(matches!(resolved, InverseLink::BetaLogistic(_)));
+
+        let parsed =
+            parse_formula("y ~ x + link(type=blended(logit,probit,cloglog), rho=\"0.4,-0.1\")")
+                .expect("mixture formula");
+        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+            "bernoulli marginal-slope",
+        )
+        .expect("mixture base link");
+        match resolved {
+            InverseLink::Mixture(state) => {
+                assert_eq!(state.components.len(), 3);
+                assert_eq!(state.rho.len(), 2);
+            }
+            other => panic!("expected mixture link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bernoulli_marginal_slope_rejects_flexible_and_unbounded_base_links() {
+        let parsed = parse_formula("y ~ x + link(type=flexible(logit))").expect("main formula");
         let err = super::resolve_bernoulli_marginal_slope_base_link(
             parsed.linkspec.as_ref(),
             "bernoulli marginal-slope",
         )
-        .expect_err("non-probit marginal-slope link should be rejected");
-        assert!(err.contains("only implements link(type=probit)"));
+        .expect_err("flexible link should be rejected");
+        assert!(err.contains("does not accept flexible"));
+
+        let parsed = parse_formula("y ~ x + link(type=log)").expect("main formula");
+        let err = super::resolve_bernoulli_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+            "bernoulli marginal-slope",
+        )
+        .expect_err("log link should be rejected");
+        assert!(err.contains("does not support link(type=log)"));
     }
 
     #[test]
@@ -12974,6 +13030,76 @@ mod tests {
             (predicted - expected).abs() <= 1e-12,
             "saved marginal-slope prediction should use normalized z: predicted={predicted}, expected={expected}"
         );
+    }
+
+    #[test]
+    fn saved_marginal_slope_models_require_latent_z_normalization() {
+        let mut bernoulli = super::build_bernoulli_marginal_slope_saved_model(
+            "y ~ 1".to_string(),
+            DataSchema { columns: vec![] },
+            "y ~ 1".to_string(),
+            "z".to_string(),
+            vec![],
+            empty_termspec(),
+            empty_termspec(),
+            core_saved_fit_result(
+                array![0.0],
+                Array1::zeros(0),
+                1.0,
+                None,
+                None,
+                saved_fit_summary_stub(),
+            ),
+            0.0,
+            0.0,
+            SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
+            None,
+            None,
+            InverseLink::Standard(LinkFunction::Probit),
+            gam::families::lognormal_kernel::FrailtySpec::None,
+        )
+        .payload()
+        .clone();
+        bernoulli.latent_z_normalization = None;
+        let err = SavedModel::from_payload(bernoulli)
+            .validate_for_persistence()
+            .expect_err("bernoulli marginal-slope payload without z normalization should fail");
+        assert!(err.contains("latent_z_normalization"));
+
+        let mut survival = test_payload(
+            "Surv(entry, exit, event) ~ 1",
+            ModelKind::Survival,
+            FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("marginal-slope".to_string()),
+                survival_distribution: Some("probit".to_string()),
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            },
+            "survival",
+        );
+        survival.fit_result = Some(core_saved_fit_result(
+            array![0.0],
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            saved_fit_summary_stub(),
+        ));
+        survival.data_schema = Some(DataSchema { columns: vec![] });
+        survival.training_headers = Some(vec![]);
+        survival.resolved_termspec = Some(empty_termspec());
+        survival.resolved_termspec_noise = Some(empty_termspec());
+        survival.formula_logslope = Some("1".to_string());
+        survival.z_column = Some("z".to_string());
+        survival.logslope_baseline = Some(0.0);
+        survival.survival_entry = Some("entry".to_string());
+        survival.survival_exit = Some("exit".to_string());
+        survival.survival_event = Some("event".to_string());
+        survival.survival_likelihood = Some("marginal-slope".to_string());
+        let err = SavedModel::from_payload(survival)
+            .validate_for_persistence()
+            .expect_err("survival marginal-slope payload without z normalization should fail");
+        assert!(err.contains("latent_z_normalization"));
     }
 
     #[test]
@@ -13823,6 +13949,156 @@ mod tests {
                 expected_mean[i]
             );
         }
+    }
+
+    #[test]
+    fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
+        let fit_saved = compact_saved_multiblock_fit_result(
+            vec![
+                FittedBlock {
+                    beta: array![0.4],
+                    role: BlockRole::Mean,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: Array1::zeros(0),
+                    role: BlockRole::Mean,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: array![1.0],
+                    role: BlockRole::Scale,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                },
+            ],
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            saved_fit_summary_stub(),
+        );
+
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ 1",
+            ModelKind::Survival,
+            FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("marginal-slope".to_string()),
+                survival_distribution: Some("probit".to_string()),
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            },
+            "survival",
+        );
+        payload.fit_result = Some(fit_saved.clone());
+        payload.unified = Some(fit_saved.clone());
+        payload.data_schema = Some(DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "entry".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "exit".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "event".to_string(),
+                    kind: ColumnKindTag::Binary,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "z".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        });
+        payload.training_headers = Some(vec![
+            "entry".to_string(),
+            "exit".to_string(),
+            "event".to_string(),
+            "z".to_string(),
+        ]);
+        payload.resolved_termspec = Some(empty_termspec());
+        payload.resolved_termspec_noise = Some(empty_termspec());
+        payload.survival_entry = Some("entry".to_string());
+        payload.survival_exit = Some("exit".to_string());
+        payload.survival_event = Some("event".to_string());
+        payload.survivalspec = Some("net".to_string());
+        payload.survival_baseline_target = Some("linear".to_string());
+        payload.survival_likelihood = Some("marginal-slope".to_string());
+        payload.survival_distribution = Some("probit".to_string());
+        payload.survival_time_basis = Some("ispline".to_string());
+        payload.formula_logslope = Some("1".to_string());
+        payload.z_column = Some("z".to_string());
+        payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 1.0, sd: 2.0 });
+        payload.logslope_baseline = Some(0.0);
+        payload.link = Some("probit".to_string());
+        let model = SavedModel::from_payload(payload);
+        model
+            .validate_for_persistence()
+            .expect("saved survival marginal-slope payload should validate");
+
+        let time_build = gam::survival_construction::SurvivalTimeBuildOutput {
+            x_entry_time: DesignMatrix::from(array![[1.0]]),
+            x_exit_time: DesignMatrix::from(array![[1.0]]),
+            x_derivative_time: DesignMatrix::from(array![[1.0]]),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            basisname: "ispline".to_string(),
+            degree: Some(1),
+            knots: None,
+            keep_cols: None,
+            smooth_lambda: None,
+        };
+        let cov_design = DesignMatrix::from(Array2::<f64>::zeros((1, 0)));
+        let logslope_design = DesignMatrix::from(array![[1.0]]);
+        let z_raw = array![3.0];
+        let eta_offset_entry = array![0.0];
+        let eta_offset_exit = array![0.0];
+        let derivative_offset_exit = array![0.0];
+        let primary_offset = array![0.0];
+        let noise_offset = array![0.0];
+
+        let (predictor, pred_input, _) = super::build_saved_survival_marginal_slope_predictor(
+            &model,
+            &fit_saved,
+            "z",
+            &z_raw,
+            &cov_design,
+            &logslope_design,
+            &time_build,
+            &eta_offset_entry,
+            &eta_offset_exit,
+            &derivative_offset_exit,
+            &primary_offset,
+            &noise_offset,
+        )
+        .expect("saved survival marginal-slope predictor should build");
+        let prediction = predictor
+            .predict_plugin_response(&pred_input)
+            .expect("saved survival marginal-slope predictor should score");
+
+        let z_normalized = array![1.0];
+        let (expected_eta, expected_mean) =
+            saved_survival_marginal_slope_test_support::predict_saved_survival_marginal_slope_flex_exit(
+                &array![0.4],
+                &array![1.0],
+                &z_normalized,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("saved survival helper should evaluate");
+        assert!((prediction.eta[0] - expected_eta[0]).abs() <= 1e-12);
+        assert!((prediction.mean[0] - expected_mean[0]).abs() <= 1e-12);
     }
 
     #[test]
