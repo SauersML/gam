@@ -528,6 +528,15 @@ pub trait CustomFamily {
         cost_gated_outer_order(specs)
     }
 
+    /// Family-specific outer seeding policy.
+    ///
+    /// The default preserves the generic custom-family behavior. Families with
+    /// a strong warm start can override this to keep seed screening from
+    /// dominating the fit.
+    fn outer_seed_config(&self, _n_params: usize) -> crate::seeding::SeedConfig {
+        crate::seeding::SeedConfig::default()
+    }
+
     /// Whether outer hyper-derivative evaluation must use a joint exact path.
     ///
     /// Default `false` allows the generic blockwise diagonal fallback when a
@@ -9502,6 +9511,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
         .with_fd_step(1e-4)
+        .with_seed_config(family.outer_seed_config(n_rho))
         .with_initial_rho(rho0.clone());
 
     let mut obj = problem.build_objective(

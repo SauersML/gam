@@ -7538,27 +7538,6 @@ mod tests {
         }
     }
 
-    fn dummy_penalized_blockspec(
-        p: usize,
-        n_rows: usize,
-        n_penalties: usize,
-    ) -> ParameterBlockSpec {
-        let identity = Array2::from_diag(&Array1::ones(p));
-        ParameterBlockSpec {
-            name: "dummy".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::<f64>::zeros((n_rows, p)),
-            )),
-            offset: Array1::zeros(n_rows),
-            penalties: (0..n_penalties)
-                .map(|_| PenaltyMatrix::Dense(identity.clone()))
-                .collect(),
-            nullspace_dims: vec![0; n_penalties],
-            initial_log_lambdas: Array1::zeros(n_penalties),
-            initial_beta: Some(Array1::zeros(p)),
-        }
-    }
-
     fn dummy_block_state(beta: Array1<f64>, n_rows: usize) -> ParameterBlockState {
         ParameterBlockState {
             beta,
