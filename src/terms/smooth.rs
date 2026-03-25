@@ -5556,9 +5556,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(
-            if crate::custom_family::joint_exact_analytic_outer_hessian_available(
-                blockspec.design.ncols(),
-            ) && base_family
+            if crate::custom_family::joint_exact_analytic_outer_hessian_available()
+                && base_family
                 .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
                 .has_hessian()
                 && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(

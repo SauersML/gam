@@ -165,7 +165,6 @@ pub(crate) fn build_deviation_block_from_seed(
 const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 
 #[inline]
-#[cfg(test)]
 pub(crate) fn bernoulli_marginal_slope_probit_link() -> InverseLink {
     InverseLink::Standard(LinkFunction::Probit)
 }
@@ -979,7 +978,7 @@ fn rigid_transformed_fourth_contracted(
 ) -> [[f64; 2]; 2] {
     let h_q = kernel.primary_hessian(marginal.q);
     let grad_q = -kernel.u1 * kernel.eta_q;
-    let (f_qqq, f_qqg, f_qgg, _f_ggg) = rigid_internal_third_components(marginal, kernel);
+    let (f_qqq, f_qqg, f_qgg, _) = rigid_internal_third_components(marginal, kernel);
     let qq = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 1.0, 0.0);
     let qg = kernel.fourth_contracted(marginal.q, 1.0, 0.0, 0.0, 1.0);
     let gg = kernel.fourth_contracted(marginal.q, 0.0, 1.0, 0.0, 1.0);
@@ -1960,15 +1959,6 @@ struct BernoulliMarginalSlopeExactEvalCache {
     primary: PrimarySlices,
     /// Pre-solved row contexts (intercept, M_a, observed score-warp value).
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
-}
-
-fn bernoulli_row_work_order(
-    _specs: &[ParameterBlockSpec],
-    _n_rows: usize,
-    _score_warp_dim: usize,
-    _link_dev_dim: usize,
-) -> ExactOuterDerivativeOrder {
-    ExactOuterDerivativeOrder::Second
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -6531,18 +6521,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        let _ = bernoulli_row_work_order(
-            specs,
-            self.y.len(),
-            self.score_warp
-                .as_ref()
-                .map(DeviationRuntime::basis_dim)
-                .unwrap_or(0),
-            self.link_dev
-                .as_ref()
-                .map(DeviationRuntime::basis_dim)
-                .unwrap_or(0),
-        );
         cost_gated_outer_order(specs)
     }
 
