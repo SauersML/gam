@@ -348,12 +348,11 @@ pub fn build_smooth_basis(
             let power = parse_duchon_power(options)?;
             let nullspace_order = parse_duchon_order(options)?;
             let length_scale = option_f64(options, "length_scale");
-            let aniso_log_scales =
-                if length_scale.is_some() && option_bool(options, "scale_dims").unwrap_or(false) {
-                    Some(vec![0.0; cols.len()])
-                } else {
-                    None
-                };
+            let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
+                Some(vec![0.0; cols.len()])
+            } else {
+                None
+            };
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
@@ -390,7 +389,7 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
                 spec: duchon,
                 ..
             } => {
-                if duchon.length_scale.is_some() && duchon.aniso_log_scales.is_none() {
+                if duchon.aniso_log_scales.is_none() {
                     let d = feature_cols.len();
                     duchon.aniso_log_scales = Some(vec![0.0; d]);
                 }

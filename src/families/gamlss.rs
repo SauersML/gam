@@ -9237,7 +9237,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 objective_psi,
                 score_psi,
                 hessian_psi: Array2::zeros((0, 0)),
-                hessian_psi_operator: Some(Box::new(operator)),
+                hessian_psi_operator: Some(std::sync::Arc::new(operator)),
             }));
         }
 
@@ -12729,7 +12729,7 @@ impl BinomialLocationScaleWiggleFamily {
                 objective_psi,
                 score_psi,
                 hessian_psi: Array2::zeros((0, 0)),
-                hessian_psi_operator: Some(Box::new(operator)),
+                hessian_psi_operator: Some(std::sync::Arc::new(operator)),
             }));
         }
         let h_tt_block = xt_diag_y_dense(&dir_a.x_t_psi, &coeff_tt_w, x_t)?

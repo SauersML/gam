@@ -221,7 +221,11 @@ impl<'a> RemlState<'a> {
             grad,
             hess.materialize_dense()
                 .map_err(EstimationError::RemlOptimizationFailed)?
-                .unwrap_or_else(|| Array2::zeros((theta.len(), theta.len()))),
+                .ok_or_else(|| {
+                    EstimationError::RemlOptimizationFailed(
+                        "joint hyper Hessian requested but unavailable".to_string(),
+                    )
+                })?,
         ))
     }
 
@@ -540,21 +544,21 @@ impl<'a> RemlState<'a> {
             // negligibly to the stochastic trace estimate.
             let b_operator: Option<std::sync::Arc<dyn super::unified::HyperOperator>> =
                 if use_implicit {
-                if let Some((implicit_deriv, axis)) = hyper_dirs[j].implicit_first_axis_info() {
-                    Some(std::sync::Arc::new(super::unified::ImplicitHyperOperator {
-                        implicit_deriv,
-                        axis,
-                        x_design: x_design_shared.clone().unwrap(),
-                        w_diag: w_diag_shared.clone().unwrap(),
-                        s_psi: s_tau_j.clone(),
-                        p: p_dim,
-                    }))
+                    if let Some((implicit_deriv, axis)) = hyper_dirs[j].implicit_first_axis_info() {
+                        Some(std::sync::Arc::new(super::unified::ImplicitHyperOperator {
+                            implicit_deriv,
+                            axis,
+                            x_design: x_design_shared.clone().unwrap(),
+                            w_diag: w_diag_shared.clone().unwrap(),
+                            s_psi: s_tau_j.clone(),
+                            p: p_dim,
+                        }))
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             // Materialize the dense B_j matrix only when we are not using the
             // operator-backed fast path. The HyperCoord drift wrapper can carry

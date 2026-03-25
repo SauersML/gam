@@ -8004,7 +8004,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 objective_psi,
                 score_psi,
                 hessian_psi: Array2::zeros((0, 0)),
-                hessian_psi_operator: Some(Box::new(CustomFamilyJointPsiOperator::new(
+                hessian_psi_operator: Some(std::sync::Arc::new(CustomFamilyJointPsiOperator::new(
                     p_total, channels, pairs,
                 ))),
             }));

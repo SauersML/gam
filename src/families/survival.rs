@@ -1496,7 +1496,7 @@ impl WorkingModelSurvival {
             penalty_quadratic,
             beta: beta.clone(),
             n_observations: self.nrows(),
-            hessian_op: Box::new(hop),
+            hessian_op: std::sync::Arc::new(hop),
             penalty_coords,
             penalty_logdet,
             dispersion: DispersionHandling::Fixed {

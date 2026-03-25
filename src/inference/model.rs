@@ -1590,7 +1590,8 @@ impl FittedModel {
                     payload.latent_z_normalization?,
                     payload.marginal_baseline?,
                     payload.logslope_baseline?,
-                    self.resolved_inverse_link()?
+                    self.resolved_inverse_link()
+                        .ok()?
                         .unwrap_or(InverseLink::Standard(LinkFunction::Probit)),
                     self.family_state.frailty()?.clone(),
                     runtime.score_warp,

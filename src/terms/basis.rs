@@ -1593,16 +1593,13 @@ pub struct DuchonBasisSpec {
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]
     pub identifiability: SpatialIdentifiability,
-    /// Per-axis anisotropy log-scales η_a (contrasts with Ση_a = 0).
+    /// Per-axis anisotropy log-scales η_a.
     ///
-    /// Geometric anisotropy for hybrid Duchon: Λ = κA, det(A) = 1, so
-    /// the kernel becomes φ(h; κ, A) = κ^δ H(κ|Ah|) where δ = d − 2p − 2s.
-    /// The partial-fraction spatial evaluator survives: just replace r with |Ah|.
-    /// In frequency domain the spectrum uses the inverse metric Λ⁻²:
-    ///   K̂_Λ(ω) ∝ |det Λ|⁻¹ / ((ω'Λ⁻²ω)^p (κ² + ω'Λ⁻²ω)^s)
-    ///
-    /// Only applies to hybrid Duchon (length_scale is Some). Pure Duchon has
-    /// no κ to optimize, so anisotropy requires a different parameterization.
+    /// For hybrid Duchon (`length_scale=Some`), these are centered contrasts in
+    /// the decomposition Λ = κA with det(A)=1. For pure Duchon
+    /// (`length_scale=None`), they parameterize shape-only axis warping on the
+    /// public path and are centered before basis evaluation/writeback so no
+    /// global length scale is introduced.
     ///
     /// When Some, the distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
     /// When None, isotropic distance r = ‖x - c‖ is used.

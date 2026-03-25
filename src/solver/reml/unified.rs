@@ -1115,8 +1115,7 @@ pub trait HyperOperator: Send + Sync {
 /// simultaneously without relying on dummy zero-sized matrices.
 /// A block-local square matrix embedded in joint p-space. Supports O(p_block²)
 /// matvec without materializing to full p×p.
-#[derive(Clone)]
-#[derive(Clone)]
+#[derive(Clone, Clone)]
 pub struct BlockLocalDrift {
     pub local: Array2<f64>,
     pub start: usize,
@@ -3177,22 +3176,20 @@ pub fn reml_laml_evaluate(
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
-        let use_operator = hop.dim() >= 512
-            && hessian_kernel.is_some()
-            && prior_cost_gradient
-                .as_ref()
-                .and_then(|(_, _, prior_hessian)| prior_hessian.as_ref())
-                .is_none();
+        let use_operator = hop.dim() >= 512 && hessian_kernel.is_some();
         if use_operator {
-            crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
+            let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
                 build_outer_hessian_operator(
                     solution,
-                    rho,
                     &lambdas,
                     effective_deriv,
                     hessian_kernel.expect("checked is_some above"),
                 )?,
-            ))
+            ));
+            if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
+                hessian.add_rho_block_dense(ph)?;
+            }
+            hessian
         } else {
             let mut h = compute_outer_hessian(solution, rho, &lambdas, hop, effective_deriv)?;
             // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
@@ -4323,13 +4320,12 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
 
 fn build_outer_hessian_operator(
     solution: &InnerSolution<'_>,
-    rho: &[f64],
     lambdas: &[f64],
     effective_deriv: &dyn HessianDerivativeProvider,
     kernel: OuterHessianDerivativeKernel,
 ) -> Result<UnifiedOuterHessianOperator, String> {
     let hop = Arc::clone(&solution.hessian_op);
-    let k = rho.len();
+    let k = lambdas.len();
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
     let curvature_lambdas: Vec<f64> = lambdas
@@ -4394,6 +4390,12 @@ fn build_outer_hessian_operator(
             }
             if let Some(op) = coord.drift.operator.as_ref() {
                 ops.push(Arc::clone(op));
+            }
+            if ops.is_empty() {
+                return Err(
+                    "operator fast-path selected for ext drift, but no operator terms were stored"
+                        .to_string(),
+                );
             }
             StoredFirstDrift::Operators(ops)
         } else {

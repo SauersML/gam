@@ -53,7 +53,9 @@ use gam::inference::model::{
     survival_baseline_config_from_model,
 };
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
-use gam::matrix::{DesignMatrix, SymmetricMatrix};
+use gam::matrix::{
+    BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, SymmetricMatrix,
+};
 use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
     state_fromspec,
@@ -107,6 +109,7 @@ use rand::{SeedableRng, rngs::StdRng};
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 mod report;
@@ -344,11 +347,12 @@ struct FitArgs {
     /// Enable MM-based spatial adaptive regularization for compatible smooth terms.
     #[arg(long = "adaptive-regularization", action = ArgAction::Set, default_value_t = true)]
     adaptive_regularization: bool,
-    /// Enable per-axis anisotropic length-scale optimization for all eligible
-    /// spatial terms (Matérn and hybrid Duchon).  Only takes effect when kappa
-    /// optimization is enabled (which it is by default).  Each spatial smooth
-    /// starts with zero-initialized per-axis log-scales that are jointly
-    /// optimized alongside the scalar kappa.
+    /// Enable per-axis anisotropic spatial optimization for all eligible
+    /// spatial terms (Matérn and Duchon). Hybrid Duchon jointly optimizes a
+    /// scalar kappa plus per-axis contrasts; pure Duchon optimizes shape-only
+    /// per-axis contrasts without introducing a global length scale. This only
+    /// takes effect when spatial hyperparameter optimization is enabled (which
+    /// it is by default).
     ///
     /// Individual terms can opt in/out via the formula option
     /// `scale_dims=true` / `scale_dims=false`, which overrides this global flag.
@@ -1390,16 +1394,20 @@ fn run_fit_bernoulli_marginal_slope(
     );
     if parsed.linkwiggle.is_some() {
         inference_notes.push(
-            "bernoulli marginal-slope routes main-formula linkwiggle(...) into its anchored internal link-deviation block while keeping the fixed probit base link"
+            "bernoulli marginal-slope routes main-formula linkwiggle(...) into its anchored internal link-deviation block"
                 .to_string(),
         );
     }
     if parsed_logslope.linkwiggle.is_some() {
         inference_notes.push(
-            "bernoulli marginal-slope routes --logslope-formula linkwiggle(...) into its anchored internal score-warp block while keeping the fixed probit base link"
+            "bernoulli marginal-slope routes --logslope-formula linkwiggle(...) into its anchored internal score-warp block"
                 .to_string(),
         );
     }
+    inference_notes.push(format!(
+        "bernoulli marginal-slope marginal block uses base link {} and is mapped into the internal exact probit target during fitting",
+        inverse_link_to_saved_string(&base_link)
+    ));
     inference_notes.extend(marginal_slope_disable_flag_notes(
         "bernoulli marginal-slope",
         "--logslope-formula",
@@ -1432,6 +1440,7 @@ fn run_fit_bernoulli_marginal_slope(
                 y: y.clone(),
                 weights,
                 z,
+                base_link: base_link.clone(),
                 marginalspec: marginalspec.clone(),
                 logslopespec: logslopespec.clone(),
                 marginal_offset,
@@ -7943,6 +7952,27 @@ fn concat_array1_refs(parts: &[&Array1<f64>]) -> Array1<f64> {
     out
 }
 
+fn design_block_from_design(design: &DesignMatrix) -> DesignBlock {
+    match design {
+        DesignMatrix::Dense(matrix) => DesignBlock::Dense(matrix.clone()),
+        DesignMatrix::Sparse(matrix) => DesignBlock::Sparse(matrix.clone()),
+    }
+}
+
+fn horizontally_compose_designs(designs: Vec<DesignMatrix>) -> Result<DesignMatrix, String> {
+    if designs.is_empty() {
+        return Err("cannot horizontally compose an empty design list".to_string());
+    }
+    if designs.len() == 1 {
+        return Ok(designs.into_iter().next().expect("non-empty design list"));
+    }
+    let blocks = designs.iter().map(design_block_from_design).collect();
+    let operator = BlockDesignOperator::new(blocks)?;
+    Ok(DesignMatrix::from(DenseDesignMatrix::from(Arc::new(
+        operator,
+    ))))
+}
+
 fn build_saved_survival_marginal_slope_predictor(
     model: &SavedModel,
     fit_saved: &UnifiedFitResult,
@@ -8020,20 +8050,18 @@ fn build_saved_survival_marginal_slope_predictor(
         }
     }
 
-    let dense_cov = cov_design.to_dense();
-    let dense_logslope = logslope_design.to_dense();
-    if beta_marginal.len() != dense_cov.ncols() {
+    if beta_marginal.len() != cov_design.ncols() {
         return Err(format!(
             "saved survival marginal-slope marginal coefficient mismatch: beta has {} entries but baseline design has {} columns",
             beta_marginal.len(),
-            dense_cov.ncols()
+            cov_design.ncols()
         ));
     }
-    if beta_logslope.len() != dense_logslope.ncols() {
+    if beta_logslope.len() != logslope_design.ncols() {
         return Err(format!(
             "saved survival marginal-slope slope coefficient mismatch: beta has {} entries but slope design has {} columns",
             beta_logslope.len(),
-            dense_logslope.ncols()
+            logslope_design.ncols()
         ));
     }
 
@@ -8053,17 +8081,17 @@ fn build_saved_survival_marginal_slope_predictor(
 
     let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
     let q_entry_base = time_build.x_entry_time.dot(&beta_time_base)
-        + dense_cov.dot(beta_marginal)
+        + cov_design.dot(beta_marginal)
         + eta_offset_entry
         + primary_offset;
     let q_exit_base = time_build.x_exit_time.dot(&beta_time_base)
-        + dense_cov.dot(beta_marginal)
+        + cov_design.dot(beta_marginal)
         + eta_offset_exit
         + primary_offset;
     let qd_exit_base = time_build.x_derivative_time.dot(&beta_time_base) + derivative_offset_exit;
 
-    let x_exit_time_base = time_build.x_exit_time.to_dense();
-    let x_exit_time_full = if saved_timewiggle.is_some() {
+    let mut q_design_parts = vec![time_build.x_exit_time.clone()];
+    if saved_timewiggle.is_some() {
         let (_, exit_w, _) = saved_baseline_timewiggle_components(
             &q_entry_base,
             &q_exit_base,
@@ -8081,23 +8109,10 @@ fn build_saved_survival_marginal_slope_predictor(
                 p_timewiggle
             ));
         }
-        let mut full = Array2::<f64>::zeros((x_exit_time_base.nrows(), p_time_base + p_timewiggle));
-        full.slice_mut(s![.., ..p_time_base])
-            .assign(&x_exit_time_base);
-        full.slice_mut(s![.., p_time_base..]).assign(&exit_w);
-        full
-    } else {
-        x_exit_time_base
-    };
-
-    let p_q = beta_time.len() + beta_marginal.len();
-    let mut q_design = Array2::<f64>::zeros((x_exit_time_full.nrows(), p_q));
-    q_design
-        .slice_mut(s![.., ..beta_time.len()])
-        .assign(&x_exit_time_full);
-    q_design
-        .slice_mut(s![.., beta_time.len()..])
-        .assign(&dense_cov);
+        q_design_parts.push(DesignMatrix::from(exit_w));
+    }
+    q_design_parts.push(cov_design.clone());
+    let q_design = horizontally_compose_designs(q_design_parts)?;
 
     let combined_q_beta = concat_array1_refs(&[beta_time, beta_marginal]);
     let combined_q_lambdas = concat_array1_refs(&[&blocks[0].lambdas, &blocks[1].lambdas]);
@@ -8162,7 +8177,7 @@ fn build_saved_survival_marginal_slope_predictor(
     )?;
 
     let pred_input = PredictInput {
-        design: DesignMatrix::from(q_design),
+        design: q_design,
         offset: eta_offset_exit + primary_offset,
         design_noise: Some(logslope_design.clone()),
         offset_noise: Some(noise_offset.clone()),
@@ -8224,30 +8239,116 @@ fn resolve_bernoulli_marginal_slope_base_link(
     let Some(linkspec) = linkspec else {
         return Ok(InverseLink::Standard(LinkFunction::Probit));
     };
-    if linkspec.mixture_rho.is_some()
-        || linkspec.sas_init.is_some()
-        || linkspec.beta_logistic_init.is_some()
-    {
-        return Err(format!(
-            "{context} only implements link(type=probit); stateful/blended marginal-slope links are not wired into the exact family"
-        ));
-    }
     let choice = parse_link_choice(Some(&linkspec.link), false)?;
     let Some(choice) = choice else {
         return Ok(InverseLink::Standard(LinkFunction::Probit));
     };
-    if choice.mixture_components.is_some() || matches!(choice.mode, LinkMode::Flexible) {
+    if matches!(choice.mode, LinkMode::Flexible) {
         return Err(format!(
-            "{context} only implements link(type=probit); blended and flexible marginal-slope links are not wired into the exact family"
+            "{context} does not accept flexible(...) inside link(); use link(type=<base-link>) plus linkwiggle(...) to learn anchored link deviations"
         ));
     }
-    if choice.link != LinkFunction::Probit {
-        return Err(format!(
-            "{context} only implements link(type=probit); requested link(type={}) is not wired into the exact family yet",
+    if let Some(components) = choice.mixture_components.as_ref() {
+        if linkspec.sas_init.is_some() {
+            return Err("link(sas_init=...) requires link(type=sas)".to_string());
+        }
+        if linkspec.beta_logistic_init.is_some() {
+            return Err("link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string());
+        }
+        let expected = components.len().saturating_sub(1);
+        let rho = if let Some(raw) = linkspec.mixture_rho.as_deref() {
+            let vals = parse_comma_f64(raw, "link(rho=...)")?;
+            if vals.len() != expected {
+                return Err(format!(
+                    "link(rho=...) length mismatch: expected {expected}, got {}",
+                    vals.len()
+                ));
+            }
+            Array1::from_vec(vals)
+        } else {
+            Array1::zeros(expected)
+        };
+        return state_fromspec(&MixtureLinkSpec {
+            components: components.clone(),
+            initial_rho: rho,
+        })
+        .map(InverseLink::Mixture)
+        .map_err(|e| format!("invalid blended link configuration: {e}"));
+    }
+    if linkspec.mixture_rho.is_some() {
+        return Err("link(rho=...) requires link(type=blended(...)/mixture(...))".to_string());
+    }
+    match choice.link {
+        LinkFunction::Probit | LinkFunction::Logit | LinkFunction::CLogLog => {
+            if linkspec.sas_init.is_some() {
+                return Err("link(sas_init=...) requires link(type=sas)".to_string());
+            }
+            if linkspec.beta_logistic_init.is_some() {
+                return Err(
+                    "link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string(),
+                );
+            }
+            Ok(InverseLink::Standard(choice.link))
+        }
+        LinkFunction::Sas => {
+            if linkspec.beta_logistic_init.is_some() {
+                return Err(
+                    "link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string(),
+                );
+            }
+            let spec = if let Some(raw) = linkspec.sas_init.as_deref() {
+                let vals = parse_comma_f64(raw, "link(sas_init=...)")?;
+                if vals.len() != 2 {
+                    return Err(format!(
+                        "link(sas_init=...) expects two values: epsilon,log_delta (got {})",
+                        vals.len()
+                    ));
+                }
+                SasLinkSpec {
+                    initial_epsilon: vals[0],
+                    initial_log_delta: vals[1],
+                }
+            } else {
+                SasLinkSpec {
+                    initial_epsilon: 0.0,
+                    initial_log_delta: 0.0,
+                }
+            };
+            state_from_sasspec(spec)
+                .map(InverseLink::Sas)
+                .map_err(|e| format!("invalid SAS link configuration: {e}"))
+        }
+        LinkFunction::BetaLogistic => {
+            if linkspec.sas_init.is_some() {
+                return Err("link(sas_init=...) requires link(type=sas)".to_string());
+            }
+            let spec = if let Some(raw) = linkspec.beta_logistic_init.as_deref() {
+                let vals = parse_comma_f64(raw, "link(beta_logistic_init=...)")?;
+                if vals.len() != 2 {
+                    return Err(format!(
+                        "link(beta_logistic_init=...) expects two values: epsilon,delta (got {})",
+                        vals.len()
+                    ));
+                }
+                SasLinkSpec {
+                    initial_epsilon: vals[0],
+                    initial_log_delta: vals[1],
+                }
+            } else {
+                SasLinkSpec {
+                    initial_epsilon: 0.0,
+                    initial_log_delta: 0.0,
+                }
+            };
+            state_from_beta_logisticspec(spec)
+                .map(InverseLink::BetaLogistic)
+                .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))
+        }
+        LinkFunction::Identity | LinkFunction::Log => Err(format!(
+            "{context} does not support link(type={}); use probit|logit|cloglog|sas|beta-logistic|blended(...)/mixture(...)",
             linkname(choice.link)
-        ));
+        )),
     }
-    Ok(InverseLink::Standard(LinkFunction::Probit))
 }
 
 fn build_transformation_normal_saved_model(
@@ -10385,8 +10486,11 @@ mod tests {
     };
     use gam::inference::formula_dsl::{ParsedTerm, parse_linkwiggle_formulaspec};
     use gam::inference::model::{
-        ColumnKindTag, FittedModelPayload, SavedAnchoredDeviationRuntime, SchemaColumn,
+        ColumnKindTag, FittedModelPayload, SavedAnchoredDeviationRuntime,
+        SavedLatentZNormalization, SchemaColumn,
     };
+    use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
+    use gam::predict::PredictableModel;
     use gam::smooth::{
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
         SmoothTermSpec, TermCollectionSpec,
@@ -10405,7 +10509,9 @@ mod tests {
     use rand_distr::{Distribution, StandardNormal};
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
+    use std::ops::Range;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
 
@@ -11216,6 +11322,7 @@ mod tests {
             .fit_result
             .as_ref()
             .expect("fit_result should be saved");
+        assert!(saved.payload().latent_z_normalization.is_some());
         assert!(
             fit_result.beta_covariance().is_some()
                 || fit_result.beta_covariance_corrected().is_some(),
@@ -12769,10 +12876,15 @@ mod tests {
             ),
             0.0,
             0.0,
+            SavedLatentZNormalization { mean: 0.2, sd: 1.3 },
             None,
             None,
             InverseLink::Standard(LinkFunction::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
+        );
+        assert_eq!(
+            model.payload().latent_z_normalization,
+            Some(SavedLatentZNormalization { mean: 0.2, sd: 1.3 })
         );
         assert_eq!(model.payload().marginal_baseline, Some(0.0));
         assert_eq!(model.payload().logslope_baseline, Some(0.0));
@@ -12782,6 +12894,85 @@ mod tests {
                 .resolved_inverse_link()
                 .expect("resolved inverse link"),
             Some(InverseLink::Standard(LinkFunction::Probit))
+        );
+    }
+
+    #[test]
+    fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
+        let td = tempdir().expect("tempdir");
+        let model_path = td.path().join("model.json");
+        let data_path = td.path().join("predict.csv");
+        let out_path = td.path().join("pred.csv");
+        let fit_result = compact_saved_multiblock_fit_result(
+            vec![
+                FittedBlock {
+                    beta: Array1::zeros(0),
+                    role: BlockRole::Mean,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: Array1::zeros(0),
+                    role: BlockRole::Scale,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+            ],
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            SavedFitSummary {
+                likelihood_family: Some(LikelihoodFamily::BinomialProbit),
+                likelihood_scale: LikelihoodScaleMetadata::Unspecified,
+                log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
+                ..saved_fit_summary_stub()
+            },
+        );
+        let model = super::build_bernoulli_marginal_slope_saved_model(
+            "y ~ 1".to_string(),
+            DataSchema {
+                columns: vec![SchemaColumn {
+                    name: "z".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                }],
+            },
+            "y ~ 1".to_string(),
+            "z".to_string(),
+            vec!["z".to_string()],
+            empty_termspec(),
+            empty_termspec(),
+            fit_result,
+            0.0,
+            1.0,
+            SavedLatentZNormalization { mean: 1.0, sd: 2.0 },
+            None,
+            None,
+            InverseLink::Standard(LinkFunction::Probit),
+            gam::families::lognormal_kernel::FrailtySpec::None,
+        );
+        write_model_json(&model_path, &model).expect("write saved marginal-slope model");
+        fs::write(&data_path, "z\n3.0\n").expect("write prediction data");
+
+        run_predict(PredictArgs {
+            model: model_path,
+            new_data: data_path,
+            out: out_path.clone(),
+            offset_column: None,
+            noise_offset_column: None,
+            uncertainty: false,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::Map,
+        })
+        .expect("saved marginal-slope predict should succeed");
+
+        let predicted = csv_mean_at(&out_path, 0);
+        let expected = normal_cdf(1.0);
+        assert!(
+            (predicted - expected).abs() <= 1e-12,
+            "saved marginal-slope prediction should use normalized z: predicted={predicted}, expected={expected}"
         );
     }
 
@@ -13419,6 +13610,218 @@ mod tests {
             let expected_mean = super::normal_cdf(-expected_eta);
             assert!((eta[i] - expected_eta).abs() <= 1e-10);
             assert!((mean[i] - expected_mean).abs() <= 1e-10);
+        }
+    }
+
+    #[test]
+    fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() {
+        #[derive(Clone)]
+        struct NoDensifyTestOperator {
+            dense: Array2<f64>,
+        }
+
+        impl LinearOperator for NoDensifyTestOperator {
+            fn nrows(&self) -> usize {
+                self.dense.nrows()
+            }
+
+            fn ncols(&self) -> usize {
+                self.dense.ncols()
+            }
+
+            fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+                self.dense.dot(vector)
+            }
+
+            fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+                self.dense.t().dot(vector)
+            }
+
+            fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+                if weights.len() != self.nrows() {
+                    return Err(format!(
+                        "NoDensifyTestOperator weight length mismatch: weights={}, nrows={}",
+                        weights.len(),
+                        self.nrows()
+                    ));
+                }
+                let p = self.ncols();
+                let mut out = Array2::<f64>::zeros((p, p));
+                for i in 0..self.nrows() {
+                    let w = weights[i].max(0.0);
+                    for a in 0..p {
+                        let xia = self.dense[[i, a]];
+                        for b in 0..p {
+                            out[[a, b]] += w * xia * self.dense[[i, b]];
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        impl DenseDesignOperator for NoDensifyTestOperator {
+            fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+                self.dense.slice(s![rows, ..]).to_owned()
+            }
+
+            fn to_dense(&self) -> Array2<f64> {
+                panic!("saved survival marginal-slope predictor should not densify this operator")
+            }
+        }
+
+        fn nondensify_design(dense: Array2<f64>) -> DesignMatrix {
+            DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyTestOperator {
+                dense,
+            })))
+        }
+
+        let time_entry_dense = array![[0.1], [0.4]];
+        let time_exit_dense = array![[0.2], [0.6]];
+        let time_deriv_dense = array![[1.0], [1.0]];
+        let cov_dense = array![[1.0, -0.5], [0.3, 0.8]];
+        let logslope_dense = array![[0.7], [-0.2]];
+        let time_build = gam::survival_construction::SurvivalTimeBuildOutput {
+            x_entry_time: nondensify_design(time_entry_dense.clone()),
+            x_exit_time: nondensify_design(time_exit_dense.clone()),
+            x_derivative_time: nondensify_design(time_deriv_dense.clone()),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            basisname: "ispline".to_string(),
+            degree: Some(1),
+            knots: None,
+            keep_cols: None,
+            smooth_lambda: None,
+        };
+        let fit_saved = compact_saved_multiblock_fit_result(
+            vec![
+                FittedBlock {
+                    beta: array![0.6],
+                    role: BlockRole::Mean,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: array![0.5, -0.25],
+                    role: BlockRole::Mean,
+                    edf: 2.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: array![0.8],
+                    role: BlockRole::Scale,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                },
+            ],
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            saved_fit_summary_stub(),
+        );
+
+        let mut payload = test_payload(
+            "Surv(entry, exit, event) ~ x1 + x2",
+            ModelKind::Survival,
+            FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("marginal-slope".to_string()),
+                survival_distribution: Some("probit".to_string()),
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            },
+            "survival",
+        );
+        payload.fit_result = Some(fit_saved.clone());
+        payload.unified = Some(fit_saved.clone());
+        payload.survival_entry = Some("entry".to_string());
+        payload.survival_exit = Some("exit".to_string());
+        payload.survival_event = Some("event".to_string());
+        payload.survivalspec = Some("net".to_string());
+        payload.survival_baseline_target = Some("linear".to_string());
+        payload.survival_likelihood = Some("marginal-slope".to_string());
+        payload.survival_distribution = Some("probit".to_string());
+        payload.survival_time_basis = Some("ispline".to_string());
+        payload.formula_logslope = Some("ls ~ 1".to_string());
+        payload.z_column = Some("z".to_string());
+        payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
+        payload.logslope_baseline = Some(0.0);
+        payload.link = Some("probit".to_string());
+        let model = SavedModel::from_payload(payload);
+
+        let cov_design = nondensify_design(cov_dense.clone());
+        let logslope_design = nondensify_design(logslope_dense.clone());
+        let z = array![-1.0, 0.5];
+        let eta_offset_entry = array![0.05, -0.02];
+        let eta_offset_exit = array![0.1, -0.03];
+        let derivative_offset_exit = array![0.0, 0.0];
+        let primary_offset = array![0.2, -0.15];
+        let noise_offset = array![0.04, -0.01];
+
+        let (predictor, pred_input, _) = super::build_saved_survival_marginal_slope_predictor(
+            &model,
+            &fit_saved,
+            "z",
+            &z,
+            &cov_design,
+            &logslope_design,
+            &time_build,
+            &eta_offset_entry,
+            &eta_offset_exit,
+            &derivative_offset_exit,
+            &primary_offset,
+            &noise_offset,
+        )
+        .expect("operator-backed saved survival predictor should build without densifying");
+
+        assert!(
+            pred_input.design.as_dense_ref().is_none(),
+            "saved survival predictor should keep the rebuilt q design operator-backed"
+        );
+        assert!(
+            pred_input
+                .design_noise
+                .as_ref()
+                .expect("logslope design")
+                .as_dense_ref()
+                .is_none(),
+            "saved survival predictor should keep the logslope design operator-backed"
+        );
+
+        let prediction = predictor
+            .predict_plugin_response(&pred_input)
+            .expect("operator-backed saved survival predictor should score");
+        let q_exit = time_exit_dense.dot(&array![0.6])
+            + cov_dense.dot(&array![0.5, -0.25])
+            + &eta_offset_exit
+            + &primary_offset;
+        let slope = logslope_dense.dot(&array![0.8]) + &noise_offset;
+        let (expected_eta, expected_mean) =
+            saved_survival_marginal_slope_test_support::predict_saved_survival_marginal_slope_flex_exit(
+                &q_exit,
+                &slope,
+                &z,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("closed-form saved survival helper should evaluate");
+
+        for i in 0..expected_eta.len() {
+            assert!(
+                (prediction.eta[i] - expected_eta[i]).abs() <= 1e-10,
+                "row {i}: eta mismatch: got {}, expected {}",
+                prediction.eta[i],
+                expected_eta[i]
+            );
+            assert!(
+                (prediction.mean[i] - expected_mean[i]).abs() <= 1e-10,
+                "row {i}: mean mismatch: got {}, expected {}",
+                prediction.mean[i],
+                expected_mean[i]
+            );
         }
     }
 

@@ -1,4 +1,7 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
+use crate::families::bernoulli_marginal_slope::{
+    bernoulli_marginal_link_map, bernoulli_marginal_slope_eta_from_probability,
+};
 use crate::families::lognormal_kernel::{FrailtySpec, ProbitFrailtyScale};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::inference::model::{
@@ -13,7 +16,7 @@ use crate::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
 };
-use crate::probability::standard_normal_quantile;
+use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::types::{InverseLink, LikelihoodFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -881,6 +884,43 @@ impl BernoulliMarginalSlopePredictor {
         marginal_eta * (1.0 + (probit_scale * slope).powi(2)).sqrt() / probit_scale
     }
 
+    fn transform_internal_eta_to_base_scale(
+        &self,
+        internal_eta: Array1<f64>,
+        internal_grad: Option<Array2<f64>>,
+    ) -> Result<(Array1<f64>, Option<Array2<f64>>), EstimationError> {
+        if matches!(self.base_link, InverseLink::Standard(crate::types::LinkFunction::Probit)) {
+            return Ok((internal_eta, internal_grad));
+        }
+        let mut eta = Array1::<f64>::zeros(internal_eta.len());
+        let mut grad = internal_grad;
+        for i in 0..internal_eta.len() {
+            let probability = normal_cdf(internal_eta[i]);
+            let eta_i = bernoulli_marginal_slope_eta_from_probability(
+                &self.base_link,
+                probability,
+                "saved bernoulli marginal-slope eta transform",
+            )
+            .map_err(EstimationError::InvalidInput)?;
+            let marginal = bernoulli_marginal_link_map(&self.base_link, eta_i)
+                .map_err(EstimationError::InvalidInput)?;
+            if !marginal.mu1.is_finite() || marginal.mu1 <= 0.0 {
+                return Err(EstimationError::InvalidInput(format!(
+                    "saved bernoulli marginal-slope inverse-link derivative must be positive, got {} at eta={eta_i}",
+                    marginal.mu1
+                )));
+            }
+            eta[i] = eta_i;
+            if let Some(grad) = grad.as_mut() {
+                let factor = normal_pdf(internal_eta[i]) / marginal.mu1;
+                for j in 0..grad.ncols() {
+                    grad[[i, j]] *= factor;
+                }
+            }
+        }
+        Ok((eta, grad))
+    }
+
     fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
         [
             scale * coefficients[0],
@@ -991,9 +1031,11 @@ impl BernoulliMarginalSlopePredictor {
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
     ) -> Result<(f64, f64, f64), EstimationError> {
+        let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
+            .map_err(EstimationError::InvalidInput)?;
         let cells = self.denested_partition_cells(a, slope, beta_score_warp, beta_link_dev)?;
         let scale = self.probit_frailty_scale();
-        let mut f = -crate::probability::normal_cdf(marginal_eta);
+        let mut f = -marginal.mu;
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
         for partition_cell in cells {
@@ -1206,6 +1248,8 @@ impl BernoulliMarginalSlopePredictor {
         score_warp_beta: Option<&Array1<f64>>,
         warm_start_buf: &mut Array1<f64>,
     ) -> Result<f64, EstimationError> {
+        let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
+            .map_err(EstimationError::InvalidInput)?;
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
             self.evaluate_denested_calibration(
                 a,
@@ -1218,7 +1262,7 @@ impl BernoulliMarginalSlopePredictor {
         };
 
         let probit_scale = self.probit_frailty_scale();
-        let a_rigid = self.rigid_intercept_from_marginal(marginal_eta, slope);
+        let a_rigid = self.rigid_intercept_from_marginal(marginal.q, slope);
         let mut intercept = a_rigid;
         if let (Some(_), Some(beta)) = (self.link_deviation_runtime.as_ref(), link_dev_beta) {
             warm_start_buf[0] = a_rigid;
@@ -1228,7 +1272,7 @@ impl BernoulliMarginalSlopePredictor {
             if ell1 > 1e-8 {
                 let ell0 = l_val[0] - ell1 * a_rigid;
                 let observed_logslope = probit_scale * ell1 * slope;
-                intercept = (marginal_eta * (1.0 + observed_logslope * observed_logslope).sqrt()
+                intercept = (marginal.q * (1.0 + observed_logslope * observed_logslope).sqrt()
                     / probit_scale
                     - ell0)
                     / ell1;
@@ -1252,11 +1296,11 @@ impl BernoulliMarginalSlopePredictor {
             score_warp_beta,
             link_dev_beta,
         )?;
-        let target = crate::probability::normal_cdf(marginal_eta);
+        let target = marginal.mu;
         let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
         if f_best.abs() > abs_tol {
             return Err(EstimationError::InvalidInput(format!(
-                "saved bernoulli marginal-slope intercept solve failed: residual={f_best:.3e} at a={root:.6}, target Phi(q)={target:.6}"
+                "saved bernoulli marginal-slope intercept solve failed: residual={f_best:.3e} at a={root:.6}, target mu={target:.6}"
             )));
         }
         Ok(root)
@@ -1335,6 +1379,13 @@ impl BernoulliMarginalSlopePredictor {
         let chunk_size = prediction_chunk_rows(theta.len(), 1, n);
         let num_chunks = (n + chunk_size - 1) / chunk_size;
         let scale = self.probit_frailty_scale();
+        let marginal_map = marginal_eta
+            .iter()
+            .map(|&eta| {
+                bernoulli_marginal_link_map(&self.base_link, eta)
+                    .map_err(EstimationError::InvalidInput)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // ── Rigid closed-form path under probit Gaussian frailty ──────
         // When neither score-warp nor link-deviation is active, z passes
@@ -1580,7 +1631,7 @@ impl BernoulliMarginalSlopePredictor {
             }
         }
 
-        let eta_base = &intercepts + &(&logslope_eta * z);
+        let eta_base = &intercepts + &(&logslope_eta * &z);
 
         let mut link_c_obs: Option<Array1<f64>> = None;
         let mut link_basis_obs: Option<Array2<f64>> = None;

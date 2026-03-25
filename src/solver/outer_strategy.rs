@@ -90,6 +90,24 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
         }
         Ok(out)
     }
+
+    fn materialize_dense(&self) -> Result<Array2<f64>, String> {
+        let mut dense = self.base.materialize_dense()?;
+        let k = self.rho_block.nrows();
+        if k > dense.nrows() || k > dense.ncols() {
+            return Err(format!(
+                "rho-block Hessian update shape mismatch: got {}x{}, dense operator is {}x{}",
+                self.rho_block.nrows(),
+                self.rho_block.ncols(),
+                dense.nrows(),
+                dense.ncols()
+            ));
+        }
+        dense
+            .slice_mut(ndarray::s![..k, ..k])
+            .scaled_add(1.0, &self.rho_block);
+        Ok(dense)
+    }
 }
 
 /// Whether an analytic derivative is available for a given order.
@@ -699,7 +717,8 @@ impl HessianResult {
                 Ok(())
             }
             HessianResult::Operator(op) => {
-                let dim = op.dim();
+                let base = Arc::clone(op);
+                let dim = base.dim();
                 if rho_block.nrows() > dim {
                     return Err(format!(
                         "rho-block Hessian update dimension mismatch: got {}x{}, operator dim is {}",
@@ -709,7 +728,7 @@ impl HessianResult {
                     ));
                 }
                 *self = HessianResult::Operator(Arc::new(RhoBlockAdditiveOuterHessian {
-                    base: Arc::clone(op),
+                    base,
                     rho_block: rho_block.clone(),
                     dim,
                 }));
