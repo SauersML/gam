@@ -868,10 +868,12 @@ impl SpatialLogKappaCoords {
     ///
     /// For each term, checks whether it has `aniso_log_scales` set on its basis spec.
     /// - If isotropic (no aniso_log_scales, or 1-D): 1 entry = −ln(length_scale).
-    /// - If anisotropic (aniso_log_scales present): d entries, one ψ_a per axis.
+    /// - If anisotropic with a scalar length scale: d entries, one ψ_a per axis.
     ///   Initialized as ψ_a = −ln(length_scale) + η_a  where η_a are the existing
     ///   aniso_log_scales (which sum to zero). If aniso_log_scales is empty or missing
     ///   for a multi-dimensional term, the scalar −ln(length_scale) is broadcast.
+    /// - If pure Duchon anisotropic: d entries equal the current η_a values
+    ///   directly; no scalar length_scale is introduced.
     pub(crate) fn from_length_scales_aniso(
         spec: &TermCollectionSpec,
         term_indices: &[usize],
@@ -884,10 +886,10 @@ impl SpatialLogKappaCoords {
                 let d = get_spatial_feature_dim(spec, term_idx).unwrap_or(1);
                 let eta =
                     get_spatial_aniso_log_scales(spec, term_idx).unwrap_or_else(|| vec![0.0; d]);
-                for eta_a in eta.into_iter().take(d) {
+                for eta_a in eta.into_iter().take(d.saturating_sub(1)) {
                     vals.push(eta_a);
                 }
-                dims.push(d);
+                dims.push(d.saturating_sub(1).max(1));
                 continue;
             }
             let length_scale = get_spatial_length_scale(spec, term_idx)
@@ -1031,9 +1033,9 @@ impl SpatialLogKappaCoords {
     /// Apply optimized ψ values back to the spec.
     ///
     /// For isotropic terms (dims=1): sets scalar length_scale = exp(−ψ).
-    /// For anisotropic terms (dims=d): sets length_scale = exp(−ψ̄) where
-    /// ψ̄ = mean(ψ_a), and sets aniso_log_scales = Some([η_a]) where
-    /// η_a = ψ_a − ψ̄ (these sum to zero by construction).
+    /// For anisotropic terms (dims=d): hybrid/isotropic families set
+    /// length_scale = exp(−ψ̄) with centered η_a = ψ_a − ψ̄, while pure Duchon
+    /// writes only centered η_a and leaves length_scale = None.
     pub(crate) fn apply_tospec(
         &self,
         spec: &TermCollectionSpec,
@@ -1110,8 +1112,17 @@ fn spatial_term_psi_to_length_scale_and_aniso(
     term_idx: usize,
     psi: &[f64],
 ) -> (Option<f64>, Option<Vec<f64>>) {
-    if is_pure_duchon_aniso_term(spec, term_idx) && psi.len() > 1 {
-        return (None, Some(psi.to_vec()));
+    if is_pure_duchon_aniso_term(spec, term_idx) {
+        let d = get_spatial_feature_dim(spec, term_idx).unwrap_or(psi.len());
+        let free = d.saturating_sub(1);
+        let mut eta = vec![0.0; d];
+        for (axis, &value) in psi.iter().take(free).enumerate() {
+            eta[axis] = value;
+        }
+        if d > 1 {
+            eta[d - 1] = -eta[..d - 1].iter().sum::<f64>();
+        }
+        return (None, Some(eta));
     }
     if psi.len() <= 1 {
         (Some((-psi.first().copied().unwrap_or(0.0)).exp()), None)
@@ -3483,6 +3494,16 @@ fn build_constraint_block(
     block
 }
 
+fn smooth_has_overlapping_linear_terms(
+    linear_terms: &[LinearTermSpec],
+    termspec: &SmoothTermSpec,
+) -> bool {
+    let feature_cols = smooth_term_feature_cols(termspec);
+    linear_terms
+        .iter()
+        .any(|linear| feature_cols.contains(&linear.feature_col))
+}
+
 fn apply_global_smooth_identifiability(
     smooth: RawSmoothDesign,
     data: ArrayView2<'_, f64>,
@@ -3491,8 +3512,9 @@ fn apply_global_smooth_identifiability(
 ) -> Result<SmoothDesign, BasisError> {
     // Global smooth identifiability policy:
     //
-    // 1. Spatial smooths keep their existing intercept/linear orthogonality
-    //    policy when requested.
+    // 1. Any smooth that overlaps explicit linear terms is residualized against
+    //    [intercept | overlapping linear columns]. Spatial smooths also keep
+    //    their existing parametric orthogonality policy when requested.
     // 2. Higher-order / duplicate smooths are orthogonalized to the realized
     //    design columns of lower-order owned smooths over nested feature sets.
     //
@@ -3530,7 +3552,7 @@ fn apply_global_smooth_identifiability(
         let termspec = &smoothspecs[idx];
         let design_local = smooth.term_designs[idx].clone();
         let skip_global_transform =
-            smooth_has_frozen_identifiability(termspec) || term.shape != ShapeConstraint::None;
+            smooth_has_frozen_identifiability(termspec) || term.lower_bounds_local.is_some();
         let owner_indices = if skip_global_transform {
             Vec::new()
         } else {
@@ -3550,19 +3572,20 @@ fn apply_global_smooth_identifiability(
                     .expect("owner design must be available before dependent smooth")
             })
             .collect::<Vec<_>>();
-        let parametric_block = if skip_global_transform {
+        let needs_parametric_block = !skip_global_transform
+            && (smooth_has_overlapping_linear_terms(linear_terms, termspec)
+                || matches!(
+                    spatial_identifiability_policy(termspec),
+                    Some(SpatialIdentifiability::OrthogonalToParametric)
+                ));
+        let parametric_block = if !needs_parametric_block {
             None
-        } else if matches!(
-            spatial_identifiability_policy(termspec),
-            Some(SpatialIdentifiability::OrthogonalToParametric)
-        ) {
+        } else {
             Some(build_parametric_constraint_block_for_term(
                 data,
                 linear_terms,
                 termspec,
             )?)
-        } else {
-            None
         };
         let c_local =
             if skip_global_transform || (parametric_block.is_none() && owner_blocks.is_empty()) {
@@ -3845,7 +3868,7 @@ fn apply_smooth_transform_to_design(
             )))
         }
         DesignMatrix::Sparse(inner) => {
-            let dense = inner.to_dense().dot(transform);
+            let dense = inner.to_dense_arc().as_ref().dot(transform);
             Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 dense,
             )))
@@ -9055,6 +9078,9 @@ fn compute_spatial_dims_per_term(
         .iter()
         .map(|&term_idx| {
             let d = get_spatial_feature_dim(resolvedspec, term_idx).unwrap_or(1);
+            if is_pure_duchon_aniso_term(resolvedspec, term_idx) {
+                return d.saturating_sub(1).max(1);
+            }
             let has_aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx).is_some();
             if has_aniso && d > 1 { d } else { 1 }
         })
@@ -9062,8 +9088,10 @@ fn compute_spatial_dims_per_term(
 }
 
 /// Check whether any spatial terms are anisotropic (dims_per_term > 1).
-fn has_aniso_terms(dims_per_term: &[usize]) -> bool {
-    dims_per_term.iter().any(|&d| d > 1)
+fn has_aniso_terms(resolvedspec: &TermCollectionSpec, spatial_terms: &[usize]) -> bool {
+    spatial_terms.iter().any(|&term_idx| {
+        get_spatial_aniso_log_scales(resolvedspec, term_idx).is_some_and(|eta| eta.len() > 1)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -9209,7 +9237,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     // Compute per-term dimensionality for anisotropic terms.
     let dims_per_term = compute_spatial_dims_per_term(resolvedspec, spatial_terms);
-    let use_aniso = has_aniso_terms(&dims_per_term);
+    let use_aniso = has_aniso_terms(resolvedspec, spatial_terms);
 
     // Build initial ψ values and bounds, using aniso-aware constructors
     // when any term has d > 1 axes.
@@ -11143,7 +11171,7 @@ where
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
 
-    use crate::solver::outer_strategy::{Derivative, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, EfsEval, OuterEval};
 
     let problem = exact_joint_multistart_outer_problem(
         &theta0,
@@ -12306,6 +12334,63 @@ mod tests {
             out.is_ok(),
             "term-local Option 5 should not over-constrain non-overlapping smooth/linear terms: {:?}",
             out.err()
+        );
+    }
+
+    #[test]
+    fn overlapping_linear_term_residualizes_bspline_smooth() {
+        let data = array![
+            [0.0],
+            [0.1],
+            [0.2],
+            [0.3],
+            [0.4],
+            [0.5],
+            [0.6],
+            [0.7],
+            [0.8],
+            [0.9],
+            [1.0],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "x".to_string(),
+                feature_col: 0,
+                double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None,
+                coefficient_max: None,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "s_x".to_string(),
+                basis: SmoothBasisSpec::BSpline1D {
+                    feature_col: 0,
+                    spec: BSplineBasisSpec {
+                        degree: 3,
+                        penalty_order: 2,
+                        knotspec: BSplineKnotSpec::Generate {
+                            data_range: (0.0, 1.0),
+                            num_internal_knots: 4,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("bspline design");
+        let mut c = Array2::<f64>::zeros((data.nrows(), 2));
+        c.column_mut(0).fill(1.0);
+        c.column_mut(1).assign(&data.column(0));
+        let rel =
+            orthogonality_relative_residual_for_design(&design.smooth.term_designs[0], c.view())
+                .expect("orthogonality residual");
+        assert!(
+            rel <= 1e-10,
+            "B-spline smooth should be orthogonal to [1, x] when linear(x) is present; rel={rel}"
         );
     }
 
@@ -14567,7 +14652,7 @@ mod tests {
             }],
         };
 
-        let updated = SpatialLogKappaCoords::new_with_dims(array![0.4, -0.1], vec![2])
+        let updated = SpatialLogKappaCoords::new_with_dims(array![0.4], vec![1])
             .apply_tospec(&spec, &[0])
             .expect("pure Duchon update should succeed");
         match &updated.smooth_terms[0].basis {
@@ -14578,6 +14663,8 @@ mod tests {
                     .as_ref()
                     .expect("pure Duchon should keep aniso");
                 assert!((eta.iter().sum::<f64>()).abs() <= 1e-12);
+                assert!((eta[0] - 0.4).abs() <= 1e-12);
+                assert!((eta[1] + 0.4).abs() <= 1e-12);
             }
             _ => panic!("expected Duchon term"),
         }

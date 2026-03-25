@@ -9333,12 +9333,32 @@ fn center_aniso_log_scales_basis(eta: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-fn perturb_duchon_pure_aniso(spec: &DuchonBasisSpec, delta: &[(usize, f64)]) -> DuchonBasisSpec {
-    let mut next = spec.clone();
-    let mut eta = next.aniso_log_scales.clone().unwrap_or_default();
-    for &(axis, step) in delta {
-        eta[axis] += step;
+fn pure_duchon_eta_from_free(free_eta: &[f64], full_dim: usize) -> Vec<f64> {
+    if full_dim <= 1 {
+        return free_eta.to_vec();
     }
+    let mut eta = vec![0.0; full_dim];
+    for (axis, &value) in free_eta.iter().take(full_dim - 1).enumerate() {
+        eta[axis] = value;
+    }
+    eta[full_dim - 1] = -eta[..full_dim - 1].iter().sum::<f64>();
+    eta
+}
+
+fn perturb_duchon_pure_aniso(
+    spec: &DuchonBasisSpec,
+    free_eta: &[f64],
+    delta: &[(usize, f64)],
+) -> DuchonBasisSpec {
+    let mut next = spec.clone();
+    let mut perturbed = free_eta.to_vec();
+    for &(axis, step) in delta {
+        perturbed[axis] += step;
+    }
+    let eta = pure_duchon_eta_from_free(
+        &perturbed,
+        spec.aniso_log_scales.as_deref().map_or(0, |v| v.len()),
+    );
     next.aniso_log_scales = Some(center_aniso_log_scales_basis(&eta));
     next
 }
@@ -9390,20 +9410,26 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     let base_penalties = base.penalties.clone();
     let effective_eta = basis_duchon_effective_aniso(&base.metadata)
         .unwrap_or_else(|| center_aniso_log_scales_basis(raw_eta));
+    let free_eta = if dim > 1 {
+        effective_eta[..dim - 1].to_vec()
+    } else {
+        effective_eta.clone()
+    };
+    let free_dim = free_eta.len().max(1);
     let base_spec = DuchonBasisSpec {
         aniso_log_scales: Some(effective_eta),
         ..spec.clone()
     };
     let eps = 2e-5_f64;
 
-    let mut design_first = Vec::with_capacity(dim);
-    let mut design_second_diag = Vec::with_capacity(dim);
-    let mut penalties_first = Vec::with_capacity(dim);
-    let mut penalties_second_diag = Vec::with_capacity(dim);
+    let mut design_first = Vec::with_capacity(free_dim);
+    let mut design_second_diag = Vec::with_capacity(free_dim);
+    let mut penalties_first = Vec::with_capacity(free_dim);
+    let mut penalties_second_diag = Vec::with_capacity(free_dim);
 
-    for axis in 0..dim {
-        let plus_spec = perturb_duchon_pure_aniso(&base_spec, &[(axis, eps)]);
-        let minus_spec = perturb_duchon_pure_aniso(&base_spec, &[(axis, -eps)]);
+    for axis in 0..free_dim {
+        let plus_spec = perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis, eps)]);
+        let minus_spec = perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis, -eps)]);
         let plus = build_duchon_basiswithworkspace(data, &plus_spec, &mut workspace)?;
         let minus = build_duchon_basiswithworkspace(data, &minus_spec, &mut workspace)?;
         let plus_design = plus.design.to_dense();
@@ -9431,25 +9457,25 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     let mut design_second_cross_pairs = Vec::new();
     let mut penalties_cross = Vec::new();
     let mut penalties_cross_pairs = Vec::new();
-    for (axis_a, axis_b) in fd_cross_axis_pairs(dim) {
+    for (axis_a, axis_b) in fd_cross_axis_pairs(free_dim) {
         let plus_plus = build_duchon_basiswithworkspace(
             data,
-            &perturb_duchon_pure_aniso(&base_spec, &[(axis_a, eps), (axis_b, eps)]),
+            &perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis_a, eps), (axis_b, eps)]),
             &mut workspace,
         )?;
         let plus_minus = build_duchon_basiswithworkspace(
             data,
-            &perturb_duchon_pure_aniso(&base_spec, &[(axis_a, eps), (axis_b, -eps)]),
+            &perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis_a, eps), (axis_b, -eps)]),
             &mut workspace,
         )?;
         let minus_plus = build_duchon_basiswithworkspace(
             data,
-            &perturb_duchon_pure_aniso(&base_spec, &[(axis_a, -eps), (axis_b, eps)]),
+            &perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis_a, -eps), (axis_b, eps)]),
             &mut workspace,
         )?;
         let minus_minus = build_duchon_basiswithworkspace(
             data,
-            &perturb_duchon_pure_aniso(&base_spec, &[(axis_a, -eps), (axis_b, -eps)]),
+            &perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis_a, -eps), (axis_b, -eps)]),
             &mut workspace,
         )?;
 

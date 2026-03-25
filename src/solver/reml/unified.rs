@@ -1115,7 +1115,7 @@ pub trait HyperOperator: Send + Sync {
 /// simultaneously without relying on dummy zero-sized matrices.
 /// A block-local square matrix embedded in joint p-space. Supports O(p_block²)
 /// matvec without materializing to full p×p.
-#[derive(Clone, Clone)]
+#[derive(Clone)]
 pub struct BlockLocalDrift {
     pub local: Array2<f64>,
     pub start: usize,

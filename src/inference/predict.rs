@@ -889,7 +889,10 @@ impl BernoulliMarginalSlopePredictor {
         internal_eta: Array1<f64>,
         internal_grad: Option<Array2<f64>>,
     ) -> Result<(Array1<f64>, Option<Array2<f64>>), EstimationError> {
-        if matches!(self.base_link, InverseLink::Standard(crate::types::LinkFunction::Probit)) {
+        if matches!(
+            self.base_link,
+            InverseLink::Standard(crate::types::LinkFunction::Probit)
+        ) {
             return Ok((internal_eta, internal_grad));
         }
         let mut eta = Array1::<f64>::zeros(internal_eta.len());
@@ -1394,14 +1397,15 @@ impl BernoulliMarginalSlopePredictor {
         if !flex_active {
             let sb_vec = logslope_eta.mapv(|b| scale * b);
             let c_vec = sb_vec.mapv(|sb| (1.0 + sb * sb).sqrt());
-            let final_eta = &c_vec * &marginal_eta + &sb_vec * &z;
+            let final_eta_internal =
+                Array1::from_iter((0..n).map(|i| c_vec[i] * marginal_map[i].q + sb_vec[i] * z[i]));
 
             if !need_gradient {
-                return Ok((final_eta, None));
+                return self.transform_internal_eta_to_base_scale(final_eta_internal, None);
             }
 
             // Chunk Jacobian: one pass per row fills both blocks.
-            let mut grad = Array2::<f64>::zeros((n, theta.len()));
+            let mut grad_internal = Array2::<f64>::zeros((n, theta.len()));
             let mut start = 0usize;
             while start < n {
                 let end = (start + chunk_size).min(n);
@@ -1412,10 +1416,10 @@ impl BernoulliMarginalSlopePredictor {
                     let i = start + li;
                     let c = c_vec[i];
                     let b = logslope_eta[i];
-                    let g_scale = marginal_eta[i] * (scale * scale) * b / c + scale * z[i];
-                    let mut row = grad.row_mut(i);
+                    let g_scale = marginal_map[i].q * (scale * scale) * b / c + scale * z[i];
+                    let mut row = grad_internal.row_mut(i);
                     for j in 0..marginal_dim {
-                        row[j] = c * mc[[li, j]];
+                        row[j] = c * marginal_map[i].q1 * mc[[li, j]];
                     }
                     for j in 0..logslope_dim {
                         row[logslope_offset + j] = g_scale * lc[[li, j]];
@@ -1424,7 +1428,8 @@ impl BernoulliMarginalSlopePredictor {
 
                 start = end;
             }
-            return Ok((final_eta, Some(grad)));
+            return self
+                .transform_internal_eta_to_base_scale(final_eta_internal, Some(grad_internal));
         }
 
         // ── Flexible path: per-row intercept solve, chunked Jacobians ──
@@ -1499,7 +1504,7 @@ impl BernoulliMarginalSlopePredictor {
                         link_dev_beta_owned.as_ref(),
                     )?;
                     let m_a = m_a_raw.max(1e-12);
-                    a_q.as_mut().unwrap()[local_row] = crate::probability::normal_pdf(q) / m_a;
+                    a_q.as_mut().unwrap()[local_row] = marginal_map[i].mu1 / m_a;
                     let cells = self.denested_partition_cells(
                         intercept,
                         slope,
@@ -1656,11 +1661,11 @@ impl BernoulliMarginalSlopePredictor {
         } else {
             Array1::zeros(n)
         };
-        let final_eta =
+        let final_eta_internal =
             (&eta_base + &(&logslope_eta * &score_dev_obs) + &link_dev_obs).mapv(|v| scale * v);
 
         if !need_gradient {
-            return Ok((final_eta, None));
+            return self.transform_internal_eta_to_base_scale(final_eta_internal, None);
         }
 
         let a_q_vec = a_q_vec.unwrap();
@@ -1738,7 +1743,7 @@ impl BernoulliMarginalSlopePredictor {
         if scale != 1.0 {
             grad.mapv_inplace(|v| scale * v);
         }
-        Ok((final_eta, Some(grad)))
+        self.transform_internal_eta_to_base_scale(final_eta_internal, Some(grad))
     }
 
     fn final_eta_from_theta(
@@ -4078,6 +4083,96 @@ mod tests {
             let grad = grad.as_ref().expect("gradient should be returned");
             assert!((grad[[i, 0]] - expected_d_marginal).abs() <= 1e-12);
             assert!((grad[[i, 1]] - expected_d_logslope).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
+    fn bernoulli_marginal_slope_predictor_reports_eta_on_selected_base_link_scale() {
+        let predictor = BernoulliMarginalSlopePredictor {
+            beta_marginal: array![0.7],
+            beta_logslope: array![-0.4],
+            beta_score_warp: None,
+            beta_link_dev: None,
+            base_link: InverseLink::Standard(crate::types::LinkFunction::Logit),
+            z_column: "z".to_string(),
+            latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
+            baseline_marginal: 0.1,
+            baseline_logslope: -0.2,
+            covariance: None,
+            score_warp_runtime: None,
+            link_deviation_runtime: None,
+            gaussian_frailty_sd: Some(0.8),
+        };
+        let theta = predictor.theta();
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0], [1.0]]),
+            offset: array![0.0, 0.05],
+            design_noise: Some(DesignMatrix::from(array![[1.0], [1.0]])),
+            offset_noise: Some(array![0.0, -0.1]),
+            auxiliary_scalar: Some(array![-0.3, 1.2]),
+        };
+
+        let (eta, grad) = predictor
+            .final_eta_and_gradient_from_theta(&input, &theta, true)
+            .expect("logit base-link rigid path should evaluate");
+
+        let scale = predictor.probit_frailty_scale();
+        let marginal_q = array![
+            crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
+                &predictor.base_link,
+                0.8,
+            )
+            .expect("map")
+            .q,
+            crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
+                &predictor.base_link,
+                0.85,
+            )
+            .expect("map")
+            .q,
+        ];
+        let marginal_q1 = array![
+            crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
+                &predictor.base_link,
+                0.8,
+            )
+            .expect("map")
+            .q1,
+            crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
+                &predictor.base_link,
+                0.85,
+            )
+            .expect("map")
+            .q1,
+        ];
+        let logslope_eta = array![-0.6, -0.7];
+        let z = array![-0.3, 1.2];
+        for i in 0..eta.len() {
+            let sb = scale * logslope_eta[i];
+            let c = (1.0 + sb * sb).sqrt();
+            let internal_eta = marginal_q[i] * c + sb * z[i];
+            let probability = normal_cdf(internal_eta);
+            let expected_eta =
+                crate::families::bernoulli_marginal_slope::bernoulli_marginal_slope_eta_from_probability(
+                    &predictor.base_link,
+                    probability,
+                    "predict test",
+                )
+                .expect("invert probability");
+            assert!((eta[i] - expected_eta).abs() <= 1e-12);
+            let eta_internal_dm = c * marginal_q1[i];
+            let eta_internal_dg =
+                marginal_q[i] * scale * scale * logslope_eta[i] / c + scale * z[i];
+            let expected_factor = normal_pdf(internal_eta)
+                / crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
+                    &predictor.base_link,
+                    eta[i],
+                )
+                .expect("map")
+                .mu1;
+            let grad = grad.as_ref().expect("gradient should be returned");
+            assert!((grad[[i, 0]] - expected_factor * eta_internal_dm).abs() <= 1e-12);
+            assert!((grad[[i, 1]] - expected_factor * eta_internal_dg).abs() <= 1e-12);
         }
     }
 
