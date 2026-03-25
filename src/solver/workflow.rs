@@ -1622,66 +1622,64 @@ fn materialize_survival<'a>(
     } else {
         None
     };
-    let (marginal_logslopespec, marginal_slope_deviation_routing) =
-        if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-            if let Some(ls_formula) = config.logslope_formula.as_deref() {
-                let (_, ls_parsed) = parse_matching_auxiliary_formula(
-                    ls_formula,
-                    &parsed.response,
-                    "logslope_formula",
-                )?;
-                if ls_parsed.linkspec.is_some() {
-                    return Err(
+    let (marginal_logslopespec, marginal_slope_deviation_routing) = if survival_mode
+        == SurvivalLikelihoodMode::MarginalSlope
+    {
+        if let Some(ls_formula) = config.logslope_formula.as_deref() {
+            let (_, ls_parsed) =
+                parse_matching_auxiliary_formula(ls_formula, &parsed.response, "logslope_formula")?;
+            if ls_parsed.linkspec.is_some() {
+                return Err(
                         "link(...) is not supported in logslope_formula for the survival marginal-slope family"
                             .to_string(),
                     );
-                }
-                if ls_parsed.timewiggle.is_some() {
-                    return Err(
+            }
+            if ls_parsed.timewiggle.is_some() {
+                return Err(
                         "timewiggle(...) is not supported in logslope_formula for the survival marginal-slope family"
                             .to_string(),
                     );
-                }
-                if ls_parsed.survivalspec.is_some() {
-                    return Err(
+            }
+            if ls_parsed.survivalspec.is_some() {
+                return Err(
                         "survmodel(...) is not supported in logslope_formula for the survival marginal-slope family"
                             .to_string(),
                     );
-                }
-                validate_marginal_slope_z_column_exclusion(
-                    parsed,
-                    &ls_parsed,
-                    z_col_name,
-                    "survival marginal-slope",
-                    "logslope_formula",
-                )?;
-                (
-                    Some(build_termspec(
-                        &ls_parsed.terms,
-                        data,
-                        col_map,
-                        &mut inference_notes,
-                    )?),
-                    route_marginal_slope_deviation_blocks(
-                        parsed.linkwiggle.as_ref(),
-                        ls_parsed.linkwiggle.as_ref(),
-                    ),
-                )
-            } else {
-                (
-                    Some(termspec.clone()),
-                    route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None),
-                )
             }
+            validate_marginal_slope_z_column_exclusion(
+                parsed,
+                &ls_parsed,
+                z_col_name,
+                "survival marginal-slope",
+                "logslope_formula",
+            )?;
+            (
+                Some(build_termspec(
+                    &ls_parsed.terms,
+                    data,
+                    col_map,
+                    &mut inference_notes,
+                )?),
+                route_marginal_slope_deviation_blocks(
+                    parsed.linkwiggle.as_ref(),
+                    ls_parsed.linkwiggle.as_ref(),
+                ),
+            )
         } else {
             (
-                None,
-                MarginalSlopeDeviationRouting {
-                    score_warp: None,
-                    link_dev: None,
-                },
+                Some(termspec.clone()),
+                route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None),
             )
-        };
+        }
+    } else {
+        (
+            None,
+            MarginalSlopeDeviationRouting {
+                score_warp: None,
+                link_dev: None,
+            },
+        )
+    };
     let marginal_slope_score_warp = marginal_slope_deviation_routing.score_warp;
     let marginal_slope_link_dev = marginal_slope_deviation_routing.link_dev;
     if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
@@ -2115,6 +2113,65 @@ fn materialize_location_scale<'a>(
             }),
             inference_notes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FitConfig, materialize};
+    use crate::inference::data::load_dataset_projected;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn load_survival_dataset() -> crate::inference::data::EncodedDataset {
+        let td = tempdir().expect("tempdir");
+        let data_path = td.path().join("survival.csv");
+        fs::write(
+            &data_path,
+            "entry,exit,event,x,z\n0.0,1.0,1,0.2,-0.4\n0.3,1.6,0,-0.1,0.6\n",
+        )
+        .expect("write survival csv");
+        load_dataset_projected(
+            &data_path,
+            &[
+                "entry".to_string(),
+                "exit".to_string(),
+                "event".to_string(),
+                "x".to_string(),
+                "z".to_string(),
+            ],
+        )
+        .expect("load survival dataset")
+    }
+
+    #[test]
+    fn survival_marginal_slope_materialize_rejects_z_column_in_main_formula() {
+        let data = load_survival_dataset();
+        let mut config = FitConfig::default();
+        config.survival_likelihood = "marginal-slope".to_string();
+        config.logslope_formula = Some("1".to_string());
+        config.z_column = Some("z".to_string());
+
+        let err = materialize("Surv(entry, exit, event) ~ x + z", &data, &config)
+            .expect_err("main formula should reject z-column reuse");
+
+        assert!(err.contains("survival marginal-slope reserves z column 'z'"));
+        assert!(err.contains("main formula"));
+    }
+
+    #[test]
+    fn survival_marginal_slope_materialize_rejects_z_column_in_logslope_formula() {
+        let data = load_survival_dataset();
+        let mut config = FitConfig::default();
+        config.survival_likelihood = "marginal-slope".to_string();
+        config.logslope_formula = Some("1 + z".to_string());
+        config.z_column = Some("z".to_string());
+
+        let err = materialize("Surv(entry, exit, event) ~ x", &data, &config)
+            .expect_err("logslope formula should reject z-column reuse");
+
+        assert!(err.contains("survival marginal-slope reserves z column 'z'"));
+        assert!(err.contains("logslope_formula"));
     }
 }
 

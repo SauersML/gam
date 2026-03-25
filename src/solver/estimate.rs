@@ -2857,6 +2857,88 @@ where
     )
 }
 
+pub(crate) fn compute_external_joint_hyper_eval<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<BlockwisePenalty>,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    hyper_dirs: Vec<DirectionalHyperParam>,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    opts: &ExternalOptimOptions,
+) -> Result<
+    (
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    ),
+    EstimationError,
+>
+where
+    X: Into<DesignMatrix>,
+{
+    let specs: Vec<PenaltySpec> = s_list
+        .into_iter()
+        .map(PenaltySpec::from_blockwise)
+        .collect();
+    validate_and_build_reml_state(
+        y,
+        w,
+        x,
+        offset,
+        specs,
+        theta,
+        rho_dim,
+        hyper_dirs,
+        warm_start_beta,
+        opts,
+        "compute_external_joint_hyper_eval",
+        |reml_state, conditioned_hyper_dirs| {
+            reml_state.compute_joint_hyper_eval(theta, rho_dim, conditioned_hyper_dirs)
+        },
+    )
+}
+
+pub(crate) fn compute_external_joint_hyperefs<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<BlockwisePenalty>,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    hyper_dirs: Vec<DirectionalHyperParam>,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    opts: &ExternalOptimOptions,
+) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let specs: Vec<PenaltySpec> = s_list
+        .into_iter()
+        .map(PenaltySpec::from_blockwise)
+        .collect();
+    validate_and_build_reml_state(
+        y,
+        w,
+        x,
+        offset,
+        specs,
+        theta,
+        rho_dim,
+        hyper_dirs,
+        warm_start_beta,
+        opts,
+        "compute_external_joint_hyperefs",
+        |reml_state, conditioned_hyper_dirs| {
+            let rho = theta.slice(s![..rho_dim]).to_owned();
+            reml_state.compute_efs_steps_with_psi_ext(&rho, conditioned_hyper_dirs)
+        },
+    )
+}
+
 #[derive(Clone)]
 pub struct FitOptions {
     pub latent_cloglog: Option<LatentCLogLogState>,

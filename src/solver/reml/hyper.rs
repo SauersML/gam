@@ -157,18 +157,23 @@ impl<'a> RemlState<'a> {
         Ok(out)
     }
 
-    pub(crate) fn compute_joint_hypercostgradienthessian(
+    pub(crate) fn compute_joint_hyper_eval(
         &self,
         theta: &Array1<f64>,
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+    ) -> Result<
+        (
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        ),
+        EstimationError,
+    > {
         let t_outer_start = std::time::Instant::now();
         let rho = theta.slice(s![..rho_dim]).to_owned();
 
         if !hyper_dirs.is_empty() {
-            // Unified evaluator path: produces the joint [ρ, ψ] gradient and
-            // Hessian from a single InnerSolution + reml_laml_evaluate call.
             let result = self.evaluate_unified_with_psi_ext(
                 &rho,
                 super::unified::EvalMode::ValueGradientHessian,
@@ -178,33 +183,46 @@ impl<'a> RemlState<'a> {
             let grad = result
                 .gradient
                 .unwrap_or_else(|| Array1::zeros(theta.len()));
-            let hess = result
-                .hessian
-                .materialize_dense()
-                .map_err(EstimationError::RemlOptimizationFailed)?
-                .unwrap_or_else(|| Array2::zeros((theta.len(), theta.len())));
             log::info!(
-                "[outer-timing] compute_joint_hypercostgradienthessian (unified, rho_dim={}, psi_dim={}): {:.3}s  cost={:.6e}",
+                "[outer-timing] compute_joint_hyper_eval (unified, rho_dim={}, psi_dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 hyper_dirs.len(),
                 t_outer_start.elapsed().as_secs_f64(),
                 cost,
             );
-            Ok((cost, grad, hess))
+            Ok((cost, grad, result.hessian))
         } else {
-            // Rho-only path: no directional hyperparameters, use the standard
-            // rho-only evaluators and let inner_strategy pick the Hessian path.
             let cost = self.compute_cost(&rho)?;
             let grad = self.compute_gradient(&rho)?;
             let hess = self.compute_lamlhessian_consistent(&rho)?;
             log::info!(
-                "[outer-timing] compute_joint_hypercostgradienthessian (rho-only, dim={}): {:.3}s  cost={:.6e}",
+                "[outer-timing] compute_joint_hyper_eval (rho-only, dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 t_outer_start.elapsed().as_secs_f64(),
                 cost,
             );
-            Ok((cost, grad, hess))
+            Ok((
+                cost,
+                grad,
+                crate::solver::outer_strategy::HessianResult::Analytic(hess),
+            ))
         }
+    }
+
+    pub(crate) fn compute_joint_hypercostgradienthessian(
+        &self,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+        let (cost, grad, hess) = self.compute_joint_hyper_eval(theta, rho_dim, hyper_dirs)?;
+        Ok((
+            cost,
+            grad,
+            hess.materialize_dense()
+                .map_err(EstimationError::RemlOptimizationFailed)?
+                .unwrap_or_else(|| Array2::zeros((theta.len(), theta.len()))),
+        ))
     }
 
     pub(crate) fn build_tau_unified_objects_from_bundle(

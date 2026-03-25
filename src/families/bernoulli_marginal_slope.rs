@@ -27,7 +27,7 @@ use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_designs_joint, freeze_term_collection_from_design,
+    TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
@@ -6888,19 +6888,15 @@ pub fn fit_bernoulli_marginal_slope_terms(
     };
     let probit_scale = probit_frailty_scale(initial_sigma);
     let baseline = (pilot_baseline.0, pilot_baseline.1 / probit_scale);
-    let mut joint_designs = build_term_collection_designs_joint(
+    let (mut joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
         data,
         &[spec.marginalspec.clone(), spec.logslopespec.clone()],
     )
     .map_err(|e| e.to_string())?;
     let marginal_design = joint_designs.remove(0);
     let logslope_design = joint_designs.remove(0);
-    let marginalspec_boot =
-        freeze_term_collection_from_design(&spec.marginalspec, &marginal_design)
-            .map_err(|e| e.to_string())?;
-    let logslopespec_boot =
-        freeze_term_collection_from_design(&spec.logslopespec, &logslope_design)
-            .map_err(|e| e.to_string())?;
+    let marginalspec_boot = joint_specs.remove(0);
+    let logslopespec_boot = joint_specs.remove(0);
 
     let y = Arc::new(spec.y.clone());
     let weights = Arc::new(spec.weights.clone());

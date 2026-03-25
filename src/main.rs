@@ -11230,6 +11230,104 @@ mod tests {
     }
 
     #[test]
+    fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
+        let td = tempdir().expect("tempdir");
+        let train_path = td.path().join("train.csv");
+        write_bernoulli_marginal_slope_train_csv(&train_path);
+
+        let err = run_fit(FitArgs {
+            data: train_path,
+            formula_positional: "y ~ x + z".to_string(),
+            predict_noise: None,
+            logslope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+            disable_score_warp: false,
+            disable_link_dev: false,
+            transformation_normal: false,
+            firth: false,
+            survival_likelihood: "transformation".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            adaptive_regularization: false,
+            scale_dimensions: false,
+            pilot_subsample_threshold: 0,
+            out: None,
+        })
+        .expect_err("main formula should reject z-column reuse");
+
+        assert!(err.contains("bernoulli marginal-slope reserves z column 'z'"));
+        assert!(err.contains("main formula"));
+    }
+
+    #[test]
+    fn cli_bernoulli_marginal_slope_rejects_z_column_in_logslope_formula() {
+        let td = tempdir().expect("tempdir");
+        let train_path = td.path().join("train.csv");
+        write_bernoulli_marginal_slope_train_csv(&train_path);
+
+        let err = run_fit(FitArgs {
+            data: train_path,
+            formula_positional: "y ~ x".to_string(),
+            predict_noise: None,
+            logslope_formula: Some("1 + s(z, type=duchon, centers=6)".to_string()),
+            z_column: Some("z".to_string()),
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+            disable_score_warp: false,
+            disable_link_dev: false,
+            transformation_normal: false,
+            firth: false,
+            survival_likelihood: "transformation".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            adaptive_regularization: false,
+            scale_dimensions: false,
+            pilot_subsample_threshold: 0,
+            out: None,
+        })
+        .expect_err("logslope formula should reject z-column reuse");
+
+        assert!(err.contains("bernoulli marginal-slope reserves z column 'z'"));
+        assert!(err.contains("--logslope-formula"));
+    }
+
+    #[test]
     fn cli_bernoulli_marginal_slope_routes_main_and_logslope_linkwiggles_to_distinct_blocks() {
         let td = tempdir().expect("tempdir");
         let train_path = td.path().join("train.csv");

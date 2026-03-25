@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """End-to-end PIT pipeline: transformation-normal fit -> predict z -> marginal-slope fits.
 
-Duchon smooths throughout, linkwiggle, timewiggle, score warp — no linear terms.
-PIT is done entirely by the gam binary via --transformation-normal.
+Duchon smooths throughout, main-formula linkwiggle, logslope score-warp via
+logslope-formula linkwiggle, and timewiggle — no linear terms. PIT is done
+entirely by the gam binary via --transformation-normal.
 """
 
 import csv
@@ -207,13 +208,13 @@ def main():
     else:
         merge_z_into_study(study_csv, fit1_pred_csv, enriched_csv)
 
-        # ── Fit 2: Bernoulli marginal-slope (Duchon + linkwiggle) ────────
+        # ── Fit 2: Bernoulli marginal-slope (Duchon + linkwiggle + score-warp)
         fit2_model = os.path.join(tmpdir, "bernoulli.json")
         ok, elapsed = run([
             "fit", enriched_csv,
             "case ~ duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
             "--logslope-formula",
-            "duchon(pc1, pc2, pc3, pc4, centers=20)",
+            "duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
             "--z-column", "z",
             "--scale-dimensions",
             "--out", fit2_model,
@@ -221,7 +222,7 @@ def main():
         results["fit2_bern_ms"] = ok
         timings["fit2_bern_ms"] = elapsed
 
-        # ── Fit 4: Survival marginal-slope (Duchon + linkwiggle + timewiggle)
+        # ── Fit 4: Survival marginal-slope (Duchon + linkwiggle + score-warp + timewiggle)
         fit4_model = os.path.join(tmpdir, "survival.json")
         ok, elapsed = run([
             "fit", enriched_csv,
@@ -229,7 +230,7 @@ def main():
             "--survival-likelihood", "marginal-slope",
             "--baseline-target", "gompertz-makeham",
             "--logslope-formula",
-            "duchon(pc1, pc2, pc3, pc4, centers=20)",
+            "duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
             "--z-column", "z",
             "--scale-dimensions",
             "--out", fit4_model,
