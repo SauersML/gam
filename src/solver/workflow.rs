@@ -253,6 +253,21 @@ fn deviation_block_config_from_formula_linkwiggle(
     }
 }
 
+struct MarginalSlopeDeviationRouting {
+    score_warp: Option<DeviationBlockConfig>,
+    link_dev: Option<DeviationBlockConfig>,
+}
+
+fn route_marginal_slope_deviation_blocks(
+    main_linkwiggle: Option<&LinkWiggleFormulaSpec>,
+    logslope_linkwiggle: Option<&LinkWiggleFormulaSpec>,
+) -> MarginalSlopeDeviationRouting {
+    MarginalSlopeDeviationRouting {
+        score_warp: logslope_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
+        link_dev: main_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
+    }
+}
+
 fn fixed_gaussian_shift_frailty_from_spec(
     frailty: &FrailtySpec,
     context: &str,
@@ -876,7 +891,8 @@ use crate::families::survival_location_scale::{
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
     LinkChoice, LinkWiggleFormulaSpec, ParsedFormula, effectivelinkwiggle_formulaspec,
-    parse_formula, parse_link_choice, parse_surv_response,
+    parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
+    validate_marginal_slope_z_column_exclusion,
 };
 use crate::term_builder::{build_termspec, enable_scale_dimensions};
 
@@ -1606,62 +1622,90 @@ fn materialize_survival<'a>(
     } else {
         None
     };
-    let marginal_logslopespec = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        if let Some(ls_formula) = config.logslope_formula.as_deref() {
-            let ls_parsed = parse_formula(&format!("{} ~ {ls_formula}", parsed.response))?;
-            if ls_parsed.linkspec.is_some() {
-                return Err(
-                    "link(...) is not supported in logslope_formula for the survival marginal-slope family"
-                        .to_string(),
-                );
+    let (marginal_logslopespec, marginal_slope_deviation_routing) =
+        if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+            if let Some(ls_formula) = config.logslope_formula.as_deref() {
+                let (_, ls_parsed) = parse_matching_auxiliary_formula(
+                    ls_formula,
+                    &parsed.response,
+                    "logslope_formula",
+                )?;
+                if ls_parsed.linkspec.is_some() {
+                    return Err(
+                        "link(...) is not supported in logslope_formula for the survival marginal-slope family"
+                            .to_string(),
+                    );
+                }
+                if ls_parsed.timewiggle.is_some() {
+                    return Err(
+                        "timewiggle(...) is not supported in logslope_formula for the survival marginal-slope family"
+                            .to_string(),
+                    );
+                }
+                if ls_parsed.survivalspec.is_some() {
+                    return Err(
+                        "survmodel(...) is not supported in logslope_formula for the survival marginal-slope family"
+                            .to_string(),
+                    );
+                }
+                validate_marginal_slope_z_column_exclusion(
+                    parsed,
+                    &ls_parsed,
+                    z_col_name,
+                    "survival marginal-slope",
+                    "logslope_formula",
+                )?;
+                (
+                    Some(build_termspec(
+                        &ls_parsed.terms,
+                        data,
+                        col_map,
+                        &mut inference_notes,
+                    )?),
+                    route_marginal_slope_deviation_blocks(
+                        parsed.linkwiggle.as_ref(),
+                        ls_parsed.linkwiggle.as_ref(),
+                    ),
+                )
+            } else {
+                (
+                    Some(termspec.clone()),
+                    route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None),
+                )
             }
-            if ls_parsed.linkwiggle.is_some() {
-                return Err(
-                    "linkwiggle(...) is not supported in logslope_formula for the survival marginal-slope family"
-                        .to_string(),
-                );
-            }
-            Some(build_termspec(
-                &ls_parsed.terms,
-                data,
-                col_map,
-                &mut inference_notes,
-            )?)
         } else {
-            Some(termspec.clone())
-        }
-    } else {
-        None
-    };
-    let marginal_slope_link_dev = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+            (
+                None,
+                MarginalSlopeDeviationRouting {
+                    score_warp: None,
+                    link_dev: None,
+                },
+            )
+        };
+    let marginal_slope_score_warp = marginal_slope_deviation_routing.score_warp;
+    let marginal_slope_link_dev = marginal_slope_deviation_routing.link_dev;
+    if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         if parsed.linkwiggle.is_some() {
             inference_notes.push(
-                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation and score-warp blocks while keeping the probit survival base link".to_string(),
+                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
             );
+        }
+        if marginal_slope_score_warp.is_some() {
+            inference_notes.push(
+                "survival marginal-slope routes logslope_formula linkwiggle(...) into its anchored internal score-warp block while keeping the probit survival base link".to_string(),
+            );
+        }
+        if marginal_slope_link_dev.is_none() && marginal_slope_score_warp.is_none() {
+            inference_notes.push(
+                "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
+            );
+        } else {
             inference_notes.push(
                 "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic transport cells with analytic value evaluation and calibrated survival normalization"
                     .to_string(),
             );
-        } else {
-            inference_notes.push(
-                "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
-            );
         }
-        parsed
-            .linkwiggle
-            .as_ref()
-            .map(deviation_block_config_from_formula_linkwiggle)
-    } else {
-        None
-    };
-    let marginal_slope_score_warp = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        parsed
-            .linkwiggle
-            .as_ref()
-            .map(deviation_block_config_from_formula_linkwiggle)
-    } else {
-        None
-    };
+    }
     let marginal_slope_frailty = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         Some(fixed_gaussian_shift_frailty_from_spec(
             config.frailty.as_ref().unwrap_or(&FrailtySpec::None),
@@ -2071,5 +2115,116 @@ fn materialize_location_scale<'a>(
             }),
             inference_notes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
+
+    fn workflow_test_dataset() -> Dataset {
+        Dataset {
+            headers: vec![
+                "age_entry".to_string(),
+                "age_exit".to_string(),
+                "event".to_string(),
+                "bmi".to_string(),
+                "z".to_string(),
+            ],
+            values: Array2::from_shape_vec(
+                (4, 5),
+                vec![
+                    40.0, 43.0, 1.0, 22.0, -1.0, 41.0, 46.0, 0.0, 24.0, -0.2, 42.0, 47.0, 1.0,
+                    27.0, 0.3, 44.0, 49.0, 0.0, 29.0, 1.2,
+                ],
+            )
+            .expect("workflow test data shape"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "age_entry".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "age_exit".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "event".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "bmi".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "z".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Binary,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        }
+    }
+
+    #[test]
+    fn workflow_survival_marginal_slope_routes_logslope_linkwiggle_into_score_warp_only() {
+        let data = workflow_test_dataset();
+        let config = FitConfig {
+            survival_likelihood: "marginal-slope".to_string(),
+            logslope_formula: Some(
+                "1 + linkwiggle(degree=5, internal_knots=7, penalty_order=\"2,3\")".to_string(),
+            ),
+            z_column: Some("z".to_string()),
+            ..FitConfig::default()
+        };
+        let materialized = materialize(
+            "Surv(age_entry, age_exit, event) ~ s(bmi) + linkwiggle(degree=4, internal_knots=9, penalty_order=\"1\")",
+            &data,
+            &config,
+        )
+        .expect("workflow materialization should succeed");
+
+        let FitRequest::SurvivalMarginalSlope(request) = materialized.request else {
+            panic!("expected survival marginal-slope request");
+        };
+
+        let link_dev = request.spec.link_dev.expect("main-formula link-dev");
+        let score_warp = request.spec.score_warp.expect("logslope score-warp");
+        assert_eq!(link_dev.degree, 4);
+        assert_eq!(link_dev.num_internal_knots, 9);
+        assert_eq!(link_dev.penalty_order, 1);
+        assert!(link_dev.penalty_orders.is_empty());
+        assert_eq!(score_warp.degree, 5);
+        assert_eq!(score_warp.num_internal_knots, 7);
+        assert_eq!(score_warp.penalty_order, 2);
+        assert_eq!(score_warp.penalty_orders, vec![3]);
+        assert!(
+            materialized
+                .inference_notes
+                .iter()
+                .any(|note| note.contains("link-deviation block")),
+            "workflow notes should mention main-formula linkwiggle routing"
+        );
+        assert!(
+            materialized
+                .inference_notes
+                .iter()
+                .any(|note| note.contains("score-warp block")),
+            "workflow notes should mention logslope_formula linkwiggle routing"
+        );
     }
 }

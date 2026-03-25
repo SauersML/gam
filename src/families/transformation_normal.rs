@@ -2704,14 +2704,20 @@ pub fn fit_transformation_normal(
 
             exact_warm_start.replace(Some(eval.warm_start));
 
-            if need_hessian && eval.outer_hessian.is_none() {
+            if need_hessian && !eval.outer_hessian.is_analytic() {
                 return Err(
                     "transformation exact joint objective did not return an outer Hessian"
                         .to_string(),
                 );
             }
 
-            Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            Ok((
+                eval.objective,
+                eval.gradient,
+                eval.outer_hessian
+                    .materialize_dense()
+                    .map_err(|e| e.to_string())?,
+            ))
         },
     )?;
 

@@ -181,11 +181,15 @@ impl<'a> RemlState<'a> {
         } else {
             self.evaluate_unified(rho, bundle, mode)?
         };
-        result.hessian.ok_or_else(|| {
-            EstimationError::RemlOptimizationFailed(
-                "Unified Hessian returned None for VGH mode".into(),
-            )
-        })
+        result
+            .hessian
+            .materialize_dense()
+            .map_err(EstimationError::RemlOptimizationFailed)?
+            .ok_or_else(|| {
+                EstimationError::RemlOptimizationFailed(
+                    "Unified Hessian returned no analytic representation for VGH mode".into(),
+                )
+            })
     }
 
     pub(crate) fn compute_lamlhessian_consistent(

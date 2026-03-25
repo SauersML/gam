@@ -5359,11 +5359,16 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     "exact spatial adaptive objective returned non-finite values".to_string(),
                 ));
             }
-            let hessian = result.outer_hessian.ok_or_else(|| {
-                EstimationError::RemlOptimizationFailed(
-                    "exact spatial adaptive objective did not return an outer Hessian".to_string(),
-                )
-            })?;
+            let hessian = result
+                .outer_hessian
+                .materialize_dense()
+                .map_err(EstimationError::RemlOptimizationFailed)?
+                .ok_or_else(|| {
+                    EstimationError::RemlOptimizationFailed(
+                        "exact spatial adaptive objective did not return an outer Hessian"
+                            .to_string(),
+                    )
+                })?;
             if hessian.nrows() != theta.len() || hessian.ncols() != theta.len() {
                 return Err(EstimationError::RemlOptimizationFailed(format!(
                     "exact spatial adaptive outer Hessian shape mismatch: got {}x{}, expected {}x{}",
@@ -8832,6 +8837,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         {
             return Ok(());
         }
+        let t_ensure = std::time::Instant::now();
         let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
             theta,
             self.rho_dim,
@@ -8839,6 +8845,11 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         );
         self.realizer
             .apply_log_kappa(&log_kappa, &self.spatial_terms)?;
+        log::info!(
+            "[outer-timing] ensure_theta (apply_log_kappa, {} terms): {:.1}ms",
+            self.spatial_terms.len(),
+            t_ensure.elapsed().as_secs_f64() * 1000.0,
+        );
         self.current_theta = Some(theta.clone());
         self.last_cost = None;
         self.last_eval = None;
@@ -10128,6 +10139,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         term_idx: usize,
         realization: SingleSmoothTermRealization,
     ) -> Result<(), String> {
+        let t_replace = std::time::Instant::now();
         let SingleSmoothTermRealization {
             design_local,
             term,
@@ -10307,6 +10319,13 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         target_term.lower_bounds_local = lower_bounds_local;
         target_term.linear_constraints_local = linear_constraints_local;
         self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
+        log::info!(
+            "[outer-timing] replace_term_realization (term {}, '{}', cols={}): {:.1}ms",
+            term_idx,
+            target_term.name,
+            coeff_range.len(),
+            t_replace.elapsed().as_secs_f64() * 1000.0,
+        );
         Ok(())
     }
 }
@@ -10464,6 +10483,7 @@ impl<'d> ExactJointDesignCache<'d> {
             return Ok(());
         }
 
+        let t_ensure = std::time::Instant::now();
         let full_log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
             theta,
             self.rho_dim,
@@ -10489,6 +10509,12 @@ impl<'d> ExactJointDesignCache<'d> {
             }
         }
 
+        log::info!(
+            "[outer-timing] ensure_theta (n-block, {} blocks, {} realizers): {:.1}ms",
+            n,
+            self.realizers.len(),
+            t_ensure.elapsed().as_secs_f64() * 1000.0,
+        );
         self.current_theta = Some(theta.clone());
         self.last_cost = None;
         self.last_eval = None;
@@ -14886,6 +14912,8 @@ mod tests {
         let analytic_hessian = analytic
             .outer_hessian
             .clone()
+            .materialize_dense()
+            .expect("adaptive joint hyper Hessian should materialize")
             .expect("adaptive joint hyper Hessian should be present");
         let h = 1e-5;
         for j in 0..theta.len() {

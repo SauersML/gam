@@ -32,7 +32,7 @@ pub struct InnerAssembly<'dp> {
     pub penalty_quadratic: f64,
     pub beta: Array1<f64>,
     pub n_observations: usize,
-    pub hessian_op: Box<dyn HessianOperator>,
+    pub hessian_op: std::sync::Arc<dyn HessianOperator>,
     pub penalty_coords: Vec<PenaltyCoordinate>,
     pub penalty_logdet: PenaltyLogdetDerivs,
     pub dispersion: DispersionHandling,

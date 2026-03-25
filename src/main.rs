@@ -44,6 +44,7 @@ use gam::inference::formula_dsl::{
     effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
     linkchoice_supports_joint_wiggle, linkname, parse_formula, parse_link_choice,
     parse_matching_auxiliary_formula, parse_surv_response, validate_auxiliary_formula_controls,
+    validate_marginal_slope_z_column_exclusion,
 };
 use gam::inference::model::{
     DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, ModelKind,
@@ -270,8 +271,14 @@ struct FitArgs {
     /// Hazard loading for `hazard-multiplier` frailty.
     #[arg(long = "hazard-loading", value_enum)]
     hazard_loading: Option<HazardLoadingArg>,
+    /// Disable `--logslope-formula` `linkwiggle(...)` routing into the anchored
+    /// internal score-warp block for marginal-slope families. Errors if
+    /// `--logslope-formula` still contains `linkwiggle(...)`.
     #[arg(long = "disable-score-warp", default_value_t = false)]
     disable_score_warp: bool,
+    /// Disable main-formula `linkwiggle(...)` routing into the anchored internal
+    /// link-deviation block for marginal-slope families. Errors if the main
+    /// formula still contains `linkwiggle(...)`.
     #[arg(long = "disable-link-dev", default_value_t = false)]
     disable_link_dev: bool,
     /// Fit a conditional transformation-normal model: h(Y|x) ~ N(0,1).
@@ -1315,6 +1322,13 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
+    validate_marginal_slope_z_column_exclusion(
+        parsed,
+        &parsed_logslope,
+        z_column,
+        "bernoulli marginal-slope",
+        "--logslope-formula",
+    )?;
 
     progress.set_stage("fit", "building marginal/logslope term specifications");
     progress.start_secondary_workflow("Marginal/Slope Terms", 2);
@@ -1385,6 +1399,14 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
+    inference_notes.extend(marginal_slope_disable_flag_notes(
+        "bernoulli marginal-slope",
+        "--logslope-formula",
+        parsed.linkwiggle.is_some(),
+        parsed_logslope.linkwiggle.is_some(),
+        args.disable_score_warp,
+        args.disable_link_dev,
+    ));
     if !requested_flex {
         inference_notes.push(
             "bernoulli marginal-slope rigid probit mode is algebraic closed-form exact".to_string(),
@@ -5036,6 +5058,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     .to_string(),
             );
         }
+        validate_marginal_slope_z_column_exclusion(
+            parsed,
+            &parsed_logslope,
+            z_column_name,
+            "survival marginal-slope",
+            "--logslope-formula",
+        )?;
         let mut logslopespec =
             build_termspec(&parsed_logslope.terms, &ds, &col_map, &mut inference_notes)?;
         if args.scale_dimensions {
@@ -5067,6 +5096,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 "survival marginal-slope routes --logslope-formula linkwiggle(...) into its anchored internal score-warp block while keeping the probit survival base link".to_string(),
             );
         }
+        inference_notes.extend(marginal_slope_disable_flag_notes(
+            "survival marginal-slope",
+            "--logslope-formula",
+            parsed.linkwiggle.is_some(),
+            parsed_logslope.linkwiggle.is_some(),
+            args.disable_score_warp,
+            args.disable_link_dev,
+        ));
         if routed_link_dev.is_none() && routed_score_warp.is_none() {
             inference_notes.push(
                 "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
@@ -7691,6 +7728,28 @@ fn route_marginal_slope_deviation_blocks(
     })
 }
 
+fn marginal_slope_disable_flag_notes(
+    family_label: &str,
+    logslope_flag: &str,
+    main_has_linkwiggle: bool,
+    logslope_has_linkwiggle: bool,
+    disable_score_warp: bool,
+    disable_link_dev: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if disable_link_dev && !main_has_linkwiggle {
+        notes.push(format!(
+            "{family_label} --disable-link-dev had no effect because the main formula does not contain linkwiggle(...)"
+        ));
+    }
+    if disable_score_warp && !logslope_has_linkwiggle {
+        notes.push(format!(
+            "{family_label} --disable-score-warp had no effect because {logslope_flag} does not contain linkwiggle(...)"
+        ));
+    }
+    notes
+}
+
 fn hazard_loading_from_arg(
     loading: HazardLoadingArg,
 ) -> gam::families::lognormal_kernel::HazardLoading {
@@ -8149,7 +8208,10 @@ fn resolve_bernoulli_marginal_slope_base_link(
     let Some(linkspec) = linkspec else {
         return Ok(InverseLink::Standard(LinkFunction::Probit));
     };
-    if linkspec.mixture_rho.is_some() || linkspec.sas_init.is_some() || linkspec.beta_logistic_init.is_some() {
+    if linkspec.mixture_rho.is_some()
+        || linkspec.sas_init.is_some()
+        || linkspec.beta_logistic_init.is_some()
+    {
         return Err(format!(
             "{context} only implements link(type=probit); stateful/blended marginal-slope links are not wired into the exact family"
         ));
@@ -11226,7 +11288,9 @@ mod tests {
             "main-formula linkwiggle should persist link-deviation runtime"
         );
         assert_eq!(
-            saved.resolved_inverse_link().expect("resolved inverse link"),
+            saved
+                .resolved_inverse_link()
+                .expect("resolved inverse link"),
             Some(InverseLink::Standard(LinkFunction::Probit))
         );
     }
@@ -12515,6 +12579,32 @@ mod tests {
     }
 
     #[test]
+    fn marginal_slope_disable_flag_notes_report_noop_flags_per_formula_side() {
+        let notes = super::marginal_slope_disable_flag_notes(
+            "survival marginal-slope",
+            "--logslope-formula",
+            false,
+            false,
+            true,
+            true,
+        );
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("--disable-link-dev had no effect"));
+        assert!(notes[1].contains("--disable-score-warp had no effect"));
+
+        let notes = super::marginal_slope_disable_flag_notes(
+            "survival marginal-slope",
+            "--logslope-formula",
+            true,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("--disable-score-warp had no effect"));
+    }
+
+    #[test]
     fn bernoulli_marginal_slope_accepts_explicit_probit_link_only() {
         let parsed = parse_formula("y ~ x + link(type=probit)").expect("main formula");
         let resolved = super::resolve_bernoulli_marginal_slope_base_link(
@@ -12574,7 +12664,9 @@ mod tests {
         assert_eq!(model.payload().logslope_baseline, Some(0.0));
         assert_eq!(model.payload().link.as_deref(), Some("probit"));
         assert_eq!(
-            model.resolved_inverse_link().expect("resolved inverse link"),
+            model
+                .resolved_inverse_link()
+                .expect("resolved inverse link"),
             Some(InverseLink::Standard(LinkFunction::Probit))
         );
     }

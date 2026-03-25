@@ -2586,7 +2586,7 @@ impl<'a> RemlState<'a> {
         &self,
         pirls_result: &PirlsResult,
         ctx: DerivativeContext,
-        hessian_op: Box<dyn super::unified::HessianOperator>,
+        hessian_op: std::sync::Arc<dyn super::unified::HessianOperator>,
         beta: Array1<f64>,
         penalty_logdet: super::unified::PenaltyLogdetDerivs,
         nullspace_dim: f64,
@@ -2645,7 +2645,7 @@ impl<'a> RemlState<'a> {
             )
         };
 
-        let hessian_op = Box::new(
+        let hessian_op = std::sync::Arc::new(
             DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
                 EstimationError::InvalidInput(format!(
                     "DenseSpectralOperator from PIRLS Hessian: {e}"
@@ -2695,12 +2695,12 @@ impl<'a> RemlState<'a> {
 
         let beta = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta.len();
-        let hessian_op: Box<dyn HessianOperator> = {
+        let hessian_op: std::sync::Arc<dyn HessianOperator> = {
             let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
-            Box::new(op)
+            std::sync::Arc::new(op)
         };
 
         log::trace!(
@@ -2749,7 +2749,7 @@ impl<'a> RemlState<'a> {
 
         let h_total_original =
             self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
-        let hessian_op = Box::new(
+        let hessian_op = std::sync::Arc::new(
             DenseSpectralOperator::from_symmetric(&h_total_original).map_err(|e| {
                 EstimationError::InvalidInput(format!(
                     "DenseSpectralOperator from original-basis PIRLS Hessian: {e}"
