@@ -12,7 +12,9 @@ pub enum SeedRiskProfile {
 pub struct SeedConfig {
     pub bounds: (f64, f64),
     pub max_seeds: usize,
-    pub screening_budget: usize,
+    /// Maximum number of seed starts to run in heuristic order.
+    pub seed_budget: usize,
+    /// Screening-only inner-iteration cap used while ranking candidate seeds.
     pub screen_max_inner_iterations: usize,
     pub risk_profile: SeedRiskProfile,
     /// Number of trailing dimensions that are auxiliary parameters (e.g. SAS
@@ -27,7 +29,7 @@ impl Default for SeedConfig {
         Self {
             bounds: (-12.0, 12.0),
             max_seeds: 16,
-            screening_budget: 4,
+            seed_budget: 4,
             screen_max_inner_iterations: 5,
             risk_profile: SeedRiskProfile::GeneralizedLinear,
             num_auxiliary_trailing: 0,

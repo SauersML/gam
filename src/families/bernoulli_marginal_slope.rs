@@ -7,8 +7,8 @@ use crate::custom_family::{
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
     cost_gated_outer_order, custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
-    slice_joint_into_block_working_sets,
+    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
+    second_psi_linear_map, slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
@@ -165,13 +165,13 @@ pub(crate) fn build_deviation_block_from_seed(
 const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn bernoulli_marginal_slope_probit_link() -> InverseLink {
     InverseLink::Standard(LinkFunction::Probit)
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BernoulliMarginalLinkMap {
-    pub eta: f64,
     pub mu: f64,
     pub mu1: f64,
     pub mu2: f64,
@@ -250,7 +250,6 @@ pub(crate) fn bernoulli_marginal_link_map(
         mu4 / phi_q + (q.powi(3) - 3.0 * q) * q1.powi(4) + 4.0 * q * q1 * q3 + 3.0 * q * q2 * q2
             - 6.0 * (q * q - 1.0) * q1 * q1 * q2;
     Ok(BernoulliMarginalLinkMap {
-        eta,
         mu,
         mu1: jet.d1,
         mu2: jet.d2,
@@ -7376,7 +7375,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     rho,
                     &derivative_blocks,
                     exact_warm_start.borrow().as_ref(),
-                    need_hessian,
+                    if need_hessian {
+                        crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                    } else {
+                        crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+                    },
                 )?;
                 exact_warm_start.replace(Some(eval.warm_start));
                 if need_hessian && !eval.outer_hessian.is_analytic() {
@@ -7386,6 +7389,49 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     );
                 }
                 Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            },
+            |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+                let family = make_family(&designs[0], &designs[1], current_sigma.get());
+                let marginal_psi_derivs = if marginal_has_spatial {
+                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
+                        || {
+                            "bernoulli marginal-slope: marginal block has spatial terms \
+                             but spatial psi derivatives are unavailable"
+                                .to_string()
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let logslope_psi_derivs = if logslope_has_spatial {
+                    build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
+                        || {
+                            "bernoulli marginal-slope: logslope block has spatial terms \
+                             but spatial psi derivatives are unavailable"
+                                .to_string()
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let mut derivative_blocks = vec![marginal_psi_derivs, logslope_psi_derivs];
+                if family.score_warp.is_some() {
+                    derivative_blocks.push(Vec::new());
+                }
+                if family.link_dev.is_some() {
+                    derivative_blocks.push(Vec::new());
+                }
+                let eval = evaluate_custom_family_joint_hyper_efs(
+                    &family,
+                    &blocks,
+                    options,
+                    rho,
+                    &derivative_blocks,
+                    exact_warm_start.borrow().as_ref(),
+                )?;
+                exact_warm_start.replace(Some(eval.warm_start));
+                Ok(eval.efs_eval)
             },
         )
     };

@@ -7,11 +7,11 @@ use crate::custom_family::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, build_embedded_dense_psi_operator, build_rowwise_kronecker_psi_operator,
-    evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
-    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
-    shared_dense_arc, should_materialize_custom_family_psi_dense,
-    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
-    wrap_spatial_implicit_psi_operator,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
+    first_psi_linear_map, fit_custom_family, resolve_custom_family_x_psi,
+    resolve_custom_family_x_psi_psi, second_psi_linear_map, shared_dense_arc,
+    should_materialize_custom_family_psi_dense, slice_joint_into_block_working_sets,
+    weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{FaerEigh, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::erfcx_nonnegative;
@@ -9158,11 +9158,54 @@ pub(crate) fn fit_survival_location_scale_terms(
                 rho,
                 &derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
-                need_hessian && analytic_joint_hessian_available,
+                if need_hessian && analytic_joint_hessian_available {
+                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                } else {
+                    crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+                },
             )
             .map_err(|e| e.to_string())?;
             exact_warm_start.replace(Some(eval.warm_start));
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
+        },
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            if !analytic_joint_gradient_available {
+                return Err(
+                    "analytic spatial psi derivatives are unavailable for survival exact two-block path"
+                        .to_string(),
+                );
+            }
+            let assembled = build_spec(rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
+            let prepared = prepare_survival_location_scale_model(&assembled)?;
+            let threshold_derivs = build_survival_covariate_block_psi_derivatives(
+                data,
+                &specs[0],
+                &designs[0],
+                &spec.threshold_template,
+            )?
+            .ok_or_else(|| "missing survival threshold spatial psi derivatives".to_string())?;
+            let log_sigma_derivs = build_survival_covariate_block_psi_derivatives(
+                data,
+                &specs[1],
+                &designs[1],
+                &spec.log_sigma_template,
+            )?
+            .ok_or_else(|| "missing survival log-sigma spatial psi derivatives".to_string())?;
+            let mut derivative_blocks = vec![Vec::new(), threshold_derivs, log_sigma_derivs];
+            if prepared.family.x_link_wiggle.is_some() {
+                derivative_blocks.push(Vec::new());
+            }
+            let eval = evaluate_custom_family_joint_hyper_efs(
+                &prepared.family,
+                &prepared.blockspecs,
+                &survival_blockwise_fit_options(&assembled),
+                rho,
+                &derivative_blocks,
+                exact_warm_start.borrow().as_ref(),
+            )
+            .map_err(|e| e.to_string())?;
+            exact_warm_start.replace(Some(eval.warm_start));
+            Ok(eval.efs_eval)
         },
     )?;
 

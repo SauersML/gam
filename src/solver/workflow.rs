@@ -573,7 +573,7 @@ fn fit_survival_location_scale_model(
             let dim = init.len();
             let mut seed_config = crate::seeding::SeedConfig::default();
             seed_config.max_seeds = 8;
-            seed_config.screening_budget = 3;
+            seed_config.seed_budget = 3;
             seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
             let problem = crate::solver::outer_strategy::OuterProblem::new(dim)
                 .with_tolerance(1e-4)
@@ -2168,7 +2168,8 @@ mod tests {
         config.z_column = Some("z".to_string());
 
         let err = materialize("Surv(entry, exit, event) ~ x + z", &data, &config)
-            .expect_err("main formula should reject z-column reuse");
+            .err()
+            .expect("main formula should reject z-column reuse");
 
         assert!(err.contains("survival marginal-slope reserves z column 'z'"));
         assert!(err.contains("main formula"));
@@ -2183,7 +2184,8 @@ mod tests {
         config.z_column = Some("z".to_string());
 
         let err = materialize("Surv(entry, exit, event) ~ x", &data, &config)
-            .expect_err("logslope formula should reject z-column reuse");
+            .err()
+            .expect("logslope formula should reject z-column reuse");
 
         assert!(err.contains("survival marginal-slope reserves z column 'z'"));
         assert!(err.contains("logslope_formula"));
@@ -2197,7 +2199,8 @@ mod tests {
         config.z_column = Some("z".to_string());
 
         let err = materialize("Surv(entry, exit, event) ~ x + z", &data, &config)
-            .expect_err("defaulted logslope spec should still reject z-column reuse");
+            .err()
+            .expect("defaulted logslope spec should still reject z-column reuse");
 
         assert!(err.contains("survival marginal-slope reserves z column 'z'"));
         assert!(err.contains("main formula"));

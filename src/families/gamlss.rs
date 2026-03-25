@@ -9,9 +9,10 @@ use crate::custom_family::{
     CustomFamilyPsiSecondDesignAction, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    evaluate_custom_family_joint_hyper, first_psi_linear_map, fit_custom_family,
-    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
-    shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
+    first_psi_linear_map, fit_custom_family, resolve_custom_family_x_psi,
+    resolve_custom_family_x_psi_psi, second_psi_linear_map, shared_dense_arc,
+    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -34,7 +35,8 @@ use crate::smooth::{
     BlockwisePenalty, ExactJointHyperSetup, PenaltyBlockInfo,
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
     TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    optimize_spatial_length_scale_exact_joint, spatial_dims_per_term,
+    spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
@@ -1174,6 +1176,7 @@ fn binomial_location_scalewarm_start(
         use_remlobjective: false,
         compute_covariance: false,
         use_outer_hessian: false,
+        screening_max_inner_iterations: None,
     };
     let warm_fit = fit_custom_family(&warm_family, &warm_blocks, &warm_options)?;
     let beta_threshold = warm_fit
@@ -1481,21 +1484,6 @@ impl BlockwiseTermWiggleFitResult {
     }
 }
 
-fn single_block_spatial_dims_per_term(
-    spec: &TermCollectionSpec,
-    spatial_terms: &[usize],
-) -> Vec<usize> {
-    spatial_terms
-        .iter()
-        .map(|&term_idx| {
-            crate::smooth::get_spatial_aniso_log_scales(spec, term_idx)
-                .map(|eta| eta.len())
-                .filter(|&dim| dim > 1)
-                .unwrap_or(1)
-        })
-        .collect()
-}
-
 pub struct BinomialLocationScaleFitResult {
     pub fit: BlockwiseTermFitResult,
     pub wiggle_knots: Option<Array1<f64>>,
@@ -1738,7 +1726,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 &joint_setup,
                 builder.exact_spatial_seed_risk_profile(),
                 analytic_joint_derivatives_available,
-                analytic_joint_derivatives_available,
+                // This outer problem moves the realized spatial design, so
+                // we intentionally plan it as gradient/fixed-point rather
+                // than an ARC/Newton Hessian solve.
+                false,
                 |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let fit = {
                         let blocks = builder.build_blocks(
@@ -1798,7 +1789,11 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         rho,
                         &psiderivative_blocks,
                         None,
-                        need_hessian,
+                        if need_hessian {
+                            crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                        } else {
+                            crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+                        },
                     )?;
                     if need_hessian && !eval.outer_hessian.is_analytic() {
                         return Err(
@@ -1807,6 +1802,38 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         );
                     }
                     Ok((eval.objective, eval.gradient, eval.outer_hessian))
+                },
+                |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                    if !analytic_joint_derivatives_available {
+                        return Err(
+                            "analytic spatial psi derivatives are unavailable for this exact two-block path"
+                                .to_string(),
+                        );
+                    }
+                    let blocks = builder.build_blocks(
+                        rho,
+                        &designs[0],
+                        &designs[1],
+                        mean_beta_hint_cell.borrow().clone(),
+                        noise_beta_hint_cell.borrow().clone(),
+                    )?;
+                    let family = builder.build_family(&designs[0], &designs[1]);
+                    let psiderivative_blocks = builder.build_psiderivative_blocks(
+                        data,
+                        &specs[0],
+                        &specs[1],
+                        &designs[0],
+                        &designs[1],
+                    )?;
+                    let eval = evaluate_custom_family_joint_hyper_efs(
+                        &family,
+                        &blocks,
+                        options,
+                        rho,
+                        &psiderivative_blocks,
+                        None,
+                    )?;
+                    Ok(eval.efs_eval)
                 },
             )
         }};
@@ -2845,7 +2872,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         });
     }
 
-    let dims_per_term = single_block_spatial_dims_per_term(pilot_spec, &spatial_terms);
+    let dims_per_term = spatial_dims_per_term(pilot_spec, &spatial_terms);
     let log_kappa0 =
         SpatialLogKappaCoords::from_length_scales_aniso(pilot_spec, &spatial_terms, kappa_options);
     let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&dims_per_term, kappa_options);
@@ -2931,10 +2958,16 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let y_cloned = y.clone();
     let weights_cloned = weights.clone();
     let link_kind_cloned = link_kind.clone();
-    let mut analytic_outer_hessian_available =
-        crate::custom_family::joint_exact_analytic_outer_hessian_available(
-            pilot_beta.len() + wiggle_design.ncols(),
-        );
+    let outer_family = BinomialMeanWiggleFamily {
+        y: y_cloned.clone(),
+        weights: weights_cloned.clone(),
+        link_kind: link_kind_cloned.clone(),
+        wiggle_knots: wiggle_knots_cloned.clone(),
+        wiggle_degree,
+    };
+    // This outer problem is design-moving in the spatial block, so we
+    // intentionally plan it as gradient/fixed-point rather than ARC/Newton.
+    let analytic_outer_hessian_available = false;
 
     struct MeanWiggleOuterState {
         warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
@@ -2947,14 +2980,12 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         )>,
     }
 
-    let build_eval = |theta: &Array1<f64>,
-                      warm_cache: Option<&crate::custom_family::CustomFamilyWarmStart>,
-                      need_hessian: bool|
-     -> Result<
+    let build_realized_blocks = |theta: &Array1<f64>| -> Result<
         (
-            crate::custom_family::CustomFamilyJointHyperResult,
             TermCollectionSpec,
             TermCollectionDesign,
+            Vec<ParameterBlockSpec>,
+            Vec<CustomFamilyBlockPsiDerivative>,
         ),
         String,
     > {
@@ -3008,41 +3039,51 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 initial_beta: wiggle_initial_beta.clone(),
             },
         ];
-        let family = BinomialMeanWiggleFamily {
-            y: y_cloned.clone(),
-            weights: weights_cloned.clone(),
-            link_kind: link_kind_cloned.clone(),
-            wiggle_knots: wiggle_knots_cloned.clone(),
-            wiggle_degree,
-        };
+        Ok((resolvedspec, design, blocks, eta_derivs))
+    };
+
+    let build_eval = |theta: &Array1<f64>,
+                      warm_cache: Option<&crate::custom_family::CustomFamilyWarmStart>,
+                      need_hessian: bool|
+     -> Result<
+        (
+            crate::custom_family::CustomFamilyJointHyperResult,
+            TermCollectionSpec,
+            TermCollectionDesign,
+        ),
+        String,
+    > {
+        let (resolvedspec, design, blocks, eta_derivs) = build_realized_blocks(theta)?;
         let eval = evaluate_custom_family_joint_hyper(
-            &family,
+            &outer_family,
             &blocks,
             options,
             &theta.slice(s![0..rho_dim]).to_owned(),
             &[eta_derivs, Vec::new()],
             warm_cache,
-            need_hessian,
+            if need_hessian {
+                crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+            } else {
+                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+            },
         )?;
         Ok((eval, resolvedspec, design))
     };
 
-    if analytic_outer_hessian_available {
-        let hessian_ready = build_eval(&theta0, None, true)
-            .ok()
-            .is_some_and(|(eval, _, _)| match &eval.outer_hessian {
-                crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
-                    hessian.nrows() == theta_dim
-                        && hessian.ncols() == theta_dim
-                        && hessian.iter().all(|value| value.is_finite())
-                }
-                crate::solver::outer_strategy::HessianResult::Operator(op) => op.dim() == theta_dim,
-                crate::solver::outer_strategy::HessianResult::Unavailable => false,
-            });
-        if !hessian_ready {
-            analytic_outer_hessian_available = false;
-        }
-    }
+    let build_efs = |theta: &Array1<f64>,
+                     warm_cache: Option<&crate::custom_family::CustomFamilyWarmStart>|
+     -> Result<crate::custom_family::CustomFamilyJointHyperEfsResult, String> {
+        let (_, _, blocks, eta_derivs) = build_realized_blocks(theta)?;
+        evaluate_custom_family_joint_hyper_efs(
+            &outer_family,
+            &blocks,
+            options,
+            &theta.slice(s![0..rho_dim]).to_owned(),
+            &[eta_derivs, Vec::new()],
+            warm_cache,
+        )
+        .map_err(|e| e.to_string())
+    };
 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{Derivative, OuterEval};
@@ -3076,7 +3117,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .with_initial_rho(theta0.clone())
         .with_seed_config(crate::seeding::SeedConfig {
             max_seeds: 4,
-            screening_budget: 2,
+            seed_budget: 2,
             risk_profile: crate::seeding::SeedRiskProfile::GeneralizedLinear,
             num_auxiliary_trailing: theta_dim - rho_dim,
             ..Default::default()
@@ -3143,12 +3184,12 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             state.warm_cache = None;
             state.last_eval = None;
         }),
-        None::<
-            fn(
-                &mut MeanWiggleOuterState,
-                &Array1<f64>,
-            ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
-        >,
+        Some(|state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
+            let eval = build_efs(theta, state.warm_cache.as_ref())
+                .map_err(EstimationError::InvalidInput)?;
+            state.warm_cache = Some(eval.warm_start);
+            Ok(eval.efs_eval)
+        }),
     );
 
     let outer = problem
@@ -16405,7 +16446,7 @@ mod tests {
             &rho,
             &derivative_blocks,
             None,
-            true,
+            crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian,
         )
         .expect("exact spatial joint hyper eval");
         assert!(eval.objective.is_finite());
@@ -16495,7 +16536,7 @@ mod tests {
             &rho,
             &derivative_blocks,
             None,
-            true,
+            crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian,
         )
         .expect("exact wiggle spatial joint hyper eval");
         assert!(eval.objective.is_finite());
@@ -16576,7 +16617,7 @@ mod tests {
             &rho,
             &derivative_blocks,
             None,
-            true,
+            crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian,
         )
         .expect("exact spatial joint hyper eval");
         assert!(eval.objective.is_finite());

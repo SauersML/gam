@@ -9,7 +9,7 @@ It fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms, random ef
 - **Three-part penalty structure.** Each smooth gets separate penalties for magnitude, gradient, and curvature. Most GAM libraries use one (curvature only) or two (curvature + combined magnitude/gradient). The three-part structure gives the smoother more degrees of freedom to distinguish flat-but-offset functions from wiggly ones.
 - **Flexible link functions.** A spline offset from a base link (e.g. probit) lets the data correct for link misspecification while encoding the belief that the base link is approximately right. This is equivalent to joint fitting with post-hoc calibration. The same mechanism applies to survival time basis functions.
 - **Surface smooths.** Thin-plate splines, Duchon splines, and Matern covariance-based smooths in arbitrary dimension, with automatic knot placement.
-- **Adaptive anisotropy.** Per-axis length-scale optimization (`--scale-dimensions`) lets the model shrink or stretch each feature axis independently within a single joint smooth, instead of assuming isotropic smoothness.
+- **Adaptive anisotropy.** Per-axis spatial anisotropy (`--scale-dimensions`) lets the model shrink or stretch each feature axis independently within a single joint smooth, instead of assuming isotropic smoothness. Matérn and hybrid Duchon optimize a global scale plus per-axis contrasts; pure Duchon optimizes the per-axis contrasts directly without introducing a global length scale.
 - **Composable basis/kernel.** You can combine the kernel of one spline family with the length-scale behavior of another (e.g. Duchon kernel with Matern-style global kappa scaling).
 
 ## Install
@@ -113,7 +113,7 @@ response ~ term + term + ...
 
 Common smooth options: `knots=`, `k=`, `centers=`, `degree=`, `penalty_order=`, `double_penalty=true|false`, `type=ps|tps|matern|duchon`.
 
-Spatial smooths support per-axis anisotropy via `scale_dims=true` or the global `--scale-dimensions` flag.
+Spatial smooths support per-axis anisotropy via `scale_dims=true` or the global `--scale-dimensions` flag. For pure Duchon this stays scale-free: the optimizer updates only centered per-axis shape contrasts, not a scalar `length_scale`.
 
 **Formula-level configuration:**
 

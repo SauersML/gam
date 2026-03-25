@@ -4580,6 +4580,23 @@ fn assemble_sparseweighted_gram_system(
 }
 
 impl DesignMatrix {
+    /// Horizontally concatenate design blocks without forcing eager densification.
+    ///
+    /// The returned matrix is a lazy `BlockDesignOperator` when more than one
+    /// block is provided, so operator-backed inputs stay chunkable on the
+    /// prediction path.
+    pub fn hstack(blocks: Vec<DesignMatrix>) -> Result<Self, String> {
+        if blocks.is_empty() {
+            return Err("DesignMatrix::hstack requires at least one block".to_string());
+        }
+        if blocks.len() == 1 {
+            return Ok(blocks.into_iter().next().expect("non-empty block list"));
+        }
+        let operator =
+            BlockDesignOperator::new(blocks.into_iter().map(DesignBlock::from).collect())?;
+        Ok(Self::Dense(DenseDesignMatrix::from(Arc::new(operator))))
+    }
+
     pub fn nrows(&self) -> usize {
         <Self as LinearOperator>::nrows(self)
     }
@@ -5352,17 +5369,37 @@ impl From<&DesignMatrix> for DesignMatrix {
     }
 }
 
+impl From<DesignMatrix> for DesignBlock {
+    fn from(value: DesignMatrix) -> Self {
+        match value {
+            DesignMatrix::Dense(matrix) => Self::Dense(matrix),
+            DesignMatrix::Sparse(matrix) => Self::Sparse(matrix),
+        }
+    }
+}
+
+impl From<&DesignMatrix> for DesignBlock {
+    fn from(value: &DesignMatrix) -> Self {
+        match value {
+            DesignMatrix::Dense(matrix) => Self::Dense(matrix.clone()),
+            DesignMatrix::Sparse(matrix) => Self::Sparse(matrix.clone()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkedKernelDesignOperator, DesignMatrix, SparseDesignMatrix, dense_matvec,
-        dense_transpose_matvec, dense_transpose_weighted_response,
+        ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
+        SparseDesignMatrix, dense_matvec, dense_transpose_matvec,
+        dense_transpose_weighted_response,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use ndarray::{Array1, Array2, Axis, array};
+    use ndarray::{Array1, Array2, Axis, array, s};
+    use std::ops::Range;
     use std::sync::Arc;
 
     fn exact_weighted_penalized_solve(
@@ -5460,6 +5497,78 @@ mod tests {
         assert_eq!(operator.ncols(), 3);
         let chunk = operator.row_chunk_combined(0..2);
         assert_eq!(chunk.dim(), (2, 3));
+    }
+
+    #[test]
+    fn design_matrix_hstack_preserves_lazy_blocks() {
+        #[derive(Clone)]
+        struct NoDensifyOperator {
+            dense: Array2<f64>,
+        }
+
+        impl LinearOperator for NoDensifyOperator {
+            fn nrows(&self) -> usize {
+                self.dense.nrows()
+            }
+
+            fn ncols(&self) -> usize {
+                self.dense.ncols()
+            }
+
+            fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+                self.dense.dot(vector)
+            }
+
+            fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+                self.dense.t().dot(vector)
+            }
+
+            fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+                if weights.len() != self.nrows() {
+                    return Err(format!(
+                        "NoDensifyOperator weight length mismatch: weights={}, nrows={}",
+                        weights.len(),
+                        self.nrows()
+                    ));
+                }
+                let weighted = &self.dense * &weights.view().insert_axis(Axis(1));
+                Ok(self.dense.t().dot(&weighted))
+            }
+        }
+
+        impl DenseDesignOperator for NoDensifyOperator {
+            fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+                self.dense.slice(s![rows, ..]).to_owned()
+            }
+
+            fn to_dense(&self) -> Array2<f64> {
+                panic!("DesignMatrix::hstack should not densify lazy blocks")
+            }
+        }
+
+        let left_dense = array![[1.0, 2.0], [3.0, 4.0]];
+        let right_dense = array![[5.0], [6.0]];
+        let left = DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyOperator {
+            dense: left_dense.clone(),
+        })));
+        let right = DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyOperator {
+            dense: right_dense.clone(),
+        })));
+        let stacked = DesignMatrix::hstack(vec![left, right]).expect("stacked design");
+
+        assert!(stacked.as_dense_ref().is_none());
+        assert_eq!(stacked.nrows(), 2);
+        assert_eq!(stacked.ncols(), 3);
+
+        let beta = array![0.25, -0.5, 2.0];
+        let expected = array![9.25, 11.75];
+        let got = stacked.dot(&beta);
+        for i in 0..expected.len() {
+            assert!((got[i] - expected[i]).abs() < 1e-12);
+        }
+
+        let chunk = stacked.row_chunk(0..2);
+        assert_eq!(chunk, array![[1.0, 2.0, 5.0], [3.0, 4.0, 6.0]]);
     }
 
     #[test]

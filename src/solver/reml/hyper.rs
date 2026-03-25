@@ -141,20 +141,41 @@ impl<'a> RemlState<'a> {
             )));
         }
 
-        let mut out = Array2::<f64>::zeros((p, p));
-        for col in 0..p {
-            let rhs = weights * &x_dense.column(col).to_owned();
-            let result = deriv.transformed_transpose_mul(qs, free_basis_opt, &rhs)?;
-            if result.len() != p {
-                return Err(EstimationError::InvalidInput(format!(
-                    "weighted_cross_from_design_derivative column size mismatch: got {}, expected {}",
-                    result.len(),
-                    p
-                )));
-            }
-            out.column_mut(col).assign(&result);
+        let mut weighted_x = x_dense.clone();
+        for (mut row, &weight) in weighted_x.outer_iter_mut().zip(weights.iter()) {
+            row *= weight;
         }
-        Ok(out)
+
+        match &deriv.storage {
+            DerivativeMatrixStorage::Dense(dense) => Ok(dense.t().dot(&weighted_x)),
+            DerivativeMatrixStorage::Embedded(embedded) => {
+                if embedded.total_dim != qs.nrows() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "embedded hyper design derivative width mismatch: total_cols={}, qs rows={}",
+                        embedded.total_dim,
+                        qs.nrows()
+                    )));
+                }
+                let pulled = embedded.local.t().dot(&weighted_x);
+                let qs_local = qs.slice(s![embedded.global_range.clone(), ..]).to_owned();
+                let mut out = qs_local.t().dot(&pulled);
+                if let Some(z) = free_basis_opt {
+                    out = z.t().dot(&out);
+                }
+                Ok(out)
+            }
+            DerivativeMatrixStorage::Implicit(_) => {
+                let transformed = deriv.transformed(qs, free_basis_opt)?;
+                if transformed.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "weighted_cross_from_design_derivative transformed width mismatch: got {}, expected {}",
+                        transformed.ncols(),
+                        p
+                    )));
+                }
+                Ok(transformed.t().dot(&weighted_x))
+            }
+        }
     }
 
     pub(crate) fn compute_joint_hyper_eval(
@@ -209,6 +230,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn compute_joint_hypercostgradienthessian(
         &self,
         theta: &Array1<f64>,

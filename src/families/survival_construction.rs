@@ -484,7 +484,7 @@ where
     let dim = seed.len();
     let mut seed_config = crate::seeding::SeedConfig::default();
     seed_config.max_seeds = 8;
-    seed_config.screening_budget = 3;
+    seed_config.seed_budget = 3;
     seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
     let problem = OuterProblem::new(dim)
         .with_tolerance(1e-4)

@@ -53,9 +53,7 @@ use gam::inference::model::{
     survival_baseline_config_from_model,
 };
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
-use gam::matrix::{
-    BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, SymmetricMatrix,
-};
+use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
     state_fromspec,
@@ -109,7 +107,6 @@ use rand::{SeedableRng, rngs::StdRng};
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use thiserror::Error;
 
 mod report;
@@ -972,14 +969,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     progress.advance_secondary_workflow(2);
     progress.finish_secondary_progress("dataset parsed and terms resolved");
     progress.advance_workflow(2);
-    let mut spatial_usagewarnings =
-        collect_spatial_smooth_usagewarnings(&spec, &ds.headers, "model");
-    spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
-        &spec,
-        &ds.headers,
-        "model",
-    ));
-    emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
+    let spatial_usagewarnings = collect_smooth_structure_warnings(&spec, &ds.headers, "model");
+    emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(&inference_notes);
     let has_bounded_terms = termspec_has_bounded_terms(&spec);
     validate_cli_firth_configuration(CliFirthValidation {
@@ -1166,13 +1157,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         })) {
             Ok(FitResult::Standard(result)) => result,
             Ok(_) => {
-                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
                 return Err(
                     "internal standard workflow returned the wrong result variant".to_string(),
                 );
             }
             Err(e) => {
-                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
                 return Err(format!("standard term fit failed: {e}"));
             }
         };
@@ -1275,7 +1266,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         progress.advance_workflow(5);
     }
 
-    emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+    emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
     progress.finish_progress("fit complete");
     Ok(())
 }
@@ -1348,23 +1339,13 @@ fn run_fit_bernoulli_marginal_slope(
     progress.advance_workflow(2);
 
     let mut spatial_usagewarnings =
-        collect_spatial_smooth_usagewarnings(&marginalspec, &ds.headers, "marginal model");
-    spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
-        &marginalspec,
-        &ds.headers,
-        "marginal model",
-    ));
-    spatial_usagewarnings.extend(collect_spatial_smooth_usagewarnings(
+        collect_smooth_structure_warnings(&marginalspec, &ds.headers, "marginal model");
+    spatial_usagewarnings.extend(collect_smooth_structure_warnings(
         &logslopespec,
         &ds.headers,
         "logslope model",
     ));
-    spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
-        &logslopespec,
-        &ds.headers,
-        "logslope model",
-    ));
-    emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
+    emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(inference_notes);
 
     let z_col = *col_map
@@ -1455,14 +1436,14 @@ fn run_fit_bernoulli_marginal_slope(
     )) {
         Ok(FitResult::BernoulliMarginalSlope(result)) => result,
         Ok(_) => {
-            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
             return Err(
                 "internal bernoulli marginal-slope workflow returned the wrong result variant"
                     .to_string(),
             );
         }
         Err(e) => {
-            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
             return Err(format!("bernoulli marginal-slope fit failed: {e}"));
         }
     };
@@ -1520,7 +1501,7 @@ fn run_fit_bernoulli_marginal_slope(
         progress.advance_workflow(fit_total_steps);
     }
 
-    emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+    emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
     progress.finish_progress("bernoulli marginal-slope fit complete");
     Ok(())
 }
@@ -1561,8 +1542,8 @@ fn run_fit_transformation_normal(
     }
 
     let spatial_usagewarnings =
-        collect_spatial_smooth_usagewarnings(&covariate_spec, &ds.headers, "transformation-normal");
-    emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
+        collect_smooth_structure_warnings(&covariate_spec, &ds.headers, "transformation-normal");
+    emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(inference_notes);
 
     let options = blockwise_options_from_fit_args(args)?;
@@ -1591,14 +1572,14 @@ fn run_fit_transformation_normal(
     )) {
         Ok(FitResult::TransformationNormal(result)) => result,
         Ok(_) => {
-            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
             return Err(
                 "internal transformation-normal workflow returned the wrong result variant"
                     .to_string(),
             );
         }
         Err(e) => {
-            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
             return Err(format!("transformation-normal fit failed: {e}"));
         }
     };
@@ -1632,7 +1613,7 @@ fn run_fit_transformation_normal(
         progress.advance_workflow(fit_total_steps);
     }
 
-    emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+    emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
     progress.finish_progress("transformation-normal fit complete");
     Ok(())
 }
@@ -1670,23 +1651,13 @@ fn run_fitwith_predict_noise(
     progress.finish_secondary_progress("mean and noise terms resolved");
     progress.advance_workflow(2);
     let mut spatial_usagewarnings =
-        collect_spatial_smooth_usagewarnings(&meanspec, &ds.headers, "mean model");
-    spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
-        &meanspec,
-        &ds.headers,
-        "mean model",
-    ));
-    spatial_usagewarnings.extend(collect_spatial_smooth_usagewarnings(
+        collect_smooth_structure_warnings(&meanspec, &ds.headers, "mean model");
+    spatial_usagewarnings.extend(collect_smooth_structure_warnings(
         &noisespec,
         &ds.headers,
         "noise model",
     ));
-    spatial_usagewarnings.extend(collect_linear_smooth_overlapwarnings(
-        &noisespec,
-        &ds.headers,
-        "noise model",
-    ));
-    emit_spatial_smooth_usagewarnings("fit-start", &spatial_usagewarnings);
+    emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(inference_notes);
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
@@ -1724,14 +1695,14 @@ fn run_fitwith_predict_noise(
         )) {
             Ok(FitResult::GaussianLocationScale(result)) => result,
             Ok(_) => {
-                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
                 return Err(
                     "internal gaussian location-scale workflow returned the wrong result variant"
                         .to_string(),
                 );
             }
             Err(e) => {
-                emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
                 return Err(format!("gaussian location-scale fit failed: {e}"));
             }
         };
@@ -1831,7 +1802,7 @@ fn run_fitwith_predict_noise(
             write_model_json(out, &model)?;
             progress.advance_workflow(fit_total_steps);
         }
-        emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+        emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
         progress.finish_progress("gaussian location-scale fit complete");
         return Ok(());
     }
@@ -1907,14 +1878,14 @@ fn run_fitwith_predict_noise(
     )) {
         Ok(FitResult::BinomialLocationScale(result)) => result,
         Ok(_) => {
-            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
             return Err(
                 "internal binomial location-scale workflow returned the wrong result variant"
                     .to_string(),
             );
         }
         Err(e) => {
-            emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+            emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
             return Err(e);
         }
     };
@@ -2012,7 +1983,7 @@ fn run_fitwith_predict_noise(
         write_model_json(out, &model)?;
         progress.advance_workflow(fit_total_steps);
     }
-    emit_spatial_smooth_usagewarnings("fit-end", &spatial_usagewarnings);
+    emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
     progress.finish_progress("binomial location-scale fit complete");
     Ok(())
 }
@@ -4110,7 +4081,7 @@ where
     let dim = seed.len();
     let mut seed_config = gam::seeding::SeedConfig::default();
     seed_config.max_seeds = 4;
-    seed_config.screening_budget = 2;
+    seed_config.seed_budget = 2;
     seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
     let problem = gam::solver::outer_strategy::OuterProblem::new(dim)
         .with_tolerance(1e-3)
@@ -5073,7 +5044,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
         }
         validate_marginal_slope_z_column_exclusion(
-            parsed,
+            &parsed,
             &parsed_logslope,
             z_column_name,
             "survival marginal-slope",
@@ -5093,8 +5064,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let routed_deviations = route_marginal_slope_deviation_blocks(
             parsed.linkwiggle.as_ref(),
             parsed_logslope.linkwiggle.as_ref(),
-            args.disable_score_warp,
-            args.disable_link_dev,
+            false,
+            false,
             "survival marginal-slope",
             "--logslope-formula",
         )?;
@@ -5115,8 +5086,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             "--logslope-formula",
             parsed.linkwiggle.is_some(),
             parsed_logslope.linkwiggle.is_some(),
-            args.disable_score_warp,
-            args.disable_link_dev,
+            false,
+            false,
         ));
         if routed_link_dev.is_none() && routed_score_warp.is_none() {
             inference_notes.push(
@@ -7709,6 +7680,7 @@ fn deviation_block_config_from_formula_linkwiggle(
     }
 }
 
+#[derive(Debug)]
 struct MarginalSlopeDeviationRouting {
     score_warp: Option<DeviationBlockConfig>,
     link_dev: Option<DeviationBlockConfig>,
@@ -7952,27 +7924,6 @@ fn concat_array1_refs(parts: &[&Array1<f64>]) -> Array1<f64> {
     out
 }
 
-fn design_block_from_design(design: &DesignMatrix) -> DesignBlock {
-    match design {
-        DesignMatrix::Dense(matrix) => DesignBlock::Dense(matrix.clone()),
-        DesignMatrix::Sparse(matrix) => DesignBlock::Sparse(matrix.clone()),
-    }
-}
-
-fn horizontally_compose_designs(designs: Vec<DesignMatrix>) -> Result<DesignMatrix, String> {
-    if designs.is_empty() {
-        return Err("cannot horizontally compose an empty design list".to_string());
-    }
-    if designs.len() == 1 {
-        return Ok(designs.into_iter().next().expect("non-empty design list"));
-    }
-    let blocks = designs.iter().map(design_block_from_design).collect();
-    let operator = BlockDesignOperator::new(blocks)?;
-    Ok(DesignMatrix::from(DenseDesignMatrix::from(Arc::new(
-        operator,
-    ))))
-}
-
 fn build_saved_survival_marginal_slope_predictor(
     model: &SavedModel,
     fit_saved: &UnifiedFitResult,
@@ -8112,7 +8063,7 @@ fn build_saved_survival_marginal_slope_predictor(
         q_design_parts.push(DesignMatrix::from(exit_w));
     }
     q_design_parts.push(cov_design.clone());
-    let q_design = horizontally_compose_designs(q_design_parts)?;
+    let q_design = DesignMatrix::hstack(q_design_parts)?;
 
     let combined_q_beta = concat_array1_refs(&[beta_time, beta_marginal]);
     let combined_q_lambdas = concat_array1_refs(&[&blocks[0].lambdas, &blocks[1].lambdas]);
@@ -8771,20 +8722,124 @@ fn collect_linear_smooth_overlapwarnings(
             .collect::<Vec<_>>()
             .join(" + ");
         warnings.push(format!(
-            "{label}: feature(s) [{overlap_features}] appear both in smooth term `{}` and explicit linear term(s) `{linear_terms}`. This usually double-counts the same direction: the smooth already carries low-order structure for its own variables, so adding explicit linear terms on those same variables is typically redundant and can destabilize smoothing/identifiability.",
+            "{label}: feature(s) [{overlap_features}] appear both in smooth term `{}` and explicit linear term(s) `{linear_terms}`. The fit now residualizes the smooth against the intercept and those overlapping linear columns, so the smooth contributes only the nonlinear remainder on those variables. This changes the term decomposition and interpretation.",
             smooth.name
         ));
     }
     warnings
 }
 
-fn emit_spatial_smooth_usagewarnings(stage: &str, warnings: &[String]) {
+fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
+    match &term.basis {
+        SmoothBasisSpec::BSpline1D { .. } => 0,
+        SmoothBasisSpec::TensorBSpline { .. } => 1,
+        SmoothBasisSpec::ThinPlate { .. } => 2,
+        SmoothBasisSpec::Matern { .. } => 3,
+        SmoothBasisSpec::Duchon { .. } => 4,
+    }
+}
+
+fn compare_smooth_warning_priority(
+    lhs_idx: usize,
+    lhs: &SmoothTermSpec,
+    rhs_idx: usize,
+    rhs: &SmoothTermSpec,
+) -> std::cmp::Ordering {
+    let lhs_cols = smooth_term_feature_cols(lhs);
+    let rhs_cols = smooth_term_feature_cols(rhs);
+    lhs_cols
+        .len()
+        .cmp(&rhs_cols.len())
+        .then_with(|| lhs_cols.cmp(&rhs_cols))
+        .then_with(|| {
+            smooth_basiswarning_family_rank(lhs).cmp(&smooth_basiswarning_family_rank(rhs))
+        })
+        .then_with(|| lhs.name.cmp(&rhs.name))
+        .then(lhs_idx.cmp(&rhs_idx))
+}
+
+fn collect_hierarchical_smooth_overlapwarnings(
+    spec: &TermCollectionSpec,
+    headers: &[String],
+    label: &str,
+) -> Vec<String> {
+    let mut ownership_order: Vec<usize> = (0..spec.smooth_terms.len()).collect();
+    ownership_order.sort_by(|&lhs, &rhs| {
+        compare_smooth_warning_priority(lhs, &spec.smooth_terms[lhs], rhs, &spec.smooth_terms[rhs])
+    });
+
+    let mut warnings = Vec::new();
+    for (pos, &target_idx) in ownership_order.iter().enumerate() {
+        let target = &spec.smooth_terms[target_idx];
+        let target_cols = smooth_term_feature_cols(target);
+        let target_features = target_cols
+            .iter()
+            .map(|&col| {
+                headers
+                    .get(col)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{col}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target_set = target_cols.into_iter().collect::<BTreeSet<_>>();
+
+        let owners = ownership_order[..pos]
+            .iter()
+            .filter_map(|&owner_idx| {
+                let owner = &spec.smooth_terms[owner_idx];
+                let owner_cols = smooth_term_feature_cols(owner);
+                let owner_set = owner_cols.iter().copied().collect::<BTreeSet<_>>();
+                if !owner_set.is_subset(&target_set) {
+                    return None;
+                }
+                let owner_features = owner_cols
+                    .iter()
+                    .map(|&col| {
+                        headers
+                            .get(col)
+                            .cloned()
+                            .unwrap_or_else(|| format!("#{col}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!("`{}` over [{}]", owner.name, owner_features))
+            })
+            .collect::<Vec<_>>();
+        if owners.is_empty() {
+            continue;
+        }
+
+        warnings.push(format!(
+            "{label}: smooth term `{}` over [{target_features}] overlaps nested or duplicate smooth term(s) {}. The fit uses automatic hierarchical ownership: those higher-priority smooth term(s) keep any shared realized subspace, and `{}` is residualized against that overlap before fitting.",
+            target.name,
+            owners.join(", "),
+            target.name,
+        ));
+    }
+    warnings
+}
+
+fn collect_smooth_structure_warnings(
+    spec: &TermCollectionSpec,
+    headers: &[String],
+    label: &str,
+) -> Vec<String> {
+    let mut warnings = collect_spatial_smooth_usagewarnings(spec, headers, label);
+    warnings.extend(collect_linear_smooth_overlapwarnings(spec, headers, label));
+    warnings.extend(collect_hierarchical_smooth_overlapwarnings(
+        spec, headers, label,
+    ));
+    warnings
+}
+
+fn emit_smooth_structure_warnings(stage: &str, warnings: &[String]) {
     for warning in warnings {
         eprintln!("WARNING [{stage}]: {warning}");
     }
 }
 
-/// Build anisotropic-scale report rows from an optional resolved spec.
+/// Build anisotropic spatial-geometry report rows from an optional resolved spec.
 fn build_anisotropic_scales_rows(
     spec: Option<&TermCollectionSpec>,
 ) -> Vec<report::AnisotropicScalesRow> {
@@ -8800,15 +8855,16 @@ fn build_anisotropic_scales_rows(
         if eta.is_empty() {
             continue;
         }
-        let Some(ls) = get_spatial_length_scale(spec, term_idx) else {
-            continue;
-        };
+        let ls = get_spatial_length_scale(spec, term_idx);
         let axes = eta
             .iter()
             .enumerate()
             .map(|(a, &eta_a)| {
-                let length_a = ls * (-eta_a).exp();
-                let kappa_a = (1.0 / ls) * eta_a.exp();
+                let (length_a, kappa_a) = if let Some(ls) = ls {
+                    (Some(ls * (-eta_a).exp()), Some((1.0 / ls) * eta_a.exp()))
+                } else {
+                    (None, None)
+                };
                 (a, eta_a, length_a, kappa_a)
             })
             .collect();
@@ -8821,7 +8877,7 @@ fn build_anisotropic_scales_rows(
     rows
 }
 
-/// Print learned per-axis anisotropic length scales for spatial terms to stdout.
+/// Print learned per-axis spatial anisotropy for spatial terms to stdout.
 fn print_spatial_aniso_scales(spec: &TermCollectionSpec) {
     use gam::smooth::{get_spatial_aniso_log_scales, get_spatial_length_scale};
     for (term_idx, term) in spec.smooth_terms.iter().enumerate() {
@@ -8831,20 +8887,28 @@ fn print_spatial_aniso_scales(spec: &TermCollectionSpec) {
         if eta.is_empty() {
             continue;
         }
-        let Some(ls) = get_spatial_length_scale(spec, term_idx) else {
-            continue;
-        };
-        println!(
-            "[spatial-kappa] term {} (\"{}\"): anisotropic length scales (global length_scale={:.4})",
-            term_idx, term.name, ls
-        );
+        let ls = get_spatial_length_scale(spec, term_idx);
+        match ls {
+            Some(ls) => println!(
+                "[spatial-kappa] term {} (\"{}\"): anisotropic length scales (global length_scale={:.4})",
+                term_idx, term.name, ls
+            ),
+            None => println!(
+                "[spatial-kappa] term {} (\"{}\"): pure Duchon shape anisotropy",
+                term_idx, term.name
+            ),
+        }
         for (a, &eta_a) in eta.iter().enumerate() {
-            let length_a = ls * (-eta_a).exp();
-            let kappa_a = (1.0 / ls) * eta_a.exp();
-            println!(
-                "  axis {}: eta={:+.4}, length={:.4}, kappa={:.4}",
-                a, eta_a, length_a, kappa_a
-            );
+            if let Some(ls) = ls {
+                let length_a = ls * (-eta_a).exp();
+                let kappa_a = (1.0 / ls) * eta_a.exp();
+                println!(
+                    "  axis {}: eta={:+.4}, length={:.4}, kappa={:.4}",
+                    a, eta_a, length_a, kappa_a
+                );
+            } else {
+                println!("  axis {}: eta={:+.4}", a, eta_a);
+            }
         }
     }
 }
@@ -10461,7 +10525,8 @@ mod tests {
         MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
         apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
-        chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlapwarnings,
+        chi_square_survival_approx, classify_cli_error,
+        collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_saved_multiblock_fit_result,
         compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
@@ -10478,8 +10543,9 @@ mod tests {
     };
     use csv::StringRecord;
     use gam::basis::{
-        BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
-        MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
+        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy,
+        Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec, MaternNu,
+        SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
     use gam::estimate::{FitGeometry, FittedBlock, FittedLinkState, UnifiedFitResultParts};
     use gam::gamlss::buildwiggle_block_input_from_knots;
@@ -10493,6 +10559,7 @@ mod tests {
     };
     use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
     use gam::predict::PredictableModel;
+    use gam::probability::normal_cdf;
     use gam::smooth::{
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
         SmoothTermSpec, TermCollectionSpec,
@@ -12550,7 +12617,60 @@ mod tests {
         assert!(warnings[0].contains("feature(s) [pc1]"));
         assert!(warnings[0].contains("duchon(pc1, pc2, pc3)"));
         assert!(warnings[0].contains("linear(pc1)"));
-        assert!(warnings[0].contains("double-counts the same direction"));
+        assert!(warnings[0].contains("residualizes the smooth against the intercept"));
+        assert!(warnings[0].contains("nonlinear remainder"));
+    }
+
+    #[test]
+    fn warns_for_nested_smooth_terms_with_hierarchical_ownership() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![
+                SmoothTermSpec {
+                    name: "duchon(pc1, pc2)".to_string(),
+                    basis: SmoothBasisSpec::Duchon {
+                        feature_cols: vec![0, 1],
+                        spec: DuchonBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                            length_scale: Some(1.0),
+                            power: 1,
+                            nullspace_order: DuchonNullspaceOrder::Linear,
+                            identifiability: SpatialIdentifiability::default(),
+                            aniso_log_scales: None,
+                        },
+                        input_scales: None,
+                    },
+                    shape: ShapeConstraint::None,
+                },
+                SmoothTermSpec {
+                    name: "s(pc1)".to_string(),
+                    basis: SmoothBasisSpec::BSpline1D {
+                        feature_col: 0,
+                        spec: BSplineBasisSpec {
+                            degree: 3,
+                            penalty_order: 2,
+                            knotspec: BSplineKnotSpec::Generate {
+                                data_range: (0.0, 1.0),
+                                num_internal_knots: 4,
+                            },
+                            double_penalty: false,
+                            identifiability: BSplineIdentifiability::default(),
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+            ],
+        };
+        let headers = vec!["pc1".to_string(), "pc2".to_string()];
+
+        let warnings = collect_hierarchical_smooth_overlapwarnings(&spec, &headers, "model");
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("duchon(pc1, pc2)"));
+        assert!(warnings[0].contains("s(pc1)"));
+        assert!(warnings[0].contains("automatic hierarchical ownership"));
+        assert!(warnings[0].contains("residualized against that overlap"));
     }
 
     #[test]
