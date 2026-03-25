@@ -613,7 +613,10 @@ impl HessianResult {
 
     /// Returns `true` if an analytic Hessian is present in any exact form.
     pub fn is_analytic(&self) -> bool {
-        matches!(self, HessianResult::Analytic(_) | HessianResult::Operator(_))
+        matches!(
+            self,
+            HessianResult::Analytic(_) | HessianResult::Operator(_)
+        )
     }
 
     /// Convert to the optional Hessian shape used by the opt bridge.
@@ -1453,10 +1456,7 @@ const OPERATOR_TRUST_RADIUS_INIT: f64 = 1.0;
 const OPERATOR_TRUST_RADIUS_MAX: f64 = 1.0e6;
 const OPERATOR_ETA_ACCEPT: f64 = 1.0e-4;
 
-fn project_to_bounds(
-    x: &Array1<f64>,
-    bounds: Option<&(Array1<f64>, Array1<f64>)>,
-) -> Array1<f64> {
+fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
     match bounds {
         Some((lower, upper)) => {
             let mut out = x.clone();
@@ -1712,7 +1712,9 @@ fn run_operator_trust_region(
             continue;
         }
 
-        let pred_dec = if (&s_trial - &trial_step).dot(&(&s_trial - &trial_step)).sqrt()
+        let pred_dec = if (&s_trial - &trial_step)
+            .dot(&(&s_trial - &trial_step))
+            .sqrt()
             > 1e-8 * (1.0 + trial_step.dot(&trial_step).sqrt())
         {
             predicted_decrease_from_operator(op_arc.as_ref(), &g_proj, &s_trial, &active)
@@ -1726,17 +1728,15 @@ fn run_operator_trust_region(
         }
 
         let eval_trial = obj.eval(&x_trial)?;
-        let eval_trial = finite_outer_eval_or_error(
-            "outer operator eval failed",
-            layout,
-            eval_trial,
-        )
-        .map_err(|err| match err {
-            ObjectiveEvalError::Recoverable { message }
-            | ObjectiveEvalError::Fatal { message } => {
-                EstimationError::RemlOptimizationFailed(message)
-            }
-        })?;
+        let eval_trial =
+            finite_outer_eval_or_error("outer operator eval failed", layout, eval_trial).map_err(
+                |err| match err {
+                    ObjectiveEvalError::Recoverable { message }
+                    | ObjectiveEvalError::Fatal { message } => {
+                        EstimationError::RemlOptimizationFailed(message)
+                    }
+                },
+            )?;
         let act_dec = eval_k.cost - eval_trial.cost;
         let rho = act_dec / pred_dec;
         if rho > 0.75 && s_norm > 0.99 * trust_radius {
@@ -2046,49 +2046,76 @@ fn run_outer_with_plan(
 
         let result: Result<OuterResult, EstimationError> = match the_plan.solver {
             Solver::Arc | Solver::NewtonTrustRegion => {
-                let hessian_source = the_plan.hessian_source;
-                let objective = OuterSecondOrderBridge {
-                    obj,
-                    layout,
-                    hessian_source,
-                };
-
-                let (lo, hi) = &bounds_template;
-                let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
-                    .expect("outer rho bounds must be valid");
-                let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
-                let max_iter =
-                    MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
-
-                if the_plan.solver == Solver::Arc {
-                    let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
-                        .with_bounds(bounds)
-                        .with_tolerance(tol)
-                        .with_max_iterations(max_iter)
-                        .with_fd_hessian_step(config.fd_step);
-                    match optimizer.run() {
-                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                        Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                let seed_eval = obj.eval(seed)?;
+                let seed_eval = finite_outer_eval_or_error("outer eval failed", layout, seed_eval)
+                    .map_err(|err| match err {
+                        ObjectiveEvalError::Recoverable { message }
+                        | ObjectiveEvalError::Fatal { message } => {
+                            EstimationError::RemlOptimizationFailed(message)
                         }
-                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                            "Arc solver failed: {e:?}"
-                        ))),
-                    }
+                    })?;
+
+                if matches!(seed_eval.hessian, HessianResult::Operator(_)) {
+                    log::debug!(
+                        "[OUTER] {context}: analytic Hessian provided as Hv operator; \
+                         routing to internal trust-region CG"
+                    );
+                    run_operator_trust_region(
+                        obj,
+                        seed,
+                        layout,
+                        Some(&bounds_template),
+                        config.tolerance,
+                        config.max_iter,
+                        seed_eval,
+                        *the_plan,
+                    )
                 } else {
-                    let mut optimizer = NewtonTrustRegion::new(seed.clone(), objective)
-                        .with_bounds(bounds)
-                        .with_tolerance(tol)
-                        .with_max_iterations(max_iter)
-                        .with_fd_hessian_step(config.fd_step);
-                    match optimizer.run() {
-                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                    let hessian_source = the_plan.hessian_source;
+                    let objective = OuterSecondOrderBridge {
+                        obj,
+                        layout,
+                        hessian_source,
+                    };
+
+                    let (lo, hi) = &bounds_template;
+                    let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
+                        .expect("outer rho bounds must be valid");
+                    let tol =
+                        Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
+                    let max_iter =
+                        MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+
+                    if the_plan.solver == Solver::Arc {
+                        let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
+                            .with_bounds(bounds)
+                            .with_tolerance(tol)
+                            .with_max_iterations(max_iter)
+                            .with_fd_hessian_step(config.fd_step);
+                        match optimizer.run() {
+                            Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                            Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
+                                Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                            }
+                            Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                                "Arc solver failed: {e:?}"
+                            ))),
                         }
-                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                            "Newton trust-region solver failed: {e:?}"
-                        ))),
+                    } else {
+                        let mut optimizer = NewtonTrustRegion::new(seed.clone(), objective)
+                            .with_bounds(bounds)
+                            .with_tolerance(tol)
+                            .with_max_iterations(max_iter)
+                            .with_fd_hessian_step(config.fd_step);
+                        match optimizer.run() {
+                            Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                            Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
+                                Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                            }
+                            Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                                "Newton trust-region solver failed: {e:?}"
+                            ))),
+                        }
                     }
                 }
             }

@@ -163,6 +163,7 @@ impl<'a> RemlState<'a> {
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+        let t_outer_start = std::time::Instant::now();
         let rho = theta.slice(s![..rho_dim]).to_owned();
 
         if !hyper_dirs.is_empty() {
@@ -180,12 +181,12 @@ impl<'a> RemlState<'a> {
             let hess = result
                 .hessian
                 .unwrap_or_else(|| Array2::zeros((theta.len(), theta.len())));
-            log::trace!(
-                "[joint-hyper] unified evaluator: cost={:.6e}, grad_norm={:.4e}, hess_dim={}x{}",
+            log::info!(
+                "[outer-timing] compute_joint_hypercostgradienthessian (unified, rho_dim={}, psi_dim={}): {:.3}s  cost={:.6e}",
+                rho_dim,
+                hyper_dirs.len(),
+                t_outer_start.elapsed().as_secs_f64(),
                 cost,
-                grad.iter().map(|g| g * g).sum::<f64>().sqrt(),
-                hess.nrows(),
-                hess.ncols(),
             );
             Ok((cost, grad, hess))
         } else {
@@ -194,6 +195,12 @@ impl<'a> RemlState<'a> {
             let cost = self.compute_cost(&rho)?;
             let grad = self.compute_gradient(&rho)?;
             let hess = self.compute_lamlhessian_consistent(&rho)?;
+            log::info!(
+                "[outer-timing] compute_joint_hypercostgradienthessian (rho-only, dim={}): {:.3}s  cost={:.6e}",
+                rho_dim,
+                t_outer_start.elapsed().as_secs_f64(),
+                cost,
+            );
             Ok((cost, grad, hess))
         }
     }

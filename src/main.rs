@@ -40,7 +40,7 @@ use gam::inference::data::{
     load_datasetwith_schema as load_dataset_auto_with_schema,
 };
 use gam::inference::formula_dsl::{
-    LinkChoice, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
+    LinkChoice, LinkFormulaSpec, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
     effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
     linkchoice_supports_joint_wiggle, linkname, parse_formula, parse_link_choice,
     parse_matching_auxiliary_formula, parse_surv_response, validate_auxiliary_formula_controls,
@@ -1287,12 +1287,6 @@ fn run_fit_bernoulli_marginal_slope(
     if args.firth {
         return Err("--firth is not supported for the bernoulli marginal-slope family".to_string());
     }
-    if parsed.linkspec.is_some() {
-        return Err(
-            "link(...) is not supported for the bernoulli marginal-slope family; the family has a fixed probit base link with optional internal link deviation"
-                .to_string(),
-        );
-    }
     if args.predict_noise.is_some() {
         return Err(
             "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
@@ -1306,6 +1300,10 @@ fn run_fit_bernoulli_marginal_slope(
         .z_column
         .as_ref()
         .ok_or_else(|| "missing --z-column".to_string())?;
+    let base_link = resolve_bernoulli_marginal_slope_base_link(
+        parsed.linkspec.as_ref(),
+        "bernoulli marginal-slope",
+    )?;
     let (logslope_formula, parsed_logslope) = parse_matching_auxiliary_formula(
         logslope_formula_raw,
         &parsed.response,
@@ -1477,6 +1475,7 @@ fn run_fit_bernoulli_marginal_slope(
             solved.baseline_logslope,
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
+            base_link,
             save_frailty,
         );
         model.offset_column = args.offset_column.clone();
@@ -8078,6 +8077,9 @@ fn build_saved_survival_marginal_slope_predictor(
         0.0,
         model.logslope_baseline.unwrap_or(0.0),
         model
+            .resolved_inverse_link()?
+            .unwrap_or(InverseLink::Standard(LinkFunction::Probit)),
+        model
             .family_state
             .frailty()
             .cloned()
@@ -8110,6 +8112,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     baseline_logslope: f64,
     score_warp_runtime: Option<&DeviationRuntime>,
     link_dev_runtime: Option<&DeviationRuntime>,
+    base_link: InverseLink,
     frailty: gam::families::lognormal_kernel::FrailtySpec,
 ) -> SavedModel {
     let mut payload = FittedModelPayload::new(
@@ -8117,7 +8120,8 @@ fn build_bernoulli_marginal_slope_saved_model(
         formula,
         ModelKind::MarginalSlope,
         FittedFamily::MarginalSlope {
-            likelihood: LikelihoodFamily::BinomialProbit,
+            likelihood: inverse_link_to_binomial_family(&base_link),
+            base_link: Some(base_link.clone()),
             frailty,
         },
         FAMILY_BERNOULLI_MARGINAL_SLOPE.to_string(),
@@ -8129,12 +8133,43 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.z_column = Some(z_column);
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
+    payload.link = Some(inverse_link_to_saved_string(&base_link));
     payload.training_headers = Some(training_headers);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_noise = Some(resolved_logslopespec);
     payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
     payload.link_deviation_runtime = link_dev_runtime.map(saved_anchored_deviation_runtime);
     SavedModel::from_payload(payload)
+}
+
+fn resolve_bernoulli_marginal_slope_base_link(
+    linkspec: Option<&LinkFormulaSpec>,
+    context: &str,
+) -> Result<InverseLink, String> {
+    let Some(linkspec) = linkspec else {
+        return Ok(InverseLink::Standard(LinkFunction::Probit));
+    };
+    if linkspec.mixture_rho.is_some() || linkspec.sas_init.is_some() || linkspec.beta_logistic_init.is_some() {
+        return Err(format!(
+            "{context} only implements link(type=probit); stateful/blended marginal-slope links are not wired into the exact family"
+        ));
+    }
+    let choice = parse_link_choice(Some(&linkspec.link), false)?;
+    let Some(choice) = choice else {
+        return Ok(InverseLink::Standard(LinkFunction::Probit));
+    };
+    if choice.mixture_components.is_some() || matches!(choice.mode, LinkMode::Flexible) {
+        return Err(format!(
+            "{context} only implements link(type=probit); blended and flexible marginal-slope links are not wired into the exact family"
+        ));
+    }
+    if choice.link != LinkFunction::Probit {
+        return Err(format!(
+            "{context} only implements link(type=probit); requested link(type={}) is not wired into the exact family yet",
+            linkname(choice.link)
+        ));
+    }
+    Ok(InverseLink::Standard(LinkFunction::Probit))
 }
 
 fn build_transformation_normal_saved_model(
@@ -11142,7 +11177,7 @@ mod tests {
         run_fit(FitArgs {
             data: train_path,
             formula_positional:
-                "y ~ x + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")".to_string(),
+                "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")".to_string(),
             predict_noise: None,
             logslope_formula: Some(
                 "1 + linkwiggle(degree=3, internal_knots=4, penalty_order=\"2\")".to_string(),
@@ -11189,6 +11224,10 @@ mod tests {
         assert!(
             saved.payload().link_deviation_runtime.is_some(),
             "main-formula linkwiggle should persist link-deviation runtime"
+        );
+        assert_eq!(
+            saved.resolved_inverse_link().expect("resolved inverse link"),
+            Some(InverseLink::Standard(LinkFunction::Probit))
         );
     }
 
@@ -12476,6 +12515,25 @@ mod tests {
     }
 
     #[test]
+    fn bernoulli_marginal_slope_accepts_explicit_probit_link_only() {
+        let parsed = parse_formula("y ~ x + link(type=probit)").expect("main formula");
+        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+            "bernoulli marginal-slope",
+        )
+        .expect("explicit probit base link");
+        assert_eq!(resolved, InverseLink::Standard(LinkFunction::Probit));
+
+        let parsed = parse_formula("y ~ x + link(type=logit)").expect("main formula");
+        let err = super::resolve_bernoulli_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+            "bernoulli marginal-slope",
+        )
+        .expect_err("non-probit marginal-slope link should be rejected");
+        assert!(err.contains("only implements link(type=probit)"));
+    }
+
+    #[test]
     fn parse_timewiggle_defaults_to_all_penalty_orders() {
         let parsed =
             parse_formula("Surv(entry, exit, event) ~ timewiggle(degree=4, internal_knots=9)")
@@ -12509,10 +12567,16 @@ mod tests {
             0.0,
             None,
             None,
+            InverseLink::Standard(LinkFunction::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
         );
         assert_eq!(model.payload().marginal_baseline, Some(0.0));
         assert_eq!(model.payload().logslope_baseline, Some(0.0));
+        assert_eq!(model.payload().link.as_deref(), Some("probit"));
+        assert_eq!(
+            model.resolved_inverse_link().expect("resolved inverse link"),
+            Some(InverseLink::Standard(LinkFunction::Probit))
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::mixture_link::{
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
 };
 use crate::probability::standard_normal_quantile;
-use crate::types::InverseLink;
+use crate::types::{InverseLink, LikelihoodFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -820,6 +820,7 @@ pub struct BernoulliMarginalSlopePredictor {
     pub beta_logslope: Array1<f64>,
     pub beta_score_warp: Option<Array1<f64>>,
     pub beta_link_dev: Option<Array1<f64>>,
+    pub base_link: InverseLink,
     pub z_column: String,
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
@@ -830,6 +831,44 @@ pub struct BernoulliMarginalSlopePredictor {
 }
 
 impl BernoulliMarginalSlopePredictor {
+    fn likelihood_family(&self) -> LikelihoodFamily {
+        match &self.base_link {
+            InverseLink::Standard(crate::types::LinkFunction::Logit) => {
+                LikelihoodFamily::BinomialLogit
+            }
+            InverseLink::Standard(crate::types::LinkFunction::Probit) => {
+                LikelihoodFamily::BinomialProbit
+            }
+            InverseLink::Standard(crate::types::LinkFunction::CLogLog) => {
+                LikelihoodFamily::BinomialCLogLog
+            }
+            InverseLink::Standard(crate::types::LinkFunction::Sas) | InverseLink::Sas(_) => {
+                LikelihoodFamily::BinomialSas
+            }
+            InverseLink::Standard(crate::types::LinkFunction::BetaLogistic)
+            | InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
+            InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
+            InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+            InverseLink::Standard(crate::types::LinkFunction::Identity)
+            | InverseLink::Standard(crate::types::LinkFunction::Log) => {
+                LikelihoodFamily::BinomialProbit
+            }
+        }
+    }
+
+    fn mean_from_eta(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        apply_family_inverse_link(eta, self.likelihood_family(), Some(&self.base_link))
+    }
+
+    fn mean_derivative_from_eta(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        let strategy = strategy_for_family(self.likelihood_family(), Some(&self.base_link));
+        Ok(Array1::from_iter(
+            eta.iter()
+                .map(|&value| strategy.inverse_link_jet(value).map(|jet| jet.d1))
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
     fn probit_frailty_scale(&self) -> f64 {
         ProbitFrailtyScale::new(self.gaussian_frailty_sd.unwrap_or(0.0)).s
     }
@@ -999,6 +1038,7 @@ impl BernoulliMarginalSlopePredictor {
         z_column: String,
         baseline_marginal: f64,
         baseline_logslope: f64,
+        base_link: InverseLink,
         frailty: FrailtySpec,
         score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
         link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
@@ -1069,6 +1109,7 @@ impl BernoulliMarginalSlopePredictor {
             beta_logslope: blocks[1].beta.clone(),
             beta_score_warp,
             beta_link_dev,
+            base_link,
             z_column,
             baseline_marginal,
             baseline_logslope,
@@ -1694,7 +1735,7 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         input: &PredictInput,
     ) -> Result<PredictResult, EstimationError> {
         let eta = self.final_eta_from_theta(input, &self.theta())?;
-        let mean = eta.mapv(|v| crate::probability::normal_cdf(v).clamp(0.0, 1.0));
+        let mean = self.mean_from_eta(&eta)?;
         Ok(PredictResult { eta, mean })
     }
 
@@ -1715,7 +1756,7 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
                 )));
             }
             let eta_se = self.eta_standard_error_from_covariance(input, covariance)?;
-            let mean_se = eta_se.clone() * plugin.eta.mapv(crate::probability::normal_pdf);
+            let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&plugin.eta)?;
             (Some(eta_se), Some(mean_se))
         } else {
             (None, None)
@@ -1747,9 +1788,9 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
             .map_err(EstimationError::InvalidInput)?;
         let eta_lower = &plugin.eta - &eta_se.mapv(|s| zcrit * s);
         let eta_upper = &plugin.eta + &eta_se.mapv(|s| zcrit * s);
-        let mean_lower = eta_lower.mapv(|v| crate::probability::normal_cdf(v).clamp(0.0, 1.0));
-        let mean_upper = eta_upper.mapv(|v| crate::probability::normal_cdf(v).clamp(0.0, 1.0));
-        let mean_se = eta_se.clone() * plugin.eta.mapv(crate::probability::normal_pdf);
+        let mean_lower = self.mean_from_eta(&eta_lower)?;
+        let mean_upper = self.mean_from_eta(&eta_upper)?;
+        let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&plugin.eta)?;
         Ok(PredictUncertaintyResult {
             eta: plugin.eta,
             mean: plugin.mean,
@@ -1774,29 +1815,25 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         let plugin = self.predict_plugin_response(input)?;
         let eta_se = self.eta_standard_error(input, fit)?;
+        let strategy = strategy_for_family(self.likelihood_family(), Some(&self.base_link));
+        let quadctx = crate::quadrature::QuadratureContext::new();
         let mean = Array1::from_iter(
             plugin
                 .eta
                 .iter()
                 .zip(eta_se.iter())
-                .map(|(&m, &s)| crate::probability::normal_cdf(m / (1.0 + s * s).sqrt())),
+                .map(|(&eta, &se)| strategy.posterior_mean(&quadctx, eta, se))
+                .collect::<Result<Vec<_>, _>>()?,
         );
-        // Bernoulli marginal-slope eta is probit-scale; TransformEta gives
-        // normal_cdf(eta ± z·se) which matches predict_full_uncertainty.
         let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
             let z = standard_normal_quantile(0.5 + 0.5 * level)
                 .map_err(EstimationError::InvalidInput)?;
-            let lo = plugin
-                .eta
-                .iter()
-                .zip(eta_se.iter())
-                .map(|(&e, &s)| crate::probability::normal_cdf(e - z * s).clamp(0.0, 1.0));
-            let hi = plugin
-                .eta
-                .iter()
-                .zip(eta_se.iter())
-                .map(|(&e, &s)| crate::probability::normal_cdf(e + z * s).clamp(0.0, 1.0));
-            (Some(Array1::from_iter(lo)), Some(Array1::from_iter(hi)))
+            let eta_lower = &plugin.eta - &eta_se.mapv(|s| z * s);
+            let eta_upper = &plugin.eta + &eta_se.mapv(|s| z * s);
+            (
+                Some(self.mean_from_eta(&eta_lower)?),
+                Some(self.mean_from_eta(&eta_upper)?),
+            )
         } else {
             (None, None)
         };
@@ -3841,6 +3878,7 @@ mod tests {
             beta_logslope: array![1.6],
             beta_score_warp: Some(array![0.7, -0.4]),
             beta_link_dev: None,
+            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
             z_column: "z".to_string(),
             baseline_marginal: 0.0,
             baseline_logslope: 0.0,
@@ -3936,6 +3974,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
+            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
             z_column: "z".to_string(),
             baseline_marginal: 0.1,
             baseline_logslope: -0.2,

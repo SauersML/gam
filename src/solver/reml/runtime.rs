@@ -2968,8 +2968,11 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        let t0 = std::time::Instant::now();
         let bundle = self.obtain_eval_bundle(rho)?;
+        let pirls_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+        let t1 = std::time::Instant::now();
         let (ext_coords, ext_pair_fn, rho_ext_pair_fn) = if !hyper_dirs.is_empty() {
             if mode == super::unified::EvalMode::ValueGradientHessian {
                 let (coords, epf, repf) =
@@ -3003,12 +3006,24 @@ impl<'a> RemlState<'a> {
         } else {
             (Vec::new(), None, None)
         };
+        let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
+        let t2 = std::time::Instant::now();
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
         assembly.ext_coords = ext_coords;
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
-        self.assemble_and_evaluate(rho, &bundle, mode, assembly)
+        let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
+        let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        log::info!(
+            "[outer-timing] evaluate_unified_with_psi_ext: PIRLS={:.1}ms  tau_build={:.1}ms  reml_eval={:.1}ms  total={:.1}ms",
+            pirls_ms,
+            tau_build_ms,
+            reml_eval_ms,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        result
     }
 
     /// Compute EFS (Extended Fellner-Schall) evaluation: runs the inner solve

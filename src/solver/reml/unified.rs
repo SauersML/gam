@@ -366,6 +366,17 @@ pub trait HessianDerivativeProvider: Send + Sync {
     fn scalar_glm_ingredients(&self) -> Option<ScalarGlmIngredients<'_>> {
         None
     }
+
+    /// Owned data needed for matrix-free outer Hessian-vector products.
+    ///
+    /// Providers that can express their second-order corrections through an
+    /// owned scalar-GLM kernel or owned callback closures should override
+    /// this so the unified evaluator can return an exact outer Hv operator
+    /// instead of forcing dense materialization.
+    fn outer_hessian_derivative_kernel(&self) -> Option<OuterHessianDerivativeKernel> {
+        self.scalar_glm_ingredients()
+            .map(OuterHessianDerivativeKernel::from_scalar_glm)
+    }
 }
 
 /// Raw ingredients for the adjoint trace optimization in scalar GLMs.
@@ -384,6 +395,31 @@ pub struct ScalarGlmIngredients<'a> {
     pub d_array: Option<&'a Array1<f64>>,
     /// Design matrix X in the transformed basis.
     pub x: &'a DesignMatrix,
+}
+
+#[derive(Clone)]
+pub enum OuterHessianDerivativeKernel {
+    ScalarGlm {
+        c_array: Array1<f64>,
+        d_array: Option<Array1<f64>>,
+        x: DesignMatrix,
+    },
+    Callback {
+        first: Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>,
+        second: Arc<
+            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync,
+        >,
+    },
+}
+
+impl OuterHessianDerivativeKernel {
+    fn from_scalar_glm(ingredients: ScalarGlmIngredients<'_>) -> Self {
+        Self::ScalarGlm {
+            c_array: ingredients.c_array.clone(),
+            d_array: ingredients.d_array.cloned(),
+            x: ingredients.x.clone(),
+        }
+    }
 }
 
 /// Null implementation for Gaussian families (c=d=0).
@@ -1132,7 +1168,7 @@ pub struct HyperCoordDrift {
     /// Block-local penalty contribution (does NOT force dense fallback).
     pub block_local: Option<BlockLocalDrift>,
     /// Implicit operator (fast path).
-    pub operator: Option<Box<dyn HyperOperator>>,
+    pub operator: Option<Arc<dyn HyperOperator>>,
 }
 
 impl HyperCoordDrift {
@@ -1152,7 +1188,7 @@ impl HyperCoordDrift {
         }
     }
 
-    pub fn from_operator(operator: Box<dyn HyperOperator>) -> Self {
+    pub fn from_operator(operator: Arc<dyn HyperOperator>) -> Self {
         Self {
             dense: None,
             block_local: None,
@@ -1162,7 +1198,7 @@ impl HyperCoordDrift {
 
     pub fn from_parts(
         dense: Option<Array2<f64>>,
-        operator: Option<Box<dyn HyperOperator>>,
+        operator: Option<Arc<dyn HyperOperator>>,
     ) -> Self {
         let dense = dense.filter(|mat| !(operator.is_some() && mat.is_empty()));
         Self {
@@ -1176,7 +1212,7 @@ impl HyperCoordDrift {
         local: Array2<f64>,
         start: usize,
         end: usize,
-        operator: Option<Box<dyn HyperOperator>>,
+        operator: Option<Arc<dyn HyperOperator>>,
     ) -> Self {
         Self {
             dense: None,
@@ -1197,7 +1233,7 @@ impl HyperCoordDrift {
     }
 
     pub fn operator_ref(&self) -> Option<&dyn HyperOperator> {
-        self.operator.as_deref()
+        self.operator.as_ref().map(Arc::as_ref)
     }
 
     pub fn materialize(&self) -> Array2<f64> {
@@ -2175,7 +2211,7 @@ pub struct InnerSolution<'dp> {
     /// for non-canonical links. Using expected Fisher H_Fisher = X'W_Fisher X + S
     /// would make this a PQL surrogate rather than the exact Laplace approximation.
     /// See response.md Section 3 for the mathematical justification.
-    pub hessian_op: Box<dyn HessianOperator>,
+    pub hessian_op: Arc<dyn HessianOperator>,
 
     // === Coefficients and penalty structure ===
     /// β̂ — coefficients at the converged mode (in the operator's native basis).
@@ -2261,7 +2297,7 @@ pub struct InnerSolutionBuilder<'dp> {
     // Required fields
     log_likelihood: f64,
     penalty_quadratic: f64,
-    hessian_op: Box<dyn HessianOperator>,
+    hessian_op: Arc<dyn HessianOperator>,
     beta: Array1<f64>,
     penalty_coords: Vec<PenaltyCoordinate>,
     penalty_logdet: PenaltyLogdetDerivs,
@@ -2290,7 +2326,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         penalty_quadratic: f64,
         beta: Array1<f64>,
         n_observations: usize,
-        hessian_op: Box<dyn HessianOperator>,
+        hessian_op: Arc<dyn HessianOperator>,
         penalty_coords: Vec<PenaltyCoordinate>,
         penalty_logdet: PenaltyLogdetDerivs,
         dispersion: DispersionHandling,
@@ -2441,7 +2477,7 @@ pub struct RemlLamlResult {
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,
     /// Outer Hessian ∂²V/∂ρ² (present if mode = ValueGradientHessian).
-    pub hessian: Option<Array2<f64>>,
+    pub hessian: crate::solver::outer_strategy::HessianResult,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2775,7 +2811,7 @@ pub fn reml_laml_evaluate(
         return Ok(RemlLamlResult {
             cost,
             gradient: None,
-            hessian: None,
+            hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
         });
     }
 
@@ -3139,15 +3175,29 @@ pub fn reml_laml_evaluate(
 
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
-        let mut h = compute_outer_hessian(solution, rho, &lambdas, hop, effective_deriv)?;
-        // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
-        if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
-            let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
-            sl += ph;
+        let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
+        let use_operator = hop.dim() >= 512 && hessian_kernel.is_some();
+        if use_operator {
+            crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
+                build_outer_hessian_operator(
+                    solution,
+                    rho,
+                    &lambdas,
+                    effective_deriv,
+                    hessian_kernel.expect("checked is_some above"),
+                )?,
+            ))
+        } else {
+            let mut h = compute_outer_hessian(solution, rho, &lambdas, hop, effective_deriv)?;
+            // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
+            if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
+                let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
+                sl += ph;
+            }
+            crate::solver::outer_strategy::HessianResult::Analytic(h)
         }
-        Some(h)
     } else {
-        None
+        crate::solver::outer_strategy::HessianResult::Unavailable
     };
 
     Ok(RemlLamlResult {
