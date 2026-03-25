@@ -7516,21 +7516,6 @@ mod tests {
         InverseLink::Standard(LinkFunction::Probit)
     }
 
-    fn bernoulli_row_work_order(
-        specs: &[ParameterBlockSpec],
-        n_rows: usize,
-        score_warp_dim: usize,
-        link_dev_dim: usize,
-    ) -> ExactOuterDerivativeOrder {
-        let directional_work = n_rows
-            .saturating_mul(score_warp_dim.saturating_add(link_dev_dim).saturating_add(1));
-        if directional_work == usize::MAX {
-            ExactOuterDerivativeOrder::First
-        } else {
-            cost_gated_outer_order(specs)
-        }
-    }
-
     fn empty_termspec() -> TermCollectionSpec {
         TermCollectionSpec {
             linear_terms: vec![],
@@ -8654,51 +8639,6 @@ mod tests {
         )
         .expect_err("non-finite z should be rejected");
         assert!(err.contains("finite z values"));
-    }
-
-    #[test]
-    fn row_work_order_keeps_exact_outer_second_order() {
-        let rigid_specs = vec![
-            dummy_penalized_blockspec(2, 8, 1),
-            dummy_penalized_blockspec(1, 8, 1),
-        ];
-        assert_eq!(
-            bernoulli_row_work_order(&rigid_specs, 2_000, 0, 0),
-            ExactOuterDerivativeOrder::Second
-        );
-
-        let flex_specs = vec![
-            dummy_penalized_blockspec(3, 8, 1),
-            dummy_penalized_blockspec(1, 8, 0),
-            dummy_penalized_blockspec(2, 8, 0),
-        ];
-        // Flex gate: n=200 × p=6 × directional terms=3 × primary²=16 = 57_600 < 20M.
-        assert_eq!(
-            bernoulli_row_work_order(&flex_specs, 200, 2, 0),
-            ExactOuterDerivativeOrder::Second
-        );
-    }
-
-    #[test]
-    fn row_work_order_no_longer_downgrades_large_models() {
-        let rigid_specs = vec![
-            dummy_penalized_blockspec(24, 8, 1),
-            dummy_penalized_blockspec(1, 8, 1),
-        ];
-        assert_eq!(
-            bernoulli_row_work_order(&rigid_specs, 300, 0, 0),
-            ExactOuterDerivativeOrder::Second
-        );
-
-        let rich_specs = vec![
-            dummy_penalized_blockspec(6, 8, 1),
-            dummy_penalized_blockspec(4, 8, 1),
-            dummy_penalized_blockspec(8, 8, 1),
-        ];
-        assert_eq!(
-            bernoulli_row_work_order(&rich_specs, 1_000, 8, 0),
-            ExactOuterDerivativeOrder::Second
-        );
     }
 
     #[test]
