@@ -186,7 +186,7 @@ fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
             &array![rho],
             &derivative_blocks,
             None,
-            false,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
         )
         .expect("pseudo-laplace rho hyper eval");
         let (value_nd, grad_nd) = first_derivative(
@@ -256,7 +256,7 @@ fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
             &Array1::zeros(0),
             &derivative_blocks,
             None,
-            false,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
         )
         .expect("pseudo-laplace psi hyper eval");
         let (value_nd, grad_nd) = first_derivative(scalar_pseudo_laplace_psiobjective_numdual, psi);
