@@ -1291,9 +1291,9 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
-    if parsed.linkwiggle.is_some() && args.disable_link_dev {
+    if parsed.linkwiggle.is_some() && args.disable_link_dev && args.disable_score_warp {
         return Err(
-            "linkwiggle(...) routes into the bernoulli marginal-slope link-deviation block; remove --disable-link-dev or drop linkwiggle(...)"
+            "linkwiggle(...) routes into the bernoulli marginal-slope score-warp and link-deviation blocks; cannot disable both simultaneously"
                 .to_string(),
         );
     }
@@ -1371,23 +1371,29 @@ fn run_fit_bernoulli_marginal_slope(
         &fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?,
         "bernoulli marginal-slope",
     )?;
-    let routed_link_dev = parsed
-        .linkwiggle
-        .as_ref()
-        .map(deviation_block_config_from_formula_linkwiggle);
-    if args.disable_score_warp {
-        return Err(
-            "--disable-score-warp is no longer supported; bernoulli marginal-slope linkwiggle(...) only creates the anchored link-deviation block"
-                .to_string(),
-        );
-    }
-    let requested_flex = routed_link_dev.is_some();
+    let routed_link_dev = if args.disable_link_dev {
+        None
+    } else {
+        parsed
+            .linkwiggle
+            .as_ref()
+            .map(deviation_block_config_from_formula_linkwiggle)
+    };
+    let routed_score_warp = if args.disable_score_warp {
+        None
+    } else {
+        parsed
+            .linkwiggle
+            .as_ref()
+            .map(deviation_block_config_from_formula_linkwiggle)
+    };
+    let requested_flex = routed_link_dev.is_some() || routed_score_warp.is_some();
     inference_notes.push(
         "bernoulli marginal-slope expects z to already be PIT-probit standardized to latent N(0,1) upstream".to_string(),
     );
     if parsed.linkwiggle.is_some() {
         inference_notes.push(
-            "bernoulli marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the fixed probit base link"
+            "bernoulli marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation and score-warp blocks while keeping the fixed probit base link"
                 .to_string(),
         );
     }
@@ -1420,7 +1426,7 @@ fn run_fit_bernoulli_marginal_slope(
                 marginal_offset,
                 logslope_offset,
                 frailty: frailty.clone(),
-                score_warp: None,
+                score_warp: routed_score_warp,
                 link_dev: routed_link_dev,
             },
             options,
@@ -5058,16 +5064,28 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             .ok_or_else(|| format!("z column '{z_column_name}' not found"))?;
         let z = ds.values.column(z_col).to_owned();
 
-        let routed_link_dev = parsed
-            .linkwiggle
-            .as_ref()
-            .map(deviation_block_config_from_formula_linkwiggle);
+        let routed_link_dev = if args.disable_link_dev {
+            None
+        } else {
+            parsed
+                .linkwiggle
+                .as_ref()
+                .map(deviation_block_config_from_formula_linkwiggle)
+        };
+        let routed_score_warp = if args.disable_score_warp {
+            None
+        } else {
+            parsed
+                .linkwiggle
+                .as_ref()
+                .map(deviation_block_config_from_formula_linkwiggle)
+        };
         if parsed.linkwiggle.is_some() {
             inference_notes.push(
-                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
+                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation and score-warp blocks while keeping the probit survival base link".to_string(),
             );
         }
-        if routed_link_dev.is_none() {
+        if routed_link_dev.is_none() && routed_score_warp.is_none() {
             inference_notes.push(
                 "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
             );
@@ -5124,7 +5142,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             timewiggle_block: prepared.timewiggle_block.clone(),
             logslopespec: logslopespec.clone(),
             logslope_offset: log_sigma_offset.clone(),
-            score_warp: None,
+            score_warp: routed_score_warp.clone(),
             link_dev: routed_link_dev.clone(),
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {

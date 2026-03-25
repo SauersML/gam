@@ -2363,6 +2363,14 @@ def _dataset_for_scenario_unvalidated(s):
             noise_scale_min=s.get("noise_scale_min", 0.25),
             noise_scale_max=s.get("noise_scale_max", 0.85),
         )
+    if name.startswith("geo_subpop16_margslope_aniso_duchon16d_"):
+        return _geo_subpop16_randomprev_randomscale_dataset(
+            seed=s.get("seed", 20260702),
+            prevalence_min=s.get("prevalence_min", 0.02),
+            prevalence_max=s.get("prevalence_max", 0.40),
+            noise_scale_min=s.get("noise_scale_min", 0.25),
+            noise_scale_max=s.get("noise_scale_max", 0.85),
+        )
     if name.startswith("geo_subpop16_"):
         return _geo_subpop16_dataset(
             seed=s.get("seed", 20260330),
@@ -3025,6 +3033,22 @@ def _scenario_fit_mapping(scenario_name):
             smooth_basis="duchon",
             linear_cols=[],
             knots=50,
+        ),
+        "geo_subpop16_margslope_aniso_duchon16d_k50": dict(
+            family="binomial-logit",
+            smooth_cols=[f"pc{i}" for i in range(1, 17)],
+            smooth_basis="duchon",
+            linear_cols=[],
+            knots=50,
+            scale_dimensions=True,
+        ),
+        "geo_subpop16_margslope_aniso_duchon16d_k50_biobank": dict(
+            family="binomial-logit",
+            smooth_cols=[f"pc{i}" for i in range(1, 17)],
+            smooth_basis="duchon",
+            linear_cols=[],
+            knots=50,
+            scale_dimensions=True,
         ),
         "continuous_order_fractional_spde_nu18": dict(
             family="gaussian",
@@ -4429,6 +4453,7 @@ def run_rust_gamlss_marginal_slope_cv(
     contender_name: str = "rust_gamlss_marginal_slope",
     ds: dict | None = None,
     folds: list[Fold] | None = None,
+    rust_fit_extra_args: list[str] | None = None,
 ):
     scenario_name = scenario["name"]
     if _scenario_fit_mapping(scenario_name) is None:
@@ -4490,9 +4515,10 @@ def run_rust_gamlss_marginal_slope_cv(
                 z_column,
                 "--out",
                 str(model_path),
-                str(train_path),
-                mean_formula,
             ]
+            if rust_fit_extra_args:
+                fit_cmd.extend([str(x) for x in rust_fit_extra_args])
+            fit_cmd.extend([str(train_path), mean_formula])
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)
             fit_sec = perf_counter() - t0
@@ -8049,11 +8075,22 @@ def main():
                 if ds["family"] == "binomial" and _is_contender_enabled(
                     s_cfg, "rust_gamlss_marginal_slope"
                 ):
+                    _ms_cfg = _effective_scenario_fit_mapping(scenario_name) or {}
+                    _ms_extra = (
+                        ["--scale-dimensions"] if _ms_cfg.get("scale_dimensions") else None
+                    )
+                    _ms_contender = (
+                        "rust_gamlss_marginal_slope_aniso"
+                        if _ms_cfg.get("scale_dimensions")
+                        else "rust_gamlss_marginal_slope"
+                    )
                     results.append(
                         run_rust_gamlss_marginal_slope_cv(
                             s_cfg,
+                            contender_name=_ms_contender,
                             ds=ds,
                             folds=folds,
+                            rust_fit_extra_args=_ms_extra,
                         )
                     )
             rust_gamlss_surv_row = (
