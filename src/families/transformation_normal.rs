@@ -27,7 +27,8 @@ use crate::families::custom_family::{
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper, fit_custom_family,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -2698,7 +2699,11 @@ pub fn fit_transformation_normal(
                 rho,
                 &derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
-                need_hessian,
+                if need_hessian {
+                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                } else {
+                    crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+                },
             )
             .map_err(|e| format!("transformation exact_fn: {e}"))?;
 
@@ -2712,6 +2717,29 @@ pub fn fit_transformation_normal(
             }
 
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
+        },
+        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let family = make_family(&designs[0])?;
+            let blocks = make_blocks(&family);
+            let cov_psi_derivs =
+                build_block_spatial_psi_derivatives(covariate_data, &specs[0], &designs[0])?
+                    .ok_or_else(|| {
+                        "missing covariate spatial psi derivatives for transformation model"
+                            .to_string()
+                    })?;
+            let tensor_derivs = build_tensor_psi_derivatives(&family, &cov_psi_derivs)?;
+            let derivative_blocks = vec![tensor_derivs];
+            let eval = evaluate_custom_family_joint_hyper_efs(
+                &family,
+                &blocks,
+                &options,
+                rho,
+                &derivative_blocks,
+                exact_warm_start.borrow().as_ref(),
+            )
+            .map_err(|e| format!("transformation exact_efs_fn: {e}"))?;
+            exact_warm_start.replace(Some(eval.warm_start));
+            Ok(eval.efs_eval)
         },
     )?;
 

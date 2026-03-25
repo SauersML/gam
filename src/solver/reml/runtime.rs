@@ -7,7 +7,7 @@ use crate::linalg::utils::{boundary_hit_indices, symmetric_spectrum_condition_nu
 use crate::pirls::PirlsWorkspace;
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const TK_BLOCK_SIZE: usize = 128;
 const TK_MAX_OBSERVATIONS: usize = 20_000;
@@ -1024,7 +1024,7 @@ impl<'a> RemlState<'a> {
             offset,
             Arc::new(canonical_penalties),
             p,
-            config,
+            Arc::new(config.clone()),
             nullspace_dims,
             coefficient_lower_bounds,
             linear_constraints,
@@ -1038,7 +1038,7 @@ impl<'a> RemlState<'a> {
         offset: ArrayView1<'_, f64>,
         canonical_penalties: Arc<Vec<crate::construction::CanonicalPenalty>>,
         p: usize,
-        config: &'a RemlConfig,
+        config: Arc<RemlConfig>,
         nullspace_dims: Option<Vec<usize>>,
         coefficient_lower_bounds: Option<Array1<f64>>,
         linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
@@ -1072,6 +1072,9 @@ impl<'a> RemlState<'a> {
             build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
                 .map(Arc::new);
 
+        let runtime_mixture_link_state = config.link_kind.mixture_state().cloned();
+        let runtime_sas_link_state = config.link_kind.sas_state().copied();
+
         Ok(Self {
             y,
             x,
@@ -1083,8 +1086,8 @@ impl<'a> RemlState<'a> {
             sparse_penalty_blocks,
             p,
             config,
-            runtime_mixture_link_state: config.link_kind.mixture_state().cloned(),
-            runtime_sas_link_state: config.link_kind.sas_state().copied(),
+            runtime_mixture_link_state,
+            runtime_sas_link_state,
             nullspace_dims,
             coefficient_lower_bounds,
             linear_constraints,
@@ -1097,6 +1100,53 @@ impl<'a> RemlState<'a> {
             kronecker_penalty_system: None,
             kronecker_factored: None,
         })
+    }
+
+    pub(crate) fn reset_surface<X>(
+        &mut self,
+        x: X,
+        canonical_penalties: Arc<Vec<crate::construction::CanonicalPenalty>>,
+        p: usize,
+        nullspace_dims: Vec<usize>,
+        coefficient_lower_bounds: Option<Array1<f64>>,
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
+        kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
+    ) -> Result<(), EstimationError>
+    where
+        X: Into<DesignMatrix>,
+    {
+        let expected_len = canonical_penalties.len();
+        if nullspace_dims.len() != expected_len {
+            return Err(EstimationError::InvalidInput(format!(
+                "nullspace_dims length {} does not match penalties {}",
+                nullspace_dims.len(),
+                expected_len
+            )));
+        }
+
+        let balanced_penalty_root =
+            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
+        let reparam_invariant =
+            precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
+        let sparse_penalty_blocks =
+            build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
+                .map(Arc::new);
+
+        self.x = x.into();
+        self.canonical_penalties = canonical_penalties;
+        self.balanced_penalty_root = balanced_penalty_root;
+        self.reparam_invariant = reparam_invariant;
+        self.sparse_penalty_blocks = sparse_penalty_blocks;
+        self.p = p;
+        self.nullspace_dims = nullspace_dims;
+        self.coefficient_lower_bounds = coefficient_lower_bounds;
+        self.linear_constraints = linear_constraints;
+        self.kronecker_penalty_system = kronecker_penalty_system;
+        self.kronecker_factored = kronecker_factored;
+        self.cache_manager.clear_eval_and_factor_caches();
+        self.cache_manager.pirls_cache.write().unwrap().clear();
+        Ok(())
     }
 
     /// Inject Kronecker penalty system metadata for tensor-product smooth terms.
@@ -1462,6 +1512,11 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    pub(crate) fn reset_outer_seed_state(&self) {
+        self.cache_manager.invalidate_eval_bundle();
+        self.warm_start_beta.write().unwrap().take();
+    }
+
     // Accessor methods for private fields
     pub(crate) fn x(&self) -> &DesignMatrix {
         &self.x
@@ -1743,12 +1798,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<Arc<PirlsResult>, EstimationError> {
-        let screening_active = self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0;
-        let use_cache = !screening_active
-            && self
-                .cache_manager
-                .pirls_cache_enabled
-                .load(Ordering::Relaxed);
+        let use_cache = self
+            .cache_manager
+            .pirls_cache_enabled
+            .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
         let key_opt = self.rhokey_sanitized(rho);
         if use_cache
@@ -1794,10 +1847,9 @@ impl<'a> RemlState<'a> {
                 None
             };
             let mut pirls_config = self.config.as_pirls_config();
-            // Apply screening cap when active (seed screening uses cheap partial PIRLS).
-            let screen_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
-            if screen_cap > 0 {
-                pirls_config.max_iterations = pirls_config.max_iterations.min(screen_cap);
+            let screening_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
+            if screening_cap > 0 {
+                pirls_config.max_iterations = pirls_config.max_iterations.min(screening_cap);
             }
             pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
                 InverseLink::Mixture(state)
@@ -1836,10 +1888,9 @@ impl<'a> RemlState<'a> {
                 warm_start_ref,
             );
             let pirls_elapsed = pirls_start.elapsed();
-            let screen_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
             if let Ok((ref res, ref wm)) = result {
                 log::info!(
-                    "[PIRLS-timing] iters={} status={:?} max_eta={:.1} jeffreys_logdet={} elapsed={:.3}s screening={}",
+                    "[PIRLS-timing] iters={} status={:?} max_eta={:.1} jeffreys_logdet={} elapsed={:.3}s",
                     wm.iterations,
                     res.status,
                     res.max_abs_eta,
@@ -1847,11 +1898,6 @@ impl<'a> RemlState<'a> {
                         .map(|v| format!("{v:.3e}"))
                         .unwrap_or_else(|| "none".to_string()),
                     pirls_elapsed.as_secs_f64(),
-                    if screen_cap > 0 {
-                        format!("cap={screen_cap}")
-                    } else {
-                        "off".to_string()
-                    },
                 );
             }
             result

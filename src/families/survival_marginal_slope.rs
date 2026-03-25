@@ -4,8 +4,9 @@ use crate::custom_family::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, build_block_spatial_psi_derivatives, cost_gated_outer_order,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper, first_psi_linear_map,
-    fit_custom_family, second_psi_linear_map, slice_joint_into_block_working_sets,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
+    second_psi_linear_map, slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
@@ -12212,7 +12213,11 @@ pub fn fit_survival_marginal_slope_terms(
                     rho,
                     &derivative_blocks,
                     exact_warm_start.borrow().as_ref(),
-                    need_hessian,
+                    if need_hessian {
+                        crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                    } else {
+                        crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+                    },
                 )?;
                 exact_warm_start.replace(Some(eval.warm_start));
                 if need_hessian && !eval.outer_hessian.is_analytic() {
@@ -12222,6 +12227,33 @@ pub fn fit_survival_marginal_slope_terms(
                     );
                 }
                 Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            },
+            |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                let blocks = build_blocks(rho, &designs[0], &designs[1])?;
+                let family = make_family(&designs[0], &designs[1], current_sigma.get());
+                let mut derivative_blocks = vec![
+                    Vec::new(),
+                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?
+                        .unwrap_or_default(),
+                    build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?
+                        .unwrap_or_default(),
+                ];
+                if family.score_warp.is_some() {
+                    derivative_blocks.push(Vec::new());
+                }
+                if family.link_dev.is_some() {
+                    derivative_blocks.push(Vec::new());
+                }
+                let eval = evaluate_custom_family_joint_hyper_efs(
+                    &family,
+                    &blocks,
+                    options,
+                    rho,
+                    &derivative_blocks,
+                    exact_warm_start.borrow().as_ref(),
+                )?;
+                exact_warm_start.replace(Some(eval.warm_start));
+                Ok(eval.efs_eval)
             },
         )
     };

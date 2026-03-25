@@ -1483,6 +1483,302 @@ fn validate_penalty_specs(
     Ok(())
 }
 
+fn validate_joint_hyper_direction_shapes(
+    x: &DesignMatrix,
+    canonical_len: usize,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    hyper_dirs: &[DirectionalHyperParam],
+) -> Result<(), EstimationError> {
+    if rho_dim > theta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho_dim {} exceeds theta dimension {}",
+            rho_dim,
+            theta.len()
+        )));
+    }
+
+    let p = x.ncols();
+    let psi_dim = theta.len() - rho_dim;
+    if hyper_dirs.len() != psi_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "joint hyper-gradient derivative count mismatch: psi_dim={}, hyper_dirs={}",
+            psi_dim,
+            hyper_dirs.len()
+        )));
+    }
+
+    for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
+        for component in hyper_dir.penalty_first_components() {
+            if component.penalty_index >= canonical_len {
+                return Err(EstimationError::InvalidInput(format!(
+                    "penalty_index for dir {idx} out of bounds: {} >= {}",
+                    component.penalty_index, canonical_len
+                )));
+            }
+        }
+        if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "X_tau[{idx}] must be {}x{}, got {}x{}",
+                x.nrows(),
+                p,
+                hyper_dir.x_tau_original.nrows(),
+                hyper_dir.x_tau_original.ncols()
+            )));
+        }
+        RemlState::validate_penalty_component_shapes(
+            hyper_dir.penalty_first_components(),
+            p,
+            &format!("S_tau[{idx}]"),
+        )?;
+        if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
+            if x2.len() != psi_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "X_tau_tau[{idx}] length mismatch: expected {}, got {}",
+                    psi_dim,
+                    x2.len()
+                )));
+            }
+            for (j, x_ij) in x2.iter().enumerate() {
+                let Some(x_ij) = x_ij.as_ref() else {
+                    continue;
+                };
+                if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
+                        x.nrows(),
+                        p,
+                        x_ij.nrows(),
+                        x_ij.ncols()
+                    )));
+                }
+            }
+        }
+        if let Some(s2) = hyper_dir.penaltysecond_componentrows() {
+            if s2.len() != psi_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
+                    psi_dim,
+                    s2.len()
+                )));
+            }
+            for (j, components) in s2.iter().enumerate() {
+                let Some(components) = components.as_ref() else {
+                    continue;
+                };
+                RemlState::validate_penalty_component_shapes(
+                    components,
+                    p,
+                    &format!("S_tau_tau[{idx}][{j}]"),
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) struct ExternalJointHyperEvaluator<'a> {
+    conditioning: ParametricColumnConditioning,
+    config: Arc<RemlConfig>,
+    penalty_shrinkage_floor: Option<f64>,
+    kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
+    kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
+    reml_state: RemlState<'a>,
+}
+
+impl<'a> ExternalJointHyperEvaluator<'a> {
+    pub(crate) fn new(
+        y: ArrayView1<'a, f64>,
+        w: ArrayView1<'a, f64>,
+        x: &DesignMatrix,
+        offset: ArrayView1<'_, f64>,
+        s_list: &[BlockwisePenalty],
+        opts: &ExternalOptimOptions,
+        context: &str,
+    ) -> Result<Self, EstimationError> {
+        if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+            return Err(EstimationError::InvalidInput(message));
+        }
+
+        let p = x.ncols();
+        let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
+        validate_penalty_specs(&specs, p, context)?;
+        let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
+            &specs,
+            &opts.nullspace_dims,
+            p,
+            context,
+        )?;
+        let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(x, &specs);
+        let x_fit = conditioning.apply_to_design(x);
+        let fit_linear_constraints =
+            conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
+        let (config, _) = resolved_external_config(opts)?;
+        let config = Arc::new(config);
+
+        let mut reml_state = RemlState::newwith_offset_shared(
+            y,
+            x_fit,
+            w,
+            offset,
+            Arc::new(canonical),
+            p,
+            Arc::clone(&config),
+            Some(active_nullspace_dims.clone()),
+            None,
+            fit_linear_constraints.clone(),
+        )?;
+        reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
+        reml_state.set_link_states(
+            config.link_kind.mixture_state().cloned(),
+            config.link_kind.sas_state().copied(),
+        );
+        if let Some(kron) = opts.kronecker_penalty_system.clone() {
+            reml_state.set_kronecker_penalty_system(kron);
+        }
+        if let Some(kf) = opts.kronecker_factored.clone() {
+            reml_state.set_kronecker_factored(kf);
+        }
+
+        Ok(Self {
+            conditioning,
+            config,
+            penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+            kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
+            kronecker_factored: opts.kronecker_factored.clone(),
+            reml_state,
+        })
+    }
+
+    fn prepare_eval_state(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        mut hyper_dirs: Vec<DirectionalHyperParam>,
+        warm_start_beta: Option<ArrayView1<'_, f64>>,
+        context: &str,
+    ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
+        let p = x.ncols();
+        let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
+        validate_penalty_specs(&specs, p, context)?;
+        let (canonical, active_nullspace_dims) =
+            crate::construction::canonicalize_penalty_specs(&specs, nullspace_dims, p, context)?;
+        validate_joint_hyper_direction_shapes(x, canonical.len(), theta, rho_dim, &hyper_dirs)?;
+
+        let x_fit = self.conditioning.apply_to_design(x);
+        let fit_linear_constraints = self
+            .conditioning
+            .transform_linear_constraints_to_internal(linear_constraints);
+
+        for dir in &mut hyper_dirs {
+            let mut x_tau = dir.x_tau_dense();
+            self.conditioning
+                .transform_matrix_columnswith_a_inplace(&mut x_tau);
+            dir.x_tau_original = crate::estimate::reml::HyperDesignDerivative::from(x_tau);
+            if let Some(rows) = dir.x_tau_tau_original.as_mut() {
+                for mat in rows.iter_mut().flatten() {
+                    let mut dense = mat.materialize();
+                    self.conditioning
+                        .transform_matrix_columnswith_a_inplace(&mut dense);
+                    *mat = crate::estimate::reml::HyperDesignDerivative::from(dense);
+                }
+            }
+        }
+
+        let has_design_drift = hyper_dirs
+            .iter()
+            .any(|dir| dir.x_tau_original.any_nonzero());
+        ensure_exact_directional_hyper_supported(
+            self.config.link_function(),
+            self.config.firth_bias_reduction,
+            has_design_drift,
+            context,
+        )?;
+
+        self.reml_state.reset_surface(
+            x_fit,
+            Arc::new(canonical),
+            p,
+            active_nullspace_dims,
+            None,
+            fit_linear_constraints,
+            self.kronecker_penalty_system.clone(),
+            self.kronecker_factored.clone(),
+        )?;
+        self.reml_state
+            .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
+        self.reml_state.setwarm_start_original_beta(warm_start_beta);
+        Ok(hyper_dirs)
+    }
+
+    pub(crate) fn evaluate(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        hyper_dirs: Vec<DirectionalHyperParam>,
+        warm_start_beta: Option<ArrayView1<'_, f64>>,
+        context: &str,
+    ) -> Result<
+        (
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        ),
+        EstimationError,
+    > {
+        let hyper_dirs = self.prepare_eval_state(
+            x,
+            s_list,
+            nullspace_dims,
+            linear_constraints,
+            theta,
+            rho_dim,
+            hyper_dirs,
+            warm_start_beta,
+            context,
+        )?;
+        self.reml_state
+            .compute_joint_hyper_eval(theta, rho_dim, &hyper_dirs)
+    }
+
+    pub(crate) fn evaluate_efs(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        hyper_dirs: Vec<DirectionalHyperParam>,
+        warm_start_beta: Option<ArrayView1<'_, f64>>,
+        context: &str,
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+        let hyper_dirs = self.prepare_eval_state(
+            x,
+            s_list,
+            nullspace_dims,
+            linear_constraints,
+            theta,
+            rho_dim,
+            hyper_dirs,
+            warm_start_beta,
+            context,
+        )?;
+        let rho = theta.slice(s![..rho_dim]).to_owned();
+        self.reml_state
+            .compute_efs_steps_with_psi_ext(&rho, &hyper_dirs)
+    }
+}
+
 // canonicalize_active_penalties removed — replaced by
 // crate::construction::canonicalize_penalty_specs.
 
@@ -1584,6 +1880,7 @@ where
     let x_o = x;
     let offset_o = offset.to_owned();
     let canonical_shared = Arc::new(canonical);
+    let cfg_shared = Arc::new(cfg.clone());
     let mut reml_state = RemlState::newwith_offset_shared(
         y_o.view(),
         x_fit,
@@ -1591,7 +1888,7 @@ where
         offset_o.view(),
         Arc::clone(&canonical_shared),
         p,
-        &cfg,
+        Arc::clone(&cfg_shared),
         Some(active_nullspace_dims.clone()),
         None,
         fit_linear_constraints.clone(),
@@ -1614,17 +1911,13 @@ where
         } else {
             12
         },
-        screening_budget: if k <= 6 { 2 } else { 3 },
-        screen_max_inner_iterations: if matches!(cfg.link_function(), LinkFunction::Identity) {
-            3
-        } else {
-            5
-        },
+        seed_budget: if k <= 6 { 2 } else { 3 },
         risk_profile: if matches!(cfg.link_function(), LinkFunction::Identity) {
             SeedRiskProfile::Gaussian
         } else {
             SeedRiskProfile::GeneralizedLinear
         },
+        screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
         num_auxiliary_trailing: 0,
     };
     let reml_tol = cfg.reml_convergence_tolerance;
@@ -1674,8 +1967,8 @@ where
             .with_max_iter(reml_max_iter)
             .with_fd_step(1e-3)
             .with_seed_config(reml_seed_config.clone())
-            .with_rho_bound(crate::estimate::RHO_BOUND)
-            .with_screening_cap(reml_state.screening_max_inner_iterations.clone());
+            .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
+            .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(ref h) = heuristic_lambdas {
             problem.with_heuristic_lambdas(h.to_vec())
         } else {
@@ -1699,7 +1992,7 @@ where
                     },
                 })
             },
-            None::<fn(&mut &mut self::reml::RemlState<'_>)>,
+            Some(|state: &mut &mut self::reml::RemlState<'_>| state.reset_outer_seed_state()),
             Some(
                 |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                     state.compute_efs_steps(rho)
@@ -1771,8 +2064,8 @@ where
             .with_max_iter(reml_max_iter)
             .with_fd_step(1e-3)
             .with_seed_config(reml_seed_config_mix.clone())
-            .with_rho_bound(crate::estimate::RHO_BOUND)
-            .with_screening_cap(reml_state.screening_max_inner_iterations.clone());
+            .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
+            .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(h) = heuristic_theta_ref {
             problem.with_heuristic_lambdas(h.to_vec())
         } else {
@@ -1917,6 +2210,7 @@ where
                 })
             },
             Some(|state: &mut &mut self::reml::RemlState<'_>| {
+                state.reset_outer_seed_state();
                 state.set_link_states(
                     initial_link_kind.mixture_state().cloned(),
                     initial_link_kind.sas_state().copied(),
@@ -2648,295 +2942,6 @@ where
         },
     };
     Ok(conditioning.backtransform_external_result(result))
-}
-
-fn validate_and_build_reml_state<X, T, F>(
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    x: X,
-    offset: ArrayView1<'_, f64>,
-    s_list: Vec<PenaltySpec>,
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    mut hyper_dirs: Vec<DirectionalHyperParam>,
-    warm_start_beta: Option<ArrayView1<'_, f64>>,
-    opts: &ExternalOptimOptions,
-    context: &str,
-    eval: F,
-) -> Result<T, EstimationError>
-where
-    X: Into<DesignMatrix>,
-    F: for<'a> FnOnce(&RemlState<'a>, &[DirectionalHyperParam]) -> Result<T, EstimationError>,
-{
-    let x = x.into();
-    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
-        return Err(EstimationError::InvalidInput(message));
-    }
-    if rho_dim > theta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "rho_dim {} exceeds theta dimension {}",
-            rho_dim,
-            theta.len()
-        )));
-    }
-    let p = x.ncols();
-    validate_penalty_specs(&s_list, p, context)?;
-    let (canonical, active_nullspace_dims) =
-        crate::construction::canonicalize_penalty_specs(&s_list, &opts.nullspace_dims, p, context)?;
-    if rho_dim != active_nullspace_dims.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "rho_dim mismatch: rho_dim={}, active_penalties={}",
-            rho_dim,
-            active_nullspace_dims.len()
-        )));
-    }
-    let psi_dim = theta.len() - rho_dim;
-    if hyper_dirs.len() != psi_dim {
-        return Err(EstimationError::InvalidInput(format!(
-            "joint hyper-gradient derivative count mismatch: psi_dim={}, hyper_dirs={}",
-            psi_dim,
-            hyper_dirs.len()
-        )));
-    }
-    for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
-        for component in hyper_dir.penalty_first_components() {
-            if component.penalty_index >= canonical.len() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "penalty_index for dir {idx} out of bounds: {} >= {}",
-                    component.penalty_index,
-                    canonical.len()
-                )));
-            }
-        }
-        if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "X_tau[{idx}] must be {}x{}, got {}x{}",
-                x.nrows(),
-                p,
-                hyper_dir.x_tau_original.nrows(),
-                hyper_dir.x_tau_original.ncols()
-            )));
-        }
-        RemlState::validate_penalty_component_shapes(
-            hyper_dir.penalty_first_components(),
-            p,
-            &format!("S_tau[{idx}]"),
-        )?;
-        if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
-            if x2.len() != psi_dim {
-                return Err(EstimationError::InvalidInput(format!(
-                    "X_tau_tau[{idx}] length mismatch: expected {}, got {}",
-                    psi_dim,
-                    x2.len()
-                )));
-            }
-            for (j, x_ij) in x2.iter().enumerate() {
-                let Some(x_ij) = x_ij.as_ref() else {
-                    continue;
-                };
-                if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
-                        x.nrows(),
-                        p,
-                        x_ij.nrows(),
-                        x_ij.ncols()
-                    )));
-                }
-            }
-        }
-        if let Some(s2) = hyper_dir.penaltysecond_componentrows() {
-            if s2.len() != psi_dim {
-                return Err(EstimationError::InvalidInput(format!(
-                    "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
-                    psi_dim,
-                    s2.len()
-                )));
-            }
-            for (j, components) in s2.iter().enumerate() {
-                let Some(components) = components.as_ref() else {
-                    continue;
-                };
-                RemlState::validate_penalty_component_shapes(
-                    components,
-                    p,
-                    &format!("S_tau_tau[{idx}][{j}]"),
-                )?;
-            }
-        }
-    }
-
-    let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(&x, &s_list);
-    let x_fit = conditioning.apply_to_design(&x);
-    let fit_linear_constraints =
-        conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
-    for dir in &mut hyper_dirs {
-        let mut x_tau = dir.x_tau_dense();
-        conditioning.transform_matrix_columnswith_a_inplace(&mut x_tau);
-        dir.x_tau_original = crate::estimate::reml::HyperDesignDerivative::from(x_tau);
-        if let Some(rows) = dir.x_tau_tau_original.as_mut() {
-            for mat in rows.iter_mut().flatten() {
-                let mut dense = mat.materialize();
-                conditioning.transform_matrix_columnswith_a_inplace(&mut dense);
-                *mat = crate::estimate::reml::HyperDesignDerivative::from(dense);
-            }
-        }
-    }
-    let (cfg, _) = resolved_external_config(opts)?;
-    let has_design_drift = hyper_dirs
-        .iter()
-        .any(|dir| dir.x_tau_original.any_nonzero());
-    ensure_exact_directional_hyper_supported(
-        cfg.link_function(),
-        cfg.firth_bias_reduction,
-        has_design_drift,
-        context,
-    )?;
-    let y_o = y.to_owned();
-    let w_o = w.to_owned();
-    let offset_o = offset.to_owned();
-    let mut reml_state = RemlState::newwith_offset(
-        y_o.view(),
-        x_fit,
-        w_o.view(),
-        offset_o.view(),
-        canonical,
-        p,
-        &cfg,
-        Some(active_nullspace_dims),
-        None,
-        fit_linear_constraints,
-    )?;
-    reml_state.set_penalty_shrinkage_floor(opts.penalty_shrinkage_floor);
-    reml_state.set_link_states(
-        cfg.link_kind.mixture_state().cloned(),
-        cfg.link_kind.sas_state().copied(),
-    );
-    reml_state.setwarm_start_original_beta(warm_start_beta);
-    eval(&reml_state, &hyper_dirs)
-}
-
-pub(crate) fn compute_external_joint_hypercostgradienthessian<X>(
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    x: X,
-    offset: ArrayView1<'_, f64>,
-    s_list: Vec<BlockwisePenalty>,
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    hyper_dirs: Vec<DirectionalHyperParam>,
-    warm_start_beta: Option<ArrayView1<'_, f64>>,
-    opts: &ExternalOptimOptions,
-) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let specs: Vec<PenaltySpec> = s_list
-        .into_iter()
-        .map(PenaltySpec::from_blockwise)
-        .collect();
-    validate_and_build_reml_state(
-        y,
-        w,
-        x,
-        offset,
-        specs,
-        theta,
-        rho_dim,
-        hyper_dirs,
-        warm_start_beta,
-        opts,
-        "compute_external_joint_hypercostgradienthessian",
-        |reml_state, conditioned_hyper_dirs| {
-            reml_state.compute_joint_hypercostgradienthessian(
-                theta,
-                rho_dim,
-                conditioned_hyper_dirs,
-            )
-        },
-    )
-}
-
-pub(crate) fn compute_external_joint_hyper_eval<X>(
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    x: X,
-    offset: ArrayView1<'_, f64>,
-    s_list: Vec<BlockwisePenalty>,
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    hyper_dirs: Vec<DirectionalHyperParam>,
-    warm_start_beta: Option<ArrayView1<'_, f64>>,
-    opts: &ExternalOptimOptions,
-) -> Result<
-    (
-        f64,
-        Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
-    ),
-    EstimationError,
->
-where
-    X: Into<DesignMatrix>,
-{
-    let specs: Vec<PenaltySpec> = s_list
-        .into_iter()
-        .map(PenaltySpec::from_blockwise)
-        .collect();
-    validate_and_build_reml_state(
-        y,
-        w,
-        x,
-        offset,
-        specs,
-        theta,
-        rho_dim,
-        hyper_dirs,
-        warm_start_beta,
-        opts,
-        "compute_external_joint_hyper_eval",
-        |reml_state, conditioned_hyper_dirs| {
-            reml_state.compute_joint_hyper_eval(theta, rho_dim, conditioned_hyper_dirs)
-        },
-    )
-}
-
-pub(crate) fn compute_external_joint_hyperefs<X>(
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    x: X,
-    offset: ArrayView1<'_, f64>,
-    s_list: Vec<BlockwisePenalty>,
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    hyper_dirs: Vec<DirectionalHyperParam>,
-    warm_start_beta: Option<ArrayView1<'_, f64>>,
-    opts: &ExternalOptimOptions,
-) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let specs: Vec<PenaltySpec> = s_list
-        .into_iter()
-        .map(PenaltySpec::from_blockwise)
-        .collect();
-    validate_and_build_reml_state(
-        y,
-        w,
-        x,
-        offset,
-        specs,
-        theta,
-        rho_dim,
-        hyper_dirs,
-        warm_start_beta,
-        opts,
-        "compute_external_joint_hyperefs",
-        |reml_state, conditioned_hyper_dirs| {
-            let rho = theta.slice(s![..rho_dim]).to_owned();
-            reml_state.compute_efs_steps_with_psi_ext(&rho, conditioned_hyper_dirs)
-        },
-    )
 }
 
 #[derive(Clone)]

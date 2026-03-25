@@ -14,6 +14,7 @@
 //! the finite-difference fill internally when the selected plan requires it.
 
 use crate::estimate::EstimationError;
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FiniteDiffGradient,
@@ -22,6 +23,7 @@ use ::opt::{
     ObjectiveEvalError, SecondOrderObjective, SecondOrderSample, Solution, Tolerance,
     ZerothOrderObjective,
 };
+use faer::Side;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -131,6 +133,8 @@ pub enum Derivative {
 /// to describe its analytic derivative coverage. The [`plan`] function then
 /// selects the optimizer and Hessian strategy.
 const SMALL_OUTER_FD_HESSIAN_MAX_PARAMS: usize = 8;
+const SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS: usize = 64;
+const SECOND_ORDER_NEGATIVE_EIGENVALUE_TOL: f64 = 1.0e-10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OuterThetaLayout {
@@ -798,7 +802,7 @@ pub struct EfsEval {
 ///   Return `Err(...)` for genuine evaluation breakdowns so the runner can mark
 ///   the step as a recoverable solver failure and escalate to the next declared
 ///   fallback plan if the full attempt still fails.
-/// - `eval_cost()` is used for seed screening (cheap, no gradient needed).
+/// - `eval_cost()` is used only for cost-based optimization paths.
 /// - `eval()` is the main evaluation path (cost + gradient + optional Hessian).
 /// - `eval_efs()` is used only by the EFS solver. It runs the inner solve,
 ///   builds the `InnerSolution`, and computes the EFS step vector. The default
@@ -809,7 +813,7 @@ pub trait OuterObjective {
     /// Declare what this objective can compute analytically.
     fn capability(&self) -> OuterCapability;
 
-    /// Evaluate cost only (for seed screening). Must be cheaper than `eval()`.
+    /// Evaluate cost only for cost-based optimization paths.
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError>;
 
     /// Evaluate cost + gradient + (if capable) Hessian.
@@ -960,54 +964,81 @@ fn finite_outer_first_order_eval_or_error(
     Ok(eval)
 }
 
-fn verify_outer_seed_for_plan(
-    obj: &mut dyn OuterObjective,
-    rho: &Array1<f64>,
+fn second_order_seed_geometry_mismatch(
     context: &str,
-    cap: &OuterCapability,
-    the_plan: &OuterPlan,
-) -> Result<(), ObjectiveEvalError> {
-    let layout = cap.theta_layout();
-    layout.validate_point_len(rho, context)?;
-    match the_plan.solver {
-        Solver::Efs | Solver::HybridEfs => {
-            let eval = obj
-                .eval_efs(rho)
-                .map_err(|err| into_objective_error(context, err))?;
-            layout.validate_efs_eval(&eval, context)?;
-            finite_cost_or_error(context, eval.cost).map(|_| ())
-        }
-        Solver::Arc | Solver::NewtonTrustRegion => match the_plan.hessian_source {
-            HessianSource::Analytic => {
-                let eval = obj
-                    .eval(rho)
-                    .map_err(|err| into_objective_error(context, err))?;
-                finite_outer_eval_or_error(context, layout, eval).map(|_| ())
-            }
-            HessianSource::FiniteDifference
-            | HessianSource::BfgsApprox
-            | HessianSource::EfsFixedPoint
-            | HessianSource::HybridEfsFixedPoint => {
-                let eval = obj
-                    .eval(rho)
-                    .map_err(|err| into_objective_error(context, err))?;
-                finite_outer_first_order_eval_or_error(context, layout, eval).map(|_| ())
-            }
-        },
-        Solver::Bfgs => {
-            if cap.gradient == Derivative::FiniteDifference {
-                let cost = obj
-                    .eval_cost(rho)
-                    .map_err(|err| into_objective_error(context, err))?;
-                finite_cost_or_error(context, cost).map(|_| ())
-            } else {
-                let eval = obj
-                    .eval(rho)
-                    .map_err(|err| into_objective_error(context, err))?;
-                finite_outer_first_order_eval_or_error(context, layout, eval).map(|_| ())
-            }
+    layout: OuterThetaLayout,
+    eval: &OuterEval,
+) -> Result<Option<String>, ObjectiveEvalError> {
+    if layout.n_params > SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS || !eval.hessian.is_analytic() {
+        return Ok(None);
+    }
+
+    let Some(mut hessian) = eval.hessian.materialize_dense().map_err(|message| {
+        ObjectiveEvalError::recoverable(format!(
+            "{context}: analytic outer Hessian materialization failed during Newton-geometry probe: {message}"
+        ))
+    })?
+    else {
+        return Ok(None);
+    };
+
+    layout.validate_hessian_shape(&hessian, context)?;
+    if !hessian.iter().all(|value| value.is_finite()) {
+        return Err(ObjectiveEvalError::recoverable(format!(
+            "{context}: analytic outer Hessian probe encountered non-finite entries"
+        )));
+    }
+
+    for row in 0..hessian.nrows() {
+        for col in (row + 1)..hessian.ncols() {
+            let sym = 0.5 * (hessian[[row, col]] + hessian[[col, row]]);
+            hessian[[row, col]] = sym;
+            hessian[[col, row]] = sym;
         }
     }
+
+    if hessian.cholesky(Side::Lower).is_ok() {
+        return Ok(None);
+    }
+
+    match hessian.eigh(Side::Lower) {
+        Ok((evals, _)) => {
+            let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
+            let negative_count = evals
+                .iter()
+                .filter(|&&value| value < -SECOND_ORDER_NEGATIVE_EIGENVALUE_TOL)
+                .count();
+            let nonpositive_count = evals
+                .iter()
+                .filter(|&&value| value <= SECOND_ORDER_NEGATIVE_EIGENVALUE_TOL)
+                .count();
+            let curvature_note = if negative_count > 0 {
+                format!(
+                    "indefinite (min_eigenvalue={min_eval:.3e}, negative_eigenvalues={negative_count})"
+                )
+            } else {
+                format!(
+                    "not SPD (min_eigenvalue={min_eval:.3e}, nonpositive_eigenvalues={nonpositive_count})"
+                )
+            };
+            Ok(Some(format!(
+                "analytic outer Hessian has unstable Newton geometry at the seed: {curvature_note}"
+            )))
+        }
+        Err(err) => Ok(Some(format!(
+            "analytic outer Hessian failed the SPD probe and eigendecomposition could not diagnose it ({err:?})"
+        ))),
+    }
+}
+
+fn finite_efs_eval_or_error(
+    context: &str,
+    layout: OuterThetaLayout,
+    eval: EfsEval,
+) -> Result<EfsEval, ObjectiveEvalError> {
+    layout.validate_efs_eval(&eval, context)?;
+    finite_cost_or_error(context, eval.cost)?;
+    Ok(eval)
 }
 
 struct OuterCostBridge<'a> {
@@ -1291,45 +1322,6 @@ struct OuterConfig {
     screening_cap: Option<Arc<AtomicUsize>>,
 }
 
-struct ScreeningCapGuard<'a> {
-    cap: Option<&'a Arc<AtomicUsize>>,
-}
-
-impl<'a> ScreeningCapGuard<'a> {
-    fn engage(cap: Option<&'a Arc<AtomicUsize>>, screen_max: usize) -> Self {
-        if screen_max > 0 {
-            if let Some(cap) = cap {
-                cap.store(screen_max, Ordering::Relaxed);
-                return Self { cap: Some(cap) };
-            }
-        }
-        Self { cap: None }
-    }
-
-    fn is_active(&self) -> bool {
-        self.cap.is_some()
-    }
-}
-
-impl Drop for ScreeningCapGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(cap) = self.cap {
-            cap.store(0, Ordering::Relaxed);
-        }
-    }
-}
-
-fn with_screening_cap<T>(
-    cap: Option<&Arc<AtomicUsize>>,
-    screen_max: usize,
-    f: impl FnOnce(bool) -> T,
-) -> T {
-    // Keep the guard scoped to the callback so every return path resets the
-    // screening cap before the caller can reuse the objective.
-    let screening_cap_guard = ScreeningCapGuard::engage(cap, screen_max);
-    f(screening_cap_guard.is_active())
-}
-
 impl Default for OuterConfig {
     fn default() -> Self {
         Self {
@@ -1343,6 +1335,29 @@ impl Default for OuterConfig {
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
+        }
+    }
+}
+
+struct ScreeningCapGuard<'a> {
+    cap: Option<&'a Arc<AtomicUsize>>,
+    previous: usize,
+}
+
+impl<'a> ScreeningCapGuard<'a> {
+    fn engage(cap: Option<&'a Arc<AtomicUsize>>, screening_limit: usize) -> Self {
+        let previous = match cap {
+            Some(cap) => cap.swap(screening_limit, Ordering::Relaxed),
+            None => 0,
+        };
+        Self { cap, previous }
+    }
+}
+
+impl Drop for ScreeningCapGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(cap) = self.cap {
+            cap.store(self.previous, Ordering::Relaxed);
         }
     }
 }
@@ -1445,8 +1460,8 @@ impl OuterProblem {
         self.initial_rho = Some(rho);
         self
     }
-    pub fn with_screening_cap(mut self, cap: Arc<AtomicUsize>) -> Self {
-        self.screening_cap = Some(cap);
+    pub fn with_screening_cap(mut self, screening_cap: Arc<AtomicUsize>) -> Self {
+        self.screening_cap = Some(screening_cap);
         self
     }
 
@@ -1867,8 +1882,8 @@ fn run_operator_trust_region(
 /// 1. Queries the objective's capability declaration.
 /// 2. Calls `plan()` to select solver + hessian source.
 /// 3. Logs the plan (so FD is never silent).
-/// 4. Generates and screens seed candidates.
-/// 5. Runs the chosen solver on each screened seed.
+/// 4. Generates seed candidates.
+/// 5. Runs the chosen solver on candidates in heuristic order up to budget.
 /// 6. If the configured fallback policy allows it, re-plans with degraded
 ///    capabilities chosen centrally inside outer_strategy and retries.
 /// 7. Returns the best result (including which plan was actually used).
@@ -1933,10 +1948,7 @@ fn run_outer(
         obj.reset();
 
         match run_outer_with_plan(obj, config, context, attempt_cap, &the_plan) {
-            Ok(mut result) => {
-                result.plan_used = the_plan;
-                return Ok(result);
-            }
+            Ok(result) => return Ok(result),
             Err(e) => {
                 log::debug!(
                     "[OUTER] {context}: attempt {} (plan={the_plan}) failed: {e}",
@@ -1953,6 +1965,93 @@ fn run_outer(
 }
 
 /// Execute a single plan attempt (seed generation → solver loop → best result).
+fn screen_seed_candidates(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    seeds: Vec<Array1<f64>>,
+) -> Result<Vec<Array1<f64>>, EstimationError> {
+    if seeds.len() <= 1 {
+        return Ok(seeds);
+    }
+
+    let screening_limit = config.seed_config.screen_max_inner_iterations.max(1);
+    let seed_budget = config.seed_config.seed_budget.max(1).min(seeds.len());
+    log::info!(
+        "[OUTER] {context}: screening {}/{} seeds (budget={}, pirls_cap={})",
+        seeds.len(),
+        seeds.len(),
+        seed_budget,
+        screening_limit,
+    );
+
+    let t_start = std::time::Instant::now();
+    let mut screened = Vec::with_capacity(seeds.len());
+    let mut last_error: Option<String> = None;
+
+    for (idx, seed) in seeds.into_iter().enumerate() {
+        obj.reset();
+        let _screening_guard =
+            ScreeningCapGuard::engage(config.screening_cap.as_ref(), screening_limit);
+        let cost = obj
+            .eval_cost(&seed)
+            .map_err(|err| into_objective_error("outer eval_cost failed", err));
+        let cost = match cost {
+            Ok(cost) => cost,
+            Err(err) => {
+                let err = match err {
+                    ObjectiveEvalError::Recoverable { message }
+                    | ObjectiveEvalError::Fatal { message } => {
+                        EstimationError::RemlOptimizationFailed(message)
+                    }
+                };
+                log::warn!(
+                    "[OUTER] {context}: screening rejected seed {}: {err}",
+                    idx + 1
+                );
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+        let cost = finite_cost_or_error("outer eval_cost failed", cost).map_err(|err| match err {
+            ObjectiveEvalError::Recoverable { message } | ObjectiveEvalError::Fatal { message } => {
+                EstimationError::RemlOptimizationFailed(message)
+            }
+        });
+        match cost {
+            Ok(cost) => screened.push((idx, cost, seed)),
+            Err(err) => {
+                log::warn!(
+                    "[OUTER] {context}: screening rejected seed {}: {err}",
+                    idx + 1
+                );
+                last_error = Some(err.to_string());
+            }
+        }
+    }
+
+    if screened.is_empty() {
+        let detail = last_error.unwrap_or_else(|| "no finite screening evaluations".to_string());
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "all seed screenings failed ({context}): {detail}"
+        )));
+    }
+
+    screened.sort_by(|(idx_a, cost_a, _), (idx_b, cost_b, _)| {
+        cost_a.total_cmp(cost_b).then_with(|| idx_a.cmp(idx_b))
+    });
+
+    log::info!(
+        "[OUTER] {context}: screening done in {:.3}s",
+        t_start.elapsed().as_secs_f64()
+    );
+
+    Ok(screened
+        .into_iter()
+        .map(|(_, _, seed)| seed)
+        .collect::<Vec<_>>())
+}
+
 fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -1983,145 +2082,15 @@ fn run_outer_with_plan(
         )));
     }
 
-    // Screen seeds by cost-only evaluation.
-    // Use cheap partial-PIRLS (capped inner iterations) when available.
-    let budget = config.seed_config.screening_budget.max(1);
-    let screen_max = config.seed_config.screen_max_inner_iterations;
-    let screened_indices: Vec<usize> = if seeds.len() <= budget {
-        (0..seeds.len()).collect()
-    } else {
+    seeds = screen_seed_candidates(obj, config, context, seeds)?;
+
+    let seed_budget = config.seed_config.seed_budget.max(1).min(seeds.len());
+    if seeds.len() > seed_budget {
         log::info!(
-            "[OUTER] {context}: screening {}/{} seeds (budget={budget}, pirls_cap={screen_max})",
-            seeds.len(),
+            "[OUTER] {context}: trying up to {seed_budget}/{} screened seeds",
             seeds.len(),
         );
-        let screen_start = std::time::Instant::now();
-        let mut scored: Vec<(usize, f64)> = with_screening_cap(
-            config.screening_cap.as_ref(),
-            screen_max,
-            |screening_cap_active| {
-                if screening_cap_active {
-                    log::debug!(
-                        "[OUTER] {context}: screening cap enabled for cost-only evaluation ({screen_max} PIRLS iterations)"
-                    );
-                }
-                let mut scored: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
-                for (i, rho) in seeds.iter().enumerate() {
-                    obj.reset();
-                    let cost = obj.eval_cost(rho).unwrap_or(f64::INFINITY);
-                    scored.push((
-                        i,
-                        if cost.is_finite() {
-                            cost
-                        } else {
-                            f64::INFINITY
-                        },
-                    ));
-                }
-                scored
-            },
-        );
-        // Reset after screening so cached partial-iteration results don't
-        // leak into the real optimizer.
-        obj.reset();
-        log::info!(
-            "[OUTER] {context}: screening done in {:.3}s",
-            screen_start.elapsed().as_secs_f64(),
-        );
-        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let finite_ranked: Vec<usize> = scored
-            .iter()
-            .filter_map(|&(i, cost)| cost.is_finite().then_some(i))
-            .collect();
-        if finite_ranked.is_empty() {
-            log::warn!(
-                "[OUTER] {context}: seed screening produced no finite costs; trying all {} seeds without pruning.",
-                seeds.len()
-            );
-            (0..seeds.len()).collect()
-        } else {
-            // Keep the best finite seeds first, then backfill with the original
-            // heuristic order so capped screening cannot prune away every
-            // recoverable start when the cheap eval path is over-pessimistic.
-            let mut selected = Vec::with_capacity(budget);
-            let mut picked = vec![false; seeds.len()];
-            for idx in finite_ranked.into_iter().take(budget) {
-                selected.push(idx);
-                picked[idx] = true;
-            }
-            if selected.len() < budget {
-                for idx in 0..seeds.len() {
-                    if picked[idx] {
-                        continue;
-                    }
-                    selected.push(idx);
-                    picked[idx] = true;
-                    if selected.len() == budget {
-                        break;
-                    }
-                }
-            }
-            selected
-        }
-    };
-    let mut attempted = vec![false; seeds.len()];
-    let mut verified_indices = Vec::with_capacity(screened_indices.len().min(budget));
-    for &idx in &screened_indices {
-        attempted[idx] = true;
-        obj.reset();
-        match verify_outer_seed_for_plan(
-            obj,
-            &seeds[idx],
-            "outer seed verification failed",
-            cap,
-            the_plan,
-        ) {
-            Ok(()) => verified_indices.push(idx),
-            Err(err) => {
-                log::warn!(
-                    "[OUTER] {context}: rejecting screened seed after full verification: {err:?}"
-                );
-            }
-        }
     }
-    if verified_indices.len() < budget {
-        for idx in 0..seeds.len() {
-            if attempted[idx] {
-                continue;
-            }
-            obj.reset();
-            match verify_outer_seed_for_plan(
-                obj,
-                &seeds[idx],
-                "outer seed verification failed",
-                cap,
-                the_plan,
-            ) {
-                Ok(()) => {
-                    verified_indices.push(idx);
-                    if verified_indices.len() == budget {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    log::warn!(
-                        "[OUTER] {context}: rejecting fallback seed after full verification: {err:?}"
-                    );
-                }
-            }
-        }
-    }
-    obj.reset();
-    let screened: Vec<Array1<f64>> = if verified_indices.is_empty() {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "all candidate seeds failed full outer verification ({context})"
-        )));
-    } else {
-        verified_indices
-            .into_iter()
-            .map(|idx| seeds[idx].clone())
-            .collect()
-    };
 
     let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {
         (
@@ -2134,21 +2103,75 @@ fn run_outer_with_plan(
     let mut best: Option<OuterResult> = None;
     let mut last_seed_error: Option<String> = None;
     let layout = cap.theta_layout();
+    let mut started_seeds = 0usize;
 
-    for (seed_idx, seed) in screened.iter().enumerate() {
+    'seed_attempts: for seed in &seeds {
+        if started_seeds == seed_budget {
+            break;
+        }
         obj.reset();
         let t_seed_start = std::time::Instant::now();
-
+        let seed_slot;
         let result: Result<OuterResult, EstimationError> = match the_plan.solver {
             Solver::Arc | Solver::NewtonTrustRegion => {
-                let seed_eval = obj.eval(seed)?;
+                let seed_eval = obj
+                    .eval(seed)
+                    .map_err(|err| into_objective_error("outer eval failed", err));
+                let seed_eval = match seed_eval {
+                    Ok(seed_eval) => seed_eval,
+                    Err(err) => {
+                        let err = match err {
+                            ObjectiveEvalError::Recoverable { message }
+                            | ObjectiveEvalError::Fatal { message } => {
+                                EstimationError::RemlOptimizationFailed(message)
+                            }
+                        };
+                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                        last_seed_error = Some(err.to_string());
+                        continue 'seed_attempts;
+                    }
+                };
                 let seed_eval = finite_outer_eval_or_error("outer eval failed", layout, seed_eval)
                     .map_err(|err| match err {
                         ObjectiveEvalError::Recoverable { message }
                         | ObjectiveEvalError::Fatal { message } => {
                             EstimationError::RemlOptimizationFailed(message)
                         }
-                    })?;
+                    });
+                let seed_eval = match seed_eval {
+                    Ok(seed_eval) => seed_eval,
+                    Err(err) => {
+                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                        last_seed_error = Some(err.to_string());
+                        continue 'seed_attempts;
+                    }
+                };
+                let geometry_mismatch = second_order_seed_geometry_mismatch(
+                    context, layout, &seed_eval,
+                )
+                .map_err(|err| match err {
+                    ObjectiveEvalError::Recoverable { message }
+                    | ObjectiveEvalError::Fatal { message } => {
+                        EstimationError::RemlOptimizationFailed(message)
+                    }
+                })?;
+                if let Some(reason) = geometry_mismatch {
+                    let downgraded_cap = downgrade_hessian(cap)
+                        .expect("second-order solver branch requires analytic Hessian capability");
+                    let downgraded_plan = plan(&downgraded_cap);
+                    log::warn!(
+                        "[OUTER] {context}: {reason}; replanning from {the_plan} to {downgraded_plan}"
+                    );
+                    return run_outer_with_plan(
+                        obj,
+                        config,
+                        context,
+                        &downgraded_cap,
+                        &downgraded_plan,
+                    );
+                }
+                started_seeds += 1;
+                seed_slot = started_seeds;
 
                 if matches!(seed_eval.hessian, HessianResult::Operator(_)) {
                     log::debug!(
@@ -2216,6 +2239,77 @@ fn run_outer_with_plan(
             }
             Solver::Bfgs => {
                 let gradient_available = cap.gradient == Derivative::Analytic;
+                if gradient_available {
+                    let seed_eval = obj
+                        .eval(seed)
+                        .map_err(|err| into_objective_error("outer eval failed", err));
+                    let seed_eval = match seed_eval {
+                        Ok(seed_eval) => seed_eval,
+                        Err(err) => {
+                            let err = match err {
+                                ObjectiveEvalError::Recoverable { message }
+                                | ObjectiveEvalError::Fatal { message } => {
+                                    EstimationError::RemlOptimizationFailed(message)
+                                }
+                            };
+                            log::warn!(
+                                "[OUTER] {context}: rejecting seed before solver start: {err}"
+                            );
+                            last_seed_error = Some(err.to_string());
+                            continue 'seed_attempts;
+                        }
+                    };
+                    let seed_eval = finite_outer_first_order_eval_or_error(
+                        "outer eval failed",
+                        layout,
+                        seed_eval,
+                    )
+                    .map_err(|err| match err {
+                        ObjectiveEvalError::Recoverable { message }
+                        | ObjectiveEvalError::Fatal { message } => {
+                            EstimationError::RemlOptimizationFailed(message)
+                        }
+                    });
+                    if let Err(err) = seed_eval {
+                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                        last_seed_error = Some(err.to_string());
+                        continue 'seed_attempts;
+                    }
+                } else {
+                    let seed_cost = obj
+                        .eval_cost(seed)
+                        .map_err(|err| into_objective_error("outer eval_cost failed", err));
+                    let seed_cost = match seed_cost {
+                        Ok(seed_cost) => seed_cost,
+                        Err(err) => {
+                            let err = match err {
+                                ObjectiveEvalError::Recoverable { message }
+                                | ObjectiveEvalError::Fatal { message } => {
+                                    EstimationError::RemlOptimizationFailed(message)
+                                }
+                            };
+                            log::warn!(
+                                "[OUTER] {context}: rejecting seed before solver start: {err}"
+                            );
+                            last_seed_error = Some(err.to_string());
+                            continue 'seed_attempts;
+                        }
+                    };
+                    let seed_cost = finite_cost_or_error("outer eval_cost failed", seed_cost)
+                        .map_err(|err| match err {
+                            ObjectiveEvalError::Recoverable { message }
+                            | ObjectiveEvalError::Fatal { message } => {
+                                EstimationError::RemlOptimizationFailed(message)
+                            }
+                        });
+                    if let Err(err) = seed_cost {
+                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                        last_seed_error = Some(err.to_string());
+                        continue 'seed_attempts;
+                    }
+                }
+                started_seeds += 1;
+                seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
@@ -2262,6 +2356,39 @@ fn run_outer_with_plan(
                 }
             }
             Solver::Efs => {
+                let seed_eval = obj
+                    .eval_efs(seed)
+                    .map_err(|err| into_objective_error("outer EFS eval failed", err));
+                let seed_eval = match seed_eval {
+                    Ok(seed_eval) => seed_eval,
+                    Err(err) => {
+                        let err = match err {
+                            ObjectiveEvalError::Recoverable { message }
+                            | ObjectiveEvalError::Fatal { message } => {
+                                EstimationError::RemlOptimizationFailed(message)
+                            }
+                        };
+                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                        last_seed_error = Some(err.to_string());
+                        continue 'seed_attempts;
+                    }
+                };
+                let seed_eval =
+                    finite_efs_eval_or_error("outer EFS eval failed", layout, seed_eval).map_err(
+                        |err| match err {
+                            ObjectiveEvalError::Recoverable { message }
+                            | ObjectiveEvalError::Fatal { message } => {
+                                EstimationError::RemlOptimizationFailed(message)
+                            }
+                        },
+                    );
+                if let Err(err) = seed_eval {
+                    log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                    last_seed_error = Some(err.to_string());
+                    continue 'seed_attempts;
+                }
+                started_seeds += 1;
+                seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
@@ -2310,6 +2437,39 @@ fn run_outer_with_plan(
             // step size α is halved (up to MAX_PSI_BACKTRACK times) while the
             // ρ-EFS step is kept fixed.
             Solver::HybridEfs => {
+                let seed_eval = obj
+                    .eval_efs(seed)
+                    .map_err(|err| into_objective_error("outer EFS eval failed", err));
+                let seed_eval = match seed_eval {
+                    Ok(seed_eval) => seed_eval,
+                    Err(err) => {
+                        let err = match err {
+                            ObjectiveEvalError::Recoverable { message }
+                            | ObjectiveEvalError::Fatal { message } => {
+                                EstimationError::RemlOptimizationFailed(message)
+                            }
+                        };
+                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                        last_seed_error = Some(err.to_string());
+                        continue 'seed_attempts;
+                    }
+                };
+                let seed_eval =
+                    finite_efs_eval_or_error("outer EFS eval failed", layout, seed_eval).map_err(
+                        |err| match err {
+                            ObjectiveEvalError::Recoverable { message }
+                            | ObjectiveEvalError::Fatal { message } => {
+                                EstimationError::RemlOptimizationFailed(message)
+                            }
+                        },
+                    );
+                if let Err(err) = seed_eval {
+                    log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                    last_seed_error = Some(err.to_string());
+                    continue 'seed_attempts;
+                }
+                started_seeds += 1;
+                seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
@@ -2342,8 +2502,8 @@ fn run_outer_with_plan(
             Ok(candidate) => {
                 log::info!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  cost={:.6e}  converged={}",
-                    seed_idx + 1,
-                    screened.len(),
+                    seed_slot,
+                    seed_budget,
                     the_plan.solver,
                     seed_elapsed,
                     candidate.final_value,
@@ -2362,8 +2522,8 @@ fn run_outer_with_plan(
             Err(e) => {
                 log::info!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  FAILED: {}",
-                    seed_idx + 1,
-                    screened.len(),
+                    seed_slot,
+                    seed_budget,
                     the_plan.solver,
                     seed_elapsed,
                     e,
@@ -2373,15 +2533,27 @@ fn run_outer_with_plan(
         }
     }
 
-    best.ok_or_else(|| match last_seed_error {
-        Some(err) => EstimationError::RemlOptimizationFailed(format!(
-            "all {} seed candidates failed ({context}); last_error: {err}",
-            screened.len()
-        )),
-        None => EstimationError::RemlOptimizationFailed(format!(
-            "all {} seed candidates failed ({context})",
-            screened.len()
-        )),
+    best.ok_or_else(|| {
+        if started_seeds == 0 {
+            return match last_seed_error {
+                Some(err) => EstimationError::RemlOptimizationFailed(format!(
+                    "no candidate seeds passed outer startup validation ({context}); last_error: {err}"
+                )),
+                None => EstimationError::RemlOptimizationFailed(format!(
+                    "no candidate seeds passed outer startup validation ({context})"
+                )),
+            };
+        }
+        match last_seed_error {
+            Some(err) => EstimationError::RemlOptimizationFailed(format!(
+                "all {} seed candidates failed ({context}); last_error: {err}",
+                started_seeds
+            )),
+            None => EstimationError::RemlOptimizationFailed(format!(
+                "all {} seed candidates failed ({context})",
+                started_seeds
+            )),
+        }
     })
 }
 
@@ -2389,6 +2561,7 @@ fn run_outer_with_plan(
 mod tests {
     use super::*;
     use ndarray::array;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn plan_analytic_hessian_selects_arc() {
@@ -2909,9 +3082,12 @@ mod tests {
             .clone();
         let expected_seed = valid_seed.clone();
         let initial_seed = array![9.0];
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Unavailable)
+            .with_seed_config(seed_config)
             .with_initial_rho(initial_seed)
             .with_max_iter(1);
         let mut obj = problem.build_objective(
@@ -2947,38 +3123,124 @@ mod tests {
     }
 
     #[test]
-    fn run_fd_plan_verifies_seeds_from_cost_only() {
-        let generated = crate::seeding::generate_rho_candidates(
-            1,
-            None,
-            &crate::seeding::SeedConfig::default(),
-        );
-        let target = generated
-            .first()
-            .expect("seed generator should yield at least one candidate")
-            .clone();
-        let target_for_cost = target.clone();
+    fn run_indefinite_analytic_seed_replans_before_arc() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
-            .with_gradient(Derivative::FiniteDifference)
-            .with_hessian(Derivative::Unavailable)
-            .with_max_iter(25);
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_seed_config(seed_config)
+            .with_initial_rho(array![0.0])
+            .with_max_iter(1);
         let mut obj = problem.build_objective(
             (),
-            move |_: &mut (), theta: &Array1<f64>| {
-                let diff = theta[0] - target_for_cost[0];
-                Ok(diff * diff)
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.0,
+                    gradient: array![0.0],
+                    hessian: HessianResult::Analytic(array![[-1.0]]),
+                })
             },
-            |_: &mut (), theta: &Array1<f64>| Ok(OuterEval::infeasible(theta.len())),
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
         let result = problem
-            .run(
-                &mut obj,
-                "fd seed verification should not require analytic eval",
-            )
-            .expect("finite-difference plans should verify seeds from cost only");
-        assert!((result.rho[0] - target[0]).abs() < 1e-3);
+            .run(&mut obj, "indefinite seed geometry")
+            .expect("indefinite analytic seed geometry should trigger a degraded replan");
+        assert_eq!(result.plan_used.solver, Solver::Bfgs);
+        assert_eq!(result.plan_used.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn run_starts_solver_without_upfront_seed_pass() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_seed_config(seed_config)
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            {
+                let calls = Arc::clone(&calls);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    calls.lock().unwrap().push("cost");
+                    Ok(theta[0] * theta[0])
+                }
+            },
+            {
+                let calls = Arc::clone(&calls);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    calls.lock().unwrap().push("eval");
+                    Ok(OuterEval {
+                        cost: theta[0] * theta[0],
+                        gradient: array![2.0 * theta[0]],
+                        hessian: HessianResult::Analytic(array![[2.0]]),
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        problem
+            .run(&mut obj, "solver should start without an upfront seed pass")
+            .expect("analytic plans should start with a real evaluation");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.first().copied(), Some("eval"));
+    }
+
+    #[test]
+    fn run_efs_skips_invalid_leading_seed_without_spending_budget() {
+        let generated = crate::seeding::generate_rho_candidates(
+            15,
+            None,
+            &crate::seeding::SeedConfig::default(),
+        );
+        let valid_seed = generated
+            .first()
+            .expect("seed generator should yield at least one candidate")
+            .clone();
+        let invalid_seed = Array1::from_elem(15, 9.0);
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
+        let problem = OuterProblem::new(15)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable)
+            .with_seed_config(seed_config)
+            .with_initial_rho(invalid_seed)
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), _: &Array1<f64>| Ok(0.0),
+            |_: &mut (), theta: &Array1<f64>| Ok(OuterEval::infeasible(theta.len())),
+            None::<fn(&mut ())>,
+            {
+                let valid_seed = valid_seed.clone();
+                Some(move |_: &mut (), theta: &Array1<f64>| {
+                    if theta == &valid_seed {
+                        Ok(EfsEval {
+                            cost: 0.0,
+                            steps: vec![0.0; theta.len()],
+                            beta: None,
+                            psi_gradient: None,
+                            psi_indices: None,
+                        })
+                    } else {
+                        Err(EstimationError::RemlOptimizationFailed(
+                            "invalid EFS seed".to_string(),
+                        ))
+                    }
+                })
+            },
+        );
+        let result = problem
+            .run(&mut obj, "efs generated seed should remain reachable")
+            .expect("invalid startup seeds should not consume the only EFS seed slot");
+        assert_eq!(result.rho, valid_seed);
+        assert_eq!(result.plan_used.solver, Solver::Efs);
     }
 
     #[test]

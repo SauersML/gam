@@ -2752,7 +2752,7 @@ pub(crate) struct RemlState<'a> {
     reparam_invariant: ReparamInvariant,
     sparse_penalty_blocks: Option<Arc<Vec<SparsePenaltyBlock>>>,
     p: usize,
-    config: &'a RemlConfig,
+    config: Arc<RemlConfig>,
     runtime_mixture_link_state: Option<crate::types::MixtureLinkState>,
     runtime_sas_link_state: Option<SasLinkState>,
     nullspace_dims: Vec<usize>,
@@ -2765,9 +2765,6 @@ pub(crate) struct RemlState<'a> {
     arena: RemlArena,
     pub(crate) warm_start_beta: RwLock<Option<Coefficients>>,
     warm_start_enabled: AtomicBool,
-    /// When nonzero, caps PIRLS max_iterations for cheap seed screening.
-    /// Shared with `OuterConfig.screening_cap` so the screening loop can
-    /// set/clear it atomically without accessing `RemlState` directly.
     pub(crate) screening_max_inner_iterations: Arc<AtomicUsize>,
 
     /// When set, the penalties have Kronecker (tensor-product) structure and

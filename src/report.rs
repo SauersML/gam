@@ -50,9 +50,9 @@ pub struct ContinuousOrderRow {
 
 pub struct AnisotropicScalesRow {
     pub term_name: String,
-    pub global_length_scale: f64,
+    pub global_length_scale: Option<f64>,
     /// Per-axis: (axis_index, eta, per_axis_length_scale, per_axis_kappa)
-    pub axes: Vec<(usize, f64, f64, f64)>,
+    pub axes: Vec<(usize, f64, Option<f64>, Option<f64>)>,
 }
 
 pub struct DiagnosticsInput {
@@ -420,7 +420,7 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
         )
     };
 
-    // Anisotropic spatial length scales section
+    // Anisotropic spatial geometry section
     let aniso_section = if input.anisotropic_scales.is_empty() {
         String::new()
     } else {
@@ -428,17 +428,31 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
             .anisotropic_scales
             .iter()
             .flat_map(|row| {
+                let header = match row.global_length_scale {
+                    Some(length_scale) => format!(
+                        "{} (global \u{2113}={length_scale:.4})",
+                        esc(&row.term_name),
+                    ),
+                    None => format!(
+                        "{} (pure Duchon shape-only anisotropy)",
+                        esc(&row.term_name)
+                    ),
+                };
                 let mut out = vec![format!(
-                    "<tr><td colspan=\"5\" style=\"font-weight:600\">{} (global \u{2113}={:.4})</td></tr>",
-                    esc(&row.term_name),
-                    row.global_length_scale
+                    "<tr><td colspan=\"5\" style=\"font-weight:600\">{header}</td></tr>"
                 )];
                 for &(axis, eta, length, kappa) in &row.axes {
+                    let length = length
+                        .map(|value| format!("{value:.4}"))
+                        .unwrap_or_else(|| "\u{2014}".to_string());
+                    let kappa = kappa
+                        .map(|value| format!("{value:.4}"))
+                        .unwrap_or_else(|| "\u{2014}".to_string());
                     out.push(format!(
                         "<tr><td style=\"padding-left:2em\">axis {axis}</td>\
                          <td class=\"num\">{eta:+.4}</td>\
-                         <td class=\"num\">{length:.4}</td>\
-                         <td class=\"num\">{kappa:.4}</td>\
+                         <td class=\"num\">{length}</td>\
+                         <td class=\"num\">{kappa}</td>\
                          <td></td></tr>"
                     ));
                 }
@@ -448,7 +462,8 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
             .join("\n");
         format!(
             "<section class=\"card\" id=\"sec-aniso-scales\">\n\
-             <h2>Anisotropic Spatial Length Scales</h2>\n\
+             <h2>Anisotropic Spatial Geometry</h2>\n\
+             <p class=\"muted\">Pure Duchon terms are scale-free, so only the centered axis contrasts (&eta;) are reported; \u{2113} and &kappa; are shown only for terms with a global length scale.</p>\n\
              <div class=\"table-wrap\"><table>\n\
              <thead><tr><th>Term / Axis</th><th>&eta;</th><th>\u{2113}</th><th>&kappa;</th><th></th></tr></thead>\n\
              <tbody>{rows}</tbody>\n</table></div>\n</section>"
@@ -548,6 +563,9 @@ fn render_html(input: &ReportInput) -> Result<String, String> {
     ];
     if !input.continuous_order.is_empty() {
         nav_items.push(("sec-cont-order", "Smoothness Order"));
+    }
+    if !input.anisotropic_scales.is_empty() {
+        nav_items.push(("sec-aniso-scales", "Anisotropy"));
     }
     if input.diagnostics.is_some() {
         nav_items.push(("sec-diagnostics", "Diagnostics"));

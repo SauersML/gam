@@ -228,6 +228,24 @@ class RunSuiteMappingTests(unittest.TestCase):
             self.assertEqual(cfg["smooth_cols"], ["pc1", "pc2", "pc3"])
             self.assertEqual(cfg["knots"], 12)
 
+    def test_geo_subpop16_marginal_slope_aniso_keeps_16d_duchon_mapping(self) -> None:
+        cfg = _RUN_SUITE._scenario_fit_mapping("geo_subpop16_margslope_aniso_duchon16d_k50")
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg["family"], "binomial-logit")
+        self.assertEqual(cfg["smooth_basis"], "duchon")
+        self.assertEqual(cfg["smooth_cols"], [f"pc{i}" for i in range(1, 17)])
+        self.assertEqual(cfg["knots"], 50)
+        self.assertTrue(cfg.get("scale_dimensions"))
+
+    def test_geo_subpop16_marginal_slope_aniso_lane_is_present_and_enabled(self) -> None:
+        scenarios = json.loads((_REPO_ROOT / "bench" / "scenarios.json").read_text())["scenarios"]
+        scenario = next(
+            s for s in scenarios if s["name"] == "geo_subpop16_margslope_aniso_duchon16d_k50"
+        )
+        self.assertTrue(
+            _RUN_SUITE._is_contender_enabled(scenario, "rust_gamlss_marginal_slope")
+        )
+
     def test_thread3_adaptive_reml_uses_current_boolean_cli(self) -> None:
         seen = []
         orig_run = _RUN_SUITE.run_rust_scenario_cv
