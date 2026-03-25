@@ -164,11 +164,6 @@ pub(crate) fn build_deviation_block_from_seed(
 
 const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 
-#[inline]
-pub(crate) fn bernoulli_marginal_slope_probit_link() -> InverseLink {
-    InverseLink::Standard(LinkFunction::Probit)
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BernoulliMarginalLinkMap {
     pub mu: f64,
@@ -7515,6 +7510,11 @@ mod tests {
         transformed_link_cubic as exact_transformed_link_cubic,
     };
     use ndarray::array;
+
+    #[inline]
+    fn bernoulli_marginal_slope_probit_link() -> InverseLink {
+        InverseLink::Standard(LinkFunction::Probit)
+    }
 
     fn empty_termspec() -> TermCollectionSpec {
         TermCollectionSpec {

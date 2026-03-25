@@ -75,6 +75,27 @@ mod tests {
         }
     }
 
+    fn compute_joint_hypercostgradienthessian(
+        state: &RemlState<'_>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
+        let (cost, gradient, hessian) = state.compute_joint_hyper_eval(theta, rho_dim, hyper_dirs)?;
+        Ok((
+            cost,
+            gradient,
+            hessian
+                .materialize_dense()
+                .map_err(EstimationError::RemlOptimizationFailed)?
+                .ok_or_else(|| {
+                    EstimationError::RemlOptimizationFailed(
+                        "joint hyper Hessian requested but unavailable".to_string(),
+                    )
+                })?,
+        ))
+    }
+
     fn h_original_from_bundle(bundle: &EvalShared) -> Array2<f64> {
         let pr = bundle.pirls_result.as_ref();
         match pr.coordinate_frame {
@@ -95,7 +116,7 @@ mod tests {
         let mut theta = Array1::<f64>::zeros(rho.len() + 1);
         theta.slice_mut(s![..rho.len()]).assign(rho);
         let (_, gradient, _) =
-            state.compute_joint_hypercostgradienthessian(&theta, rho.len(), &[hyper])?;
+            compute_joint_hypercostgradienthessian(state, &theta, rho.len(), &[hyper])?;
         Ok(gradient[rho.len()])
     }
 
@@ -665,8 +686,7 @@ mod tests {
             .expect("single-penalty hyper direction"),
         ];
 
-        let (_, _, h) = state
-            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+        let (_, _, h) = compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
             .expect("joint hyper cost+gradient+hessian");
         assert_eq!(h.nrows(), theta.len());
         assert_eq!(h.ncols(), theta.len());
@@ -733,8 +753,8 @@ mod tests {
             .expect("linear tau direction"),
         ];
 
-        let (_, _, h_full) = state
-            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+        let (_, _, h_full) =
+            compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
             .expect("joint hyper cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
 
@@ -820,7 +840,7 @@ mod tests {
             .expect("hyper direction with invalid second-order penalty index"),
         ];
 
-        let msg = match state.compute_joint_hypercostgradienthessian(&theta, 1, &hyper_dirs) {
+        let msg = match compute_joint_hypercostgradienthessian(&state, &theta, 1, &hyper_dirs) {
             Ok(_) => panic!("invalid second-order penalty index should be rejected"),
             Err(err) => err.to_string(),
         };
@@ -879,8 +899,8 @@ mod tests {
             t.slice_mut(s![rho.len()..]).assign(&psi);
             t
         };
-        let (_, _, h_full) = state
-            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+        let (_, _, h_full) =
+            compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
             .expect("joint hyper cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
         assert_eq!(h_tt_analytic.nrows(), hyper_dirs.len());
@@ -1106,8 +1126,8 @@ mod tests {
         let state = f.state();
         let mut theta = Array1::<f64>::zeros(f.rho.len() + hyper_dirs.len());
         theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
-        let (_, _, h_full) = state
-            .compute_joint_hypercostgradienthessian(&theta, f.rho.len(), &hyper_dirs)
+        let (_, _, h_full) =
+            compute_joint_hypercostgradienthessian(&state, &theta, f.rho.len(), &hyper_dirs)
             .expect("joint cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
 
@@ -1284,8 +1304,8 @@ mod tests {
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let mut theta = Array1::<f64>::zeros(rho.len() + hyper_dirs.len());
         theta.slice_mut(s![..rho.len()]).assign(&rho);
-        let (_, _, h_full) = state
-            .compute_joint_hypercostgradienthessian(&theta, rho.len(), &hyper_dirs)
+        let (_, _, h_full) =
+            compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
             .expect("joint cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
 
@@ -1607,8 +1627,8 @@ mod tests {
         let state = f.state();
         let mut theta = Array1::<f64>::zeros(f.rho.len() + hyper_dirs.len());
         theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
-        let (_, _, h_full) = state
-            .compute_joint_hypercostgradienthessian(&theta, f.rho.len(), &hyper_dirs)
+        let (_, _, h_full) =
+            compute_joint_hypercostgradienthessian(&state, &theta, f.rho.len(), &hyper_dirs)
             .expect("joint cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
 
