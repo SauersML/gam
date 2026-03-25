@@ -230,7 +230,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn compute_joint_hypercostgradienthessian(
         &self,
         theta: &Array1<f64>,

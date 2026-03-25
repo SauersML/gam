@@ -1991,11 +1991,19 @@ fn screen_seed_candidates(
 
     for (idx, seed) in seeds.into_iter().enumerate() {
         obj.reset();
-        let _screening_guard =
-            ScreeningCapGuard::engage(config.screening_cap.as_ref(), screening_limit);
-        let cost = obj
-            .eval_cost(&seed)
-            .map_err(|err| into_objective_error("outer eval_cost failed", err));
+        let cost = {
+            let screening_guard =
+                ScreeningCapGuard::engage(config.screening_cap.as_ref(), screening_limit);
+            if idx == 0 && screening_guard.cap.is_some() && log::log_enabled!(log::Level::Trace) {
+                log::trace!(
+                    "[OUTER] {context}: screening PIRLS cap set to {screening_limit} (previous={})",
+                    screening_guard.previous
+                );
+            }
+            obj
+                .eval_cost(&seed)
+                .map_err(|err| into_objective_error("outer eval_cost failed", err))
+        };
         let cost = match cost {
             Ok(cost) => cost,
             Err(err) => {

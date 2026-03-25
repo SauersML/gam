@@ -4672,7 +4672,6 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
     block_states: &'a [ParameterBlockState],
     specs: &'a [ParameterBlockSpec],
     total: usize,
-    need_hessian: bool,
 ) -> Result<Option<JointHessianBundle<'a>>, String> {
     // Path 1: exact Newton joint Hessian (preferred).
     let beta_flat = flatten_state_betas(block_states, specs);
@@ -4716,7 +4715,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             hessian_logdet_correction: curvature.hessian_logdet_correction,
         }));
     }
-    let exact_joint_source = if use_joint_matrix_free_path(total, need_hessian) {
+    let exact_joint_source = if use_joint_matrix_free_path(total) {
         hessian_workspace
             .as_ref()
             .map(|workspace| {
@@ -5251,7 +5250,7 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         let logdet_h_total = logdet_h_scaled + curvature.hessian_logdet_correction;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
-    let exact_joint_source = if !strict_spd && use_joint_matrix_free_path(total, false) {
+    let exact_joint_source = if !strict_spd && use_joint_matrix_free_path(total) {
         family
             .exact_newton_joint_hessian_workspace(states, specs)?
             .as_ref()
@@ -5423,7 +5422,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let mut states = buildblock_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
-    let has_joint_exacthessian = if use_joint_matrix_free_path(total_joint_p, false) {
+    let has_joint_exacthessian = if use_joint_matrix_free_path(total_joint_p) {
         let workspace = family.exact_newton_joint_hessian_workspace(&states, specs)?;
         match workspace.as_ref() {
             Some(workspace) => {
@@ -5532,7 +5531,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // Get joint Hessian and block gradients from the current evaluation.
-            let joint_hessian_source = if use_joint_matrix_free_path(total_p, false) {
+            let joint_hessian_source = if use_joint_matrix_free_path(total_p) {
                 family
                     .exact_newton_joint_hessian_workspace(&states, specs)?
                     .as_ref()
@@ -5636,7 +5635,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_mode_diagonal_ridge,
                 );
                 let rhs = &grad_joint - &penalty_beta;
-                let mut delta = if use_joint_matrix_free_path(total_p, false) {
+                let mut delta = if use_joint_matrix_free_path(total_p) {
                     let preconditioner_diag = match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
                             &h_joint.diag().to_owned(),
@@ -6702,7 +6701,7 @@ fn joint_outer_evaluate(
         .collect();
 
     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
-        if use_joint_matrix_free_path(total, eval_mode == EvalMode::ValueGradientHessian) {
+        if use_joint_matrix_free_path(total) {
             let ranges_vec = ranges.to_vec();
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
@@ -6961,7 +6960,7 @@ fn joint_outer_evaluate_efs(
         .collect();
 
     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
-        if use_joint_matrix_free_path(total, false) {
+        if use_joint_matrix_free_path(total) {
             let ranges_vec = ranges.to_vec();
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
@@ -7177,8 +7176,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
 
-    let efs_eval = if let Some(joint_bundle) =
-        build_joint_hessian_closures(family, &inner.block_states, specs, total, false)?
+    let efs_eval =
+        if let Some(joint_bundle) = build_joint_hessian_closures(family, &inner.block_states, specs, total)?
     {
         let JointHessianBundle {
             source: h_joint_unpen,
@@ -7397,7 +7396,6 @@ fn normalize_outer_eval_error_detail(error: &str) -> &str {
         .unwrap_or(error)
 }
 
-#[cfg(test)]
 fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -8191,7 +8189,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             )
         } else {
             let h_joint_unpen =
-                if use_joint_matrix_free_path(total, eval_mode == EvalMode::ValueGradientHessian) {
+                if use_joint_matrix_free_path(total) {
                     hessian_workspace
                         .as_ref()
                         .map(|workspace| {
@@ -8431,13 +8429,9 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
     // Try build_joint_hessian_closures which handles both exact Newton and
     // surrogate Hessian sources, then call joint_outer_evaluate with no
     // extended coordinates.
-    if let Some(joint_bundle) = build_joint_hessian_closures(
-        family,
-        &inner.block_states,
-        specs,
-        total,
-        eval_mode == EvalMode::ValueGradientHessian,
-    )? {
+    if let Some(joint_bundle) =
+        build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+    {
         let JointHessianBundle {
             source: h_joint_unpen,
             beta_flat,
@@ -8771,7 +8765,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal<
             true,
         )
     } else {
-        let h_joint_unpen = if use_joint_matrix_free_path(total, false) {
+        let h_joint_unpen = if use_joint_matrix_free_path(total) {
             hessian_workspace
                 .as_ref()
                 .map(|workspace| {
@@ -9032,12 +9026,11 @@ const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
 const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
 
-pub(crate) fn joint_exact_analytic_outer_hessian_available(_total_p: usize) -> bool {
+pub(crate) fn joint_exact_analytic_outer_hessian_available() -> bool {
     true
 }
 
-fn use_joint_matrix_free_path(total_p: usize, need_hessian: bool) -> bool {
-    let _ = need_hessian;
+fn use_joint_matrix_free_path(total_p: usize) -> bool {
     total_p >= JOINT_MATRIX_FREE_MIN_DIM
 }
 
