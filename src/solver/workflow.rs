@@ -1636,7 +1636,7 @@ fn materialize_survival<'a>(
     let marginal_slope_link_dev = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         if parsed.linkwiggle.is_some() {
             inference_notes.push(
-                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
+                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation and score-warp blocks while keeping the probit survival base link".to_string(),
             );
             inference_notes.push(
                 "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic transport cells with analytic value evaluation and calibrated survival normalization"
@@ -1647,6 +1647,14 @@ fn materialize_survival<'a>(
                 "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
             );
         }
+        parsed
+            .linkwiggle
+            .as_ref()
+            .map(deviation_block_config_from_formula_linkwiggle)
+    } else {
+        None
+    };
+    let marginal_slope_score_warp = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         parsed
             .linkwiggle
             .as_ref()
@@ -1783,7 +1791,7 @@ fn materialize_survival<'a>(
                         "marginal-slope survival is missing logslope spec".to_string()
                     })?,
                     logslope_offset: log_sigma_offset.clone(),
-                    score_warp: None,
+                    score_warp: marginal_slope_score_warp.clone(),
                     link_dev: marginal_slope_link_dev.clone(),
                 },
                 options: BlockwiseFitOptions {
