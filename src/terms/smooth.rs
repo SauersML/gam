@@ -1171,20 +1171,27 @@ pub fn log_spatial_aniso_scales(spec: &TermCollectionSpec) {
         if eta.is_empty() {
             continue;
         }
-        let Some(ls) = length_scale else { continue };
-        // psi_bar = -ln(length_scale), kappa_bar = 1/length_scale
-        // per-axis: kappa_a = kappa_bar * exp(eta_a), length_a = ls * exp(-eta_a)
-        let mut lines = format!(
-            "[spatial-kappa] term {} (\"{}\"): anisotropic length scales optimized (global length_scale={:.4})",
-            term_idx, term.name, ls
-        );
+        let mut lines = match length_scale {
+            Some(ls) => format!(
+                "[spatial-kappa] term {} (\"{}\"): anisotropic length scales optimized (global length_scale={:.4})",
+                term_idx, term.name, ls
+            ),
+            None => format!(
+                "[spatial-kappa] term {} (\"{}\"): pure Duchon shape anisotropy optimized",
+                term_idx, term.name
+            ),
+        };
         for (a, &eta_a) in eta.iter().enumerate() {
-            let length_a = ls * (-eta_a).exp();
-            let kappa_a = (1.0 / ls) * eta_a.exp();
-            lines.push_str(&format!(
-                "\n  axis {}: eta={:+.4}, length={:.4}, kappa={:.4}",
-                a, eta_a, length_a, kappa_a
-            ));
+            if let Some(ls) = length_scale {
+                let length_a = ls * (-eta_a).exp();
+                let kappa_a = (1.0 / ls) * eta_a.exp();
+                lines.push_str(&format!(
+                    "\n  axis {}: eta={:+.4}, length={:.4}, kappa={:.4}",
+                    a, eta_a, length_a, kappa_a
+                ));
+            } else {
+                lines.push_str(&format!("\n  axis {}: eta={:+.4}", a, eta_a));
+            }
         }
         log::info!("{}", lines);
     }
@@ -1250,7 +1257,7 @@ pub(crate) fn sync_aniso_contrasts_from_metadata(
 pub struct SpatialLengthScaleOptimizationOptions {
     /// Enable outer-loop optimization over spatial κ (= 1 / length_scale)
     /// for supported radial-kernel smooths.
-    /// This applies to ThinPlate, Matérn, and hybrid Duchon terms.
+    /// This applies to ThinPlate, Matérn, and Duchon terms.
     pub enabled: bool,
     /// Maximum number of outer iterations in the exact joint [rho, psi] solve.
     pub max_outer_iter: usize,
@@ -3484,8 +3491,8 @@ fn apply_global_smooth_identifiability(
 ) -> Result<SmoothDesign, BasisError> {
     // Global smooth identifiability policy:
     //
-    // 1. Each smooth is orthogonalized to the intercept plus any explicit linear
-    //    columns that reuse its feature axes.
+    // 1. Spatial smooths keep their existing intercept/linear orthogonality
+    //    policy when requested.
     // 2. Higher-order / duplicate smooths are orthogonalized to the realized
     //    design columns of lower-order owned smooths over nested feature sets.
     //
@@ -3543,19 +3550,30 @@ fn apply_global_smooth_identifiability(
                     .expect("owner design must be available before dependent smooth")
             })
             .collect::<Vec<_>>();
-        let c_local = if skip_global_transform {
+        let parametric_block = if skip_global_transform {
             None
+        } else if matches!(
+            spatial_identifiability_policy(termspec),
+            Some(SpatialIdentifiability::OrthogonalToParametric)
+        ) {
+            Some(build_parametric_constraint_block_for_term(
+                data,
+                linear_terms,
+                termspec,
+            )?)
         } else {
-            Some(build_constraint_block(
-                data.nrows(),
-                Some(&build_parametric_constraint_block_for_term(
-                    data,
-                    linear_terms,
-                    termspec,
-                )?),
-                &owner_blocks,
-            ))
+            None
         };
+        let c_local =
+            if skip_global_transform || (parametric_block.is_none() && owner_blocks.is_empty()) {
+                None
+            } else {
+                Some(build_constraint_block(
+                    data.nrows(),
+                    parametric_block.as_ref(),
+                    &owner_blocks,
+                ))
+            };
         let z_opt = maybe_smooth_identifiability_transform(
             termspec,
             &design_local,
@@ -8640,6 +8658,17 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                 cd.push((b, Array2::<f64>::zeros((0, 0))));
             }
             cd
+        } else if !aniso_result.design_second_cross.is_empty() {
+            let mut cd = Vec::new();
+            for (cross_idx, &(pa, pb)) in aniso_result.design_second_cross_pairs.iter().enumerate()
+            {
+                if pa == a {
+                    cd.push((pb, aniso_result.design_second_cross[cross_idx].clone()));
+                } else if pb == a {
+                    cd.push((pa, aniso_result.design_second_cross[cross_idx].clone()));
+                }
+            }
+            cd
         } else {
             Vec::new()
         };
@@ -9565,7 +9594,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{Derivative, EfsEval, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, OuterEval};
 
     let theta_dim = theta0.len();
     let kappa_dim = theta_dim - rho_dim;
@@ -10265,18 +10294,6 @@ fn theta_values_match(left: &Array1<f64>, right: &Array1<f64>) -> bool {
             .all(|(&l, &r)| l.to_bits() == r.to_bits())
 }
 
-fn spatial_psi_to_length_scale_and_aniso(psi: &[f64]) -> (f64, Option<Vec<f64>>) {
-    if psi.len() <= 1 {
-        ((-psi.first().copied().unwrap_or(0.0)).exp(), None)
-    } else {
-        let psi_bar = psi.iter().sum::<f64>() / psi.len() as f64;
-        (
-            (-psi_bar).exp(),
-            Some(psi.iter().map(|&value| value - psi_bar).collect()),
-        )
-    }
-}
-
 fn spatial_aniso_matches(left: Option<&[f64]>, right: Option<&[f64]>) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -10286,6 +10303,14 @@ fn spatial_aniso_matches(left: Option<&[f64]>, right: Option<&[f64]>) -> bool {
                     .zip(b.iter())
                     .all(|(&x, &y)| x.to_bits() == y.to_bits())
         }
+        _ => false,
+    }
+}
+
+fn spatial_length_scale_matches(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
         _ => false,
     }
 }
@@ -10439,22 +10464,25 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     }
 
     fn apply_log_kappa_to_term(&mut self, term_idx: usize, psi: &[f64]) -> Result<bool, String> {
-        let current_length_scale =
-            get_spatial_length_scale(&self.spec, term_idx).ok_or_else(|| {
-                format!(
-                    "incremental realizer term {term_idx} does not expose a spatial length scale"
-                )
-            })?;
+        if !spatial_term_supports_hyper_optimization(&self.spec, term_idx) {
+            return Err(format!(
+                "incremental realizer term {term_idx} does not expose spatial hyperparameters"
+            ));
+        }
+        let current_length_scale = get_spatial_length_scale(&self.spec, term_idx);
         let current_aniso = get_spatial_aniso_log_scales(&self.spec, term_idx);
-        let (next_length_scale, next_aniso) = spatial_psi_to_length_scale_and_aniso(psi);
-        let same_length = current_length_scale.to_bits() == next_length_scale.to_bits();
+        let (next_length_scale, next_aniso) =
+            spatial_term_psi_to_length_scale_and_aniso(&self.spec, term_idx, psi);
+        let same_length = spatial_length_scale_matches(current_length_scale, next_length_scale);
         let same_aniso = spatial_aniso_matches(current_aniso.as_deref(), next_aniso.as_deref());
         if same_length && same_aniso {
             return Ok(false);
         }
 
-        set_spatial_length_scale(&mut self.spec, term_idx, next_length_scale)
-            .map_err(|e| e.to_string())?;
+        if let Some(length_scale) = next_length_scale {
+            set_spatial_length_scale(&mut self.spec, term_idx, length_scale)
+                .map_err(|e| e.to_string())?;
+        }
         if let Some(eta) = next_aniso {
             set_spatial_aniso_log_scales(&mut self.spec, term_idx, eta)
                 .map_err(|e| e.to_string())?;
@@ -11115,7 +11143,7 @@ where
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
 
-    use crate::solver::outer_strategy::{Derivative, EfsEval, HessianResult, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, OuterEval};
 
     let problem = exact_joint_multistart_outer_problem(
         &theta0,
@@ -11269,9 +11297,10 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     options: &FitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
-    // For spatial terms with an explicit length scale, κ (= 1/length_scale)
-    // changes kernel geometry nonlinearly. That means both basis values B and
-    // penalty blocks S change, so each κ proposal rebuilds the spatial basis.
+    // Spatial hyperparameters change kernel geometry nonlinearly, so each
+    // proposal rebuilds the spatial basis. Hybrid/isotropic terms expose a
+    // scalar κ (= 1/length_scale); pure Duchon anisotropy exposes only
+    // per-axis shape coordinates.
     //
     // When exact derivative information is available for the rebuilt basis and
     // penalty, kappa is promoted to a first-class outer hyperparameter beside
@@ -11280,9 +11309,9 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // optimizer is expected to consume a real joint Hessian. NewtonTrustRegion
     // and ARC are not meant to run on a gradient-only surrogate here.
     //
-    // Any smooth with an explicit spatial length scale participates in this
-    // outer solve. If an eligible spatial basis does not expose exact
-    // log-kappa derivatives, that is now a hard error.
+    // Any eligible spatial smooth participates in this outer solve. If an
+    // eligible spatial basis does not expose derivative information, that is
+    // now a hard error.
     let mut resolvedspec = spec.clone();
     let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
     let n = data.nrows();
@@ -12277,6 +12306,204 @@ mod tests {
             out.is_ok(),
             "term-local Option 5 should not over-constrain non-overlapping smooth/linear terms: {:?}",
             out.err()
+        );
+    }
+
+    #[test]
+    fn hierarchical_smooth_ownership_is_order_independent_for_bspline_and_duchon() {
+        let data = array![
+            [0.00, 0.00],
+            [0.10, 0.15],
+            [0.18, 0.30],
+            [0.27, 0.10],
+            [0.35, 0.55],
+            [0.46, 0.25],
+            [0.54, 0.70],
+            [0.63, 0.40],
+            [0.72, 0.85],
+            [0.81, 0.60],
+            [0.90, 0.95],
+            [1.00, 0.75],
+        ];
+
+        let bspline_term = SmoothTermSpec {
+            name: "s_x".to_string(),
+            basis: SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec: BSplineBasisSpec {
+                    degree: 3,
+                    penalty_order: 2,
+                    knotspec: BSplineKnotSpec::Generate {
+                        data_range: (0.0, 1.0),
+                        num_internal_knots: 5,
+                    },
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::default(),
+                },
+            },
+            shape: ShapeConstraint::None,
+        };
+        let duchon_term = SmoothTermSpec {
+            name: "duchon_xy".to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: vec![0, 1],
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                    length_scale: Some(1.0),
+                    power: 1,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+        };
+
+        let spec_a = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![duchon_term.clone(), bspline_term.clone()],
+        };
+        let spec_b = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![bspline_term, duchon_term],
+        };
+
+        let design_a = build_term_collection_design(data.view(), &spec_a).expect("design a");
+        let design_b = build_term_collection_design(data.view(), &spec_b).expect("design b");
+
+        for design in [&design_a, &design_b] {
+            let owner_idx = design
+                .smooth
+                .terms
+                .iter()
+                .position(|term| term.name == "s_x")
+                .expect("owner term");
+            let target_idx = design
+                .smooth
+                .terms
+                .iter()
+                .position(|term| term.name == "duchon_xy")
+                .expect("target term");
+            let owner_dense = design.smooth.term_designs[owner_idx].to_dense();
+            let rel = orthogonality_relative_residual_for_design(
+                &design.smooth.term_designs[target_idx],
+                owner_dense.view(),
+            )
+            .expect("orthogonality residual");
+            assert!(
+                rel <= 1e-10,
+                "multivariate Duchon term should be residualized against owned 1D spline space; rel={rel}"
+            );
+        }
+
+        let duchon_a_idx = design_a
+            .smooth
+            .terms
+            .iter()
+            .position(|term| term.name == "duchon_xy")
+            .expect("duchon in design a");
+        let duchon_b_idx = design_b
+            .smooth
+            .terms
+            .iter()
+            .position(|term| term.name == "duchon_xy")
+            .expect("duchon in design b");
+        let duchon_a = design_a.smooth.term_designs[duchon_a_idx].to_dense();
+        let duchon_b = design_b.smooth.term_designs[duchon_b_idx].to_dense();
+        assert_eq!(duchon_a.dim(), duchon_b.dim());
+        let max_abs = duchon_a
+            .iter()
+            .zip(duchon_b.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs <= 1e-10,
+            "hierarchical ownership should not depend on user term order; max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn freeze_roundtrip_preserves_hierarchical_smooth_transforms() {
+        let data = array![
+            [0.00, 0.00],
+            [0.10, 0.15],
+            [0.18, 0.30],
+            [0.27, 0.10],
+            [0.35, 0.55],
+            [0.46, 0.25],
+            [0.54, 0.70],
+            [0.63, 0.40],
+            [0.72, 0.85],
+            [0.81, 0.60],
+            [0.90, 0.95],
+            [1.00, 0.75],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "x".to_string(),
+                feature_col: 0,
+                double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None,
+                coefficient_max: None,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![
+                SmoothTermSpec {
+                    name: "duchon_xy".to_string(),
+                    basis: SmoothBasisSpec::Duchon {
+                        feature_cols: vec![0, 1],
+                        spec: DuchonBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                            length_scale: Some(1.0),
+                            power: 1,
+                            nullspace_order: DuchonNullspaceOrder::Linear,
+                            identifiability: SpatialIdentifiability::default(),
+                            aniso_log_scales: None,
+                        },
+                        input_scales: None,
+                    },
+                    shape: ShapeConstraint::None,
+                },
+                SmoothTermSpec {
+                    name: "s_x".to_string(),
+                    basis: SmoothBasisSpec::BSpline1D {
+                        feature_col: 0,
+                        spec: BSplineBasisSpec {
+                            degree: 3,
+                            penalty_order: 2,
+                            knotspec: BSplineKnotSpec::Generate {
+                                data_range: (0.0, 1.0),
+                                num_internal_knots: 5,
+                            },
+                            double_penalty: false,
+                            identifiability: BSplineIdentifiability::default(),
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+            ],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("fit-time design");
+        let frozen =
+            freeze_term_collection_from_design(&spec, &design).expect("freeze hierarchical design");
+        let replay = build_term_collection_design(data.view(), &frozen).expect("replay design");
+
+        let dense_fit = design.design.to_dense();
+        let dense_replay = replay.design.to_dense();
+        assert_eq!(dense_fit.dim(), dense_replay.dim());
+        let max_abs = dense_fit
+            .iter()
+            .zip(dense_replay.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs <= 1e-10,
+            "frozen hierarchical transforms should replay exactly on the training data; max_abs={max_abs}"
         );
     }
 
@@ -14273,6 +14500,157 @@ mod tests {
                     spec.identifiability,
                     SpatialIdentifiability::FrozenTransform { .. }
                 ));
+            }
+            _ => panic!("expected Duchon term"),
+        }
+    }
+
+    #[test]
+    fn pure_duchon_scale_dimensions_participate_without_length_scale() {
+        let mut spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "pure_duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: None,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        crate::term_builder::enable_scale_dimensions(&mut spec);
+        assert_eq!(spatial_length_scale_term_indices(&spec), vec![0]);
+        match &spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                assert_eq!(spec.length_scale, None);
+                assert_eq!(spec.aniso_log_scales.as_deref(), Some(&[0.0, 0.0][..]));
+            }
+            _ => panic!("expected Duchon term"),
+        }
+    }
+
+    #[test]
+    fn pure_duchon_apply_tospec_preserves_length_scale_none() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "pure_duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::UserProvided(array![
+                            [0.0, 0.0],
+                            [1.0, 0.0],
+                            [0.0, 1.0],
+                            [1.0, 1.0]
+                        ]),
+                        length_scale: None,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: Some(vec![0.0, 0.0]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let updated = SpatialLogKappaCoords::new_with_dims(array![0.4, -0.1], vec![2])
+            .apply_tospec(&spec, &[0])
+            .expect("pure Duchon update should succeed");
+        match &updated.smooth_terms[0].basis {
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                assert_eq!(spec.length_scale, None);
+                let eta = spec
+                    .aniso_log_scales
+                    .as_ref()
+                    .expect("pure Duchon should keep aniso");
+                assert!((eta.iter().sum::<f64>()).abs() <= 1e-12);
+            }
+            _ => panic!("expected Duchon term"),
+        }
+    }
+
+    #[test]
+    fn pure_duchon_aniso_fit_optimizes_without_introducing_hybrid_scale() {
+        let data = array![
+            [0.0, 0.1],
+            [0.2, 0.0],
+            [0.4, 0.3],
+            [0.6, 0.5],
+            [0.8, 0.7],
+            [1.0, 0.9],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "pure_duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: None,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: Some(vec![0.0, 0.0]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let fit_opts = FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: true,
+            max_iter: 40,
+            tol: 1e-6,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+
+        let optimized = fit_term_collectionwith_spatial_length_scale_optimization(
+            data.view(),
+            Array1::linspace(0.0, 1.0, data.nrows()),
+            Array1::ones(data.nrows()),
+            Array1::zeros(data.nrows()),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &fit_opts,
+            &SpatialLengthScaleOptimizationOptions::default(),
+        )
+        .expect("pure Duchon anisotropic fit should optimize");
+
+        match &optimized.resolvedspec.smooth_terms[0].basis {
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                assert_eq!(spec.length_scale, None);
+                assert!(
+                    spec.aniso_log_scales.is_some(),
+                    "pure Duchon anisotropy should remain enabled"
+                );
             }
             _ => panic!("expected Duchon term"),
         }
