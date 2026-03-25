@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -13,8 +15,10 @@ DEFAULT_GAM_BIN = REPO_ROOT / "target" / "release" / "gam"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Fit a multidimensional Duchon smooth on continuous columns with "
-            "per-axis length scaling enabled."
+            "Fit a multidimensional anisotropic Duchon model with large-data-"
+            "friendly defaults. If --z-column is provided, the script builds a "
+            "Bernoulli marginal-slope fit and can optionally add main-formula "
+            "link deviation and logslope score-warp via linkwiggle(...)."
         )
     )
     parser.add_argument("csv", type=Path, help="Training CSV")
@@ -23,17 +27,32 @@ def parse_args() -> argparse.Namespace:
         "--features",
         nargs="+",
         required=True,
-        help="Continuous feature columns for the Duchon term",
+        help="Continuous feature columns for the main Duchon term",
     )
     parser.add_argument("--out", type=Path, required=True, help="Output model JSON path")
     parser.add_argument("--predict-csv", type=Path, help="Optional CSV to score after fitting")
     parser.add_argument("--predict-out", type=Path, help="Optional prediction CSV output path")
     parser.add_argument("--gam-bin", type=Path, default=DEFAULT_GAM_BIN)
-    parser.add_argument("--family", default="gaussian")
-    parser.add_argument("--centers", type=int, default=50)
+    parser.add_argument(
+        "--centers",
+        type=int,
+        help="Basis center count; defaults to 24 for >=6D, 32 for 4-5D, else 50",
+    )
     parser.add_argument("--order", type=int, default=0)
     parser.add_argument("--power", type=int, default=1)
     parser.add_argument("--length-scale", type=float)
+    parser.add_argument(
+        "--pilot-subsample-threshold",
+        type=int,
+        default=2_000,
+        help="Forwarded to gam fit; lower default is faster on large high-D fits",
+    )
+    parser.add_argument(
+        "--pilot-geometry-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip the expensive full-data anisotropy re-optimization after the pilot fit",
+    )
     parser.add_argument(
         "--double-penalty",
         action=argparse.BooleanOptionalAction,
@@ -44,24 +63,127 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--z-column",
+        help="If set, build a Bernoulli marginal-slope fit using this latent N(0,1) score column",
+    )
+    parser.add_argument(
+        "--logslope-features",
+        nargs="+",
+        help="Optional continuous columns for the logslope Duchon term; defaults to --features",
+    )
+    parser.add_argument(
+        "--main-linkwiggle-knots",
+        type=int,
+        help="Optional main-formula linkwiggle(knots=K) for marginal-slope link deviation",
+    )
+    parser.add_argument(
+        "--score-warp-knots",
+        type=int,
+        help="Optional logslope linkwiggle(knots=K) for marginal-slope score warp",
+    )
     return parser.parse_args()
 
 
-def build_formula(args: argparse.Namespace) -> str:
-    features = list(dict.fromkeys(args.features))
+def dedup_columns(columns: list[str]) -> list[str]:
+    return list(dict.fromkeys(columns))
+
+
+def default_centers(num_features: int) -> int:
+    if num_features >= 6:
+        return 24
+    if num_features >= 4:
+        return 32
+    return 50
+
+
+def build_duchon_term(
+    features: list[str],
+    *,
+    centers: int,
+    order: int,
+    power: int,
+    length_scale: float | None,
+    double_penalty: bool,
+) -> str:
     if len(features) < 2:
         raise SystemExit("--features needs at least 2 columns for a multidimensional Duchon term")
-
-    term_parts = [
+    parts = [
         ", ".join(features),
-        f"centers={args.centers}",
-        f"order={args.order}",
-        f"power={args.power}",
-        f"double_penalty={'true' if args.double_penalty else 'false'}",
+        f"centers={centers}",
+        f"order={order}",
+        f"power={power}",
+        f"double_penalty={'true' if double_penalty else 'false'}",
     ]
-    if args.length_scale is not None:
-        term_parts.append(f"length_scale={args.length_scale}")
-    return f"{args.response} ~ duchon({', '.join(term_parts)})"
+    if length_scale is not None:
+        parts.append(f"length_scale={length_scale}")
+    return f"duchon({', '.join(parts)})"
+
+
+def maybe_add_linkwiggle(terms: list[str], knots: int | None) -> None:
+    if knots is not None:
+        terms.append(f"linkwiggle(knots={knots})")
+
+
+def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
+    features = dedup_columns(args.features)
+    logslope_features = dedup_columns(args.logslope_features or features)
+    centers = args.centers if args.centers is not None else default_centers(len(features))
+
+    main_terms = [
+        build_duchon_term(
+            features,
+            centers=centers,
+            order=args.order,
+            power=args.power,
+            length_scale=args.length_scale,
+            double_penalty=args.double_penalty,
+        )
+    ]
+    maybe_add_linkwiggle(main_terms, args.main_linkwiggle_knots)
+    main_formula = f"{args.response} ~ {' + '.join(main_terms)}"
+
+    if args.z_column is None:
+        return main_formula, None
+
+    logslope_terms = [
+        build_duchon_term(
+            logslope_features,
+            centers=centers,
+            order=args.order,
+            power=args.power,
+            length_scale=args.length_scale,
+            double_penalty=args.double_penalty,
+        )
+    ]
+    maybe_add_linkwiggle(logslope_terms, args.score_warp_knots)
+    return main_formula, " + ".join(logslope_terms)
+
+
+def run_checked(cmd: list[str]) -> None:
+    proc: subprocess.Popen[str] | None = None
+    handled_signals = (signal.SIGINT, signal.SIGTERM)
+    old_handlers = {sig: signal.getsignal(sig) for sig in handled_signals}
+
+    def forward_and_exit(signum: int, _frame: object) -> None:
+        if proc is not None and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+        raise SystemExit(128 + signum)
+
+    try:
+        for sig in handled_signals:
+            signal.signal(sig, forward_and_exit)
+        proc = subprocess.Popen(cmd, cwd=REPO_ROOT, start_new_session=True)
+        rc = proc.wait()
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd)
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+        raise
+    finally:
+        for sig, old in old_handlers.items():
+            signal.signal(sig, old)
 
 
 def main() -> None:
@@ -69,25 +191,28 @@ def main() -> None:
     if (args.predict_csv is None) != (args.predict_out is None):
         raise SystemExit("--predict-csv and --predict-out must be provided together")
 
-    formula = build_formula(args)
+    main_formula, logslope_formula = build_formulas(args)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(args.gam_bin),
         "fit",
-        "--family",
-        args.family,
         "--adaptive-regularization",
         "true" if args.adaptive_regularization else "false",
         "--scale-dimensions",
-        "--out",
-        str(args.out),
-        str(args.csv),
-        formula,
+        "--pilot-subsample-threshold",
+        str(args.pilot_subsample_threshold),
     ]
+    if args.pilot_geometry_only:
+        cmd.append("--pilot-geometry-only")
+    if logslope_formula is not None:
+        cmd.extend(["--logslope-formula", logslope_formula, "--z-column", args.z_column])
+    cmd.extend(["--out", str(args.out), str(args.csv), main_formula])
 
-    print(formula)
-    subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+    print(main_formula, flush=True)
+    if logslope_formula is not None:
+        print(f"--logslope-formula {logslope_formula}", flush=True)
+    run_checked(cmd)
 
     if args.predict_csv is not None:
         args.predict_out.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +224,7 @@ def main() -> None:
             "--out",
             str(args.predict_out),
         ]
-        subprocess.run(predict_cmd, cwd=REPO_ROOT, check=True)
+        run_checked(predict_cmd)
 
 
 if __name__ == "__main__":

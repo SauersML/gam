@@ -570,9 +570,9 @@ impl CustomFamily for TransformationNormalFamily {
     fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
         crate::seeding::SeedConfig {
             bounds: (-12.0, 12.0),
-            max_seeds: if n_params <= 8 { 4 } else { 6 },
-            seed_budget: if n_params <= 6 { 2 } else { 3 },
-            screen_max_inner_iterations: 5,
+            max_seeds: if n_params <= 8 { 1 } else { 2 },
+            seed_budget: 1,
+            screen_max_inner_iterations: 2,
             risk_profile: crate::seeding::SeedRiskProfile::Gaussian,
             num_auxiliary_trailing: 0,
         }
@@ -2105,9 +2105,9 @@ mod tests {
         let (family, _, _, _) = toy_family_and_derivatives(&psi);
         let seed_config = family.outer_seed_config(6);
         assert_eq!(seed_config.bounds, (-12.0, 12.0));
-        assert_eq!(seed_config.max_seeds, 4);
-        assert_eq!(seed_config.seed_budget, 2);
-        assert_eq!(seed_config.screen_max_inner_iterations, 5);
+        assert_eq!(seed_config.max_seeds, 1);
+        assert_eq!(seed_config.seed_budget, 1);
+        assert_eq!(seed_config.screen_max_inner_iterations, 2);
         assert_eq!(
             seed_config.risk_profile,
             crate::seeding::SeedRiskProfile::Gaussian
@@ -2576,9 +2576,11 @@ pub fn fit_transformation_normal(
     // YES κ: use the N-block spatial length-scale optimizer (1 block).
     // ------------------------------------------------------------------
 
-    // Build ExactJointHyperSetup for 1 block.
+    // Seed the exact-joint [rho, psi] solve from a successful fixed-geometry
+    // transformation fit when possible. Starting from all-zero rho is brittle
+    // for multidimensional Duchon terms under scale-dimension optimization.
     let n_penalties = boot_design.penalties.len();
-    let rho0 = Array1::<f64>::zeros(n_penalties);
+    let mut rho0 = Array1::<f64>::zeros(n_penalties);
     let rho_lower = Array1::<f64>::from_elem(n_penalties, -12.0);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
     let kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(
@@ -2589,8 +2591,6 @@ pub fn fit_transformation_normal(
     let kappa_dims = kappa0.dims_per_term().to_vec();
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&kappa_dims, kappa_options);
     let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&kappa_dims, kappa_options);
-    let joint_setup =
-        ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
 
     // Check analytic derivative capability.
     let analytic_psi_available =
@@ -2629,8 +2629,22 @@ pub fn fit_transformation_normal(
             crate::solver::outer_strategy::Derivative::Analytic
         );
 
+    let baseline_fit = fit_custom_family(&probe_family, &probe_blocks, &options).ok();
+    if let Some(fit) = baseline_fit.as_ref() {
+        if fit.log_lambdas.len() == n_penalties {
+            rho0 = fit.log_lambdas.clone();
+        }
+    }
+
+    let joint_setup =
+        ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
+
     // Shared mutable state for warm-starting across optimizer iterations.
-    let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(None);
+    let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(
+        baseline_fit
+            .as_ref()
+            .and_then(|fit| fit.block_states.first().map(|block| block.beta.clone())),
+    );
     let exact_warm_start: RefCell<Option<CustomFamilyWarmStart>> = RefCell::new(None);
 
     // Clone response basis parts for use inside closures.
