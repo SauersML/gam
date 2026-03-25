@@ -8633,6 +8633,8 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             crate::estimate::reml::HyperDesignDerivative::from_implicit(
                 op.clone(),
                 ImplicitDerivLevel::SecondDiag(info.implicit_axis),
+                info.global_range.clone(),
+                info.total_p,
             )
         } else {
             crate::estimate::reml::HyperDesignDerivative::from_embedded(
@@ -8658,6 +8660,8 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                             crate::estimate::reml::HyperDesignDerivative::from_implicit(
                                 op.clone(),
                                 ImplicitDerivLevel::SecondCross(info.implicit_axis, b_axis),
+                                info.global_range.clone(),
+                                info.total_p,
                             )
                         } else {
                             crate::estimate::reml::HyperDesignDerivative::from_embedded(
@@ -8729,6 +8733,8 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             crate::estimate::reml::HyperDesignDerivative::from_implicit(
                 op.clone(),
                 ImplicitDerivLevel::First(info.implicit_axis),
+                info.global_range.clone(),
+                info.total_p,
             )
         } else {
             crate::estimate::reml::HyperDesignDerivative::from_embedded(

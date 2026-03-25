@@ -7,8 +7,8 @@ use gam::inference::model::{
 };
 use gam::pirls::PirlsStatus;
 use gam::types::{
-    LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization,
-    SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction,
+    LogLikelihoodNormalization, SasLinkState,
 };
 use ndarray::{Array1, Array2};
 use tempfile::tempdir;
@@ -35,7 +35,9 @@ fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
         outer_converged: true,
         outer_gradient_norm: 0.0,
         standard_deviation: 1.0,
-        covariance_conditional: None,
+        covariance_conditional: Some(
+            Array2::from_shape_vec((1, 1), vec![1.0e-3]).expect("1x1 covariance"),
+        ),
         covariance_corrected: None,
         inference: None,
         fitted_link,
@@ -83,7 +85,9 @@ fn minimal_survival_fit_result() -> UnifiedFitResult {
         outer_converged: true,
         outer_gradient_norm: 0.0,
         standard_deviation: 1.0,
-        covariance_conditional: None,
+        covariance_conditional: Some(
+            Array2::from_shape_vec((2, 2), vec![1.0e-3, 0.0, 0.0, 1.0e-3]).expect("2x2 covariance"),
+        ),
         covariance_corrected: None,
         inference: None,
         fitted_link: FittedLinkState::Standard(None),
@@ -169,6 +173,70 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     assert_eq!(
         payload.sas_param_covariance,
         Some(vec![vec![0.1, 0.02], vec![0.02, 0.2]])
+    );
+}
+
+#[test]
+fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
+    let latent_state = LatentCLogLogState::new(0.65).expect("valid latent state");
+    let mut payload = FittedModelPayload::new(
+        1,
+        "y ~ x".to_string(),
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+            link: Some(LinkFunction::CLogLog),
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "latent-cloglog-binomial".to_string(),
+    );
+    payload.fit_result = Some(minimal_fit_result(FittedLinkState::LatentCLogLog {
+        state: latent_state,
+    }));
+    payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
+    payload.training_headers = Some(vec![]);
+    payload.resolved_termspec = Some(gam::smooth::TermCollectionSpec {
+        linear_terms: vec![],
+        smooth_terms: vec![],
+        random_effect_terms: vec![],
+    });
+
+    let model = FittedModel::from_payload(payload);
+    let saved_state = model
+        .saved_latent_cloglog_state()
+        .expect("saved latent cloglog state")
+        .expect("expected synchronized latent cloglog state");
+    assert_eq!(saved_state, latent_state);
+    assert_eq!(
+        model
+            .resolved_inverse_link()
+            .expect("resolved inverse link"),
+        Some(InverseLink::LatentCLogLog(latent_state))
+    );
+
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("latent-cloglog-model.json");
+    model.save_to_path(&path).expect("save model");
+
+    let raw = std::fs::read_to_string(&path).expect("read model");
+    assert!(
+        raw.contains("\"latent_cloglog_state\""),
+        "serialized model should include synchronized family_state.latent_cloglog_state"
+    );
+
+    let loaded = FittedModel::load_from_path(&path).expect("load model");
+    let loaded_state = loaded
+        .saved_latent_cloglog_state()
+        .expect("loaded latent cloglog state")
+        .expect("expected loaded latent cloglog state");
+    assert_eq!(loaded_state, latent_state);
+    assert_eq!(
+        loaded
+            .resolved_inverse_link()
+            .expect("loaded resolved inverse link"),
+        Some(InverseLink::LatentCLogLog(latent_state))
     );
 }
 
