@@ -3031,7 +3031,7 @@ fn build_term_collection_design_inner(
         }
     }
 
-    let smooth = apply_spatial_orthogonality_to_parametric(
+    let smooth = apply_global_smooth_identifiability(
         smooth_raw,
         data,
         &spec.linear_terms,
@@ -3450,7 +3450,7 @@ fn build_constraint_block(
     parametric_block: Option<&Array2<f64>>,
     owner_blocks: &[&DesignMatrix],
 ) -> Array2<f64> {
-    let param_cols = parametric_block.map_or(0, Array2::ncols);
+    let param_cols = parametric_block.map_or(0, |mat| mat.ncols());
     let owner_cols: usize = owner_blocks.iter().map(|design| design.ncols()).sum();
     let mut block = Array2::<f64>::zeros((n, param_cols + owner_cols));
     let mut col_start = 0usize;
@@ -3522,8 +3522,9 @@ fn apply_global_smooth_identifiability(
         let term = &smooth.terms[idx];
         let termspec = &smoothspecs[idx];
         let design_local = smooth.term_designs[idx].clone();
-        let use_frozen_transform = smooth_has_frozen_identifiability(termspec);
-        let owner_indices = if use_frozen_transform {
+        let skip_global_transform =
+            smooth_has_frozen_identifiability(termspec) || term.shape != ShapeConstraint::None;
+        let owner_indices = if skip_global_transform {
             Vec::new()
         } else {
             processed_owner_indices
@@ -3542,7 +3543,7 @@ fn apply_global_smooth_identifiability(
                     .expect("owner design must be available before dependent smooth")
             })
             .collect::<Vec<_>>();
-        let c_local = if use_frozen_transform {
+        let c_local = if skip_global_transform {
             None
         } else {
             Some(build_constraint_block(
@@ -8304,7 +8305,7 @@ pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Ve
     spec.smooth_terms
         .iter()
         .enumerate()
-        .filter_map(|(idx, _)| get_spatial_length_scale(spec, idx).map(|_| idx))
+        .filter_map(|(idx, _)| spatial_term_supports_hyper_optimization(spec, idx).then_some(idx))
         .collect()
 }
 
@@ -11072,7 +11073,7 @@ where
     let all_dims = joint_setup.log_kappa_dims_per_term();
 
     // Build bootstrap designs and frozen specs for each block.
-    let (boot_designs, mut best_specs) = build_term_collection_designs_and_freeze_joint(
+    let (boot_designs, best_specs) = build_term_collection_designs_and_freeze_joint(
         data,
         block_specs,
     )
