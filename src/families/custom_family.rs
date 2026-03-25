@@ -7396,26 +7396,6 @@ fn normalize_outer_eval_error_detail(error: &str) -> &str {
         .unwrap_or(error)
 }
 
-fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    penalty_counts: &[usize],
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
-    let (obj, grad, _, warm) = outerobjectivegradienthessian(
-        family,
-        specs,
-        options,
-        penalty_counts,
-        rho,
-        warm_start,
-        EvalMode::ValueAndGradient,
-    )?;
-    Ok((obj, grad, warm))
-}
-
 /// Evaluate the joint outer hyper surface for the *currently realized* custom-family state.
 ///
 /// The caller has already applied the current spatial coordinates `psi` when
@@ -9734,6 +9714,26 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
+
+    fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
+        family: &F,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+        penalty_counts: &[usize],
+        rho: &Array1<f64>,
+        warm_start: Option<&ConstrainedWarmStart>,
+    ) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
+        let (obj, grad, _, warm) = outerobjectivegradienthessian(
+            family,
+            specs,
+            options,
+            penalty_counts,
+            rho,
+            warm_start,
+            EvalMode::ValueAndGradient,
+        )?;
+        Ok((obj, grad, warm))
+    }
 
     #[derive(Clone)]
     struct OneBlockIdentityFamily;

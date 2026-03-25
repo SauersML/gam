@@ -230,26 +230,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(crate) fn compute_joint_hypercostgradienthessian(
-        &self,
-        theta: &Array1<f64>,
-        rho_dim: usize,
-        hyper_dirs: &[DirectionalHyperParam],
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
-        let (cost, grad, hess) = self.compute_joint_hyper_eval(theta, rho_dim, hyper_dirs)?;
-        Ok((
-            cost,
-            grad,
-            hess.materialize_dense()
-                .map_err(EstimationError::RemlOptimizationFailed)?
-                .ok_or_else(|| {
-                    EstimationError::RemlOptimizationFailed(
-                        "joint hyper Hessian requested but unavailable".to_string(),
-                    )
-                })?,
-        ))
-    }
-
     pub(crate) fn build_tau_unified_objects_from_bundle(
         &self,
         rho: &Array1<f64>,
