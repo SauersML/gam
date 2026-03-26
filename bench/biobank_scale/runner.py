@@ -56,6 +56,11 @@ class MethodSpec:
     marginal_slope: bool = False
     scale_dimensions: bool = False
     z_column: str | None = None
+    pc_count: int = 16
+    mean_linkwiggle_knots: int | None = None
+    logslope_linkwiggle_knots: int | None = None
+    timewiggle_knots: int | None = None
+    max_centers: int | None = None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -69,6 +74,15 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def validate_method_spec(spec: MethodSpec) -> None:
+    if spec.pc_count <= 0:
+        raise RuntimeError(f"method '{spec.name}' must set pc_count > 0")
+    for key, value in (
+        ("mean_linkwiggle_knots", spec.mean_linkwiggle_knots),
+        ("logslope_linkwiggle_knots", spec.logslope_linkwiggle_knots),
+        ("timewiggle_knots", spec.timewiggle_knots),
+    ):
+        if value is not None and value < 3:
+            raise RuntimeError(f"method '{spec.name}' requires {key} >= 3")
     if spec.dataset == "disease":
         if spec.backend not in {"rust_gam", "r_mgcv"}:
             raise RuntimeError(
@@ -696,7 +710,7 @@ def generate_raw_cohort(cfg: dict[str, Any], out_dir: Path, smoke: bool) -> tupl
         cov = sample_covariance(mean, rng)
         n_local = base_n if not smoke else max(48, base_n // 5)
         pcs = rng.multivariate_normal(mean=mean, cov=cov, size=n_local)
-        for i in range(n_local):
+        for row_idx in range(n_local):
             subject_id += 1
             age_entry = rng.normal(56.0, 6.5)
             sex = int(rng.integers(0, 2))
@@ -704,7 +718,7 @@ def generate_raw_cohort(cfg: dict[str, Any], out_dir: Path, smoke: bool) -> tupl
             lon_true = tpl["lon"] + rng.normal(0.0, 0.95)
             lat_obs = lat_true if rng.random() < float(cfg["observed_latlon_fraction"]) else math.nan
             lon_obs = lon_true if math.isfinite(lat_obs) else math.nan
-            pgs = 0.55 * pcs[i, 0] - 0.25 * pcs[i, 2] + rng.normal(0.0, 1.0)
+            pgs = 0.55 * pcs[row_idx, 0] - 0.25 * pcs[row_idx, 2] + rng.normal(0.0, 1.0)
             rows.append(
                 {
                     "subject_id": subject_id,
@@ -718,7 +732,7 @@ def generate_raw_cohort(cfg: dict[str, Any], out_dir: Path, smoke: bool) -> tupl
                     "lat_obs": None if not math.isfinite(lat_obs) else float(lat_obs),
                     "lon_obs": None if not math.isfinite(lon_obs) else float(lon_obs),
                     "pgs_raw": float(pgs),
-                    **{f"pc{i+1}": float(pcs[i, i]) if i < 16 else 0.0 for i in range(16)},
+                    **{f"pc{pc_idx + 1}": float(pcs[row_idx, pc_idx]) for pc_idx in range(16)},
                 }
             )
     meta = {
@@ -855,6 +869,10 @@ def add_standardized_columns(train_rows: list[dict[str, Any]], test_rows: list[d
 
 def do_prepare(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
+    if args.target_n is not None:
+        cfg["target_n"] = int(args.target_n)
+    if args.smoke_target_n is not None:
+        cfg["smoke_target_n"] = int(args.smoke_target_n)
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     rows, raw_meta = generate_raw_cohort(cfg, out_dir, args.smoke)
@@ -910,10 +928,49 @@ def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
                 if item.get("z_column") is not None
                 else None
             ),
+            pc_count=int(item.get("pc_count", 16)),
+            mean_linkwiggle_knots=(
+                int(item["mean_linkwiggle_knots"])
+                if item.get("mean_linkwiggle_knots") is not None
+                else None
+            ),
+            logslope_linkwiggle_knots=(
+                int(item["logslope_linkwiggle_knots"])
+                if item.get("logslope_linkwiggle_knots") is not None
+                else None
+            ),
+            timewiggle_knots=(
+                int(item["timewiggle_knots"])
+                if item.get("timewiggle_knots") is not None
+                else None
+            ),
+            max_centers=(
+                int(item["max_centers"])
+                if item.get("max_centers") is not None
+                else None
+            ),
         )
         validate_method_spec(spec)
         out.append(spec)
     return out
+
+
+def count_csv_rows(path: Path) -> int:
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        return max(sum(1 for _ in fh) - 1, 0)
+
+
+def effective_marginal_slope_centers(spec: MethodSpec, train_rows: int) -> int:
+    centers = int(spec.centers or 50)
+    if spec.max_centers is not None:
+        centers = min(centers, int(spec.max_centers))
+    if train_rows >= 250000:
+        centers = min(centers, 28)
+    if train_rows >= 350000:
+        centers = min(centers, 24)
+    if spec.mean_linkwiggle_knots is not None or spec.logslope_linkwiggle_knots is not None:
+        centers = min(centers, 22)
+    return max(10, centers)
 
 
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
@@ -955,21 +1012,30 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
     return "phenotype ~ " + " + ".join(mean_terms), " + ".join(sigma_terms)
 
 
-def rust_marginal_slope_formula_classification(spec: MethodSpec) -> tuple[str, str]:
+def rust_marginal_slope_formula_classification(spec: MethodSpec, centers: int) -> tuple[str, str]:
     """Build mean and logslope formulas for 16D marginal-slope Duchon classification."""
-    pc_cols = ", ".join(f"pc{i}_std" for i in range(1, 17))
-    centers = int(spec.centers or 50)
-    spatial = f"duchon({pc_cols}, centers={centers}, order=0, power=1)"
+    pc_cols = ", ".join(f"pc{i}_std" for i in range(1, int(spec.pc_count) + 1))
+    if spec.spatial_basis == "duchon":
+        spatial = f"duchon({pc_cols}, centers={centers}, order=0, power=1)"
+    elif spec.spatial_basis == "matern":
+        spatial = f"matern({pc_cols}, centers={centers})"
+    else:
+        raise RuntimeError(
+            f"unsupported marginal-slope spatial basis '{spec.spatial_basis}' (use duchon or matern)"
+        )
     mean_terms = [
-        "pgs_std",
         "sex",
-        "smooth(age_entry_std)",
+        "age_entry_std",
         spatial,
     ]
     logslope_terms = [
-        "smooth(age_entry_std)",
+        "age_entry_std",
         spatial,
     ]
+    if spec.mean_linkwiggle_knots is not None:
+        mean_terms.append(f"linkwiggle(knots={int(spec.mean_linkwiggle_knots)})")
+    if spec.logslope_linkwiggle_knots is not None:
+        logslope_terms.append(f"linkwiggle(knots={int(spec.logslope_linkwiggle_knots)})")
     mean_formula = "phenotype ~ " + " + ".join(mean_terms)
     logslope_formula = " + ".join(logslope_terms)
     return mean_formula, logslope_formula
@@ -983,7 +1049,9 @@ def run_rust_marginal_slope_classification(
 ) -> dict[str, Any]:
     """Run 16D marginal-slope Duchon classification with optional anisotropy."""
     rust_bin = load_or_build_rust_binary()
-    mean_formula, logslope_formula = rust_marginal_slope_formula_classification(spec)
+    train_rows = count_csv_rows(train_csv)
+    centers = effective_marginal_slope_centers(spec, train_rows)
+    mean_formula, logslope_formula = rust_marginal_slope_formula_classification(spec, centers)
     z_column = spec.z_column or "pgs_std"
     model_path = out_dir / f"{spec.name}.model.json"
     pred_path = out_dir / f"{spec.name}.pred.csv"
@@ -1020,7 +1088,7 @@ def run_rust_marginal_slope_classification(
         "model_spec": (
             f"Rust 16D Duchon marginal-slope"
             f"{' aniso' if spec.scale_dimensions else ''}"
-            f" (z={z_column}, centers={spec.centers or 50}) holdout"
+            f" (z={z_column}, centers={centers}) holdout"
         ),
     }
 
@@ -1043,6 +1111,10 @@ def rust_survival_formula_rhs(spec: MethodSpec) -> str:
         "pc4_std",
         f"survmodel(spec=net, distribution={distribution})",
     ]
+    if spec.mean_linkwiggle_knots is not None:
+        terms.append(f"linkwiggle(knots={int(spec.mean_linkwiggle_knots)})")
+    if spec.timewiggle_knots is not None:
+        terms.append(f"timewiggle(knots={int(spec.timewiggle_knots)})")
     return " + ".join(terms)
 
 
@@ -1204,6 +1276,8 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
             str(train_fit_path),
             fit_formula,
         ]
+        if spec.timewiggle_knots is not None:
+            fit_cmd.extend(["--baseline-target", "gompertz-makeham"])
         t0 = time.perf_counter()
         rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
         fit_sec = time.perf_counter() - t0
@@ -1606,6 +1680,8 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     prep.add_argument("--out-dir", type=Path, required=True)
     prep.add_argument("--smoke", action="store_true")
+    prep.add_argument("--target-n", type=int, default=None)
+    prep.add_argument("--smoke-target-n", type=int, default=None)
     prep.set_defaults(func=do_prepare)
 
     matrix = sub.add_parser("matrix")

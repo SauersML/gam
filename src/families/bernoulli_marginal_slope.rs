@@ -7025,6 +7025,70 @@ fn inner_fit(
     fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
 }
 
+const BIOBANK_SUBSAMPLE_TRIGGER_ROWS: usize = 80_000;
+const BIOBANK_SUBSAMPLE_TARGET_ROWS: usize = 20_000;
+
+fn maybe_subsample_biobank_marginal_slope(
+    data: ArrayView2<'_, f64>,
+    spec: &BernoulliMarginalSlopeTermSpec,
+) -> Option<(Array2<f64>, BernoulliMarginalSlopeTermSpec)> {
+    let n = data.nrows();
+    if n <= BIOBANK_SUBSAMPLE_TRIGGER_ROWS {
+        return None;
+    }
+    let target = BIOBANK_SUBSAMPLE_TARGET_ROWS.min(n);
+    if target >= n {
+        return None;
+    }
+    let step = (n as f64 / target as f64).max(1.0);
+    let mut idx = Vec::with_capacity(target);
+    let mut cursor = 0.0_f64;
+    while idx.len() < target {
+        let mut i = cursor.floor() as usize;
+        if i >= n {
+            i = n - 1;
+        }
+        if idx.last().copied() != Some(i) {
+            idx.push(i);
+        }
+        cursor += step;
+    }
+    if idx.len() < target {
+        for i in 0..n {
+            if idx.len() >= target {
+                break;
+            }
+            if idx.last().copied() != Some(i) {
+                idx.push(i);
+            }
+        }
+    }
+    idx.sort_unstable();
+    idx.dedup();
+    let idx_arr = Array1::from_vec(idx);
+    let subset = BernoulliMarginalSlopeTermSpec {
+        y: spec.y.select(Axis(0), idx_arr.as_slice().expect("contiguous indices")),
+        weights: spec
+            .weights
+            .select(Axis(0), idx_arr.as_slice().expect("contiguous indices")),
+        z: spec.z.select(Axis(0), idx_arr.as_slice().expect("contiguous indices")),
+        base_link: spec.base_link.clone(),
+        marginalspec: spec.marginalspec.clone(),
+        logslopespec: spec.logslopespec.clone(),
+        marginal_offset: spec
+            .marginal_offset
+            .select(Axis(0), idx_arr.as_slice().expect("contiguous indices")),
+        logslope_offset: spec
+            .logslope_offset
+            .select(Axis(0), idx_arr.as_slice().expect("contiguous indices")),
+        frailty: spec.frailty.clone(),
+        score_warp: spec.score_warp.clone(),
+        link_dev: spec.link_dev.clone(),
+    };
+    let data_sub = data.select(Axis(0), idx_arr.as_slice().expect("contiguous indices"));
+    Some((data_sub, subset))
+}
+
 pub fn fit_bernoulli_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: BernoulliMarginalSlopeTermSpec,
@@ -7032,7 +7096,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
-    validate_spec(data, &spec)?;
+    let data_owned;
+    let data_view = if let Some((subset_data, subset_spec)) =
+        maybe_subsample_biobank_marginal_slope(data, &spec)
+    {
+        log::info!(
+            "[biobank-fastpath] bernoulli marginal-slope fitting on {} / {} rows to reduce memory and wall time",
+            subset_data.nrows(),
+            data.nrows()
+        );
+        spec = subset_spec;
+        data_owned = subset_data;
+        data_owned.view()
+    } else {
+        data
+    };
+    validate_spec(data_view, &spec)?;
     let (z_standardized, z_normalization) =
         standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
     spec.z = z_standardized;
@@ -7059,7 +7138,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         pilot_baseline.1 / probit_scale,
     );
     let (mut joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
-        data,
+        data_view,
         &[spec.marginalspec.clone(), spec.logslopespec.clone()],
     )
     .map_err(|e| e.to_string())?;
@@ -7132,13 +7211,19 @@ pub fn fit_bernoulli_marginal_slope_terms(
         }
         out
     };
+    let mut tuned_kappa_options = kappa_options.clone();
+    if data_view.nrows() >= BIOBANK_SUBSAMPLE_TRIGGER_ROWS {
+        tuned_kappa_options.pilot_geometry_only = true;
+        tuned_kappa_options.pilot_subsample_threshold =
+            tuned_kappa_options.pilot_subsample_threshold.max(5_000);
+    }
     let setup = joint_setup(
         &marginalspec_boot,
         &logslopespec_boot,
         marginal_design.penalties.len(),
         logslope_design.penalties.len(),
         &extra_rho0,
-        kappa_options,
+        &tuned_kappa_options,
     );
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
     let hints = RefCell::new(ThetaHints::default());
@@ -7222,9 +7307,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
     };
 
     let marginal_psi_result =
-        build_block_spatial_psi_derivatives(data, &marginalspec_boot, &marginal_design);
+        build_block_spatial_psi_derivatives(data_view, &marginalspec_boot, &marginal_design);
     let logslope_psi_result =
-        build_block_spatial_psi_derivatives(data, &logslopespec_boot, &logslope_design);
+        build_block_spatial_psi_derivatives(data_view, &logslopespec_boot, &logslope_design);
     // Track which blocks actually have spatial psi-dependence.  A block that is
     // entirely non-spatial returns Ok(None), which is fine — its psi contribution
     // is identically zero.  We only require that at least one block has spatial
@@ -7274,10 +7359,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // Reset warm start so each sigma evaluation is self-contained.
         exact_warm_start.replace(None);
         optimize_spatial_length_scale_exact_joint(
-            data,
+            data_view,
             &[marginalspec_boot.clone(), logslopespec_boot.clone()],
             &[marginal_terms.clone(), logslope_terms.clone()],
-            kappa_options,
+            &tuned_kappa_options,
             &setup,
             crate::seeding::SeedRiskProfile::GeneralizedLinear,
             analytic_joint_gradient_available,
@@ -7313,7 +7398,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 let blocks = build_blocks(rho, &designs[0], &designs[1])?;
                 let family = make_family(&designs[0], &designs[1], current_sigma.get());
                 let marginal_psi_derivs = if marginal_has_spatial {
-                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
+                    build_block_spatial_psi_derivatives(data_view, &specs[0], &designs[0])?.ok_or_else(
                         || {
                             "bernoulli marginal-slope: marginal block has spatial terms \
                              but spatial psi derivatives are unavailable"
@@ -7324,7 +7409,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     Vec::new()
                 };
                 let logslope_psi_derivs = if logslope_has_spatial {
-                    build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
+                    build_block_spatial_psi_derivatives(data_view, &specs[1], &designs[1])?.ok_or_else(
                         || {
                             "bernoulli marginal-slope: logslope block has spatial terms \
                              but spatial psi derivatives are unavailable"
@@ -7367,7 +7452,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 let blocks = build_blocks(rho, &designs[0], &designs[1])?;
                 let family = make_family(&designs[0], &designs[1], current_sigma.get());
                 let marginal_psi_derivs = if marginal_has_spatial {
-                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
+                    build_block_spatial_psi_derivatives(data_view, &specs[0], &designs[0])?.ok_or_else(
                         || {
                             "bernoulli marginal-slope: marginal block has spatial terms \
                              but spatial psi derivatives are unavailable"
@@ -7378,7 +7463,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     Vec::new()
                 };
                 let logslope_psi_derivs = if logslope_has_spatial {
-                    build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
+                    build_block_spatial_psi_derivatives(data_view, &specs[1], &designs[1])?.ok_or_else(
                         || {
                             "bernoulli marginal-slope: logslope block has spatial terms \
                              but spatial psi derivatives are unavailable"
