@@ -3723,7 +3723,7 @@ fn apply_global_smooth_identifiability(
         local_metadata[idx] = Some(with_identifiability_transform(
             &term.metadata,
             z_opt.as_ref(),
-        ));
+        )?);
         processed_owner_indices.push(idx);
     }
 
@@ -3992,44 +3992,61 @@ fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialI
 fn compose_identifiability_transforms(
     existing: Option<&Array2<f64>>,
     extra: Option<&Array2<f64>>,
-) -> Option<Array2<f64>> {
+) -> Result<Option<Array2<f64>>, BasisError> {
     match (existing, extra) {
-        (Some(lhs), Some(rhs)) => Some(lhs.dot(rhs)),
-        (Some(lhs), None) => Some(lhs.clone()),
-        (None, Some(rhs)) => Some(rhs.clone()),
-        (None, None) => None,
+        (Some(lhs), Some(rhs)) => {
+            if lhs.ncols() == rhs.nrows() {
+                Ok(Some(lhs.dot(rhs)))
+            } else if lhs.nrows() == rhs.nrows() && lhs.ncols() == rhs.ncols() {
+                // Rebuilding from an already-frozen spec can surface the same
+                // raw->frozen transform twice. Treat that as idempotent
+                // metadata, not a sequential Z_left * Z_right composition.
+                Ok(Some(rhs.clone()))
+            } else {
+                Err(BasisError::DimensionMismatch(format!(
+                    "identifiability transform mismatch: existing is {}x{}, extra is {}x{}",
+                    lhs.nrows(),
+                    lhs.ncols(),
+                    rhs.nrows(),
+                    rhs.ncols(),
+                )))
+            }
+        }
+        (Some(lhs), None) => Ok(Some(lhs.clone())),
+        (None, Some(rhs)) => Ok(Some(rhs.clone())),
+        (None, None) => Ok(None),
     }
 }
 
 fn with_identifiability_transform(
     metadata: &BasisMetadata,
     transform: Option<&Array2<f64>>,
-) -> BasisMetadata {
+) -> Result<BasisMetadata, BasisError> {
     match metadata {
         BasisMetadata::BSpline1D {
             knots,
             identifiability_transform,
-        } => BasisMetadata::BSpline1D {
+        } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
-            ),
-        },
+            )?,
+        }),
         BasisMetadata::ThinPlate {
             centers,
             length_scale,
             identifiability_transform,
             input_scales,
-        } => BasisMetadata::ThinPlate {
+        } => Ok(BasisMetadata::ThinPlate {
             centers: centers.clone(),
             length_scale: *length_scale,
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
-            ),
+            )?,
             input_scales: input_scales.clone(),
-        },
+        }),
         BasisMetadata::Matern {
             centers,
             length_scale,
@@ -4038,7 +4055,7 @@ fn with_identifiability_transform(
             identifiability_transform,
             input_scales,
             aniso_log_scales,
-        } => BasisMetadata::Matern {
+        } => Ok(BasisMetadata::Matern {
             centers: centers.clone(),
             length_scale: *length_scale,
             nu: *nu,
@@ -4046,10 +4063,10 @@ fn with_identifiability_transform(
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
-            ),
+            )?,
             input_scales: input_scales.clone(),
             aniso_log_scales: aniso_log_scales.clone(),
-        },
+        }),
         BasisMetadata::Duchon {
             centers,
             length_scale,
@@ -4058,7 +4075,7 @@ fn with_identifiability_transform(
             identifiability_transform,
             input_scales,
             aniso_log_scales,
-        } => BasisMetadata::Duchon {
+        } => Ok(BasisMetadata::Duchon {
             centers: centers.clone(),
             length_scale: *length_scale,
             power: *power,
@@ -4068,22 +4085,22 @@ fn with_identifiability_transform(
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
-            ),
-        },
+            )?,
+        }),
         BasisMetadata::TensorBSpline {
             feature_cols,
             knots,
             degrees,
             identifiability_transform,
-        } => BasisMetadata::TensorBSpline {
+        } => Ok(BasisMetadata::TensorBSpline {
             feature_cols: feature_cols.clone(),
             knots: knots.clone(),
             degrees: degrees.clone(),
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
-            ),
-        },
+            )?,
+        }),
     }
 }
 fn orthogonality_relative_residual_for_design(
@@ -10264,7 +10281,19 @@ fn finish_single_smooth_term_realization(
     // original design.  Apply it here if the spec carries one.
     let design_local = match spatial_identifiability_policy(termspec) {
         Some(SpatialIdentifiability::FrozenTransform { transform }) => {
-            let design_local = design.to_dense();
+            let design_local = if design.ncols() == transform.nrows() {
+                design.to_dense().dot(transform)
+            } else if design.ncols() == transform.ncols() {
+                design.to_dense()
+            } else {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen spatial identifiability transform mismatch in incremental realizer: \
+                     design has {} columns but transform is {}x{}",
+                    design.ncols(),
+                    transform.nrows(),
+                    transform.ncols(),
+                )));
+            };
             let active_penaltyinfo = term
                 .penaltyinfo_local
                 .iter()
@@ -10319,7 +10348,7 @@ fn finish_single_smooth_term_realization(
             term.penalties_local = penalties_local;
             term.nullspace_dims = nullspace_dims;
             term.penaltyinfo_local = penaltyinfo_local;
-            term.metadata = with_identifiability_transform(&term.metadata, Some(transform));
+            term.metadata = with_identifiability_transform(&term.metadata, Some(transform))?;
             design_local
         }
         _ => design.to_dense(),
