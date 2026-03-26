@@ -4,6 +4,8 @@
 
 It fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms, random effects, location-scale extensions, survival likelihoods, and flexible/learnable link functions. Smoothing parameters are selected by REML or LAML. Posterior sampling uses NUTS.
 
+Please open an issue if anything doesn't work as expected, if you'd like a new feature, or for questions.
+
 ## What's different
 
 - **Three-part penalty structure.** Each smooth gets separate penalties for magnitude, gradient, and curvature. Most GAM libraries use one (curvature only) or two (curvature + combined magnitude/gradient). The three-part structure gives the smoother more degrees of freedom to distinguish flat-but-offset functions from wiggly ones.
