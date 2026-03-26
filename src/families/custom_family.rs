@@ -461,6 +461,11 @@ pub struct FamilyEvaluation {
     pub blockworking_sets: Vec<BlockWorkingSet>,
 }
 
+pub struct ExactNewtonJointGradientEvaluation {
+    pub log_likelihood: f64,
+    pub gradient: Array1<f64>,
+}
+
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {
     /// Evaluate log-likelihood and per-block working quantities at current block predictors.
@@ -705,6 +710,16 @@ pub trait CustomFamily {
         &self,
         _: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
+    /// Optional exact joint log-likelihood / score evaluation in flattened
+    /// coefficient space without building per-block Hessian working sets.
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         Ok(None)
     }
 
@@ -4752,21 +4767,22 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             hessian_logdet_correction: curvature.hessian_logdet_correction,
         }));
     }
-    let exact_joint_source = if use_joint_matrix_free_path(total) {
-        hessian_workspace
-            .as_ref()
-            .map(|workspace| {
-                exact_newton_joint_hessian_source_from_workspace(
-                    workspace,
-                    total,
-                    "joint exact-newton operator mismatch in outer gradient",
-                )
-            })
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
+    let exact_joint_source =
+        if use_joint_matrix_free_path(total, joint_observation_count(block_states)) {
+            hessian_workspace
+                .as_ref()
+                .map(|workspace| {
+                    exact_newton_joint_hessian_source_from_workspace(
+                        workspace,
+                        total,
+                        "joint exact-newton operator mismatch in outer gradient",
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
     let exact_joint_source = match exact_joint_source {
         Some(source) => Some(source),
         None => exact_newton_joint_hessian_symmetrized(
@@ -5380,22 +5396,23 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         let logdet_h_total = logdet_h_scaled + curvature.hessian_logdet_correction;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
-    let exact_joint_source = if !strict_spd && use_joint_matrix_free_path(total) {
-        family
-            .exact_newton_joint_hessian_workspace(states, specs)?
-            .as_ref()
-            .map(|workspace| {
-                exact_newton_joint_hessian_source_from_workspace(
-                    workspace,
-                    total,
-                    "joint exact-newton operator mismatch in logdet terms",
-                )
-            })
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
+    let exact_joint_source =
+        if !strict_spd && use_joint_matrix_free_path(total, joint_observation_count(states)) {
+            family
+                .exact_newton_joint_hessian_workspace(states, specs)?
+                .as_ref()
+                .map(|workspace| {
+                    exact_newton_joint_hessian_source_from_workspace(
+                        workspace,
+                        total,
+                        "joint exact-newton operator mismatch in logdet terms",
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
     if let Some(JointHessianSource::Operator { apply, diagonal }) = exact_joint_source {
         let mut h = materialize_joint_hessian_source(
             &JointHessianSource::Operator { apply, diagonal },
@@ -5552,7 +5569,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let mut states = buildblock_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
-    let has_joint_exacthessian = if use_joint_matrix_free_path(total_joint_p) {
+    let total_joint_n = joint_observation_count(&states);
+    let has_joint_exacthessian = if use_joint_matrix_free_path(total_joint_p, total_joint_n) {
         let workspace = family.exact_newton_joint_hessian_workspace(&states, specs)?;
         match workspace.as_ref() {
             Some(workspace) => {
@@ -5612,10 +5630,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
-    let mut cached_eval = family.evaluate(&states)?;
+    let mut cached_eval: Option<FamilyEvaluation> = None;
+    let mut cached_joint_gradient: Option<Array1<f64>> = None;
+    let mut current_log_likelihood = 0.0_f64;
+    if use_joint_newton {
+        if let Some(joint_eval) = family.exact_newton_joint_gradient_evaluation(&states, specs)? {
+            current_log_likelihood = joint_eval.log_likelihood;
+            cached_joint_gradient = Some(joint_eval.gradient);
+        } else {
+            let eval = family.evaluate(&states)?;
+            current_log_likelihood = eval.log_likelihood;
+            cached_joint_gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
+            cached_eval = Some(eval);
+        }
+    } else {
+        let eval = family.evaluate(&states)?;
+        current_log_likelihood = eval.log_likelihood;
+        cached_eval = Some(eval);
+    }
     let mut current_penalty =
         total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-    let mut lastobjective = -cached_eval.log_likelihood + current_penalty;
+    let mut lastobjective = -current_log_likelihood + current_penalty;
     let mut converged = false;
     let mut cycles_done = 0usize;
     // Pre-allocate per-block eta backup buffers to avoid O(n) allocation
@@ -5661,7 +5696,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // Get joint Hessian and block gradients from the current evaluation.
-            let joint_hessian_source = if use_joint_matrix_free_path(total_p) {
+            let joint_hessian_source = if use_joint_matrix_free_path(total_p, total_joint_n) {
                 family
                     .exact_newton_joint_hessian_workspace(&states, specs)?
                     .as_ref()
@@ -5696,36 +5731,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             };
 
             // Concatenate block gradients and betas.
-            let mut grad_joint = Array1::<f64>::zeros(total_p);
+            let Some(mut grad_joint) = cached_joint_gradient.clone() else {
+                break;
+            };
+            if grad_joint.len() != total_p {
+                break;
+            }
             let mut beta_joint = Array1::<f64>::zeros(total_p);
-            for (b, ws) in cached_eval.blockworking_sets.iter().enumerate() {
+            for b in 0..specs.len() {
                 let (start, end) = ranges[b];
-                if let BlockWorkingSet::ExactNewton { gradient, .. } = ws {
-                    grad_joint
-                        .slice_mut(ndarray::s![start..end])
-                        .assign(gradient);
-                } else {
-                    break; // Not all blocks are ExactNewton
-                }
                 beta_joint
                     .slice_mut(ndarray::s![start..end])
                     .assign(&states[b].beta);
             }
 
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
-            let mut lhs = match materialize_joint_hessian_source(
-                &joint_hessian_source,
-                total_p,
-                "joint Newton inner Hessian materialization",
-            ) {
-                Ok(matrix) => matrix,
-                Err(_) => break,
-            };
-            add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, trace_diagonal_ridge);
 
             let (candidate_beta, joint_active_set) = if let Some(constraints) =
                 joint_constraints.as_ref()
             {
+                let mut lhs = match materialize_joint_hessian_source(
+                    &joint_hessian_source,
+                    total_p,
+                    "joint Newton inner constrained Hessian materialization",
+                ) {
+                    Ok(matrix) => matrix,
+                    Err(_) => break,
+                };
+                add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, trace_diagonal_ridge);
                 check_linear_feasibility(&beta_joint, constraints, 1e-8)
                     .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
                 let warm_joint_active =
@@ -5765,7 +5798,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_mode_diagonal_ridge,
                 );
                 let rhs = &grad_joint - &penalty_beta;
-                let mut delta = if use_joint_matrix_free_path(total_p) {
+                let mut delta = if use_joint_matrix_free_path(total_p, total_joint_n) {
                     let preconditioner_diag = match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
                             &h_joint.diag().to_owned(),
@@ -5833,6 +5866,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     None
                 };
                 if delta.is_none() {
+                    let mut lhs = match materialize_joint_hessian_source(
+                        &joint_hessian_source,
+                        total_p,
+                        "joint Newton inner dense fallback Hessian materialization",
+                    ) {
+                        Ok(matrix) => matrix,
+                        Err(_) => break,
+                    };
+                    add_joint_penalty_to_matrix(
+                        &mut lhs,
+                        &ranges,
+                        &s_lambdas,
+                        trace_diagonal_ridge,
+                    );
                     let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
                     delta = solver.solvevectorwithridge_retries(
                         &lhs,
@@ -5929,24 +5976,38 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
 
             // Re-evaluate for next iteration and convergence check
-            cached_eval = family.evaluate(&states)?;
+            if let Some(joint_eval) =
+                family.exact_newton_joint_gradient_evaluation(&states, specs)?
+            {
+                current_log_likelihood = joint_eval.log_likelihood;
+                cached_joint_gradient = Some(joint_eval.gradient);
+                cached_eval = None;
+            } else {
+                let eval = family.evaluate(&states)?;
+                current_log_likelihood = eval.log_likelihood;
+                cached_joint_gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
+                cached_eval = Some(eval);
+            }
             current_penalty =
                 total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-            lastobjective = -cached_eval.log_likelihood + current_penalty;
+            lastobjective = -current_log_likelihood + current_penalty;
             cycles_done = cycle + 1;
 
             // Check convergence via joint stationarity
-            if let Some(residual) = exact_newton_joint_stationarity_inf_norm(
-                &cached_eval,
+            let Some(gradient) = cached_joint_gradient.as_ref() else {
+                break;
+            };
+            let residual = exact_newton_joint_stationarity_inf_norm_from_gradient(
+                gradient,
                 &states,
+                specs,
                 &s_lambdas,
                 ridge,
                 options.ridge_policy,
-            )? {
-                if residual <= inner_tol && step_inf <= inner_tol {
-                    converged = true;
-                    break;
-                }
+            )?;
+            if residual <= inner_tol && step_inf <= inner_tol {
+                converged = true;
+                break;
             }
         }
 
@@ -5959,7 +6020,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
-                log_likelihood: cached_eval.log_likelihood,
+                log_likelihood: current_log_likelihood,
                 penalty_value,
                 cycles: cycles_done,
                 converged,
@@ -5970,6 +6031,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
         // Otherwise fall through to blockwise iteration below.
     }
+
+    let mut cached_eval = match cached_eval {
+        Some(eval) => eval,
+        None => family.evaluate(&states)?,
+    };
+    current_log_likelihood = cached_eval.log_likelihood;
+    lastobjective = -current_log_likelihood + current_penalty;
 
     let is_dynamic = family.block_geometry_is_dynamic();
     for cycle in 0..inner_max_cycles {
@@ -6885,7 +6953,7 @@ fn joint_outer_evaluate(
         .collect();
 
     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
-        if use_joint_matrix_free_path(total) {
+        if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
             let ranges_vec = ranges.to_vec();
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
@@ -7156,7 +7224,7 @@ fn joint_outer_evaluate_efs(
         .collect();
 
     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
-        if use_joint_matrix_free_path(total) {
+        if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
             let ranges_vec = ranges.to_vec();
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
@@ -8367,7 +8435,10 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                 true,
             )
         } else {
-            let h_joint_unpen = if use_joint_matrix_free_path(total) {
+            let h_joint_unpen = if use_joint_matrix_free_path(
+                total,
+                joint_observation_count(synced_joint_states.as_ref()),
+            ) {
                 hessian_workspace
                     .as_ref()
                     .map(|workspace| {
@@ -8943,7 +9014,10 @@ fn evaluate_custom_family_joint_hyper_efs_internal<
             true,
         )
     } else {
-        let h_joint_unpen = if use_joint_matrix_free_path(total) {
+        let h_joint_unpen = if use_joint_matrix_free_path(
+            total,
+            joint_observation_count(synced_joint_states.as_ref()),
+        ) {
             hessian_workspace
                 .as_ref()
                 .map(|workspace| {
@@ -9200,6 +9274,9 @@ fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
 }
 
 const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
+const JOINT_MATRIX_FREE_MIN_ROWS: usize = 50_000;
+const JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N: usize = 32;
+const JOINT_MATRIX_FREE_MIN_LINEAR_WORK: usize = 4_000_000;
 const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
 const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
@@ -9208,8 +9285,19 @@ pub(crate) fn joint_exact_analytic_outer_hessian_available() -> bool {
     true
 }
 
-fn use_joint_matrix_free_path(total_p: usize) -> bool {
+fn joint_observation_count(states: &[ParameterBlockState]) -> usize {
+    states
+        .iter()
+        .map(|state| state.eta.len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn use_joint_matrix_free_path(total_p: usize, total_n: usize) -> bool {
     total_p >= JOINT_MATRIX_FREE_MIN_DIM
+        || (total_n >= JOINT_MATRIX_FREE_MIN_ROWS
+            && total_p >= JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N)
+        || total_n.saturating_mul(total_p) >= JOINT_MATRIX_FREE_MIN_LINEAR_WORK
 }
 
 fn apply_joint_block_penalty(
@@ -9397,6 +9485,83 @@ fn exact_newton_joint_stationarity_inf_norm(
         inf_norm = inf_norm.max(block_inf);
     }
     Ok(Some(inf_norm))
+}
+
+fn exact_newton_joint_gradient_from_eval(
+    eval: &FamilyEvaluation,
+    specs: &[ParameterBlockSpec],
+) -> Result<Option<Array1<f64>>, String> {
+    if eval.blockworking_sets.len() != specs.len() {
+        return Err(format!(
+            "exact-newton joint gradient extraction: family returned {} block working sets, expected {}",
+            eval.blockworking_sets.len(),
+            specs.len()
+        ));
+    }
+    let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    let mut gradient = Array1::<f64>::zeros(total_p);
+    let mut offset = 0usize;
+    for (spec, work) in specs.iter().zip(eval.blockworking_sets.iter()) {
+        let width = spec.design.ncols();
+        let BlockWorkingSet::ExactNewton {
+            gradient: block_gradient,
+            ..
+        } = work
+        else {
+            return Ok(None);
+        };
+        if block_gradient.len() != width {
+            return Err(format!(
+                "exact-newton joint gradient extraction: block gradient length mismatch, got {}, expected {}",
+                block_gradient.len(),
+                width
+            ));
+        }
+        gradient
+            .slice_mut(ndarray::s![offset..offset + width])
+            .assign(block_gradient);
+        offset += width;
+    }
+    Ok(Some(gradient))
+}
+
+fn exact_newton_joint_stationarity_inf_norm_from_gradient(
+    gradient: &Array1<f64>,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<f64, String> {
+    if states.len() != specs.len() || states.len() != s_lambdas.len() {
+        return Err(
+            "exact-newton joint stationarity check from gradient: block dimension mismatch"
+                .to_string(),
+        );
+    }
+    let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    if gradient.len() != total_p {
+        return Err(format!(
+            "exact-newton joint stationarity check from gradient: joint gradient length mismatch, got {}, expected {}",
+            gradient.len(),
+            total_p
+        ));
+    }
+
+    let mut inf_norm = 0.0_f64;
+    let mut offset = 0usize;
+    for b in 0..states.len() {
+        let width = specs[b].design.ncols();
+        let mut residual =
+            s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![offset..offset + width]);
+        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+            residual += &states[b].beta.mapv(|v| ridge * v);
+        }
+        let block_inf = residual.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        inf_norm = inf_norm.max(block_inf);
+        offset += width;
+    }
+    Ok(inf_norm)
 }
 
 fn compute_joint_hessian_from_objective<F: CustomFamily + Clone + Send + Sync + 'static>(

@@ -40,8 +40,9 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices, sync_aniso_contrasts_from_metadata,
+    freeze_term_collection_from_design, is_pure_duchon_aniso_term,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    sync_aniso_contrasts_from_metadata,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use ndarray::{Array1, Array2, ArrayView2, s};
@@ -2752,9 +2753,6 @@ pub fn fit_transformation_normal(
         });
     }
 
-    let joint_setup =
-        ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
-
     // Shared mutable state for warm-starting across optimizer iterations.
     let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(
         baseline_fit
@@ -2762,6 +2760,53 @@ pub fn fit_transformation_normal(
             .and_then(|fit| fit.block_states.first().map(|block| block.beta.clone())),
     );
     let exact_warm_start: RefCell<Option<CustomFamilyWarmStart>> = RefCell::new(None);
+
+    let pure_duchon_aniso_only = spatial_terms
+        .iter()
+        .all(|&term_idx| is_pure_duchon_aniso_term(&boot_spec, term_idx));
+    let zero_aniso_seed = kappa0.as_array().iter().all(|value| value.abs() <= 1e-12);
+
+    if pure_duchon_aniso_only && zero_aniso_seed {
+        if let Some(fit) = baseline_fit.as_ref() {
+            // If the exact ψ gradient is already negligible at the baseline
+            // fit, the scale-dimensions solve would only spend time
+            // rediscovering the isotropic solution.
+            let cov_psi_derivs =
+                build_block_spatial_psi_derivatives(covariate_data, &boot_spec, &boot_design)?
+                    .ok_or_else(|| {
+                        "missing covariate spatial psi derivatives for transformation model"
+                            .to_string()
+                    })?;
+            let tensor_derivs = build_tensor_psi_derivatives(&probe_family, &cov_psi_derivs)?;
+            let derivative_blocks = vec![tensor_derivs];
+            let baseline_joint = evaluate_custom_family_joint_hyper(
+                &probe_family,
+                &probe_blocks,
+                &options,
+                &rho0,
+                &derivative_blocks,
+                None,
+                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
+            )
+            .map_err(|e| format!("transformation baseline exact-joint eval: {e}"))?;
+            let psi_grad = baseline_joint.gradient.slice(s![n_penalties..]);
+            let psi_grad_max = psi_grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            exact_warm_start.replace(Some(baseline_joint.warm_start));
+            if psi_grad_max <= (10.0_f64 * options.outer_tol).max(1e-4) {
+                let mut cov_spec_resolved = boot_spec.clone();
+                sync_aniso_contrasts_from_metadata(&mut cov_spec_resolved, &boot_design.smooth);
+                return Ok(TransformationNormalFitResult {
+                    family: probe_family,
+                    fit: fit.clone(),
+                    covariate_spec_resolved: cov_spec_resolved,
+                    covariate_design: boot_design,
+                });
+            }
+        }
+    }
+
+    let joint_setup =
+        ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
 
     // Clone response basis parts for use inside closures.
     let rv = resp_val.clone();
