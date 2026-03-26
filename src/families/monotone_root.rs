@@ -85,8 +85,7 @@ pub fn solve_monotone_root(
         ));
     };
 
-    // Normalise to lo/hi with f(lo) <= 0 <= f(hi).
-    let (mut lo, mut hi) = if f_init_negative {
+    let (mut neg_pt, mut pos_pt) = if f_init_negative {
         (same_side, other)
     } else {
         (other, same_side)
@@ -115,6 +114,11 @@ pub fn solve_monotone_root(
     }
 
     for _ in 0..max_refine_iters {
+        let (lo, hi) = if neg_pt <= pos_pt {
+            (neg_pt, pos_pt)
+        } else {
+            (pos_pt, neg_pt)
+        };
         let mid = 0.5 * (lo + hi);
         let (f_mid, f_a_mid, f_aa_mid) = eval(mid)?;
         update_best(
@@ -178,12 +182,17 @@ pub fn solve_monotone_root(
         };
 
         if f_bracket <= 0.0 {
-            lo = bracket_pt;
+            neg_pt = bracket_pt;
         } else {
-            hi = bracket_pt;
+            pos_pt = bracket_pt;
         }
 
-        if (hi - lo).abs() <= convergence_tol * (1.0 + hi.abs() + lo.abs()) {
+        let (next_lo, next_hi) = if neg_pt <= pos_pt {
+            (neg_pt, pos_pt)
+        } else {
+            (pos_pt, neg_pt)
+        };
+        if (next_hi - next_lo).abs() <= convergence_tol * (1.0 + next_hi.abs() + next_lo.abs()) {
             break;
         }
     }
@@ -200,4 +209,62 @@ pub fn solve_monotone_root(
     }
 
     Ok((best_a, best_abs_deriv))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::solve_monotone_root;
+    use std::cell::RefCell;
+
+    #[test]
+    fn solve_monotone_root_converges_for_increasing_function() {
+        let (root, abs_deriv) = solve_monotone_root(
+            |a| {
+                let ea = a.exp();
+                Ok((ea - 2.0, ea, ea))
+            },
+            0.0,
+            "increasing",
+            1e-12,
+            32,
+            32,
+        )
+        .expect("root");
+
+        assert!((root - std::f64::consts::LN_2).abs() < 1e-10);
+        assert!((abs_deriv - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn solve_monotone_root_accepts_halley_probe_for_decreasing_function() {
+        let eval_points = RefCell::new(Vec::new());
+        let (root, abs_deriv) = solve_monotone_root(
+            |a| {
+                eval_points.borrow_mut().push(a);
+                let ea = (-a).exp();
+                Ok((ea - 0.5, -ea, ea))
+            },
+            0.0,
+            "decreasing",
+            1e-12,
+            32,
+            32,
+        )
+        .expect("root");
+
+        let f_mid = (-0.5f64).exp() - 0.5;
+        let f_a_mid = -(-0.5f64).exp();
+        let f_aa_mid = (-0.5f64).exp();
+        let expected_probe =
+            0.5 - (2.0 * f_mid * f_a_mid) / (2.0 * f_a_mid * f_a_mid - f_mid * f_aa_mid);
+        assert!((root - std::f64::consts::LN_2).abs() < 1e-10);
+        assert!((abs_deriv - 0.5).abs() < 1e-10);
+        assert!(
+            eval_points
+                .borrow()
+                .iter()
+                .copied()
+                .any(|a| (a - expected_probe).abs() < 1e-12)
+        );
+    }
 }

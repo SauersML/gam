@@ -171,6 +171,17 @@ fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+fn is_exact_ident(raw: &str) -> bool {
+    let mut chars = raw.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+}
+
 pub fn parse_function_call(input: &str) -> Result<FunctionCallSpec, String> {
     validate_balanced_delimiters(input, "invalid function call syntax")?;
     let mut parsed = FormulaParser::parse(Rule::top_function_call, input)
@@ -282,6 +293,14 @@ mod tests {
     fn parse_function_call_reports_unbalanced_parentheses() {
         let err = parse_function_call("s(x, k=10").expect_err("expected parse failure");
         assert!(err.contains("unbalanced parentheses"));
+    }
+
+    #[test]
+    fn parse_formula_rejects_unsupported_top_level_rhs_expressions() {
+        for formula in ["y ~ x - z", "y ~ -x", "y ~ x / z", "y ~ (x)", "y ~ x - 1"] {
+            let err = parse_formula(formula).expect_err("expected formula parse failure");
+            assert!(err.contains("unsupported top-level RHS term"));
+        }
     }
 
     #[test]
@@ -1184,8 +1203,13 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
         }
     }
 
+    let ident = raw.trim();
+    if !is_exact_ident(ident) {
+        return Err(format!("unsupported top-level RHS term: {raw}"));
+    }
+
     Ok(ParsedTerm::Linear {
-        name: raw.trim().to_string(),
+        name: ident.to_string(),
         explicit: false,
         coefficient_min: None,
         coefficient_max: None,

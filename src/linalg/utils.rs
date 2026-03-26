@@ -340,7 +340,7 @@ where
     F: Fn(&Array1<f64>) -> Array1<f64>,
 {
     let p = rhs.len();
-    if p == 0 || preconditioner_diag.len() != p {
+    if p == 0 || preconditioner_diag.len() != p || max_iter == 0 {
         return None;
     }
     let rhs_norm = rhs.dot(rhs).sqrt();
@@ -371,7 +371,7 @@ where
         return None;
     }
 
-    for iter in 0..max_iter.max(1) {
+    for iter in 0..max_iter {
         let ap = apply(&p_dir);
         let denom = p_dir.dot(&ap);
         if !denom.is_finite() || denom <= 0.0 {
@@ -741,7 +741,7 @@ impl RidgePlanner {
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_hit_step_fraction, default_slq_parameters, solve_spd_pcg,
+        boundary_hit_step_fraction, default_slq_parameters, solve_spd_pcg, solve_spd_pcg_with_info,
         stochastic_lanczos_logdet_spd, stochastic_lanczos_logdet_spd_operator,
     };
     use crate::faer_ndarray::FaerCholesky;
@@ -774,6 +774,15 @@ mod tests {
         let x = solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-10, 20).expect("pcg solve");
         assert!((x[0] - 0.0909090909).abs() < 1e-8);
         assert!((x[1] - 0.6363636363).abs() < 1e-8);
+    }
+
+    #[test]
+    fn solve_spd_pcg_rejects_zero_iteration_budget() {
+        let h = array![[4.0, 1.0], [1.0, 3.0]];
+        let b = array![1.0, 2.0];
+        let m = Array1::from_vec(vec![4.0, 3.0]);
+        assert!(solve_spd_pcg_with_info(|v| h.dot(v), &b, &m, 1e-10, 0).is_none());
+        assert!(solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-10, 0).is_none());
     }
 
     #[test]

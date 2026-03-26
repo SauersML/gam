@@ -4060,17 +4060,13 @@ fn binomial_location_scale_core(
         return Err("binomial location-scale core wiggle size mismatch".to_string());
     }
 
-    // Use uninit to skip wasted zero-fill — every element is written in the loop.
-    let (mut sigma, mut dsigma_deta, mut q0, mut mu, mut dmu_dq, mut d2mu_dq2, mut d3mu_dq3);
-    unsafe {
-        sigma = Array1::<f64>::uninit(n).assume_init();
-        dsigma_deta = Array1::<f64>::uninit(n).assume_init();
-        q0 = Array1::<f64>::uninit(n).assume_init();
-        mu = Array1::<f64>::uninit(n).assume_init();
-        dmu_dq = Array1::<f64>::uninit(n).assume_init();
-        d2mu_dq2 = Array1::<f64>::uninit(n).assume_init();
-        d3mu_dq3 = Array1::<f64>::uninit(n).assume_init();
-    }
+    let mut sigma = Array1::<f64>::uninit(n);
+    let mut dsigma_deta = Array1::<f64>::uninit(n);
+    let mut q0 = Array1::<f64>::uninit(n);
+    let mut mu = Array1::<f64>::uninit(n);
+    let mut dmu_dq = Array1::<f64>::uninit(n);
+    let mut d2mu_dq2 = Array1::<f64>::uninit(n);
+    let mut d3mu_dq3 = Array1::<f64>::uninit(n);
     let mut ll = 0.0;
 
     for i in 0..n {
@@ -4082,24 +4078,24 @@ fn binomial_location_scale_core(
             etawiggle.map_or(0.0, |w| w[i]),
             link_kind,
         )?;
-        sigma[i] = row.sigma;
-        dsigma_deta[i] = row.dsigma_deta;
-        q0[i] = row.q0;
-        mu[i] = row.inverse_link.mu;
-        dmu_dq[i] = row.inverse_link.d1;
-        d2mu_dq2[i] = row.inverse_link.d2;
-        d3mu_dq3[i] = row.inverse_link.d3;
+        sigma[i].write(row.sigma);
+        dsigma_deta[i].write(row.dsigma_deta);
+        q0[i].write(row.q0);
+        mu[i].write(row.inverse_link.mu);
+        dmu_dq[i].write(row.inverse_link.d1);
+        d2mu_dq2[i].write(row.inverse_link.d2);
+        d3mu_dq3[i].write(row.inverse_link.d3);
         ll += row.ll;
     }
 
     Ok(BinomialLocationScaleCore {
-        sigma,
-        dsigma_deta,
-        q0,
-        mu,
-        dmu_dq,
-        d2mu_dq2,
-        d3mu_dq3,
+        sigma: unsafe { sigma.assume_init() },
+        dsigma_deta: unsafe { dsigma_deta.assume_init() },
+        q0: unsafe { q0.assume_init() },
+        mu: unsafe { mu.assume_init() },
+        dmu_dq: unsafe { dmu_dq.assume_init() },
+        d2mu_dq2: unsafe { d2mu_dq2.assume_init() },
+        d3mu_dq3: unsafe { d3mu_dq3.assume_init() },
         log_likelihood: ll,
     })
 }
@@ -5796,11 +5792,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
         // so these Diagonal weights are only used for the inner IRLS iteration
         // (where Fisher scoring is fine). See response.md Section 3.
         //
-        // SAFETY: every element is written before being read in the loop below.
-        let mut zmu = unsafe { Array1::<f64>::uninit(n).assume_init() };
-        let mut wmu = unsafe { Array1::<f64>::uninit(n).assume_init() };
-        let mut z_ls = unsafe { Array1::<f64>::uninit(n).assume_init() };
-        let mut w_ls = unsafe { Array1::<f64>::uninit(n).assume_init() };
+        let mut zmu = Array1::<f64>::zeros(n);
+        let mut wmu = Array1::<f64>::zeros(n);
+        let mut z_ls = Array1::<f64>::zeros(n);
+        let mut w_ls = Array1::<f64>::zeros(n);
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
 

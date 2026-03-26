@@ -69,9 +69,7 @@ fn solve_symmetric_system(
     out: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
     if out.len() != rhs.len() {
-        unsafe {
-            *out = Array1::uninit(rhs.len()).assume_init();
-        }
+        *out = Array1::zeros(rhs.len());
     }
     out.assign(rhs);
     let factor = StableSolver::new("active-set symmetric system")
