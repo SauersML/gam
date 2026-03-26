@@ -125,6 +125,14 @@ impl<'a> EmbeddedColumnBlock<'a> {
     }
 
     pub fn materialize(&self) -> Array2<f64> {
+        if self.local.nrows() == 0 {
+            return Array2::<f64>::zeros((0, self.total_cols));
+        }
+        debug_assert_eq!(
+            self.local.ncols(),
+            self.global_range.len(),
+            "embedded column block width mismatch"
+        );
         let mut out = Array2::<f64>::zeros((self.local.nrows(), self.total_cols));
         out.slice_mut(ndarray::s![.., self.global_range.clone()])
             .assign(self.local);
@@ -5391,6 +5399,7 @@ impl From<&DesignMatrix> for DesignBlock {
 mod tests {
     use super::{
         ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
+        EmbeddedColumnBlock,
         SparseDesignMatrix, dense_matvec, dense_transpose_matvec,
         dense_transpose_weighted_response,
     };
@@ -5930,5 +5939,12 @@ mod tests {
             .map(|v: &f64| v.abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-10, "3D X'Xβ mismatch: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn embedded_column_block_zero_row_local_materializes_empty_global_width() {
+        let local = Array2::<f64>::zeros((0, 0));
+        let out = EmbeddedColumnBlock::new(&local, 2..5, 7).materialize();
+        assert_eq!(out.dim(), (0, 7));
     }
 }

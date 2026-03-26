@@ -42,6 +42,7 @@ use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
+    sync_aniso_contrasts_from_metadata,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use ndarray::{Array1, Array2, ArrayView2, s};
@@ -2616,13 +2617,8 @@ pub fn fit_transformation_normal(
         warm_start,
     )?;
     let probe_blocks = vec![probe_family.block_spec()];
-    let (cap_gradient, cap_hessian) =
-        custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
-    let analytic_gradient = analytic_psi_available
-        && matches!(
-            cap_gradient,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+    let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
+    let analytic_gradient = analytic_psi_available;
     let analytic_hessian = analytic_psi_available
         && matches!(
             cap_hessian,
@@ -2634,6 +2630,21 @@ pub fn fit_transformation_normal(
         if fit.log_lambdas.len() == n_penalties {
             rho0 = fit.log_lambdas.clone();
         }
+    }
+
+    if !analytic_psi_available {
+        let fit = baseline_fit.ok_or_else(|| {
+            "transformation fit failed before scale-dimensions optimization and analytic spatial psi derivatives are unavailable"
+                .to_string()
+        })?;
+        let mut cov_spec_resolved = boot_spec.clone();
+        sync_aniso_contrasts_from_metadata(&mut cov_spec_resolved, &boot_design.smooth);
+        return Ok(TransformationNormalFitResult {
+            family: probe_family,
+            fit,
+            covariate_spec_resolved: cov_spec_resolved,
+            covariate_design: boot_design,
+        });
     }
 
     let joint_setup =

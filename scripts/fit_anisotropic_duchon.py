@@ -42,6 +42,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--power", type=int, default=1)
     parser.add_argument("--length-scale", type=float)
     parser.add_argument(
+        "--pure-duchon",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Disable the wrapper's large-data hybrid default. When not set, "
+            "fits with >=6 features default to length_scale=1.0 because the "
+            "hybrid Duchon path is much faster and more stable."
+        ),
+    )
+    parser.add_argument(
         "--pilot-subsample-threshold",
         type=int,
         default=2_000,
@@ -129,6 +139,7 @@ def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
     features = dedup_columns(args.features)
     logslope_features = dedup_columns(args.logslope_features or features)
     centers = args.centers if args.centers is not None else default_centers(len(features))
+    length_scale = resolved_length_scale(args, len(features))
 
     main_terms = [
         build_duchon_term(
@@ -136,7 +147,7 @@ def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
             centers=centers,
             order=args.order,
             power=args.power,
-            length_scale=args.length_scale,
+            length_scale=length_scale,
             double_penalty=args.double_penalty,
         )
     ]
@@ -152,12 +163,22 @@ def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
             centers=centers,
             order=args.order,
             power=args.power,
-            length_scale=args.length_scale,
+            length_scale=length_scale,
             double_penalty=args.double_penalty,
         )
     ]
     maybe_add_linkwiggle(logslope_terms, args.score_warp_knots)
     return main_formula, " + ".join(logslope_terms)
+
+
+def resolved_length_scale(args: argparse.Namespace, num_features: int) -> float | None:
+    if args.pure_duchon:
+        return None
+    if args.length_scale is not None:
+        return args.length_scale
+    if num_features >= 6:
+        return 1.0
+    return None
 
 
 def run_checked(cmd: list[str]) -> None:
