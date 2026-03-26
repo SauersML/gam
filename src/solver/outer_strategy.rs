@@ -2000,8 +2000,7 @@ fn screen_seed_candidates(
                     screening_guard.previous
                 );
             }
-            obj
-                .eval_cost(&seed)
+            obj.eval_cost(&seed)
                 .map_err(|err| into_objective_error("outer eval_cost failed", err))
         };
         let cost = match cost {

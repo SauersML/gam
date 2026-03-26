@@ -338,6 +338,19 @@ pub trait HessianDerivativeProvider: Send + Sync {
         v_k: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String>;
 
+    /// Operator-capable version of `hessian_derivative_correction`.
+    ///
+    /// Implementations may override this to return matrix-free or composite
+    /// drifts without forcing dense materialization.
+    fn hessian_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        Ok(self
+            .hessian_derivative_correction(v_k)?
+            .map(DriftDerivResult::Dense))
+    }
+
     /// Compute the second-order correction to H_{k,l} for the outer Hessian.
     ///
     /// Returns `None` if not needed or not implemented.
@@ -348,6 +361,18 @@ pub trait HessianDerivativeProvider: Send + Sync {
         _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
+    }
+
+    /// Operator-capable version of `hessian_second_derivative_correction`.
+    fn hessian_second_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        Ok(self
+            .hessian_second_derivative_correction(v_k, v_l, u_kl)?
+            .map(DriftDerivResult::Dense))
     }
 
     /// Whether this provider has non-trivial corrections.
@@ -405,9 +430,11 @@ pub enum OuterHessianDerivativeKernel {
         x: DesignMatrix,
     },
     Callback {
-        first: Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>,
+        first: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
         second: Arc<
-            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync,
+            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                + Send
+                + Sync,
         >,
     },
 }
@@ -887,6 +914,28 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
         }
     }
 
+    fn hessian_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        let neg_v_k = v_k.mapv(|x| -x);
+        let barrier_corr = self.barrier_correction(&neg_v_k);
+        match self.inner.hessian_derivative_correction_result(v_k)? {
+            Some(DriftDerivResult::Dense(mut dense)) => {
+                dense += &barrier_corr;
+                Ok(Some(DriftDerivResult::Dense(dense)))
+            }
+            Some(DriftDerivResult::Operator(operator)) => Ok(Some(DriftDerivResult::Operator(
+                Arc::new(CompositeHyperOperator {
+                    dense: Some(barrier_corr),
+                    operators: vec![operator],
+                    dim_hint: self.p,
+                }),
+            ))),
+            None => Ok(Some(DriftDerivResult::Dense(barrier_corr))),
+        }
+    }
+
     fn hessian_second_derivative_correction(
         &self,
         v_k: &Array1<f64>,
@@ -904,6 +953,33 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
                 Ok(Some(ic))
             }
             None => Ok(Some(barrier_total)),
+        }
+    }
+
+    fn hessian_second_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        let barrier_total =
+            &self.barrier_correction(u_kl) + &self.barrier_second_correction(v_k, v_l);
+        match self
+            .inner
+            .hessian_second_derivative_correction_result(v_k, v_l, u_kl)?
+        {
+            Some(DriftDerivResult::Dense(mut dense)) => {
+                dense += &barrier_total;
+                Ok(Some(DriftDerivResult::Dense(dense)))
+            }
+            Some(DriftDerivResult::Operator(operator)) => Ok(Some(DriftDerivResult::Operator(
+                Arc::new(CompositeHyperOperator {
+                    dense: Some(barrier_total),
+                    operators: vec![operator],
+                    dim_hint: self.p,
+                }),
+            ))),
+            None => Ok(Some(DriftDerivResult::Dense(barrier_total))),
         }
     }
 
@@ -1051,7 +1127,30 @@ impl HyperCoordPair {
 /// Result of a fixed-drift derivative evaluation: can be dense or operator-backed.
 pub enum DriftDerivResult {
     Dense(Array2<f64>),
-    Operator(Box<dyn HyperOperator>),
+    Operator(Arc<dyn HyperOperator>),
+}
+
+impl DriftDerivResult {
+    pub fn into_operator(self) -> Arc<dyn HyperOperator> {
+        match self {
+            Self::Dense(matrix) => Arc::new(DenseMatrixHyperOperator { matrix }),
+            Self::Operator(operator) => operator,
+        }
+    }
+
+    pub fn trace_logdet(&self, hop: &dyn HessianOperator) -> f64 {
+        match self {
+            Self::Dense(matrix) => hop.trace_logdet_gradient(matrix),
+            Self::Operator(operator) => hop.trace_logdet_operator(operator.as_ref()),
+        }
+    }
+
+    pub fn trace_hinv(&self, hop: &dyn HessianOperator) -> f64 {
+        match self {
+            Self::Dense(matrix) => hop.trace_hinv_product(matrix),
+            Self::Operator(operator) => hop.trace_hinv_operator(operator.as_ref()),
+        }
+    }
 }
 
 pub type FixedDriftDerivFn =
@@ -1104,6 +1203,76 @@ pub trait HyperOperator: Send + Sync {
     /// computations instead of O(p²).
     fn block_local_data(&self) -> Option<(&Array2<f64>, usize, usize)> {
         None
+    }
+}
+
+/// Dense matrix wrapper implementing `HyperOperator`.
+#[derive(Clone)]
+pub struct DenseMatrixHyperOperator {
+    pub matrix: Array2<f64>,
+}
+
+impl HyperOperator for DenseMatrixHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.matrix.dot(v)
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        u.dot(&self.matrix.dot(v))
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.matrix.clone()
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone)]
+pub struct CompositeHyperOperator {
+    pub dense: Option<Array2<f64>>,
+    pub operators: Vec<Arc<dyn HyperOperator>>,
+    pub dim_hint: usize,
+}
+
+impl HyperOperator for CompositeHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(v.len());
+        if let Some(dense) = self.dense.as_ref() {
+            out += &dense.dot(v);
+        }
+        for op in &self.operators {
+            out += &op.mul_vec(v);
+        }
+        out
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        let mut total = 0.0;
+        if let Some(dense) = self.dense.as_ref() {
+            total += u.dot(&dense.dot(v));
+        }
+        for op in &self.operators {
+            total += op.bilinear(v, u);
+        }
+        total
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = self
+            .dense
+            .clone()
+            .unwrap_or_else(|| Array2::<f64>::zeros((self.dim_hint, self.dim_hint)));
+        for op in &self.operators {
+            out += &op.to_dense();
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        self.operators.iter().any(|op| op.is_implicit())
     }
 }
 
@@ -2537,6 +2706,79 @@ fn trace_hinv_penalty_cross(
     }
 }
 
+fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) -> Arc<dyn HyperOperator> {
+    struct OwnedPenaltyHyperOperator {
+        coord: PenaltyCoordinate,
+        scale: f64,
+    }
+
+    impl HyperOperator for OwnedPenaltyHyperOperator {
+        fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+            self.coord.apply_penalty(v, self.scale)
+        }
+
+        fn to_dense(&self) -> Array2<f64> {
+            self.coord.scaled_dense_matrix(self.scale)
+        }
+
+        fn is_implicit(&self) -> bool {
+            false
+        }
+    }
+
+    Arc::new(OwnedPenaltyHyperOperator { coord, scale })
+}
+
+fn penalty_total_drift_result(
+    coord: &PenaltyCoordinate,
+    scale: f64,
+    correction: Option<&DriftDerivResult>,
+) -> DriftDerivResult {
+    match correction {
+        Some(DriftDerivResult::Dense(corr)) => {
+            if coord.uses_operator_fast_path() {
+                DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                    dense: Some(corr.clone()),
+                    operators: vec![penalty_coord_to_operator(coord.clone(), scale)],
+                    dim_hint: coord.dim(),
+                }))
+            } else {
+                let mut dense = coord.scaled_dense_matrix(scale);
+                dense += corr;
+                DriftDerivResult::Dense(dense)
+            }
+        }
+        Some(DriftDerivResult::Operator(corr_op)) => {
+            DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                dense: if coord.uses_operator_fast_path() {
+                    None
+                } else {
+                    Some(coord.scaled_dense_matrix(scale))
+                },
+                operators: {
+                    let mut ops = vec![Arc::clone(corr_op)];
+                    if coord.uses_operator_fast_path() {
+                        ops.push(penalty_coord_to_operator(coord.clone(), scale));
+                    }
+                    ops
+                },
+                dim_hint: coord.dim(),
+            }))
+        }
+        None => {
+            if coord.uses_operator_fast_path() {
+                DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                    dense: None,
+                    operators: vec![penalty_coord_to_operator(coord.clone(), scale)],
+                    dim_hint: coord.dim(),
+                }))
+            } else {
+                DriftDerivResult::Dense(coord.scaled_dense_matrix(scale))
+            }
+        }
+    }
+}
+
 fn trace_hinv_drift_cross(
     hop: &dyn HessianOperator,
     left: &HyperCoordDrift,
@@ -2563,6 +2805,17 @@ fn trace_hinv_drift_cross(
             let left_matrix = left.materialize();
             let right_matrix = right.materialize();
             hop.trace_hinv_product_cross(&left_matrix, &right_matrix)
+        }
+    }
+}
+
+fn drift_result_add_into_dense(target: &mut Array2<f64>, result: &DriftDerivResult) {
+    match result {
+        DriftDerivResult::Dense(matrix) => {
+            *target += matrix;
+        }
+        DriftDerivResult::Operator(operator) => {
+            *target += &operator.to_dense();
         }
     }
 }
@@ -2873,12 +3126,12 @@ pub fn reml_laml_evaluate(
     } else {
         None
     };
-    let rho_corrections: Vec<Option<Array2<f64>>> = if effective_deriv.has_corrections() {
+    let rho_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
         rho_v_ks
             .as_ref()
             .expect("rho mode responses required for Hessian corrections")
             .iter()
-            .map(|v_k| effective_deriv.hessian_derivative_correction(v_k))
+            .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
             .collect::<Result<Vec<_>, _>>()?
     } else {
         vec![None; k]
@@ -2923,19 +3176,19 @@ pub fn reml_laml_evaluate(
 
             for idx in 0..k {
                 let coord = &solution.penalty_coords[idx];
-                if coord.uses_operator_fast_path() {
-                    rho_ops.push(
-                        coord
-                            .scaled_operator(curvature_lambdas[idx], rho_corrections[idx].as_ref()),
-                    );
-                    coord_has_operator.push(true);
-                } else {
-                    let mut a_k = coord.scaled_dense_matrix(curvature_lambdas[idx]);
-                    if let Some(corr) = rho_corrections[idx].as_ref() {
-                        a_k += corr;
+                match penalty_total_drift_result(
+                    coord,
+                    curvature_lambdas[idx],
+                    rho_corrections[idx].as_ref(),
+                ) {
+                    DriftDerivResult::Dense(matrix) => {
+                        dense_matrices.push(matrix);
+                        coord_has_operator.push(false);
                     }
-                    dense_matrices.push(a_k);
-                    coord_has_operator.push(false);
+                    DriftDerivResult::Operator(op) => {
+                        rho_ops.push(op);
+                        coord_has_operator.push(true);
+                    }
                 }
             }
 
@@ -2960,8 +3213,10 @@ pub fn reml_laml_evaluate(
                     let mut h_i = coord.drift.materialize();
                     if effective_deriv.has_corrections() {
                         let v_i = hop.solve(&coord.g);
-                        if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
-                            h_i += &corr;
+                        if let Some(corr) =
+                            effective_deriv.hessian_derivative_correction_result(&v_i)?
+                        {
+                            drift_result_add_into_dense(&mut h_i, &corr);
                         }
                     }
                     dense_matrices.push(h_i);
@@ -3008,12 +3263,14 @@ pub fn reml_laml_evaluate(
 
             // rho-coordinates: H_k = A_k + correction(v_k)
             for idx in 0..k {
-                let mut a_k =
-                    solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
-                if let Some(corr) = rho_corrections[idx].as_ref() {
-                    a_k += corr;
+                match penalty_total_drift_result(
+                    &solution.penalty_coords[idx],
+                    curvature_lambdas[idx],
+                    rho_corrections[idx].as_ref(),
+                ) {
+                    DriftDerivResult::Dense(matrix) => all_h_k_matrices.push(matrix),
+                    DriftDerivResult::Operator(op) => all_h_k_matrices.push(op.to_dense()),
                 }
-                all_h_k_matrices.push(a_k);
             }
 
             // ext-coordinates: dH_i = B_i + correction(v_i)
@@ -3021,8 +3278,10 @@ pub fn reml_laml_evaluate(
                 let mut h_i = coord.drift.materialize();
                 if effective_deriv.has_corrections() {
                     let v_i = hop.solve(&coord.g);
-                    if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
-                        h_i += &corr;
+                    if let Some(corr) =
+                        effective_deriv.hessian_derivative_correction_result(&v_i)?
+                    {
+                        drift_result_add_into_dense(&mut h_i, &corr);
                     }
                 }
                 all_h_k_matrices.push(h_i);
@@ -3055,18 +3314,12 @@ pub fn reml_laml_evaluate(
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
             stoch_traces[idx]
-        } else if coord.uses_operator_fast_path() {
-            let op = coord.scaled_operator(curvature_lambdas[idx], rho_corrections[idx].as_ref());
-            hop.trace_logdet_h_k_operator(&op, None)
         } else if coord.is_block_local() && rho_corrections[idx].is_none() {
             let (block, start, end) = coord.scaled_block_local(1.0);
             hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
         } else {
-            let mut a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
-            if let Some(corr) = rho_corrections[idx].as_ref() {
-                a_k_matrix += corr;
-            }
-            hop.trace_logdet_h_k(&a_k_matrix, None)
+            penalty_total_drift_result(coord, curvature_lambdas[idx], rho_corrections[idx].as_ref())
+                .trace_logdet(hop)
         };
 
         grad[idx] = outer_gradient_entry(
@@ -3103,19 +3356,22 @@ pub fn reml_laml_evaluate(
             stoch_traces[k + ext_idx]
         } else {
             let correction = if effective_deriv.has_corrections() {
-                effective_deriv.hessian_derivative_correction(&v_i)?
+                effective_deriv.hessian_derivative_correction_result(&v_i)?
             } else {
                 None
             };
-            if let Some(op) = coord
+            if let Some(corr) = correction.as_ref() {
+                let base = coord.drift.materialize();
+                hop.trace_logdet_gradient(&base) + corr.trace_logdet(hop)
+            } else if let Some(op) = coord
                 .drift
                 .operator_ref()
                 .filter(|_| coord.drift.uses_operator_fast_path())
             {
-                hop.trace_logdet_h_k_operator(op, correction.as_ref())
+                hop.trace_logdet_operator(op)
             } else {
                 let h_i = coord.drift.materialize();
-                hop.trace_logdet_h_k(&h_i, correction.as_ref())
+                hop.trace_logdet_h_k(&h_i, None)
             }
         };
 
@@ -3465,9 +3721,9 @@ fn compute_ift_correction_trace(
     } else {
         let u = hop.solve(rhs);
         if let Some(correction) =
-            effective_deriv.hessian_second_derivative_correction(v_i, v_j, &u)?
+            effective_deriv.hessian_second_derivative_correction_result(v_i, v_j, &u)?
         {
-            Ok(hop.trace_logdet_gradient(&correction))
+            Ok(correction.trace_logdet(hop))
         } else {
             Ok(0.0)
         }
@@ -4031,23 +4287,32 @@ fn compute_outer_hessian(
     Ok(hess)
 }
 
-enum StoredFirstDrift {
-    Dense(Array2<f64>),
-    Operators(Vec<Arc<dyn HyperOperator>>),
+struct StoredFirstDrift {
+    dense: Option<Array2<f64>>,
+    operators: Vec<Arc<dyn HyperOperator>>,
 }
 
 impl StoredFirstDrift {
-    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(matrix) => matrix.dot(v),
-            Self::Operators(ops) => {
-                let mut out = Array1::<f64>::zeros(v.len());
-                for op in ops {
-                    out += &op.mul_vec(v);
-                }
-                out
-            }
+    fn from_dense(matrix: Array2<f64>) -> Self {
+        Self {
+            dense: Some(matrix),
+            operators: Vec::new(),
         }
+    }
+
+    fn from_parts(dense: Option<Array2<f64>>, operators: Vec<Arc<dyn HyperOperator>>) -> Self {
+        Self { dense, operators }
+    }
+
+    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(v.len());
+        if let Some(matrix) = self.dense.as_ref() {
+            out += &matrix.dot(v);
+        }
+        for op in &self.operators {
+            out += &op.mul_vec(v);
+        }
+        out
     }
 
     fn accumulate(
@@ -4059,13 +4324,11 @@ impl StoredFirstDrift {
         if alpha == 0.0 {
             return;
         }
-        match self {
-            Self::Dense(matrix) => dense.scaled_add(alpha, matrix),
-            Self::Operators(stored_ops) => {
-                for op in stored_ops {
-                    ops.push((alpha, Arc::clone(op)));
-                }
-            }
+        if let Some(matrix) = self.dense.as_ref() {
+            dense.scaled_add(alpha, matrix);
+        }
+        for op in &self.operators {
+            ops.push((alpha, Arc::clone(op)));
         }
     }
 }
@@ -4205,7 +4468,12 @@ impl UnifiedOuterHessianOperator {
                 let Some(term2) = second(&neg_m, &neg_v)? else {
                     return Ok(0.0);
                 };
-                Ok(self.hop.trace_logdet_gradient(&(term1 + &term2)))
+                let combined = CompositeHyperOperator {
+                    dense: None,
+                    operators: vec![term1.into_operator(), term2.into_operator()],
+                    dim_hint: self.hop.dim(),
+                };
+                Ok(self.hop.trace_logdet_operator(&combined))
             }
         }
     }
@@ -4247,35 +4515,32 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             let cross_trace = if !self.incl_logdet_h {
                 0.0
             } else {
-                match &coord.drift {
-                    StoredFirstDrift::Dense(left) => {
-                        let mut value = if alpha_dense.is_empty() {
-                            0.0
-                        } else {
-                            self.hop.trace_logdet_hessian_cross(left, &alpha_dense)
-                        };
-                        if let Some(op) = alpha_op.as_ref() {
-                            value -= self.hop.trace_hinv_matrix_operator_cross(left, op);
-                        }
-                        value
+                let mut value = if let Some(left_dense) = coord.drift.dense.as_ref() {
+                    if alpha_dense.is_empty() {
+                        0.0
+                    } else {
+                        self.hop
+                            .trace_logdet_hessian_cross(left_dense, &alpha_dense)
                     }
-                    StoredFirstDrift::Operators(left_ops) => {
-                        let mut value = 0.0;
-                        if !alpha_dense.is_empty() {
-                            for left in left_ops {
-                                value -= self
-                                    .hop
-                                    .trace_hinv_matrix_operator_cross(&alpha_dense, left.as_ref());
-                            }
-                        }
-                        if let Some(op) = alpha_op.as_ref() {
-                            for left in left_ops {
-                                value -= self.hop.trace_hinv_operator_cross(left.as_ref(), op);
-                            }
-                        }
-                        value
+                } else {
+                    0.0
+                };
+                if let Some(op) = alpha_op.as_ref() {
+                    if let Some(left_dense) = coord.drift.dense.as_ref() {
+                        value -= self.hop.trace_hinv_matrix_operator_cross(left_dense, op);
+                    }
+                    for left in &coord.drift.operators {
+                        value -= self.hop.trace_hinv_operator_cross(left.as_ref(), op);
                     }
                 }
+                if !alpha_dense.is_empty() {
+                    for left in &coord.drift.operators {
+                        value -= self
+                            .hop
+                            .trace_hinv_matrix_operator_cross(&alpha_dense, left.as_ref());
+                    }
+                }
+                value
             };
 
             let mut rhs = alpha_dense.dot(&coord.v);
@@ -4365,17 +4630,25 @@ fn build_outer_hessian_operator(
         let coord = &solution.penalty_coords[idx];
         let a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
         let v_k = hop.solve(&a_k_beta);
-        let mut h_k = coord.scaled_dense_matrix(curvature_lambdas[idx]);
-        if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_k)? {
-            h_k += &corr;
-        }
+        let correction = effective_deriv.hessian_derivative_correction_result(&v_k)?;
+        let h_k =
+            match penalty_total_drift_result(coord, curvature_lambdas[idx], correction.as_ref()) {
+                DriftDerivResult::Dense(matrix) => matrix,
+                DriftDerivResult::Operator(op) => op.to_dense(),
+            };
         rho_h_matrices.push(h_k.clone());
         rho_a_k_betas.push(a_k_beta.clone());
+        let mut dense = None;
+        let mut operators = Vec::new();
+        match penalty_total_drift_result(coord, curvature_lambdas[idx], correction.as_ref()) {
+            DriftDerivResult::Dense(matrix) => dense = Some(matrix),
+            DriftDerivResult::Operator(op) => operators.push(op),
+        }
         coords.push(OuterHessianCoord {
             a: 0.5 * solution.beta.dot(&a_k_beta),
             g: a_k_beta,
             v: v_k,
-            drift: StoredFirstDrift::Dense(h_k),
+            drift: StoredFirstDrift::from_parts(dense, operators),
             ext_index: None,
             b_depends_on_beta: false,
         });
@@ -4383,28 +4656,28 @@ fn build_outer_hessian_operator(
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let v_i = hop.solve(&coord.g);
-        let drift = if coord.drift.uses_operator_fast_path() && !effective_deriv.has_corrections() {
-            let mut ops: Vec<Arc<dyn HyperOperator>> = Vec::new();
-            if let Some(block_local) = coord.drift.block_local.as_ref() {
-                ops.push(Arc::new(block_local.clone()));
+        let correction = effective_deriv.hessian_derivative_correction_result(&v_i)?;
+        let mut dense = coord.drift.dense.clone();
+        let mut operators: Vec<Arc<dyn HyperOperator>> = Vec::new();
+        if let Some(block_local) = coord.drift.block_local.as_ref() {
+            operators.push(Arc::new(block_local.clone()));
+        }
+        if let Some(op) = coord.drift.operator.as_ref() {
+            operators.push(Arc::clone(op));
+        }
+        if let Some(corr) = correction {
+            match corr {
+                DriftDerivResult::Dense(matrix) => {
+                    if let Some(existing) = dense.as_mut() {
+                        *existing += &matrix;
+                    } else {
+                        dense = Some(matrix);
+                    }
+                }
+                DriftDerivResult::Operator(op) => operators.push(op),
             }
-            if let Some(op) = coord.drift.operator.as_ref() {
-                ops.push(Arc::clone(op));
-            }
-            if ops.is_empty() {
-                return Err(
-                    "operator fast-path selected for ext drift, but no operator terms were stored"
-                        .to_string(),
-                );
-            }
-            StoredFirstDrift::Operators(ops)
-        } else {
-            let mut h_i = coord.drift.materialize();
-            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
-                h_i += &corr;
-            }
-            StoredFirstDrift::Dense(h_i)
-        };
+        }
+        let drift = StoredFirstDrift::from_parts(dense, operators);
         coords.push(OuterHessianCoord {
             a: coord.a,
             g: coord.g.clone(),

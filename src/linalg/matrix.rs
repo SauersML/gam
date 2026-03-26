@@ -5399,8 +5399,7 @@ impl From<&DesignMatrix> for DesignBlock {
 mod tests {
     use super::{
         ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
-        EmbeddedColumnBlock,
-        SparseDesignMatrix, dense_matvec, dense_transpose_matvec,
+        EmbeddedColumnBlock, SparseDesignMatrix, dense_matvec, dense_transpose_matvec,
         dense_transpose_weighted_response,
     };
     use crate::linalg::matrix::LinearOperator;

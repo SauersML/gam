@@ -2288,7 +2288,8 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                 if local.ncols() == 0 || local.nrows() == 0 {
                     return Array2::<f64>::zeros((local.nrows(), info.total_p));
                 }
-                EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p).materialize()
+                EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p)
+                    .materialize()
             };
             let x_full = if materialize_dense_design {
                 embed_design(&info.x_psi_local)
@@ -3149,12 +3150,36 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String>;
 
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        Ok(self.directional_derivative(d_beta_flat)?.map(|matrix| {
+            Arc::new(crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix })
+                as Arc<dyn HyperOperator>
+        }))
+    }
+
     fn second_directional_derivative(
         &self,
         _: &Array1<f64>,
         _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        Ok(self
+            .second_directional_derivative(d_beta_u, d_beta_v)?
+            .map(|matrix| {
+                Arc::new(
+                    crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix },
+                ) as Arc<dyn HyperOperator>
+            }))
     }
 }
 
@@ -4560,9 +4585,9 @@ enum JointHessianSource {
 struct JointHessianBundle<'a> {
     source: JointHessianSource,
     beta_flat: Array1<f64>,
-    compute_dh: Box<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
+    compute_dh: Box<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
     compute_d2h:
-        Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a>,
+        Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
     rho_curvature_scale: f64,
     hessian_logdet_correction: f64,
 }
@@ -4798,7 +4823,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
 
         let compute_dh =
             Box::new(
-                move |v_k: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+                move |v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
                     let h_rho = family
                         .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
                             block_states,
@@ -4806,18 +4831,18 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
                             v_k,
                         )?;
                     match h_rho {
-                        Some(h) => Ok(Some(symmetrized_square_matrix(
+                        Some(h) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
                             h,
                             total,
                             "joint surrogate dH shape mismatch",
-                        )?)),
+                        )?))),
                         None => Err("joint surrogate dH unavailable for analytic outer gradient"
                             .to_string()),
                     }
                 },
             );
         let compute_d2h = Box::new(
-            move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
                 match family
                     .joint_outer_hyper_surrogate_hessian_second_directional_derivative_with_specs(
                         block_states,
@@ -4825,11 +4850,11 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
                         u,
                         v,
                     )? {
-                    Some(m) => Ok(Some(symmetrized_square_matrix(
+                    Some(m) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
                         m,
                         total,
                         "joint surrogate d2H shape mismatch",
-                    )?)),
+                    )?))),
                     None => Ok(None),
                 }
             },
@@ -4857,24 +4882,50 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
     use_outer_curvature_derivatives: bool,
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-) -> impl Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
+) -> impl Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a {
     move |v_k: &Array1<f64>| {
-        let h_rho = if use_outer_curvature_derivatives {
-            family.exact_newton_outer_curvature_directional_derivative_with_specs(
+        if use_outer_curvature_derivatives {
+            let h_rho = family.exact_newton_outer_curvature_directional_derivative_with_specs(
                 synced_states.as_ref(),
                 specs,
                 v_k,
-            )?
-        } else if let Some(workspace) = workspace.as_ref() {
-            workspace.directional_derivative(v_k)?
-        } else {
-            family.exact_newton_joint_hessian_directional_derivative_with_specs(
-                synced_states.as_ref(),
-                specs,
-                v_k,
-            )?
-        };
-        match h_rho {
+            )?;
+            return match h_rho {
+                Some(h) => {
+                    if h.iter().any(|v| !v.is_finite()) {
+                        Err("joint exact-newton dH returned non-finite values".to_string())
+                    } else {
+                        let mut sym = symmetrized_square_matrix(
+                            h,
+                            total,
+                            "joint exact-newton dH shape mismatch",
+                        )?;
+                        if scale != 1.0 {
+                            sym *= scale;
+                        }
+                        Ok(Some(DriftDerivResult::Dense(sym)))
+                    }
+                }
+                None => {
+                    Err("joint exact-newton dH unavailable for analytic outer gradient".to_string())
+                }
+            };
+        }
+
+        if let Some(workspace) = workspace.as_ref() {
+            if let Some(operator) = workspace.directional_derivative_operator(v_k)? {
+                return Ok(Some(scale_drift_deriv_result(
+                    DriftDerivResult::Operator(operator),
+                    scale,
+                )));
+            }
+        }
+
+        match family.exact_newton_joint_hessian_directional_derivative_with_specs(
+            synced_states.as_ref(),
+            specs,
+            v_k,
+        )? {
             Some(h) => {
                 if h.iter().any(|v| !v.is_finite()) {
                     Err("joint exact-newton dH returned non-finite values".to_string())
@@ -4887,7 +4938,7 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
                     if scale != 1.0 {
                         sym *= scale;
                     }
-                    Ok(Some(sym))
+                    Ok(Some(DriftDerivResult::Dense(sym)))
                 }
             }
             None => {
@@ -4906,33 +4957,56 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily>(
     use_outer_curvature_derivatives: bool,
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + 'a {
-    move |u: &Array1<f64>, v: &Array1<f64>| match if use_outer_curvature_derivatives {
-        family.exact_newton_outer_curvature_second_directional_derivative_with_specs(
-            synced_states.as_ref(),
-            specs,
-            u,
-            v,
-        )?
-    } else if let Some(workspace) = workspace.as_ref() {
-        workspace.second_directional_derivative(u, v)?
-    } else {
-        family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
-            synced_states.as_ref(),
-            specs,
-            u,
-            v,
-        )?
-    } {
-        Some(m) => {
-            let mut sym =
-                symmetrized_square_matrix(m, total, "joint exact-newton d2H shape mismatch")?;
-            if scale != 1.0 {
-                sym *= scale;
-            }
-            Ok(Some(sym))
+) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a {
+    move |u: &Array1<f64>, v: &Array1<f64>| {
+        if use_outer_curvature_derivatives {
+            return match family
+                .exact_newton_outer_curvature_second_directional_derivative_with_specs(
+                    synced_states.as_ref(),
+                    specs,
+                    u,
+                    v,
+                )? {
+                Some(m) => {
+                    let mut sym = symmetrized_square_matrix(
+                        m,
+                        total,
+                        "joint exact-newton d2H shape mismatch",
+                    )?;
+                    if scale != 1.0 {
+                        sym *= scale;
+                    }
+                    Ok(Some(DriftDerivResult::Dense(sym)))
+                }
+                None => Ok(None),
+            };
         }
-        None => Ok(None),
+
+        if let Some(workspace) = workspace.as_ref() {
+            if let Some(operator) = workspace.second_directional_derivative_operator(u, v)? {
+                return Ok(Some(scale_drift_deriv_result(
+                    DriftDerivResult::Operator(operator),
+                    scale,
+                )));
+            }
+        }
+
+        match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+            synced_states.as_ref(),
+            specs,
+            u,
+            v,
+        )? {
+            Some(m) => {
+                let mut sym =
+                    symmetrized_square_matrix(m, total, "joint exact-newton d2H shape mismatch")?;
+                if scale != 1.0 {
+                    sym *= scale;
+                }
+                Ok(Some(DriftDerivResult::Dense(sym)))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -4944,31 +5018,53 @@ fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static
     use_outer_curvature_derivatives: bool,
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-) -> Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync> {
+) -> Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync> {
     Arc::new(move |v_k: &Array1<f64>| {
-        let h_rho = if use_outer_curvature_derivatives {
-            family.exact_newton_outer_curvature_directional_derivative_with_specs(
+        if use_outer_curvature_derivatives {
+            let h_rho = family.exact_newton_outer_curvature_directional_derivative_with_specs(
                 synced_states.as_ref(),
                 &specs,
                 v_k,
-            )?
-        } else if let Some(workspace) = workspace.as_ref() {
-            workspace.directional_derivative(v_k)?
-        } else {
-            family.exact_newton_joint_hessian_directional_derivative_with_specs(
-                synced_states.as_ref(),
-                &specs,
-                v_k,
-            )?
-        };
-        match h_rho {
+            )?;
+            return match h_rho {
+                Some(h) => {
+                    let mut sym = symmetrized_square_matrix(
+                        h,
+                        total,
+                        "joint exact-newton dH shape mismatch",
+                    )?;
+                    if scale != 1.0 {
+                        sym *= scale;
+                    }
+                    Ok(Some(DriftDerivResult::Dense(sym)))
+                }
+                None => {
+                    Err("joint exact-newton dH unavailable for analytic outer gradient".to_string())
+                }
+            };
+        }
+
+        if let Some(workspace) = workspace.as_ref() {
+            if let Some(operator) = workspace.directional_derivative_operator(v_k)? {
+                return Ok(Some(scale_drift_deriv_result(
+                    DriftDerivResult::Operator(operator),
+                    scale,
+                )));
+            }
+        }
+
+        match family.exact_newton_joint_hessian_directional_derivative_with_specs(
+            synced_states.as_ref(),
+            &specs,
+            v_k,
+        )? {
             Some(h) => {
                 let mut sym =
                     symmetrized_square_matrix(h, total, "joint exact-newton dH shape mismatch")?;
                 if scale != 1.0 {
                     sym *= scale;
                 }
-                Ok(Some(sym))
+                Ok(Some(DriftDerivResult::Dense(sym)))
             }
             None => {
                 Err("joint exact-newton dH unavailable for analytic outer gradient".to_string())
@@ -4985,32 +5081,54 @@ fn exact_newton_d2h_closure_owned<F: CustomFamily + Clone + Send + Sync + 'stati
     use_outer_curvature_derivatives: bool,
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-) -> Arc<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync> {
+) -> Arc<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>
+{
     Arc::new(move |u: &Array1<f64>, v: &Array1<f64>| {
-        match if use_outer_curvature_derivatives {
-            family.exact_newton_outer_curvature_second_directional_derivative_with_specs(
-                synced_states.as_ref(),
-                &specs,
-                u,
-                v,
-            )?
-        } else if let Some(workspace) = workspace.as_ref() {
-            workspace.second_directional_derivative(u, v)?
-        } else {
-            family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                synced_states.as_ref(),
-                &specs,
-                u,
-                v,
-            )?
-        } {
+        if use_outer_curvature_derivatives {
+            return match family
+                .exact_newton_outer_curvature_second_directional_derivative_with_specs(
+                    synced_states.as_ref(),
+                    &specs,
+                    u,
+                    v,
+                )? {
+                Some(m) => {
+                    let mut sym = symmetrized_square_matrix(
+                        m,
+                        total,
+                        "joint exact-newton d2H shape mismatch",
+                    )?;
+                    if scale != 1.0 {
+                        sym *= scale;
+                    }
+                    Ok(Some(DriftDerivResult::Dense(sym)))
+                }
+                None => Ok(None),
+            };
+        }
+
+        if let Some(workspace) = workspace.as_ref() {
+            if let Some(operator) = workspace.second_directional_derivative_operator(u, v)? {
+                return Ok(Some(scale_drift_deriv_result(
+                    DriftDerivResult::Operator(operator),
+                    scale,
+                )));
+            }
+        }
+
+        match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+            synced_states.as_ref(),
+            &specs,
+            u,
+            v,
+        )? {
             Some(m) => {
                 let mut sym =
                     symmetrized_square_matrix(m, total, "joint exact-newton d2H shape mismatch")?;
                 if scale != 1.0 {
                     sym *= scale;
                 }
-                Ok(Some(sym))
+                Ok(Some(DriftDerivResult::Dense(sym)))
             }
             None => Ok(None),
         }
@@ -6153,9 +6271,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// By the implicit function theorem, `dβ̂/dρ_k = −v_k`. The stored `compute_dh`
 /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
 struct BorrowedJointDerivProvider<'a> {
-    compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     compute_d2h:
-        Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>>,
+        Option<&'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>>,
 }
 
 // SAFETY: Only used synchronously within the same stack frame that creates it.
@@ -6170,6 +6288,15 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         &self,
         v_k: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        Ok(self
+            .hessian_derivative_correction_result(v_k)?
+            .map(|result| result.into_operator().to_dense()))
+    }
+
+    fn hessian_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
         let neg_v = -v_k;
         (self.compute_dh)(&neg_v)
     }
@@ -6180,6 +6307,17 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        Ok(self
+            .hessian_second_derivative_correction_result(v_k, v_l, u_kl)?
+            .map(|result| result.into_operator().to_dense()))
+    }
+
+    fn hessian_second_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
         let Some(d2h) = self.compute_d2h.as_ref() else {
             return Ok(None);
         };
@@ -6191,7 +6329,12 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         let Some(term2) = d2h(&neg_v_l, &neg_v_k)? else {
             return Ok(None);
         };
-        Ok(Some(term1 + &term2))
+        let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+            dense: None,
+            operators: vec![term1.into_operator(), term2.into_operator()],
+            dim_hint: u_kl.len(),
+        };
+        Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
     }
 
     fn has_corrections(&self) -> bool {
@@ -6200,9 +6343,11 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 }
 
 struct OwnedJointDerivProvider {
-    compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>,
+    compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     compute_d2h: Arc<
-        dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync,
+        dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+            + Send
+            + Sync,
     >,
 }
 
@@ -6211,6 +6356,15 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
         &self,
         v_k: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        Ok(self
+            .hessian_derivative_correction_result(v_k)?
+            .map(|result| result.into_operator().to_dense()))
+    }
+
+    fn hessian_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
         let neg_v = -v_k;
         (self.compute_dh)(&neg_v)
     }
@@ -6221,6 +6375,17 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        Ok(self
+            .hessian_second_derivative_correction_result(v_k, v_l, u_kl)?
+            .map(|result| result.into_operator().to_dense()))
+    }
+
+    fn hessian_second_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
         let Some(term1) = (self.compute_dh)(u_kl)? else {
             return Ok(None);
         };
@@ -6229,7 +6394,12 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
         let Some(term2) = (self.compute_d2h)(&neg_v_l, &neg_v_k)? else {
             return Ok(None);
         };
-        Ok(Some(term1 + &term2))
+        let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+            dense: None,
+            operators: vec![term1.into_operator(), term2.into_operator()],
+            dim_hint: u_kl.len(),
+        };
+        Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
     }
 
     fn has_corrections(&self) -> bool {
@@ -6333,8 +6503,8 @@ fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> DriftDerivR
             DriftDerivResult::Dense(dense)
         }
         DriftDerivResult::Operator(operator) => {
-            DriftDerivResult::Operator(Box::new(ScaledHyperOperator {
-                inner: Arc::from(operator),
+            DriftDerivResult::Operator(Arc::new(ScaledHyperOperator {
+                inner: operator,
                 scale,
             }))
         }
@@ -6668,14 +6838,16 @@ fn joint_outer_evaluate(
     strict_spd: bool,
     eval_mode: EvalMode,
     options: &BlockwiseFitOptions,
-    compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-    compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     owned_compute_dh: Option<
-        Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>,
+        Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     >,
     owned_compute_d2h: Option<
         Arc<
-            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync,
+            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                + Send
+                + Sync,
         >,
     >,
     ext_bundle: Option<ExtCoordBundle>,
@@ -6692,7 +6864,7 @@ fn joint_outer_evaluate(
             })
         } else {
             let compute_d2h_ref: Option<
-                &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+                &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
             > = Some(compute_d2h);
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
@@ -6938,14 +7110,16 @@ fn joint_outer_evaluate_efs(
     include_logdet_s: bool,
     strict_spd: bool,
     options: &BlockwiseFitOptions,
-    compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-    compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     owned_compute_dh: Option<
-        Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>,
+        Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     >,
     owned_compute_d2h: Option<
         Arc<
-            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync,
+            dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                + Send
+                + Sync,
         >,
     >,
     ext_bundle: Option<ExtCoordBundle>,
@@ -6961,7 +7135,7 @@ fn joint_outer_evaluate_efs(
             })
         } else {
             let compute_d2h_ref: Option<
-                &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+                &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
             > = Some(compute_d2h);
             Box::new(BorrowedJointDerivProvider {
                 compute_dh,
@@ -7198,8 +7372,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
 
-    let efs_eval =
-        if let Some(joint_bundle) = build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+    let efs_eval = if let Some(joint_bundle) =
+        build_joint_hessian_closures(family, &inner.block_states, specs, total)?
     {
         let JointHessianBundle {
             source: h_joint_unpen,
@@ -7280,7 +7454,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
         };
         let beta_flat = inner.block_states[block_idx].beta.clone();
-        let compute_dh = |direction: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+        let compute_dh =
+            |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
             if !include_logdet_h {
                 return Ok(None);
             }
@@ -7291,13 +7466,13 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                         block_idx,
                         direction,
                     )? {
-                        Some(h_exact) => Ok(Some(symmetrized_square_matrix(
+                        Some(h_exact) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
                             h_exact,
                             p,
                             &format!(
                                 "block {block_idx} exact-newton dH shape mismatch in fixed-point outer evaluation"
                             ),
-                        )?)),
+                        )?))),
                         None => Err(format!(
                             "missing exact-newton dH callback for block {block_idx} while fixed-point evaluation requires H_beta term"
                         )),
@@ -7367,12 +7542,13 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                     correction_mat += &x_dense.t().dot(&scaled_x);
 
-                    Ok(Some(correction_mat))
+                    Ok(Some(DriftDerivResult::Dense(correction_mat)))
                 }
             }
         };
-        let compute_d2h =
-            |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<Array2<f64>>, String> { Ok(None) };
+        let compute_d2h = |_: &Array1<f64>,
+                           _: &Array1<f64>|
+         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
         joint_outer_evaluate_efs(
             &inner,
             specs,
@@ -8190,22 +8366,21 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                 true,
             )
         } else {
-            let h_joint_unpen =
-                if use_joint_matrix_free_path(total) {
-                    hessian_workspace
-                        .as_ref()
-                        .map(|workspace| {
-                            exact_newton_joint_hessian_source_from_workspace(
-                                workspace,
-                                total,
-                                "joint exact-newton operator mismatch in joint hyper evaluator",
-                            )
-                        })
-                        .transpose()?
-                        .flatten()
-                } else {
-                    None
-                };
+            let h_joint_unpen = if use_joint_matrix_free_path(total) {
+                hessian_workspace
+                    .as_ref()
+                    .map(|workspace| {
+                        exact_newton_joint_hessian_source_from_workspace(
+                            workspace,
+                            total,
+                            "joint exact-newton operator mismatch in joint hyper evaluator",
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
             (
                 match h_joint_unpen {
                     Some(source) => Some(source),
@@ -8529,7 +8704,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
     let beta_flat = inner.block_states[b].beta.clone();
 
     // Build a derivative provider that computes D_β H_L[direction] on demand.
-    let compute_dh = |direction: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+    let compute_dh = |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
         if !include_logdet_h {
             return Ok(None);
         }
@@ -8540,11 +8715,11 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                     b,
                     direction,
                 )? {
-                    Some(h_exact) => Ok(Some(symmetrized_square_matrix(
+                    Some(h_exact) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
                         h_exact,
                         p,
                         &format!("block {b} exact-newton dH shape mismatch"),
-                    )?)),
+                    )?))),
                     None => Err(format!(
                         "missing exact-newton dH callback for block {b} while REML gradient requires H_beta term"
                     )),
@@ -8612,14 +8787,15 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                 }
                 correction_mat += &x_dense.t().dot(&scaled_x);
 
-                Ok(Some(correction_mat))
+                Ok(Some(DriftDerivResult::Dense(correction_mat)))
             }
         }
     };
 
     // No d²H provider for the generic single-block fallback.
-    let compute_d2h =
-        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<Array2<f64>>, String> { Ok(None) };
+    let compute_d2h = |_: &Array1<f64>,
+                       _: &Array1<f64>|
+     -> Result<Option<DriftDerivResult>, String> { Ok(None) };
 
     let eval_result = joint_outer_evaluate(
         &inner,
@@ -9801,7 +9977,7 @@ mod tests {
                 _: &Array1<f64>,
             ) -> Result<Option<DriftDerivResult>, String> {
                 assert_eq!(psi_index, 0);
-                Ok(Some(DriftDerivResult::Operator(Box::new(
+                Ok(Some(DriftDerivResult::Operator(Arc::new(
                     crate::solver::estimate::reml::unified::BlockLocalDrift {
                         local: array![[3.0, 1.0], [1.0, 2.0]],
                         start: 1,

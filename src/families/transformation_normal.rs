@@ -41,8 +41,7 @@ use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
-    sync_aniso_contrasts_from_metadata,
+    spatial_length_scale_term_indices, sync_aniso_contrasts_from_metadata,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use ndarray::{Array1, Array2, ArrayView2, s};
