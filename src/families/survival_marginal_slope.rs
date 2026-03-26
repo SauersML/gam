@@ -1,12 +1,13 @@
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyPsiDesignAction,
-    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, build_block_spatial_psi_derivatives, cost_gated_outer_order,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
-    second_psi_linear_map, slice_joint_into_block_working_sets,
+    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
+    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
+    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
+    slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
@@ -9507,6 +9508,57 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    fn evaluate_exact_newton_joint_gradient_dynamic_q(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>), String> {
+        let flex_active = self.effective_flex_active(block_states)?;
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let identity_blocks = if flex_active {
+            flex_identity_block_pairs(&primary, &slices)
+        } else {
+            vec![]
+        };
+        type Acc = (f64, Array1<f64>);
+        let make_acc = || -> Acc { (0.0, Array1::zeros(slices.total)) };
+
+        (0..self.n)
+            .into_par_iter()
+            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let (row_nll, f_pi, _) = if flex_active {
+                    self.compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        &primary,
+                    )?
+                } else {
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                };
+                acc.0 -= row_nll;
+                self.accumulate_dynamic_q_core_gradient(
+                    row,
+                    &slices,
+                    &q_geom,
+                    f_pi.slice(s![0..N_PRIMARY]),
+                    &mut acc.1,
+                )?;
+                for (primary_range, joint_range) in &identity_blocks {
+                    for local in 0..primary_range.len() {
+                        acc.1[joint_range.start + local] -= f_pi[primary_range.start + local];
+                    }
+                }
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                left.0 += right.0;
+                left.1 += &right.1;
+                Ok(left)
+            })
+    }
+
     /// Exact directional derivative of the joint Hessian for timewiggle-only
     /// models (no score-warp / link-deviation).  Replaces FD by analytically
     /// differentiating the J^T H J + f·K pullback through the timewiggle
@@ -11612,6 +11664,27 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         Ok(Some(
             self.evaluate_exact_newton_joint_dense(block_states)?.2,
         ))
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        if self.effective_flex_active(block_states)? || self.flex_timewiggle_active() {
+            let (log_likelihood, gradient) =
+                self.evaluate_exact_newton_joint_gradient_dynamic_q(block_states)?;
+            return Ok(Some(ExactNewtonJointGradientEvaluation {
+                log_likelihood,
+                gradient,
+            }));
+        }
+        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+        let cache = build_row_kernel_cache(&kern)?;
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood: row_kernel_log_likelihood(&cache),
+            gradient: -row_kernel_gradient(&kern, &cache),
+        }))
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {

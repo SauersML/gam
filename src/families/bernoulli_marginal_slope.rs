@@ -3,12 +3,13 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
-    cost_gated_outer_order, custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
-    second_psi_linear_map, slice_joint_into_block_working_sets,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
+    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
+    slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
@@ -1954,6 +1955,14 @@ struct BernoulliMarginalSlopeExactEvalCache {
     primary: PrimarySlices,
     /// Pre-solved row contexts (intercept, M_a, observed score-warp value).
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
+    row_primary_caches: Option<Vec<BernoulliMarginalSlopeRowPrimaryCache>>,
+}
+
+#[derive(Clone)]
+struct BernoulliMarginalSlopeRowPrimaryCache {
+    neglog: f64,
+    gradient: Array1<f64>,
+    hessian: Array2<f64>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -2591,6 +2600,17 @@ impl BernoulliMarginalSlopeFamily {
         &cache.row_contexts[row]
     }
 
+    #[inline]
+    fn row_primary_cache(
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        row: usize,
+    ) -> Option<&BernoulliMarginalSlopeRowPrimaryCache> {
+        cache
+            .row_primary_caches
+            .as_ref()
+            .map(|entries| &entries[row])
+    }
+
     fn build_exact_eval_cache_with_order(
         &self,
         block_states: &[ParameterBlockState],
@@ -2604,10 +2624,36 @@ impl BernoulliMarginalSlopeFamily {
             .map(|row| self.build_row_exact_context(row, block_states))
             .collect();
         let row_contexts = row_contexts?;
+        let row_primary_caches = if self.effective_flex_active(block_states)? {
+            let row_primary_caches: Result<Vec<_>, String> = (0..n)
+                .into_par_iter()
+                .map(|row| {
+                    let row_ctx = &row_contexts[row];
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+                    let neglog = self.compute_row_analytic_flex_into(
+                        row,
+                        block_states,
+                        &primary,
+                        row_ctx,
+                        true,
+                        &mut scratch,
+                    )?;
+                    Ok(BernoulliMarginalSlopeRowPrimaryCache {
+                        neglog,
+                        gradient: scratch.grad.clone(),
+                        hessian: scratch.hess.clone(),
+                    })
+                })
+                .collect();
+            Some(row_primary_caches?)
+        } else {
+            None
+        };
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
             row_contexts,
+            row_primary_caches,
         })
     }
 
@@ -5168,12 +5214,18 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = Self::row_ctx(cache, row);
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                        let (_, _, row_hessian) = self.compute_row_primary_gradient_hessian(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                        )?;
+                        let row_hessian =
+                            if let Some(row_cache) = Self::row_primary_cache(cache, row) {
+                                row_cache.hessian.clone()
+                            } else {
+                                self.compute_row_primary_gradient_hessian(
+                                    row,
+                                    block_states,
+                                    primary,
+                                    row_ctx,
+                                )?
+                                .2
+                            };
                         let row_action = row_hessian.dot(&row_dir);
                         chunk_out +=
                             &self.pullback_primary_vector(row, slices, primary, &row_action)?;
@@ -5255,12 +5307,18 @@ impl BernoulliMarginalSlopeFamily {
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
-                        let (_, _, row_hessian) = self.compute_row_primary_gradient_hessian(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                        )?;
+                        let row_hessian =
+                            if let Some(row_cache) = Self::row_primary_cache(cache, row) {
+                                row_cache.hessian.clone()
+                            } else {
+                                self.compute_row_primary_gradient_hessian(
+                                    row,
+                                    block_states,
+                                    primary,
+                                    row_ctx,
+                                )?
+                                .2
+                            };
 
                         {
                             let mut marginal_diag =
@@ -5382,12 +5440,19 @@ impl BernoulliMarginalSlopeFamily {
                                     continue;
                                 };
                                 let row_ctx = Self::row_ctx(cache, row);
-                                let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
-                                    row,
-                                    block_states,
-                                    primary,
-                                    row_ctx,
-                                )?;
+                                let (f_pi, f_pipi) =
+                                    if let Some(row_cache) = Self::row_primary_cache(cache, row) {
+                                        (row_cache.gradient.clone(), row_cache.hessian.clone())
+                                    } else {
+                                        let (_, f_pi, f_pipi) = self
+                                            .compute_row_primary_gradient_hessian(
+                                                row,
+                                                block_states,
+                                                primary,
+                                                row_ctx,
+                                            )?;
+                                        (f_pi, f_pipi)
+                                    };
                                 let third = self.row_primary_third_contracted_recompute(
                                     row,
                                     block_states,
@@ -5574,12 +5639,18 @@ impl BernoulliMarginalSlopeFamily {
                             continue;
                         };
                         let row_ctx = Self::row_ctx(cache, row);
-                        let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                        )?;
+                        let (f_pi, f_pipi) =
+                            if let Some(row_cache) = Self::row_primary_cache(cache, row) {
+                                (row_cache.gradient.clone(), row_cache.hessian.clone())
+                            } else {
+                                let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                                    row,
+                                    block_states,
+                                    primary,
+                                    row_ctx,
+                                )?;
+                                (f_pi, f_pipi)
+                            };
                         let third = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
@@ -5709,12 +5780,18 @@ impl BernoulliMarginalSlopeFamily {
                             )?
                             .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
                         let row_ctx = Self::row_ctx(cache, row);
-                        let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                        )?;
+                        let (f_pi, f_pipi) =
+                            if let Some(row_cache) = Self::row_primary_cache(cache, row) {
+                                (row_cache.gradient.clone(), row_cache.hessian.clone())
+                            } else {
+                                let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                                    row,
+                                    block_states,
+                                    primary,
+                                    row_ctx,
+                                )?;
+                                (f_pi, f_pipi)
+                            };
                         let third_i = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
@@ -6938,6 +7015,127 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         Ok(Some(dense))
     }
 
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        self.validate_exact_monotonicity(block_states)?;
+        let slices = block_slices(self);
+        if !self.effective_flex_active(block_states)? {
+            let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+            let cache = build_row_kernel_cache(&kern)?;
+            return Ok(Some(ExactNewtonJointGradientEvaluation {
+                log_likelihood: row_kernel_log_likelihood(&cache),
+                gradient: Self::exact_newton_score_from_objective_gradient(row_kernel_gradient(
+                    &kern, &cache,
+                )),
+            }));
+        }
+
+        let cache = self.build_exact_eval_cache_with_order(block_states)?;
+        let Some(row_primary_caches) = cache.row_primary_caches.as_ref() else {
+            return Ok(None);
+        };
+        let primary = &cache.primary;
+        let n = self.y.len();
+        let make_acc = || {
+            (
+                0.0_f64,
+                Array1::<f64>::zeros(slices.marginal.len()),
+                Array1::<f64>::zeros(slices.logslope.len()),
+                slices
+                    .h
+                    .as_ref()
+                    .map(|range| Array1::<f64>::zeros(range.len())),
+                slices
+                    .w
+                    .as_ref()
+                    .map(|range| Array1::<f64>::zeros(range.len())),
+            )
+        };
+        let (log_likelihood, grad_marginal, grad_logslope, grad_h, grad_w) = (0..((n
+            + ROW_CHUNK_SIZE
+            - 1)
+            / ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
+                let start = chunk_idx * ROW_CHUNK_SIZE;
+                let end = (start + ROW_CHUNK_SIZE).min(n);
+                for row in start..end {
+                    let row_cache = &row_primary_caches[row];
+                    acc.0 -= row_cache.neglog;
+                    {
+                        let mut marginal = acc.1.view_mut();
+                        self.marginal_design.axpy_row_into(
+                            row,
+                            Self::exact_newton_score_component_from_objective_gradient(
+                                row_cache.gradient[0],
+                            ),
+                            &mut marginal,
+                        )?;
+                    }
+                    {
+                        let mut logslope = acc.2.view_mut();
+                        self.logslope_design.axpy_row_into(
+                            row,
+                            Self::exact_newton_score_component_from_objective_gradient(
+                                row_cache.gradient[1],
+                            ),
+                            &mut logslope,
+                        )?;
+                    }
+                    if let (Some(primary_h), Some(grad_h)) = (primary.h.as_ref(), acc.3.as_mut()) {
+                        for idx in 0..primary_h.len() {
+                            grad_h[idx] +=
+                                Self::exact_newton_score_component_from_objective_gradient(
+                                    row_cache.gradient[primary_h.start + idx],
+                                );
+                        }
+                    }
+                    if let (Some(primary_w), Some(grad_w)) = (primary.w.as_ref(), acc.4.as_mut()) {
+                        for idx in 0..primary_w.len() {
+                            grad_w[idx] +=
+                                Self::exact_newton_score_component_from_objective_gradient(
+                                    row_cache.gradient[primary_w.start + idx],
+                                );
+                        }
+                    }
+                }
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                left.0 += right.0;
+                left.1 += &right.1;
+                left.2 += &right.2;
+                if let (Some(lhs), Some(rhs)) = (left.3.as_mut(), right.3.as_ref()) {
+                    *lhs += rhs;
+                }
+                if let (Some(lhs), Some(rhs)) = (left.4.as_mut(), right.4.as_ref()) {
+                    *lhs += rhs;
+                }
+                Ok(left)
+            })?;
+
+        let mut gradient = Array1::<f64>::zeros(slices.total);
+        gradient
+            .slice_mut(s![slices.marginal.clone()])
+            .assign(&grad_marginal);
+        gradient
+            .slice_mut(s![slices.logslope.clone()])
+            .assign(&grad_logslope);
+        if let (Some(range), Some(grad_h)) = (slices.h.as_ref(), grad_h.as_ref()) {
+            gradient.slice_mut(s![range.clone()]).assign(grad_h);
+        }
+        if let (Some(range), Some(grad_w)) = (slices.w.as_ref(), grad_w.as_ref()) {
+            gradient.slice_mut(s![range.clone()]).assign(grad_w);
+        }
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood,
+            gradient,
+        }))
+    }
+
     fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
@@ -7339,79 +7537,14 @@ fn inner_fit(
     fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
 }
 
-const BIOBANK_FAST_MAX_ROWS: usize = 40_000;
-
-fn maybe_subsample_biobank_marginal_slope(
-    data: ArrayView2<'_, f64>,
-    spec: &BernoulliMarginalSlopeTermSpec,
-) -> Option<(Array2<f64>, BernoulliMarginalSlopeTermSpec, usize)> {
-    let full_n = data.nrows();
-    if full_n <= BIOBANK_FAST_MAX_ROWS {
-        return None;
-    }
-    let target = BIOBANK_FAST_MAX_ROWS;
-    let step = full_n as f64 / target as f64;
-    let mut selected = Vec::with_capacity(target);
-    for i in 0..target {
-        let idx = ((i as f64) * step).floor() as usize;
-        selected.push(idx.min(full_n - 1));
-    }
-    selected.sort_unstable();
-    selected.dedup();
-    if selected.len() < target {
-        let mut cursor = 0usize;
-        while selected.len() < target && cursor < full_n {
-            if selected.binary_search(&cursor).is_err() {
-                selected.push(cursor);
-            }
-            cursor += 1;
-        }
-        selected.sort_unstable();
-    }
-    let sampled_n = selected.len().max(1);
-    let weight_scale = full_n as f64 / sampled_n as f64;
-    let subset = BernoulliMarginalSlopeTermSpec {
-        y: spec.y.select(Axis(0), &selected),
-        weights: spec
-            .weights
-            .select(Axis(0), &selected)
-            .mapv(|weight| weight * weight_scale),
-        z: spec.z.select(Axis(0), &selected),
-        base_link: spec.base_link.clone(),
-        marginalspec: spec.marginalspec.clone(),
-        logslopespec: spec.logslopespec.clone(),
-        marginal_offset: spec.marginal_offset.select(Axis(0), &selected),
-        logslope_offset: spec.logslope_offset.select(Axis(0), &selected),
-        frailty: spec.frailty.clone(),
-        score_warp: spec.score_warp.clone(),
-        link_dev: spec.link_dev.clone(),
-    };
-    let data_sub = data.select(Axis(0), &selected);
-    Some((data_sub, subset, full_n))
-}
-
 pub fn fit_bernoulli_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: BernoulliMarginalSlopeTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
-    let mut spec = spec;
-    let data_owned;
-    let data_view = if let Some((subset_data, subset_spec, full_n)) =
-        maybe_subsample_biobank_marginal_slope(data, &spec)
-    {
-        log::info!(
-            "bernoulli marginal-slope fast-path: subsampled rows {} -> {} for biobank-scale fit",
-            full_n,
-            subset_data.nrows()
-        );
-        spec = subset_spec;
-        data_owned = subset_data;
-        data_owned.view()
-    } else {
-        data
-    };
+    let spec = spec;
+    let data_view = data;
     validate_spec(data_view, &spec)?;
     let (z_standardized, z_normalization) =
         standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;

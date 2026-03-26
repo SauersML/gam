@@ -1088,7 +1088,7 @@ fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-fn is_pure_duchon_aniso_term(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+pub(crate) fn is_pure_duchon_aniso_term(spec: &TermCollectionSpec, term_idx: usize) -> bool {
     spec.smooth_terms
         .get(term_idx)
         .is_some_and(|term| match &term.basis {
@@ -11269,6 +11269,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
     }
+    let (max_seeds, seed_budget) = if auxiliary_dim <= 4 { (2, 1) } else { (4, 2) };
 
     crate::solver::outer_strategy::OuterProblem::new(n_params)
         .with_gradient(gradient)
@@ -11280,8 +11281,8 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(theta0.clone())
         .with_seed_config(crate::seeding::SeedConfig {
-            max_seeds: 4,
-            seed_budget: 2,
+            max_seeds,
+            seed_budget,
             risk_profile,
             num_auxiliary_trailing: auxiliary_dim,
             ..Default::default()
