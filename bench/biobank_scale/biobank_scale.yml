@@ -83,7 +83,9 @@
       "include_sigma": false,
       "marginal_slope": true,
       "scale_dimensions": true,
-      "z_column": "pgs_std"
+      "z_column": "pgs_std",
+      "pilot_subsample_threshold": 25000,
+      "pilot_geometry_only": true
     },
     {
       "name": "r_mgcv_matern60",
@@ -114,6 +116,39 @@
       "spatial_basis": "ps",
       "smooth_kind": "separate",
       "include_sigma": false
+    },
+    {
+      "name": "rust_margslope_aniso_scorewarp_linkdev_duchon16d_50",
+      "dataset": "disease",
+      "backend": "rust_gam",
+      "family": "binomial",
+      "spatial_basis": "duchon",
+      "centers": 50,
+      "smooth_kind": "joint",
+      "include_sigma": false,
+      "marginal_slope": true,
+      "scale_dimensions": true,
+      "z_column": "pgs_std",
+      "pilot_subsample_threshold": 25000,
+      "pilot_geometry_only": true,
+      "score_warp_knots": 8,
+      "link_dev_knots": 8
+    },
+    {
+      "name": "rust_survival_locscale_linkwiggle_timewiggle_ps",
+      "dataset": "survival",
+      "backend": "rust_survival",
+      "family": "survival",
+      "spatial_basis": "ps",
+      "smooth_kind": "separate",
+      "include_sigma": false,
+      "survival_likelihood": "location-scale",
+      "survival_distribution": "probit",
+      "pilot_subsample_threshold": 25000,
+      "pilot_geometry_only": true,
+      "survival_linkwiggle_knots": 8,
+      "survival_timewiggle_knots": 8
     }
-  ]
+  ],
+  "medium_target_n": 120000
 }

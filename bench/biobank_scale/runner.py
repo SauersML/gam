@@ -56,6 +56,12 @@ class MethodSpec:
     marginal_slope: bool = False
     scale_dimensions: bool = False
     z_column: str | None = None
+    pilot_subsample_threshold: int | None = None
+    pilot_geometry_only: bool = False
+    score_warp_knots: int | None = None
+    link_dev_knots: int | None = None
+    survival_linkwiggle_knots: int | None = None
+    survival_timewiggle_knots: int | None = None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -730,8 +736,16 @@ def generate_raw_cohort(cfg: dict[str, Any], out_dir: Path, smoke: bool) -> tupl
     return rows, meta
 
 
-def impute_and_upsample(rows: list[dict[str, Any]], cfg: dict[str, Any], smoke: bool) -> list[dict[str, Any]]:
+def impute_and_upsample(
+    rows: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    smoke: bool,
+    *,
+    target_n_override: int | None = None,
+) -> list[dict[str, Any]]:
     target_n = int(cfg["smoke_target_n"] if smoke else cfg["target_n"])
+    if target_n_override is not None:
+        target_n = int(target_n_override)
     split_rng = np.random.default_rng(int(cfg["split_seed"]))
     by_subpop: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -858,7 +872,12 @@ def do_prepare(args: argparse.Namespace) -> int:
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     rows, raw_meta = generate_raw_cohort(cfg, out_dir, args.smoke)
-    rows = impute_and_upsample(rows, cfg, args.smoke)
+    rows = impute_and_upsample(
+        rows,
+        cfg,
+        args.smoke,
+        target_n_override=args.target_n,
+    )
     rows = attach_outcomes(rows, cfg)
     train_rows, test_rows = split_rows(rows, cfg)
     add_standardized_columns(train_rows, test_rows)
@@ -910,6 +929,32 @@ def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
                 if item.get("z_column") is not None
                 else None
             ),
+            pilot_subsample_threshold=(
+                int(item["pilot_subsample_threshold"])
+                if item.get("pilot_subsample_threshold") is not None
+                else None
+            ),
+            pilot_geometry_only=bool(item.get("pilot_geometry_only", False)),
+            score_warp_knots=(
+                int(item["score_warp_knots"])
+                if item.get("score_warp_knots") is not None
+                else None
+            ),
+            link_dev_knots=(
+                int(item["link_dev_knots"])
+                if item.get("link_dev_knots") is not None
+                else None
+            ),
+            survival_linkwiggle_knots=(
+                int(item["survival_linkwiggle_knots"])
+                if item.get("survival_linkwiggle_knots") is not None
+                else None
+            ),
+            survival_timewiggle_knots=(
+                int(item["survival_timewiggle_knots"])
+                if item.get("survival_timewiggle_knots") is not None
+                else None
+            ),
         )
         validate_method_spec(spec)
         out.append(spec)
@@ -956,7 +1001,7 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
 
 
 def rust_marginal_slope_formula_classification(spec: MethodSpec) -> tuple[str, str]:
-    """Build mean and logslope formulas for 16D marginal-slope Duchon classification."""
+    """Build mean/logslope formulas for high-dimensional marginal-slope classification."""
     pc_cols = ", ".join(f"pc{i}_std" for i in range(1, 17))
     centers = int(spec.centers or 50)
     spatial = f"duchon({pc_cols}, centers={centers}, order=0, power=1)"
@@ -970,6 +1015,10 @@ def rust_marginal_slope_formula_classification(spec: MethodSpec) -> tuple[str, s
         "smooth(age_entry_std)",
         spatial,
     ]
+    if spec.link_dev_knots is not None and spec.link_dev_knots > 0:
+        mean_terms.append(f"linkwiggle(knots={int(spec.link_dev_knots)})")
+    if spec.score_warp_knots is not None and spec.score_warp_knots > 0:
+        logslope_terms.append(f"linkwiggle(knots={int(spec.score_warp_knots)})")
     mean_formula = "phenotype ~ " + " + ".join(mean_terms)
     logslope_formula = " + ".join(logslope_terms)
     return mean_formula, logslope_formula
@@ -995,6 +1044,10 @@ def run_rust_marginal_slope_classification(
     ]
     if spec.scale_dimensions:
         fit_cmd.append("--scale-dimensions")
+    if spec.pilot_subsample_threshold is not None and spec.pilot_subsample_threshold >= 0:
+        fit_cmd.extend(["--pilot-subsample-threshold", str(int(spec.pilot_subsample_threshold))])
+    if spec.pilot_geometry_only:
+        fit_cmd.append("--pilot-geometry-only")
     fit_cmd.extend([str(train_csv), mean_formula])
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
@@ -1043,6 +1096,10 @@ def rust_survival_formula_rhs(spec: MethodSpec) -> str:
         "pc4_std",
         f"survmodel(spec=net, distribution={distribution})",
     ]
+    if spec.survival_linkwiggle_knots is not None and spec.survival_linkwiggle_knots > 0:
+        terms.append(f"linkwiggle(knots={int(spec.survival_linkwiggle_knots)})")
+    if spec.survival_timewiggle_knots is not None and spec.survival_timewiggle_knots > 0:
+        terms.append(f"timewiggle(knots={int(spec.survival_timewiggle_knots)})")
     return " + ".join(terms)
 
 
@@ -1201,9 +1258,15 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
             "--time-smooth-lambda", "0.01",
             "--ridge-lambda", "1e-6",
             "--out", str(model_path),
+        ]
+        if spec.pilot_subsample_threshold is not None and spec.pilot_subsample_threshold >= 0:
+            fit_cmd.extend(["--pilot-subsample-threshold", str(int(spec.pilot_subsample_threshold))])
+        if spec.pilot_geometry_only:
+            fit_cmd.append("--pilot-geometry-only")
+        fit_cmd.extend([
             str(train_fit_path),
             fit_formula,
-        ]
+        ])
         t0 = time.perf_counter()
         rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
         fit_sec = time.perf_counter() - t0
@@ -1606,6 +1669,7 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     prep.add_argument("--out-dir", type=Path, required=True)
     prep.add_argument("--smoke", action="store_true")
+    prep.add_argument("--target-n", type=int, default=None, help="Override target cohort size after imputation/upsampling")
     prep.set_defaults(func=do_prepare)
 
     matrix = sub.add_parser("matrix")
