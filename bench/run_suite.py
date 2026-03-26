@@ -4171,29 +4171,6 @@ def run_rust_scenario_cv(
     )
 
 
-def run_rust_sas_scenario_cv(
-    scenario,
-    *,
-    ds: dict | None = None,
-    folds: list[Fold] | None = None,
-    shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
-    contender_name: str = "rust_gam_sas",
-    binomial_link_name: str = "sas",
-):
-    if ds is None:
-        ds = dataset_for_scenario(scenario)
-    if ds.get("family") != "binomial":
-        return None
-    return run_rust_scenario_cv(
-        scenario,
-        contender_name=contender_name,
-        binomial_link=binomial_link_name,
-        ds=ds,
-        folds=folds,
-        shared_fold_artifacts=shared_fold_artifacts,
-    )
-
-
 def _run_rust_gamlss_scenario_cv_variant(
     scenario,
     *,
@@ -8032,18 +8009,6 @@ def main():
                             ],
                         )
                     )
-            rust_sas_row = (
-                run_rust_sas_scenario_cv(
-                    s_cfg,
-                    ds=ds,
-                    folds=folds,
-                    shared_fold_artifacts=shared_fold_artifacts,
-                )
-                if _is_contender_enabled(s_cfg, "rust_gam_sas")
-                else None
-            )
-            if rust_sas_row is not None:
-                results.append(rust_sas_row)
             rust_gamlss_row = run_rust_gamlss_scenario_cv(
                 s_cfg,
                 ds=ds,
