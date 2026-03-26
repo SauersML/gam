@@ -1938,17 +1938,17 @@ fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &Array1<f64>, target: &
     *target += &chunk.t().dot(&weighted_chunk);
 }
 
-/// Chunk size for parallel row accumulation.  Rows within a chunk are
-/// processed sequentially; per-row gradient / Hessian vectors are computed
-/// on the fly and discarded after accumulation.  The per-row *context*
-/// (intercept, M_a, observed score-warp value) is pre-solved once in the eval
-/// cache.
+/// Chunk size for parallel row accumulation. Rows within a chunk are
+/// processed sequentially. Flexible exact-Newton caches keep the per-row
+/// context plus the current primary gradient/Hessian, so repeated workspace
+/// matvec/diagonal calls do not recompute row jets at a fixed Newton state.
 const ROW_CHUNK_SIZE: usize = 1024;
 
 /// Shared precomputed state plus pre-solved per-row contexts. All row
 /// intercepts are solved once during cache construction so that workspace
 /// calls (matvec, diagonal, psi, directional derivatives) never redundantly
-/// re-solve the Newton intercept equation.
+/// re-solve the Newton intercept equation, and flexible paths can reuse
+/// cached primary jets.
 #[derive(Clone)]
 struct BernoulliMarginalSlopeExactEvalCache {
     slices: BlockSlices,
