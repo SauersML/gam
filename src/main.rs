@@ -361,11 +361,6 @@ struct FitArgs {
     /// full dataset re-optimizes κ/anisotropy jointly. Set to 0 to disable.
     #[arg(long, value_name = "N", default_value_t = 10_000)]
     pilot_subsample_threshold: usize,
-    /// When a pilot spatial fit is used, keep the pilot-derived anisotropic
-    /// geometry for the final full-data fit and skip the exact full-data
-    /// [rho, psi] re-optimization. This is much faster on large datasets.
-    #[arg(long = "pilot-geometry-only", default_value_t = false)]
-    pilot_geometry_only: bool,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -421,7 +416,6 @@ struct SurvivalArgs {
     sigma_time_degree: usize,
     scale_dimensions: bool,
     pilot_subsample_threshold: usize,
-    pilot_geometry_only: bool,
     out: Option<PathBuf>,
     logslope_formula: Option<String>,
     z_column: Option<String>,
@@ -687,7 +681,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             sigma_time_degree: args.sigma_time_degree,
             scale_dimensions: args.scale_dimensions,
             pilot_subsample_threshold: args.pilot_subsample_threshold,
-            pilot_geometry_only: args.pilot_geometry_only,
             out: args.out.clone(),
             logslope_formula: args.logslope_formula.clone(),
             z_column: args.z_column.clone(),
@@ -968,7 +961,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
-        opts.pilot_geometry_only = args.pilot_geometry_only;
         opts
     };
     let route_flexible_through_standard = link_choice.as_ref().is_some_and(|choice| {
@@ -1419,7 +1411,6 @@ fn run_fit_bernoulli_marginal_slope(
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
-        opts.pilot_geometry_only = args.pilot_geometry_only;
         opts
     };
     progress.set_stage("fit", "optimizing bernoulli marginal-slope model");
@@ -1562,7 +1553,6 @@ fn run_fit_transformation_normal(
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
-        opts.pilot_geometry_only = args.pilot_geometry_only;
         opts
     };
 
@@ -1672,7 +1662,6 @@ fn run_fitwith_predict_noise(
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
-        opts.pilot_geometry_only = args.pilot_geometry_only;
         opts
     };
     let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
@@ -4745,7 +4734,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let kappa_options = {
             let mut opts = SpatialLengthScaleOptimizationOptions::default();
             opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
-            opts.pilot_geometry_only = args.pilot_geometry_only;
             opts
         };
         let optimize_inverse_link = match &survival_inverse_link {
@@ -5119,7 +5107,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let kappa_options = {
             let mut opts = SpatialLengthScaleOptimizationOptions::default();
             opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
-            opts.pilot_geometry_only = args.pilot_geometry_only;
             opts
         };
         let options = gam::families::custom_family::BlockwiseFitOptions {
