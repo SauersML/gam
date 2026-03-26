@@ -1715,6 +1715,23 @@ impl BlockHessianAccumulator {
         self.h_gw += &other.h_gw;
         self.h_hw += &other.h_hw;
     }
+
+    fn diagonal(&self, slices: &BlockSlices) -> Array1<f64> {
+        let mut out = Array1::zeros(slices.total);
+        out.slice_mut(s![slices.time.clone()])
+            .assign(&self.h_tt.diag());
+        out.slice_mut(s![slices.marginal.clone()])
+            .assign(&self.h_mm.diag());
+        out.slice_mut(s![slices.logslope.clone()])
+            .assign(&self.h_gg.diag());
+        if let Some(range) = slices.score_warp.as_ref() {
+            out.slice_mut(s![range.clone()]).assign(&self.h_hh.diag());
+        }
+        if let Some(range) = slices.link_dev.as_ref() {
+            out.slice_mut(s![range.clone()]).assign(&self.h_ww.diag());
+        }
+        out
+    }
 }
 
 impl BlockHessianAccumulator {
@@ -8673,6 +8690,337 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok(Some(acc.to_dense(&slices)))
     }
+
+    fn psi_hessian_directional_derivative_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        let flex_active = self.effective_flex_active(block_states)?;
+        let flex_primary = flex_active.then(|| flex_primary_slices(self));
+        let slices = block_slices(self, block_states);
+        let Some((block_idx, local_idx, p_psi, psi_label)) =
+            self.psi_block_info(derivative_blocks, psi_index)?
+        else {
+            return Ok(None);
+        };
+        let deriv = &derivative_blocks[block_idx][local_idx];
+        let loading = if let Some(primary) = flex_primary.as_ref() {
+            spatial_block_primary_loading_flex(primary, block_idx)?
+        } else {
+            spatial_block_primary_loading(block_idx)?
+        };
+        let beta_psi = match block_idx {
+            1 => &block_states[1].beta,
+            _ => &block_states[2].beta,
+        };
+        let d_beta_block = match block_idx {
+            1 => d_beta_flat.slice(s![slices.marginal.clone()]),
+            _ => d_beta_flat.slice(s![slices.logslope.clone()]),
+        };
+
+        let timewiggle_active = self.flex_timewiggle_active();
+        let timewiggle_psi = timewiggle_active && block_idx == 1;
+
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+
+        let acc = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                |mut acc, row| -> Result<BlockHessianAccumulator, String> {
+                    let psi_row =
+                        self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+
+                    let q_geom = if timewiggle_active {
+                        Some(self.row_dynamic_q_geometry(row, block_states)?)
+                    } else {
+                        None
+                    };
+
+                    let psi_lift = if timewiggle_psi {
+                        Some(self.timewiggle_marginal_psi_row_lift(
+                            row,
+                            block_states,
+                            flex_primary.as_ref(),
+                            &psi_row,
+                            beta_psi,
+                        )?)
+                    } else {
+                        None
+                    };
+
+                    let psi_dir = if let Some(lift) = psi_lift.as_ref() {
+                        lift.dir.clone()
+                    } else if let Some(primary) = flex_primary.as_ref() {
+                        primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
+                    } else {
+                        primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
+                    };
+                    let psi_action = if psi_lift.is_some() {
+                        self.timewiggle_psi_action(
+                            row,
+                            block_states,
+                            &slices,
+                            flex_primary.as_ref(),
+                            &psi_row,
+                            beta_psi,
+                            d_beta_flat,
+                        )?
+                    } else if let Some(primary) = flex_primary.as_ref() {
+                        primary_psi_action_from_psi_row_flex(
+                            primary,
+                            block_idx,
+                            &psi_row,
+                            d_beta_block,
+                        )
+                    } else {
+                        primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
+                    };
+                    let row_dir = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_beta_flat,
+                    )?;
+                    let q_geom_lazy;
+                    let h_pi = if let Some(primary) = flex_primary.as_ref() {
+                        let q_ref = match q_geom.as_ref() {
+                            Some(q) => q,
+                            None => {
+                                q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
+                                &q_geom_lazy
+                            }
+                        };
+                        self.compute_row_flex_primary_gradient_hessian_exact(
+                            row,
+                            block_states,
+                            q_ref,
+                            primary,
+                        )?
+                        .2
+                    } else {
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                            .2
+                    };
+                    let third_beta =
+                        self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
+                    let fourth = self.row_primary_fourth_contracted_general(
+                        row,
+                        block_states,
+                        &row_dir,
+                        &psi_dir,
+                    )?;
+
+                    let right_primary = third_beta.t().dot(&loading);
+                    if let Some(q) = q_geom.as_ref() {
+                        acc.add_rank1_psi_cross_with_q_geometry(
+                            self,
+                            row,
+                            q,
+                            block_idx,
+                            &psi_row,
+                            &right_primary,
+                        );
+                    } else {
+                        acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                    }
+                    if let Some(q) = q_geom.as_ref() {
+                        let zero_grad = Array1::zeros(fourth.nrows());
+                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth);
+                    } else {
+                        acc.add_pullback(self, row, &fourth);
+                    }
+                    let third_action =
+                        self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
+                    if let Some(q) = q_geom.as_ref() {
+                        let zero_grad = Array1::zeros(third_action.nrows());
+                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action);
+                    } else {
+                        acc.add_pullback(self, row, &third_action);
+                    }
+                    if let Some(lift) = psi_lift.as_ref() {
+                        let q = q_geom.as_ref().unwrap();
+                        acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta);
+                        let second_pullback_weight =
+                            third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
+                        acc.add_second_pullback_weighted(q, &second_pullback_weight);
+                        let kappa_weight = h_pi.dot(&row_dir);
+                        acc.add_timewiggle_psi_kappa_alpha(self, lift, &kappa_weight);
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                |mut a, b| {
+                    a.add(&b);
+                    Ok(a)
+                },
+            )?;
+
+        Ok(Some(
+            Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>
+        ))
+    }
+
+    fn exact_newton_joint_hessian_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(Arc<dyn HyperOperator>, Array1<f64>), String> {
+        let slices = block_slices(self, block_states);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let make_acc = || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w);
+
+        let acc = if self.effective_flex_active(block_states)? {
+            let primary = flex_primary_slices(self);
+            (0..self.n)
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        &primary,
+                    )?;
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h);
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
+                    a.add(&b);
+                    Ok(a)
+                })?
+        } else {
+            (0..self.n)
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let (_, g, h) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h);
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
+                    a.add(&b);
+                    Ok(a)
+                })?
+        };
+
+        let diagonal = acc.diagonal(&slices);
+        Ok((
+            Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>,
+            diagonal,
+        ))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Arc<dyn HyperOperator>, String> {
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let acc = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                |mut acc, row| -> Result<_, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let h_pi = self
+                        .compute_row_flex_primary_gradient_hessian_exact(
+                            row,
+                            block_states,
+                            &q_geom,
+                            &primary,
+                        )?
+                        .2;
+                    let u_d = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_beta_flat,
+                    )?;
+                    let t_ud =
+                        self.row_flex_primary_third_contracted_exact(row, block_states, &u_d)?;
+                    let h_ud = h_pi.dot(&u_d);
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &h_ud, &t_ud);
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                |mut a, b| -> Result<_, String> {
+                    a.add(&b);
+                    Ok(a)
+                },
+            )?;
+        Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
+    }
+
+    fn exact_newton_joint_hessiansecond_directional_derivative_operator_flex_no_wiggle(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_u: &Array1<f64>,
+        d_v: &Array1<f64>,
+    ) -> Result<Arc<dyn HyperOperator>, String> {
+        let slices = block_slices(self, block_states);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let acc = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                |mut acc, row| -> Result<_, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let ud = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_u,
+                    )?;
+                    let ue = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_v,
+                    )?;
+                    let q_de =
+                        self.row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
+                    let t_d =
+                        self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
+                    let gamma = t_d.dot(&ue);
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &gamma, &q_de);
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                |mut a, b| -> Result<_, String> {
+                    a.add(&b);
+                    Ok(a)
+                },
+            )?;
+        Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
+    }
 }
 
 // ── Workspace structs ─────────────────────────────────────────────────
@@ -8687,7 +9035,8 @@ struct SurvivalMarginalSlopePsiWorkspace {
 struct SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     family: SurvivalMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
-    joint_hessian: Array2<f64>,
+    joint_hessian_operator: Arc<dyn HyperOperator>,
+    joint_hessian_diagonal: Array1<f64>,
     /// Cached per-row primary gradient + Hessian for timewiggle directional
     /// derivative reuse.  Built once during workspace construction so that
     /// repeated directional-derivative calls do not recompute them.
@@ -8699,7 +9048,8 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
         family: SurvivalMarginalSlopeFamily,
         block_states: Vec<ParameterBlockState>,
     ) -> Result<Self, String> {
-        let joint_hessian = family.evaluate_exact_newton_joint_dense(&block_states)?.2;
+        let (joint_hessian_operator, joint_hessian_diagonal) =
+            family.exact_newton_joint_hessian_operator(&block_states)?;
         let eval_cache = if family.flex_timewiggle_active() && !family.flex_active() {
             Some(family.build_eval_cache(&block_states)?)
         } else {
@@ -8708,7 +9058,8 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
         Ok(Self {
             family,
             block_states,
-            joint_hessian,
+            joint_hessian_operator,
+            joint_hessian_diagonal,
             eval_cache,
         })
     }
@@ -8716,11 +9067,51 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
 
 impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
-        Ok(Some(self.joint_hessian.dot(beta_flat)))
+        Ok(Some(self.joint_hessian_operator.mul_vec(beta_flat)))
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        Ok(Some(self.joint_hessian.diag().to_owned()))
+        Ok(Some(self.joint_hessian_diagonal.clone()))
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        if self.family.effective_flex_active(&self.block_states)?
+            && !self.family.flex_timewiggle_active()
+        {
+            return self
+                .family
+                .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle(
+                    &self.block_states,
+                    d_beta_flat,
+                )
+                .map(Some);
+        }
+        if let Some(cache) = self.eval_cache.as_ref() {
+            return self
+                .family
+                .exact_newton_joint_hessian_directional_derivative_timewiggle_cached(
+                    &self.block_states,
+                    d_beta_flat,
+                    cache,
+                )
+                .map(|matrix| {
+                    Some(Arc::new(
+                        crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix },
+                    ) as Arc<dyn HyperOperator>)
+                });
+        }
+        self.family
+            .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
+            .map(|result| {
+                result.map(|matrix| {
+                    Arc::new(
+                        crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix },
+                    ) as Arc<dyn HyperOperator>
+                })
+            })
     }
 
     fn directional_derivative(
@@ -8739,6 +9130,38 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         }
         self.family
             .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        if self.family.effective_flex_active(&self.block_states)?
+            && !self.family.flex_timewiggle_active()
+        {
+            return self
+                .family
+                .exact_newton_joint_hessiansecond_directional_derivative_operator_flex_no_wiggle(
+                    &self.block_states,
+                    d_beta_u_flat,
+                    d_beta_v_flat,
+                )
+                .map(Some);
+        }
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+            )
+            .map(|result| {
+                result.map(|matrix| {
+                    Arc::new(
+                        crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix },
+                    ) as Arc<dyn HyperOperator>
+                })
+            })
     }
 
     fn second_directional_derivative(
@@ -8808,14 +9231,14 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         self.family
-            .psi_hessian_directional_derivative(
+            .psi_hessian_directional_derivative_operator(
                 &self.block_states,
                 &self.derivative_blocks,
                 psi_index,
                 d_beta_flat,
             )
             .map(|result| {
-                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense)
+                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator)
             })
     }
 }

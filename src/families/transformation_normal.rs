@@ -79,11 +79,14 @@ impl Default for TransformationNormalConfig {
     }
 }
 
-/// Hard cap for the tensor-product width used by the transformation-normal
-/// response basis. The fit repeatedly factorizes dense penalized Hessians, so
-/// letting the response basis stay at its default size when the covariate side
-/// is already wide creates cubic blowups on small datasets.
-const MAX_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+/// Baseline cap for the tensor-product width used by the transformation-normal
+/// response basis. Small datasets should stay compact because the fit
+/// repeatedly factorizes dense penalized Hessians.
+const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
+/// Large samples can support a richer response basis without the aggressive
+/// underfitting forced by the small-sample cap above. This upper cap keeps the
+/// tensor width bounded even when the covariate side is narrow.
+const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
 const STANDARD_NORMAL_LOG_ABS_MEAN: f64 = -0.635_181_422_730_739_1;
 
 /// Optional warm-start for the transformation model: per-observation location and
@@ -130,6 +133,8 @@ pub struct TransformationNormalFamily {
     offset: Arc<Array1<f64>>,
     // --- Tensor penalties ---
     tensor_penalties: Vec<PenaltyMatrix>,
+    /// Constant `X_val^T W X_val` term reused across all Newton steps.
+    x_val_weighted_gram: Array2<f64>,
 
     // --- Initial values ---
     initial_beta: Array1<f64>,
@@ -249,6 +254,7 @@ impl TransformationNormalFamily {
             p_cov,
             config,
         )?;
+        let x_val_weighted_gram = x_val_kron.weighted_gram(weights);
 
         // ----- 5. Initial log-lambdas (one per penalty, start at 0.0) -----
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
@@ -271,6 +277,7 @@ impl TransformationNormalFamily {
             weights: Arc::new(weights.clone()),
             offset: Arc::new(offset.clone()),
             tensor_penalties,
+            x_val_weighted_gram,
             initial_beta,
             initial_log_lambdas,
             block_name: "transformation".to_string(),
@@ -378,6 +385,7 @@ impl TransformationNormalFamily {
             p_cov,
             config,
         )?;
+        let x_val_weighted_gram = x_val_kron.weighted_gram(weights);
 
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
 
@@ -399,6 +407,7 @@ impl TransformationNormalFamily {
             weights: Arc::new(weights.clone()),
             offset: Arc::new(offset.clone()),
             tensor_penalties,
+            x_val_weighted_gram,
             initial_beta,
             initial_log_lambdas,
             block_name: "transformation".to_string(),
@@ -522,10 +531,10 @@ impl CustomFamily for TransformationNormalFamily {
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
         let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
         let hessian = {
-            let xtx_val = self.x_val_kron.weighted_gram(self.weights.as_ref());
             // X_deriv^T diag(w) X_deriv where w = 1/h'^2
-            let xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_h_prime_sq);
-            xtx_val + &xtx_deriv
+            let mut xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_h_prime_sq);
+            xtx_deriv += &self.x_val_weighted_gram;
+            xtx_deriv
         };
 
         Ok(FamilyEvaluation {
@@ -661,9 +670,9 @@ impl CustomFamily for TransformationNormalFamily {
         let h_prime = self.x_deriv_kron.forward_mul(beta);
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
         let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
-        let xtx_val = self.x_val_kron.weighted_gram(self.weights.as_ref());
-        let xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_h_prime_sq);
-        Ok(Some(xtx_val + &xtx_deriv))
+        let mut xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_h_prime_sq);
+        xtx_deriv += &self.x_val_weighted_gram;
+        Ok(Some(xtx_deriv))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -1137,8 +1146,10 @@ fn effective_response_num_internal_knots(
 ) -> usize {
     let sample_cap = (n_obs / 10).max(1);
     let min_internal = 1usize;
+    let tensor_width_cap = (BASE_TRANSFORMATION_TENSOR_WIDTH + n_obs / 25)
+        .min(LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH);
     let max_resp_cols_from_tensor =
-        (MAX_TRANSFORMATION_TENSOR_WIDTH / p_cov.max(1)).max(config.response_degree + 2);
+        (tensor_width_cap / p_cov.max(1)).max(config.response_degree + 2);
     let tensor_cap = max_resp_cols_from_tensor
         .saturating_sub(config.response_degree + 1)
         .max(min_internal);
@@ -1319,6 +1330,16 @@ impl KroneckerDesign {
                 let pa = left.ncols();
                 let pb = right.ncols();
                 debug_assert_eq!(v.len(), n);
+                if let Some(right_dense) = right.as_dense_ref() {
+                    let weighted_left = weight_rows(left, v);
+                    let blocks = fast_atb(right_dense, &weighted_left).reversed_axes();
+                    let mut out = Array1::<f64>::zeros(pa * pb);
+                    for j in 0..pa {
+                        out.slice_mut(s![j * pb..(j + 1) * pb])
+                            .assign(&blocks.row(j));
+                    }
+                    return out;
+                }
                 let mut out = Array1::<f64>::zeros(pa * pb);
                 for j in 0..pa {
                     let mut weighted_v = Array1::<f64>::zeros(n);
@@ -1336,7 +1357,31 @@ impl KroneckerDesign {
     /// Compute `self^T · diag(w) · self` (weighted Gram).
     fn weighted_gram(&self, w: &Array1<f64>) -> Array2<f64> {
         match self {
-            KroneckerDesign::Factored { .. } => {
+            KroneckerDesign::Factored { left, right } => {
+                if let Some(right_dense) = right.as_dense_ref() {
+                    let pa = left.ncols();
+                    let pb = right_dense.ncols();
+                    let n = left.nrows();
+                    debug_assert_eq!(w.len(), n);
+                    let mut out = Array2::<f64>::zeros((pa * pb, pa * pb));
+                    let mut pair_weights = Array1::<f64>::zeros(n);
+                    for a in 0..pa {
+                        for b in 0..=a {
+                            for i in 0..n {
+                                pair_weights[i] = w[i] * left[[i, a]] * left[[i, b]];
+                            }
+                            let block =
+                                weighted_crossprod_dense(right_dense, &pair_weights, right_dense);
+                            out.slice_mut(s![a * pb..(a + 1) * pb, b * pb..(b + 1) * pb])
+                                .assign(&block);
+                            if a != b {
+                                out.slice_mut(s![b * pb..(b + 1) * pb, a * pb..(a + 1) * pb])
+                                    .assign(&block.t());
+                            }
+                        }
+                    }
+                    return out;
+                }
                 let dense = self.to_dense();
                 let wm = weight_rows(&dense, w);
                 fast_atb(&wm, &dense)
@@ -1932,6 +1977,7 @@ impl TensorKroneckerPsiOperator {
         let deriv = self.cov_deriv(axis)?;
         let cov_psi_dense =
             (deriv.x_psi.nrows() == n && deriv.x_psi.ncols() == p_cov).then_some(&deriv.x_psi);
+        let cov_design_dense = self.covariate_design.as_dense_ref();
         let mut out = Array2::<f64>::zeros((p_left_resp * p_cov, p_right_resp * p_cov));
         for a in 0..p_left_resp {
             for b in 0..p_right_resp {
@@ -1940,7 +1986,11 @@ impl TensorKroneckerPsiOperator {
                     pair_weights[i] =
                         weights[i] * left_resp_basis[[i, a]] * right_resp_basis[[i, b]];
                 }
-                let block = if let Some(cov_psi) = cov_psi_dense {
+                let block = if let (Some(cov_design), Some(cov_psi)) =
+                    (cov_design_dense, cov_psi_dense)
+                {
+                    weighted_crossprod_dense(cov_design, &pair_weights, cov_psi)
+                } else if let Some(cov_psi) = cov_psi_dense {
                     let mut block = Array2::<f64>::zeros((p_cov, p_cov));
                     for j in 0..p_cov {
                         let weighted_col = &pair_weights * &cov_psi.column(j).to_owned();
@@ -2113,6 +2163,58 @@ mod tests {
             crate::seeding::SeedRiskProfile::Gaussian
         );
         assert_eq!(seed_config.num_auxiliary_trailing, 0);
+    }
+
+    #[test]
+    fn kronecker_dense_fast_paths_match_dense_materialization() {
+        let left = array![[1.0, -0.4], [0.5, 0.3], [-0.2, 0.9], [1.1, -0.7],];
+        let right = array![
+            [0.2, 1.0, -0.3],
+            [0.4, -0.5, 0.8],
+            [0.7, 0.1, 0.6],
+            [-0.2, 0.9, 0.5],
+        ];
+        let weights = array![0.7, 1.4, 0.9, 1.2];
+        let v = array![0.6, -0.3, 0.5, 0.8];
+        let kron = KroneckerDesign::new(
+            &left,
+            DesignMatrix::Dense(DenseDesignMatrix::from(right.clone())),
+        )
+        .expect("kronecker design");
+
+        let dense = rowwise_kronecker(&left, &right);
+        let expected_transpose = dense.t().dot(&v);
+        let expected_gram = fast_atb(&weight_rows(&dense, &weights), &dense);
+
+        let got_transpose = kron.transpose_mul(&v);
+        let got_gram = kron.weighted_gram(&weights);
+
+        let transpose_err = (&got_transpose - &expected_transpose)
+            .iter()
+            .fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+        let gram_err = (&got_gram - &expected_gram)
+            .iter()
+            .fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+        assert!(
+            transpose_err < 1e-10,
+            "Kronecker transpose fast path mismatch: max_abs={transpose_err}"
+        );
+        assert!(
+            gram_err < 1e-10,
+            "Kronecker weighted Gram fast path mismatch: max_abs={gram_err}"
+        );
+    }
+
+    #[test]
+    fn large_samples_allow_richer_response_basis_than_small_samples() {
+        let config = TransformationNormalConfig::default();
+        let small = effective_response_num_internal_knots(&config, 40, 20);
+        let large = effective_response_num_internal_knots(&config, 4000, 20);
+        assert!(large >= small);
+        assert!(
+            large > small,
+            "large-sample tensor cap should relax the small-sample response bottleneck"
+        );
     }
 
     #[test]
@@ -2576,25 +2678,12 @@ pub fn fit_transformation_normal(
     // YES κ: use the N-block spatial length-scale optimizer (1 block).
     // ------------------------------------------------------------------
 
-    // Seed the exact-joint [rho, psi] solve from a successful fixed-geometry
-    // transformation fit when possible. Starting from all-zero rho is brittle
-    // for multidimensional Duchon terms under scale-dimension optimization.
-    let n_penalties = boot_design.penalties.len();
-    let mut rho0 = Array1::<f64>::zeros(n_penalties);
-    let rho_lower = Array1::<f64>::from_elem(n_penalties, -12.0);
-    let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
     let kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(
         covariate_spec,
         &spatial_terms,
         kappa_options,
     );
     let kappa_dims = kappa0.dims_per_term().to_vec();
-    log::info!(
-        "[transformation-normal] exact joint setup: rho_dim={} log_kappa_dim={} dims_per_term={:?}",
-        n_penalties,
-        kappa0.len(),
-        kappa_dims,
-    );
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&kappa_dims, kappa_options);
     let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&kappa_dims, kappa_options);
 
@@ -2621,7 +2710,18 @@ pub fn fit_transformation_normal(
         &effective_config,
         warm_start,
     )?;
-    let probe_blocks = vec![probe_family.block_spec()];
+    let probe_block = probe_family.block_spec();
+    let n_penalties = probe_block.initial_log_lambdas.len();
+    log::info!(
+        "[transformation-normal] exact joint setup: rho_dim={} log_kappa_dim={} dims_per_term={:?}",
+        n_penalties,
+        kappa0.len(),
+        kappa_dims,
+    );
+    let mut rho0 = Array1::<f64>::zeros(n_penalties);
+    let rho_lower = Array1::<f64>::from_elem(n_penalties, -12.0);
+    let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
+    let probe_blocks = vec![probe_block];
     let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
     let analytic_gradient = analytic_psi_available;
     let analytic_hessian = analytic_psi_available
