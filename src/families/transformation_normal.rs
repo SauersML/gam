@@ -2759,6 +2759,15 @@ pub fn fit_transformation_normal(
             )
             .map_err(|e| format!("transformation exact_fn: {e}"))?;
 
+            if !eval.objective.is_finite() {
+                log::warn!(
+                    "transformation exact joint returned non-finite objective: need_hessian={} rho={:?} gradient_len={}",
+                    need_hessian,
+                    rho,
+                    eval.gradient.len(),
+                );
+            }
+
             exact_warm_start.replace(Some(eval.warm_start));
 
             if need_hessian && !eval.outer_hessian.is_analytic() {

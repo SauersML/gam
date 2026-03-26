@@ -8068,7 +8068,7 @@ def main():
                 if ds["family"] == "binomial" and _is_contender_enabled(
                     s_cfg, "rust_gamlss_marginal_slope"
                 ):
-                    _ms_cfg = _effective_scenario_fit_mapping(scenario_name) or {}
+                    _ms_cfg = _effective_scenario_fit_mapping(s_cfg["name"]) or {}
                     _ms_extra = (
                         ["--scale-dimensions"] if _ms_cfg.get("scale_dimensions") else None
                     )

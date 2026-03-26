@@ -2220,8 +2220,11 @@ impl BinomialLocationScalePredictor {
             .as_ref()
             .map_or_else(|| Array1::zeros(design_noise.nrows()), |o| o.clone());
         let eta_s = design_noise.dot(&self.beta_noise) + &offset_noise;
-        let sigma = eta_s.mapv(f64::exp);
-        let q0 = Array1::from_shape_fn(eta_t.len(), |i| -eta_t[i] / sigma[i]);
+        // Floor sigma to prevent division by zero when eta_s underflows.
+        let sigma = eta_s.mapv(|v| v.exp().max(f64::MIN_POSITIVE));
+        let q0 = Array1::from_shape_fn(eta_t.len(), |i| {
+            (-eta_t[i] / sigma[i]).clamp(-1e6, 1e6)
+        });
         Ok((q0, sigma, eta_t))
     }
 
