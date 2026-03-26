@@ -7543,7 +7543,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
-    let spec = spec;
+    let mut spec = spec;
     let data_view = data;
     validate_spec(data_view, &spec)?;
     let (z_standardized, z_normalization) =

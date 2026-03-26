@@ -5632,22 +5632,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
     let mut cached_eval: Option<FamilyEvaluation> = None;
     let mut cached_joint_gradient: Option<Array1<f64>> = None;
-    let mut current_log_likelihood = 0.0_f64;
-    if use_joint_newton {
+    let mut current_log_likelihood = if use_joint_newton {
         if let Some(joint_eval) = family.exact_newton_joint_gradient_evaluation(&states, specs)? {
-            current_log_likelihood = joint_eval.log_likelihood;
             cached_joint_gradient = Some(joint_eval.gradient);
+            joint_eval.log_likelihood
         } else {
             let eval = family.evaluate(&states)?;
-            current_log_likelihood = eval.log_likelihood;
             cached_joint_gradient = exact_newton_joint_gradient_from_eval(&eval, specs)?;
+            let log_likelihood = eval.log_likelihood;
             cached_eval = Some(eval);
+            log_likelihood
         }
     } else {
         let eval = family.evaluate(&states)?;
-        current_log_likelihood = eval.log_likelihood;
+        let log_likelihood = eval.log_likelihood;
         cached_eval = Some(eval);
-    }
+        log_likelihood
+    };
     let mut current_penalty =
         total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
     let mut lastobjective = -current_log_likelihood + current_penalty;
@@ -5731,7 +5732,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             };
 
             // Concatenate block gradients and betas.
-            let Some(mut grad_joint) = cached_joint_gradient.clone() else {
+            let Some(grad_joint) = cached_joint_gradient.clone() else {
                 break;
             };
             if grad_joint.len() != total_p {
@@ -5956,7 +5957,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
                 let trialobjective = -trial_ll + trial_penalty;
                 if trialobjective.is_finite() && trialobjective <= lastobjective + 1e-10 {
-                    lastobjective = trialobjective;
                     current_penalty = trial_penalty;
                     if let Some(joint_active_set) = joint_active_set.as_ref() {
                         cached_active_sets =

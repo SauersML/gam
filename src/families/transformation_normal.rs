@@ -40,7 +40,7 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, is_pure_duchon_aniso_term,
+    freeze_term_collection_from_design, get_spatial_aniso_log_scales, is_pure_duchon_aniso_term,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
     sync_aniso_contrasts_from_metadata,
 };
@@ -2956,11 +2956,37 @@ pub fn fit_transformation_normal(
 
     // Extract the family and fit from the optimizer result.
     let (family, fit) = solved.fit;
+    let solved_spec = solved.resolved_specs.into_iter().next().unwrap();
+    let solved_design = solved.designs.into_iter().next().unwrap();
+
+    if let Some(baseline) = baseline_fit {
+        let baseline_score = baseline.reml_score;
+        let solved_score = fit.reml_score;
+        let no_material_gain = baseline_score.is_finite()
+            && solved_score.is_finite()
+            && solved_score >= baseline_score - 1e-10;
+        let solved_aniso_is_zero = pure_duchon_aniso_only
+            && spatial_terms.iter().all(|&term_idx| {
+                get_spatial_aniso_log_scales(&solved_spec, term_idx)
+                    .is_none_or(|eta| eta.iter().all(|value| value.abs() <= 1e-8))
+            });
+
+        if no_material_gain && (solved_aniso_is_zero || !fit.outer_converged) {
+            let mut cov_spec_resolved = boot_spec.clone();
+            sync_aniso_contrasts_from_metadata(&mut cov_spec_resolved, &boot_design.smooth);
+            return Ok(TransformationNormalFitResult {
+                family: probe_family,
+                fit: baseline,
+                covariate_spec_resolved: cov_spec_resolved,
+                covariate_design: boot_design,
+            });
+        }
+    }
 
     Ok(TransformationNormalFitResult {
         family,
         fit,
-        covariate_spec_resolved: solved.resolved_specs.into_iter().next().unwrap(),
-        covariate_design: solved.designs.into_iter().next().unwrap(),
+        covariate_spec_resolved: solved_spec,
+        covariate_design: solved_design,
     })
 }
