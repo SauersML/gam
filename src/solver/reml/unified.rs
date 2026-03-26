@@ -5743,6 +5743,10 @@ impl HessianOperator for DenseSpectralOperator {
         result
     }
 
+    fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        self.trace_logdet_gradient(&op.to_dense())
+    }
+
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
         // Spectral divided-difference kernel:
         // result = Σ_{a,b} Γ_{ab} (Ḣ'_i)_{ab} (Ḣ'_j)_{ba}
@@ -6173,6 +6177,10 @@ impl HessianOperator for BlockCoupledOperator {
         third_deriv_correction: Option<&Array2<f64>>,
     ) -> f64 {
         self.inner.trace_logdet_h_k(a_k, third_deriv_correction)
+    }
+
+    fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        self.inner.trace_logdet_operator(op)
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
