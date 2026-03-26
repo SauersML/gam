@@ -1,25 +1,26 @@
 use crate::basis::create_difference_penalty_matrix;
 use crate::custom_family::{
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
+    CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
+    CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
     first_psi_linear_map, fit_custom_family, second_psi_linear_map,
-    slice_joint_into_block_working_sets, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
-    CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
-    CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction,
-    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    slice_joint_into_block_working_sets,
 };
-use crate::estimate::reml::unified::HyperOperator;
 use crate::estimate::UnifiedFitResult;
+use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{
-    append_selected_wiggle_penalty_orders, select_wiggle_basis_from_seed,
-    split_wiggle_penalty_orders, ParameterBlockInput, WiggleBlockConfig,
+    ParameterBlockInput, WiggleBlockConfig, append_selected_wiggle_penalty_orders,
+    select_wiggle_basis_from_seed, split_wiggle_penalty_orders,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
-    build_row_kernel_cache, row_kernel_gradient, row_kernel_hessian_dense,
-    row_kernel_log_likelihood, RowKernel, RowKernelHessianWorkspace,
+    RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
+    row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{
@@ -28,13 +29,13 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
-    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec,
+    TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{s, Array1, Array2, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
@@ -764,6 +765,13 @@ fn signed_probit_neglog_derivatives_up_to_fourth_numeric(
     (weight * k1, weight * k2, weight * k3, weight * k4)
 }
 
+/// Exact probit derivative helper used by analytic jet code paths.
+///
+/// `+inf` is the saturated zero tail and is allowed. `-inf` and `NaN` are
+/// rejected instead of being silently collapsed, so exact callers fail fast
+/// rather than erasing curvature or domain errors. Numeric boundary behavior
+/// that needs to preserve `-inf` / `NaN` values lives in
+/// `signed_probit_neglog_derivatives_up_to_fourth_numeric`.
 pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
     signed_margin: f64,
     weight: f64,
@@ -8054,12 +8062,11 @@ mod tests {
     use super::*;
     use crate::custom_family::CustomFamily;
     use crate::families::bernoulli_marginal_slope::exact_kernel::{
-        branch_cell as branch_exact_cell, build_denested_partition_cells,
+        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
+        LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
         denested_cell_coefficient_partials as exact_denested_cell_coefficient_partials,
         global_cubic_from_local as exact_global_cubic_from_local,
         transformed_link_cubic as exact_transformed_link_cubic,
-        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
-        LocalSpanCubic,
     };
     use ndarray::array;
 
@@ -8541,10 +8548,12 @@ mod tests {
             .monotonicity_feasible(&feasible, "feasible structural beta")
             .expect("boundary point should be feasible");
         let infeasible = &feasible - 1e-3;
-        assert!(prepared
-            .runtime
-            .monotonicity_feasible(&infeasible, "infeasible structural beta")
-            .is_err());
+        assert!(
+            prepared
+                .runtime
+                .monotonicity_feasible(&infeasible, "infeasible structural beta")
+                .is_err()
+        );
     }
 
     #[test]
@@ -13161,8 +13170,9 @@ mod tests {
 
     #[test]
     fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
-        let z =
-            array![-0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67];
+        let z = array![
+            -0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67
+        ];
         let weights = Array1::from_elem(12, 1.0);
         let (standardized, normalization) =
             standardize_latent_z(&z, &weights, "bernoulli-marginal-slope").expect("normalize z");
@@ -13253,13 +13263,17 @@ mod tests {
         ];
         let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
-        assert!(family
-            .exact_newton_joint_hessian_workspace(&block_states, &specs)
-            .expect("flex hessian workspace")
-            .is_some());
-        assert!(family
-            .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
-            .expect("flex psi workspace")
-            .is_some());
+        assert!(
+            family
+                .exact_newton_joint_hessian_workspace(&block_states, &specs)
+                .expect("flex hessian workspace")
+                .is_some()
+        );
+        assert!(
+            family
+                .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
+                .expect("flex psi workspace")
+                .is_some()
+        );
     }
 }
