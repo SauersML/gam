@@ -13323,6 +13323,88 @@ mod tests {
     }
 
     #[test]
+    fn row_primary_closed_form_rejects_negative_infinite_signed_margin() {
+        let err = row_primary_closed_form(f64::INFINITY, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0)
+            .expect_err("exact closed-form row should reject -inf signed margins");
+        assert!(err.contains("non-finite signed margin"));
+    }
+
+    #[test]
+    fn row_primary_closed_form_rejects_nan_signed_margin() {
+        let err = row_primary_closed_form(f64::NAN, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0)
+            .expect_err("exact closed-form row should reject NaN signed margins");
+        assert!(err.contains("non-finite signed margin"));
+    }
+
+    #[test]
+    fn rigid_row_kernel_propagates_invalid_nonfinite_signed_margin_errors() {
+        let mut family = test_family(None, None);
+        family.offset_entry = Arc::new(array![f64::INFINITY]);
+        family.offset_exit = Arc::new(array![0.0]);
+        family.derivative_offset_exit = Arc::new(array![1.0]);
+        family.event = Arc::new(array![1.0]);
+
+        let kernel = SurvivalMarginalSlopeRowKernel::new(
+            family,
+            vec![
+                ParameterBlockState {
+                    beta: Array1::zeros(1),
+                    eta: Array1::zeros(1),
+                },
+                ParameterBlockState {
+                    beta: Array1::zeros(2),
+                    eta: Array1::zeros(1),
+                },
+                ParameterBlockState {
+                    beta: Array1::zeros(3),
+                    eta: Array1::zeros(1),
+                },
+            ],
+        );
+
+        let err =
+            <SurvivalMarginalSlopeRowKernel as crate::families::row_kernel::RowKernel<4>>::row_kernel(
+                &kernel, 0,
+            )
+            .expect_err("row kernel should propagate exact probit boundary failures");
+        assert!(err.contains("non-finite signed margin"));
+    }
+
+    #[test]
+    fn rigid_row_kernel_propagates_nan_signed_margin_errors() {
+        let mut family = test_family(None, None);
+        family.offset_entry = Arc::new(array![f64::NAN]);
+        family.offset_exit = Arc::new(array![0.0]);
+        family.derivative_offset_exit = Arc::new(array![1.0]);
+        family.event = Arc::new(array![1.0]);
+
+        let kernel = SurvivalMarginalSlopeRowKernel::new(
+            family,
+            vec![
+                ParameterBlockState {
+                    beta: Array1::zeros(1),
+                    eta: Array1::zeros(1),
+                },
+                ParameterBlockState {
+                    beta: Array1::zeros(2),
+                    eta: Array1::zeros(1),
+                },
+                ParameterBlockState {
+                    beta: Array1::zeros(3),
+                    eta: Array1::zeros(1),
+                },
+            ],
+        );
+
+        let err =
+            <SurvivalMarginalSlopeRowKernel as crate::families::row_kernel::RowKernel<4>>::row_kernel(
+                &kernel, 0,
+            )
+            .expect_err("row kernel should propagate NaN probit boundary failures");
+        assert!(err.contains("non-finite signed margin"));
+    }
+
+    #[test]
     fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
