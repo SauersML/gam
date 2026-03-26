@@ -10242,7 +10242,7 @@ fn finish_single_smooth_term_realization(
         terms,
         ..
     } = raw;
-    let term = terms.into_iter().next().ok_or_else(|| {
+    let mut term = terms.into_iter().next().ok_or_else(|| {
         BasisError::InvalidInput("single-term smooth build returned no term".to_string())
     })?;
     let design = term_designs.into_iter().next().ok_or_else(|| {
@@ -10263,7 +10263,48 @@ fn finish_single_smooth_term_realization(
                     transform.nrows()
                 )));
             }
-            design.to_dense().dot(transform)
+            let design_local = design.to_dense().dot(transform);
+            let active_penaltyinfo = term
+                .penaltyinfo_local
+                .iter()
+                .filter(|info| info.active)
+                .cloned()
+                .collect::<Vec<_>>();
+            if active_penaltyinfo.len() != term.penalties_local.len() {
+                return Err(BasisError::InvalidInput(format!(
+                    "incremental realizer frozen Duchon penalty metadata mismatch: activeinfos={}, penalties={}",
+                    active_penaltyinfo.len(),
+                    term.penalties_local.len()
+                )));
+            }
+            let penalty_candidates = term
+                .penalties_local
+                .iter()
+                .cloned()
+                .zip(active_penaltyinfo.into_iter())
+                .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
+                    let projected = {
+                        let zt_s = transform.t().dot(&matrix);
+                        zt_s.dot(transform)
+                    };
+                    let (projected, normalization_adjustment) =
+                        normalize_penalty_in_constrained_space(&projected);
+                    Ok(PenaltyCandidate {
+                        nullspace_dim_hint: estimate_penalty_nullity(&projected)?,
+                        matrix: projected,
+                        source: info.source,
+                        normalization_scale: info.normalization_scale * normalization_adjustment,
+                        kronecker_factors: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (penalties_local, nullspace_dims, penaltyinfo_local) =
+                filter_active_penalty_candidates(penalty_candidates)?;
+            term.penalties_local = penalties_local;
+            term.nullspace_dims = nullspace_dims;
+            term.penaltyinfo_local = penaltyinfo_local;
+            term.metadata = with_identifiability_transform(&term.metadata, Some(transform));
+            design_local
         }
         _ => design.to_dense(),
     };
