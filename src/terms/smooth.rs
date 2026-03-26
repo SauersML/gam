@@ -11405,7 +11405,12 @@ where
                         ctx.track_best(theta, cost);
                         Ok(cost)
                     }
-                    Err(_) => Ok(f64::INFINITY),
+                    Err(err) => {
+                        log::warn!(
+                            "[OUTER] n-block exact-joint spatial: exact cost evaluation failed: {err}"
+                        );
+                        Ok(f64::INFINITY)
+                    }
                 }
             },
             |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
@@ -11454,7 +11459,12 @@ where
                             hessian: hess,
                         })
                     }
-                    Err(_) => Ok(OuterEval::infeasible(theta.len())),
+                    Err(err) => {
+                        log::warn!(
+                            "[OUTER] n-block exact-joint spatial: exact evaluation failed: {err}"
+                        );
+                        Ok(OuterEval::infeasible(theta.len()))
+                    }
                 }
             },
             None::<fn(&mut &mut NBlockExactJointState<'_>)>,
@@ -11597,7 +11607,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         let offset_pilot: Array1<f64> = indices.iter().map(|&i| offset[i]).collect();
         let mut pilot_kappa = kappa_options.clone();
         pilot_kappa.pilot_subsample_threshold = 0;
-        let pilot_result = fit_term_collectionwith_spatial_length_scale_optimization(
+        match fit_term_collectionwith_spatial_length_scale_optimization(
             data_pilot.view(),
             y_pilot,
             weights_pilot,
@@ -11606,12 +11616,20 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             family,
             options,
             &pilot_kappa,
-        )?;
-        log::info!(
-            "[spatial-kappa] pilot complete; using pilot geometry as the full-data initializer"
-        );
-        resolvedspec = pilot_result.resolvedspec;
-        used_pilot = true;
+        ) {
+            Ok(pilot_result) => {
+                log::info!(
+                    "[spatial-kappa] pilot complete; using pilot geometry as the full-data initializer"
+                );
+                resolvedspec = pilot_result.resolvedspec;
+                used_pilot = true;
+            }
+            Err(err) => {
+                log::warn!(
+                    "[spatial-kappa] pilot anisotropy optimization failed; continuing with the current geometry: {err}"
+                );
+            }
+        }
     }
 
     let best = fit_term_collection_forspec(
@@ -11645,7 +11663,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
     }
     if !spatial_terms.is_empty() {
-        if let Some(exact_joint) = try_exact_joint_spatial_length_scale_optimization(
+        match try_exact_joint_spatial_length_scale_optimization(
             data,
             y.view(),
             weights.view(),
@@ -11656,30 +11674,37 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             options,
             kappa_options,
             &spatial_terms,
-        )? {
-            let exact_score = fit_score(&exact_joint.fit);
-            if exact_score <= initial_score + 1e-10 {
-                log_spatial_aniso_scales(&exact_joint.resolvedspec);
-                return Ok(exact_joint);
+        ) {
+            Ok(Some(exact_joint)) => {
+                let exact_score = fit_score(&exact_joint.fit);
+                if exact_score <= initial_score + 1e-10 {
+                    log_spatial_aniso_scales(&exact_joint.resolvedspec);
+                    return Ok(exact_joint);
+                }
+                log::warn!(
+                    "[spatial-kappa] --scale-dimensions optimization made REML score worse ({:.6e} -> {:.6e}); \
+                     discarding optimized spatial anisotropy and keeping the pre-optimized geometry.",
+                    initial_score,
+                    exact_score
+                );
             }
-            log::warn!(
-                "[spatial-kappa] --scale-dimensions optimization made REML score worse ({:.6e} -> {:.6e}); \
-                 discarding optimized spatial anisotropy and falling back to isotropic geometry. \
-                 The final model does NOT use anisotropic scaling.",
-                initial_score,
-                exact_score
-            );
-            return Ok(FittedTermCollectionWithSpec {
-                fit: best.fit,
-                design: best.design,
-                resolvedspec,
-                adaptive_diagnostics: best.adaptive_diagnostics,
-            });
+            Ok(None) => {
+                log::warn!(
+                    "[spatial-kappa] exact joint spatial optimization is unavailable for one or more eligible spatial terms; keeping the pre-optimized geometry"
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "[spatial-kappa] exact joint spatial optimization failed; keeping the pre-optimized geometry: {err}"
+                );
+            }
         }
-        return Err(EstimationError::InvalidInput(
-            "exact joint spatial length-scale path is unavailable for one or more eligible spatial terms"
-                .to_string(),
-        ));
+        return Ok(FittedTermCollectionWithSpec {
+            fit: best.fit,
+            design: best.design,
+            resolvedspec,
+            adaptive_diagnostics: best.adaptive_diagnostics,
+        });
     }
 
     Ok(FittedTermCollectionWithSpec {
