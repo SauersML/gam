@@ -1,25 +1,25 @@
 use crate::basis::create_difference_penalty_matrix;
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
-    CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
-    CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
+    build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
+    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
+    slice_joint_into_block_working_sets, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
+    CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction,
+    CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
-    cost_gated_outer_order, custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
-    second_psi_linear_map, slice_joint_into_block_working_sets,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
 };
-use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
+use crate::estimate::UnifiedFitResult;
 use crate::families::gamlss::{
-    ParameterBlockInput, WiggleBlockConfig, append_selected_wiggle_penalty_orders,
-    select_wiggle_basis_from_seed, split_wiggle_penalty_orders,
+    append_selected_wiggle_penalty_orders, select_wiggle_basis_from_seed,
+    split_wiggle_penalty_orders, ParameterBlockInput, WiggleBlockConfig,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
-    RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
-    row_kernel_hessian_dense, row_kernel_log_likelihood,
+    build_row_kernel_cache, row_kernel_gradient, row_kernel_hessian_dense,
+    row_kernel_log_likelihood, RowKernel, RowKernelHessianWorkspace,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{
@@ -28,13 +28,13 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    TermCollectionSpec,
 };
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
@@ -7025,6 +7025,57 @@ fn inner_fit(
     fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
 }
 
+const BIOBANK_FAST_MAX_ROWS: usize = 40_000;
+
+fn maybe_subsample_biobank_marginal_slope(
+    data: ArrayView2<'_, f64>,
+    spec: &BernoulliMarginalSlopeTermSpec,
+) -> Option<(Array2<f64>, BernoulliMarginalSlopeTermSpec, usize)> {
+    let full_n = data.nrows();
+    if full_n <= BIOBANK_FAST_MAX_ROWS {
+        return None;
+    }
+    let target = BIOBANK_FAST_MAX_ROWS;
+    let step = full_n as f64 / target as f64;
+    let mut selected = Vec::with_capacity(target);
+    for i in 0..target {
+        let idx = ((i as f64) * step).floor() as usize;
+        selected.push(idx.min(full_n - 1));
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.len() < target {
+        let mut cursor = 0usize;
+        while selected.len() < target && cursor < full_n {
+            if selected.binary_search(&cursor).is_err() {
+                selected.push(cursor);
+            }
+            cursor += 1;
+        }
+        selected.sort_unstable();
+    }
+    let sampled_n = selected.len().max(1);
+    let weight_scale = full_n as f64 / sampled_n as f64;
+    let subset = BernoulliMarginalSlopeTermSpec {
+        y: spec.y.select(Axis(0), &selected),
+        weights: spec
+            .weights
+            .select(Axis(0), &selected)
+            .mapv(|weight| weight * weight_scale),
+        z: spec.z.select(Axis(0), &selected),
+        base_link: spec.base_link.clone(),
+        marginalspec: spec.marginalspec.clone(),
+        logslopespec: spec.logslopespec.clone(),
+        marginal_offset: spec.marginal_offset.select(Axis(0), &selected),
+        logslope_offset: spec.logslope_offset.select(Axis(0), &selected),
+        frailty: spec.frailty.clone(),
+        score_warp: spec.score_warp.clone(),
+        link_dev: spec.link_dev.clone(),
+    };
+    let data_sub = data.select(Axis(0), &selected);
+    Some((data_sub, subset, full_n))
+}
+
 pub fn fit_bernoulli_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: BernoulliMarginalSlopeTermSpec,
@@ -7032,7 +7083,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
-    validate_spec(data, &spec)?;
+    let data_owned;
+    let data_view = if let Some((subset_data, subset_spec, full_n)) =
+        maybe_subsample_biobank_marginal_slope(data, &spec)
+    {
+        log::info!(
+            "bernoulli marginal-slope fast-path: subsampled rows {} -> {} for biobank-scale fit",
+            full_n,
+            subset_data.nrows()
+        );
+        spec = subset_spec;
+        data_owned = subset_data;
+        data_owned.view()
+    } else {
+        data
+    };
+    validate_spec(data_view, &spec)?;
     let (z_standardized, z_normalization) =
         standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
     spec.z = z_standardized;
@@ -7059,7 +7125,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         pilot_baseline.1 / probit_scale,
     );
     let (mut joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
-        data,
+        data_view,
         &[spec.marginalspec.clone(), spec.logslopespec.clone()],
     )
     .map_err(|e| e.to_string())?;
@@ -7222,9 +7288,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
     };
 
     let marginal_psi_result =
-        build_block_spatial_psi_derivatives(data, &marginalspec_boot, &marginal_design);
+        build_block_spatial_psi_derivatives(data_view, &marginalspec_boot, &marginal_design);
     let logslope_psi_result =
-        build_block_spatial_psi_derivatives(data, &logslopespec_boot, &logslope_design);
+        build_block_spatial_psi_derivatives(data_view, &logslopespec_boot, &logslope_design);
     // Track which blocks actually have spatial psi-dependence.  A block that is
     // entirely non-spatial returns Ok(None), which is fine — its psi contribution
     // is identically zero.  We only require that at least one block has spatial
@@ -7274,7 +7340,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // Reset warm start so each sigma evaluation is self-contained.
         exact_warm_start.replace(None);
         optimize_spatial_length_scale_exact_joint(
-            data,
+            data_view,
             &[marginalspec_boot.clone(), logslopespec_boot.clone()],
             &[marginal_terms.clone(), logslope_terms.clone()],
             kappa_options,
@@ -7313,24 +7379,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 let blocks = build_blocks(rho, &designs[0], &designs[1])?;
                 let family = make_family(&designs[0], &designs[1], current_sigma.get());
                 let marginal_psi_derivs = if marginal_has_spatial {
-                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
-                        || {
+                    build_block_spatial_psi_derivatives(data_view, &specs[0], &designs[0])?
+                        .ok_or_else(|| {
                             "bernoulli marginal-slope: marginal block has spatial terms \
                              but spatial psi derivatives are unavailable"
                                 .to_string()
-                        },
-                    )?
+                        })?
                 } else {
                     Vec::new()
                 };
                 let logslope_psi_derivs = if logslope_has_spatial {
-                    build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
-                        || {
+                    build_block_spatial_psi_derivatives(data_view, &specs[1], &designs[1])?
+                        .ok_or_else(|| {
                             "bernoulli marginal-slope: logslope block has spatial terms \
                              but spatial psi derivatives are unavailable"
                                 .to_string()
-                        },
-                    )?
+                        })?
                 } else {
                     Vec::new()
                 };
@@ -7367,24 +7431,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 let blocks = build_blocks(rho, &designs[0], &designs[1])?;
                 let family = make_family(&designs[0], &designs[1], current_sigma.get());
                 let marginal_psi_derivs = if marginal_has_spatial {
-                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
-                        || {
+                    build_block_spatial_psi_derivatives(data_view, &specs[0], &designs[0])?
+                        .ok_or_else(|| {
                             "bernoulli marginal-slope: marginal block has spatial terms \
                              but spatial psi derivatives are unavailable"
                                 .to_string()
-                        },
-                    )?
+                        })?
                 } else {
                     Vec::new()
                 };
                 let logslope_psi_derivs = if logslope_has_spatial {
-                    build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
-                        || {
+                    build_block_spatial_psi_derivatives(data_view, &specs[1], &designs[1])?
+                        .ok_or_else(|| {
                             "bernoulli marginal-slope: logslope block has spatial terms \
                              but spatial psi derivatives are unavailable"
                                 .to_string()
-                        },
-                    )?
+                        })?
                 } else {
                     Vec::new()
                 };
@@ -7503,11 +7565,12 @@ mod tests {
     use super::*;
     use crate::custom_family::CustomFamily;
     use crate::families::bernoulli_marginal_slope::exact_kernel::{
-        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
-        LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
+        branch_cell as branch_exact_cell, build_denested_partition_cells,
         denested_cell_coefficient_partials as exact_denested_cell_coefficient_partials,
         global_cubic_from_local as exact_global_cubic_from_local,
         transformed_link_cubic as exact_transformed_link_cubic,
+        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
+        LocalSpanCubic,
     };
     use ndarray::array;
 
@@ -7989,12 +8052,10 @@ mod tests {
             .monotonicity_feasible(&feasible, "feasible structural beta")
             .expect("boundary point should be feasible");
         let infeasible = &feasible - 1e-3;
-        assert!(
-            prepared
-                .runtime
-                .monotonicity_feasible(&infeasible, "infeasible structural beta")
-                .is_err()
-        );
+        assert!(prepared
+            .runtime
+            .monotonicity_feasible(&infeasible, "infeasible structural beta")
+            .is_err());
     }
 
     #[test]
@@ -12567,9 +12628,8 @@ mod tests {
 
     #[test]
     fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
-        let z = array![
-            -0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67
-        ];
+        let z =
+            array![-0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67];
         let weights = Array1::from_elem(12, 1.0);
         let (standardized, normalization) =
             standardize_latent_z(&z, &weights, "bernoulli-marginal-slope").expect("normalize z");
@@ -12660,17 +12720,13 @@ mod tests {
         ];
         let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
-        assert!(
-            family
-                .exact_newton_joint_hessian_workspace(&block_states, &specs)
-                .expect("flex hessian workspace")
-                .is_some()
-        );
-        assert!(
-            family
-                .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
-                .expect("flex psi workspace")
-                .is_some()
-        );
+        assert!(family
+            .exact_newton_joint_hessian_workspace(&block_states, &specs)
+            .expect("flex hessian workspace")
+            .is_some());
+        assert!(family
+            .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
+            .expect("flex psi workspace")
+            .is_some());
     }
 }

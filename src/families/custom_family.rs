@@ -2284,14 +2284,22 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                     psi_dim,
                     design_operator.is_some(),
                 );
+            let embed_design = |local: &Array2<f64>| -> Array2<f64> {
+                if local.ncols() == 0 || local.nrows() == 0 {
+                    return Array2::<f64>::zeros((local.nrows(), info.total_p));
+                }
+                EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p).materialize()
+            };
             let x_full = if materialize_dense_design {
-                EmbeddedColumnBlock::new(&info.x_psi_local, info.global_range.clone(), info.total_p)
-                    .materialize()
+                embed_design(&info.x_psi_local)
             } else {
                 Array2::<f64>::zeros((0, 0))
             };
             let penalty_indices = info.penalty_indices.clone();
             let embed_penalty = |local: &Array2<f64>| -> Array2<f64> {
+                if local.nrows() == 0 || local.ncols() == 0 {
+                    return Array2::<f64>::zeros((info.total_p, info.total_p));
+                }
                 EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
                     .materialize()
             };
@@ -2308,23 +2316,13 @@ pub(crate) fn build_block_spatial_psi_derivatives(
             let x_psi_psi_rows = if materialize_dense_design {
                 let mut rows =
                     vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
-                rows[psi_idx] = EmbeddedColumnBlock::new(
-                    &info.x_psi_psi_local,
-                    info.global_range.clone(),
-                    info.total_p,
-                )
-                .materialize();
+                rows[psi_idx] = embed_design(&info.x_psi_psi_local);
                 if let (Some(gid), Some(cross_designs)) =
                     (info.aniso_group_id, info.aniso_cross_designs.as_ref())
                 {
                     for (axis_j, local) in cross_designs {
                         if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                            rows[global_j] = EmbeddedColumnBlock::new(
-                                local,
-                                info.global_range.clone(),
-                                info.total_p,
-                            )
-                            .materialize();
+                            rows[global_j] = embed_design(local);
                         }
                     }
                 }
