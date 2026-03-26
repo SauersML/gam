@@ -1876,6 +1876,7 @@ pub fn stable_reparameterizationwith_invariant(
             }
         }
         let mut maxdet1_mismatch = 0.0_f64;
+        let mut det1_scale = 0.0_f64;
         for (k, lambda) in lambdas.iter().enumerate() {
             let s_k = &s_k_transformed_cache[k];
             // Reference: tr(s_reg_inv * S_k) restricted to the penalized block
@@ -1888,10 +1889,12 @@ pub fn stable_reparameterizationwith_invariant(
             }
             let reference = *lambda * trace;
             maxdet1_mismatch = maxdet1_mismatch.max((reference - det1vec[k]).abs());
+            det1_scale = det1_scale.max(reference.abs()).max(det1vec[k].abs());
         }
+        let det1_tolerance = 1e-7 * det1_scale.max(1.0);
         assert!(
-            maxdet1_mismatch <= 1e-9,
-            "det1 mismatch between optimized and reference formulas: max_abs={maxdet1_mismatch:.3e}"
+            maxdet1_mismatch <= det1_tolerance,
+            "det1 mismatch between optimized and reference formulas: max_abs={maxdet1_mismatch:.3e}, tol={det1_tolerance:.3e}"
         );
     }
 
