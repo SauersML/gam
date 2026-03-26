@@ -933,10 +933,7 @@ impl PirlsWorkspace {
         S: Data<Elem = f64>,
     {
         if self.sqrtw.len() != weights.len() {
-            // Use uninit — every element is written by the Zip below.
-            unsafe {
-                self.sqrtw = Array1::uninit(weights.len()).assume_init();
-            }
+            self.sqrtw = Array1::zeros(weights.len());
         }
         Zip::from(&mut self.sqrtw)
             .and(weights)
@@ -1596,16 +1593,10 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
     ) -> Result<WorkingState, EstimationError> {
         let n = self.offset.len();
         if self.workspace.eta_buf.len() != n {
-            // Use uninit — buffer is immediately overwritten by assign + add below.
-            unsafe {
-                self.workspace.eta_buf = Array1::uninit(n).assume_init();
-            }
+            self.workspace.eta_buf = Array1::zeros(n);
         }
         if self.workspace.matvec_buf.len() != n {
-            // Use uninit — buffer is immediately overwritten by transformed_matvec_into.
-            unsafe {
-                self.workspace.matvec_buf = Array1::uninit(n).assume_init();
-            }
+            self.workspace.matvec_buf = Array1::zeros(n);
         }
         let mut matvec_tmp = std::mem::take(&mut self.workspace.matvec_buf);
         self.transformed_matvec_into(beta, &mut matvec_tmp);
@@ -2405,10 +2396,7 @@ fn solve_subsystem_direction(
 ) -> Result<(), EstimationError> {
     let n = g_sub.len();
     if out.len() != n {
-        // Use uninit — immediately overwritten by assign below.
-        unsafe {
-            *out = Array1::uninit(n).assume_init();
-        }
+        *out = Array1::zeros(n);
     }
     // Try direct factorization first.
     if let Ok(factor) = StableSolver::new("pirls bounded subsystem").factorize(h_sub) {

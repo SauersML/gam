@@ -161,7 +161,7 @@ pub fn build_peeled_hull(data: &Array2<f64>, peels: usize) -> Result<PeeledHull,
     let directions = generate_directions(d, 8 * d); // total ≈ 10d with axes
 
     // Iterative peeling
-    for _ in 0..peels.max(1) {
+    for _ in 0..peels {
         if current.nrows() < d + 1 {
             break;
         }
@@ -360,6 +360,24 @@ mod tests {
         for i in 0..corrected.nrows() {
             assert!(hull.is_inside(corrected.row(i)));
         }
+    }
+
+    #[test]
+    fn test_zero_peels_preserves_outer_support() {
+        let mut pts = Vec::new();
+        for k in 0..80 {
+            let theta = 2.0 * std::f64::consts::PI * (k as f64) / 80.0;
+            pts.push([theta.cos(), theta.sin()]);
+        }
+        pts.extend([[5.0, 0.0], [-5.0, 0.0], [0.0, 5.0], [0.0, -5.0]]);
+        let data = ndarray::Array2::from(pts);
+
+        let zero_peel = build_peeled_hull(&data, 0).expect("zero-peel hull");
+        let one_peel = build_peeled_hull(&data, 1).expect("one-peel hull");
+        let outer_probe = array![4.0, 0.0];
+
+        assert!(zero_peel.is_inside(outer_probe.view()));
+        assert!(!one_peel.is_inside(outer_probe.view()));
     }
 
     #[test]

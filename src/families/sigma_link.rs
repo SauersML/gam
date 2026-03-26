@@ -81,22 +81,25 @@ pub fn exp_sigma_derivs_up_to_third(
     eta: ArrayView1<'_, f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
     let n = eta.len();
-    // Use uninit — every element is written in the loop below.
-    let (mut sigma, mut d1, mut d2, mut d3);
-    unsafe {
-        sigma = Array1::<f64>::uninit(n).assume_init();
-        d1 = Array1::<f64>::uninit(n).assume_init();
-        d2 = Array1::<f64>::uninit(n).assume_init();
-        d3 = Array1::<f64>::uninit(n).assume_init();
-    }
+    let mut sigma = Array1::<f64>::uninit(n);
+    let mut d1 = Array1::<f64>::uninit(n);
+    let mut d2 = Array1::<f64>::uninit(n);
+    let mut d3 = Array1::<f64>::uninit(n);
     for i in 0..n {
         let jet = exp_sigma_jet3_scalar(eta[i]);
-        sigma[i] = jet.sigma;
-        d1[i] = jet.d1;
-        d2[i] = jet.d2;
-        d3[i] = jet.d3;
+        sigma[i].write(jet.sigma);
+        d1[i].write(jet.d1);
+        d2[i].write(jet.d2);
+        d3[i].write(jet.d3);
     }
-    (sigma, d1, d2, d3)
+    unsafe {
+        (
+            sigma.assume_init(),
+            d1.assume_init(),
+            d2.assume_init(),
+            d3.assume_init(),
+        )
+    }
 }
 
 #[inline]
@@ -127,24 +130,28 @@ pub fn exp_sigma_derivs_up_to_fourth(
     Array1<f64>,
 ) {
     let n = eta.len();
-    // Use uninit — every element is written in the loop below.
-    let (mut sigma, mut d1, mut d2, mut d3, mut d4);
-    unsafe {
-        sigma = Array1::<f64>::uninit(n).assume_init();
-        d1 = Array1::<f64>::uninit(n).assume_init();
-        d2 = Array1::<f64>::uninit(n).assume_init();
-        d3 = Array1::<f64>::uninit(n).assume_init();
-        d4 = Array1::<f64>::uninit(n).assume_init();
-    }
+    let mut sigma = Array1::<f64>::uninit(n);
+    let mut d1 = Array1::<f64>::uninit(n);
+    let mut d2 = Array1::<f64>::uninit(n);
+    let mut d3 = Array1::<f64>::uninit(n);
+    let mut d4 = Array1::<f64>::uninit(n);
     for i in 0..n {
         let jet = exp_sigma_jet4_scalar(eta[i]);
-        sigma[i] = jet.sigma;
-        d1[i] = jet.d1;
-        d2[i] = jet.d2;
-        d3[i] = jet.d3;
-        d4[i] = jet.d4;
+        sigma[i].write(jet.sigma);
+        d1[i].write(jet.d1);
+        d2[i].write(jet.d2);
+        d3[i].write(jet.d3);
+        d4[i].write(jet.d4);
     }
-    (sigma, d1, d2, d3, d4)
+    unsafe {
+        (
+            sigma.assume_init(),
+            d1.assume_init(),
+            d2.assume_init(),
+            d3.assume_init(),
+            d4.assume_init(),
+        )
+    }
 }
 
 #[cfg(test)]

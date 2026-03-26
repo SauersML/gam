@@ -125,6 +125,17 @@ impl EngineLayoutBuilder {
                         "existing-penalty spec must provide at least one index",
                     ));
                 }
+                let next_penalty = indices
+                    .iter()
+                    .copied()
+                    .max()
+                    .and_then(|idx| idx.checked_add(1))
+                    .ok_or_else(|| {
+                        LayoutBuildError::new(
+                            "existing penalty index would overflow layout penalty count",
+                        )
+                    })?;
+                self.next_penalty = self.next_penalty.max(next_penalty);
                 indices
             }
         };
@@ -140,6 +151,12 @@ impl EngineLayoutBuilder {
     }
 
     pub fn build(self) -> EngineLayout {
+        assert!(
+            self.terms
+                .iter()
+                .flat_map(|term| term.penalty_indices.iter())
+                .all(|&idx| idx < self.next_penalty)
+        );
         EngineLayout {
             terms: self.terms,
             total_coeffs: self.next_col,
@@ -195,8 +212,25 @@ mod tests {
         .expect("custom");
         let layout = b.build();
         assert_eq!(layout.total_coeffs, 13);
-        assert_eq!(layout.num_penalties, 4);
+        assert_eq!(layout.num_penalties, 8);
         assert_eq!(layout.terms[0].penalty_indices, vec![1, 7]);
+    }
+
+    #[test]
+    fn builder_allocates_new_penalties_after_existing_indices() {
+        let mut b = EngineLayoutBuilder::with_offsets(0, 2);
+        b.push_term(EngineTermSpec {
+            kind: EngineTermKind::Custom,
+            width: 2,
+            penaltyspec: PenaltySpec::Existing(vec![1, 7]),
+        })
+        .expect("existing");
+        b.push_term(EngineTermSpec::penalized(EngineTermKind::Smooth, 3, 2))
+            .expect("new");
+
+        let layout = b.build();
+        assert_eq!(layout.num_penalties, 10);
+        assert_eq!(layout.terms[1].penalty_indices, vec![8, 9]);
     }
 
     #[test]
