@@ -7454,8 +7454,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
         };
         let beta_flat = inner.block_states[block_idx].beta.clone();
-        let compute_dh =
-            |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+        let compute_dh = |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
             if !include_logdet_h {
                 return Ok(None);
             }
@@ -7466,13 +7465,15 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                         block_idx,
                         direction,
                     )? {
-                        Some(h_exact) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
-                            h_exact,
-                            p,
-                            &format!(
-                                "block {block_idx} exact-newton dH shape mismatch in fixed-point outer evaluation"
-                            ),
-                        )?))),
+                        Some(h_exact) => {
+                            Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                                h_exact,
+                                p,
+                                &format!(
+                                    "block {block_idx} exact-newton dH shape mismatch in fixed-point outer evaluation"
+                                ),
+                            )?)))
+                        }
                         None => Err(format!(
                             "missing exact-newton dH callback for block {block_idx} while fixed-point evaluation requires H_beta term"
                         )),
@@ -8793,9 +8794,8 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
     };
 
     // No d²H provider for the generic single-block fallback.
-    let compute_d2h = |_: &Array1<f64>,
-                       _: &Array1<f64>|
-     -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+    let compute_d2h =
+        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
 
     let eval_result = joint_outer_evaluate(
         &inner,

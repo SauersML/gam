@@ -1145,12 +1145,6 @@ impl DriftDerivResult {
         }
     }
 
-    pub fn trace_hinv(&self, hop: &dyn HessianOperator) -> f64 {
-        match self {
-            Self::Dense(matrix) => hop.trace_hinv_product(matrix),
-            Self::Operator(operator) => hop.trace_hinv_operator(operator.as_ref()),
-        }
-    }
 }
 
 pub type FixedDriftDerivFn =
@@ -3134,7 +3128,7 @@ pub fn reml_laml_evaluate(
             .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        vec![None; k]
+        (0..k).map(|_| None).collect()
     };
 
     // --- Stochastic trace estimation decision ---
@@ -3195,7 +3189,7 @@ pub fn reml_laml_evaluate(
             let mut generic_ops: Vec<&dyn HyperOperator> = Vec::new();
             let mut implicit_ops: Vec<&ImplicitHyperOperator> = Vec::new();
             for op in &rho_ops {
-                generic_ops.push(op);
+                generic_ops.push(op.as_ref());
             }
             for coord in solution.ext_coords.iter() {
                 if let Some(op) = coord
