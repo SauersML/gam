@@ -5973,6 +5973,111 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Some(block_acc.to_dense(slices)))
     }
 
+    fn exact_newton_joint_psihessian_directional_derivative_operator_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let Some((block_idx, _)) = self.resolve_psi_location(derivative_blocks, psi_index) else {
+            return Ok(None);
+        };
+        let idx_primary = if block_idx == 0 { 0 } else { 1 };
+        let n = self.y.len();
+        let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(
+                || BernoulliBlockHessianAccumulator::new(slices),
+                |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let row_dir = self.row_primary_direction_from_flat(
+                            row,
+                            slices,
+                            primary,
+                            d_beta_flat,
+                        )?;
+                        let Some(psi_dir) = self.row_primary_psi_direction(
+                            row,
+                            block_states,
+                            derivative_blocks,
+                            psi_index,
+                            primary,
+                        )?
+                        else {
+                            continue;
+                        };
+                        let psi_action = self
+                            .row_primary_psi_action_on_direction(
+                                row,
+                                slices,
+                                derivative_blocks,
+                                psi_index,
+                                d_beta_flat,
+                                primary,
+                            )?
+                            .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
+                        let row_ctx = Self::row_ctx(cache, row);
+                        let third_beta = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &row_dir,
+                        )?;
+                        let fourth = self.row_primary_fourth_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &row_dir,
+                            &psi_dir,
+                        )?;
+                        let psi_row = self
+                            .block_psi_row(row, slices, derivative_blocks, psi_index)?
+                            .ok_or_else(|| {
+                                "missing bernoulli marginal-slope psi vector".to_string()
+                            })?;
+                        let right_primary = third_beta.row(idx_primary).to_owned();
+                        acc.add_rank1_psi_cross(
+                            self,
+                            row,
+                            slices,
+                            primary,
+                            psi_row.block_idx,
+                            &psi_row.local_vec,
+                            &right_primary,
+                        );
+                        acc.add_pullback(self, row, slices, primary, &fourth);
+                        let third_action = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &psi_action,
+                        )?;
+                        acc.add_pullback(self, row, slices, primary, &third_action);
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BernoulliBlockHessianAccumulator::new(slices),
+                |mut left, right| -> Result<_, String> {
+                    left.add(&right);
+                    Ok(left)
+                },
+            )?;
+        Ok(Some(
+            Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
+        ))
+    }
+
     fn exact_newton_joint_hessian_directional_derivative_from_cache(
         &self,
         block_states: &[ParameterBlockState],
@@ -6064,6 +6169,100 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Some(block_acc.to_dense(slices)))
     }
 
+    fn exact_newton_joint_hessian_directional_derivative_operator_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
+
+        if !self.effective_flex_active(block_states)? {
+            let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(
+                    || BernoulliBlockHessianAccumulator::new(slices),
+                    |mut acc, chunk_idx| -> Result<_, String> {
+                        let probit_scale = self.probit_frailty_scale();
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        for row in start..end {
+                            let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                            let g = block_states[1].eta[row];
+                            let k = RigidProbitKernel::new(
+                                marginal.q,
+                                g,
+                                self.z[row],
+                                self.y[row],
+                                self.weights[row],
+                                probit_scale,
+                            );
+                            let dq = self
+                                .marginal_design
+                                .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
+                            let dg = self
+                                .logslope_design
+                                .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
+                            let t = rigid_transformed_third_contracted(marginal, &k, dq, dg);
+                            let t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
+                            acc.add_pullback(self, row, slices, primary, &t_arr);
+                        }
+                        Ok(acc)
+                    },
+                )
+                .try_reduce(
+                    || BernoulliBlockHessianAccumulator::new(slices),
+                    |mut left, right| -> Result<_, String> {
+                        left.add(&right);
+                        Ok(left)
+                    },
+                )?;
+            return Ok(Some(
+                Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
+            ));
+        }
+
+        let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(
+                || BernoulliBlockHessianAccumulator::new(slices),
+                |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let row_dir = self.row_primary_direction_from_flat(
+                            row,
+                            slices,
+                            primary,
+                            d_beta_flat,
+                        )?;
+                        let row_ctx = Self::row_ctx(cache, row);
+                        let third = self.row_primary_third_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &row_dir,
+                        )?;
+                        acc.add_pullback(self, row, slices, primary, &third);
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BernoulliBlockHessianAccumulator::new(slices),
+                |mut left, right| -> Result<_, String> {
+                    left.add(&right);
+                    Ok(left)
+                },
+            )?;
+        Ok(Some(
+            Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
+        ))
+    }
+
     fn exact_newton_joint_hessiansecond_directional_derivative_from_cache(
         &self,
         block_states: &[ParameterBlockState],
@@ -6148,6 +6347,95 @@ impl BernoulliMarginalSlopeFamily {
                 Ok(left)
             })?;
         Ok(Some(block_acc.to_dense(slices)))
+    }
+
+    fn exact_newton_joint_hessiansecond_directional_derivative_operator_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
+        let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
+
+        if !self.effective_flex_active(block_states)? {
+            let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
+                    let probit_scale = self.probit_frailty_scale();
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                        let g = block_states[1].eta[row];
+                        let k = RigidProbitKernel::new(
+                            marginal.q,
+                            g,
+                            self.z[row],
+                            self.y[row],
+                            self.weights[row],
+                            probit_scale,
+                        );
+                        let uq = self
+                            .marginal_design
+                            .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
+                        let ug = self
+                            .logslope_design
+                            .dot_row_view(row, d_beta_u_flat.slice(s![slices.logslope.clone()]));
+                        let vq = self
+                            .marginal_design
+                            .dot_row_view(row, d_beta_v_flat.slice(s![slices.marginal.clone()]));
+                        let vg = self
+                            .logslope_design
+                            .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
+                        let f = rigid_transformed_fourth_contracted(marginal, &k, uq, ug, vq, vg);
+                        let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                        acc.add_pullback(self, row, slices, primary, &f_arr);
+                    }
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                    left.add(&right);
+                    Ok(left)
+                })?;
+            return Ok(Some(
+                Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
+            ));
+        }
+
+        let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
+                let start = chunk_idx * ROW_CHUNK_SIZE;
+                let end = (start + ROW_CHUNK_SIZE).min(n);
+                for row in start..end {
+                    let row_u =
+                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_u_flat)?;
+                    let row_v =
+                        self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let fourth = self.row_primary_fourth_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &row_u,
+                        &row_v,
+                    )?;
+                    acc.add_pullback(self, row, slices, primary, &fourth);
+                }
+                Ok(acc)
+            })
+            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                left.add(&right);
+                Ok(left)
+            })?;
+        Ok(Some(
+            Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
+        ))
     }
 
     fn evaluate_blockwise_exact_newton(
@@ -6890,6 +7178,18 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(Some)
     }
 
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_operator_from_cache(
+                &self.block_states,
+                d_beta_flat,
+                &self.cache,
+            )
+    }
+
     fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
@@ -6898,6 +7198,20 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .exact_newton_joint_hessian_directional_derivative_from_cache(
                 &self.block_states,
                 d_beta_flat,
+                &self.cache,
+            )
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_operator_from_cache(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
                 &self.cache,
             )
     }
@@ -6967,7 +7281,7 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         self.family
-            .exact_newton_joint_psihessian_directional_derivative_from_cache(
+            .exact_newton_joint_psihessian_directional_derivative_operator_from_cache(
                 &self.block_states,
                 &self.derivative_blocks,
                 psi_index,
@@ -6975,7 +7289,7 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
                 &self.cache,
             )
             .map(|result| {
-                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense)
+                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator)
             })
     }
 }

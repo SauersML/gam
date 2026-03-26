@@ -1130,6 +1130,21 @@ pub enum DriftDerivResult {
     Operator(Arc<dyn HyperOperator>),
 }
 
+impl std::fmt::Debug for DriftDerivResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense(matrix) => f
+                .debug_tuple("Dense")
+                .field(&format_args!("{}x{}", matrix.nrows(), matrix.ncols()))
+                .finish(),
+            Self::Operator(_) => f
+                .debug_tuple("Operator")
+                .field(&"<hyper-operator>")
+                .finish(),
+        }
+    }
+}
+
 impl DriftDerivResult {
     pub fn into_operator(self) -> Arc<dyn HyperOperator> {
         match self {
@@ -1144,7 +1159,6 @@ impl DriftDerivResult {
             Self::Operator(operator) => hop.trace_logdet_operator(operator.as_ref()),
         }
     }
-
 }
 
 pub type FixedDriftDerivFn =
@@ -4287,13 +4301,6 @@ struct StoredFirstDrift {
 }
 
 impl StoredFirstDrift {
-    fn from_dense(matrix: Array2<f64>) -> Self {
-        Self {
-            dense: Some(matrix),
-            operators: Vec::new(),
-        }
-    }
-
     fn from_parts(dense: Option<Array2<f64>>, operators: Vec<Arc<dyn HyperOperator>>) -> Self {
         Self { dense, operators }
     }

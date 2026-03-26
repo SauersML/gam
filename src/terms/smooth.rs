@@ -9322,7 +9322,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         );
         self.realizer
             .apply_log_kappa(&log_kappa, &self.spatial_terms)?;
-        log::info!(
+        log::trace!(
             "[outer-timing] ensure_theta (apply_log_kappa, {} terms): {:.1}ms",
             self.spatial_terms.len(),
             t_ensure.elapsed().as_secs_f64() * 1000.0,
@@ -10919,7 +10919,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         target_term.lower_bounds_local = lower_bounds_local;
         target_term.linear_constraints_local = linear_constraints_local;
         self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
-        log::info!(
+        log::trace!(
             "[outer-timing] replace_term_realization (term {}, '{}', cols={}): {:.1}ms",
             term_idx,
             target_term.name,
@@ -11166,7 +11166,7 @@ impl<'d> ExactJointDesignCache<'d> {
             }
         }
 
-        log::info!(
+        log::trace!(
             "[outer-timing] ensure_theta (n-block, {} blocks, {} realizers): {:.1}ms",
             n,
             self.realizers.len(),
