@@ -2590,6 +2590,12 @@ pub fn fit_transformation_normal(
         kappa_options,
     );
     let kappa_dims = kappa0.dims_per_term().to_vec();
+    log::info!(
+        "[transformation-normal] exact joint setup: rho_dim={} log_kappa_dim={} dims_per_term={:?}",
+        n_penalties,
+        kappa0.len(),
+        kappa_dims,
+    );
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&kappa_dims, kappa_options);
     let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&kappa_dims, kappa_options);
 

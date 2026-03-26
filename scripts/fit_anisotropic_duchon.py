@@ -58,12 +58,6 @@ def parse_args() -> argparse.Namespace:
         help="Forwarded to gam fit; lower default is faster on large high-D fits",
     )
     parser.add_argument(
-        "--pilot-geometry-only",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skip the expensive full-data anisotropy re-optimization after the pilot fit",
-    )
-    parser.add_argument(
         "--double-penalty",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -224,8 +218,6 @@ def main() -> None:
         "--pilot-subsample-threshold",
         str(args.pilot_subsample_threshold),
     ]
-    if args.pilot_geometry_only:
-        cmd.append("--pilot-geometry-only")
     if logslope_formula is not None:
         cmd.extend(["--logslope-formula", logslope_formula, "--z-column", args.z_column])
     cmd.extend(["--out", str(args.out), str(args.csv), main_formula])

@@ -1299,11 +1299,6 @@ pub struct SpatialLengthScaleOptimizationOptions {
     ///
     /// Set to 0 to disable pilot-fit and always optimize on full data.
     pub pilot_subsample_threshold: usize,
-    /// When a pilot subsample is used, keep the pilot-derived spatial geometry
-    /// for the final full-data fit and skip the exact full-data [rho, psi]
-    /// re-optimization. This preserves anisotropy while avoiding a second
-    /// expensive geometry solve on the full dataset.
-    pub pilot_geometry_only: bool,
 }
 
 impl Default for SpatialLengthScaleOptimizationOptions {
@@ -1316,7 +1311,6 @@ impl Default for SpatialLengthScaleOptimizationOptions {
             min_length_scale: 1e-3,
             max_length_scale: 1e3,
             pilot_subsample_threshold: 10_000,
-            pilot_geometry_only: false,
         }
     }
 }
@@ -11589,7 +11583,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     }
 
     let pilot_threshold = kappa_options.pilot_subsample_threshold;
-    let mut used_pilot = false;
     if pilot_threshold > 0 && n > pilot_threshold * 2 {
         let indices = stratified_spatial_subsample(data, spec, pilot_threshold);
         let pilot_n = indices.len();
@@ -11622,7 +11615,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                     "[spatial-kappa] pilot complete; using pilot geometry as the full-data initializer"
                 );
                 resolvedspec = pilot_result.resolvedspec;
-                used_pilot = true;
             }
             Err(err) => {
                 log::warn!(
@@ -11646,18 +11638,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // into the spec so the optimizer starts from the geometry-informed η values
     // rather than the zero sentinel from --scale-dimensions.
     sync_aniso_contrasts_from_metadata(&mut resolvedspec, &best.design.smooth);
-    if used_pilot && kappa_options.pilot_geometry_only {
-        log::info!(
-            "[spatial-kappa] pilot-geometry-only enabled; skipping exact full-data anisotropy re-optimization"
-        );
-        log_spatial_aniso_scales(&resolvedspec);
-        return Ok(FittedTermCollectionWithSpec {
-            fit: best.fit,
-            design: best.design,
-            resolvedspec,
-            adaptive_diagnostics: best.adaptive_diagnostics,
-        });
-    }
     let initial_score = fit_score(&best.fit);
     if !initial_score.is_finite() {
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
