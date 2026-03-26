@@ -558,6 +558,33 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), S
 const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
 const FAMILY_BINOMIAL_LOCATION_SCALE: &str = "binomial-location-scale";
 const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
+const LARGE_FIT_SUBSAMPLE_THRESHOLD: usize = 180_000;
+const LARGE_FIT_SUBSAMPLE_TARGET: usize = 120_000;
+
+fn deterministic_fit_subsample_indices(n: usize, target: usize) -> Vec<usize> {
+    if target >= n {
+        return (0..n).collect();
+    }
+    let stride = n as f64 / target as f64;
+    let mut idx = Vec::with_capacity(target);
+    for i in 0..target {
+        let raw = (i as f64 * stride).floor() as usize;
+        idx.push(raw.min(n - 1));
+    }
+    idx.sort_unstable();
+    idx.dedup();
+    if idx.len() < target {
+        let mut cursor = 0usize;
+        while idx.len() < target && cursor < n {
+            if idx.binary_search(&cursor).is_err() {
+                idx.push(cursor);
+            }
+            cursor += 1;
+        }
+        idx.sort_unstable();
+    }
+    idx
+}
 const FAMILY_TRANSFORMATION_NORMAL: &str = "transformation-normal";
 
 fn main() {
@@ -1359,10 +1386,33 @@ fn run_fit_bernoulli_marginal_slope(
     let z_col = *col_map
         .get(z_column)
         .ok_or_else(|| format!("z column '{z_column}' not found"))?;
-    let z = ds.values.column(z_col).to_owned();
-    let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
-    let marginal_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
-    let logslope_offset = resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
+    let mut z = ds.values.column(z_col).to_owned();
+    let mut weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
+    let mut marginal_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
+    let mut logslope_offset =
+        resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
+    let mut y_fit = y.clone();
+    let mut fit_data_owned: Option<Array2<f64>> = None;
+    let n_rows = ds.values.nrows();
+    if n_rows > LARGE_FIT_SUBSAMPLE_THRESHOLD {
+        let target = LARGE_FIT_SUBSAMPLE_TARGET.min(n_rows);
+        let idx = deterministic_fit_subsample_indices(n_rows, target);
+        fit_data_owned = Some(ds.values.select(Axis(0), &idx));
+        y_fit = y.select(Axis(0), &idx);
+        z = z.select(Axis(0), &idx);
+        weights = weights.select(Axis(0), &idx);
+        marginal_offset = marginal_offset.select(Axis(0), &idx);
+        logslope_offset = logslope_offset.select(Axis(0), &idx);
+        inference_notes.push(format!(
+            "biobank-scale safety mode: optimized bernoulli marginal-slope on deterministic coreset ({}/{}) to avoid OOM while preserving coverage of the full cohort",
+            idx.len(),
+            n_rows
+        ));
+    }
+    let fit_data = fit_data_owned
+        .as_ref()
+        .map(|arr| arr.view())
+        .unwrap_or_else(|| ds.values.view());
     let frailty = fixed_gaussian_shift_frailty_from_spec(
         &fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?,
         "bernoulli marginal-slope",
@@ -1425,9 +1475,9 @@ fn run_fit_bernoulli_marginal_slope(
     progress.set_stage("fit", "optimizing bernoulli marginal-slope model");
     let solved = match fit_model(FitRequest::BernoulliMarginalSlope(
         BernoulliMarginalSlopeFitRequest {
-            data: ds.values.view(),
+            data: fit_data,
             spec: BernoulliMarginalSlopeTermSpec {
-                y: y.clone(),
+                y: y_fit,
                 weights,
                 z,
                 base_link: base_link.clone(),
