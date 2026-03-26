@@ -11383,7 +11383,10 @@ where
                     ctx.track_best(theta, cost);
                     return Ok(cost);
                 }
-                if ctx.cache.ensure_theta(theta).is_err() {
+                if let Err(err) = ctx.cache.ensure_theta(theta) {
+                    log::warn!(
+                        "[OUTER] n-block exact-joint spatial: ensure_theta failed during cost evaluation: {err}"
+                    );
                     return Ok(f64::INFINITY);
                 }
                 let specs = collect_specs(&ctx.cache);
@@ -11424,7 +11427,10 @@ where
                         hessian: hess,
                     });
                 }
-                if ctx.cache.ensure_theta(theta).is_err() {
+                if let Err(err) = ctx.cache.ensure_theta(theta) {
+                    log::warn!(
+                        "[OUTER] n-block exact-joint spatial: ensure_theta failed during gradient evaluation: {err}"
+                    );
                     return Ok(OuterEval::infeasible(theta.len()));
                 }
                 let specs = collect_specs(&ctx.cache);

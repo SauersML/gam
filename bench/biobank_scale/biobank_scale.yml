@@ -83,7 +83,39 @@
       "include_sigma": false,
       "marginal_slope": true,
       "scale_dimensions": true,
-      "z_column": "pgs_std"
+      "z_column": "pgs_std",
+      "max_centers": 32
+    },
+    {
+      "name": "rust_margslope_aniso_matern16d_scorewarp_fast",
+      "dataset": "disease",
+      "backend": "rust_gam",
+      "family": "binomial",
+      "spatial_basis": "matern",
+      "centers": 40,
+      "smooth_kind": "joint",
+      "include_sigma": false,
+      "marginal_slope": true,
+      "scale_dimensions": true,
+      "z_column": "pgs_std",
+      "logslope_linkwiggle_knots": 8,
+      "max_centers": 24
+    },
+    {
+      "name": "rust_margslope_aniso_matern16d_linkwiggle_scorewarp_fast",
+      "dataset": "disease",
+      "backend": "rust_gam",
+      "family": "binomial",
+      "spatial_basis": "matern",
+      "centers": 36,
+      "smooth_kind": "joint",
+      "include_sigma": false,
+      "marginal_slope": true,
+      "scale_dimensions": true,
+      "z_column": "pgs_std",
+      "mean_linkwiggle_knots": 8,
+      "logslope_linkwiggle_knots": 8,
+      "max_centers": 22
     },
     {
       "name": "r_mgcv_matern60",
@@ -105,6 +137,19 @@
       "include_sigma": false,
       "survival_likelihood": "transformation",
       "survival_distribution": "gaussian"
+    },
+    {
+      "name": "rust_survival_transform_ps_link_timewiggle_fast",
+      "dataset": "survival",
+      "backend": "rust_survival",
+      "family": "survival",
+      "spatial_basis": "ps",
+      "smooth_kind": "separate",
+      "include_sigma": false,
+      "survival_likelihood": "transformation",
+      "survival_distribution": "gaussian",
+      "mean_linkwiggle_knots": 8,
+      "timewiggle_knots": 8
     },
     {
       "name": "r_mgcv_survival_ps",
