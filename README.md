@@ -175,8 +175,6 @@ gam fit data.csv \
 
 Models `P(case | covariates, z)` where `z` is a standardized score (e.g. a polygenic risk score). The key idea: the baseline risk surface and the effect of `z` are decoupled into separate formulas. The main formula controls the population-level risk landscape (how risk varies with age, ancestry PCs, etc.), while `--logslope-formula` controls how strongly `z` modifies that risk at each point in covariate space. This decoupling lets you estimate spatially-varying effect sizes for `z` without the baseline absorbing signal that belongs to the slope, or vice versa.
 
-Saved marginal-slope models persist the training-time `z` normalization and replay it automatically at prediction time. Older saved marginal-slope models without that metadata must be refit.
-
 ```bash
 gam fit data.csv \
   'case ~ smooth(age) + matern(pc1, pc2, pc3)' \

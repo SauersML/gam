@@ -1,26 +1,25 @@
 use crate::basis::create_difference_penalty_matrix;
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
-    CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
-    CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart,
-    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
     first_psi_linear_map, fit_custom_family, second_psi_linear_map,
-    slice_joint_into_block_working_sets,
+    slice_joint_into_block_working_sets, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
+    CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction,
+    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
 };
-use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
+use crate::estimate::UnifiedFitResult;
 use crate::families::gamlss::{
-    ParameterBlockInput, WiggleBlockConfig, append_selected_wiggle_penalty_orders,
-    select_wiggle_basis_from_seed, split_wiggle_penalty_orders,
+    append_selected_wiggle_penalty_orders, select_wiggle_basis_from_seed,
+    split_wiggle_penalty_orders, ParameterBlockInput, WiggleBlockConfig,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
-    RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
-    row_kernel_hessian_dense, row_kernel_log_likelihood,
+    build_row_kernel_cache, row_kernel_gradient, row_kernel_hessian_dense,
+    row_kernel_log_likelihood, RowKernel, RowKernelHessianWorkspace,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{
@@ -29,13 +28,13 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
     SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    TermCollectionSpec,
 };
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
 use std::cell::RefCell;
@@ -713,6 +712,15 @@ pub(crate) fn erfcx_nonnegative(x: f64) -> f64 {
 
 #[inline]
 pub(crate) fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
+    if x == f64::INFINITY {
+        return (0.0, 0.0);
+    }
+    if x == f64::NEG_INFINITY {
+        return (f64::NEG_INFINITY, f64::INFINITY);
+    }
+    if x.is_nan() {
+        return (f64::NAN, f64::NAN);
+    }
     if x < 0.0 {
         let u = -x / std::f64::consts::SQRT_2;
         let ex = erfcx_nonnegative(u).max(1e-300);
@@ -726,12 +734,19 @@ pub(crate) fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
     }
 }
 
-pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
+#[inline]
+fn signed_probit_neglog_derivatives_up_to_fourth_numeric(
     signed_margin: f64,
     weight: f64,
 ) -> (f64, f64, f64, f64) {
-    if weight == 0.0 || !signed_margin.is_finite() {
+    if weight == 0.0 || signed_margin == f64::INFINITY {
         return (0.0, 0.0, 0.0, 0.0);
+    }
+    if signed_margin == f64::NEG_INFINITY {
+        return (f64::NEG_INFINITY, weight, 0.0, 0.0);
+    }
+    if signed_margin.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
     }
     let (_, lambda) = signed_probit_logcdf_and_mills_ratio(signed_margin);
     let k1 = -lambda;
@@ -747,6 +762,24 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
             + 12.0 * signed_margin * lambda * lambda
             + 6.0 * lambda.powi(3));
     (weight * k1, weight * k2, weight * k3, weight * k4)
+}
+
+pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
+    signed_margin: f64,
+    weight: f64,
+) -> Result<(f64, f64, f64, f64), String> {
+    if weight == 0.0 || signed_margin == f64::INFINITY {
+        return Ok((0.0, 0.0, 0.0, 0.0));
+    }
+    if !signed_margin.is_finite() {
+        return Err(format!(
+            "non-finite signed margin in exact probit derivative helper: {signed_margin}"
+        ));
+    }
+    Ok(signed_probit_neglog_derivatives_up_to_fourth_numeric(
+        signed_margin,
+        weight,
+    ))
 }
 
 #[inline]
@@ -791,7 +824,7 @@ struct RigidProbitKernel {
 
 impl RigidProbitKernel {
     #[inline]
-    fn new(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Self {
+    fn new(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Result<Self, String> {
         let s = 2.0 * y - 1.0;
         let observed_logslope = rigid_observed_logslope(g, probit_scale);
         let g2 = observed_logslope * observed_logslope;
@@ -803,8 +836,8 @@ impl RigidProbitKernel {
         let eta = q * c + observed_logslope * z;
         let m = s * eta;
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
-        let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w);
-        Self {
+        let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w)?;
+        Ok(Self {
             logcdf,
             u1: s * k1,
             u2: k2,
@@ -816,7 +849,7 @@ impl RigidProbitKernel {
             c4: probit_scale.powi(4) * (12.0 * g2 - 3.0) * c_inv7,
             eta_q: c,
             eta_g: q * c1 + probit_scale * z,
-        }
+        })
     }
 
     #[inline]
@@ -1019,7 +1052,16 @@ pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     ]
 }
 pub(crate) fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
-    let (d1, d2, d3, d4) = signed_probit_neglog_derivatives_up_to_fourth(x, weight);
+    if weight == 0.0 || x == f64::INFINITY {
+        return [0.0, 0.0, 0.0, 0.0, 0.0];
+    }
+    if x == f64::NEG_INFINITY {
+        return [f64::INFINITY, f64::NEG_INFINITY, weight, 0.0, 0.0];
+    }
+    if x.is_nan() {
+        return [f64::NAN; 5];
+    }
+    let (d1, d2, d3, d4) = signed_probit_neglog_derivatives_up_to_fourth_numeric(x, weight);
     let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(x);
     [-weight * log_cdf, d1, d2, d3, d4]
 }
@@ -2005,7 +2047,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             self.family.y[row],
             self.family.weights[row],
             probit_scale,
-        );
+        )?;
         let nll = -self.family.weights[row] * k.logcdf;
         let grad = rigid_transformed_gradient(marginal, &k);
         let h = rigid_transformed_hessian(marginal, &k);
@@ -2122,7 +2164,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             self.family.y[row],
             self.family.weights[row],
             probit_scale,
-        );
+        )?;
         Ok(rigid_transformed_third_contracted(
             marginal, &k, dir[0], dir[1],
         ))
@@ -2146,7 +2188,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             self.family.y[row],
             self.family.weights[row],
             probit_scale,
-        );
+        )?;
         Ok(rigid_transformed_fourth_contracted(
             marginal, &k, dir_u[0], dir_u[1], dir_v[0], dir_v[1],
         ))
@@ -3076,7 +3118,7 @@ impl BernoulliMarginalSlopeFamily {
             self.y[row],
             self.weights[row],
             self.probit_frailty_scale(),
-        );
+        )?;
         let neglog = -self.weights[row] * kern.logcdf;
         let grad_pair = rigid_transformed_gradient(marginal, &kern);
         let mut grad = Array1::<f64>::zeros(2);
@@ -3532,7 +3574,7 @@ impl BernoulliMarginalSlopeFamily {
                 self.y[row],
                 self.weights[row],
                 self.probit_frailty_scale(),
-            );
+            )?;
             let t = rigid_transformed_third_contracted(marginal, &kern, dir[0], dir[1]);
             let mut out = Array2::<f64>::zeros((2, 2));
             out[[0, 0]] = t[0][0];
@@ -4000,7 +4042,7 @@ impl BernoulliMarginalSlopeFamily {
         let w_i = self.weights[row];
         let s_y = 2.0 * y_i - 1.0;
         let m = s_y * eta_val;
-        let (k1, k2, k3, _) = signed_probit_neglog_derivatives_up_to_fourth(m, w_i);
+        let (k1, k2, k3, _) = signed_probit_neglog_derivatives_up_to_fourth(m, w_i)?;
         let u1 = s_y * k1;
         let u3 = s_y * k3;
 
@@ -4042,7 +4084,7 @@ impl BernoulliMarginalSlopeFamily {
                 self.y[row],
                 self.weights[row],
                 self.probit_frailty_scale(),
-            );
+            )?;
             let f = rigid_transformed_fourth_contracted(
                 marginal, &kern, dir_u[0], dir_u[1], dir_v[0], dir_v[1],
             );
@@ -4938,7 +4980,7 @@ impl BernoulliMarginalSlopeFamily {
         let w_i = self.weights[row];
         let s_y = 2.0 * y_i - 1.0;
         let m = s_y * eta_val;
-        let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w_i);
+        let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w_i)?;
         let u1 = s_y * k1;
         let u3 = s_y * k3;
 
@@ -5171,7 +5213,7 @@ impl BernoulliMarginalSlopeFamily {
                                 self.y[row],
                                 self.weights[row],
                                 probit_scale,
-                            );
+                            )?;
                             let h = rigid_transformed_hessian(marginal, &k);
                             let v_q = self
                                 .marginal_design
@@ -5272,7 +5314,7 @@ impl BernoulliMarginalSlopeFamily {
                                 self.y[row],
                                 self.weights[row],
                                 probit_scale,
-                            );
+                            )?;
                             let h = rigid_transformed_hessian(marginal, &k);
                             {
                                 let mut m = chunk_diag.slice_mut(s![slices.marginal.clone()]);
@@ -6185,7 +6227,7 @@ impl BernoulliMarginalSlopeFamily {
                                 self.y[row],
                                 self.weights[row],
                                 probit_scale,
-                            );
+                            )?;
                             let dq = self
                                 .marginal_design
                                 .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
@@ -6275,7 +6317,7 @@ impl BernoulliMarginalSlopeFamily {
                                 self.y[row],
                                 self.weights[row],
                                 probit_scale,
-                            );
+                            )?;
                             let dq = self
                                 .marginal_design
                                 .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
@@ -6370,7 +6412,7 @@ impl BernoulliMarginalSlopeFamily {
                             self.y[row],
                             self.weights[row],
                             probit_scale,
-                        );
+                        )?;
                         let uq = self
                             .marginal_design
                             .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -6455,7 +6497,7 @@ impl BernoulliMarginalSlopeFamily {
                             self.y[row],
                             self.weights[row],
                             probit_scale,
-                        );
+                        )?;
                         let uq = self
                             .marginal_design
                             .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -6673,7 +6715,7 @@ impl BernoulliMarginalSlopeFamily {
                     self.y[row],
                     self.weights[row],
                     probit_scale,
-                );
+                )?;
                 ll += self.weights[row] * kern.logcdf;
                 let grad = rigid_transformed_gradient(marginal, &kern);
                 let h = rigid_transformed_hessian(marginal, &kern);
@@ -8012,11 +8054,12 @@ mod tests {
     use super::*;
     use crate::custom_family::CustomFamily;
     use crate::families::bernoulli_marginal_slope::exact_kernel::{
-        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
-        LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
+        branch_cell as branch_exact_cell, build_denested_partition_cells,
         denested_cell_coefficient_partials as exact_denested_cell_coefficient_partials,
         global_cubic_from_local as exact_global_cubic_from_local,
         transformed_link_cubic as exact_transformed_link_cubic,
+        DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
+        LocalSpanCubic,
     };
     use ndarray::array;
 
@@ -8498,12 +8541,10 @@ mod tests {
             .monotonicity_feasible(&feasible, "feasible structural beta")
             .expect("boundary point should be feasible");
         let infeasible = &feasible - 1e-3;
-        assert!(
-            prepared
-                .runtime
-                .monotonicity_feasible(&infeasible, "infeasible structural beta")
-                .is_err()
-        );
+        assert!(prepared
+            .runtime
+            .monotonicity_feasible(&infeasible, "infeasible structural beta")
+            .is_err());
     }
 
     #[test]
@@ -8583,8 +8624,7 @@ mod tests {
                         .runtime
                         .local_cubic_on_span(&beta, expected_span_idx)
                         .expect("expected lookup cubic on span");
-                    assert_eq!(selected.left, expected_cubic.left);
-                    assert_eq!(selected.right, expected_cubic.right);
+                    assert_eq!(selected, expected_cubic);
                 }
             }
         }
@@ -8635,8 +8675,7 @@ mod tests {
                     .runtime
                     .basis_span_cubic(expected_span_idx, basis_idx)
                     .expect("expected basis span cubic");
-                assert_eq!(selected.left, expected_cubic.left);
-                assert_eq!(selected.right, expected_cubic.right);
+                assert_eq!(selected, expected_cubic);
             }
         }
     }
@@ -9127,6 +9166,52 @@ mod tests {
         )
         .expect_err("non-finite z should be rejected");
         assert!(err.contains("finite z values"));
+    }
+
+    #[test]
+    fn signed_probit_helpers_handle_nonfinite_boundaries_explicitly() {
+        let (logcdf_pos, lambda_pos) = signed_probit_logcdf_and_mills_ratio(f64::INFINITY);
+        assert_eq!(logcdf_pos, 0.0);
+        assert_eq!(lambda_pos, 0.0);
+
+        let (logcdf_neg, lambda_neg) = signed_probit_logcdf_and_mills_ratio(f64::NEG_INFINITY);
+        assert_eq!(logcdf_neg, f64::NEG_INFINITY);
+        assert_eq!(lambda_neg, f64::INFINITY);
+
+        let (logcdf_nan, lambda_nan) = signed_probit_logcdf_and_mills_ratio(f64::NAN);
+        assert!(logcdf_nan.is_nan());
+        assert!(lambda_nan.is_nan());
+    }
+
+    #[test]
+    fn signed_probit_exact_derivative_helper_rejects_invalid_nonfinite_margins() {
+        assert_eq!(
+            signed_probit_neglog_derivatives_up_to_fourth(f64::INFINITY, 2.5)
+                .expect("+inf should use the zero tail"),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+
+        let neg_inf_err = signed_probit_neglog_derivatives_up_to_fourth(f64::NEG_INFINITY, 2.5)
+            .expect_err("-inf should be rejected in the exact derivative path");
+        assert!(neg_inf_err.contains("non-finite signed margin"));
+
+        let nan_err = signed_probit_neglog_derivatives_up_to_fourth(f64::NAN, 2.5)
+            .expect_err("NaN should be rejected in the exact derivative path");
+        assert!(nan_err.contains("non-finite signed margin"));
+    }
+
+    #[test]
+    fn unary_neglog_phi_preserves_negative_infinity_and_nan_boundaries() {
+        assert_eq!(
+            unary_derivatives_neglog_phi(f64::INFINITY, 1.75),
+            [0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            unary_derivatives_neglog_phi(f64::NEG_INFINITY, 1.75),
+            [f64::INFINITY, f64::NEG_INFINITY, 1.75, 0.0, 0.0]
+        );
+        let nan_terms = unary_derivatives_neglog_phi(f64::NAN, 1.75);
+        assert!(nan_terms.iter().all(|value| value.is_nan()));
     }
 
     #[test]
@@ -13076,9 +13161,8 @@ mod tests {
 
     #[test]
     fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
-        let z = array![
-            -0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67
-        ];
+        let z =
+            array![-0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67];
         let weights = Array1::from_elem(12, 1.0);
         let (standardized, normalization) =
             standardize_latent_z(&z, &weights, "bernoulli-marginal-slope").expect("normalize z");
@@ -13169,17 +13253,13 @@ mod tests {
         ];
         let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
-        assert!(
-            family
-                .exact_newton_joint_hessian_workspace(&block_states, &specs)
-                .expect("flex hessian workspace")
-                .is_some()
-        );
-        assert!(
-            family
-                .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
-                .expect("flex psi workspace")
-                .is_some()
-        );
+        assert!(family
+            .exact_newton_joint_hessian_workspace(&block_states, &specs)
+            .expect("flex hessian workspace")
+            .is_some());
+        assert!(family
+            .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
+            .expect("flex psi workspace")
+            .is_some());
     }
 }

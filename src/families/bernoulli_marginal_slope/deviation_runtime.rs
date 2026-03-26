@@ -314,10 +314,9 @@ impl DeviationRuntime {
     }
 
     /// Return the correct per-basis `LocalSpanCubic` for any evaluation
-    /// point.  At or outside the knot support, returns a constant cubic
-    /// (c1=c2=c3=0)
-    /// at the saturated tail value — the I-spline basis saturates, not
-    /// extrapolates, outside its support.
+    /// point. Strictly outside the knot support, returns a constant cubic
+    /// (c1=c2=c3=0) at the saturated tail value. Exact support endpoints
+    /// still use the adjacent interior span cubic.
     pub fn basis_cubic_at(
         &self,
         basis_idx: usize,
@@ -330,7 +329,7 @@ impl DeviationRuntime {
             ));
         }
         let (left_ep, right_ep) = self.support_interval()?;
-        if value <= left_ep {
+        if value < left_ep {
             return Ok(exact_kernel::LocalSpanCubic {
                 left: left_ep,
                 right: left_ep + 1.0,
@@ -340,7 +339,7 @@ impl DeviationRuntime {
                 c3: 0.0,
             });
         }
-        if value >= right_ep {
+        if value > right_ep {
             return Ok(exact_kernel::LocalSpanCubic {
                 left: right_ep,
                 right: right_ep + 1.0,
@@ -355,8 +354,9 @@ impl DeviationRuntime {
     }
 
     /// Return the correct composite `LocalSpanCubic` for any evaluation
-    /// point.  At or outside the knot support, returns a constant cubic
-    /// (c1=c2=c3=0) at the saturated tail value.
+    /// point. Strictly outside the knot support, returns a constant cubic
+    /// (c1=c2=c3=0) at the saturated tail value. Exact support endpoints
+    /// still use the adjacent interior span cubic.
     pub(crate) fn local_cubic_at(
         &self,
         beta: &Array1<f64>,
@@ -364,7 +364,7 @@ impl DeviationRuntime {
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
         self.validate_beta_shape(beta, "deviation local cubic")?;
         let (left_ep, right_ep) = self.support_interval()?;
-        if value <= left_ep {
+        if value < left_ep {
             return Ok(exact_kernel::LocalSpanCubic {
                 left: left_ep,
                 right: left_ep + 1.0,
@@ -374,7 +374,7 @@ impl DeviationRuntime {
                 c3: 0.0,
             });
         }
-        if value >= right_ep {
+        if value > right_ep {
             return Ok(exact_kernel::LocalSpanCubic {
                 left: right_ep,
                 right: right_ep + 1.0,
