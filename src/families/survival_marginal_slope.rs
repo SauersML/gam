@@ -286,6 +286,114 @@ fn flex_identity_block_pairs(
     pairs
 }
 
+#[derive(Clone)]
+struct DynamicQBlockwiseAccumulator {
+    log_likelihood: f64,
+    grad_time: Array1<f64>,
+    grad_marginal: Array1<f64>,
+    grad_logslope: Array1<f64>,
+    hess_time: Array2<f64>,
+    hess_marginal: Array2<f64>,
+    hess_logslope: Array2<f64>,
+    grad_score_warp: Option<Array1<f64>>,
+    hess_score_warp: Option<Array2<f64>>,
+    grad_link_dev: Option<Array1<f64>>,
+    hess_link_dev: Option<Array2<f64>>,
+}
+
+impl DynamicQBlockwiseAccumulator {
+    fn new(slices: &BlockSlices) -> Self {
+        Self {
+            log_likelihood: 0.0,
+            grad_time: Array1::zeros(slices.time.len()),
+            grad_marginal: Array1::zeros(slices.marginal.len()),
+            grad_logslope: Array1::zeros(slices.logslope.len()),
+            hess_time: Array2::zeros((slices.time.len(), slices.time.len())),
+            hess_marginal: Array2::zeros((slices.marginal.len(), slices.marginal.len())),
+            hess_logslope: Array2::zeros((slices.logslope.len(), slices.logslope.len())),
+            grad_score_warp: slices
+                .score_warp
+                .as_ref()
+                .map(|range| Array1::zeros(range.len())),
+            hess_score_warp: slices
+                .score_warp
+                .as_ref()
+                .map(|range| Array2::zeros((range.len(), range.len()))),
+            grad_link_dev: slices
+                .link_dev
+                .as_ref()
+                .map(|range| Array1::zeros(range.len())),
+            hess_link_dev: slices
+                .link_dev
+                .as_ref()
+                .map(|range| Array2::zeros((range.len(), range.len()))),
+        }
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        self.log_likelihood += other.log_likelihood;
+        self.grad_time += &other.grad_time;
+        self.grad_marginal += &other.grad_marginal;
+        self.grad_logslope += &other.grad_logslope;
+        self.hess_time += &other.hess_time;
+        self.hess_marginal += &other.hess_marginal;
+        self.hess_logslope += &other.hess_logslope;
+        if let (Some(lhs), Some(rhs)) = (
+            self.grad_score_warp.as_mut(),
+            other.grad_score_warp.as_ref(),
+        ) {
+            *lhs += rhs;
+        }
+        if let (Some(lhs), Some(rhs)) = (
+            self.hess_score_warp.as_mut(),
+            other.hess_score_warp.as_ref(),
+        ) {
+            *lhs += rhs;
+        }
+        if let (Some(lhs), Some(rhs)) = (self.grad_link_dev.as_mut(), other.grad_link_dev.as_ref())
+        {
+            *lhs += rhs;
+        }
+        if let (Some(lhs), Some(rhs)) = (self.hess_link_dev.as_mut(), other.hess_link_dev.as_ref())
+        {
+            *lhs += rhs;
+        }
+    }
+
+    fn into_family_evaluation(self) -> FamilyEvaluation {
+        let mut blockworking_sets = vec![
+            BlockWorkingSet::ExactNewton {
+                gradient: self.grad_time,
+                hessian: SymmetricMatrix::Dense(self.hess_time),
+            },
+            BlockWorkingSet::ExactNewton {
+                gradient: self.grad_marginal,
+                hessian: SymmetricMatrix::Dense(self.hess_marginal),
+            },
+            BlockWorkingSet::ExactNewton {
+                gradient: self.grad_logslope,
+                hessian: SymmetricMatrix::Dense(self.hess_logslope),
+            },
+        ];
+        if let (Some(gradient), Some(hessian)) = (self.grad_score_warp, self.hess_score_warp) {
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(hessian),
+            });
+        }
+        if let (Some(gradient), Some(hessian)) = (self.grad_link_dev, self.hess_link_dev) {
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(hessian),
+            });
+        }
+        FamilyEvaluation {
+            log_likelihood: self.log_likelihood,
+            blockworking_sets,
+        }
+    }
+}
+
 #[inline]
 fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
     ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
@@ -4532,6 +4640,147 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    fn accumulate_dynamic_q_blockwise_gradient(
+        &self,
+        row: usize,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        grad_time: &mut Array1<f64>,
+        grad_marginal: &mut Array1<f64>,
+        grad_logslope: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+        for (q_idx, dq) in dq_time.iter().enumerate() {
+            for coeff_idx in 0..dq.len() {
+                grad_time[coeff_idx] -= primary_gradient[q_idx] * dq[coeff_idx];
+            }
+        }
+        for (q_idx, dq) in dq_marginal.iter().enumerate() {
+            for coeff_idx in 0..dq.len() {
+                grad_marginal[coeff_idx] -= primary_gradient[q_idx] * dq[coeff_idx];
+            }
+        }
+        self.logslope_design.axpy_row_into(
+            row,
+            -primary_gradient[3],
+            &mut grad_logslope.view_mut(),
+        )?;
+        Ok(())
+    }
+
+    fn accumulate_dynamic_q_core_block_hessians(
+        &self,
+        row: usize,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+        hess_time: &mut Array2<f64>,
+        hess_marginal: &mut Array2<f64>,
+        hess_logslope: &mut Array2<f64>,
+    ) {
+        let d2q_time_time = [
+            &q_geom.d2q0_time_time,
+            &q_geom.d2q1_time_time,
+            &q_geom.d2qd1_time_time,
+        ];
+        let d2q_marginal_marginal = [
+            &q_geom.d2q0_marginal_marginal,
+            &q_geom.d2q1_marginal_marginal,
+            &q_geom.d2qd1_marginal_marginal,
+        ];
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+
+        for a in 0..hess_time.nrows() {
+            for b in 0..hess_time.ncols() {
+                let mut value = 0.0;
+                for q_u in 0..3 {
+                    for q_v in 0..3 {
+                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_time[q_v][b];
+                    }
+                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
+                }
+                hess_time[[a, b]] += value;
+            }
+        }
+
+        for a in 0..hess_marginal.nrows() {
+            for b in 0..hess_marginal.ncols() {
+                let mut value = 0.0;
+                for q_u in 0..3 {
+                    for q_v in 0..3 {
+                        value +=
+                            primary_hessian[[q_u, q_v]] * dq_marginal[q_u][a] * dq_marginal[q_v][b];
+                    }
+                    value += primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
+                }
+                hess_marginal[[a, b]] += value;
+            }
+        }
+
+        self.logslope_design
+            .syr_row_into(row, primary_hessian[[3, 3]], hess_logslope)
+            .expect("survival logslope block syr");
+    }
+
+    fn accumulate_dynamic_q_blockwise_row(
+        &self,
+        row: usize,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        primary: &FlexPrimarySlices,
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ArrayView2<'_, f64>,
+        acc: &mut DynamicQBlockwiseAccumulator,
+    ) -> Result<(), String> {
+        self.accumulate_dynamic_q_blockwise_gradient(
+            row,
+            q_geom,
+            primary_gradient.slice(s![0..N_PRIMARY]),
+            &mut acc.grad_time,
+            &mut acc.grad_marginal,
+            &mut acc.grad_logslope,
+        )?;
+        self.accumulate_dynamic_q_core_block_hessians(
+            row,
+            q_geom,
+            primary_gradient.slice(s![0..N_PRIMARY]),
+            primary_hessian.slice(s![0..N_PRIMARY, 0..N_PRIMARY]),
+            &mut acc.hess_time,
+            &mut acc.hess_marginal,
+            &mut acc.hess_logslope,
+        );
+        if let (Some(primary_range), Some(gradient), Some(hessian)) = (
+            primary.h.as_ref(),
+            acc.grad_score_warp.as_mut(),
+            acc.hess_score_warp.as_mut(),
+        ) {
+            *gradient -= &primary_gradient.slice(s![primary_range.clone()]);
+            *hessian += &primary_hessian
+                .slice(s![primary_range.clone(), primary_range.clone()])
+                .to_owned();
+        }
+        if let (Some(primary_range), Some(gradient), Some(hessian)) = (
+            primary.w.as_ref(),
+            acc.grad_link_dev.as_mut(),
+            acc.hess_link_dev.as_mut(),
+        ) {
+            *gradient -= &primary_gradient.slice(s![primary_range.clone()]);
+            *hessian += &primary_hessian
+                .slice(s![primary_range.clone(), primary_range.clone()])
+                .to_owned();
+        }
+        Ok(())
+    }
+
     fn accumulate_identity_primary_cross_hessian(
         &self,
         row: usize,
@@ -4680,10 +4929,10 @@ impl SurvivalMarginalSlopeFamily {
         Ok(())
     }
 
-    fn evaluate_blockwise_exact_newton_dynamic_q_dense<RowTerms>(
+    fn evaluate_blockwise_exact_newton_dynamic_q<RowTerms>(
         &self,
         block_states: &[ParameterBlockState],
-        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+        primary: &FlexPrimarySlices,
         row_terms: RowTerms,
     ) -> Result<FamilyEvaluation, String>
     where
@@ -4694,47 +4943,30 @@ impl SurvivalMarginalSlopeFamily {
             + Sync,
     {
         let slices = block_slices(self, block_states);
-        let p_total = slices.total;
-        type Acc = (f64, Array1<f64>, Array2<f64>);
-        let make_acc = || -> Acc {
-            (
-                0.0,
-                Array1::zeros(p_total),
-                Array2::zeros((p_total, p_total)),
-            )
-        };
+        let make_acc = || DynamicQBlockwiseAccumulator::new(&slices);
 
-        let (log_likelihood, joint_gradient, joint_hessian) = (0..self.n)
+        let acc = (0..self.n)
             .into_par_iter()
             .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
                 let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
                 let (row_nll, primary_gradient, primary_hessian) = row_terms(row, &q_geom)?;
-                acc.0 -= row_nll;
-                self.accumulate_dynamic_q_joint_row(
+                acc.log_likelihood -= row_nll;
+                self.accumulate_dynamic_q_blockwise_row(
                     row,
-                    &slices,
                     &q_geom,
+                    primary,
                     primary_gradient.view(),
                     primary_hessian.view(),
-                    identity_blocks,
-                    &mut acc.1,
-                    &mut acc.2,
+                    &mut acc,
                 )?;
                 Ok(acc)
             })
-            .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
-                a.0 += b.0;
-                a.1 += &b.1;
-                a.2 += &b.2;
-                Ok(a)
+            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                left.add_assign(&right);
+                Ok(left)
             })?;
 
-        Ok(self.finalize_dense_joint_working_sets(
-            &slices,
-            log_likelihood,
-            joint_gradient,
-            joint_hessian,
-        ))
+        Ok(acc.into_family_evaluation())
     }
 
     fn row_primary_third_contracted(
@@ -10866,50 +11098,36 @@ impl SurvivalMarginalSlopeFamily {
     /// Blockwise exact-Newton for the flexible (score-warp / link-deviation)
     /// model.
     ///
-    /// Builds the **full joint Hessian** including all cross-block terms
-    /// (time-marginal, time-logslope, time-score, time-link, etc.), then
-    /// slices into per-block working sets.  The extended primary space
-    /// (q0, q1, qd1, g, h?, w?) is mapped to beta-space via the full
-    /// Jacobian pullback J^T f_pipi J + Sigma f_pi d^2pi/dbeta^2.
+    /// Accumulates exact per-block coefficient gradients and Hessians directly
+    /// from the dynamic-q row jets. This preserves the exact block Newton
+    /// update while avoiding dense full-joint assembly when the caller only
+    /// needs block-local working sets.
     fn evaluate_blockwise_exact_newton_flexible_dense(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
         self.validate_exact_monotonicity(block_states)?;
-        let slices = block_slices(self, block_states);
         let primary = flex_primary_slices(self);
-        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
-        self.evaluate_blockwise_exact_newton_dynamic_q_dense(
-            block_states,
-            &identity_blocks,
-            |row, q_geom| {
-                self.compute_row_flex_primary_gradient_hessian_exact(
-                    row,
-                    block_states,
-                    q_geom,
-                    &primary,
-                )
-            },
-        )
+        self.evaluate_blockwise_exact_newton_dynamic_q(block_states, &primary, |row, q_geom| {
+            self.compute_row_flex_primary_gradient_hessian_exact(
+                row,
+                block_states,
+                q_geom,
+                &primary,
+            )
+        })
     }
 
     /// Blockwise exact-Newton for the time-wiggle model.
     ///
-    /// Builds the full joint Hessian over all parameter blocks (time,
-    /// marginal, logslope) using the pullback formula
-    /// `J^T f_pipi J + f_pi d²π/dβ²`, then slices into per-block
-    /// working sets via `slice_joint_into_block_working_sets`.
-    ///
-    /// The 4×4 primary space has indices 0=q0, 1=q1, 2=qd1, 3=g.
-    /// The q-geometry Jacobians map time/marginal coefficients into
-    /// the first three primary coordinates; the logslope design maps
-    /// into the fourth.  All cross-block terms (time-marginal,
-    /// time-logslope, marginal-logslope) are included.
+    /// Accumulates exact block-local Hessians directly from the 4D primary
+    /// row calculus instead of materializing and slicing a dense joint Hessian.
     fn evaluate_blockwise_exact_newton_timewiggle_dense(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
-        self.evaluate_blockwise_exact_newton_dynamic_q_dense(block_states, &[], |row, _| {
+        let primary = flex_primary_slices(self);
+        self.evaluate_blockwise_exact_newton_dynamic_q(block_states, &primary, |row, _| {
             self.compute_row_primary_gradient_hessian_uncached(row, block_states)
         })
     }
@@ -12925,6 +13143,54 @@ mod tests {
         .runtime
     }
 
+    fn max_abs_diff_vec(lhs: &Array1<f64>, rhs: &Array1<f64>) -> f64 {
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn max_abs_diff_mat(lhs: &Array2<f64>, rhs: &Array2<f64>) -> f64 {
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn assert_blockwise_matches_joint_principal_blocks(
+        family: &SurvivalMarginalSlopeFamily,
+        block_states: &[ParameterBlockState],
+    ) {
+        let eval = family
+            .evaluate_blockwise_exact_newton(block_states)
+            .expect("blockwise exact-newton evaluation");
+        let (joint_ll, joint_gradient, joint_hessian) = family
+            .evaluate_exact_newton_joint_dense(block_states)
+            .expect("joint dense exact-newton evaluation");
+        let slices = block_slices(family, block_states);
+        let block_ranges = exact_newton_block_ranges(&slices);
+
+        assert!((eval.log_likelihood - joint_ll).abs() <= 1e-10);
+        assert_eq!(eval.blockworking_sets.len(), block_ranges.len());
+        for (work, range) in eval.blockworking_sets.iter().zip(block_ranges.iter()) {
+            let BlockWorkingSet::ExactNewton { gradient, hessian } = work else {
+                panic!("expected exact-newton block working set");
+            };
+            let expected_gradient = joint_gradient.slice(s![range.clone()]).to_owned();
+            let expected_hessian = joint_hessian
+                .slice(s![range.clone(), range.clone()])
+                .to_owned();
+            assert!(
+                max_abs_diff_vec(gradient, &expected_gradient) <= 1e-10,
+                "gradient block mismatch"
+            );
+            assert!(
+                max_abs_diff_mat(&hessian.to_dense(), &expected_hessian) <= 1e-10,
+                "hessian block mismatch"
+            );
+        }
+    }
+
     fn test_family(
         score_warp: Option<DeviationRuntime>,
         link_dev: Option<DeviationRuntime>,
@@ -13525,6 +13791,62 @@ mod tests {
     }
 
     #[test]
+    fn link_flex_blockwise_exact_newton_matches_joint_principal_blocks() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
+        let logslope_design = array![[1.0], [0.5]];
+        let family = SurvivalMarginalSlopeFamily {
+            n: 2,
+            event: Arc::new(array![1.0, 0.0]),
+            weights: Arc::new(array![1.0, 0.8]),
+            z: Arc::new(array![0.15, -0.25]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((2, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((2, 1))),
+            offset_entry: Arc::new(array![0.05, -0.02]),
+            offset_exit: Arc::new(array![0.15, 0.08]),
+            derivative_offset_exit: Arc::new(array![0.9, 1.1]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(logslope_design.clone()),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_beta = array![0.2];
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_design.dot(&logslope_beta),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+        ];
+
+        assert_blockwise_matches_joint_principal_blocks(&family, &block_states);
+    }
+
+    #[test]
     fn link_flex_marginal_psi_terms_return_finite_joint_terms() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
@@ -13846,6 +14168,67 @@ mod tests {
         assert_eq!(terms.score_psi.len(), slices.total);
         assert!(terms.score_psi.iter().all(|value| value.is_finite()));
         assert!(terms.hessian_psi_operator.is_some());
+    }
+
+    #[test]
+    fn timewiggle_blockwise_exact_newton_matches_joint_principal_blocks() {
+        let score_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_beta = array![0.2];
+        let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) =
+            standard_test_time_wiggle();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 2,
+            event: Arc::new(array![1.0, 0.0]),
+            weights: Arc::new(array![1.0, 0.8]),
+            z: Arc::new(array![0.15, -0.25]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            design_exit: DesignMatrix::from(array![
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            design_derivative_exit: DesignMatrix::from(array![
+                [1.0, 0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0]
+            ]),
+            offset_entry: Arc::new(array![0.05, -0.02]),
+            offset_exit: Arc::new(array![0.15, 0.08]),
+            derivative_offset_exit: Arc::new(array![0.9, 1.1]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(array![[1.0], [0.5]]),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: Some(time_wiggle_knots),
+            time_wiggle_degree: Some(time_wiggle_degree),
+            time_wiggle_ncols,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+                eta: array![0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: array![0.2, 0.1],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(2),
+            },
+        ];
+
+        assert_blockwise_matches_joint_principal_blocks(&family, &block_states);
     }
 
     #[test]
