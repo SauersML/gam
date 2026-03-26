@@ -427,7 +427,6 @@
         "r_gamboostlss",
         "r_bamlss",
         "r_brms",
-        "rust_gam_sas",
         "rust_gamlss_survival",
         "r_mgcv_coxph",
         "python_sksurv_rsf",
@@ -448,7 +447,6 @@
       "noise_scale_max": 0.85,
       "exclude_contenders": [
         "rust_gam",
-        "rust_gam_sas",
         "rust_gamlss",
         "rust_gamlss_flexible",
         "rust_gamlss_survival",
@@ -623,7 +621,6 @@
       "true_nu": 1.8,
       "true_kappa2": 0.7,
       "exclude_contenders": [
-        "rust_gam_sas",
         "rust_gamlss_survival",
         "r_mgcv",
         "r_mgcv_gaulss",
@@ -645,7 +642,6 @@
       "n": 512,
       "seed": 20260502,
       "exclude_contenders": [
-        "rust_gam_sas",
         "rust_gamlss_survival",
         "r_mgcv",
         "r_mgcv_gaulss",
@@ -667,7 +663,6 @@
       "n": 512,
       "seed": 20260503,
       "exclude_contenders": [
-        "rust_gam_sas",
         "rust_gamlss_survival",
         "r_mgcv",
         "r_mgcv_gaulss",
@@ -689,7 +684,6 @@
       "n": 6000,
       "seed": 20260601,
       "exclude_contenders": [
-        "rust_gam_sas",
         "rust_gamlss_survival",
         "r_mgcv_gaulss",
         "r_gamboostlss",
