@@ -6855,6 +6855,16 @@ fn joint_outer_evaluate(
         ext_bundle.map(|bundle| bundle.scaled(rho_curvature_scale)),
     )?;
     if !objective.is_finite() {
+        log::warn!(
+            "joint outer evaluation produced non-finite objective: log_likelihood={} penalty_value={} block_logdet_h={} block_logdet_s={} include_logdet_h={} include_logdet_s={} rho_curvature_scale={}",
+            inner.log_likelihood,
+            inner.penalty_value,
+            inner.block_logdet_h,
+            inner.block_logdet_s,
+            include_logdet_h,
+            include_logdet_s,
+            rho_curvature_scale,
+        );
         return Err("joint outer evaluation produced a non-finite objective".to_string());
     }
     if grad.iter().any(|value| !value.is_finite()) {
