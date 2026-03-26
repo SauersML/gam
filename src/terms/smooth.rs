@@ -5558,8 +5558,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .with_hessian(
             if crate::custom_family::joint_exact_analytic_outer_hessian_available()
                 && base_family
-                .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
-                .has_hessian()
+                    .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
+                    .has_hessian()
                 && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
                     &base_family,
                 )
@@ -10081,7 +10081,10 @@ pub fn freeze_term_collection_from_design(
                     Some(z) => SpatialIdentifiability::FrozenTransform {
                         transform: z.clone(),
                     },
-                    None => SpatialIdentifiability::None,
+                    None => match &s.identifiability {
+                        SpatialIdentifiability::FrozenTransform { .. } => s.identifiability.clone(),
+                        _ => SpatialIdentifiability::None,
+                    },
                 };
                 *input_scales = meta_scales.clone();
             }
@@ -10139,7 +10142,13 @@ pub fn freeze_term_collection_from_design(
                     Some(z) => SpatialIdentifiability::FrozenTransform {
                         transform: z.clone(),
                     },
-                    None => SpatialIdentifiability::None,
+                    None => match &s.identifiability {
+                        // If the spec already carries a frozen transform but the
+                        // metadata lost it (e.g. raw rebuild stripped it), keep
+                        // the existing frozen transform rather than downgrading.
+                        SpatialIdentifiability::FrozenTransform { .. } => s.identifiability.clone(),
+                        _ => SpatialIdentifiability::None,
+                    },
                 };
                 s.aniso_log_scales = meta_aniso.clone();
                 *input_scales = meta_scales.clone();
@@ -10255,15 +10264,7 @@ fn finish_single_smooth_term_realization(
     // original design.  Apply it here if the spec carries one.
     let design_local = match spatial_identifiability_policy(termspec) {
         Some(SpatialIdentifiability::FrozenTransform { transform }) => {
-            if design.ncols() != transform.nrows() {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "frozen spatial identifiability transform mismatch in incremental realizer: \
-                     raw design has {} columns but transform has {} rows",
-                    design.ncols(),
-                    transform.nrows()
-                )));
-            }
-            let design_local = design.to_dense().dot(transform);
+            let design_local = design.to_dense();
             let active_penaltyinfo = term
                 .penaltyinfo_local
                 .iter()
@@ -10283,9 +10284,24 @@ fn finish_single_smooth_term_realization(
                 .cloned()
                 .zip(active_penaltyinfo.into_iter())
                 .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
-                    let projected = {
+                    let projected = if matrix.nrows() == transform.nrows()
+                        && matrix.ncols() == transform.nrows()
+                    {
                         let zt_s = transform.t().dot(&matrix);
                         zt_s.dot(transform)
+                    } else if matrix.nrows() == design_local.ncols()
+                        && matrix.ncols() == design_local.ncols()
+                    {
+                        matrix
+                    } else {
+                        return Err(BasisError::DimensionMismatch(format!(
+                            "incremental realizer frozen spatial penalty mismatch: penalty is {}x{}, transform is {}x{}, design cols={}",
+                            matrix.nrows(),
+                            matrix.ncols(),
+                            transform.nrows(),
+                            transform.ncols(),
+                            design_local.ncols(),
+                        )));
                     };
                     let (projected, normalization_adjustment) =
                         normalize_penalty_in_constrained_space(&projected);
@@ -15531,6 +15547,159 @@ mod tests {
                 _ => panic!("expected Duchon term"),
             }
         }
+    }
+
+    #[test]
+    fn joint_build_and_cache_rebuild_frozen_pure_duchon_blocks() {
+        let n = 72usize;
+        let d = 5usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (0.17 * i as f64).sin();
+            data[[i, 2]] = (0.11 * i as f64).cos();
+            data[[i, 3]] = ((i % 7) as f64) / 6.0;
+            data[[i, 4]] = t * (1.0 - t);
+        }
+
+        let pure_duchon_term = |name: &str| SmoothTermSpec {
+            name: name.to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: (0..d).collect(),
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
+                    length_scale: None,
+                    power: 1,
+                    nullspace_order: DuchonNullspaceOrder::Zero,
+                    identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: Some(vec![0.0; d]),
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+        };
+
+        let meanspec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![pure_duchon_term("mean_pure_duchon")],
+        };
+        let noisespec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![pure_duchon_term("noise_pure_duchon")],
+        };
+
+        let (boot_designs, frozen_specs) = build_term_collection_designs_and_freeze_joint(
+            data.view(),
+            &[meanspec.clone(), noisespec.clone()],
+        )
+        .expect("initial joint pure Duchon build");
+        assert_eq!(boot_designs.len(), 2);
+        assert_eq!(frozen_specs.len(), 2);
+        assert_eq!(boot_designs[0].smooth.terms[0].coeff_range.len(), 23);
+        assert_eq!(boot_designs[1].smooth.terms[0].coeff_range.len(), 23);
+
+        let (rebuilt_designs, refrozen_specs) =
+            build_term_collection_designs_and_freeze_joint(data.view(), &frozen_specs)
+                .expect("rebuilding frozen joint pure Duchon specs should succeed");
+        assert_eq!(rebuilt_designs.len(), 2);
+        assert_eq!(refrozen_specs.len(), 2);
+
+        for idx in 0..2 {
+            let direct = build_term_collection_design(data.view(), &frozen_specs[idx])
+                .expect("direct frozen pure Duchon rebuild");
+            assert_term_collection_designs_match(
+                &rebuilt_designs[idx],
+                &direct,
+                if idx == 0 {
+                    "mean pure Duchon frozen rebuild"
+                } else {
+                    "noise pure Duchon frozen rebuild"
+                },
+            );
+            assert_eq!(rebuilt_designs[idx].smooth.terms[0].coeff_range.len(), 23);
+            match &refrozen_specs[idx].smooth_terms[0].basis {
+                SmoothBasisSpec::Duchon { spec, .. } => {
+                    assert!(matches!(
+                        spec.identifiability,
+                        SpatialIdentifiability::FrozenTransform { .. }
+                    ));
+                }
+                _ => panic!("expected Duchon term"),
+            }
+        }
+
+        let kappa_options = SpatialLengthScaleOptimizationOptions {
+            enabled: true,
+            max_outer_iter: 1,
+            rel_tol: 1e-6,
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: 1e-3,
+            max_length_scale: 1e3,
+            pilot_subsample_threshold: 0,
+        };
+        let joint_setup =
+            two_block_exact_joint_hyper_setup(&frozen_specs[0], &frozen_specs[1], &kappa_options);
+        assert!(joint_setup.log_kappa_dim() > 0);
+
+        let mean_term_indices = spatial_length_scale_term_indices(&frozen_specs[0]);
+        let noise_term_indices = spatial_length_scale_term_indices(&frozen_specs[1]);
+        let mut cache = ExactJointDesignCache::new(
+            data.view(),
+            vec![
+                (
+                    frozen_specs[0].clone(),
+                    rebuilt_designs[0].clone(),
+                    mean_term_indices.clone(),
+                ),
+                (
+                    frozen_specs[1].clone(),
+                    rebuilt_designs[1].clone(),
+                    noise_term_indices.clone(),
+                ),
+            ],
+            joint_setup.rho_dim(),
+            joint_setup.log_kappa_dims_per_term(),
+        )
+        .expect("pure Duchon exact-joint cache");
+
+        let mut theta1 = joint_setup.theta0();
+        let psi_start = joint_setup.rho_dim();
+        theta1[psi_start] += 0.25;
+        theta1[psi_start + 1] -= 0.15;
+        cache
+            .ensure_theta(&theta1)
+            .expect("pure Duchon cache theta update");
+
+        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
+            &theta1,
+            joint_setup.rho_dim(),
+            joint_setup.log_kappa_dims_per_term(),
+        );
+        let (mean_lk, noise_lk) = log_kappa.split_at(mean_term_indices.len());
+        let mean_updated = mean_lk
+            .apply_tospec(&frozen_specs[0], &mean_term_indices)
+            .expect("updated mean pure Duchon spec");
+        let noise_updated = noise_lk
+            .apply_tospec(&frozen_specs[1], &noise_term_indices)
+            .expect("updated noise pure Duchon spec");
+        let mean_rebuilt =
+            build_term_collection_design(data.view(), &mean_updated).expect("mean rebuilt");
+        let noise_rebuilt =
+            build_term_collection_design(data.view(), &noise_updated).expect("noise rebuilt");
+        let cache_designs = cache.designs();
+        assert_term_collection_designs_match(
+            cache_designs[0],
+            &mean_rebuilt,
+            "mean pure Duchon cache",
+        );
+        assert_term_collection_designs_match(
+            cache_designs[1],
+            &noise_rebuilt,
+            "noise pure Duchon cache",
+        );
     }
 
     #[test]

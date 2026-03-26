@@ -16,8 +16,10 @@
 //! derivatives — is then generic over any `RowKernel<K>`.
 
 use crate::custom_family::ExactNewtonJointHessianWorkspace;
+use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
+use std::sync::Arc;
 
 // ── Trait ────────────────────────────────────────────────────────────
 
@@ -309,19 +311,138 @@ pub fn row_kernel_second_directional_derivative<const K: usize>(
         .try_reduce(|| Array2::zeros((p, p)), |a, b| Ok(a + b))
 }
 
+struct RowKernelDirectionalDerivativeOperator<const K: usize, T: RowKernel<K>> {
+    kern: Arc<T>,
+    direction: Vec<f64>,
+    p: usize,
+}
+
+impl<const K: usize, T: RowKernel<K>> HyperOperator for RowKernelDirectionalDerivativeOperator<K, T> {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let direction = v
+            .as_slice()
+            .expect("row-kernel directional derivative operator requires contiguous input");
+        let out = (0..self.kern.n_rows())
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f64; self.p],
+                |mut acc, row| {
+                    let dir_k = self.kern.jacobian_action(row, &self.direction);
+                    let vec_k = self.kern.jacobian_action(row, direction);
+                    let third = self
+                        .kern
+                        .row_third_contracted(row, &dir_k)
+                        .expect("row-kernel third contraction should succeed for validated directions");
+                    let mut action = [0.0_f64; K];
+                    for a in 0..K {
+                        let mut sum = 0.0;
+                        for b in 0..K {
+                            sum += third[a][b] * vec_k[b];
+                        }
+                        action[a] = sum;
+                    }
+                    self.kern
+                        .jacobian_transpose_action(row, &action, &mut acc);
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0_f64; self.p],
+                |mut left, right| {
+                    for idx in 0..left.len() {
+                        left[idx] += right[idx];
+                    }
+                    left
+                },
+            );
+        Array1::from_vec(out)
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        row_kernel_directional_derivative(&*self.kern, &self.direction)
+            .expect("row-kernel directional derivative dense materialization should succeed")
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+struct RowKernelSecondDirectionalDerivativeOperator<const K: usize, T: RowKernel<K>> {
+    kern: Arc<T>,
+    direction_u: Vec<f64>,
+    direction_v: Vec<f64>,
+    p: usize,
+}
+
+impl<const K: usize, T: RowKernel<K>> HyperOperator
+    for RowKernelSecondDirectionalDerivativeOperator<K, T>
+{
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let direction = v
+            .as_slice()
+            .expect("row-kernel second directional derivative operator requires contiguous input");
+        let out = (0..self.kern.n_rows())
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f64; self.p],
+                |mut acc, row| {
+                    let dir_u = self.kern.jacobian_action(row, &self.direction_u);
+                    let dir_v = self.kern.jacobian_action(row, &self.direction_v);
+                    let vec_k = self.kern.jacobian_action(row, direction);
+                    let fourth = self
+                        .kern
+                        .row_fourth_contracted(row, &dir_u, &dir_v)
+                        .expect("row-kernel fourth contraction should succeed for validated directions");
+                    let mut action = [0.0_f64; K];
+                    for a in 0..K {
+                        let mut sum = 0.0;
+                        for b in 0..K {
+                            sum += fourth[a][b] * vec_k[b];
+                        }
+                        action[a] = sum;
+                    }
+                    self.kern
+                        .jacobian_transpose_action(row, &action, &mut acc);
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0_f64; self.p],
+                |mut left, right| {
+                    for idx in 0..left.len() {
+                        left[idx] += right[idx];
+                    }
+                    left
+                },
+            );
+        Array1::from_vec(out)
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        row_kernel_second_directional_derivative(&*self.kern, &self.direction_u, &self.direction_v)
+            .expect("row-kernel second directional derivative dense materialization should succeed")
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
 // ── Workspace adapter ────────────────────────────────────────────────
 
 /// Generic adapter: any `RowKernel<K>` + its cache → `ExactNewtonJointHessianWorkspace`.
 ///
 /// Plugs into the existing solver without any solver-side changes.
 pub struct RowKernelHessianWorkspace<const K: usize, T: RowKernel<K>> {
-    kern: T,
+    kern: Arc<T>,
     cache: RowKernelCache<K>,
 }
 
 impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
     pub fn new(kern: T) -> Result<Self, String> {
-        let cache = build_row_kernel_cache(&kern)?;
+        let kern = Arc::new(kern);
+        let cache = build_row_kernel_cache(&*kern)?;
         Ok(Self { kern, cache })
     }
 }
@@ -331,11 +452,11 @@ impl<const K: usize, T: RowKernel<K>> ExactNewtonJointHessianWorkspace
 {
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let sl = v.as_slice().ok_or("hessian_matvec: non-contiguous input")?;
-        Ok(Some(row_kernel_hessian_matvec(&self.kern, &self.cache, sl)))
+        Ok(Some(row_kernel_hessian_matvec(&*self.kern, &self.cache, sl)))
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        Ok(Some(row_kernel_hessian_diagonal(&self.kern, &self.cache)))
+        Ok(Some(row_kernel_hessian_diagonal(&*self.kern, &self.cache)))
     }
 
     fn directional_derivative(
@@ -345,7 +466,22 @@ impl<const K: usize, T: RowKernel<K>> ExactNewtonJointHessianWorkspace
         let sl = d_beta_flat
             .as_slice()
             .ok_or("directional_derivative: non-contiguous input")?;
-        row_kernel_directional_derivative(&self.kern, sl).map(Some)
+        row_kernel_directional_derivative(&*self.kern, sl).map(Some)
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        let direction = d_beta_flat
+            .as_slice()
+            .ok_or("directional_derivative_operator: non-contiguous input")?
+            .to_vec();
+        Ok(Some(Arc::new(RowKernelDirectionalDerivativeOperator {
+            kern: Arc::clone(&self.kern),
+            direction,
+            p: self.cache.p,
+        })))
     }
 
     fn second_directional_derivative(
@@ -359,6 +495,27 @@ impl<const K: usize, T: RowKernel<K>> ExactNewtonJointHessianWorkspace
         let sv = d_beta_v
             .as_slice()
             .ok_or("second_directional_derivative: non-contiguous v")?;
-        row_kernel_second_directional_derivative(&self.kern, su, sv).map(Some)
+        row_kernel_second_directional_derivative(&*self.kern, su, sv).map(Some)
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        let direction_u = d_beta_u
+            .as_slice()
+            .ok_or("second_directional_derivative_operator: non-contiguous u")?
+            .to_vec();
+        let direction_v = d_beta_v
+            .as_slice()
+            .ok_or("second_directional_derivative_operator: non-contiguous v")?
+            .to_vec();
+        Ok(Some(Arc::new(RowKernelSecondDirectionalDerivativeOperator {
+            kern: Arc::clone(&self.kern),
+            direction_u,
+            direction_v,
+            p: self.cache.p,
+        })))
     }
 }

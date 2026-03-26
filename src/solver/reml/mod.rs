@@ -81,7 +81,8 @@ mod tests {
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
-        let (cost, gradient, hessian) = state.compute_joint_hyper_eval(theta, rho_dim, hyper_dirs)?;
+        let (cost, gradient, hessian) =
+            state.compute_joint_hyper_eval(theta, rho_dim, hyper_dirs)?;
         Ok((
             cost,
             gradient,
@@ -686,8 +687,9 @@ mod tests {
             .expect("single-penalty hyper direction"),
         ];
 
-        let (_, _, h) = compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
-            .expect("joint hyper cost+gradient+hessian");
+        let (_, _, h) =
+            compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
+                .expect("joint hyper cost+gradient+hessian");
         assert_eq!(h.nrows(), theta.len());
         assert_eq!(h.ncols(), theta.len());
         assert!(h.iter().all(|v| v.is_finite()));
@@ -755,7 +757,7 @@ mod tests {
 
         let (_, _, h_full) =
             compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
-            .expect("joint hyper cost+gradient+hessian");
+                .expect("joint hyper cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
 
         // FD via physical perturbation of design/penalty matrices (matching
@@ -901,7 +903,7 @@ mod tests {
         };
         let (_, _, h_full) =
             compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
-            .expect("joint hyper cost+gradient+hessian");
+                .expect("joint hyper cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
         assert_eq!(h_tt_analytic.nrows(), hyper_dirs.len());
         assert_eq!(h_tt_analytic.ncols(), hyper_dirs.len());
@@ -1128,7 +1130,7 @@ mod tests {
         theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
         let (_, _, h_full) =
             compute_joint_hypercostgradienthessian(&state, &theta, f.rho.len(), &hyper_dirs)
-            .expect("joint cost+gradient+hessian");
+                .expect("joint cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
 
         // Finite-difference Hessian: perturb each direction, re-evaluate
@@ -1306,7 +1308,7 @@ mod tests {
         theta.slice_mut(s![..rho.len()]).assign(&rho);
         let (_, _, h_full) =
             compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
-            .expect("joint cost+gradient+hessian");
+                .expect("joint cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
 
         let x_tau_mats = [&x_tau_0, &x_tau_1];
@@ -1629,7 +1631,7 @@ mod tests {
         theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
         let (_, _, h_full) =
             compute_joint_hypercostgradienthessian(&state, &theta, f.rho.len(), &hyper_dirs)
-            .expect("joint cost+gradient+hessian");
+                .expect("joint cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
 
         let x_tau_mats = [&x_tau_0, &x_tau_1];
