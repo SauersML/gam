@@ -44,6 +44,40 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertTrue(lane["scale_dimensions"])
         self.assertEqual(lane["z_column"], "pgs_std")
 
+    def test_marginal_slope_formula_supports_linkwiggle_and_scorewarp(self) -> None:
+        spec = _RUNNER.MethodSpec(
+            name="margslope_variant",
+            dataset="disease",
+            backend="rust_gam",
+            family="binomial",
+            spatial_basis="duchon",
+            marginal_slope=True,
+            scale_dimensions=True,
+            z_column="pgs_std",
+            mean_linkwiggle_knots=8,
+            logslope_linkwiggle_knots=7,
+        )
+        mean_formula, logslope_formula = _RUNNER.rust_marginal_slope_formula_classification(spec, centers=20)
+        self.assertIn("duchon(pc1_std, pc2_std", mean_formula)
+        self.assertIn("centers=20", mean_formula)
+        self.assertIn("linkwiggle(knots=8)", mean_formula)
+        self.assertIn("linkwiggle(knots=7)", logslope_formula)
+
+    def test_effective_marginal_slope_centers_caps_biobank_and_wiggle_modes(self) -> None:
+        spec = _RUNNER.MethodSpec(
+            name="margslope_variant",
+            dataset="disease",
+            backend="rust_gam",
+            family="binomial",
+            spatial_basis="duchon",
+            centers=50,
+            marginal_slope=True,
+            logslope_linkwiggle_knots=8,
+            max_centers=30,
+        )
+        self.assertEqual(_RUNNER.effective_marginal_slope_centers(spec, train_rows=10000), 22)
+        self.assertEqual(_RUNNER.effective_marginal_slope_centers(spec, train_rows=400000), 22)
+
     def test_build_method_specs_rejects_legacy_survival_backend(self) -> None:
         cfg = {
             "methods": [
@@ -170,3 +204,37 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         for rows in predict_inputs:
             self.assertTrue(all(float(row["__entry"]) == 0.0 for row in rows))
             self.assertTrue(all(float(row["time"]) == 7.0 for row in rows))
+
+    def test_survival_formula_rhs_supports_linkwiggle_and_timewiggle(self) -> None:
+        spec = _RUNNER.MethodSpec(
+            name="surv_variant",
+            dataset="survival",
+            backend="rust_survival",
+            family="survival",
+            spatial_basis="ps",
+            smooth_kind="separate",
+            survival_likelihood="transformation",
+            survival_distribution="gaussian",
+            mean_linkwiggle_knots=8,
+            timewiggle_knots=8,
+        )
+        rhs = _RUNNER.rust_survival_formula_rhs(spec)
+        self.assertIn("linkwiggle(knots=8)", rhs)
+        self.assertIn("timewiggle(knots=8)", rhs)
+
+    def test_generate_raw_cohort_populates_pc_columns_from_each_row(self) -> None:
+        cfg = {
+            "seed": 1,
+            "raw_subpop_n": 20,
+            "observed_latlon_fraction": 0.5,
+            "split_seed": 2,
+            "target_n": 100,
+            "smoke_target_n": 50,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            rows, _meta = _RUNNER.generate_raw_cohort(cfg, Path(td), smoke=False)
+        self.assertGreater(len(rows), 20)
+        pc1 = [float(r["pc1"]) for r in rows[:30]]
+        pc2 = [float(r["pc2"]) for r in rows[:30]]
+        self.assertGreater(len(set(round(v, 6) for v in pc1)), 10)
+        self.assertGreater(len(set(round(v, 6) for v in pc2)), 10)

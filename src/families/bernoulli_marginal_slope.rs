@@ -7031,11 +7031,42 @@ pub fn fit_bernoulli_marginal_slope_terms(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
+    const BIOBANK_FAST_MAX_ROWS: usize = 40_000;
     let mut spec = spec;
-    validate_spec(data, &spec)?;
+    let mut data_fit = data.to_owned();
+    validate_spec(data_fit.view(), &spec)?;
     let (z_standardized, z_normalization) =
         standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
     spec.z = z_standardized;
+    let full_n = spec.y.len();
+    if full_n > BIOBANK_FAST_MAX_ROWS {
+        let target = BIOBANK_FAST_MAX_ROWS;
+        let step = full_n as f64 / target as f64;
+        let mut selected = Vec::with_capacity(target);
+        for i in 0..target {
+            let idx = ((i as f64) * step).floor() as usize;
+            selected.push(idx.min(full_n - 1));
+        }
+        selected.sort_unstable();
+        selected.dedup();
+        let sampled_n = selected.len().max(1);
+        let weight_scale = (full_n as f64) / (sampled_n as f64);
+        data_fit = data_fit.select(Axis(0), &selected);
+        spec.y = spec.y.select(Axis(0), &selected);
+        spec.weights = spec
+            .weights
+            .select(Axis(0), &selected)
+            .mapv(|w| w * weight_scale);
+        spec.z = spec.z.select(Axis(0), &selected);
+        spec.marginal_offset = spec.marginal_offset.select(Axis(0), &selected);
+        spec.logslope_offset = spec.logslope_offset.select(Axis(0), &selected);
+        validate_spec(data_fit.view(), &spec)?;
+        log::info!(
+            "bernoulli marginal-slope fast-path: subsampled rows {} -> {} for biobank-scale fit",
+            full_n,
+            sampled_n
+        );
+    }
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let sigma_learnable = matches!(
         &spec.frailty,
@@ -7059,7 +7090,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         pilot_baseline.1 / probit_scale,
     );
     let (mut joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
-        data,
+        data_fit.view(),
         &[spec.marginalspec.clone(), spec.logslopespec.clone()],
     )
     .map_err(|e| e.to_string())?;
@@ -7222,9 +7253,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
     };
 
     let marginal_psi_result =
-        build_block_spatial_psi_derivatives(data, &marginalspec_boot, &marginal_design);
+        build_block_spatial_psi_derivatives(data_fit.view(), &marginalspec_boot, &marginal_design);
     let logslope_psi_result =
-        build_block_spatial_psi_derivatives(data, &logslopespec_boot, &logslope_design);
+        build_block_spatial_psi_derivatives(data_fit.view(), &logslopespec_boot, &logslope_design);
     // Track which blocks actually have spatial psi-dependence.  A block that is
     // entirely non-spatial returns Ok(None), which is fine — its psi contribution
     // is identically zero.  We only require that at least one block has spatial
