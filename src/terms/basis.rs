@@ -2,6 +2,7 @@ use crate::faer_ndarray::{
     FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
     rrqr_nullspace_basis,
 };
+use crate::linalg::utils::KahanSum;
 use crate::matrix::{ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix};
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
@@ -7036,57 +7037,81 @@ fn polyharmonic_kernel_triplet(
     Ok((value, first, second))
 }
 
-/// Unified radial jet for one polyharmonic partial-fraction block.
-///
-/// Returns (φ, φ', φ'', φ''', φ'''') from a single consistent evaluation,
-/// sharing normalization constant, r_safe, and log_r.  This eliminates the
-/// possibility of numerical drift between the triplet and higher-order
-/// derivative paths.
-fn polyharmonic_block_jet4(
+#[inline(always)]
+fn log_power_family_derivative(exponent: f64, log_coeff: f64, pure_coeff: f64) -> (f64, f64, f64) {
+    (
+        exponent - 1.0,
+        exponent * log_coeff,
+        exponent * pure_coeff + log_coeff,
+    )
+}
+
+#[inline(always)]
+fn log_power_family_value(
+    r: f64,
+    coeff: f64,
+    exponent: f64,
+    log_coeff: f64,
+    pure_coeff: f64,
+) -> f64 {
+    coeff * r.powf(exponent) * (log_coeff * r.ln() + pure_coeff)
+}
+
+#[inline(always)]
+fn duchon_polyharmonic_operator_block_jets(
     r: f64,
     m: usize,
     k_dim: usize,
-) -> Result<(f64, f64, f64, f64, f64), BasisError> {
+) -> Result<(f64, f64, f64, f64), BasisError> {
     if !r.is_finite() || r < 0.0 {
         return Err(BasisError::InvalidInput(
             "polyharmonic distance must be finite and non-negative".to_string(),
         ));
     }
     if r <= 0.0 {
-        return Ok((0.0, 0.0, 0.0, 0.0, 0.0));
+        return Ok((0.0, 0.0, 0.0, 0.0));
     }
 
     let k_half = 0.5 * k_dim as f64;
     let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
-    let r_safe = r.max(1e-300);
-    let log_r = r_safe.ln();
+    let (c, phi_log_coeff, phi_pure_coeff) = if k_dim % 2 == 0 && m >= (k_dim / 2) {
+        (
+            polyharmonic_log_sign(m, k_dim)
+                / (2.0_f64.powi((2 * m - 1) as i32)
+                    * std::f64::consts::PI.powf(k_half)
+                    * gamma_lanczos(m as f64)
+                    * gamma_lanczos((m - k_dim / 2 + 1) as f64)),
+            1.0,
+            0.0,
+        )
+    } else {
+        (
+            gamma_lanczos(k_half - m as f64)
+                / (4.0_f64.powi(m as i32)
+                    * std::f64::consts::PI.powf(k_half)
+                    * gamma_lanczos(m as f64)),
+            0.0,
+            1.0,
+        )
+    };
 
-    if k_dim % 2 == 0 && m >= (k_dim / 2) {
-        // Log case: φ_m(r) = c · r^α · ln(r)
-        let c = polyharmonic_log_sign(m, k_dim)
-            / (2.0_f64.powi((2 * m - 1) as i32)
-                * std::f64::consts::PI.powf(k_half)
-                * gamma_lanczos(m as f64)
-                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
-        let mut out = [0.0; 5];
-        for d in 0..5 {
-            let e = alpha - d as f64;
-            let ff = falling_factorial(alpha, d);
-            let ff_d = falling_factorial_derivative(alpha, d);
-            out[d] = c * r_safe.powf(e) * (ff * log_r + ff_d);
-        }
-        return Ok((out[0], out[1], out[2], out[3], out[4]));
-    }
+    let (phi_r_exp, phi_r_log, phi_r_pure) =
+        log_power_family_derivative(alpha, phi_log_coeff, phi_pure_coeff);
+    let q_exp = phi_r_exp - 1.0;
+    let q = log_power_family_value(r, c, q_exp, phi_r_log, phi_r_pure);
 
-    // Power-only case: φ_m(r) = c · r^α
-    let c = gamma_lanczos(k_half - m as f64)
-        / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
-    let mut out = [0.0; 5];
-    for d in 0..5 {
-        let e = alpha - d as f64;
-        out[d] = c * falling_factorial(alpha, d) * r_safe.powf(e);
-    }
-    Ok((out[0], out[1], out[2], out[3], out[4]))
+    let (q_r_exp_raw, q_r_log, q_r_pure) =
+        log_power_family_derivative(q_exp, phi_r_log, phi_r_pure);
+    let t_exp = q_r_exp_raw - 1.0;
+    let t = log_power_family_value(r, c, t_exp, q_r_log, q_r_pure);
+
+    let (t_r_exp, t_r_log, t_r_pure) = log_power_family_derivative(t_exp, q_r_log, q_r_pure);
+    let t_r = log_power_family_value(r, c, t_r_exp, t_r_log, t_r_pure);
+
+    let (t_rr_exp, t_rr_log, t_rr_pure) = log_power_family_derivative(t_r_exp, t_r_log, t_r_pure);
+    let t_rr = log_power_family_value(r, c, t_rr_exp, t_rr_log, t_rr_pure);
+
+    Ok((q, t, t_r, t_rr))
 }
 
 /// Unified radial jet for one Matérn/Bessel-potential partial-fraction block.
@@ -7103,12 +7128,59 @@ fn polyharmonic_block_jet4(
 ///   g^(2) = c·κ² r^ν K_{ν−2} − c·κ r^{ν−1} K_{ν−1}
 ///   g^(3) = 3c·κ² r^{ν−1} K_{ν−2} − c·κ³ r^ν K_{ν−3}
 ///   g^(4) = 3c·κ² r^{ν−2} K_{ν−2} − 6c·κ³ r^{ν−1} K_{ν−3} + c·κ⁴ r^ν K_{ν−4}
-fn duchon_matern_block_jet4(
+#[inline(always)]
+fn duchon_matern_family_jet4(
+    r: f64,
+    kappa: f64,
+    coeff: f64,
+    mu: f64,
+) -> Result<(f64, f64, f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon Matérn-family distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !kappa.is_finite() || kappa <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon Matérn-family kappa must be finite and positive".to_string(),
+        ));
+    }
+    if r <= 0.0 {
+        return Ok((0.0, 0.0, 0.0, 0.0, 0.0));
+    }
+
+    let z = (kappa * r).max(1e-300);
+    let k_mu = bessel_k_real_half_integer_or_integer(mu.abs(), z)?;
+    let k_mu_m1 = bessel_k_real_half_integer_or_integer((mu - 1.0).abs(), z)?;
+    let k_mu_m2 = bessel_k_real_half_integer_or_integer((mu - 2.0).abs(), z)?;
+    let k_mu_m3 = bessel_k_real_half_integer_or_integer((mu - 3.0).abs(), z)?;
+    let k_mu_m4 = bessel_k_real_half_integer_or_integer((mu - 4.0).abs(), z)?;
+
+    let r_mu = r.powf(mu);
+    let r_mu_m1 = r.powf(mu - 1.0);
+    let r_mu_m2 = r.powf(mu - 2.0);
+    let k1 = kappa;
+    let k2 = kappa * kappa;
+    let k3 = k2 * kappa;
+    let k4 = k3 * kappa;
+
+    let g0 = coeff * r_mu * k_mu;
+    let g1 = -coeff * k1 * r_mu * k_mu_m1;
+    let g2 = coeff * k2 * r_mu * k_mu_m2 - coeff * k1 * r_mu_m1 * k_mu_m1;
+    let g3 = 3.0 * coeff * k2 * r_mu_m1 * k_mu_m2 - coeff * k3 * r_mu * k_mu_m3;
+    let g4 = 3.0 * coeff * k2 * r_mu_m2 * k_mu_m2 - 6.0 * coeff * k3 * r_mu_m1 * k_mu_m3
+        + coeff * k4 * r_mu * k_mu_m4;
+
+    Ok((g0, g1, g2, g3, g4))
+}
+
+#[inline(always)]
+fn duchon_matern_operator_block_jets(
     r: f64,
     kappa: f64,
     n_order: usize,
     k_dim: usize,
-) -> Result<(f64, f64, f64, f64, f64), BasisError> {
+) -> Result<(f64, f64, f64, f64), BasisError> {
     if !r.is_finite() || r < 0.0 {
         return Err(BasisError::InvalidInput(
             "Duchon Matérn-block distance must be finite and non-negative".to_string(),
@@ -7120,7 +7192,7 @@ fn duchon_matern_block_jet4(
         ));
     }
     if r <= 0.0 {
-        return Ok((0.0, 0.0, 0.0, 0.0, 0.0));
+        return Ok((0.0, 0.0, 0.0, 0.0));
     }
 
     let n = n_order as f64;
@@ -7129,30 +7201,9 @@ fn duchon_matern_block_jet4(
     let c = kappa.powf(k_half - n)
         / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
 
-    let z = (kappa * r).max(1e-300);
-    // Evaluate all 5 Bessel K orders from a single consistent set.
-    let k_nu = bessel_k_real_half_integer_or_integer(nu.abs(), z)?;
-    let k_nu_m1 = bessel_k_real_half_integer_or_integer((nu - 1.0).abs(), z)?;
-    let k_nu_m2 = bessel_k_real_half_integer_or_integer((nu - 2.0).abs(), z)?;
-    let k_nu_m3 = bessel_k_real_half_integer_or_integer((nu - 3.0).abs(), z)?;
-    let k_nu_m4 = bessel_k_real_half_integer_or_integer((nu - 4.0).abs(), z)?;
-
-    let r_nu = r.powf(nu);
-    let r_nu_m1 = r.powf(nu - 1.0);
-    let r_nu_m2 = r.powf(nu - 2.0);
-    let k1 = kappa;
-    let k2 = kappa * kappa;
-    let k3 = k2 * kappa;
-    let k4 = k3 * kappa;
-
-    let g0 = c * r_nu * k_nu;
-    let g1 = -c * k1 * r_nu * k_nu_m1;
-    let g2 = c * k2 * r_nu * k_nu_m2 - c * k1 * r_nu_m1 * k_nu_m1;
-    let g3 = 3.0 * c * k2 * r_nu_m1 * k_nu_m2 - c * k3 * r_nu * k_nu_m3;
-    let g4 = 3.0 * c * k2 * r_nu_m2 * k_nu_m2 - 6.0 * c * k3 * r_nu_m1 * k_nu_m3
-        + c * k4 * r_nu * k_nu_m4;
-
-    Ok((g0, g1, g2, g3, g4))
+    let (q, _, _, _, _) = duchon_matern_family_jet4(r, kappa, -c * kappa, nu - 1.0)?;
+    let (t, t_r, t_rr, _, _) = duchon_matern_family_jet4(r, kappa, c * kappa * kappa, nu - 2.0)?;
+    Ok((q, t, t_r, t_rr))
 }
 
 #[inline(always)]
@@ -7243,20 +7294,20 @@ fn duchon_matern_kernel_general_from_distance(
         coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
         &coeffs_local
     };
-    let mut val = 0.0_f64;
+    let mut val = KahanSum::default();
     for (m, coeff) in coeffs_ref.a.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
-        val += coeff * polyharmonic_kernel(r, m, k_dim);
+        val.add(coeff * polyharmonic_kernel(r, m, k_dim));
     }
     for (n, coeff) in coeffs_ref.b.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
-        val += coeff * duchon_matern_block(r, kappa, n, k_dim)?;
+        val.add(coeff * duchon_matern_block(r, kappa, n, k_dim)?);
     }
-    Ok(val)
+    Ok(val.sum())
 }
 
 /// Compute anisotropic squared distance components and total distance.
@@ -9674,15 +9725,15 @@ fn duchon_matern_block_radial_derivative(
         terms = next_terms;
     }
 
-    let mut value = 0.0;
+    let mut value = KahanSum::default();
     for term in terms {
         if term.coeff == 0.0 {
             continue;
         }
         let k_term = bessel_k_real_half_integer_or_integer(term.bessel_order.abs(), z)?;
-        value += term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term;
+        value.add(term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term);
     }
-    Ok(c * value)
+    Ok(c * value.sum())
 }
 
 #[inline(always)]
@@ -9789,8 +9840,14 @@ struct DuchonRadialJets {
 struct DuchonRegularizedPhiCore {
     phi_r: f64,
     phi_rr: f64,
-    phi_rrr: f64,
-    phi_rrrr: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DuchonRegularizedOperatorCore {
+    q: f64,
+    t: f64,
+    t_r: f64,
+    t_rr: f64,
 }
 
 #[inline(always)]
@@ -9934,68 +9991,43 @@ fn duchon_collision_operator_core_fromphi_rr(
     )
 }
 
-#[inline(always)]
-fn duchon_operator_jets_from_phi_derivatives(
-    phi_r: f64,
-    phi_rr: f64,
-    phi_rrr: f64,
-    phi_rrrr: f64,
-    r: f64,
-    d: f64,
-) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64) {
-    // Canonical radial identities for one exact differentiable scalar family:
-    //   q       = phi_r / r
-    //   phi_rr  = q + r q_r
-    //   q_rr    = (phi_rrr - 2 q_r) / r
-    //   lap     = phi_rr + (d - 1) q = d q + r^2 t
-    //   t       = (phi_rr - q) / r^2 = q_r / r
-    //   t_r     = (q_rr - t) / r
-    //   t_rr    = (lap_rr + 2 t - (d + 4) q_rr) / r^2
-    let q = phi_r / r;
-    let q_r = (phi_rr - q) / r;
-    let q_rr = (phi_rrr - 2.0 * q_r) / r;
-    let lap = phi_rr + (d - 1.0) * q;
-    let lap_r = phi_rrr + (d - 1.0) * q_r;
-    let lap_rr = phi_rrrr + (d - 1.0) * q_rr;
-    let t = q_r / r;
-    let t_r = (q_rr - t) / r;
-    let t_rr = (lap_rr + 2.0 * t - (d + 4.0) * q_rr) / (r * r);
-
-    assert!(((phi_rr - (q + r * q_r)).abs()) <= 1e-10 * phi_rr.abs().max(1.0));
-    assert!(((t - (phi_rr - q) / (r * r)).abs()) <= 1e-10 * t.abs().max(1.0));
-    assert!(((lap - (d * q + r * r * t)).abs()) <= 1e-10 * lap.abs().max(1.0));
-
-    (q, q_r, q_rr, lap, lap_r, lap_rr, t, t_r, t_rr)
-}
-
-fn duchon_regularized_phi_core(
+fn duchon_regularized_operator_core(
     r_eval: f64,
     kappa: f64,
     k_dim: usize,
     coeffs: &DuchonPartialFractionCoeffs,
-) -> Result<DuchonRegularizedPhiCore, BasisError> {
-    let mut core = DuchonRegularizedPhiCore::default();
+) -> Result<DuchonRegularizedOperatorCore, BasisError> {
+    let mut q_sum = KahanSum::default();
+    let mut t_sum = KahanSum::default();
+    let mut t_r_sum = KahanSum::default();
+    let mut t_rr_sum = KahanSum::default();
+
     for (m, coeff) in coeffs.a.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
-        let (_, d1, d2, d3, d4) = polyharmonic_block_jet4(r_eval, m, k_dim)?;
-        core.phi_r += coeff * d1;
-        core.phi_rr += coeff * d2;
-        core.phi_rrr += coeff * d3;
-        core.phi_rrrr += coeff * d4;
+        let (q, t, t_r, t_rr) = duchon_polyharmonic_operator_block_jets(r_eval, m, k_dim)?;
+        q_sum.add(coeff * q);
+        t_sum.add(coeff * t);
+        t_r_sum.add(coeff * t_r);
+        t_rr_sum.add(coeff * t_rr);
     }
     for (n, coeff) in coeffs.b.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
-        let (_, d1, d2, d3, d4) = duchon_matern_block_jet4(r_eval, kappa, n, k_dim)?;
-        core.phi_r += coeff * d1;
-        core.phi_rr += coeff * d2;
-        core.phi_rrr += coeff * d3;
-        core.phi_rrrr += coeff * d4;
+        let (q, t, t_r, t_rr) = duchon_matern_operator_block_jets(r_eval, kappa, n, k_dim)?;
+        q_sum.add(coeff * q);
+        t_sum.add(coeff * t);
+        t_r_sum.add(coeff * t_r);
+        t_rr_sum.add(coeff * t_rr);
     }
-    Ok(core)
+    Ok(DuchonRegularizedOperatorCore {
+        q: q_sum.sum(),
+        t: t_sum.sum(),
+        t_r: t_r_sum.sum(),
+        t_rr: t_rr_sum.sum(),
+    })
 }
 
 fn duchon_collision_taylor_phi_core(
@@ -10011,8 +10043,6 @@ fn duchon_collision_taylor_phi_core(
     DuchonRegularizedPhiCore {
         phi_r: phi_rr_collision * r + 0.5 * t_collision * r3 + 0.125 * t_rr_collision * r5,
         phi_rr: phi_rr_collision + 1.5 * t_collision * r2 + 0.625 * t_rr_collision * r4,
-        phi_rrr: 3.0 * t_collision * r + 2.5 * t_rr_collision * r3,
-        phi_rrrr: 3.0 * t_collision + 7.5 * t_rr_collision * r2,
     }
 }
 
@@ -10045,26 +10075,23 @@ fn duchon_radial_jets(
         )));
     }
 
-    // Build one regularized phi-derivative core and derive every secondary
-    // radial scalar from that same core. This keeps q/t/laplacian identities
-    // exact off-origin and leaves only the r -> 0 Taylor carrier as the
-    // special-case branch.
-    let mut phi_core = duchon_regularized_phi_core(r_eval, kappa, k_dim, coeffs)?;
-
-    // Derive every non-phi radial scalar from the same off-origin phi jets so
-    // the Duchon identities cannot drift across independently assembled paths.
-    (
-        out.q, out.q_r, out.q_rr, out.lap, out.lap_r, out.lap_rr, out.t, out.t_r, out.t_rr,
-    ) = duchon_operator_jets_from_phi_derivatives(
-        phi_core.phi_r,
-        phi_core.phi_rr,
-        phi_core.phi_rrr,
-        phi_core.phi_rrrr,
-        r_eval,
-        d,
-    );
-    out.phi_r = phi_core.phi_r;
-    out.phi_rr = phi_core.phi_rr;
+    // Assemble the operator scalars directly from the partial-fraction blocks.
+    // This avoids the unstable off-origin subtraction
+    //   t = (phi_rr - phi_r / r) / r^2
+    // in high dimensions, where phi_rr and phi_r / r can be enormous and nearly
+    // cancel long before the final Duchon operator stays moderate.
+    let op_core = duchon_regularized_operator_core(r_eval, kappa, k_dim, coeffs)?;
+    out.q = op_core.q;
+    out.t = op_core.t;
+    out.t_r = op_core.t_r;
+    out.t_rr = op_core.t_rr;
+    out.q_r = r_eval * out.t;
+    out.q_rr = out.t + r_eval * out.t_r;
+    out.lap = d * out.q + r_eval * r_eval * out.t;
+    out.lap_r = (d + 2.0) * r_eval * out.t + r_eval * r_eval * out.t_r;
+    out.lap_rr = (d + 2.0) * out.t + (d + 4.0) * r_eval * out.t_r + r_eval * r_eval * out.t_rr;
+    out.phi_r = r_eval * out.q;
+    out.phi_rr = out.q + r_eval * r_eval * out.t;
 
     // Smoothness check: the collision Taylor expansion requires analytic
     // collision limits (t(0) = φ''''(0)/3, etc.) which only exist when the
@@ -10092,39 +10119,33 @@ fn duchon_radial_jets(
             // order.  Use the generic-path value at r_floor instead.
             out.t_rr
         };
-        phi_core = duchon_collision_taylor_phi_core(
+        let phi_core = duchon_collision_taylor_phi_core(
             r,
             analytic_phi_rr,
             analytic_t_collision,
             analytic_t_rr_collision,
         );
 
-        if r > 0.0 {
-            (
-                out.q, out.q_r, out.q_rr, out.lap, out.lap_r, out.lap_rr, out.t, out.t_r, out.t_rr,
-            ) = duchon_operator_jets_from_phi_derivatives(
-                phi_core.phi_r,
-                phi_core.phi_rr,
-                phi_core.phi_rrr,
-                phi_core.phi_rrrr,
-                r,
-                d,
-            );
-            out.phi_r = phi_core.phi_r;
-            out.phi_rr = phi_core.phi_rr;
-        } else {
-            out.phi_r = phi_core.phi_r;
-            out.phi_rr = phi_core.phi_rr;
-            out.q = analytic_phi_rr;
-            out.q_r = 0.0;
-            out.q_rr = analytic_t_collision;
-            out.t = analytic_t_collision;
-            out.t_r = 0.0;
-            out.t_rr = analytic_t_rr_collision;
-            out.lap = d * analytic_phi_rr;
-            out.lap_r = 0.0;
-            out.lap_rr = (d + 2.0) * analytic_t_collision;
-        }
+        let r2 = r * r;
+        let r3 = r2 * r;
+        let r4 = r2 * r2;
+        out.phi_r = phi_core.phi_r;
+        out.phi_rr = phi_core.phi_rr;
+        out.t = analytic_t_collision + 0.5 * analytic_t_rr_collision * r2;
+        out.t_r = analytic_t_rr_collision * r;
+        out.t_rr = analytic_t_rr_collision;
+        out.q = analytic_phi_rr
+            + 0.5 * analytic_t_collision * r2
+            + 0.125 * analytic_t_rr_collision * r4;
+        out.q_r = analytic_t_collision * r + 0.5 * analytic_t_rr_collision * r3;
+        out.q_rr = analytic_t_collision + 1.5 * analytic_t_rr_collision * r2;
+        out.lap = d * out.q + r2 * out.t;
+        out.lap_r = (d + 2.0) * r * out.t + r2 * out.t_r;
+        out.lap_rr = (d + 2.0) * out.t + (d + 4.0) * r * out.t_r + r2 * out.t_rr;
+
+        assert!(((out.phi_rr - (out.q + r * out.q_r)).abs()) <= 1e-10 * out.phi_rr.abs().max(1.0));
+        assert!(((out.phi_rr - (out.q + r2 * out.t)).abs()) <= 1e-10 * out.phi_rr.abs().max(1.0));
+        assert!(((out.lap - (d * out.q + r2 * out.t)).abs()) <= 1e-10 * out.lap.abs().max(1.0));
     } else if r < r_floor && collision_q_exists {
         // Tier 1: only lower-order collision identities exist.  φ''(0) is
         // finite but φ''''(0) diverges logarithmically at this smoothness
@@ -10302,18 +10323,18 @@ fn duchonphi_rr_collision_psi_triplet(
     //   phi_rr_psipsi  = (delta + 2)^2 phi_rr
     // and is used as an optimization.  Both paths produce consistent results;
     // the assembled path is the primary, fully supported computation.
-    let mut phi_rr = 0.0;
-    let mut phi_rr_psi = 0.0;
-    let mut phi_rr_psi_psi = 0.0;
+    let mut phi_rr = KahanSum::default();
+    let mut phi_rr_psi = KahanSum::default();
+    let mut phi_rr_psi_psi = KahanSum::default();
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
         if a_m == 0.0 {
             continue;
         }
         let alpha_m = duchon_coeff_exponents(p_order, s_order, m);
         let (g0, g1, g2) = duchon_polyharmonicsecond_collision_psi_triplet(length_scale, m, k_dim);
-        phi_rr += a_m * g0;
-        phi_rr_psi += alpha_m * a_m * g0 + a_m * g1;
-        phi_rr_psi_psi += alpha_m * alpha_m * a_m * g0 + 2.0 * alpha_m * a_m * g1 + a_m * g2;
+        phi_rr.add(a_m * g0);
+        phi_rr_psi.add(alpha_m * a_m * g0 + a_m * g1);
+        phi_rr_psi_psi.add(alpha_m * alpha_m * a_m * g0 + 2.0 * alpha_m * a_m * g1 + a_m * g2);
     }
     for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
         if b_n == 0.0 {
@@ -10321,10 +10342,13 @@ fn duchonphi_rr_collision_psi_triplet(
         }
         let beta_n = duchon_coeff_exponents(p_order, s_order, n);
         let (g0, g1, g2) = duchon_maternsecond_collision_psi_triplet(length_scale, n, k_dim)?;
-        phi_rr += b_n * g0;
-        phi_rr_psi += beta_n * b_n * g0 + b_n * g1;
-        phi_rr_psi_psi += beta_n * beta_n * b_n * g0 + 2.0 * beta_n * b_n * g1 + b_n * g2;
+        phi_rr.add(b_n * g0);
+        phi_rr_psi.add(beta_n * b_n * g0 + b_n * g1);
+        phi_rr_psi_psi.add(beta_n * beta_n * b_n * g0 + 2.0 * beta_n * b_n * g1 + b_n * g2);
     }
+    let phi_rr = phi_rr.sum();
+    let phi_rr_psi = phi_rr_psi.sum();
+    let phi_rr_psi_psi = phi_rr_psi_psi.sum();
     if duchon_has_classicalsecond_order_origin(p_order, s_order, k_dim) {
         let scale = duchon_scaling_exponent(p_order, s_order, k_dim) + 2.0;
         return Ok((phi_rr, scale * phi_rr, scale * scale * phi_rr));
@@ -10644,29 +10668,31 @@ fn duchon_phi_even_derivative_collision(
         // divergent, so any finite floor gives a regularized approximation.
         let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
         let kappa = 1.0 / length_scale.max(1e-300);
-        let mut result = 0.0;
+        let mut result = KahanSum::default();
         let deriv_order = 2 * j;
         for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
             if a_m == 0.0 {
                 continue;
             }
-            result +=
-                a_m * duchon_polyharmonic_radial_derivative_at_r(r_eff, m, k_dim, deriv_order);
+            result.add(
+                a_m * duchon_polyharmonic_radial_derivative_at_r(r_eff, m, k_dim, deriv_order),
+            );
         }
         for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
             if b_n == 0.0 {
                 continue;
             }
-            result +=
-                b_n * duchon_matern_block_radial_derivative(r_eff, kappa, n, k_dim, deriv_order)?;
+            result.add(
+                b_n * duchon_matern_block_radial_derivative(r_eff, kappa, n, k_dim, deriv_order)?,
+            );
         }
-        return Ok(result);
+        return Ok(result.sum());
     }
 
     // Analytic path: extract per-block Taylor r^{2j} coefficients and sum.
     let kappa = 1.0 / length_scale.max(1e-300);
-    let mut total_pure = 0.0;
-    let mut total_log = 0.0;
+    let mut total_pure = KahanSum::default();
+    let mut total_log = KahanSum::default();
 
     // Polyharmonic blocks.
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
@@ -10674,8 +10700,8 @@ fn duchon_phi_even_derivative_collision(
             continue;
         }
         let (pure, log) = duchon_polyharmonic_block_taylor_r2j(m, k_dim, j);
-        total_pure += a_m * pure;
-        total_log += a_m * log;
+        total_pure.add(a_m * pure);
+        total_log.add(a_m * log);
     }
 
     // Matérn blocks.
@@ -10684,9 +10710,11 @@ fn duchon_phi_even_derivative_collision(
             continue;
         }
         let (pure, log) = duchon_matern_block_taylor_r2j(kappa, n, k_dim, j);
-        total_pure += b_n * pure;
-        total_log += b_n * log;
+        total_pure.add(b_n * pure);
+        total_log.add(b_n * log);
     }
+    let total_pure = total_pure.sum();
+    let total_log = total_log.sum();
 
     // The ln(r) coefficients should cancel to zero (guaranteed by the PFD
     // identity when 2(p+s) > d+2j).  Check this as a sanity guard.
@@ -17235,6 +17263,59 @@ mod tests {
             "expected exact t_rr(0) collision limit, got {} vs {}",
             jets_0.t_rr,
             t_rr_collision
+        );
+    }
+
+    #[test]
+    fn test_duchon_high_dim_single_matern_block_operator_jets_are_stable() {
+        let p_order = 0usize;
+        let s_order = 1usize;
+        let k_dim = 16usize;
+        let length_scale = 1.0;
+        let kappa = 1.0 / length_scale;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+        let r = 1e-5;
+
+        let jets =
+            duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs).expect("jets");
+        let (q_expected, t_expected, t_r_expected, t_rr_expected) =
+            duchon_matern_operator_block_jets(r, kappa, 1, k_dim).expect("block operator jets");
+
+        assert!((jets.q - q_expected).abs() <= 1e-12 * q_expected.abs().max(1.0));
+        assert!((jets.t - t_expected).abs() <= 1e-12 * t_expected.abs().max(1.0));
+        assert!((jets.t_r - t_r_expected).abs() <= 1e-12 * t_r_expected.abs().max(1.0));
+        assert!((jets.t_rr - t_rr_expected).abs() <= 1e-12 * t_rr_expected.abs().max(1.0));
+        assert!(
+            ((jets.phi_rr - (jets.q + r * r * jets.t)).abs()) <= 1e-12 * jets.phi_rr.abs().max(1.0)
+        );
+        assert!(
+            ((jets.lap - (k_dim as f64 * jets.q + r * r * jets.t)).abs())
+                <= 1e-12 * jets.lap.abs().max(1.0)
+        );
+    }
+
+    #[test]
+    fn test_duchon_high_dim_mixed_operator_jets_remain_finite_and_consistent() {
+        let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
+        let s_order = 4usize;
+        let k_dim = 16usize;
+        let length_scale = 1.0;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let r = 1e-5;
+
+        let jets =
+            duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs).expect("jets");
+
+        assert!(jets.q.is_finite());
+        assert!(jets.t.is_finite());
+        assert!(jets.t_r.is_finite());
+        assert!(jets.t_rr.is_finite());
+        assert!(
+            ((jets.phi_rr - (jets.q + r * r * jets.t)).abs()) <= 1e-10 * jets.phi_rr.abs().max(1.0)
+        );
+        assert!(
+            ((jets.lap - (k_dim as f64 * jets.q + r * r * jets.t)).abs())
+                <= 1e-10 * jets.lap.abs().max(1.0)
         );
     }
 

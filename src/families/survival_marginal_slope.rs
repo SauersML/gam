@@ -2761,9 +2761,9 @@ fn row_primary_closed_form(
     // -weight * logΦ(m). Here m = -η, so odd derivatives flip sign when mapped
     // back to derivatives with respect to η.
     // For entry: m = -η₀, weight = -w because the NLL contains +w logΦ(-η₀)
-    let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w);
+    let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w)?;
     // For exit: m = -η₁, weight = w(1-d)
-    let (e1_k1, e1_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d));
+    let (e1_k1, e1_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d))?;
     // Event density: -d·logφ(η₁) = d·(η₁²/2 + const).
     // d/dη₁ = d·w·η₁, d²/dη₁² = d·w.
     let phi_u1 = w * d * eta1;
@@ -4208,9 +4208,9 @@ impl SurvivalMarginalSlopeFamily {
         let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-entry.eta);
         let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-exit.eta);
         let (entry_k1, entry_k2, _, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi);
+            signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
         let (exit_k1, exit_k2, _, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di));
+            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di))?;
         let log_phi_eta1 = -0.5 * (exit.eta * exit.eta + std::f64::consts::TAU.ln());
         let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
         let row_nll = wi
@@ -7201,9 +7201,9 @@ impl SurvivalMarginalSlopeFamily {
         let di = self.event[row];
 
         let (entry_k1, entry_k2, entry_k3, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi);
+            signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
         let (exit_k1, exit_k2, exit_k3, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di));
+            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di))?;
 
         let entry_u1 = -entry_k1;
         let entry_u2 = entry_k2;
@@ -7429,9 +7429,9 @@ impl SurvivalMarginalSlopeFamily {
         let di = self.event[row];
 
         let (entry_k1, entry_k2, entry_k3, entry_k4) =
-            signed_probit_neglog_derivatives_up_to_fourth(-entry_base.eta, -wi);
+            signed_probit_neglog_derivatives_up_to_fourth(-entry_base.eta, -wi)?;
         let (exit_k1, exit_k2, exit_k3, exit_k4) =
-            signed_probit_neglog_derivatives_up_to_fourth(-exit_base.eta, wi * (1.0 - di));
+            signed_probit_neglog_derivatives_up_to_fourth(-exit_base.eta, wi * (1.0 - di))?;
 
         let entry_u1 = -entry_k1;
         let entry_u2 = entry_k2;
