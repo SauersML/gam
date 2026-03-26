@@ -244,31 +244,6 @@ fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlice
     }
 }
 
-fn exact_newton_block_ranges(slices: &BlockSlices) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = vec![
-        slices.time.clone(),
-        slices.marginal.clone(),
-        slices.logslope.clone(),
-    ];
-    if let Some(range) = slices.score_warp.clone() {
-        ranges.push(range);
-    }
-    if let Some(range) = slices.link_dev.clone() {
-        ranges.push(range);
-    }
-    ranges
-}
-
-fn exact_newton_block_gradients(
-    joint_gradient: &Array1<f64>,
-    block_ranges: &[std::ops::Range<usize>],
-) -> Vec<Array1<f64>> {
-    block_ranges
-        .iter()
-        .map(|range| joint_gradient.slice(s![range.clone()]).to_owned())
-        .collect()
-}
-
 fn flex_identity_block_pairs(
     primary: &FlexPrimarySlices,
     slices: &BlockSlices,
@@ -4473,25 +4448,6 @@ impl SurvivalMarginalSlopeFamily {
     ) -> (&'a Array1<f64>, &'a Array2<f64>) {
         let base = &cache.row_bases[row];
         (&base.gradient, &base.hessian)
-    }
-
-    fn finalize_dense_joint_working_sets(
-        &self,
-        slices: &BlockSlices,
-        log_likelihood: f64,
-        joint_gradient: Array1<f64>,
-        joint_hessian: Array2<f64>,
-    ) -> FamilyEvaluation {
-        let block_ranges = exact_newton_block_ranges(slices);
-        let block_gradients = exact_newton_block_gradients(&joint_gradient, &block_ranges);
-        FamilyEvaluation {
-            log_likelihood,
-            blockworking_sets: slice_joint_into_block_working_sets(
-                block_gradients,
-                &joint_hessian,
-                &block_ranges,
-            ),
-        }
     }
 
     fn accumulate_dynamic_q_core_gradient(
@@ -11034,10 +10990,10 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
         if self.effective_flex_active(block_states)? {
-            return self.evaluate_blockwise_exact_newton_flexible_dense(block_states);
+            return self.evaluate_blockwise_exact_newton_flexible(block_states);
         }
         if self.flex_timewiggle_active() {
-            return self.evaluate_blockwise_exact_newton_timewiggle_dense(block_states);
+            return self.evaluate_blockwise_exact_newton_timewiggle(block_states);
         }
 
         // For all non-flex, non-timewiggle modes: use the dense joint path
@@ -11102,7 +11058,7 @@ impl SurvivalMarginalSlopeFamily {
     /// from the dynamic-q row jets. This preserves the exact block Newton
     /// update while avoiding dense full-joint assembly when the caller only
     /// needs block-local working sets.
-    fn evaluate_blockwise_exact_newton_flexible_dense(
+    fn evaluate_blockwise_exact_newton_flexible(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
@@ -11122,7 +11078,7 @@ impl SurvivalMarginalSlopeFamily {
     ///
     /// Accumulates exact block-local Hessians directly from the 4D primary
     /// row calculus instead of materializing and slicing a dense joint Hessian.
-    fn evaluate_blockwise_exact_newton_timewiggle_dense(
+    fn evaluate_blockwise_exact_newton_timewiggle(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
@@ -13168,7 +13124,17 @@ mod tests {
             .evaluate_exact_newton_joint_dense(block_states)
             .expect("joint dense exact-newton evaluation");
         let slices = block_slices(family, block_states);
-        let block_ranges = exact_newton_block_ranges(&slices);
+        let mut block_ranges = vec![
+            slices.time.clone(),
+            slices.marginal.clone(),
+            slices.logslope.clone(),
+        ];
+        if let Some(range) = slices.score_warp.clone() {
+            block_ranges.push(range);
+        }
+        if let Some(range) = slices.link_dev.clone() {
+            block_ranges.push(range);
+        }
 
         assert!((eval.log_likelihood - joint_ll).abs() <= 1e-10);
         assert_eq!(eval.blockworking_sets.len(), block_ranges.len());

@@ -40,8 +40,9 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices, sync_aniso_contrasts_from_metadata,
+    freeze_term_collection_from_design, get_spatial_aniso_log_scales, get_spatial_length_scale,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    sync_aniso_contrasts_from_metadata,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use ndarray::{Array1, Array2, ArrayView2, s};
@@ -2587,6 +2588,51 @@ pub fn build_tensor_psi_derivatives(
     Ok(derivs)
 }
 
+#[derive(Clone)]
+struct TransformationExactGeometryCache {
+    key: Vec<u64>,
+    family: TransformationNormalFamily,
+    base_block_spec: ParameterBlockSpec,
+    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+}
+
+fn transformation_spatial_geometry_key(
+    spec: &TermCollectionSpec,
+    spatial_terms: &[usize],
+) -> Vec<u64> {
+    let mut key = Vec::with_capacity(1 + spatial_terms.len() * 8);
+    key.push(spatial_terms.len() as u64);
+    for &term_idx in spatial_terms {
+        key.push(term_idx as u64);
+        key.push(
+            get_spatial_length_scale(spec, term_idx)
+                .map(f64::to_bits)
+                .unwrap_or(u64::MAX),
+        );
+        match get_spatial_aniso_log_scales(spec, term_idx) {
+            Some(eta) => {
+                key.push(eta.len() as u64);
+                key.extend(eta.into_iter().map(f64::to_bits));
+            }
+            None => key.push(u64::MAX - 1),
+        }
+    }
+    key
+}
+
+fn build_blocks_from_base_spec(
+    base_block_spec: &ParameterBlockSpec,
+    beta_hint: Option<&Array1<f64>>,
+) -> Vec<ParameterBlockSpec> {
+    let mut spec = base_block_spec.clone();
+    if let Some(hint) = beta_hint
+        && hint.len() == spec.design.ncols()
+    {
+        spec.initial_beta = Some(hint.clone());
+    }
+    vec![spec]
+}
+
 // ---------------------------------------------------------------------------
 // Top-level fit function
 // ---------------------------------------------------------------------------
@@ -2796,19 +2842,47 @@ pub fn fit_transformation_normal(
             )
         };
 
-    // Helper: build blocks from family + beta hint.
-    let make_blocks = |family: &TransformationNormalFamily| -> Vec<ParameterBlockSpec> {
-        let mut spec = family.block_spec();
-        if let Some(hint) = beta_hint.borrow().as_ref() {
-            if hint.len() == spec.design.ncols() {
-                spec.initial_beta = Some(hint.clone());
-            }
-        }
-        vec![spec]
-    };
-
     let block_specs_slice = [boot_spec.clone()];
     let block_term_indices_slice = [spatial_terms.clone()];
+    let exact_geometry_cache: RefCell<Option<TransformationExactGeometryCache>> =
+        RefCell::new(None);
+    let spatial_terms_for_cache = spatial_terms.clone();
+
+    let ensure_exact_geometry =
+        |spec: &TermCollectionSpec, design: &TermCollectionDesign| -> Result<(), String> {
+            let key = transformation_spatial_geometry_key(spec, &spatial_terms_for_cache);
+            let needs_rebuild = exact_geometry_cache
+                .borrow()
+                .as_ref()
+                .map(|cached| cached.key != key)
+                .unwrap_or(true);
+            if !needs_rebuild {
+                return Ok(());
+            }
+
+            let family = make_family(design)?;
+            let cov_psi_derivs = build_block_spatial_psi_derivatives(covariate_data, spec, design)?
+                .ok_or_else(|| {
+                    "missing covariate spatial psi derivatives for transformation model".to_string()
+                })?;
+            let tensor_derivs = build_tensor_psi_derivatives(&family, &cov_psi_derivs)?;
+
+            log::trace!(
+                "[transformation-normal] rebuilt exact geometry cache for {} spatial terms",
+                spatial_terms_for_cache.len(),
+            );
+
+            // The exact-inner warm start embeds geometry-dependent state.
+            // Reuse it across rho updates, but drop it when the spatial basis changes.
+            exact_warm_start.replace(None);
+            exact_geometry_cache.replace(Some(TransformationExactGeometryCache {
+                key,
+                base_block_spec: family.block_spec(),
+                family,
+                derivative_blocks: vec![tensor_derivs],
+            }));
+            Ok(())
+        };
 
     let solved = optimize_spatial_length_scale_exact_joint(
         covariate_data,
@@ -2820,41 +2894,38 @@ pub fn fit_transformation_normal(
         analytic_gradient,
         analytic_hessian,
         // fit_fn
-        |_, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let family = make_family(&designs[0])?;
-            let blocks = make_blocks(&family);
-            let fit = fit_custom_family(&family, &blocks, &options)
+        |_, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            ensure_exact_geometry(&specs[0], &designs[0])?;
+            let cache_ref = exact_geometry_cache.borrow();
+            let geometry = cache_ref
+                .as_ref()
+                .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
+            let blocks =
+                build_blocks_from_base_spec(&geometry.base_block_spec, beta_hint.borrow().as_ref());
+            let fit = fit_custom_family(&geometry.family, &blocks, &options)
                 .map_err(|e| format!("transformation fit_fn: {e}"))?;
             // Update warm start hints.
             if let Some(block) = fit.block_states.first() {
                 *beta_hint.borrow_mut() = Some(block.beta.clone());
             }
-            Ok((family, fit))
+            Ok((geometry.family.clone(), fit))
         },
         // exact_fn
         |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
-            let family = make_family(&designs[0])?;
-            let blocks = make_blocks(&family);
-
-            // Build covariate-side psi derivatives, then lift to tensor product space.
-            let cov_psi_derivs =
-                build_block_spatial_psi_derivatives(covariate_data, &specs[0], &designs[0])?
-                    .ok_or_else(|| {
-                        "missing covariate spatial psi derivatives for transformation model"
-                            .to_string()
-                    })?;
-
-            let tensor_derivs = build_tensor_psi_derivatives(&family, &cov_psi_derivs)?;
-
-            // Single block: derivative_blocks[0] = tensor_derivs.
-            let derivative_blocks = vec![tensor_derivs];
+            ensure_exact_geometry(&specs[0], &designs[0])?;
+            let cache_ref = exact_geometry_cache.borrow();
+            let geometry = cache_ref
+                .as_ref()
+                .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
+            let blocks =
+                build_blocks_from_base_spec(&geometry.base_block_spec, beta_hint.borrow().as_ref());
 
             let eval = evaluate_custom_family_joint_hyper(
-                &family,
+                &geometry.family,
                 &blocks,
                 &options,
                 rho,
-                &derivative_blocks,
+                &geometry.derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
                 if need_hessian {
                     crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
@@ -2885,22 +2956,19 @@ pub fn fit_transformation_normal(
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
         |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            let family = make_family(&designs[0])?;
-            let blocks = make_blocks(&family);
-            let cov_psi_derivs =
-                build_block_spatial_psi_derivatives(covariate_data, &specs[0], &designs[0])?
-                    .ok_or_else(|| {
-                        "missing covariate spatial psi derivatives for transformation model"
-                            .to_string()
-                    })?;
-            let tensor_derivs = build_tensor_psi_derivatives(&family, &cov_psi_derivs)?;
-            let derivative_blocks = vec![tensor_derivs];
+            ensure_exact_geometry(&specs[0], &designs[0])?;
+            let cache_ref = exact_geometry_cache.borrow();
+            let geometry = cache_ref
+                .as_ref()
+                .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
+            let blocks =
+                build_blocks_from_base_spec(&geometry.base_block_spec, beta_hint.borrow().as_ref());
             let eval = evaluate_custom_family_joint_hyper_efs(
-                &family,
+                &geometry.family,
                 &blocks,
                 &options,
                 rho,
-                &derivative_blocks,
+                &geometry.derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )
             .map_err(|e| format!("transformation exact_efs_fn: {e}"))?;
