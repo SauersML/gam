@@ -2920,6 +2920,38 @@ where
     M: WorkingModel + ?Sized,
     F: FnMut(&WorkingModelIterationInfo),
 {
+    const LM_MAX_LAMBDA: f64 = 1e12;
+
+    fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
+        match err {
+            EstimationError::LinearSystemSolveFailed(_)
+            | EstimationError::HessianNotPositiveDefinite { .. } => true,
+            EstimationError::InvalidInput(message) => {
+                let message = message.to_ascii_lowercase();
+                message.contains("nan")
+                    || message.contains("non-finite")
+                    || message.contains("infinite")
+                    || message.contains("overflow")
+            }
+            _ => false,
+        }
+    }
+    fn lm_can_retry(loop_lambda: f64) -> bool {
+        loop_lambda.is_finite() && loop_lambda < LM_MAX_LAMBDA
+    }
+    fn lm_retry_exhausted(loop_lambda: f64, attempts: usize, max_attempts: usize) -> bool {
+        attempts >= max_attempts || !loop_lambda.is_finite() || loop_lambda > LM_MAX_LAMBDA
+    }
+    fn lm_nonconvergence_error(
+        options: &WorkingModelPirlsOptions,
+        last_change: f64,
+    ) -> EstimationError {
+        EstimationError::PirlsDidNotConverge {
+            max_iterations: options.max_iterations,
+            last_change,
+        }
+    }
+
     if let Some(lb) = options.coefficient_lower_bounds.as_ref() {
         project_coefficients_to_lower_bounds(&mut beta.0, lb);
     }
@@ -2959,6 +2991,7 @@ where
 
     let mut lambda = 1e-6; // Initial damping (Levenberg-Marquardt parameter)
     let lambda_factor = 10.0;
+    let lm_max_attempts = options.max_step_halving.max(1);
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
     //
@@ -3106,7 +3139,7 @@ where
                         )));
                     }
                     // Singular even with ridge (unlikely unless huge). Increase lambda.
-                    if loop_lambda < 1e12 {
+                    if lm_can_retry(loop_lambda) {
                         loop_lambda *= lambda_factor;
                         continue;
                     } else {
@@ -3118,7 +3151,7 @@ where
                 }
             };
             if !array1_is_finite(direction) {
-                if loop_lambda < 1e12 {
+                if lm_can_retry(loop_lambda) {
                     loop_lambda *= lambda_factor;
                     continue;
                 }
@@ -3207,11 +3240,23 @@ where
                                 .update_with_curvature(&candidate_beta, state.hessian_curvature)
                             {
                                 Ok(state) => state,
-                                Err(_) if loop_lambda < 1e12 => {
+                                Err(err) => {
+                                    if !is_lm_retriable_candidate_error(&err) {
+                                        return Err(err);
+                                    }
+                                    if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                                        return Err(lm_nonconvergence_error(
+                                            options,
+                                            state.gradient.dot(&state.gradient).sqrt(),
+                                        ));
+                                    }
+                                    if lm_can_retry(loop_lambda) {
+                                        loop_lambda *= lambda_factor;
+                                        continue;
+                                    }
                                     loop_lambda *= lambda_factor;
                                     continue;
                                 }
-                                Err(err) => return Err(err),
                             }
                         } else {
                             candidate_state
@@ -3365,26 +3410,23 @@ where
                             break 'pirls_loop;
                         }
 
-                        if loop_lambda > 1e12 {
-                            // Exhausted attempts
-                            if attempts > 30 {
-                                lastgradient_norm = stategrad_norm;
-                                // Only accept "stalled but valid" when we are near stationarity.
-                                // Otherwise report MaxIterationsReached so callers can fail fast.
-                                if projected_grad <= near_stationary_tol {
-                                    status = PirlsStatus::StalledAtValidMinimum;
-                                } else {
-                                    status = PirlsStatus::MaxIterationsReached;
-                                }
-                                // Preserve the structural ridge from the model state.
-                                final_state = Some(state.clone());
-                                break 'pirls_loop;
+                        if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                            lastgradient_norm = stategrad_norm;
+                            // Only accept "stalled but valid" when we are near stationarity.
+                            // Otherwise report MaxIterationsReached so callers can fail fast.
+                            if projected_grad <= near_stationary_tol {
+                                status = PirlsStatus::StalledAtValidMinimum;
+                            } else {
+                                status = PirlsStatus::MaxIterationsReached;
                             }
+                            // Preserve the structural ridge from the model state.
+                            final_state = Some(state.clone());
+                            break 'pirls_loop;
                         }
                         loop_lambda *= lambda_factor;
                     }
                 }
-                Err(_) => {
+                Err(err) => {
                     if state.hessian_curvature == HessianCurvatureKind::Observed
                         && !used_fisher_fallback_this_iter
                     {
@@ -3400,7 +3442,16 @@ where
                         loop_lambda = lambda;
                         continue;
                     }
-                    // Evaluation failed (NaN?)
+                    if !is_lm_retriable_candidate_error(&err) {
+                        return Err(err);
+                    }
+                    if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                        return Err(lm_nonconvergence_error(
+                            options,
+                            state.gradient.dot(&state.gradient).sqrt(),
+                        ));
+                    }
+                    // Retry only clearly numerical candidate-evaluation failures.
                     loop_lambda *= lambda_factor;
                 }
             }
@@ -4494,6 +4545,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         .map(|transform| transform.apply_transpose(beta_guess_original.as_ref()))
         .unwrap_or_else(|| beta_guess_original.as_ref().clone());
     let firth_active = config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit);
+    let base_max_step_halving = if firth_active { 60 } else { 30 };
     let options = WorkingModelPirlsOptions {
         // Firth logit fits often need more inner iterations to settle.
         max_iterations: if firth_active {
@@ -4502,7 +4554,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             config.max_iterations
         },
         convergence_tolerance: config.convergence_tolerance,
-        max_step_halving: if firth_active { 60 } else { 30 },
+        max_step_halving: base_max_step_halving.min(config.max_iterations.max(1)),
         min_step_size: if firth_active { 1e-12 } else { 1e-10 },
         firth_bias_reduction: firth_active,
         coefficient_lower_bounds: None,
@@ -7737,6 +7789,144 @@ mod root_cause_tests {
     use super::*;
     use ndarray::array;
 
+    fn test_working_state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+        WorkingState {
+            eta: LinearPredictor::new(array![beta.as_ref()[0]]),
+            gradient: array![1.0],
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(array![[1.0]]),
+            log_likelihood: 0.0,
+            deviance: 1.0,
+            penalty_term: 0.0,
+            firth: FirthDiagnostics::Inactive,
+            ridge_used: 0.0,
+            hessian_curvature: curvature,
+        }
+    }
+
+    #[derive(Default)]
+    struct CandidateEvalFailureModel {
+        observed_updates: usize,
+        fisher_updates: usize,
+        observed_candidate_calls: usize,
+        fisher_candidate_calls: usize,
+    }
+
+    impl CandidateEvalFailureModel {
+        fn state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+            test_working_state(beta, curvature)
+        }
+    }
+
+    impl WorkingModel for CandidateEvalFailureModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            match curvature {
+                HessianCurvatureKind::Observed => self.observed_updates += 1,
+                HessianCurvatureKind::Fisher => self.fisher_updates += 1,
+            }
+            Ok(Self::state(beta, curvature))
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            match curvature {
+                HessianCurvatureKind::Observed => self.observed_candidate_calls += 1,
+                HessianCurvatureKind::Fisher => self.fisher_candidate_calls += 1,
+            }
+            Err(EstimationError::InvalidInput(format!(
+                "non-finite candidate evaluation under {curvature:?} curvature at beta={:.3e}",
+                beta.as_ref()[0],
+            )))
+        }
+
+        fn supports_observed_information_curvature(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct PermanentCandidateErrorModel {
+        candidate_calls: usize,
+    }
+
+    impl WorkingModel for PermanentCandidateErrorModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(test_working_state(beta, curvature))
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            self.candidate_calls += 1;
+            Err(EstimationError::InvalidSpecification(format!(
+                "permanent candidate failure under {curvature:?} curvature at beta={:.3e}",
+                beta.as_ref()[0],
+            )))
+        }
+    }
+
+    #[derive(Default)]
+    struct FirthAcceptedStateFailureModel {
+        current_state_calls: usize,
+        candidate_state_calls: usize,
+        candidate_screen_calls: usize,
+    }
+
+    impl WorkingModel for FirthAcceptedStateFailureModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            if beta.as_ref()[0].abs() < 1e-12 {
+                self.current_state_calls += 1;
+                Ok(test_working_state(beta, curvature))
+            } else {
+                self.candidate_state_calls += 1;
+                Err(EstimationError::InvalidInput(format!(
+                    "overflow while re-evaluating accepted candidate under {curvature:?} curvature at beta={:.3e}",
+                    beta.as_ref()[0],
+                )))
+            }
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            self.candidate_screen_calls += 1;
+            let mut state = test_working_state(beta, curvature);
+            state.deviance = 0.5;
+            state.gradient = array![0.5];
+            Ok(state)
+        }
+    }
+
     /// Hypothesis 1: `projected_gradient_norm` uses `bound_tol = 1e-10` which
     /// is too tight.  A coefficient at 1e-6 above its lower bound with a
     /// positive gradient (KKT multiplier) should be recognized as "at the
@@ -7822,6 +8012,148 @@ mod root_cause_tests {
             predicted_reduction,
             actual_reduction,
             noise_floor
+        );
+    }
+
+    #[test]
+    fn candidate_evaluation_errors_respect_lm_exhaustion_budget() {
+        let mut model = CandidateEvalFailureModel::default();
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 1,
+            convergence_tolerance: 1e-8,
+            max_step_halving: 5,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+        };
+
+        let err = match runworking_model_pirls(
+            &mut model,
+            Coefficients::new(array![0.0]),
+            &options,
+            |_| {},
+        ) {
+            Ok(_) => panic!("candidate evaluation failures should exhaust LM retries and surface"),
+            Err(err) => err,
+        };
+
+        match err {
+            EstimationError::PirlsDidNotConverge {
+                max_iterations,
+                last_change,
+            } => {
+                assert!(
+                    max_iterations == options.max_iterations,
+                    "expected LM exhaustion to surface as PIRLS non-convergence with screening cap"
+                );
+                assert!(last_change.is_finite() && last_change > 0.0);
+            }
+            other => {
+                panic!("expected PirlsDidNotConverge from candidate evaluation, got {other:?}")
+            }
+        }
+
+        assert_eq!(
+            model.observed_updates, 1,
+            "the PIRLS iteration should start on observed curvature once"
+        );
+        assert_eq!(
+            model.fisher_updates, 1,
+            "candidate failure should trigger exactly one observed->Fisher fallback"
+        );
+        assert_eq!(
+            model.observed_candidate_calls, 1,
+            "observed candidate evaluation should fail once before the Fisher fallback"
+        );
+        assert_eq!(
+            model.fisher_candidate_calls,
+            options.max_step_halving - 1,
+            "Fisher candidate evaluation must stop at the configured LM retry budget"
+        );
+    }
+
+    #[test]
+    fn permanent_candidate_errors_do_not_trigger_lm_retries() {
+        let mut model = PermanentCandidateErrorModel::default();
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 1,
+            convergence_tolerance: 1e-8,
+            max_step_halving: 5,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+        };
+
+        let err = match runworking_model_pirls(
+            &mut model,
+            Coefficients::new(array![0.0]),
+            &options,
+            |_| {},
+        ) {
+            Ok(_) => panic!("permanent candidate failures should surface immediately"),
+            Err(err) => err,
+        };
+
+        match err {
+            EstimationError::InvalidSpecification(message) => {
+                assert!(
+                    message.contains("permanent candidate failure"),
+                    "expected permanent candidate failure, got {message}"
+                );
+            }
+            other => panic!("expected InvalidSpecification, got {other:?}"),
+        }
+
+        assert_eq!(
+            model.candidate_calls, 1,
+            "non-retriable candidate failures should not be re-evaluated under stronger damping"
+        );
+    }
+
+    #[test]
+    fn firth_candidate_reevaluation_respects_lm_retry_budget() {
+        let mut model = FirthAcceptedStateFailureModel::default();
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 1,
+            convergence_tolerance: 1e-8,
+            max_step_halving: 4,
+            min_step_size: 0.0,
+            firth_bias_reduction: true,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+        };
+
+        let err = match runworking_model_pirls(
+            &mut model,
+            Coefficients::new(array![0.0]),
+            &options,
+            |_| {},
+        ) {
+            Ok(_) => panic!("Firth candidate reevaluation failures should not loop indefinitely"),
+            Err(err) => err,
+        };
+
+        match err {
+            EstimationError::PirlsDidNotConverge {
+                max_iterations,
+                last_change,
+            } => {
+                assert_eq!(max_iterations, options.max_iterations);
+                assert!(last_change.is_finite() && last_change > 0.0);
+            }
+            other => panic!("expected PirlsDidNotConverge, got {other:?}"),
+        }
+
+        assert_eq!(model.current_state_calls, 1);
+        assert_eq!(
+            model.candidate_screen_calls, options.max_step_halving,
+            "screening pass should retry until the LM budget is exhausted"
+        );
+        assert_eq!(
+            model.candidate_state_calls, options.max_step_halving,
+            "Firth accepted-state reevaluation must stop at the configured LM retry budget"
         );
     }
 

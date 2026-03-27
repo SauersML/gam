@@ -7,23 +7,20 @@
 //!
 //! # Design invariant
 //!
-//! Finite-difference Hessian fallback is _never_ silent. If a path cannot
-//! provide an analytic Hessian, that fact is visible in its
-//! [`OuterCapability`] declaration and in the resulting [`OuterPlan`].
-//! The runner passes Hessian availability through to `opt`, which performs
-//! the finite-difference fill internally when the selected plan requires it.
+//! The planner never selects a finite-difference Hessian policy. If a path
+//! cannot provide an analytic Hessian, that fact is visible in its
+//! [`OuterCapability`] declaration and in the resulting [`OuterPlan`], which
+//! falls back to BFGS or an EFS variant instead of synthesizing second-order
+//! curvature numerically.
 
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FiniteDiffGradient,
     FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
-    FixedPointSample, FixedPointStatus, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError,
-    ObjectiveEvalError, SecondOrderObjective, SecondOrderSample, Solution, Tolerance,
-    ZerothOrderObjective,
+    FixedPointSample, FixedPointStatus, MaxIterations, ObjectiveEvalError, SecondOrderObjective,
+    SecondOrderSample, Solution, Tolerance, ZerothOrderObjective,
 };
-use faer::Side;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,9 +129,8 @@ pub enum Derivative {
 /// Each call site that optimizes smoothing parameters constructs one of these
 /// to describe its analytic derivative coverage. The [`plan`] function then
 /// selects the optimizer and Hessian strategy.
-const SMALL_OUTER_FD_HESSIAN_MAX_PARAMS: usize = 8;
+const SMALL_OUTER_BFGS_MAX_PARAMS: usize = 8;
 const SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS: usize = 64;
-const SECOND_ORDER_NEGATIVE_EIGENVALUE_TOL: f64 = 1.0e-10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OuterThetaLayout {
@@ -267,7 +263,7 @@ pub struct OuterCapability {
     /// # Hybrid EFS strategy (when `psi_dim > 0`)
     ///
     /// Enabled when `psi_dim > 0`,
-    /// `n_params > SMALL_OUTER_FD_HESSIAN_MAX_PARAMS`, and
+    /// `n_params > SMALL_OUTER_BFGS_MAX_PARAMS`, and
     /// `fixed_point_available`.
     /// Combines:
     /// - Standard EFS multiplicative fixed-point updates for ρ coordinates
@@ -322,13 +318,13 @@ impl OuterCapability {
     fn efs_plan_eligible(&self) -> bool {
         self.fixed_point_available
             && self.all_penalty_like()
-            && self.n_params > SMALL_OUTER_FD_HESSIAN_MAX_PARAMS
+            && self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS
     }
 
     fn hybrid_efs_plan_eligible(&self) -> bool {
         self.fixed_point_available
             && self.has_psi_coords()
-            && self.n_params > SMALL_OUTER_FD_HESSIAN_MAX_PARAMS
+            && self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS
     }
 
     fn declared_hessian_for_planning(&self) -> Derivative {
@@ -344,8 +340,6 @@ impl OuterCapability {
 pub enum Solver {
     /// Adaptive Regularized Cubic; fastest convergence, requires Hessian.
     Arc,
-    /// Newton trust-region; quadratic model, requires Hessian.
-    NewtonTrustRegion,
     /// L-BFGS; gradient only, builds curvature from history.
     Bfgs,
     /// Extended Fellner-Schall; multiplicative fixed-point iteration.
@@ -379,9 +373,6 @@ pub enum Solver {
 pub enum HessianSource {
     /// Exact analytic Hessian provided by the objective.
     Analytic,
-    /// Symmetric central differences on the analytic gradient.
-    /// Cost: 2 * n_params extra gradient evaluations per outer step.
-    FiniteDifference,
     /// No explicit Hessian; BFGS builds a rank-2 approximation from
     /// gradient history.
     BfgsApprox,
@@ -391,6 +382,19 @@ pub enum HessianSource {
     /// Hybrid EFS + preconditioned gradient for ψ coordinates.
     /// EFS traces for ρ coords, trace Gram matrix + gradient for ψ coords.
     HybridEfsFixedPoint,
+}
+
+/// Requested derivative order for an outer objective evaluation.
+///
+/// Cost-only paths continue to use [`OuterObjective::eval_cost`]. This enum is
+/// for the shared `eval` bridge where the runner needs either first-order or
+/// second-order information depending on the active plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OuterEvalOrder {
+    /// Compute value and gradient only.
+    ValueAndGradient,
+    /// Compute value, gradient, and analytic Hessian when available.
+    ValueGradientHessian,
 }
 
 /// The outer optimization plan. Produced by [`plan`], consumed by the runner.
@@ -502,9 +506,6 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
 /// outer optimization so the user can see what strategy was selected and why.
 pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
     let hess_warning = match the_plan.hessian_source {
-        HessianSource::FiniteDifference => {
-            format!(" [FD Hessian: {} extra evals/step]", 2 * cap.n_params)
-        }
         HessianSource::BfgsApprox if cap.n_params > 0 => {
             " [no Hessian: BFGS approximation]".to_string()
         }
@@ -819,6 +820,22 @@ pub trait OuterObjective {
     /// Evaluate cost + gradient + (if capable) Hessian.
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError>;
 
+    /// Evaluate the outer objective at the order requested by the active plan.
+    ///
+    /// The default preserves legacy behavior by delegating to
+    /// [`OuterObjective::eval`].
+    fn eval_with_order(
+        &mut self,
+        rho: &Array1<f64>,
+        order: OuterEvalOrder,
+    ) -> Result<OuterEval, EstimationError> {
+        match order {
+            OuterEvalOrder::ValueAndGradient | OuterEvalOrder::ValueGradientHessian => {
+                self.eval(rho)
+            }
+        }
+    }
+
     /// Evaluate cost + EFS step vector. Only needed when the plan selects
     /// `Solver::Efs`. The default returns an error indicating EFS is not
     /// supported by this objective.
@@ -843,11 +860,15 @@ pub struct ClosureObjective<
     Fe,
     Fr = fn(&mut S),
     Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+    Feo = fn(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
 > {
     pub(crate) state: S,
     pub(crate) cap: OuterCapability,
     pub(crate) cost_fn: Fc,
     pub(crate) eval_fn: Fe,
+    /// Optional order-aware eval closure. When `None`, `eval_with_order()`
+    /// falls back to `eval()`.
+    pub(crate) eval_order_fn: Option<Feo>,
     /// Optional reset closure. When `None`, `reset()` is a no-op.
     pub(crate) reset_fn: Option<Fr>,
     /// Optional EFS evaluation closure. When `None`, the default
@@ -855,12 +876,13 @@ pub struct ClosureObjective<
     pub(crate) efs_fn: Option<Fefs>,
 }
 
-impl<S, Fc, Fe, Fr, Fefs> OuterObjective for ClosureObjective<S, Fc, Fe, Fr, Fefs>
+impl<S, Fc, Fe, Fr, Fefs, Feo> OuterObjective for ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo>
 where
     Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
     Fr: FnMut(&mut S),
     Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+    Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
 {
     fn capability(&self) -> OuterCapability {
         self.cap.clone()
@@ -872,6 +894,17 @@ where
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         (self.eval_fn)(&mut self.state, rho)
+    }
+
+    fn eval_with_order(
+        &mut self,
+        rho: &Array1<f64>,
+        order: OuterEvalOrder,
+    ) -> Result<OuterEval, EstimationError> {
+        match self.eval_order_fn.as_mut() {
+            Some(f) => f(&mut self.state, rho, order),
+            None => (self.eval_fn)(&mut self.state, rho),
+        }
     }
 
     fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
@@ -964,22 +997,22 @@ fn finite_outer_first_order_eval_or_error(
     Ok(eval)
 }
 
-fn second_order_seed_geometry_mismatch(
+fn validate_second_order_seed_hessian(
     context: &str,
     layout: OuterThetaLayout,
     eval: &OuterEval,
-) -> Result<Option<String>, ObjectiveEvalError> {
+) -> Result<(), ObjectiveEvalError> {
     if layout.n_params > SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS || !eval.hessian.is_analytic() {
-        return Ok(None);
+        return Ok(());
     }
 
-    let Some(mut hessian) = eval.hessian.materialize_dense().map_err(|message| {
+    let Some(hessian) = eval.hessian.materialize_dense().map_err(|message| {
         ObjectiveEvalError::recoverable(format!(
-            "{context}: analytic outer Hessian materialization failed during Newton-geometry probe: {message}"
+            "{context}: analytic outer Hessian materialization failed during second-order seed validation: {message}"
         ))
     })?
     else {
-        return Ok(None);
+        return Ok(());
     };
 
     layout.validate_hessian_shape(&hessian, context)?;
@@ -989,46 +1022,7 @@ fn second_order_seed_geometry_mismatch(
         )));
     }
 
-    for row in 0..hessian.nrows() {
-        for col in (row + 1)..hessian.ncols() {
-            let sym = 0.5 * (hessian[[row, col]] + hessian[[col, row]]);
-            hessian[[row, col]] = sym;
-            hessian[[col, row]] = sym;
-        }
-    }
-
-    if hessian.cholesky(Side::Lower).is_ok() {
-        return Ok(None);
-    }
-
-    match hessian.eigh(Side::Lower) {
-        Ok((evals, _)) => {
-            let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
-            let negative_count = evals
-                .iter()
-                .filter(|&&value| value < -SECOND_ORDER_NEGATIVE_EIGENVALUE_TOL)
-                .count();
-            let nonpositive_count = evals
-                .iter()
-                .filter(|&&value| value <= SECOND_ORDER_NEGATIVE_EIGENVALUE_TOL)
-                .count();
-            let curvature_note = if negative_count > 0 {
-                format!(
-                    "indefinite (min_eigenvalue={min_eval:.3e}, negative_eigenvalues={negative_count})"
-                )
-            } else {
-                format!(
-                    "not SPD (min_eigenvalue={min_eval:.3e}, nonpositive_eigenvalues={nonpositive_count})"
-                )
-            };
-            Ok(Some(format!(
-                "analytic outer Hessian has unstable Newton geometry at the seed: {curvature_note}"
-            )))
-        }
-        Err(err) => Ok(Some(format!(
-            "analytic outer Hessian failed the SPD probe and eigendecomposition could not diagnose it ({err:?})"
-        ))),
-    }
+    Ok(())
 }
 
 fn finite_efs_eval_or_error(
@@ -1080,9 +1074,9 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         let eval = self
             .obj
-            .eval(x)
+            .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
-        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
+        let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -1113,9 +1107,9 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         let eval = self
             .obj
-            .eval(x)
+            .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
-        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
+        let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -1128,13 +1122,12 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         let eval = self
             .obj
-            .eval(x)
+            .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         let hessian = match self.hessian_source {
             HessianSource::Analytic => eval.hessian.into_option(),
-            HessianSource::FiniteDifference
-            | HessianSource::BfgsApprox
+            HessianSource::BfgsApprox
             | HessianSource::EfsFixedPoint
             | HessianSource::HybridEfsFixedPoint => None,
         };
@@ -1525,6 +1518,40 @@ impl OuterProblem {
             cap,
             cost_fn,
             eval_fn,
+            eval_order_fn: None,
+            reset_fn,
+            efs_fn,
+        }
+    }
+
+    /// Construct a [`ClosureObjective`] with an order-aware evaluation hook.
+    ///
+    /// This lets the runner request first-order vs second-order work based on
+    /// the active outer plan while preserving the legacy eager `eval_fn`.
+    pub fn build_objective_with_eval_order<S, Fc, Fe, Feo, Fr, Fefs>(
+        &self,
+        state: S,
+        cost_fn: Fc,
+        eval_fn: Fe,
+        eval_order_fn: Feo,
+        reset_fn: Option<Fr>,
+        efs_fn: Option<Fefs>,
+    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo>
+    where
+        Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+        Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
+        Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
+        Fr: FnMut(&mut S),
+        Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+    {
+        let mut cap = self.capability();
+        cap.fixed_point_available = efs_fn.is_some();
+        ClosureObjective {
+            state,
+            cap,
+            cost_fn,
+            eval_fn,
+            eval_order_fn: Some(eval_order_fn),
             reset_fn,
             efs_fn,
         }
@@ -1836,7 +1863,7 @@ fn run_operator_trust_region(
             continue;
         }
 
-        let eval_trial = obj.eval(&x_trial)?;
+        let eval_trial = obj.eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian)?;
         let eval_trial =
             finite_outer_eval_or_error("outer operator eval failed", layout, eval_trial).map_err(
                 |err| match err {
@@ -1964,32 +1991,20 @@ fn run_outer(
     }))
 }
 
-/// Execute a single plan attempt (seed generation → solver loop → best result).
-fn screen_seed_candidates(
+/// Execute a single screening probe and return the next viable seed.
+fn screen_next_seed_candidate(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
-    seeds: Vec<Array1<f64>>,
-) -> Result<Vec<Array1<f64>>, EstimationError> {
-    if seeds.len() <= 1 {
-        return Ok(seeds);
-    }
-
+    seeds: &[Array1<f64>],
+    next_seed_idx: &mut usize,
+    last_error: &mut Option<String>,
+) -> Result<Option<Array1<f64>>, EstimationError> {
     let screening_limit = config.seed_config.screen_max_inner_iterations.max(1);
-    let seed_budget = config.seed_config.seed_budget.max(1).min(seeds.len());
-    log::info!(
-        "[OUTER] {context}: screening {}/{} seeds (budget={}, pirls_cap={})",
-        seeds.len(),
-        seeds.len(),
-        seed_budget,
-        screening_limit,
-    );
-
-    let t_start = std::time::Instant::now();
-    let mut screened = Vec::with_capacity(seeds.len());
-    let mut last_error: Option<String> = None;
-
-    for (idx, seed) in seeds.into_iter().enumerate() {
+    while *next_seed_idx < seeds.len() {
+        let idx = *next_seed_idx;
+        let seed = seeds[idx].clone();
+        *next_seed_idx += 1;
         obj.reset();
         let cost = {
             let screening_guard =
@@ -2016,7 +2031,7 @@ fn screen_seed_candidates(
                     "[OUTER] {context}: screening rejected seed {}: {err}",
                     idx + 1
                 );
-                last_error = Some(err.to_string());
+                *last_error = Some(err.to_string());
                 continue;
             }
         };
@@ -2025,40 +2040,21 @@ fn screen_seed_candidates(
                 EstimationError::RemlOptimizationFailed(message)
             }
         });
-        match cost {
-            Ok(cost) => screened.push((idx, cost, seed)),
-            Err(err) => {
-                log::warn!(
-                    "[OUTER] {context}: screening rejected seed {}: {err}",
-                    idx + 1
-                );
-                last_error = Some(err.to_string());
-            }
+        if let Err(err) = cost {
+            log::warn!(
+                "[OUTER] {context}: screening rejected seed {}: {err}",
+                idx + 1
+            );
+            *last_error = Some(err.to_string());
+            continue;
         }
+        return Ok(Some(seed));
     }
 
-    if screened.is_empty() {
-        let detail = last_error.unwrap_or_else(|| "no finite screening evaluations".to_string());
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "all seed screenings failed ({context}): {detail}"
-        )));
-    }
-
-    screened.sort_by(|(idx_a, cost_a, _), (idx_b, cost_b, _)| {
-        cost_a.total_cmp(cost_b).then_with(|| idx_a.cmp(idx_b))
-    });
-
-    log::info!(
-        "[OUTER] {context}: screening done in {:.3}s",
-        t_start.elapsed().as_secs_f64()
-    );
-
-    Ok(screened
-        .into_iter()
-        .map(|(_, _, seed)| seed)
-        .collect::<Vec<_>>())
+    Ok(None)
 }
 
+/// Execute a single plan attempt (seed generation → solver loop → best result).
 fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -2089,12 +2085,16 @@ fn run_outer_with_plan(
         )));
     }
 
-    seeds = screen_seed_candidates(obj, config, context, seeds)?;
-
     let seed_budget = config.seed_config.seed_budget.max(1).min(seeds.len());
+    log::info!(
+        "[OUTER] {context}: screening seeds lazily (generated={}, budget={}, pirls_cap={})",
+        seeds.len(),
+        seed_budget,
+        config.seed_config.screen_max_inner_iterations.max(1),
+    );
     if seeds.len() > seed_budget {
         log::info!(
-            "[OUTER] {context}: trying up to {seed_budget}/{} screened seeds",
+            "[OUTER] {context}: trying up to {seed_budget}/{} generated seeds in heuristic order",
             seeds.len(),
         );
     }
@@ -2111,18 +2111,27 @@ fn run_outer_with_plan(
     let mut last_seed_error: Option<String> = None;
     let layout = cap.theta_layout();
     let mut started_seeds = 0usize;
+    let mut next_seed_idx = 0usize;
 
-    'seed_attempts: for seed in &seeds {
-        if started_seeds == seed_budget {
+    'seed_attempts: while started_seeds < seed_budget {
+        let Some(seed) = screen_next_seed_candidate(
+            obj,
+            config,
+            context,
+            &seeds,
+            &mut next_seed_idx,
+            &mut last_seed_error,
+        )?
+        else {
             break;
-        }
+        };
         obj.reset();
         let t_seed_start = std::time::Instant::now();
         let seed_slot;
         let result: Result<OuterResult, EstimationError> = match the_plan.solver {
-            Solver::Arc | Solver::NewtonTrustRegion => {
+            Solver::Arc => {
                 let seed_eval = obj
-                    .eval(seed)
+                    .eval_with_order(&seed, OuterEvalOrder::ValueGradientHessian)
                     .map_err(|err| into_objective_error("outer eval failed", err));
                 let seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
@@ -2153,30 +2162,14 @@ fn run_outer_with_plan(
                         continue 'seed_attempts;
                     }
                 };
-                let geometry_mismatch = second_order_seed_geometry_mismatch(
-                    context, layout, &seed_eval,
-                )
-                .map_err(|err| match err {
-                    ObjectiveEvalError::Recoverable { message }
-                    | ObjectiveEvalError::Fatal { message } => {
-                        EstimationError::RemlOptimizationFailed(message)
+                validate_second_order_seed_hessian(context, layout, &seed_eval).map_err(|err| {
+                    match err {
+                        ObjectiveEvalError::Recoverable { message }
+                        | ObjectiveEvalError::Fatal { message } => {
+                            EstimationError::RemlOptimizationFailed(message)
+                        }
                     }
                 })?;
-                if let Some(reason) = geometry_mismatch {
-                    let downgraded_cap = downgrade_hessian(cap)
-                        .expect("second-order solver branch requires analytic Hessian capability");
-                    let downgraded_plan = plan(&downgraded_cap);
-                    log::warn!(
-                        "[OUTER] {context}: {reason}; replanning from {the_plan} to {downgraded_plan}"
-                    );
-                    return run_outer_with_plan(
-                        obj,
-                        config,
-                        context,
-                        &downgraded_cap,
-                        &downgraded_plan,
-                    );
-                }
                 started_seeds += 1;
                 seed_slot = started_seeds;
 
@@ -2187,7 +2180,7 @@ fn run_outer_with_plan(
                     );
                     run_operator_trust_region(
                         obj,
-                        seed,
+                        &seed,
                         layout,
                         Some(&bounds_template),
                         config.tolerance,
@@ -2211,36 +2204,18 @@ fn run_outer_with_plan(
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
-                    if the_plan.solver == Solver::Arc {
-                        let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
-                            .with_bounds(bounds)
-                            .with_tolerance(tol)
-                            .with_max_iterations(max_iter)
-                            .with_fd_hessian_step(config.fd_step);
-                        match optimizer.run() {
-                            Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                            Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
-                                Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                            }
-                            Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                                "Arc solver failed: {e:?}"
-                            ))),
+                    let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
+                        .with_bounds(bounds)
+                        .with_tolerance(tol)
+                        .with_max_iterations(max_iter);
+                    match optimizer.run() {
+                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                        Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
-                    } else {
-                        let mut optimizer = NewtonTrustRegion::new(seed.clone(), objective)
-                            .with_bounds(bounds)
-                            .with_tolerance(tol)
-                            .with_max_iterations(max_iter)
-                            .with_fd_hessian_step(config.fd_step);
-                        match optimizer.run() {
-                            Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                            Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-                                Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                            }
-                            Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                                "Newton trust-region solver failed: {e:?}"
-                            ))),
-                        }
+                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                            "Arc solver failed: {e:?}"
+                        ))),
                     }
                 }
             }
@@ -2248,7 +2223,7 @@ fn run_outer_with_plan(
                 let gradient_available = cap.gradient == Derivative::Analytic;
                 if gradient_available {
                     let seed_eval = obj
-                        .eval(seed)
+                        .eval_with_order(&seed, OuterEvalOrder::ValueAndGradient)
                         .map_err(|err| into_objective_error("outer eval failed", err));
                     let seed_eval = match seed_eval {
                         Ok(seed_eval) => seed_eval,
@@ -2284,7 +2259,7 @@ fn run_outer_with_plan(
                     }
                 } else {
                     let seed_cost = obj
-                        .eval_cost(seed)
+                        .eval_cost(&seed)
                         .map_err(|err| into_objective_error("outer eval_cost failed", err));
                     let seed_cost = match seed_cost {
                         Ok(seed_cost) => seed_cost,
@@ -2364,7 +2339,7 @@ fn run_outer_with_plan(
             }
             Solver::Efs => {
                 let seed_eval = obj
-                    .eval_efs(seed)
+                    .eval_efs(&seed)
                     .map_err(|err| into_objective_error("outer EFS eval failed", err));
                 let seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
@@ -2421,31 +2396,9 @@ fn run_outer_with_plan(
                     ))),
                 }
             }
-            // ── Hybrid EFS + preconditioned gradient for ψ coords ──
-            //
-            // This solver combines EFS multiplicative steps for ρ (penalty-like)
-            // coordinates with safeguarded preconditioned gradient steps for ψ
-            // (design-moving) coordinates.
-            //
-            // The hybrid is needed because EFS is mathematically invalid for
-            // indefinite B_ψ: Wood-Fasiolo's ascent proof requires
-            // H^{-1/2} B_d H^{-1/2} ≽ 0 with parameter-independent nullspace,
-            // which holds for penalty-like coords but fails for design-moving
-            // coords. A concrete counterexample (response.md Section 2) shows
-            // that any fixed-point map using only {a_d, tr(H⁻¹B_d),
-            // tr(H⁻¹B_dH⁻¹B_e), v_d} can be made ascent or descent by varying
-            // the local curvature c, so no universal convergence guarantee exists.
-            //
-            // The preconditioned gradient Δψ = -α G⁺ g_ψ uses the same trace
-            // Gram matrix G_{de} = tr(H⁻¹ B_d H⁻¹ B_e) that EFS computes,
-            // staying O(1) H⁻¹ solves per iteration (vs O(dim(θ)) for BFGS).
-            //
-            // Backtracking: if the combined step doesn't decrease V(θ), the ψ
-            // step size α is halved (up to MAX_PSI_BACKTRACK times) while the
-            // ρ-EFS step is kept fixed.
             Solver::HybridEfs => {
                 let seed_eval = obj
-                    .eval_efs(seed)
+                    .eval_efs(&seed)
                     .map_err(|err| into_objective_error("outer EFS eval failed", err));
                 let seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
@@ -2570,6 +2523,24 @@ mod tests {
     use ndarray::array;
     use std::sync::{Arc, Mutex};
 
+    struct FailingSeedMaterializationOperator {
+        dim: usize,
+    }
+
+    impl OuterHessianOperator for FailingSeedMaterializationOperator {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+            Ok(v.clone())
+        }
+
+        fn materialize_dense(&self) -> Result<Array2<f64>, String> {
+            Err("seed materialization failed".to_string())
+        }
+    }
+
     #[test]
     fn plan_analytic_hessian_selects_arc() {
         let cap = OuterCapability {
@@ -2601,7 +2572,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_fd_hessian_still_selects_bfgs() {
+    fn plan_fd_hessian_capability_is_treated_as_gradient_only() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::FiniteDifference,
@@ -2666,7 +2637,7 @@ mod tests {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
-            n_params: SMALL_OUTER_FD_HESSIAN_MAX_PARAMS,
+            n_params: SMALL_OUTER_BFGS_MAX_PARAMS,
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
@@ -2681,7 +2652,7 @@ mod tests {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
-            n_params: SMALL_OUTER_FD_HESSIAN_MAX_PARAMS + 1,
+            n_params: SMALL_OUTER_BFGS_MAX_PARAMS + 1,
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
@@ -2795,7 +2766,7 @@ mod tests {
     fn plan_efs_allowed_with_barrier_config_no_gradient() {
         // Even without analytic gradient, EFS is selected when all coords
         // are penalty-like and the problem is above the small-problem
-        // FD-Hessian threshold, regardless of barrier presence.
+        // BFGS cutoff, regardless of barrier presence.
         let barrier = BarrierConfig {
             tau: 1e-6,
             constrained_indices: vec![0],
@@ -2893,6 +2864,9 @@ mod tests {
                     hessian: HessianResult::Unavailable,
                 })
             },
+            eval_order_fn: None::<
+                fn(&mut i32, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
+            >,
             reset_fn: Some(|st: &mut i32| {
                 *st = 42;
             }),
@@ -2900,6 +2874,111 @@ mod tests {
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn run_bfgs_mode_aware_eval_skips_hessian_work() {
+        let seen_orders = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable)
+            .with_initial_rho(array![1.0])
+            .with_max_iter(1);
+        let mut obj = problem.build_objective_with_eval_order(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput(
+                    "legacy eager eval should not run on BFGS".to_string(),
+                ))
+            },
+            {
+                let seen_orders = Arc::clone(&seen_orders);
+                move |_: &mut (), theta: &Array1<f64>, order: OuterEvalOrder| {
+                    seen_orders.lock().unwrap().push(order);
+                    Ok(OuterEval {
+                        cost: theta[0] * theta[0],
+                        gradient: array![2.0 * theta[0]],
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "mode-aware bfgs first order")
+            .expect("BFGS should use the order-aware first-order bridge");
+        assert_eq!(result.plan_used.solver, Solver::Bfgs);
+        let seen_orders = seen_orders.lock().unwrap();
+        assert!(
+            !seen_orders.is_empty(),
+            "mode-aware eval hook should have been used"
+        );
+        assert!(
+            seen_orders
+                .iter()
+                .all(|order| *order == OuterEvalOrder::ValueAndGradient),
+            "BFGS should request only value+gradient, saw {seen_orders:?}"
+        );
+    }
+
+    #[test]
+    fn outer_second_order_bridge_separates_first_and_second_order_requests() {
+        let seen_orders = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic);
+        let mut obj = problem.build_objective_with_eval_order(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput(
+                    "legacy eager eval should not run".to_string(),
+                ))
+            },
+            {
+                let seen_orders = Arc::clone(&seen_orders);
+                move |_: &mut (), theta: &Array1<f64>, order: OuterEvalOrder| {
+                    seen_orders.lock().unwrap().push(order);
+                    Ok(OuterEval {
+                        cost: theta[0] * theta[0],
+                        gradient: array![2.0 * theta[0]],
+                        hessian: match order {
+                            OuterEvalOrder::ValueAndGradient => HessianResult::Unavailable,
+                            OuterEvalOrder::ValueGradientHessian => {
+                                HessianResult::Analytic(array![[2.0]])
+                            }
+                        },
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut bridge = OuterSecondOrderBridge {
+            obj: &mut obj,
+            layout: OuterThetaLayout::new(1, 0),
+            hessian_source: HessianSource::Analytic,
+        };
+        let grad_sample =
+            FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
+        assert_eq!(grad_sample.value, 1.0);
+        assert_eq!(grad_sample.gradient, array![2.0]);
+        let hess_sample =
+            SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0]).expect("hessian eval");
+        assert_eq!(hess_sample.value, 1.0);
+        assert_eq!(hess_sample.gradient, array![2.0]);
+        assert_eq!(hess_sample.hessian, Some(array![[2.0]]));
+        let seen_orders = seen_orders.lock().unwrap();
+        assert!(
+            *seen_orders
+                == vec![
+                    OuterEvalOrder::ValueAndGradient,
+                    OuterEvalOrder::ValueGradientHessian
+                ],
+            "second-order bridge should split first-order and second-order requests, saw {seen_orders:?}"
+        );
     }
 
     #[test]
@@ -2913,8 +2992,8 @@ mod tests {
     #[test]
     fn plan_hybrid_efs_selected_for_psi_coords_many_params() {
         // When ψ (design-moving) coords are present and the problem is above
-        // the small-problem FD-Hessian threshold, the planner should select
-        // HybridEfs instead of falling back to BFGS.
+        // the small-problem BFGS cutoff, the planner should select HybridEfs
+        // instead of falling back to BFGS.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -3054,6 +3133,34 @@ mod tests {
     }
 
     #[test]
+    fn run_bfgs_ignores_malformed_hessian_payload() {
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable)
+            .with_initial_rho(array![0.0])
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: theta[0] * theta[0],
+                    gradient: array![2.0 * theta[0]],
+                    // First-order paths must ignore Hessian payload quality.
+                    hessian: HessianResult::Analytic(array![[f64::NAN, 0.0], [0.0, 1.0]]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "bfgs should ignore malformed hessian payload")
+            .expect("valid first-order data should be enough for BFGS");
+        assert_eq!(result.plan_used.solver, Solver::Bfgs);
+        assert_eq!(result.plan_used.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
     fn finite_outer_eval_reports_gradient_length_mismatch() {
         let err = finite_outer_eval_or_error(
             "test gradient mismatch",
@@ -3130,7 +3237,7 @@ mod tests {
     }
 
     #[test]
-    fn run_indefinite_analytic_seed_replans_before_arc() {
+    fn run_indefinite_analytic_seed_stays_on_arc() {
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
@@ -3154,13 +3261,45 @@ mod tests {
         );
         let result = problem
             .run(&mut obj, "indefinite seed geometry")
-            .expect("indefinite analytic seed geometry should trigger a degraded replan");
+            .expect("indefinite analytic seed geometry should stay on the second-order plan");
+        assert_eq!(result.plan_used.solver, Solver::Arc);
+        assert_eq!(result.plan_used.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn run_seed_materialization_failure_falls_back_from_arc() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_seed_config(seed_config)
+            .with_initial_rho(array![0.0])
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.0,
+                    gradient: array![0.0],
+                    hessian: HessianResult::Operator(Arc::new(
+                        FailingSeedMaterializationOperator { dim: 1 },
+                    )),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "seed materialization failure")
+            .expect("materialization failure should trigger the degraded fallback plan");
         assert_eq!(result.plan_used.solver, Solver::Bfgs);
         assert_eq!(result.plan_used.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
-    fn run_starts_solver_without_upfront_seed_pass() {
+    fn run_starts_solver_without_upfront_seed_eval_pass() {
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -3196,7 +3335,59 @@ mod tests {
             .run(&mut obj, "solver should start without an upfront seed pass")
             .expect("analytic plans should start with a real evaluation");
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.first().copied(), Some("eval"));
+        let first_eval_idx = calls
+            .iter()
+            .position(|call| *call == "eval")
+            .expect("solver should eventually request a full eval");
+        assert!(
+            calls[..first_eval_idx].iter().all(|call| *call == "cost"),
+            "unexpected pre-solver call order: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn run_lazy_screening_stops_at_attempt_budget() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.max_seeds = 6;
+        seed_config.seed_budget = 1;
+        let screening_calls = Arc::new(AtomicUsize::new(0));
+        let problem = OuterProblem::new(15)
+            .with_gradient(Derivative::Unavailable)
+            .with_hessian(Derivative::Unavailable)
+            .with_seed_config(seed_config)
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            {
+                let screening_calls = Arc::clone(&screening_calls);
+                move |_: &mut (), _: &Array1<f64>| {
+                    screening_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(0.0)
+                }
+            },
+            |_: &mut (), theta: &Array1<f64>| Ok(OuterEval::infeasible(theta.len())),
+            None::<fn(&mut ())>,
+            Some(|_: &mut (), theta: &Array1<f64>| {
+                Ok(EfsEval {
+                    cost: 0.0,
+                    steps: vec![0.0; theta.len()],
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                })
+            }),
+        );
+        problem
+            .run(
+                &mut obj,
+                "lazy screening should not probe all generated seeds",
+            )
+            .expect("first screened EFS seed should be sufficient");
+        assert_eq!(
+            screening_calls.load(Ordering::Relaxed),
+            1,
+            "screening should stop once the attempt budget is filled"
+        );
     }
 
     #[test]

@@ -5,6 +5,8 @@ use crate::construction::{
 use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
 use crate::linalg::utils::{boundary_hit_indices, symmetric_spectrum_condition_number};
 use crate::pirls::PirlsWorkspace;
+use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
+use crate::solver::outer_strategy::{HessianResult, OuterEval};
 use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2028,6 +2030,10 @@ impl<'a> RemlState<'a> {
             *calls += 1;
             *calls
         };
+        let rho_key = EvalCacheManager::sanitized_rhokey(p);
+        if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
+            return Ok(eval.cost);
+        }
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -2249,7 +2255,7 @@ impl<'a> RemlState<'a> {
     ///   derivatives smooth and consistent with the transformed penalty basis used by PIRLS.
     ///
     /// This is the core gradient evaluator for outer optimization. The
-    /// centralized planner may feed it to ARC, Newton trust-region, or BFGS,
+    /// centralized planner may feed it to ARC, BFGS, or an EFS variant,
     /// depending on available curvature information.
     /// The calculation differs significantly between the Gaussian (REML) and non-Gaussian (LAML) cases.
     ///
@@ -3148,6 +3154,10 @@ impl<'a> RemlState<'a> {
         self.arena
             .lastgradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
+        let rho_key = EvalCacheManager::sanitized_rhokey(p);
+        if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
+            return Ok(eval.gradient);
+        }
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
@@ -3170,6 +3180,101 @@ impl<'a> RemlState<'a> {
         let result =
             self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
         Ok(result.gradient.unwrap())
+    }
+
+    pub fn compute_outer_eval_with_order(
+        &self,
+        p: &Array1<f64>,
+        order: crate::solver::outer_strategy::OuterEvalOrder,
+    ) -> Result<OuterEval, EstimationError> {
+        self.arena
+            .lastgradient_used_stochastic_fallback
+            .store(false, Ordering::Relaxed);
+        let rho_key = EvalCacheManager::sanitized_rhokey(p);
+        if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
+            let cache_satisfies_request = match order {
+                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => true,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
+                    eval.hessian.is_analytic()
+                }
+            };
+            if cache_satisfies_request {
+                return Ok(eval);
+            }
+        }
+
+        let bundle = match self.obtain_eval_bundle(p) {
+            Ok(bundle) => bundle,
+            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                self.cache_manager.invalidate_eval_bundle();
+                log::warn!(
+                    "P-IRLS flagged ill-conditioning for current rho; returning infeasible outer eval to retreat."
+                );
+                return Ok(OuterEval::infeasible(p.len()));
+            }
+            Err(EstimationError::PerfectSeparationDetected { .. })
+            | Err(EstimationError::PirlsDidNotConverge { .. }) => {
+                self.cache_manager.invalidate_eval_bundle();
+                log::warn!(
+                    "P-IRLS separation/non-convergence at current rho; returning infeasible outer eval to retreat."
+                );
+                return Ok(OuterEval::infeasible(p.len()));
+            }
+            Err(err) => {
+                self.cache_manager.invalidate_eval_bundle();
+                return Err(err);
+            }
+        };
+
+        let decision = match order {
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => None,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
+                Some(self.selecthessian_strategy_policy(p, &bundle))
+            }
+        };
+        let eval_mode = match decision.as_ref().map(|decision| decision.strategy) {
+            Some(HessianEvalStrategyKind::SpectralExact) => {
+                super::unified::EvalMode::ValueGradientHessian
+            }
+            _ => super::unified::EvalMode::ValueAndGradient,
+        };
+
+        let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            self.evaluate_unified_sparse(p, &bundle, eval_mode)?
+        } else {
+            self.evaluate_unified(p, &bundle, eval_mode)?
+        };
+
+        let gradient = result.gradient.ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "unified evaluator returned no gradient in {:?} mode",
+                eval_mode
+            ))
+        })?;
+
+        let hessian = match decision.map(|decision| decision.strategy) {
+            Some(HessianEvalStrategyKind::SpectralExact) => result.hessian,
+            Some(HessianEvalStrategyKind::DiagnosticNumeric) => self
+                .compute_lamlhessian_diagnostic_numeric(p)
+                .map(HessianResult::Analytic)
+                .unwrap_or(HessianResult::Unavailable),
+            None => HessianResult::Unavailable,
+        };
+
+        let eval = OuterEval {
+            cost: result.cost,
+            gradient,
+            hessian,
+        };
+        self.cache_manager.store_outer_eval(&rho_key, &eval);
+        Ok(eval)
+    }
+
+    pub fn compute_outer_eval(&self, p: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        self.compute_outer_eval_with_order(
+            p,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+        )
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

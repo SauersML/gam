@@ -1007,8 +1007,8 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
 /// (via the implicit function theorem) produces FIVE distinct contributions.
 /// Without these, the unified REML evaluator cannot compute the exact outer
 /// Hessian, so the outer planner must downgrade to a non-analytic-Hessian
-/// strategy (finite-difference Hessian Newton for small problems, otherwise
-/// BFGS).
+/// strategy (BFGS, or EFS / hybrid EFS when that fixed-point structure is
+/// available).
 ///
 /// This provider stores pre-computed ingredients from the converged P-IRLS
 /// inner loop and implements both first-order (∂H/∂ρ_k) and second-order

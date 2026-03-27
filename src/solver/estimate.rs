@@ -10,10 +10,9 @@
 //!     non-Gaussian models (e.g., Logit), this is the Laplace Approximate
 //!     Marginal Likelihood (LAML). The concrete solver is chosen centrally by
 //!     `outer_strategy` from the derivative capability of the model path:
-//!     ARC with analytic Hessian when available, Newton trust-region with a
-//!     finite-difference Hessian for small analytic-gradient problems, BFGS
-//!     for larger gradient-only problems, and EFS / hybrid EFS when the
-//!     hyperparameter geometry admits those fixed-point updates.
+//!     ARC with analytic Hessian when available, BFGS for gradient-only
+//!     problems, and EFS / hybrid EFS when the hyperparameter geometry
+//!     admits those fixed-point updates.
 //!
 //! 2.  Inner Loop (P-IRLS): For each set of trial smoothing parameters from the
 //!     outer loop, this routine finds the corresponding model coefficients (`beta`) by
@@ -1716,7 +1715,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         Ok(hyper_dirs)
     }
 
-    pub(crate) fn evaluate(
+    pub(crate) fn evaluate_with_order(
         &mut self,
         x: &DesignMatrix,
         s_list: &[BlockwisePenalty],
@@ -1727,6 +1726,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         hyper_dirs: Vec<DirectionalHyperParam>,
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
+        order: crate::solver::outer_strategy::OuterEvalOrder,
     ) -> Result<
         (
             f64,
@@ -1747,7 +1747,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             context,
         )?;
         self.reml_state
-            .compute_joint_hyper_eval(theta, rho_dim, &hyper_dirs)
+            .compute_joint_hyper_eval_with_order(theta, rho_dim, &hyper_dirs, order)
     }
 
     pub(crate) fn evaluate_efs(
@@ -1955,7 +1955,7 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
-        use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
+        use crate::solver::outer_strategy::{Derivative, OuterEvalOrder, OuterProblem};
 
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
@@ -1975,22 +1975,18 @@ where
             problem
         };
 
-        let mut obj = problem.build_objective(
+        let mut obj = problem.build_objective_with_eval_order(
             &mut reml_state,
             |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
             |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 outer_eval_idx.fetch_add(1, Ordering::Relaxed);
-                let cost = state.compute_cost(rho)?;
-                let grad = state.compute_gradient(rho)?;
-                let hessian = state.compute_lamlhessian_consistent(rho).ok();
-                Ok(OuterEval {
-                    cost,
-                    gradient: grad,
-                    hessian: match hessian {
-                        Some(h) => HessianResult::Analytic(h),
-                        None => HessianResult::Unavailable,
-                    },
-                })
+                state.compute_outer_eval(rho)
+            },
+            |state: &mut &mut self::reml::RemlState<'_>,
+             rho: &Array1<f64>,
+             order: OuterEvalOrder| {
+                outer_eval_idx.fetch_add(1, Ordering::Relaxed);
+                state.compute_outer_eval_with_order(rho, order)
             },
             Some(|state: &mut &mut self::reml::RemlState<'_>| state.reset_outer_seed_state()),
             Some(

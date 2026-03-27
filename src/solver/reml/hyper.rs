@@ -178,11 +178,12 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(crate) fn compute_joint_hyper_eval(
+    pub(crate) fn compute_joint_hyper_eval_with_order(
         &self,
         theta: &Array1<f64>,
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
+        order: crate::solver::outer_strategy::OuterEvalOrder,
     ) -> Result<
         (
             f64,
@@ -195,11 +196,15 @@ impl<'a> RemlState<'a> {
         let rho = theta.slice(s![..rho_dim]).to_owned();
 
         if !hyper_dirs.is_empty() {
-            let result = self.evaluate_unified_with_psi_ext(
-                &rho,
-                super::unified::EvalMode::ValueGradientHessian,
-                hyper_dirs,
-            )?;
+            let eval_mode = match order {
+                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => {
+                    super::unified::EvalMode::ValueAndGradient
+                }
+                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
+                    super::unified::EvalMode::ValueGradientHessian
+                }
+            };
+            let result = self.evaluate_unified_with_psi_ext(&rho, eval_mode, hyper_dirs)?;
             let cost = result.cost;
             let grad = result
                 .gradient
@@ -211,11 +216,21 @@ impl<'a> RemlState<'a> {
                 t_outer_start.elapsed().as_secs_f64(),
                 cost,
             );
-            Ok((cost, grad, result.hessian))
+            Ok((
+                cost,
+                grad,
+                if matches!(
+                    order,
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+                ) {
+                    result.hessian
+                } else {
+                    crate::solver::outer_strategy::HessianResult::Unavailable
+                },
+            ))
         } else {
             let cost = self.compute_cost(&rho)?;
             let grad = self.compute_gradient(&rho)?;
-            let hess = self.compute_lamlhessian_consistent(&rho)?;
             log::info!(
                 "[outer-timing] compute_joint_hyper_eval (rho-only, dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
@@ -225,7 +240,16 @@ impl<'a> RemlState<'a> {
             Ok((
                 cost,
                 grad,
-                crate::solver::outer_strategy::HessianResult::Analytic(hess),
+                if matches!(
+                    order,
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+                ) {
+                    crate::solver::outer_strategy::HessianResult::Analytic(
+                        self.compute_lamlhessian_consistent(&rho)?,
+                    )
+                } else {
+                    crate::solver::outer_strategy::HessianResult::Unavailable
+                },
             ))
         }
     }
