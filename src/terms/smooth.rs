@@ -2230,11 +2230,12 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     //   c = ||S_con||_F,  S_tilde = S_con / c.
     // This is the only normalization coherent with a REML objective that is
     // evaluated entirely in constrained coordinates.
+    let matrix = (matrix + &matrix.t().to_owned()) * 0.5;
     let c = matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
     if c.is_finite() && c > 0.0 {
         (matrix.mapv(|v| v / c), c)
     } else {
-        (matrix.clone(), 1.0)
+        (matrix, 1.0)
     }
 }
 
@@ -2683,7 +2684,6 @@ pub fn build_smooth_design_withworkspace(
                 if matches!(
                     spec_local.identifiability,
                     SpatialIdentifiability::OrthogonalToParametric
-                        | SpatialIdentifiability::FrozenTransform { .. }
                 ) {
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
@@ -2758,7 +2758,6 @@ pub fn build_smooth_design_withworkspace(
                 if matches!(
                     spec_local.identifiability,
                     SpatialIdentifiability::OrthogonalToParametric
-                        | SpatialIdentifiability::FrozenTransform { .. }
                 ) {
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
@@ -3636,11 +3635,21 @@ fn apply_global_smooth_identifiability(
                     &owner_blocks,
                 ))
             };
-        let z_opt = maybe_smooth_identifiability_transform(
-            termspec,
-            &design_local,
-            c_local.as_ref().map(|mat| mat.view()),
-        )?;
+        let z_opt = if skip_global_transform {
+            None
+        } else {
+            match maybe_smooth_identifiability_transform(
+                termspec,
+                &design_local,
+                c_local.as_ref().map(|mat| mat.view()),
+            ) {
+                Ok(z_opt) => z_opt,
+                Err(BasisError::ConstraintNullspaceNotFound) if !owner_blocks.is_empty() => {
+                    Some(Array2::zeros((design_local.ncols(), 0)))
+                }
+                Err(err) => return Err(err),
+            }
+        };
         let design_constrained = if let Some(z) = z_opt.as_ref() {
             apply_smooth_transform_to_design(design_local, z, &term.name)?
         } else {
@@ -10244,7 +10253,7 @@ fn build_single_smooth_term_realization(
     termspec: &SmoothTermSpec,
 ) -> Result<SingleSmoothTermRealization, BasisError> {
     let raw = build_smooth_design(data, std::slice::from_ref(termspec))?;
-    finish_single_smooth_term_realization(raw, termspec)
+    finish_single_smooth_term_realization(raw)
 }
 
 /// Like `build_single_smooth_term_realization` but reuses a persistent
@@ -10255,12 +10264,11 @@ fn build_single_smooth_term_realization_withworkspace(
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<SingleSmoothTermRealization, BasisError> {
     let raw = build_smooth_design_withworkspace(data, std::slice::from_ref(termspec), workspace)?;
-    finish_single_smooth_term_realization(raw, termspec)
+    finish_single_smooth_term_realization(raw)
 }
 
 fn finish_single_smooth_term_realization(
     raw: RawSmoothDesign,
-    termspec: &SmoothTermSpec,
 ) -> Result<SingleSmoothTermRealization, BasisError> {
     let RawSmoothDesign {
         term_designs,
@@ -10268,91 +10276,14 @@ fn finish_single_smooth_term_realization(
         terms,
         ..
     } = raw;
-    let mut term = terms.into_iter().next().ok_or_else(|| {
+    let term = terms.into_iter().next().ok_or_else(|| {
         BasisError::InvalidInput("single-term smooth build returned no term".to_string())
     })?;
     let design = term_designs.into_iter().next().ok_or_else(|| {
         BasisError::InvalidInput("single-term smooth build returned no term design".to_string())
     })?;
 
-    // build_smooth_design strips FrozenTransform identifiability to None for
-    // ThinPlate/Duchon terms (so it can build the raw basis), but the frozen
-    // transform must still be applied to reduce the column count to match the
-    // original design.  Apply it here if the spec carries one.
-    let design_local = match spatial_identifiability_policy(termspec) {
-        Some(SpatialIdentifiability::FrozenTransform { transform }) => {
-            let design_local = if design.ncols() == transform.nrows() {
-                design.to_dense().dot(transform)
-            } else if design.ncols() == transform.ncols() {
-                design.to_dense()
-            } else {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "frozen spatial identifiability transform mismatch in incremental realizer: \
-                     design has {} columns but transform is {}x{}",
-                    design.ncols(),
-                    transform.nrows(),
-                    transform.ncols(),
-                )));
-            };
-            let active_penaltyinfo = term
-                .penaltyinfo_local
-                .iter()
-                .filter(|info| info.active)
-                .cloned()
-                .collect::<Vec<_>>();
-            if active_penaltyinfo.len() != term.penalties_local.len() {
-                return Err(BasisError::InvalidInput(format!(
-                    "incremental realizer frozen Duchon penalty metadata mismatch: activeinfos={}, penalties={}",
-                    active_penaltyinfo.len(),
-                    term.penalties_local.len()
-                )));
-            }
-            let penalty_candidates = term
-                .penalties_local
-                .iter()
-                .cloned()
-                .zip(active_penaltyinfo.into_iter())
-                .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
-                    let projected = if matrix.nrows() == transform.nrows()
-                        && matrix.ncols() == transform.nrows()
-                    {
-                        let zt_s = transform.t().dot(&matrix);
-                        zt_s.dot(transform)
-                    } else if matrix.nrows() == design_local.ncols()
-                        && matrix.ncols() == design_local.ncols()
-                    {
-                        matrix
-                    } else {
-                        return Err(BasisError::DimensionMismatch(format!(
-                            "incremental realizer frozen spatial penalty mismatch: penalty is {}x{}, transform is {}x{}, design cols={}",
-                            matrix.nrows(),
-                            matrix.ncols(),
-                            transform.nrows(),
-                            transform.ncols(),
-                            design_local.ncols(),
-                        )));
-                    };
-                    let (projected, normalization_adjustment) =
-                        normalize_penalty_in_constrained_space(&projected);
-                    Ok(PenaltyCandidate {
-                        nullspace_dim_hint: estimate_penalty_nullity(&projected)?,
-                        matrix: projected,
-                        source: info.source,
-                        normalization_scale: info.normalization_scale * normalization_adjustment,
-                        kronecker_factors: None,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let (penalties_local, nullspace_dims, penaltyinfo_local) =
-                filter_active_penalty_candidates(penalty_candidates)?;
-            term.penalties_local = penalties_local;
-            term.nullspace_dims = nullspace_dims;
-            term.penaltyinfo_local = penaltyinfo_local;
-            term.metadata = with_identifiability_transform(&term.metadata, Some(transform))?;
-            design_local
-        }
-        _ => design.to_dense(),
-    };
+    let design_local = design.to_dense();
 
     Ok(SingleSmoothTermRealization {
         design_local,
@@ -15371,6 +15302,123 @@ mod tests {
             }
             _ => panic!("expected Duchon term"),
         }
+    }
+
+    #[test]
+    fn pure_duchon_aniso_penalties_stay_symmetric_through_freeze_and_cache() {
+        fn max_asymmetry(matrix: &Array2<f64>) -> f64 {
+            let n = matrix.nrows().min(matrix.ncols());
+            let mut max_asym = 0.0_f64;
+            for i in 0..n {
+                for j in 0..i {
+                    max_asym = max_asym.max((matrix[[i, j]] - matrix[[j, i]]).abs());
+                }
+            }
+            max_asym
+        }
+
+        fn assert_design_penalties_symmetric(label: &str, design: &TermCollectionDesign) {
+            for (penalty_idx, penalty) in design.penalties.iter().enumerate() {
+                let max_asym = max_asymmetry(&penalty.local);
+                assert!(
+                    max_asym <= 1e-10,
+                    "{label} penalty {penalty_idx} asymmetry too large: {max_asym:.3e}"
+                );
+            }
+        }
+
+        fn assert_reparam_penalty_symmetric(label: &str, design: &TermCollectionDesign) {
+            let p_total = design.design.ncols();
+            let penalty_specs = design
+                .penalties
+                .iter()
+                .map(|penalty| crate::estimate::PenaltySpec::Dense(penalty.to_global(p_total)))
+                .collect::<Vec<_>>();
+            let (canonical_penalties, _) = crate::construction::canonicalize_penalty_specs(
+                &penalty_specs,
+                &design.nullspace_dims,
+                p_total,
+                label,
+            )
+            .expect("canonicalize penalties");
+            let invariant = crate::construction::precompute_reparam_invariant_from_canonical(
+                &canonical_penalties,
+                p_total,
+            )
+            .expect("reparam invariant");
+            let lambdas = vec![1.0; canonical_penalties.len()];
+            let reparam = crate::construction::stable_reparameterizationwith_invariant(
+                &canonical_penalties,
+                &lambdas,
+                p_total,
+                &invariant,
+                None,
+            )
+            .expect("stable reparameterization");
+            let max_asym = max_asymmetry(&reparam.s_transformed);
+            assert!(
+                max_asym <= 1e-10,
+                "{label} transformed penalty asymmetry too large: {max_asym:.3e}"
+            );
+        }
+
+        let data = array![
+            [0.0, 0.1],
+            [0.2, 0.0],
+            [0.4, 0.3],
+            [0.6, 0.5],
+            [0.8, 0.7],
+            [1.0, 0.9],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "pure_duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: None,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: Some(vec![0.0, 0.0]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let base_design = build_term_collection_design(data.view(), &spec).expect("base design");
+        assert_design_penalties_symmetric("base", &base_design);
+        assert_reparam_penalty_symmetric("base", &base_design);
+
+        let frozen = freeze_term_collection_from_design(&spec, &base_design).expect("freeze spec");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen rebuild");
+        assert_design_penalties_symmetric("frozen", &frozen_design);
+        assert_reparam_penalty_symmetric("frozen", &frozen_design);
+
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        let rho_dim = frozen_design.penalties.len();
+        let dims_per_term = vec![1];
+        let mut theta = Array1::<f64>::zeros(rho_dim + 1);
+        theta[rho_dim] = 0.2;
+
+        let mut cache = SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms,
+            rho_dim,
+            dims_per_term,
+        )
+        .expect("single-block cache");
+        cache.ensure_theta(&theta).expect("updated theta");
+        assert_design_penalties_symmetric("cache", cache.design());
+        assert_reparam_penalty_symmetric("cache", cache.design());
     }
 
     #[test]
