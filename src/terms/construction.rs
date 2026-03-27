@@ -261,6 +261,7 @@ fn penalty_from_root_faer(root: &Mat<f64>) -> Mat<f64> {
     sanitize_symmetric_faer(&full)
 }
 
+#[cfg(debug_assertions)]
 fn symmetrize_faer_matrix_in_place(matrix: &mut Mat<f64>) {
     let n = matrix.nrows().min(matrix.ncols());
     for i in 0..n {
@@ -1716,8 +1717,7 @@ pub fn stable_reparameterizationwith_invariant(
     if penalized_rank > 0 {
         let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
         for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
-            let mut s_k = penalty_from_root_faer(rs_k);
-            symmetrize_faer_matrix_in_place(&mut s_k);
+            let s_k = penalty_from_root_faer(rs_k);
             for i in 0..penalized_rank {
                 for j in 0..penalized_rank {
                     range_block[(i, j)] += *lambda * s_k[(i, j)];
@@ -1757,9 +1757,7 @@ pub fn stable_reparameterizationwith_invariant(
 
     let mut s_k_penalized_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
     for rs_k in rs_transformed.iter() {
-        let mut s_k = penalty_from_root_faer(rs_k);
-        symmetrize_faer_matrix_in_place(&mut s_k);
-        s_k_penalized_cache.push(s_k);
+        s_k_penalized_cache.push(penalty_from_root_faer(rs_k));
     }
 
     // Subspace-invariant penalty spectral calculus:

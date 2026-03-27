@@ -1908,41 +1908,7 @@ fn design_gram_matrix(design: &DesignMatrix) -> Array2<f64> {
     gram
 }
 
-fn stabilized_orthogonality_transform_from_gram(
-    gram: &Array2<f64>,
-    transform: &Array2<f64>,
-) -> Result<Array2<f64>, BasisError> {
-    let constrained_gram = {
-        let gt = fast_ab(gram, transform);
-        fast_atb(transform, &gt)
-    };
-    let (eigenvalues, eigenvectors) = constrained_gram
-        .eigh(Side::Lower)
-        .map_err(BasisError::LinalgError)?;
-    let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    let tol = default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * (constrained_gram
-            .nrows()
-            .max(constrained_gram.ncols())
-            .max(1) as f64)
-        * max_eval.max(1.0);
-    let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
-    if keep == 0 {
-        return Err(BasisError::ConstraintNullspaceNotFound);
-    }
-
-    let eig_start = eigenvalues.len() - keep;
-    let kept_vectors = eigenvectors.slice(s![.., eig_start..]).to_owned();
-    let mut inv_sqrt = Array2::<f64>::zeros((keep, keep));
-    for (out_i, eig_i) in (eig_start..eigenvalues.len()).enumerate() {
-        inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].max(tol).sqrt();
-    }
-    let whitening = fast_ab(&kept_vectors, &inv_sqrt);
-    Ok(fast_ab(transform, &whitening))
-}
-
-fn whitening_transform_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
     let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
     let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
     let tol = default_rrqr_rank_alpha()
@@ -1961,6 +1927,22 @@ fn whitening_transform_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, Basi
         inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].max(tol).sqrt();
     }
     Ok(fast_ab(&kept_vectors, &inv_sqrt))
+}
+
+fn stabilized_orthogonality_transform_from_gram(
+    gram: &Array2<f64>,
+    transform: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let constrained_gram = {
+        let gt = fast_ab(gram, transform);
+        fast_atb(transform, &gt)
+    };
+    let whitening = positive_spectral_whitener_from_gram(&constrained_gram)?;
+    Ok(fast_ab(transform, &whitening))
+}
+
+fn whitening_transform_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+    positive_spectral_whitener_from_gram(gram)
 }
 
 fn orthogonality_transform_from_cross_and_gram(
