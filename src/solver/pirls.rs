@@ -1076,7 +1076,7 @@ impl WorkingReparamTransform {
         match self {
             Self::Dense(qs) => {
                 let tmp = fast_atb(qs, matrix);
-                fast_ab(&tmp, qs)
+                symmetrize_dense_matrix(&fast_ab(&tmp, qs))
             }
             Self::Kronecker(transform) => transform.conjugate_matrix(matrix),
         }
@@ -1191,7 +1191,7 @@ impl KroneckerQsTransform {
             let transformed_col = self.apply_transpose(&right.column(j).to_owned());
             out.column_mut(j).assign(&transformed_col);
         }
-        out
+        symmetrize_dense_matrix(&out)
     }
 
     fn column(&self, j: usize) -> Array1<f64> {
@@ -1199,6 +1199,11 @@ impl KroneckerQsTransform {
         e[j] = 1.0;
         self.apply(&e)
     }
+}
+
+#[inline]
+fn symmetrize_dense_matrix(matrix: &Array2<f64>) -> Array2<f64> {
+    (matrix + &matrix.t().to_owned()) * 0.5
 }
 
 fn apply_kron_mode(
@@ -4653,7 +4658,7 @@ impl PirlsConfig {
 
 #[inline]
 #[cfg(debug_assertions)]
-fn debug_assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
+fn max_symmetric_asymmetry(matrix: &Array2<f64>) -> f64 {
     let n = matrix.nrows().min(matrix.ncols());
     let mut max_asym = 0.0_f64;
     for i in 0..n {
@@ -4664,6 +4669,13 @@ fn debug_assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
             }
         }
     }
+    max_asym
+}
+
+#[inline]
+#[cfg(debug_assertions)]
+fn debug_assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
+    let max_asym = max_symmetric_asymmetry(matrix);
     assert!(
         max_asym <= tol,
         "{} asymmetry too large: {:.3e} (tol {:.3e})",
@@ -4816,11 +4828,14 @@ fn solve_penalized_least_squares_implicit(
             .diag_xtw_x(&weights_owned)
             .map_err(EstimationError::InvalidInput)?,
     };
-    let mut penalized_hessian = if let Some(transform) = transform {
+    #[cfg(debug_assertions)]
+    let xtwx_orig_asym = max_symmetric_asymmetry(&xtwx_orig);
+    let xtwx_transformed = if let Some(transform) = transform {
         transform.conjugate_matrix(&xtwx_orig)
     } else {
         xtwx_orig
     };
+    let mut penalized_hessian = xtwx_transformed.clone();
     penalty.add_to_hessian(&mut penalized_hessian);
 
     // 3. Form X'Wz: compute in original coordinates, then rotate.
@@ -4837,7 +4852,19 @@ fn solve_penalized_least_squares_implicit(
     }
 
     #[cfg(debug_assertions)]
-    debug_assert_symmetric_tol(&penalized_hessian, "implicit PLS penalized Hessian", 1e-8);
+    {
+        let xtwx_asym = max_symmetric_asymmetry(&xtwx_transformed);
+        let penalty_asym = match penalty {
+            PirlsPenalty::Dense { s_transformed, .. } => max_symmetric_asymmetry(s_transformed),
+            PirlsPenalty::Diagonal { .. } => 0.0,
+        };
+        let total_asym = max_symmetric_asymmetry(&penalized_hessian);
+        assert!(
+            total_asym <= 1e-8,
+            "implicit PLS penalized Hessian asymmetry too large: total={total_asym:.3e}, xtwx_orig={xtwx_orig_asym:.3e}, xtwx={xtwx_asym:.3e}, penalty={penalty_asym:.3e}, tol={:.3e}",
+            1e-8
+        );
+    }
 
     // 4. Ridge stabilization
     let nugget = FIXED_STABILIZATION_RIDGE;

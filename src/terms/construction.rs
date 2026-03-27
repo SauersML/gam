@@ -1,6 +1,7 @@
 use crate::basis::analyze_penalty_block;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use crate::linalg::utils::KahanSum;
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
@@ -258,6 +259,47 @@ fn penalty_from_root_faer(root: &Mat<f64>) -> Mat<f64> {
         Par::Seq,
     );
     sanitize_symmetric_faer(&full)
+}
+
+fn symmetrize_faer_matrix_in_place(matrix: &mut Mat<f64>) {
+    let n = matrix.nrows().min(matrix.ncols());
+    for i in 0..n {
+        for j in 0..i {
+            let avg = 0.5 * (matrix[(i, j)] + matrix[(j, i)]);
+            matrix[(i, j)] = avg;
+            matrix[(j, i)] = avg;
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn orthogonal_similarity_transform_faer(
+    matrix: &Mat<f64>,
+    block_dim: usize,
+    orthogonal: &Mat<f64>,
+) -> Mat<f64> {
+    let matrix_block = matrix.as_ref().submatrix(0, 0, block_dim, block_dim);
+    let cols = orthogonal.ncols();
+    let mut temp = Mat::<f64>::zeros(block_dim, cols);
+    matmul(
+        temp.as_mut(),
+        Accum::Replace,
+        matrix_block,
+        orthogonal.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+    let mut rotated = Mat::<f64>::zeros(cols, cols);
+    matmul(
+        rotated.as_mut(),
+        Accum::Replace,
+        orthogonal.transpose(),
+        temp.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+    symmetrize_faer_matrix_in_place(&mut rotated);
+    rotated
 }
 
 fn clamp_eigenvalues_for_stability(eigenvalues: &mut [f64], context: &str) {
@@ -1674,7 +1716,8 @@ pub fn stable_reparameterizationwith_invariant(
     if penalized_rank > 0 {
         let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
         for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
-            let s_k = penalty_from_root_faer(rs_k);
+            let mut s_k = penalty_from_root_faer(rs_k);
+            symmetrize_faer_matrix_in_place(&mut s_k);
             for i in 0..penalized_rank {
                 for j in 0..penalized_rank {
                     range_block[(i, j)] += *lambda * s_k[(i, j)];
@@ -1712,10 +1755,11 @@ pub fn stable_reparameterizationwith_invariant(
         // basis using U from the eigendecomposition.
     }
 
-    let mut s_k_transformed_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
+    let mut s_k_penalized_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
     for rs_k in rs_transformed.iter() {
-        let s_k = penalty_from_root_faer(rs_k);
-        s_k_transformed_cache.push(s_k);
+        let mut s_k = penalty_from_root_faer(rs_k);
+        symmetrize_faer_matrix_in_place(&mut s_k);
+        s_k_penalized_cache.push(s_k);
     }
 
     // Subspace-invariant penalty spectral calculus:
@@ -1839,55 +1883,46 @@ pub fn stable_reparameterizationwith_invariant(
     let mut det1vec = vec![0.0; lambdas.len()];
 
     for (k, lambda) in lambdas.iter().enumerate() {
-        let s_k = &s_k_transformed_cache[k];
+        let s_k = &s_k_penalized_cache[k];
         // Compute tr((S+δI)⁻¹ S_k) via the eigenbasis to avoid precision loss
-        // from materializing s_reg_inv.  Each eigencomponent contributes
-        //   (U^T S_k U)_{l,l} / (d_l + δ),
-        // which we evaluate without forming the full rotated matrix.
-        let mut trace = 0.0_f64;
+        // from materializing s_reg_inv. Each eigencomponent contributes
+        //   (U^T S_k U)_{l,l} / (d_l + δ).
+        let mut trace = KahanSum::default();
         for l in 0..penalized_rank {
-            let eigenval = range_eigs_sorted[l];
-            let inv_d = 1.0 / (eigenval + delta);
-            // (U^T S_k U)_{l,l} = sum_{i,j} U[i,l] * S_k[i,j] * U[j,l]
-            let mut diag_ll = 0.0_f64;
+            let inv_d = 1.0 / (range_eigs_sorted[l] + delta);
+            let mut diag_ll = KahanSum::default();
             for i in 0..penalized_rank {
+                let u_i = range_rotation[(i, l)];
+                let mut row_dot = KahanSum::default();
                 for j in 0..penalized_rank {
-                    diag_ll += range_rotation[(i, l)] * s_k[(i, j)] * range_rotation[(j, l)];
+                    row_dot.add(s_k[(i, j)] * range_rotation[(j, l)]);
                 }
+                diag_ll.add(u_i * row_dot.sum());
             }
-            trace += inv_d * diag_ll;
+            trace.add(inv_d * diag_ll.sum());
         }
-        det1vec[k] = *lambda * trace;
+        det1vec[k] = *lambda * trace.sum();
     }
 
     #[cfg(debug_assertions)]
     {
-        // Algebraic guardrail: cross-check the eigenbasis det1 against the
-        // materialized (S+δI)⁻¹ matrix contraction.  The eigenbasis path is
-        // primary; this validates that s_reg_inv is consistent.
-        let mut s_reg_inv = Mat::<f64>::zeros(p, p);
-        for l in 0..penalized_rank {
-            let eigenval = range_eigs_sorted[l];
-            let inv_d = 1.0 / (eigenval + delta);
-            for i in 0..penalized_rank {
-                for j in 0..penalized_rank {
-                    s_reg_inv[(i, j)] += inv_d * range_rotation[(i, l)] * range_rotation[(j, l)];
-                }
-            }
-        }
+        // Guardrail: cross-check the primary Rayleigh-quotient contraction
+        // against a full orthogonal similarity transform, while staying in
+        // the same numerically stable eigenbasis coordinates.
         let mut maxdet1_mismatch = 0.0_f64;
         let mut det1_scale = 0.0_f64;
         for (k, lambda) in lambdas.iter().enumerate() {
-            let s_k = &s_k_transformed_cache[k];
-            // Reference: tr(s_reg_inv * S_k) restricted to the penalized block
-            // (s_reg_inv is structurally zero outside it).
-            let mut trace = 0.0_f64;
-            for i in 0..penalized_rank {
-                for j in 0..penalized_rank {
-                    trace += s_reg_inv[(i, j)] * s_k[(j, i)];
-                }
+            let s_k_penalized = &s_k_penalized_cache[k];
+            let s_k_eigenbasis = orthogonal_similarity_transform_faer(
+                s_k_penalized,
+                penalized_rank,
+                &range_rotation,
+            );
+            let mut trace = KahanSum::default();
+            for l in 0..penalized_rank {
+                trace.add(s_k_eigenbasis[(l, l)] / (range_eigs_sorted[l] + delta));
             }
-            let reference = *lambda * trace;
+            let reference = *lambda * trace.sum();
             maxdet1_mismatch = maxdet1_mismatch.max((reference - det1vec[k]).abs());
             det1_scale = det1_scale.max(reference.abs()).max(det1vec[k].abs());
         }

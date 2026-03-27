@@ -1942,6 +1942,44 @@ fn stabilized_orthogonality_transform_from_gram(
     Ok(fast_ab(transform, &whitening))
 }
 
+fn whitening_transform_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+    let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
+    let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+    let tol = default_rrqr_rank_alpha()
+        * f64::EPSILON
+        * (gram.nrows().max(gram.ncols()).max(1) as f64)
+        * max_eval.max(1.0);
+    let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
+    if keep == 0 {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+
+    let eig_start = eigenvalues.len() - keep;
+    let kept_vectors = eigenvectors.slice(s![.., eig_start..]).to_owned();
+    let mut inv_sqrt = Array2::<f64>::zeros((keep, keep));
+    for (out_i, eig_i) in (eig_start..eigenvalues.len()).enumerate() {
+        inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].max(tol).sqrt();
+    }
+    Ok(fast_ab(&kept_vectors, &inv_sqrt))
+}
+
+fn orthogonality_transform_from_cross_and_gram(
+    constraint_cross: &Array2<f64>,
+    gram: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let whitening = whitening_transform_from_gram(gram)?;
+    let cross_whitened = fast_atb(&whitening, constraint_cross);
+    let (transform_whitened, rank) =
+        rrqr_nullspace_basis(&cross_whitened, default_rrqr_rank_alpha())
+            .map_err(BasisError::LinalgError)?;
+    if rank >= cross_whitened.nrows() || transform_whitened.ncols() == 0 {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+
+    let transform = fast_ab(&whitening, &transform_whitened);
+    stabilized_orthogonality_transform_from_gram(gram, &transform)
+}
+
 pub(crate) fn orthogonality_transform_for_design(
     design: &DesignMatrix,
     constraint_matrix: ArrayView2<'_, f64>,
@@ -1957,25 +1995,7 @@ pub(crate) fn orthogonality_transform_for_design(
     }
     let constraint_cross = design_constraint_cross(design, constraint_matrix, weights)?;
     let gram = design_gram_matrix(design);
-    let (transform, rank) = rrqr_nullspace_basis(&constraint_cross, default_rrqr_rank_alpha())
-        .map_err(BasisError::LinalgError)?;
-    if rank < k && transform.ncols() > 0 {
-        return stabilized_orthogonality_transform_from_gram(&gram, &transform);
-    }
-
-    let normal = fast_ab(&constraint_cross, &constraint_cross.t().to_owned());
-    let (eigenvalues, eigenvectors) = normal.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
-    let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    let tol = default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * (normal.nrows().max(normal.ncols()).max(1) as f64)
-        * max_eval.max(1.0);
-    let nullity = eigenvalues.iter().take_while(|&&ev| ev <= tol).count();
-    if nullity == 0 {
-        return Err(BasisError::ConstraintNullspaceNotFound);
-    }
-    let fallback = eigenvectors.slice(s![.., 0..nullity]).to_owned();
-    stabilized_orthogonality_transform_from_gram(&gram, &fallback)
+    orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)
 }
 
 /// Which radial kernel family is being used. Stored in the streaming operator
@@ -12189,28 +12209,10 @@ pub fn applyweighted_orthogonality_constraint(
     // M = B^T W C. Its transpose M^T has nullspace directions in coefficient space
     // that produce basis columns orthogonal to C under the W-inner product.
     let constraint_cross = basis_matrix.t().dot(&weighted_constraints); // k×q
-
-    let (transform, rank) = rrqr_nullspace_basis(&constraint_cross, default_rrqr_rank_alpha())
-        .map_err(BasisError::LinalgError)?;
-    if rank >= k {
-        return Err(BasisError::ConstraintNullspaceNotFound);
-    }
-
-    if transform.ncols() == 0 {
-        return Err(BasisError::ConstraintNullspaceNotFound);
-    }
-
-    stabilize_orthogonality_transform(basis_matrix, &transform)
-}
-
-fn stabilize_orthogonality_transform(
-    basis_matrix: ArrayView2<'_, f64>,
-    transform: &Array2<f64>,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let gram = fast_ata(&basis_matrix.to_owned());
-    let stabilized_transform = stabilized_orthogonality_transform_from_gram(&gram, transform)?;
-    let basis_orthonormal = fast_ab(&basis_matrix, &stabilized_transform);
-    Ok((basis_orthonormal, stabilized_transform))
+    let transform = orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)?;
+    let basis_orthonormal = fast_ab(&basis_matrix, &transform);
+    Ok((basis_orthonormal, transform))
 }
 
 /// Compute Greville abscissae for a B-spline basis.
