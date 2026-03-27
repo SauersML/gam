@@ -4,6 +4,7 @@ use super::*;
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, assemble_and_factor_sparse_penalized_system,
 };
+use crate::solver::outer_strategy::OuterEval;
 use crate::types::SasLinkState;
 use ndarray::s;
 use std::ops::Range;
@@ -24,12 +25,13 @@ pub(crate) mod unified;
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectionalHyperParam, EvalShared, FirthDenseOperator, GlmLikelihoodFamily,
-        HyperDesignDerivative, ImplicitDerivLevel, RemlConfig, RemlState,
+        DirectionalHyperParam, EvalCacheManager, EvalShared, FirthDenseOperator,
+        GlmLikelihoodFamily, HyperDesignDerivative, ImplicitDerivLevel, RemlConfig, RemlState,
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
     use crate::pirls::PirlsCoordinateFrame;
+    use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::ImplicitDesignPsiDerivative;
     use crate::types::GlmLikelihoodSpec;
     use faer::Side;
@@ -81,8 +83,12 @@ mod tests {
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError> {
-        let (cost, gradient, hessian) =
-            state.compute_joint_hyper_eval(theta, rho_dim, hyper_dirs)?;
+        let (cost, gradient, hessian) = state.compute_joint_hyper_eval_with_order(
+            theta,
+            rho_dim,
+            hyper_dirs,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+        )?;
         Ok((
             cost,
             gradient,
@@ -119,6 +125,33 @@ mod tests {
         let (_, gradient, _) =
             compute_joint_hypercostgradienthessian(state, &theta, rho.len(), &[hyper])?;
         Ok(gradient[rho.len()])
+    }
+
+    #[test]
+    fn eval_cache_manager_stores_first_order_outer_eval() {
+        let cache = EvalCacheManager::new();
+        let rho = array![0.25, -0.0];
+        let rho_key = EvalCacheManager::sanitized_rhokey(&rho);
+        let eval = OuterEval {
+            cost: 3.5,
+            gradient: array![1.0, -2.0],
+            hessian: HessianResult::Unavailable,
+        };
+
+        cache.store_outer_eval(&rho_key, &eval);
+
+        let cached = cache
+            .cached_outer_eval(&rho_key)
+            .expect("first-order outer eval should be cached");
+        assert_eq!(cached.cost, eval.cost);
+        assert_eq!(cached.gradient, eval.gradient);
+        assert!(matches!(cached.hessian, HessianResult::Unavailable));
+
+        cache.invalidate_eval_bundle();
+        assert!(
+            cache.cached_outer_eval(&rho_key).is_none(),
+            "invalidating the bundle should clear the outer-eval cache too"
+        );
     }
 
     #[test]
@@ -2704,6 +2737,7 @@ impl PirlsLruCache {
 struct EvalCacheManager {
     pirls_cache: RwLock<PirlsLruCache>,
     current_eval_bundle: RwLock<Option<EvalShared>>,
+    current_outer_eval: RwLock<Option<(Vec<u64>, OuterEval)>>,
     pirls_cache_enabled: AtomicBool,
 }
 
@@ -2712,6 +2746,7 @@ impl EvalCacheManager {
         Self {
             pirls_cache: RwLock::new(PirlsLruCache::new(MAX_PIRLS_CACHE_ENTRIES)),
             current_eval_bundle: RwLock::new(None),
+            current_outer_eval: RwLock::new(None),
             pirls_cache_enabled: AtomicBool::new(true),
         }
     }
@@ -2736,8 +2771,25 @@ impl EvalCacheManager {
         *self.current_eval_bundle.write().unwrap() = Some(bundle);
     }
 
+    fn cached_outer_eval(&self, key: &Option<Vec<u64>>) -> Option<OuterEval> {
+        let key = key.as_ref()?;
+        self.current_outer_eval
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|(cached_key, _)| cached_key == key)
+            .map(|(_, eval)| eval.clone())
+    }
+
+    fn store_outer_eval(&self, key: &Option<Vec<u64>>, eval: &OuterEval) {
+        if let Some(key) = key.clone() {
+            *self.current_outer_eval.write().unwrap() = Some((key, eval.clone()));
+        }
+    }
+
     fn invalidate_eval_bundle(&self) {
         self.current_eval_bundle.write().unwrap().take();
+        self.current_outer_eval.write().unwrap().take();
     }
 
     fn clear_eval_and_factor_caches(&self) {

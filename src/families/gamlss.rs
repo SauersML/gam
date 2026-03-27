@@ -3086,7 +3086,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     };
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{Derivative, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
 
     // Exact first-order AND second-order [rho, psi] calculus is available
     // for all inverse links via the shared jet formulas plus the generic
@@ -3125,7 +3125,48 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .with_rho_bound(12.0)
         .with_heuristic_lambdas(seed_heuristic);
 
-    let mut obj = problem.build_objective(
+    let eval_outer = |state: &mut MeanWiggleOuterState,
+                      theta: &Array1<f64>,
+                      order: OuterEvalOrder|
+     -> Result<OuterEval, EstimationError> {
+        if let Some((cached_theta, cached_cost, cached_grad, cached_hess, cached_warm)) =
+            &state.last_eval
+            && cached_theta == theta
+            && (!matches!(order, OuterEvalOrder::ValueGradientHessian)
+                || matches!(
+                    cached_hess,
+                    crate::solver::outer_strategy::HessianResult::Analytic(_)
+                        | crate::solver::outer_strategy::HessianResult::Operator(_)
+                ))
+        {
+            state.warm_cache = Some(cached_warm.clone());
+            return Ok(OuterEval {
+                cost: *cached_cost,
+                gradient: cached_grad.clone(),
+                hessian: cached_hess.clone(),
+            });
+        }
+        let need_hessian = matches!(order, OuterEvalOrder::ValueGradientHessian)
+            && analytic_outer_hessian_available;
+        let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), need_hessian)
+            .map_err(EstimationError::InvalidInput)?;
+        let hessian_result = eval.outer_hessian.clone();
+        state.last_eval = Some((
+            theta.clone(),
+            eval.objective,
+            eval.gradient.clone(),
+            eval.outer_hessian.clone(),
+            eval.warm_start.clone(),
+        ));
+        state.warm_cache = Some(eval.warm_start);
+        Ok(OuterEval {
+            cost: eval.objective,
+            gradient: eval.gradient,
+            hessian: hessian_result,
+        })
+    };
+
+    let mut obj = problem.build_objective_with_eval_order(
         MeanWiggleOuterState {
             warm_cache: None,
             last_eval: None,
@@ -3143,42 +3184,18 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             Ok(eval.objective)
         },
         |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
-            if let Some((cached_theta, cached_cost, cached_grad, cached_hess, cached_warm)) =
-                &state.last_eval
-                && cached_theta == theta
-            {
-                state.warm_cache = Some(cached_warm.clone());
-                return Ok(OuterEval {
-                    cost: *cached_cost,
-                    gradient: cached_grad.clone(),
-                    hessian: cached_hess.clone(),
-                });
-            }
-            // Request Hessian from the unified evaluator. Exact ∂²H/∂ρ_k∂ρ_l
-            // now comes from the generic exact-Newton closure path
-            // (exact_newton_dh_closure / exact_newton_d2h_closure ->
-            // joint_outer_evaluate -> BorrowedJointDerivProvider), enabling
-            // the outer Newton step.
-            let (eval, _, _) = build_eval(
+            eval_outer(
+                state,
                 theta,
-                state.warm_cache.as_ref(),
-                analytic_outer_hessian_available,
+                if analytic_outer_hessian_available {
+                    OuterEvalOrder::ValueGradientHessian
+                } else {
+                    OuterEvalOrder::ValueAndGradient
+                },
             )
-            .map_err(EstimationError::InvalidInput)?;
-            let hessian_result = eval.outer_hessian.clone();
-            state.last_eval = Some((
-                theta.clone(),
-                eval.objective,
-                eval.gradient.clone(),
-                eval.outer_hessian.clone(),
-                eval.warm_start.clone(),
-            ));
-            state.warm_cache = Some(eval.warm_start);
-            Ok(OuterEval {
-                cost: eval.objective,
-                gradient: eval.gradient,
-                hessian: hessian_result,
-            })
+        },
+        |state: &mut MeanWiggleOuterState, theta: &Array1<f64>, order: OuterEvalOrder| {
+            eval_outer(state, theta, order)
         },
         Some(|state: &mut MeanWiggleOuterState| {
             state.warm_cache = None;

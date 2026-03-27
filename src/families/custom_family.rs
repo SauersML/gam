@@ -9843,7 +9843,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // based on the presence of a wiggle block.
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterProblem};
+    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder, OuterProblem};
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
     // previously behind Mutex because the old optimizer bridge used `Fn`
@@ -9866,7 +9866,80 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_initial_rho(rho0.clone());
 
-    let mut obj = problem.build_objective(
+    let eval_outer = |outer: &mut CustomOuterState,
+                      rho: &Array1<f64>,
+                      order: OuterEvalOrder|
+     -> Result<OuterEval, EstimationError> {
+        let warm_ref = outer.warm_cache.as_ref();
+        let request_hessian =
+            matches!(order, OuterEvalOrder::ValueGradientHessian) && need_outer_hessian;
+        let eval_result = match outerobjectivegradienthessian_internal(
+            family,
+            specs,
+            options,
+            &penalty_counts,
+            rho,
+            warm_ref,
+            if request_hessian {
+                EvalMode::ValueGradientHessian
+            } else {
+                EvalMode::ValueAndGradient
+            },
+        ) {
+            Ok(eval)
+                if eval.objective.is_finite()
+                    && eval.gradient.iter().all(|v| v.is_finite())
+                    && match &eval.outer_hessian {
+                        crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+                            hessian.iter().all(|v| v.is_finite())
+                        }
+                        crate::solver::outer_strategy::HessianResult::Operator(op) => {
+                            !request_hessian || op.dim() == rho.len()
+                        }
+                        crate::solver::outer_strategy::HessianResult::Unavailable => {
+                            !request_hessian
+                        }
+                    } =>
+            {
+                let seed_ok = outer
+                    .warm_cache
+                    .as_ref()
+                    .map(|c| {
+                        c.rho.len() == rho.len()
+                            && c.rho
+                                .iter()
+                                .zip(rho.iter())
+                                .all(|(&a, &b)| (a - b).abs() <= 1.5)
+                    })
+                    .unwrap_or(true);
+                if seed_ok {
+                    outer.warm_cache = Some(eval.warm_start.clone());
+                } else {
+                    outer.warm_cache = None;
+                }
+                outer.last_error = None;
+                eval
+            }
+            Ok(_) => {
+                outer.last_error =
+                    Some("custom-family outer objective/derivatives became non-finite".to_string());
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "custom-family outer objective/derivatives became non-finite".to_string(),
+                ));
+            }
+            Err(e) => {
+                outer.last_error = Some(e.clone());
+                return Err(EstimationError::RemlOptimizationFailed(e));
+            }
+        };
+        Ok(OuterEval {
+            cost: eval_result.objective,
+            gradient: eval_result.gradient,
+            hessian: eval_result.outer_hessian,
+        })
+    };
+
+    let mut obj = problem.build_objective_with_eval_order(
         CustomOuterState {
             warm_cache: None,
             last_error: None,
@@ -9898,76 +9971,18 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
         },
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
-            // Always use warm cache — previous inner solution is an excellent
-            // starting point, especially when rho hasn't moved far.
-            let warm_ref = outer.warm_cache.as_ref();
-            let eval_result = match outerobjectivegradienthessian_internal(
-                family,
-                specs,
-                options,
-                &penalty_counts,
+            eval_outer(
+                outer,
                 rho,
-                warm_ref,
                 if need_outer_hessian {
-                    EvalMode::ValueGradientHessian
+                    OuterEvalOrder::ValueGradientHessian
                 } else {
-                    EvalMode::ValueAndGradient
+                    OuterEvalOrder::ValueAndGradient
                 },
-            ) {
-                Ok(eval)
-                    if eval.objective.is_finite()
-                        && eval.gradient.iter().all(|v| v.is_finite())
-                        && match &eval.outer_hessian {
-                            crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
-                                hessian.iter().all(|v| v.is_finite())
-                            }
-                            crate::solver::outer_strategy::HessianResult::Operator(op) => {
-                                !need_outer_hessian || op.dim() == rho.len()
-                            }
-                            crate::solver::outer_strategy::HessianResult::Unavailable => {
-                                !need_outer_hessian
-                            }
-                        } =>
-                {
-                    // Warm-start proximity check: discard warm cache if rho
-                    // jumped too far from the cached point.
-                    let seed_ok = outer
-                        .warm_cache
-                        .as_ref()
-                        .map(|c| {
-                            c.rho.len() == rho.len()
-                                && c.rho
-                                    .iter()
-                                    .zip(rho.iter())
-                                    .all(|(&a, &b)| (a - b).abs() <= 1.5)
-                        })
-                        .unwrap_or(true);
-                    if seed_ok {
-                        outer.warm_cache = Some(eval.warm_start.clone());
-                    } else {
-                        outer.warm_cache = None;
-                    }
-                    outer.last_error = None;
-                    eval
-                }
-                Ok(_) => {
-                    outer.last_error = Some(
-                        "custom-family outer objective/derivatives became non-finite".to_string(),
-                    );
-                    return Err(EstimationError::RemlOptimizationFailed(
-                        "custom-family outer objective/derivatives became non-finite".to_string(),
-                    ));
-                }
-                Err(e) => {
-                    outer.last_error = Some(e.clone());
-                    return Err(EstimationError::RemlOptimizationFailed(e));
-                }
-            };
-            Ok(OuterEval {
-                cost: eval_result.objective,
-                gradient: eval_result.gradient,
-                hessian: eval_result.outer_hessian,
-            })
+            )
+        },
+        |outer: &mut CustomOuterState, rho: &Array1<f64>, order: OuterEvalOrder| {
+            eval_outer(outer, rho, order)
         },
         Some(|outer: &mut CustomOuterState| {
             outer.warm_cache = None;

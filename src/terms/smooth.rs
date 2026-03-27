@@ -5579,22 +5579,21 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             .collect::<Vec<_>>();
         (rho, adaptive_params)
     };
+    let analytic_outer_hessian_available =
+        crate::custom_family::joint_exact_analytic_outer_hessian_available()
+            && base_family
+                .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
+                .has_hessian()
+            && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
+                &base_family,
+            );
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
-        .with_hessian(
-            if crate::custom_family::joint_exact_analytic_outer_hessian_available()
-                && base_family
-                    .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
-                    .has_hessian()
-                && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
-                    &base_family,
-                )
-            {
-                Derivative::Analytic
-            } else {
-                Derivative::Unavailable
-            },
-        )
+        .with_hessian(if analytic_outer_hessian_available {
+            Derivative::Analytic
+        } else {
+            Derivative::Unavailable
+        })
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
         .with_max_iter(options.max_iter)
@@ -5608,7 +5607,112 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         problem
     };
 
-    let mut obj = problem.build_objective(
+    let eval_outer = |st: &mut SpatialAdaptiveOuterState,
+                      theta: &Array1<f64>,
+                      order: crate::solver::outer_strategy::OuterEvalOrder|
+     -> Result<OuterEval, EstimationError> {
+        let theta = clamp_theta(theta);
+
+        if let Some((cached_theta, cached_cost, cached_grad, cached_hess, cached_warm)) =
+            &st.last_eval
+            && cached_theta.len() == theta.len()
+            && cached_theta
+                .iter()
+                .zip(theta.iter())
+                .all(|(&a, &b)| (a - b).abs() <= 1e-12)
+            && (!matches!(
+                order,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+            ) || analytic_outer_hessian_available)
+        {
+            st.warm_cache = Some(cached_warm.clone());
+            return Ok(OuterEval {
+                cost: *cached_cost,
+                gradient: cached_grad.clone(),
+                hessian: if matches!(
+                    order,
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+                ) && analytic_outer_hessian_available
+                {
+                    HessianResult::Analytic(cached_hess.clone())
+                } else {
+                    HessianResult::Unavailable
+                },
+            });
+        }
+
+        let (rho, adaptive_params) = decode_theta(&theta);
+        let family_eval = base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
+        let need_hessian = matches!(
+            order,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+        ) && analytic_outer_hessian_available;
+        let result = evaluate_custom_family_joint_hyper(
+            &family_eval,
+            std::slice::from_ref(&blockspec),
+            &outer_opts,
+            &rho,
+            &derivative_blocks,
+            st.warm_cache.as_ref(),
+            if need_hessian {
+                crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+            } else {
+                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+            },
+        )
+        .map_err(|e| {
+            EstimationError::RemlOptimizationFailed(format!("spatial adaptive eval failed: {e}"))
+        })?;
+        if !result.objective.is_finite() || result.gradient.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "exact spatial adaptive objective returned non-finite values".to_string(),
+            ));
+        }
+        let hessian_result = if need_hessian {
+            let hessian = result
+                .outer_hessian
+                .materialize_dense()
+                .map_err(EstimationError::RemlOptimizationFailed)?
+                .ok_or_else(|| {
+                    EstimationError::RemlOptimizationFailed(
+                        "exact spatial adaptive objective did not return an outer Hessian"
+                            .to_string(),
+                    )
+                })?;
+            if hessian.nrows() != theta.len() || hessian.ncols() != theta.len() {
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "exact spatial adaptive outer Hessian shape mismatch: got {}x{}, expected {}x{}",
+                    hessian.nrows(),
+                    hessian.ncols(),
+                    theta.len(),
+                    theta.len(),
+                )));
+            }
+            if hessian.iter().any(|v| !v.is_finite()) {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "exact spatial adaptive outer Hessian contained non-finite values".to_string(),
+                ));
+            }
+            st.last_eval = Some((
+                theta.clone(),
+                result.objective,
+                result.gradient.clone(),
+                hessian.clone(),
+                result.warm_start.clone(),
+            ));
+            HessianResult::Analytic(hessian)
+        } else {
+            HessianResult::Unavailable
+        };
+        st.warm_cache = Some(result.warm_start);
+        Ok(OuterEval {
+            cost: result.objective,
+            gradient: result.gradient,
+            hessian: hessian_result,
+        })
+    };
+
+    let mut obj = problem.build_objective_with_eval_order(
         SpatialAdaptiveOuterState {
             warm_cache: None,
             last_eval: None,
@@ -5636,86 +5740,20 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             Ok(result.objective)
         },
         |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
-            let theta = clamp_theta(theta);
-
-            // Return cached result if theta has not moved.
-            if let Some((cached_theta, cached_cost, cached_grad, cached_hess, cached_warm)) =
-                &st.last_eval
-            {
-                if cached_theta.len() == theta.len()
-                    && cached_theta
-                        .iter()
-                        .zip(theta.iter())
-                        .all(|(&a, &b)| (a - b).abs() <= 1e-12)
-                {
-                    st.warm_cache = Some(cached_warm.clone());
-                    return Ok(OuterEval {
-                        cost: *cached_cost,
-                        gradient: cached_grad.clone(),
-                        hessian: HessianResult::Analytic(cached_hess.clone()),
-                    });
-                }
-            }
-
-            let (rho, adaptive_params) = decode_theta(&theta);
-            let family_eval =
-                base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
-            let result = evaluate_custom_family_joint_hyper(
-                &family_eval,
-                std::slice::from_ref(&blockspec),
-                &outer_opts,
-                &rho,
-                &derivative_blocks,
-                st.warm_cache.as_ref(),
-                crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian,
+            eval_outer(
+                st,
+                theta,
+                if analytic_outer_hessian_available {
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+                } else {
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient
+                },
             )
-            .map_err(|e| {
-                EstimationError::RemlOptimizationFailed(format!(
-                    "spatial adaptive eval failed: {e}"
-                ))
-            })?;
-            if !result.objective.is_finite() || result.gradient.iter().any(|v| !v.is_finite()) {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "exact spatial adaptive objective returned non-finite values".to_string(),
-                ));
-            }
-            let hessian = result
-                .outer_hessian
-                .materialize_dense()
-                .map_err(EstimationError::RemlOptimizationFailed)?
-                .ok_or_else(|| {
-                    EstimationError::RemlOptimizationFailed(
-                        "exact spatial adaptive objective did not return an outer Hessian"
-                            .to_string(),
-                    )
-                })?;
-            if hessian.nrows() != theta.len() || hessian.ncols() != theta.len() {
-                return Err(EstimationError::RemlOptimizationFailed(format!(
-                    "exact spatial adaptive outer Hessian shape mismatch: got {}x{}, expected {}x{}",
-                    hessian.nrows(),
-                    hessian.ncols(),
-                    theta.len(),
-                    theta.len(),
-                )));
-            }
-            if hessian.iter().any(|v| !v.is_finite()) {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "exact spatial adaptive outer Hessian contained non-finite values".to_string(),
-                ));
-            }
-            st.warm_cache = Some(result.warm_start.clone());
-            st.last_eval = Some((
-                theta.clone(),
-                result.objective,
-                result.gradient.clone(),
-                hessian.clone(),
-                result.warm_start,
-            ));
-            Ok(OuterEval {
-                cost: result.objective,
-                gradient: result.gradient,
-                hessian: HessianResult::Analytic(hessian),
-            })
+        },
+        |st: &mut SpatialAdaptiveOuterState,
+         theta: &Array1<f64>,
+         order: crate::solver::outer_strategy::OuterEvalOrder| {
+            eval_outer(st, theta, order)
         },
         Some(|st: &mut SpatialAdaptiveOuterState| {
             st.warm_cache = None;
@@ -8598,6 +8636,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     rho_dim: usize,
     hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
+    order: crate::solver::outer_strategy::OuterEvalOrder,
 ) -> Result<
     (
         f64,
@@ -8606,7 +8645,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     ),
     EstimationError,
 > {
-    evaluator.evaluate(
+    evaluator.evaluate_with_order(
         &design.design,
         &design.penalties,
         &design.nullspace_dims,
@@ -8616,6 +8655,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
         hyper_dirs,
         warm_start_beta,
         "evaluate_joint_reml_outer_eval_at_theta",
+        order,
     )
 }
 
@@ -9567,7 +9607,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     // Use bounds and design metadata for validation.
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{Derivative, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -9594,6 +9634,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         fn eval_full(
             &mut self,
             theta: &Array1<f64>,
+            order: OuterEvalOrder,
         ) -> Result<
             (
                 f64,
@@ -9603,7 +9644,13 @@ fn try_exact_joint_spatial_aniso_optimization(
             EstimationError,
         > {
             if let Some(eval) = self.cache.memoized_eval(theta) {
-                return Ok(eval);
+                let cached_satisfies_order = match order {
+                    OuterEvalOrder::ValueAndGradient => true,
+                    OuterEvalOrder::ValueGradientHessian => eval.2.is_analytic(),
+                };
+                if cached_satisfies_order {
+                    return Ok(eval);
+                }
             }
             self.cache
                 .ensure_theta(theta)
@@ -9627,6 +9674,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 self.rho_dim,
                 hyper_dirs,
                 None,
+                order,
             );
             if let Ok(ref value) = eval {
                 self.cache.store_eval(value.clone());
@@ -9668,7 +9716,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             if let Some(cost) = self.cache.memoized_cost(theta) {
                 return cost;
             }
-            match self.eval_full(theta) {
+            match self.eval_full(theta, OuterEvalOrder::ValueAndGradient) {
                 Ok((cost, _, _)) => cost,
                 Err(_) => f64::INFINITY,
             }
@@ -9727,14 +9775,11 @@ fn try_exact_joint_spatial_aniso_optimization(
         1e-5,
     );
 
-    let mut obj = problem.build_objective(
-        &mut ctx,
-        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
-            let cost = ctx.eval_cost(theta);
-            ctx.track_best(theta, cost);
-            Ok(cost)
-        },
-        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| match ctx.eval_full(theta) {
+    let eval_outer = |ctx: &mut &mut AnisoJointContext<'_>,
+                      theta: &Array1<f64>,
+                      order: OuterEvalOrder|
+     -> Result<OuterEval, EstimationError> {
+        match ctx.eval_full(theta, order) {
             Ok((cost, grad, hess)) => {
                 ctx.track_best(theta, cost);
                 Ok(OuterEval {
@@ -9744,6 +9789,21 @@ fn try_exact_joint_spatial_aniso_optimization(
                 })
             }
             Err(_) => Ok(OuterEval::infeasible(theta.len())),
+        }
+    };
+
+    let mut obj = problem.build_objective_with_eval_order(
+        &mut ctx,
+        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
+            let cost = ctx.eval_cost(theta);
+            ctx.track_best(theta, cost);
+            Ok(cost)
+        },
+        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
+            eval_outer(ctx, theta, OuterEvalOrder::ValueGradientHessian)
+        },
+        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
+            eval_outer(ctx, theta, order)
         },
         Some(|ctx: &mut &mut AnisoJointContext<'_>| {
             ctx.reset();
@@ -9800,7 +9860,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
-    use crate::solver::outer_strategy::{Derivative, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
 
     let theta_dim = theta0.len();
     let kappa_dim = theta_dim - rho_dim;
@@ -9825,6 +9885,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
         fn eval_full(
             &mut self,
             theta: &Array1<f64>,
+            order: OuterEvalOrder,
         ) -> Result<
             (
                 f64,
@@ -9834,7 +9895,13 @@ fn try_exact_joint_spatial_isotropic_optimization(
             EstimationError,
         > {
             if let Some(eval) = self.cache.memoized_eval(theta) {
-                return Ok(eval);
+                let cached_satisfies_order = match order {
+                    OuterEvalOrder::ValueAndGradient => true,
+                    OuterEvalOrder::ValueGradientHessian => eval.2.is_analytic(),
+                };
+                if cached_satisfies_order {
+                    return Ok(eval);
+                }
             }
             self.cache
                 .ensure_theta(theta)
@@ -9858,6 +9925,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 self.rho_dim,
                 hyper_dirs,
                 None,
+                order,
             );
             if let Ok(ref value) = eval {
                 self.cache.store_eval(value.clone());
@@ -9899,7 +9967,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             if let Some(cost) = self.cache.memoized_cost(theta) {
                 return cost;
             }
-            match self.eval_full(theta) {
+            match self.eval_full(theta, OuterEvalOrder::ValueAndGradient) {
                 Ok((cost, _, _)) => cost,
                 Err(_) => f64::INFINITY,
             }
@@ -9958,14 +10026,11 @@ fn try_exact_joint_spatial_isotropic_optimization(
         1e-5,
     );
 
-    let mut obj = problem.build_objective(
-        &mut ctx,
-        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
-            let cost = ctx.eval_cost(theta);
-            ctx.track_best(theta, cost);
-            Ok(cost)
-        },
-        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| match ctx.eval_full(theta) {
+    let eval_outer = |ctx: &mut &mut IsoJointContext<'_>,
+                      theta: &Array1<f64>,
+                      order: OuterEvalOrder|
+     -> Result<OuterEval, EstimationError> {
+        match ctx.eval_full(theta, order) {
             Ok((cost, grad, hess)) => {
                 ctx.track_best(theta, cost);
                 Ok(OuterEval {
@@ -9975,6 +10040,21 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 })
             }
             Err(_) => Ok(OuterEval::infeasible(theta.len())),
+        }
+    };
+
+    let mut obj = problem.build_objective_with_eval_order(
+        &mut ctx,
+        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
+            let cost = ctx.eval_cost(theta);
+            ctx.track_best(theta, cost);
+            Ok(cost)
+        },
+        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
+            eval_outer(ctx, theta, OuterEvalOrder::ValueGradientHessian)
+        },
+        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
+            eval_outer(ctx, theta, order)
         },
         Some(|ctx: &mut &mut IsoJointContext<'_>| {
             ctx.reset();
@@ -11358,7 +11438,7 @@ where
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
     let exact_efs_fn_cell = std::cell::RefCell::new(&mut exact_efs_fn);
 
-    use crate::solver::outer_strategy::{Derivative, OuterEval};
+    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder};
 
     let problem = exact_joint_multistart_outer_problem(
         &theta0,
@@ -11392,7 +11472,75 @@ where
     }
 
     let result = {
-        let mut obj = problem.build_objective(
+        let eval_outer = |ctx: &mut &mut NBlockExactJointState<'_>,
+                          theta: &Array1<f64>,
+                          order: OuterEvalOrder|
+         -> Result<OuterEval, EstimationError> {
+            if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
+                let cached_satisfies_order = match order {
+                    OuterEvalOrder::ValueAndGradient => true,
+                    OuterEvalOrder::ValueGradientHessian => hess.is_analytic(),
+                };
+                if cached_satisfies_order {
+                    ctx.track_best(theta, cost);
+                    if !cost.is_finite() {
+                        return Ok(OuterEval::infeasible(theta.len()));
+                    }
+                    if grad.iter().any(|v| !v.is_finite()) {
+                        return Err(EstimationError::RemlOptimizationFailed(
+                            "n-block exact-joint gradient contained non-finite values".to_string(),
+                        ));
+                    }
+                    return Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: hess,
+                    });
+                }
+            }
+            if let Err(err) = ctx.cache.ensure_theta(theta) {
+                log::warn!(
+                    "[OUTER] n-block exact-joint spatial: ensure_theta failed during gradient evaluation: {err}"
+                );
+                return Ok(OuterEval::infeasible(theta.len()));
+            }
+            let specs = collect_specs(&ctx.cache);
+            let designs = collect_designs(&ctx.cache);
+            let need_hessian = matches!(order, OuterEvalOrder::ValueGradientHessian)
+                && analytic_outer_hessian_available;
+            match (&mut *exact_fn_cell.borrow_mut())(
+                &theta.slice(s![..rho_dim]).to_owned(),
+                &specs,
+                &designs,
+                need_hessian,
+            ) {
+                Ok((cost, grad, hess)) => {
+                    ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
+                    ctx.track_best(theta, cost);
+                    if !cost.is_finite() {
+                        return Ok(OuterEval::infeasible(theta.len()));
+                    }
+                    if grad.iter().any(|v| !v.is_finite()) {
+                        return Err(EstimationError::RemlOptimizationFailed(
+                            "n-block exact-joint gradient contained non-finite values".to_string(),
+                        ));
+                    }
+                    Ok(OuterEval {
+                        cost,
+                        gradient: grad,
+                        hessian: hess,
+                    })
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[OUTER] n-block exact-joint spatial: exact evaluation failed: {err}"
+                    );
+                    Ok(OuterEval::infeasible(theta.len()))
+                }
+            }
+        };
+
+        let mut obj = problem.build_objective_with_eval_order(
             &mut state,
             |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
                 if let Some(cost) = ctx.cache.memoized_cost(theta) {
@@ -11427,62 +11575,19 @@ where
                 }
             },
             |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
-                if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
-                    ctx.track_best(theta, cost);
-                    if !cost.is_finite() {
-                        return Ok(OuterEval::infeasible(theta.len()));
-                    }
-                    if grad.iter().any(|v| !v.is_finite()) {
-                        return Err(EstimationError::RemlOptimizationFailed(
-                            "n-block exact-joint gradient contained non-finite values".to_string(),
-                        ));
-                    }
-                    return Ok(OuterEval {
-                        cost,
-                        gradient: grad,
-                        hessian: hess,
-                    });
-                }
-                if let Err(err) = ctx.cache.ensure_theta(theta) {
-                    log::warn!(
-                        "[OUTER] n-block exact-joint spatial: ensure_theta failed during gradient evaluation: {err}"
-                    );
-                    return Ok(OuterEval::infeasible(theta.len()));
-                }
-                let specs = collect_specs(&ctx.cache);
-                let designs = collect_designs(&ctx.cache);
-                match (&mut *exact_fn_cell.borrow_mut())(
-                    &theta.slice(s![..rho_dim]).to_owned(),
-                    &specs,
-                    &designs,
-                    analytic_outer_hessian_available,
-                ) {
-                    Ok((cost, grad, hess)) => {
-                        ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
-                        ctx.track_best(theta, cost);
-                        if !cost.is_finite() {
-                            return Ok(OuterEval::infeasible(theta.len()));
-                        }
-                        if grad.iter().any(|v| !v.is_finite()) {
-                            return Err(EstimationError::RemlOptimizationFailed(
-                                "n-block exact-joint gradient contained non-finite values"
-                                    .to_string(),
-                            ));
-                        }
-                        Ok(OuterEval {
-                            cost,
-                            gradient: grad,
-                            hessian: hess,
-                        })
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "[OUTER] n-block exact-joint spatial: exact evaluation failed: {err}"
-                        );
-                        Ok(OuterEval::infeasible(theta.len()))
-                    }
-                }
+                eval_outer(
+                    ctx,
+                    theta,
+                    if analytic_outer_hessian_available {
+                        OuterEvalOrder::ValueGradientHessian
+                    } else {
+                        OuterEvalOrder::ValueAndGradient
+                    },
+                )
             },
+            |ctx: &mut &mut NBlockExactJointState<'_>,
+             theta: &Array1<f64>,
+             order: OuterEvalOrder| { eval_outer(ctx, theta, order) },
             None::<fn(&mut &mut NBlockExactJointState<'_>)>,
             Some(
                 |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
@@ -11548,8 +11653,8 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // penalty, kappa is promoted to a first-class outer hyperparameter beside
     // rho = log(lambda). In that mode this routine runs a joint outer solve in
     // theta = [rho, psi], where psi = log(kappa) = -log(length_scale), and the
-    // optimizer is expected to consume a real joint Hessian. NewtonTrustRegion
-    // and ARC are not meant to run on a gradient-only surrogate here.
+    // optimizer is expected to consume a real joint Hessian. ARC is not meant
+    // to run on a gradient-only surrogate here.
     //
     // Any eligible spatial smooth participates in this outer solve. If an
     // eligible spatial basis does not expose derivative information, that is
@@ -14442,6 +14547,7 @@ mod tests {
                     rho_dim,
                     build_hyper_dirs(),
                     None,
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
                 )
                 .expect("reused eval");
 
@@ -14467,6 +14573,7 @@ mod tests {
                     rho_dim,
                     build_hyper_dirs(),
                     None,
+                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
                 )
                 .expect("fresh eval");
 
