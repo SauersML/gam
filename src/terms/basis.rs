@@ -4249,6 +4249,7 @@ pub fn build_thin_plate_basiswithworkspace(
         let poly_block = polynomial_block_from_order(data, DuchonNullspaceOrder::Linear);
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
+        let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
         let kernel_fn = Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
             let mut dist2 = 0.0;
             for axis in 0..d {
@@ -4259,7 +4260,7 @@ pub fn build_thin_plate_basiswithworkspace(
                 .expect("validated thin-plate inputs should not fail")
         });
         let base_op = ChunkedKernelDesignOperator::new(
-            Arc::new(data.to_owned()),
+            shared_data,
             Arc::new(centers.clone()),
             kernel_fn,
             Some(Arc::new(internal_kernel_transform.clone())),
@@ -7569,10 +7570,28 @@ struct ConstraintNullspaceCache {
 
 const CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES: usize = 32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct OwnedDataCacheKey {
+    rows: usize,
+    cols: usize,
+    ptr: usize,
+    stride0: isize,
+    stride1: isize,
+}
+
+#[derive(Default, Clone, Debug)]
+struct OwnedDataCache {
+    map: HashMap<OwnedDataCacheKey, Arc<Array2<f64>>>,
+    order: Vec<OwnedDataCacheKey>,
+}
+
+const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 8;
+
 #[derive(Default, Clone, Debug)]
 struct BasisCacheContext {
     spatial_distance: SpatialDistanceCache,
     constraint_nullspace: ConstraintNullspaceCache,
+    owned_data: OwnedDataCache,
 }
 
 /// Explicit per-run workspace for basis/spatial cache reuse.
@@ -7703,6 +7722,38 @@ fn constraint_nullspace_order_code(order: DuchonNullspaceOrder) -> u8 {
         DuchonNullspaceOrder::Zero => 0,
         DuchonNullspaceOrder::Linear => 1,
     }
+}
+
+fn shared_owned_data_matrix(
+    data: ArrayView2<'_, f64>,
+    cache: &mut BasisCacheContext,
+) -> Arc<Array2<f64>> {
+    let key = OwnedDataCacheKey {
+        rows: data.nrows(),
+        cols: data.ncols(),
+        ptr: data.as_ptr() as usize,
+        stride0: data.strides()[0],
+        stride1: data.strides()[1],
+    };
+    if let Some(hit) = cache.owned_data.map.get(&key) {
+        return hit.clone();
+    }
+
+    let owned = Arc::new(data.to_owned());
+    if let Some(hit) = cache.owned_data.map.get(&key) {
+        return hit.clone();
+    }
+
+    cache.owned_data.map.insert(key, owned.clone());
+    cache.owned_data.order.push(key);
+    while cache.owned_data.map.len() > OWNED_DATA_CACHE_MAX_ENTRIES {
+        if cache.owned_data.order.is_empty() {
+            break;
+        }
+        let oldkey = cache.owned_data.order.remove(0);
+        cache.owned_data.map.remove(&oldkey);
+    }
+    owned
 }
 
 fn kernel_constraint_nullspace(
@@ -8023,6 +8074,7 @@ pub fn build_matern_basiswithworkspace(
             design_cols,
             dense_bytes as f64 / (1024.0 * 1024.0),
         );
+        let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
         let d = data.ncols();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
@@ -8051,7 +8103,7 @@ pub fn build_matern_basiswithworkspace(
             None
         };
         let op = ChunkedKernelDesignOperator::new(
-            Arc::new(data.to_owned()),
+            shared_data,
             Arc::new(centers.clone()),
             kernel_fn,
             z_opt.as_ref().map(|z| Arc::new(z.clone())),
@@ -11221,6 +11273,7 @@ pub fn build_duchon_basiswithworkspace(
             dense_bytes as f64 / (1024.0 * 1024.0),
         );
         let d = data.ncols();
+        let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
         let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
         let s_order = spec.power;
         let length_scale = spec.length_scale;
@@ -11288,7 +11341,7 @@ pub fn build_duchon_basiswithworkspace(
             };
         let poly_block = polynomial_block_from_order(data, spec.nullspace_order);
         let base_op = ChunkedKernelDesignOperator::new(
-            Arc::new(data.to_owned()),
+            shared_data,
             Arc::new(centers.clone()),
             kernel_fn,
             Some(Arc::new(kernel_transform.clone())),
@@ -13743,8 +13796,9 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, array};
+    use ndarray::{Array1, Array2, array};
     use num_dual::{DualNum, second_derivative};
+    use std::sync::Arc;
 
     fn dense_orthogonality_relative_residual(
         basis_matrix: ArrayView2<'_, f64>,
@@ -13818,6 +13872,19 @@ mod tests {
 
             result
         }
+    }
+
+    #[test]
+    fn shared_owned_data_matrix_reuses_cached_arc_for_same_view() {
+        let data =
+            Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("data");
+        let mut cache = BasisCacheContext::default();
+
+        let first = shared_owned_data_matrix(data.view(), &mut cache);
+        let second = shared_owned_data_matrix(data.view(), &mut cache);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.owned_data.map.len(), 1);
     }
 
     #[test]
