@@ -1332,29 +1332,6 @@ impl Default for OuterConfig {
     }
 }
 
-struct ScreeningCapGuard<'a> {
-    cap: Option<&'a Arc<AtomicUsize>>,
-    previous: usize,
-}
-
-impl<'a> ScreeningCapGuard<'a> {
-    fn engage(cap: Option<&'a Arc<AtomicUsize>>, screening_limit: usize) -> Self {
-        let previous = match cap {
-            Some(cap) => cap.swap(screening_limit, Ordering::Relaxed),
-            None => 0,
-        };
-        Self { cap, previous }
-    }
-}
-
-impl Drop for ScreeningCapGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(cap) = self.cap {
-            cap.store(self.previous, Ordering::Relaxed);
-        }
-    }
-}
-
 // ─── OuterProblem builder ─────────────────────────────────────────────
 //
 // Declarative builder for outer optimization problems.  Derives
@@ -1991,69 +1968,6 @@ fn run_outer(
     }))
 }
 
-/// Execute a single screening probe and return the next viable seed.
-fn screen_next_seed_candidate(
-    obj: &mut dyn OuterObjective,
-    config: &OuterConfig,
-    context: &str,
-    seeds: &[Array1<f64>],
-    next_seed_idx: &mut usize,
-    last_error: &mut Option<String>,
-) -> Result<Option<Array1<f64>>, EstimationError> {
-    let screening_limit = config.seed_config.screen_max_inner_iterations.max(1);
-    while *next_seed_idx < seeds.len() {
-        let idx = *next_seed_idx;
-        let seed = seeds[idx].clone();
-        *next_seed_idx += 1;
-        obj.reset();
-        let cost = {
-            let screening_guard =
-                ScreeningCapGuard::engage(config.screening_cap.as_ref(), screening_limit);
-            if idx == 0 && screening_guard.cap.is_some() && log::log_enabled!(log::Level::Trace) {
-                log::trace!(
-                    "[OUTER] {context}: screening PIRLS cap set to {screening_limit} (previous={})",
-                    screening_guard.previous
-                );
-            }
-            obj.eval_cost(&seed)
-                .map_err(|err| into_objective_error("outer eval_cost failed", err))
-        };
-        let cost = match cost {
-            Ok(cost) => cost,
-            Err(err) => {
-                let err = match err {
-                    ObjectiveEvalError::Recoverable { message }
-                    | ObjectiveEvalError::Fatal { message } => {
-                        EstimationError::RemlOptimizationFailed(message)
-                    }
-                };
-                log::warn!(
-                    "[OUTER] {context}: screening rejected seed {}: {err}",
-                    idx + 1
-                );
-                *last_error = Some(err.to_string());
-                continue;
-            }
-        };
-        let cost = finite_cost_or_error("outer eval_cost failed", cost).map_err(|err| match err {
-            ObjectiveEvalError::Recoverable { message } | ObjectiveEvalError::Fatal { message } => {
-                EstimationError::RemlOptimizationFailed(message)
-            }
-        });
-        if let Err(err) = cost {
-            log::warn!(
-                "[OUTER] {context}: screening rejected seed {}: {err}",
-                idx + 1
-            );
-            *last_error = Some(err.to_string());
-            continue;
-        }
-        return Ok(Some(seed));
-    }
-
-    Ok(None)
-}
-
 /// Execute a single plan attempt (seed generation → solver loop → best result).
 fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
@@ -2087,11 +2001,15 @@ fn run_outer_with_plan(
 
     let seed_budget = config.seed_config.seed_budget.max(1).min(seeds.len());
     log::info!(
-        "[OUTER] {context}: screening seeds lazily (generated={}, budget={}, pirls_cap={})",
+        "[OUTER] {context}: trying generated seeds directly (generated={}, budget={})",
         seeds.len(),
         seed_budget,
-        config.seed_config.screen_max_inner_iterations.max(1),
     );
+    if config.screening_cap.is_some() && log::log_enabled!(log::Level::Trace) {
+        log::trace!(
+            "[OUTER] {context}: screening cap is configured but no global seed-screening pass is used"
+        );
+    }
     if seeds.len() > seed_budget {
         log::info!(
             "[OUTER] {context}: trying up to {seed_budget}/{} generated seeds in heuristic order",
@@ -2111,20 +2029,11 @@ fn run_outer_with_plan(
     let mut last_seed_error: Option<String> = None;
     let layout = cap.theta_layout();
     let mut started_seeds = 0usize;
-    let mut next_seed_idx = 0usize;
 
-    'seed_attempts: while started_seeds < seed_budget {
-        let Some(seed) = screen_next_seed_candidate(
-            obj,
-            config,
-            context,
-            &seeds,
-            &mut next_seed_idx,
-            &mut last_seed_error,
-        )?
-        else {
+    'seed_attempts: for seed in &seeds {
+        if started_seeds == seed_budget {
             break;
-        };
+        }
         obj.reset();
         let t_seed_start = std::time::Instant::now();
         let seed_slot;
@@ -3299,7 +3208,7 @@ mod tests {
     }
 
     #[test]
-    fn run_starts_solver_without_upfront_seed_eval_pass() {
+    fn run_starts_solver_with_direct_startup_eval() {
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -3332,21 +3241,21 @@ mod tests {
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
         problem
-            .run(&mut obj, "solver should start without an upfront seed pass")
-            .expect("analytic plans should start with a real evaluation");
+            .run(&mut obj, "solver should start from a direct startup eval")
+            .expect("analytic plans should start with a direct full evaluation");
         let calls = calls.lock().unwrap();
         let first_eval_idx = calls
             .iter()
             .position(|call| *call == "eval")
             .expect("solver should eventually request a full eval");
         assert!(
-            calls[..first_eval_idx].iter().all(|call| *call == "cost"),
-            "unexpected pre-solver call order: {calls:?}"
+            first_eval_idx == 0,
+            "startup should not perform a separate cost-screening pass first: {calls:?}"
         );
     }
 
     #[test]
-    fn run_lazy_screening_stops_at_attempt_budget() {
+    fn run_efs_skips_global_cost_screening() {
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.max_seeds = 6;
         seed_config.seed_budget = 1;
@@ -3380,13 +3289,13 @@ mod tests {
         problem
             .run(
                 &mut obj,
-                "lazy screening should not probe all generated seeds",
+                "EFS should not use a separate global cost-screening pass",
             )
-            .expect("first screened EFS seed should be sufficient");
+            .expect("first generated EFS seed should be sufficient");
         assert_eq!(
             screening_calls.load(Ordering::Relaxed),
-            1,
-            "screening should stop once the attempt budget is filled"
+            0,
+            "EFS startup should not call eval_cost just to screen seeds"
         );
     }
 
