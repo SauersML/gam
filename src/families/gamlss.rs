@@ -1730,7 +1730,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 // we intentionally plan it as gradient/fixed-point rather
                 // than an ARC/Newton Hessian solve.
                 false,
-                |rho, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                    let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let fit = {
                         let blocks = builder.build_blocks(
                             rho,
@@ -1757,7 +1758,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
                     Ok(fit)
                 },
-                |rho,
+                |theta,
                  specs: &[TermCollectionSpec],
                  designs: &[TermCollectionDesign],
                  need_hessian| {
@@ -1767,6 +1768,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                                 .to_string(),
                         );
                     }
+                    let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let blocks = builder.build_blocks(
                         rho,
                         &designs[0],
@@ -1803,13 +1805,14 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     }
                     Ok((eval.objective, eval.gradient, eval.outer_hessian))
                 },
-                |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     if !analytic_joint_derivatives_available {
                         return Err(
                             "analytic spatial psi derivatives are unavailable for this exact two-block path"
                                 .to_string(),
                         );
                     }
+                    let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let blocks = builder.build_blocks(
                         rho,
                         &designs[0],

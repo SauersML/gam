@@ -2870,9 +2870,87 @@ struct EvalCache {
 // ── Row-level NLL computation ─────────────────────────────────────────
 
 impl SurvivalMarginalSlopeFamily {
+    const LOG_SIGMA_FD_STEP: f64 = 1e-4;
+
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
         probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
+    fn is_sigma_aux_index(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> bool {
+        let total = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+        if self.gaussian_frailty_sd.is_none() || total == 0 || psi_index != total - 1 {
+            return false;
+        }
+        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+        else {
+            return false;
+        };
+        let deriv = &derivative_blocks[block_idx][local_idx];
+        deriv.penalty_index.is_none()
+            && deriv.x_psi.is_empty()
+            && deriv.s_psi.is_empty()
+            && deriv.s_psi_components.is_none()
+            && deriv.x_psi_psi.is_none()
+            && deriv.s_psi_psi.is_none()
+    }
+
+    fn with_sigma(&self, sigma: f64) -> Self {
+        let mut cloned = self.clone();
+        cloned.gaussian_frailty_sd = Some(sigma);
+        cloned
+    }
+
+    fn numeric_sigma_psi_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        let sigma = match self.gaussian_frailty_sd {
+            Some(value) if value.is_finite() && value > 0.0 => value,
+            _ => return Ok(None),
+        };
+        let log_sigma = sigma.ln();
+        let step = Self::LOG_SIGMA_FD_STEP * (1.0 + log_sigma.abs());
+        let sigma_minus = (log_sigma - step).exp();
+        let sigma_plus = (log_sigma + step).exp();
+        let family_minus = self.with_sigma(sigma_minus);
+        let family_plus = self.with_sigma(sigma_plus);
+        let eval_minus = family_minus
+            .exact_newton_joint_gradient_evaluation(block_states, specs)?
+            .ok_or_else(|| {
+                "survival marginal-slope sigma derivative requires an exact joint gradient evaluation"
+                    .to_string()
+            })?;
+        let eval_plus = family_plus
+            .exact_newton_joint_gradient_evaluation(block_states, specs)?
+            .ok_or_else(|| {
+                "survival marginal-slope sigma derivative requires an exact joint gradient evaluation"
+                    .to_string()
+            })?;
+        let hess_minus = family_minus
+            .exact_newton_joint_hessian(block_states)?
+            .ok_or_else(|| {
+                "survival marginal-slope sigma derivative requires an exact joint Hessian"
+                    .to_string()
+            })?;
+        let hess_plus = family_plus
+            .exact_newton_joint_hessian(block_states)?
+            .ok_or_else(|| {
+                "survival marginal-slope sigma derivative requires an exact joint Hessian"
+                    .to_string()
+            })?;
+        let denom = 2.0 * step;
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi: -(eval_plus.log_likelihood - eval_minus.log_likelihood) / denom,
+            score_psi: (&eval_minus.gradient - &eval_plus.gradient) / denom,
+            hessian_psi: (&hess_plus - &hess_minus) / denom,
+            hessian_psi_operator: None,
+        }))
     }
 
     fn flex_timewiggle_active(&self) -> bool {
@@ -9218,6 +9296,7 @@ impl SurvivalMarginalSlopeFamily {
 struct SurvivalMarginalSlopePsiWorkspace {
     family: SurvivalMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
+    specs: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     cache: Option<EvalCache>,
 }
@@ -9372,6 +9451,7 @@ impl SurvivalMarginalSlopePsiWorkspace {
     fn new(
         family: SurvivalMarginalSlopeFamily,
         block_states: Vec<ParameterBlockState>,
+        specs: Vec<ParameterBlockSpec>,
         derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
         let cache = if family.flex_active() {
@@ -9382,6 +9462,7 @@ impl SurvivalMarginalSlopePsiWorkspace {
         Ok(Self {
             family,
             block_states,
+            specs,
             derivative_blocks,
             cache,
         })
@@ -9393,6 +9474,14 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         &self,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        if self
+            .family
+            .is_sigma_aux_index(&self.derivative_blocks, psi_index)
+        {
+            return self
+                .family
+                .numeric_sigma_psi_terms(&self.block_states, &self.specs);
+        }
         self.family.psi_terms_inner(
             &self.block_states,
             &self.derivative_blocks,
@@ -11958,10 +12047,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        if self.is_sigma_aux_index(derivative_blocks, psi_index) {
+            return self.numeric_sigma_psi_terms(block_states, specs);
+        }
         self.psi_terms(block_states, derivative_blocks, psi_index)
     }
 
@@ -11995,12 +12087,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
+            specs.to_vec(),
             derivative_blocks.to_vec(),
         )?)))
     }

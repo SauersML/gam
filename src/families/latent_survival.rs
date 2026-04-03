@@ -266,7 +266,10 @@ pub fn fixed_latent_hazard_frailty(
     }
 }
 
-pub fn latent_hazard_loading(frailty: &FrailtySpec, context: &str) -> Result<HazardLoading, String> {
+pub fn latent_hazard_loading(
+    frailty: &FrailtySpec,
+    context: &str,
+) -> Result<HazardLoading, String> {
     match frailty {
         FrailtySpec::HazardMultiplier { loading, .. } => Ok(*loading),
         FrailtySpec::GaussianShift { .. } => Err(format!(
@@ -396,12 +399,14 @@ fn validate_latent_survival_inputs(
             (*sigma_fixed, *loading)
         }
         FrailtySpec::GaussianShift { .. } => {
-            return Err("latent-survival requires HazardMultiplier frailty, not GaussianShift".to_string())
+            return Err(
+                "latent-survival requires HazardMultiplier frailty, not GaussianShift".to_string(),
+            );
         }
         FrailtySpec::None => {
             return Err(
                 "latent-survival requires a HazardMultiplier frailty specification".to_string(),
-            )
+            );
         }
     };
     let n = data.nrows();
@@ -803,9 +808,10 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
 fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "log_sigma".to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
-            Array2::from_elem((1, 1), 1.0),
-        ))),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(Array2::from_elem(
+            (1, 1),
+            1.0,
+        )))),
         offset: Array1::zeros(1),
         penalties: vec![],
         nullspace_dims: vec![],
@@ -1144,9 +1150,8 @@ impl CustomFamily for LatentSurvivalFamily {
                 self.unloaded_mass_exit[i],
                 self.unloaded_hazard_exit[i],
             )?;
-            let row_jet =
-                LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
-                    .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
+            let row_jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
+                .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
             ll += wi * row_jet.log_lik;
 
             let mean_row = self.x_mean.row_chunk(i..i + 1);

@@ -494,8 +494,7 @@ impl LogKernelSumJet {
             d1: r1,
             d2: r2 - r1 * r1,
             d3: r3 - 3.0 * r1 * r2 + 2.0 * r1 * r1 * r1,
-            d4: r4 - 4.0 * r1 * r3 - 3.0 * r2 * r2 + 12.0 * r1 * r1 * r2
-                - 6.0 * r1.powi(4),
+            d4: r4 - 4.0 * r1 * r3 - 3.0 * r2 * r2 + 12.0 * r1 * r1 * r2 - 6.0 * r1.powi(4),
             mode,
         }
     }
@@ -1410,6 +1409,43 @@ mod tests {
             (jet.score - fd_score).abs() / fd_score.abs().max(1e-15) < 1e-3,
             "score={}, fd={fd_score}",
             jet.score
+        );
+    }
+
+    #[test]
+    fn survival_right_censored_log_sigma_derivatives_match_fd() {
+        let ctx = QuadratureContext::new();
+        let mu = 0.15;
+        let sigma = 0.35;
+        let log_sigma = sigma.ln();
+        let h = 1e-5;
+        let row = LatentSurvivalRow::right_censored(0.4, 1.7, 0.1, 0.5);
+
+        let ll_p = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, (log_sigma + h).exp())
+            .unwrap()
+            .log_lik;
+        let ll_0 = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma)
+            .unwrap()
+            .log_lik;
+        let ll_m = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, (log_sigma - h).exp())
+            .unwrap()
+            .log_lik;
+
+        let fd_score = (ll_p - ll_m) / (2.0 * h);
+        let fd_neg_hessian = -(ll_p - 2.0 * ll_0 + ll_m) / (h * h);
+        let jet = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma).unwrap();
+
+        assert!(
+            (jet.score_log_sigma - fd_score).abs() / fd_score.abs().max(1e-15) < 5e-3,
+            "log-sigma score={}, fd={fd_score}",
+            jet.score_log_sigma
+        );
+        assert!(
+            (jet.neg_hessian_log_sigma - fd_neg_hessian).abs()
+                / fd_neg_hessian.abs().max(1e-12)
+                < 2e-2,
+            "log-sigma neg_hessian={}, fd={fd_neg_hessian}",
+            jet.neg_hessian_log_sigma
         );
     }
 

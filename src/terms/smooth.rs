@@ -11013,6 +11013,9 @@ pub struct ExactJointHyperSetup {
     log_kappa0: SpatialLogKappaCoords,
     log_kappa_lower: SpatialLogKappaCoords,
     log_kappa_upper: SpatialLogKappaCoords,
+    auxiliary0: Array1<f64>,
+    auxiliary_lower: Array1<f64>,
+    auxiliary_upper: Array1<f64>,
 }
 
 impl ExactJointHyperSetup {
@@ -11049,7 +11052,22 @@ impl ExactJointHyperSetup {
             log_kappa0,
             log_kappa_lower,
             log_kappa_upper,
+            auxiliary0: Array1::zeros(0),
+            auxiliary_lower: Array1::zeros(0),
+            auxiliary_upper: Array1::zeros(0),
         }
+    }
+
+    pub(crate) fn with_auxiliary(
+        mut self,
+        auxiliary0: Array1<f64>,
+        auxiliary_lower: Array1<f64>,
+        auxiliary_upper: Array1<f64>,
+    ) -> Self {
+        self.auxiliary0 = auxiliary0;
+        self.auxiliary_lower = auxiliary_lower;
+        self.auxiliary_upper = auxiliary_upper;
+        self
     }
 
     pub(crate) fn rho_dim(&self) -> usize {
@@ -11060,27 +11078,40 @@ impl ExactJointHyperSetup {
         self.log_kappa0.len()
     }
 
+    pub(crate) fn auxiliary_dim(&self) -> usize {
+        self.auxiliary0.len()
+    }
+
     pub(crate) fn theta0(&self) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        let mut out =
+            Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim() + self.auxiliary_dim());
         out.slice_mut(s![..self.rho_dim()]).assign(&self.rho0);
-        out.slice_mut(s![self.rho_dim()..])
+        out.slice_mut(s![self.rho_dim()..self.rho_dim() + self.log_kappa_dim()])
             .assign(self.log_kappa0.as_array());
+        out.slice_mut(s![self.rho_dim() + self.log_kappa_dim()..])
+            .assign(&self.auxiliary0);
         out
     }
 
     pub(crate) fn lower(&self) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        let mut out =
+            Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim() + self.auxiliary_dim());
         out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_lower);
-        out.slice_mut(s![self.rho_dim()..])
+        out.slice_mut(s![self.rho_dim()..self.rho_dim() + self.log_kappa_dim()])
             .assign(self.log_kappa_lower.as_array());
+        out.slice_mut(s![self.rho_dim() + self.log_kappa_dim()..])
+            .assign(&self.auxiliary_lower);
         out
     }
 
     pub(crate) fn upper(&self) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        let mut out =
+            Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim() + self.auxiliary_dim());
         out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_upper);
-        out.slice_mut(s![self.rho_dim()..])
+        out.slice_mut(s![self.rho_dim()..self.rho_dim() + self.log_kappa_dim()])
             .assign(self.log_kappa_upper.as_array());
+        out.slice_mut(s![self.rho_dim() + self.log_kappa_dim()..])
+            .assign(&self.auxiliary_upper);
         out
     }
 
@@ -11107,6 +11138,7 @@ struct ExactJointDesignCache<'d> {
     )>,
     rho_dim: usize,
     all_dims: Vec<usize>,
+    log_kappa_dim: usize,
     block_term_counts: Vec<usize>,
 }
 
@@ -11137,6 +11169,7 @@ impl<'d> ExactJointDesignCache<'d> {
             last_cost: None,
             last_eval: None,
             rho_dim,
+            log_kappa_dim: all_dims.iter().sum(),
             all_dims,
             block_term_counts,
         })
@@ -11152,8 +11185,19 @@ impl<'d> ExactJointDesignCache<'d> {
         }
 
         let t_ensure = std::time::Instant::now();
+        let kappa_theta_len = self.rho_dim + self.log_kappa_dim;
+        if theta.len() < kappa_theta_len {
+            return Err(format!(
+                "exact-joint theta length mismatch: got {}, expected at least {} (rho_dim={}, log_kappa_dim={})",
+                theta.len(),
+                kappa_theta_len,
+                self.rho_dim,
+                self.log_kappa_dim
+            ));
+        }
+        let theta_kappa = theta.slice(s![..kappa_theta_len]).to_owned();
         let full_log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-            theta,
+            &theta_kappa,
             self.rho_dim,
             self.all_dims.clone(),
         );
@@ -11353,22 +11397,19 @@ where
     // -----------------------------------------------------------------------
     // Fast path: kappa disabled or no spatial terms — build designs once.
     // -----------------------------------------------------------------------
-    if !kappa_options.enabled || log_kappa_dim == 0 {
+    if !kappa_options.enabled && joint_setup.auxiliary_dim() == 0 {
         let (designs, resolved_specs) = build_term_collection_designs_and_freeze_joint(
             data, block_specs,
         )
         .map_err(|e| {
             format!("failed to build and freeze joint block designs during exact joint kappa optimization: {e}")
         })?;
-        let rho_only = joint_setup
-            .theta0()
-            .slice(s![..joint_setup.rho_dim()])
-            .to_owned();
+        let theta0 = joint_setup.theta0();
 
         // Build temporary owned slices for the closure call.
         let spec_refs: Vec<TermCollectionSpec> = resolved_specs.clone();
         let design_refs: Vec<TermCollectionDesign> = designs.clone();
-        let fit = fit_fn(&rho_only, &spec_refs, &design_refs)?;
+        let fit = fit_fn(&theta0, &spec_refs, &design_refs)?;
         return Ok(SpatialLengthScaleOptimizationResult {
             resolved_specs,
             designs,
@@ -11508,11 +11549,11 @@ where
             let designs = collect_designs(&ctx.cache);
             let need_hessian = matches!(order, OuterEvalOrder::ValueGradientHessian)
                 && analytic_outer_hessian_available;
-            match (&mut *exact_fn_cell.borrow_mut())(
-                &theta.slice(s![..rho_dim]).to_owned(),
-                &specs,
-                &designs,
-                need_hessian,
+                match (&mut *exact_fn_cell.borrow_mut())(
+                    theta,
+                    &specs,
+                    &designs,
+                    need_hessian,
             ) {
                 Ok((cost, grad, hess)) => {
                     ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
@@ -11556,7 +11597,7 @@ where
                 let specs = collect_specs(&ctx.cache);
                 let designs = collect_designs(&ctx.cache);
                 match (&mut *exact_fn_cell.borrow_mut())(
-                    &theta.slice(s![..rho_dim]).to_owned(),
+                    theta,
                     &specs,
                     &designs,
                     false, // cost-only: skip outer Hessian
@@ -11597,7 +11638,7 @@ where
                     let specs = collect_specs(&ctx.cache);
                     let designs = collect_designs(&ctx.cache);
                     let eval = (&mut *exact_efs_fn_cell.borrow_mut())(
-                        &theta.slice(s![..rho_dim]).to_owned(),
+                        theta,
                         &specs,
                         &designs,
                     )
@@ -11620,8 +11661,7 @@ where
     let resolved_specs: Vec<TermCollectionSpec> = collect_specs(&state.cache);
     let designs: Vec<TermCollectionDesign> = collect_designs(&state.cache);
 
-    let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
-    let fit = fit_fn(&rho_star, &resolved_specs, &designs)?;
+    let fit = fit_fn(&theta_star, &resolved_specs, &designs)?;
 
     for spec in &resolved_specs {
         log_spatial_aniso_scales(spec);
@@ -13797,16 +13837,16 @@ mod tests {
             crate::seeding::SeedRiskProfile::Gaussian,
             true,
             true,
-            |rho, specs, designs| {
-                assert!(rho.is_empty());
+            |theta, specs, designs| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 Ok(designs[0].design.ncols() as f64
                     + designs[1].design.ncols() as f64
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |rho, specs, designs, need_hessian| {
-                assert!(rho.is_empty());
+            |theta, specs, designs, need_hessian| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
                 Ok((
@@ -13821,8 +13861,8 @@ mod tests {
                     },
                 ))
             },
-            |rho, specs, designs| {
-                assert!(rho.is_empty());
+            |theta, specs, designs| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
                 Ok(crate::solver::outer_strategy::EfsEval {
@@ -13995,14 +14035,14 @@ mod tests {
             crate::seeding::SeedRiskProfile::Gaussian,
             true,
             true,
-            |rho, specs, designs| {
-                assert!(rho.is_empty());
+            |theta, specs, designs| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert_eq!(designs.len(), 2);
                 Ok(designs[0].design.ncols() as f64 + designs[1].design.ncols() as f64)
             },
-            |rho, specs, designs, need_hessian| {
-                assert!(rho.is_empty());
+            |theta, specs, designs, need_hessian| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert_eq!(designs.len(), 2);
                 Ok((
@@ -14017,8 +14057,8 @@ mod tests {
                     },
                 ))
             },
-            |rho, specs, designs| {
-                assert!(rho.is_empty());
+            |theta, specs, designs| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert_eq!(designs.len(), 2);
                 Ok(crate::solver::outer_strategy::EfsEval {
@@ -15676,16 +15716,16 @@ mod tests {
             crate::seeding::SeedRiskProfile::Gaussian,
             true,
             true,
-            |rho, specs, designs| {
-                assert!(rho.is_empty());
+            |theta, specs, designs| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 Ok(designs[0].design.ncols() as f64
                     + designs[1].design.ncols() as f64
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |rho, specs, designs, need_hessian| {
-                assert!(rho.is_empty());
+            |theta, specs, designs, need_hessian| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
                 Ok((
@@ -15700,8 +15740,8 @@ mod tests {
                     },
                 ))
             },
-            |rho, specs, designs| {
-                assert!(rho.is_empty());
+            |theta, specs, designs| {
+                assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
                 Ok(crate::solver::outer_strategy::EfsEval {
