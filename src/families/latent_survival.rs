@@ -15,8 +15,9 @@
 
 use crate::estimate::UnifiedFitResult;
 use crate::families::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, fit_custom_family,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, fit_custom_family,
+    slice_joint_into_block_working_sets,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
 use crate::families::lognormal_kernel::{
@@ -1506,6 +1507,61 @@ fn latent_survival_row_primary_third_contracted(
     Ok(out)
 }
 
+fn latent_survival_row_primary_fourth_contracted(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    mu: f64,
+    sigma: f64,
+    direction_u: &Array1<f64>,
+    direction_v: &Array1<f64>,
+    include_log_sigma: bool,
+) -> Result<Array2<f64>, String> {
+    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
+    let active_primary = if include_log_sigma {
+        LATENT_SURVIVAL_PRIMARY_DIM
+    } else {
+        LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+    };
+    let dir_u = LatentSurvivalPrimaryDirection {
+        dq_entry: direction_u[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+        dq_exit: direction_u[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+        dqdot_exit: direction_u[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+        dmu: direction_u[LATENT_SURVIVAL_PRIMARY_MU],
+        dlog_sigma: direction_u[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
+    };
+    let dir_v = LatentSurvivalPrimaryDirection {
+        dq_entry: direction_v[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+        dq_exit: direction_v[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+        dqdot_exit: direction_v[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+        dmu: direction_v[LATENT_SURVIVAL_PRIMARY_MU],
+        dlog_sigma: direction_v[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
+    };
+    let mut out = Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+    for a in 0..active_primary {
+        let dir_a = latent_survival_basis_direction(a);
+        for b in a..active_primary {
+            let coeff = latent_survival_row_primary_log_jet(
+                quadctx,
+                row,
+                q_entry,
+                q_exit,
+                qdot_exit,
+                mu,
+                sigma,
+                log_sigma_factor,
+                &[dir_a, latent_survival_basis_direction(b), dir_u, dir_v],
+            )?
+            .coeff(15);
+            out[[a, b]] = -coeff;
+            out[[b, a]] = -coeff;
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone)]
 struct LatentSurvivalJointSlices {
     time: std::ops::Range<usize>,
@@ -1552,6 +1608,59 @@ impl LatentSurvivalFamily {
             out[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA] = d_beta_flat[range.start];
         }
         out
+    }
+
+    fn joint_block_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        let slices = self.joint_slices();
+        let mut ranges = vec![slices.time.clone(), slices.mean.clone()];
+        if let Some(log_sigma) = slices.log_sigma {
+            ranges.push(log_sigma);
+        }
+        ranges
+    }
+
+    fn add_pullback_primary_gradient(
+        &self,
+        target: &mut Array1<f64>,
+        row: usize,
+        slices: &LatentSurvivalJointSlices,
+        primary_gradient: &Array1<f64>,
+        weight: f64,
+    ) {
+        for (primary_idx, time_vec) in [
+            (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
+            (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
+            (
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                self.x_time_derivative_exit.row(row),
+            ),
+        ] {
+            let scale = weight * primary_gradient[primary_idx];
+            if scale == 0.0 {
+                continue;
+            }
+            for i in 0..time_vec.len() {
+                let xi = time_vec[i];
+                if xi != 0.0 {
+                    target[slices.time.start + i] += scale * xi;
+                }
+            }
+        }
+
+        let mean_scale = weight * primary_gradient[LATENT_SURVIVAL_PRIMARY_MU];
+        if mean_scale != 0.0 {
+            self.x_mean
+                .axpy_row_into(
+                    row,
+                    mean_scale,
+                    &mut target.slice_mut(s![slices.mean.clone()]),
+                )
+                .expect("latent survival mean gradient pullback dimension mismatch");
+        }
+
+        if let Some(log_sigma) = &slices.log_sigma {
+            target[log_sigma.start] += weight * primary_gradient[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA];
+        }
     }
 
     fn add_pullback_primary_hessian(
@@ -1699,15 +1808,16 @@ impl LatentSurvivalFamily {
         }
     }
 
-    fn joint_outer_hyper_surrogate_hessian_dense(
+    fn evaluate_exact_newton_joint_gradient_dense(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<Array2<f64>, String> {
+    ) -> Result<(f64, Array1<f64>), String> {
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let sigma = self.latent_sd(block_states)?;
         let slices = self.joint_slices();
         let include_log_sigma = slices.log_sigma.is_some();
-        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        let mut ll = 0.0;
+        let mut gradient = Array1::<f64>::zeros(slices.total);
         for row_idx in 0..self.event_target.len() {
             let wi = self.weights[row_idx];
             if wi <= MIN_WEIGHT {
@@ -1729,7 +1839,7 @@ impl LatentSurvivalFamily {
                 self.unloaded_mass_exit[row_idx],
                 self.unloaded_hazard_exit[row_idx],
             )?;
-            let (_, _, primary_hessian) = latent_survival_row_primary_gradient_hessian(
+            let (row_ll, primary_gradient, _) = latent_survival_row_primary_gradient_hessian(
                 &self.quadctx,
                 &row,
                 q_entry[row_idx],
@@ -1739,12 +1849,80 @@ impl LatentSurvivalFamily {
                 sigma,
                 include_log_sigma,
             )?;
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary_hessian));
+            ll += wi * row_ll;
+            self.add_pullback_primary_gradient(
+                &mut gradient,
+                row_idx,
+                &slices,
+                &primary_gradient,
+                wi,
+            );
         }
-        Ok(out)
+        Ok((ll, gradient))
     }
 
-    fn joint_outer_hyper_surrogate_dh_dense(
+    fn evaluate_exact_newton_joint_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let sigma = self.latent_sd(block_states)?;
+        let slices = self.joint_slices();
+        let include_log_sigma = slices.log_sigma.is_some();
+        let mut ll = 0.0;
+        let mut gradient = Array1::<f64>::zeros(slices.total);
+        let mut hessian = Array2::<f64>::zeros((slices.total, slices.total));
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let event_type = if self.event_target[row_idx] >= 1 {
+                LatentSurvivalEventType::ExactEvent
+            } else {
+                LatentSurvivalEventType::RightCensored
+            };
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                event_type,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                self.unloaded_hazard_exit[row_idx],
+            )?;
+            let (row_ll, primary_gradient, primary_hessian) =
+                latent_survival_row_primary_gradient_hessian(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    mu[row_idx],
+                    sigma,
+                    include_log_sigma,
+                )?;
+            ll += wi * row_ll;
+            self.add_pullback_primary_gradient(
+                &mut gradient,
+                row_idx,
+                &slices,
+                &primary_gradient,
+                wi,
+            );
+            self.add_pullback_primary_hessian(
+                &mut hessian,
+                row_idx,
+                &slices,
+                &(wi * primary_hessian),
+            );
+        }
+        Ok((ll, gradient, hessian))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_dense(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
@@ -1795,6 +1973,65 @@ impl LatentSurvivalFamily {
                 include_log_sigma,
             )?;
             self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * third));
+        }
+        Ok(out)
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let sigma = self.latent_sd(block_states)?;
+        let slices = self.joint_slices();
+        if d_beta_u_flat.len() != slices.total || d_beta_v_flat.len() != slices.total {
+            return Err(format!(
+                "latent survival joint d2H direction length mismatch: got {} and {}, expected {}",
+                d_beta_u_flat.len(),
+                d_beta_v_flat.len(),
+                slices.total
+            ));
+        }
+        let include_log_sigma = slices.log_sigma.is_some();
+        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let event_type = if self.event_target[row_idx] >= 1 {
+                LatentSurvivalEventType::ExactEvent
+            } else {
+                LatentSurvivalEventType::RightCensored
+            };
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                event_type,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                self.unloaded_hazard_exit[row_idx],
+            )?;
+            let direction_u = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_u_flat);
+            let direction_v = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_v_flat);
+            let fourth = latent_survival_row_primary_fourth_contracted(
+                &self.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                mu[row_idx],
+                sigma,
+                &direction_u,
+                &direction_v,
+                include_log_sigma,
+            )?;
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * fourth));
         }
         Ok(out)
     }
@@ -2084,117 +2321,25 @@ fn binary_from_log_survival(log_survival: f64, event: u8) -> Result<BinaryFromLo
 }
 
 impl CustomFamily for LatentSurvivalFamily {
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
-        let latent_sd = self.latent_sd(block_states)?;
-        let n = self.event_target.len();
-        let p_time = self.x_time_exit.ncols();
-        let p_mean = self.x_mean.ncols();
-
-        let mut ll = 0.0;
-        let mut grad_time = Array1::<f64>::zeros(p_time);
-        let mut hess_time = Array2::<f64>::zeros((p_time, p_time));
-        let mut grad_mean = Array1::<f64>::zeros(p_mean);
-        let mut hess_mean = Array2::<f64>::zeros((p_mean, p_mean));
-        let mut grad_log_sigma = 0.0_f64;
-        let mut hess_log_sigma = 0.0_f64;
-
-        for i in 0..n {
-            let wi = self.weights[i];
-            if wi <= MIN_WEIGHT {
-                continue;
-            }
-            let event_type = if self.event_target[i] >= 1 {
-                LatentSurvivalEventType::ExactEvent
-            } else {
-                LatentSurvivalEventType::RightCensored
-            };
-            if !(q_entry[i].is_finite() && q_exit[i].is_finite() && mu[i].is_finite()) {
-                return Err(format!(
-                    "latent survival row {i} contains non-finite predictors: q_entry={}, q_exit={}, mu={}",
-                    q_entry[i], q_exit[i], mu[i]
-                ));
-            }
-            if matches!(event_type, LatentSurvivalEventType::ExactEvent)
-                && !(qdot_exit[i].is_finite() && qdot_exit[i] > 0.0)
-            {
-                return Err(format!(
-                    "latent survival row {i} has non-positive baseline derivative {}",
-                    qdot_exit[i]
-                ));
-            }
-
-            let row = build_latent_survival_row(
-                i,
-                self.hazard_loading,
-                event_type,
-                q_entry[i],
-                q_exit[i],
-                qdot_exit[i],
-                self.unloaded_mass_entry[i],
-                self.unloaded_mass_exit[i],
-                self.unloaded_hazard_exit[i],
-            )?;
-            let row_jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
-                .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
-            ll += wi * row_jet.log_lik;
-
-            let mean_row = self.x_mean.row_chunk(i..i + 1);
-            let mean_vec = mean_row.row(0);
-            for j in 0..p_mean {
-                grad_mean[j] += wi * row_jet.score * mean_vec[j];
-            }
-            dense_outer_accumulate(&mut hess_mean, wi * row_jet.neg_hessian, mean_vec);
-
-            grad_log_sigma += wi * row_jet.score_log_sigma;
-            hess_log_sigma += wi * row_jet.neg_hessian_log_sigma;
-
-            let time_jet =
-                latent_survival_time_jet(&self.quadctx, &row, qdot_exit[i], mu[i], latent_sd)?;
-            let t_entry = self.x_time_entry.row(i);
-            let t_exit = self.x_time_exit.row(i);
-            let t_deriv = self.x_time_derivative_exit.row(i);
-            for j in 0..p_time {
-                grad_time[j] += wi
-                    * (time_jet.grad_entry * t_entry[j]
-                        + time_jet.grad_exit * t_exit[j]
-                        + time_jet.grad_qdot * t_deriv[j]);
-            }
-            dense_outer_accumulate(&mut hess_time, wi * time_jet.neg_hess_entry, t_entry);
-            dense_outer_accumulate(&mut hess_time, wi * time_jet.neg_hess_exit, t_exit);
-            if time_jet.neg_hess_qdot != 0.0 {
-                dense_outer_accumulate(&mut hess_time, wi * time_jet.neg_hess_qdot, t_deriv);
-            }
-            if time_jet.neg_hess_exit_qdot != 0.0 {
-                dense_symmetric_cross_accumulate(
-                    &mut hess_time,
-                    wi * time_jet.neg_hess_exit_qdot,
-                    t_exit,
-                    t_deriv,
-                );
-            }
-        }
-
-        let mut blockworking_sets = vec![
-            BlockWorkingSet::ExactNewton {
-                gradient: grad_time,
-                hessian: SymmetricMatrix::Dense(hess_time),
-            },
-            BlockWorkingSet::ExactNewton {
-                gradient: grad_mean,
-                hessian: SymmetricMatrix::Dense(hess_mean),
-            },
-        ];
-        if self.latent_sd_fixed.is_none() {
-            blockworking_sets.push(BlockWorkingSet::ExactNewton {
-                gradient: Array1::from_elem(1, grad_log_sigma),
-                hessian: SymmetricMatrix::Dense(Array2::from_elem((1, 1), hess_log_sigma)),
-            });
-        }
-
+        let (ll, joint_gradient, joint_hessian) =
+            self.evaluate_exact_newton_joint_dense(block_states)?;
+        let block_ranges = self.joint_block_ranges();
+        let block_gradients = block_ranges
+            .iter()
+            .map(|range| joint_gradient.slice(s![range.clone()]).to_owned())
+            .collect();
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets,
+            blockworking_sets: slice_joint_into_block_working_sets(
+                block_gradients,
+                &joint_hessian,
+                &block_ranges,
+            ),
         })
     }
 
@@ -2244,23 +2389,49 @@ impl CustomFamily for LatentSurvivalFamily {
         }
     }
 
-    fn joint_outer_hyper_surrogate_hessian_with_specs(
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.evaluate_exact_newton_joint_dense(block_states)
+            .map(|(_, _, hessian)| Some(hessian))
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        self.evaluate_exact_newton_joint_gradient_dense(block_states)
+            .map(|(log_likelihood, gradient)| {
+                Some(ExactNewtonJointGradientEvaluation {
+                    log_likelihood,
+                    gradient,
+                })
+            })
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.joint_outer_hyper_surrogate_hessian_dense(block_states)
+        self.exact_newton_joint_hessian_directional_derivative_dense(block_states, d_beta_flat)
             .map(Some)
     }
 
-    fn joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+    fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        d_beta_flat: &Array1<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.joint_outer_hyper_surrogate_dh_dense(block_states, d_beta_flat)
-            .map(Some)
+        self.exact_newton_joint_hessian_second_directional_derivative_dense(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+        .map(Some)
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
@@ -2427,9 +2598,85 @@ mod tests {
     use crate::matrix::DenseDesignMatrix;
     use ndarray::array;
 
+    fn learnable_sigma_test_family() -> LatentSurvivalFamily {
+        LatentSurvivalFamily {
+            event_target: array![1u8, 0u8],
+            weights: array![1.0, 0.7],
+            latent_sd_fixed: None,
+            hazard_loading: HazardLoading::Full,
+            unloaded_mass_entry: array![0.02, 0.03],
+            unloaded_mass_exit: array![0.05, 0.08],
+            unloaded_hazard_exit: array![0.04, 0.0],
+            x_time_entry: array![[1.0, -0.2], [0.4, 0.7]],
+            x_time_exit: array![[1.3, 0.1], [0.9, 1.0]],
+            x_time_derivative_exit: array![[0.8, 0.4], [0.6, 0.5]],
+            x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, -0.3], [0.2, 0.9]])),
+            time_linear_constraints: None,
+            quadctx: Arc::new(QuadratureContext::new()),
+        }
+    }
+
+    fn learnable_sigma_test_joint_beta() -> Array1<f64> {
+        array![0.15, 0.25, 0.1, -0.15, 0.35_f64.ln()]
+    }
+
+    fn latent_survival_states_from_joint_beta(
+        family: &LatentSurvivalFamily,
+        joint_beta: &Array1<f64>,
+    ) -> Vec<ParameterBlockState> {
+        let slices = family.joint_slices();
+        let n = family.event_target.len();
+        let beta_time = joint_beta.slice(s![slices.time.clone()]).to_owned();
+        let beta_mean = joint_beta.slice(s![slices.mean.clone()]).to_owned();
+
+        let mut eta_time = Array1::<f64>::zeros(3 * n);
+        eta_time
+            .slice_mut(s![0..n])
+            .assign(&family.x_time_entry.dot(&beta_time));
+        eta_time
+            .slice_mut(s![n..2 * n])
+            .assign(&family.x_time_exit.dot(&beta_time));
+        eta_time
+            .slice_mut(s![2 * n..3 * n])
+            .assign(&family.x_time_derivative_exit.dot(&beta_time));
+
+        let mut states = vec![
+            ParameterBlockState {
+                beta: beta_time,
+                eta: eta_time,
+            },
+            ParameterBlockState {
+                beta: beta_mean.clone(),
+                eta: family.x_mean.dot(&beta_mean),
+            },
+        ];
+        if let Some(log_sigma) = slices.log_sigma {
+            let beta_log_sigma = array![joint_beta[log_sigma.start]];
+            states.push(ParameterBlockState {
+                beta: beta_log_sigma.clone(),
+                eta: beta_log_sigma,
+            });
+        }
+        states
+    }
+
+    fn max_relative_array1(left: &Array1<f64>, right: &Array1<f64>) -> f64 {
+        left.iter()
+            .zip(right.iter())
+            .map(|(l, r)| (l - r).abs() / l.abs().max(r.abs()).max(1e-12))
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn max_relative_array2(left: &Array2<f64>, right: &Array2<f64>) -> f64 {
+        left.iter()
+            .zip(right.iter())
+            .map(|(l, r)| (l - r).abs() / l.abs().max(r.abs()).max(1e-12))
+            .fold(0.0_f64, f64::max)
+    }
+
     #[test]
     fn latent_survival_learnable_sigma_block_matches_family_fd() {
-        let sigma = 0.35;
+        let sigma: f64 = 0.35;
         let log_sigma = sigma.ln();
         let h = 1e-5;
 
@@ -2540,5 +2787,141 @@ mod tests {
             "family log_sigma neg_hess={}, fd={fd_neg_hess}",
             neg_hess
         );
+    }
+
+    #[test]
+    fn latent_survival_exact_joint_hessian_matches_gradient_fd() {
+        let family = learnable_sigma_test_family();
+        let beta = learnable_sigma_test_joint_beta();
+        let states = latent_survival_states_from_joint_beta(&family, &beta);
+        let h = 1e-6;
+
+        let analytic_hessian = family
+            .exact_newton_joint_hessian(&states)
+            .expect("analytic joint hessian evaluation")
+            .expect("latent survival should expose exact joint hessian");
+
+        for j in 0..beta.len() {
+            let mut beta_plus = beta.clone();
+            beta_plus[j] += h;
+            let gradient_plus = family
+                .exact_newton_joint_gradient_evaluation(
+                    &latent_survival_states_from_joint_beta(&family, &beta_plus),
+                    &[],
+                )
+                .expect("joint gradient plus")
+                .expect("joint gradient should exist")
+                .gradient;
+
+            let mut beta_minus = beta.clone();
+            beta_minus[j] -= h;
+            let gradient_minus = family
+                .exact_newton_joint_gradient_evaluation(
+                    &latent_survival_states_from_joint_beta(&family, &beta_minus),
+                    &[],
+                )
+                .expect("joint gradient minus")
+                .expect("joint gradient should exist")
+                .gradient;
+
+            let fd_column = (&gradient_plus - &gradient_minus) / (2.0 * h);
+            let analytic_column = analytic_hessian.column(j).to_owned();
+            let rel = max_relative_array1(&analytic_column, &(-fd_column));
+            assert!(
+                rel < 5e-4,
+                "joint Hessian column {j} mismatch: rel={rel}, analytic={analytic_column:?}, fd={:?}",
+                -((&gradient_plus - &gradient_minus) / (2.0 * h))
+            );
+        }
+    }
+
+    #[test]
+    fn latent_survival_exact_joint_dh_matches_hessian_fd() {
+        let family = learnable_sigma_test_family();
+        let beta = learnable_sigma_test_joint_beta();
+        let states = latent_survival_states_from_joint_beta(&family, &beta);
+        let h = 1e-6;
+        let direction = array![0.07, -0.03, 0.05, 0.02, -0.04];
+
+        let analytic = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &direction)
+            .expect("analytic joint dH evaluation")
+            .expect("latent survival should expose exact joint dH");
+
+        let hessian_plus = family
+            .exact_newton_joint_hessian(&latent_survival_states_from_joint_beta(
+                &family,
+                &(beta.clone() + h * &direction),
+            ))
+            .expect("joint hessian plus")
+            .expect("joint hessian should exist");
+        let hessian_minus = family
+            .exact_newton_joint_hessian(&latent_survival_states_from_joint_beta(
+                &family,
+                &(beta.clone() - h * &direction),
+            ))
+            .expect("joint hessian minus")
+            .expect("joint hessian should exist");
+
+        let fd = (&hessian_plus - &hessian_minus) / (2.0 * h);
+        let rel = max_relative_array2(&analytic, &fd);
+        assert!(rel < 2e-3, "joint dH mismatch: rel={rel}");
+    }
+
+    #[test]
+    fn latent_survival_exact_joint_d2h_matches_directional_fd() {
+        let family = learnable_sigma_test_family();
+        let beta = learnable_sigma_test_joint_beta();
+        let states = latent_survival_states_from_joint_beta(&family, &beta);
+        let h = 1e-6;
+        let direction_u = array![0.07, -0.03, 0.05, 0.02, -0.04];
+        let direction_v = array![-0.02, 0.06, -0.01, 0.03, 0.05];
+
+        let analytic = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &states,
+                &direction_u,
+                &direction_v,
+            )
+            .expect("analytic joint d2H evaluation")
+            .expect("latent survival should expose exact joint d2H");
+        let swapped = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &states,
+                &direction_v,
+                &direction_u,
+            )
+            .expect("swapped analytic joint d2H evaluation")
+            .expect("latent survival should expose exact joint d2H");
+        let symmetry_rel = max_relative_array2(&analytic, &swapped);
+        assert!(
+            symmetry_rel < 1e-10,
+            "joint d2H should be symmetric in directions, got rel={symmetry_rel}"
+        );
+
+        let dh_plus = family
+            .exact_newton_joint_hessian_directional_derivative(
+                &latent_survival_states_from_joint_beta(
+                    &family,
+                    &(beta.clone() + h * &direction_v),
+                ),
+                &direction_u,
+            )
+            .expect("joint dH plus")
+            .expect("joint dH should exist");
+        let dh_minus = family
+            .exact_newton_joint_hessian_directional_derivative(
+                &latent_survival_states_from_joint_beta(
+                    &family,
+                    &(beta.clone() - h * &direction_v),
+                ),
+                &direction_u,
+            )
+            .expect("joint dH minus")
+            .expect("joint dH should exist");
+
+        let fd = (&dh_plus - &dh_minus) / (2.0 * h);
+        let rel = max_relative_array2(&analytic, &fd);
+        assert!(rel < 6e-3, "joint d2H mismatch: rel={rel}");
     }
 }
