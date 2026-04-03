@@ -35,6 +35,7 @@ use crate::smooth::{
     freeze_term_collection_from_design,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const MIN_WEIGHT: f64 = 1e-12;
@@ -255,7 +256,7 @@ pub fn fixed_latent_hazard_frailty(
         FrailtySpec::HazardMultiplier {
             sigma_fixed: None, ..
         } => Err(format!(
-            "{context} requires a fixed hazard-multiplier sigma; learnable sigma is not implemented for this family"
+            "{context} currently requires a fixed hazard-multiplier sigma"
         )),
         FrailtySpec::GaussianShift { .. } => Err(format!(
             "{context} requires HazardMultiplier frailty, not GaussianShift"
@@ -823,6 +824,982 @@ fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
     }
 }
 
+const LATENT_SURVIVAL_PRIMARY_Q_ENTRY: usize = 0;
+const LATENT_SURVIVAL_PRIMARY_Q_EXIT: usize = 1;
+const LATENT_SURVIVAL_PRIMARY_QDOT_EXIT: usize = 2;
+const LATENT_SURVIVAL_PRIMARY_MU: usize = 3;
+const LATENT_SURVIVAL_PRIMARY_LOG_SIGMA: usize = 4;
+const LATENT_SURVIVAL_PRIMARY_DIM: usize = 5;
+
+fn latent_jet_subset_partitions(mask: usize) -> Vec<Vec<usize>> {
+    if mask == 0 {
+        return vec![Vec::new()];
+    }
+    let first = mask & mask.wrapping_neg();
+    let rest = mask ^ first;
+    let mut out = Vec::new();
+    let mut subset = rest;
+    loop {
+        let block = first | subset;
+        for mut remainder in latent_jet_subset_partitions(rest ^ subset) {
+            remainder.push(block);
+            out.push(remainder);
+        }
+        if subset == 0 {
+            break;
+        }
+        subset = (subset - 1) & rest;
+    }
+    out
+}
+
+#[derive(Clone)]
+struct LatentMultiDirJet {
+    coeffs: Vec<f64>,
+}
+
+impl LatentMultiDirJet {
+    fn zero(n_dirs: usize) -> Self {
+        Self {
+            coeffs: vec![0.0; 1usize << n_dirs],
+        }
+    }
+
+    fn constant(n_dirs: usize, value: f64) -> Self {
+        let mut out = Self::zero(n_dirs);
+        out.coeffs[0] = value;
+        out
+    }
+
+    fn coeff(&self, mask: usize) -> f64 {
+        self.coeffs[mask]
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        Self {
+            coeffs: self
+                .coeffs
+                .iter()
+                .zip(other.coeffs.iter())
+                .map(|(l, r)| l + r)
+                .collect(),
+        }
+    }
+
+    fn scale(&self, scalar: f64) -> Self {
+        Self {
+            coeffs: self.coeffs.iter().map(|v| scalar * v).collect(),
+        }
+    }
+
+    fn compose_unary(&self, derivs: [f64; 5]) -> Self {
+        let count = self.coeffs.len();
+        let mut out = vec![0.0; count];
+        out[0] = derivs[0];
+        for (mask, value) in out.iter_mut().enumerate().skip(1) {
+            let mut total = 0.0;
+            for partition in latent_jet_subset_partitions(mask) {
+                let order = partition.len();
+                if order == 0 || order >= derivs.len() {
+                    continue;
+                }
+                let mut prod = 1.0;
+                for block in partition {
+                    prod *= self.coeffs[block];
+                }
+                total += derivs[order] * prod;
+            }
+            *value = total;
+        }
+        Self { coeffs: out }
+    }
+}
+
+#[inline]
+fn latent_unary_derivatives_log(x: f64) -> [f64; 5] {
+    let x1 = x.max(1e-300);
+    let x2 = x1 * x1;
+    let x3 = x2 * x1;
+    let x4 = x3 * x1;
+    [x1.ln(), 1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4]
+}
+
+#[inline]
+fn latent_log1mexp(a: f64) -> f64 {
+    assert!(a >= 0.0);
+    if a > core::f64::consts::LN_2 {
+        (-(-a).exp()).ln_1p()
+    } else if a > 0.0 {
+        (-(-a).exp_m1()).ln()
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+fn latent_signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
+    let mut pos_max = f64::NEG_INFINITY;
+    let mut neg_max = f64::NEG_INFINITY;
+    for (idx, &lm) in log_mags.iter().enumerate() {
+        if signs[idx] > 0.0 {
+            pos_max = pos_max.max(lm);
+        } else if signs[idx] < 0.0 {
+            neg_max = neg_max.max(lm);
+        }
+    }
+
+    let mut pos_sum = 0.0_f64;
+    let mut neg_sum = 0.0_f64;
+    for (idx, &lm) in log_mags.iter().enumerate() {
+        if !lm.is_finite() {
+            continue;
+        }
+        if signs[idx] > 0.0 {
+            pos_sum += (lm - pos_max).exp();
+        } else if signs[idx] < 0.0 {
+            neg_sum += (lm - neg_max).exp();
+        }
+    }
+
+    let log_pos = if pos_sum > 0.0 {
+        pos_max + pos_sum.ln()
+    } else {
+        f64::NEG_INFINITY
+    };
+    let log_neg = if neg_sum > 0.0 {
+        neg_max + neg_sum.ln()
+    } else {
+        f64::NEG_INFINITY
+    };
+
+    if log_neg == f64::NEG_INFINITY {
+        return (log_pos, 1.0);
+    }
+    if log_pos == f64::NEG_INFINITY {
+        return (log_neg, -1.0);
+    }
+    if log_pos > log_neg {
+        let gap = log_pos - log_neg;
+        (log_pos + latent_log1mexp(gap), 1.0)
+    } else if log_neg > log_pos {
+        let gap = log_neg - log_pos;
+        (log_neg + latent_log1mexp(gap), -1.0)
+    } else {
+        (f64::NEG_INFINITY, 0.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LatentKernelPrimaryTerm {
+    coeff: f64,
+    q_exp: usize,
+    qdot_power: usize,
+    tau_exp: usize,
+    k: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LatentKernelPrimaryDirection {
+    dq: f64,
+    dqd: f64,
+    dmu: f64,
+    dtau: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LatentSurvivalPrimaryDirection {
+    dq_entry: f64,
+    dq_exit: f64,
+    dqdot_exit: f64,
+    dmu: f64,
+    dlog_sigma: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LatentKernelPrimaryState {
+    q: f64,
+    qdot: f64,
+    mu: f64,
+    sigma: f64,
+    log_sigma_factor: f64,
+}
+
+fn latent_kernel_accumulate_term(
+    terms: &mut BTreeMap<(usize, usize, usize, usize), f64>,
+    term: LatentKernelPrimaryTerm,
+    scale: f64,
+) {
+    if scale == 0.0 || term.coeff == 0.0 {
+        return;
+    }
+    *terms
+        .entry((term.q_exp, term.qdot_power, term.tau_exp, term.k))
+        .or_insert(0.0) += scale * term.coeff;
+}
+
+fn latent_kernel_differentiate_terms(
+    terms: &[LatentKernelPrimaryTerm],
+    dir: LatentKernelPrimaryDirection,
+) -> Vec<LatentKernelPrimaryTerm> {
+    let mut out = BTreeMap::<(usize, usize, usize, usize), f64>::new();
+    for term in terms {
+        if dir.dq != 0.0 {
+            if term.q_exp > 0 {
+                latent_kernel_accumulate_term(&mut out, *term, dir.dq * term.q_exp as f64);
+            }
+            latent_kernel_accumulate_term(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    q_exp: term.q_exp + 1,
+                    k: term.k + 1,
+                    ..*term
+                },
+                -dir.dq,
+            );
+        }
+        if dir.dmu != 0.0 {
+            if term.k > 0 {
+                latent_kernel_accumulate_term(&mut out, *term, dir.dmu * term.k as f64);
+            }
+            latent_kernel_accumulate_term(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    q_exp: term.q_exp + 1,
+                    k: term.k + 1,
+                    ..*term
+                },
+                -dir.dmu,
+            );
+        }
+        if dir.dtau != 0.0 {
+            if term.tau_exp > 0 {
+                latent_kernel_accumulate_term(&mut out, *term, dir.dtau * term.tau_exp as f64);
+            }
+            let kf = term.k as f64;
+            latent_kernel_accumulate_term(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    tau_exp: term.tau_exp + 2,
+                    ..*term
+                },
+                dir.dtau * kf * kf,
+            );
+            latent_kernel_accumulate_term(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    q_exp: term.q_exp + 1,
+                    tau_exp: term.tau_exp + 2,
+                    k: term.k + 1,
+                    ..*term
+                },
+                -dir.dtau * (2.0 * kf + 1.0),
+            );
+            latent_kernel_accumulate_term(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    q_exp: term.q_exp + 2,
+                    tau_exp: term.tau_exp + 2,
+                    k: term.k + 2,
+                    ..*term
+                },
+                dir.dtau,
+            );
+        }
+        if dir.dqd != 0.0 && term.qdot_power > 0 {
+            latent_kernel_accumulate_term(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    qdot_power: term.qdot_power - 1,
+                    ..*term
+                },
+                dir.dqd * term.qdot_power as f64,
+            );
+        }
+    }
+    out.into_iter()
+        .filter_map(|((q_exp, qdot_power, tau_exp, k), coeff)| {
+            (coeff != 0.0).then_some(LatentKernelPrimaryTerm {
+                coeff,
+                q_exp,
+                qdot_power,
+                tau_exp,
+                k,
+            })
+        })
+        .collect()
+}
+
+fn latent_kernel_term_lists_for_directions(
+    base_terms: &[LatentKernelPrimaryTerm],
+    directions: &[LatentKernelPrimaryDirection],
+) -> Vec<Vec<LatentKernelPrimaryTerm>> {
+    fn build_mask(
+        mask: usize,
+        base_terms: &[LatentKernelPrimaryTerm],
+        directions: &[LatentKernelPrimaryDirection],
+        cache: &mut [Option<Vec<LatentKernelPrimaryTerm>>],
+    ) -> Vec<LatentKernelPrimaryTerm> {
+        if let Some(existing) = &cache[mask] {
+            return existing.clone();
+        }
+        let built = if mask == 0 {
+            base_terms.to_vec()
+        } else {
+            let bit = 1usize << mask.trailing_zeros();
+            let prev = build_mask(mask ^ bit, base_terms, directions, cache);
+            latent_kernel_differentiate_terms(&prev, directions[bit.trailing_zeros() as usize])
+        };
+        cache[mask] = Some(built.clone());
+        built
+    }
+
+    let mut cache = vec![None; 1usize << directions.len()];
+    (0..cache.len())
+        .map(|mask| build_mask(mask, base_terms, directions, &mut cache))
+        .collect()
+}
+
+fn latent_kernel_sum_log_jet(
+    quadctx: &QuadratureContext,
+    base_terms: &[LatentKernelPrimaryTerm],
+    state: LatentKernelPrimaryState,
+    directions: &[LatentKernelPrimaryDirection],
+    context: &str,
+) -> Result<LatentMultiDirJet, String> {
+    let term_lists = latent_kernel_term_lists_for_directions(base_terms, directions);
+    let max_k = term_lists
+        .iter()
+        .flat_map(|terms| terms.iter().map(|term| term.k))
+        .max()
+        .unwrap_or(0);
+    let bundle = log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k)
+        .map_err(|e| format!("{context} kernel evaluation failed: {e}"))?;
+
+    let evaluate_terms = |terms: &[LatentKernelPrimaryTerm]| -> Result<(f64, f64), String> {
+        let mut log_mags = Vec::new();
+        let mut signs = Vec::new();
+        for term in terms {
+            if term.coeff == 0.0 {
+                continue;
+            }
+            if term.qdot_power > 0 && !(state.qdot.is_finite() && state.qdot > 0.0) {
+                return Err(format!(
+                    "{context} requires positive finite qdot for exact-event directional terms, got {}",
+                    state.qdot
+                ));
+            }
+            let log_qdot = if term.qdot_power > 0 {
+                state.qdot.ln()
+            } else {
+                0.0
+            };
+            let log_mag = term.coeff.abs().ln()
+                + term.q_exp as f64 * state.q
+                + term.tau_exp as f64 * state.log_sigma_factor
+                + term.qdot_power as f64 * log_qdot
+                + bundle.get(term.k);
+            log_mags.push(log_mag);
+            signs.push(term.coeff.signum());
+        }
+        if log_mags.is_empty() {
+            return Ok((f64::NEG_INFINITY, 0.0));
+        }
+        Ok(latent_signed_log_sum_exp(&log_mags, &signs))
+    };
+
+    let (base_log_sum, base_sign) = evaluate_terms(&term_lists[0])?;
+    if !(base_log_sum.is_finite() && base_sign > 0.0) {
+        return Err(format!(
+            "{context} produced a non-positive signed kernel sum"
+        ));
+    }
+
+    let mut normalized = LatentMultiDirJet::constant(directions.len(), 1.0);
+    for mask in 1..term_lists.len() {
+        let (log_abs, sign) = evaluate_terms(&term_lists[mask])?;
+        normalized.coeffs[mask] = if !log_abs.is_finite() || sign == 0.0 {
+            0.0
+        } else {
+            sign * (log_abs - base_log_sum).exp()
+        };
+    }
+
+    let mut out = normalized.compose_unary(latent_unary_derivatives_log(1.0));
+    out.coeffs[0] += base_log_sum;
+    Ok(out)
+}
+
+fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryDirection {
+    match primary_idx {
+        LATENT_SURVIVAL_PRIMARY_Q_ENTRY => LatentSurvivalPrimaryDirection {
+            dq_entry: 1.0,
+            dq_exit: 0.0,
+            dqdot_exit: 0.0,
+            dmu: 0.0,
+            dlog_sigma: 0.0,
+        },
+        LATENT_SURVIVAL_PRIMARY_Q_EXIT => LatentSurvivalPrimaryDirection {
+            dq_entry: 0.0,
+            dq_exit: 1.0,
+            dqdot_exit: 0.0,
+            dmu: 0.0,
+            dlog_sigma: 0.0,
+        },
+        LATENT_SURVIVAL_PRIMARY_QDOT_EXIT => LatentSurvivalPrimaryDirection {
+            dq_entry: 0.0,
+            dq_exit: 0.0,
+            dqdot_exit: 1.0,
+            dmu: 0.0,
+            dlog_sigma: 0.0,
+        },
+        LATENT_SURVIVAL_PRIMARY_MU => LatentSurvivalPrimaryDirection {
+            dq_entry: 0.0,
+            dq_exit: 0.0,
+            dqdot_exit: 0.0,
+            dmu: 1.0,
+            dlog_sigma: 0.0,
+        },
+        LATENT_SURVIVAL_PRIMARY_LOG_SIGMA => LatentSurvivalPrimaryDirection {
+            dq_entry: 0.0,
+            dq_exit: 0.0,
+            dqdot_exit: 0.0,
+            dmu: 0.0,
+            dlog_sigma: 1.0,
+        },
+        _ => panic!("invalid latent survival primary index {primary_idx}"),
+    }
+}
+
+fn latent_survival_map_entry_direction(
+    direction: LatentSurvivalPrimaryDirection,
+) -> LatentKernelPrimaryDirection {
+    LatentKernelPrimaryDirection {
+        dq: direction.dq_entry,
+        dqd: 0.0,
+        dmu: direction.dmu,
+        dtau: direction.dlog_sigma,
+    }
+}
+
+fn latent_survival_map_exit_direction(
+    direction: LatentSurvivalPrimaryDirection,
+    event_type: LatentSurvivalEventType,
+) -> LatentKernelPrimaryDirection {
+    LatentKernelPrimaryDirection {
+        dq: direction.dq_exit,
+        dqd: if matches!(event_type, LatentSurvivalEventType::ExactEvent) {
+            direction.dqdot_exit
+        } else {
+            0.0
+        },
+        dmu: direction.dmu,
+        dtau: direction.dlog_sigma,
+    }
+}
+
+fn latent_survival_row_primary_log_jet(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    mu: f64,
+    sigma: f64,
+    log_sigma_factor: f64,
+    directions: &[LatentSurvivalPrimaryDirection],
+) -> Result<LatentMultiDirJet, String> {
+    let entry_state = LatentKernelPrimaryState {
+        q: q_entry,
+        qdot: 1.0,
+        mu,
+        sigma,
+        log_sigma_factor,
+    };
+    let exit_state = LatentKernelPrimaryState {
+        q: q_exit,
+        qdot: qdot_exit,
+        mu,
+        sigma,
+        log_sigma_factor,
+    };
+    let entry_directions = directions
+        .iter()
+        .copied()
+        .map(latent_survival_map_entry_direction)
+        .collect::<Vec<_>>();
+    let exit_directions = directions
+        .iter()
+        .copied()
+        .map(|dir| latent_survival_map_exit_direction(dir, row.event_type))
+        .collect::<Vec<_>>();
+
+    let denominator = latent_kernel_sum_log_jet(
+        quadctx,
+        &[LatentKernelPrimaryTerm {
+            coeff: 1.0,
+            q_exp: 0,
+            qdot_power: 0,
+            tau_exp: 0,
+            k: 0,
+        }],
+        entry_state,
+        &entry_directions,
+        "latent survival denominator",
+    )?;
+
+    let numerator_terms = match row.event_type {
+        LatentSurvivalEventType::RightCensored => vec![LatentKernelPrimaryTerm {
+            coeff: 1.0,
+            q_exp: 0,
+            qdot_power: 0,
+            tau_exp: 0,
+            k: 0,
+        }],
+        LatentSurvivalEventType::ExactEvent => {
+            let mut terms = Vec::new();
+            if row.hazard_unloaded > 0.0 {
+                terms.push(LatentKernelPrimaryTerm {
+                    coeff: row.hazard_unloaded,
+                    q_exp: 0,
+                    qdot_power: 0,
+                    tau_exp: 0,
+                    k: 0,
+                });
+            }
+            terms.push(LatentKernelPrimaryTerm {
+                coeff: 1.0,
+                q_exp: 1,
+                qdot_power: 1,
+                tau_exp: 0,
+                k: 1,
+            });
+            terms
+        }
+        LatentSurvivalEventType::IntervalCensored => {
+            return Err(
+                "latent survival dynamic time derivatives do not implement interval censoring"
+                    .to_string(),
+            );
+        }
+    };
+    let numerator = latent_kernel_sum_log_jet(
+        quadctx,
+        &numerator_terms,
+        exit_state,
+        &exit_directions,
+        "latent survival numerator",
+    )?;
+
+    let mut total = numerator.add(&denominator.scale(-1.0));
+    total.coeffs[0] += -row.mass_unloaded_exit + row.mass_unloaded_entry;
+    Ok(total)
+}
+
+fn latent_survival_row_primary_gradient_hessian(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    mu: f64,
+    sigma: f64,
+    include_log_sigma: bool,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
+    let mut gradient = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
+    let mut neg_hessian =
+        Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+    let active_primary = if include_log_sigma {
+        LATENT_SURVIVAL_PRIMARY_DIM
+    } else {
+        LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+    };
+    let log_lik = latent_survival_row_primary_log_jet(
+        quadctx,
+        row,
+        q_entry,
+        q_exit,
+        qdot_exit,
+        mu,
+        sigma,
+        log_sigma_factor,
+        &[],
+    )?
+    .coeff(0);
+    for a in 0..active_primary {
+        let dir_a = latent_survival_basis_direction(a);
+        gradient[a] = latent_survival_row_primary_log_jet(
+            quadctx,
+            row,
+            q_entry,
+            q_exit,
+            qdot_exit,
+            mu,
+            sigma,
+            log_sigma_factor,
+            &[dir_a],
+        )?
+        .coeff(1);
+        for b in a..active_primary {
+            let coeff = latent_survival_row_primary_log_jet(
+                quadctx,
+                row,
+                q_entry,
+                q_exit,
+                qdot_exit,
+                mu,
+                sigma,
+                log_sigma_factor,
+                &[dir_a, latent_survival_basis_direction(b)],
+            )?
+            .coeff(3);
+            neg_hessian[[a, b]] = -coeff;
+            neg_hessian[[b, a]] = -coeff;
+        }
+    }
+    Ok((log_lik, gradient, neg_hessian))
+}
+
+fn latent_survival_row_primary_third_contracted(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    mu: f64,
+    sigma: f64,
+    direction: &Array1<f64>,
+    include_log_sigma: bool,
+) -> Result<Array2<f64>, String> {
+    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
+    let active_primary = if include_log_sigma {
+        LATENT_SURVIVAL_PRIMARY_DIM
+    } else {
+        LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+    };
+    let dir = LatentSurvivalPrimaryDirection {
+        dq_entry: direction[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+        dq_exit: direction[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+        dqdot_exit: direction[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+        dmu: direction[LATENT_SURVIVAL_PRIMARY_MU],
+        dlog_sigma: direction[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
+    };
+    let mut out = Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+    for a in 0..active_primary {
+        let dir_a = latent_survival_basis_direction(a);
+        for b in a..active_primary {
+            let coeff = latent_survival_row_primary_log_jet(
+                quadctx,
+                row,
+                q_entry,
+                q_exit,
+                qdot_exit,
+                mu,
+                sigma,
+                log_sigma_factor,
+                &[dir_a, latent_survival_basis_direction(b), dir],
+            )?
+            .coeff(7);
+            out[[a, b]] = -coeff;
+            out[[b, a]] = -coeff;
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone)]
+struct LatentSurvivalJointSlices {
+    time: std::ops::Range<usize>,
+    mean: std::ops::Range<usize>,
+    log_sigma: Option<std::ops::Range<usize>>,
+    total: usize,
+}
+
+impl LatentSurvivalFamily {
+    fn joint_slices(&self) -> LatentSurvivalJointSlices {
+        let p_time = self.x_time_exit.ncols();
+        let p_mean = self.x_mean.ncols();
+        let time = 0..p_time;
+        let mean = p_time..p_time + p_mean;
+        let log_sigma = self
+            .latent_sd_fixed
+            .is_none()
+            .then_some((p_time + p_mean)..(p_time + p_mean + 1));
+        LatentSurvivalJointSlices {
+            total: log_sigma
+                .as_ref()
+                .map_or(p_time + p_mean, |range| range.end),
+            time,
+            mean,
+            log_sigma,
+        }
+    }
+
+    fn row_primary_direction_from_flat(
+        &self,
+        row: usize,
+        slices: &LatentSurvivalJointSlices,
+        d_beta_flat: &Array1<f64>,
+    ) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
+        let d_time = d_beta_flat.slice(s![slices.time.clone()]);
+        out[LATENT_SURVIVAL_PRIMARY_Q_ENTRY] = self.x_time_entry.row(row).dot(&d_time);
+        out[LATENT_SURVIVAL_PRIMARY_Q_EXIT] = self.x_time_exit.row(row).dot(&d_time);
+        out[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT] = self.x_time_derivative_exit.row(row).dot(&d_time);
+        out[LATENT_SURVIVAL_PRIMARY_MU] = self
+            .x_mean
+            .dot_row_view(row, d_beta_flat.slice(s![slices.mean.clone()]));
+        if let Some(range) = &slices.log_sigma {
+            out[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA] = d_beta_flat[range.start];
+        }
+        out
+    }
+
+    fn add_pullback_primary_hessian(
+        &self,
+        target: &mut Array2<f64>,
+        row: usize,
+        slices: &LatentSurvivalJointSlices,
+        primary_hessian: &Array2<f64>,
+    ) {
+        let time_weights = [
+            primary_hessian[[
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+            ]],
+            primary_hessian[[
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+            ]],
+            primary_hessian[[
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+            ]],
+        ];
+        let time_cross_weights = [
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                &self.x_time_entry,
+                &self.x_time_exit,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                &self.x_time_entry,
+                &self.x_time_derivative_exit,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                &self.x_time_exit,
+                &self.x_time_derivative_exit,
+            ),
+        ];
+        {
+            let time_target = &mut target.slice_mut(s![slices.time.clone(), slices.time.clone()]);
+            dense_outer_accumulate(time_target, time_weights[0], self.x_time_entry.row(row));
+            dense_outer_accumulate(time_target, time_weights[1], self.x_time_exit.row(row));
+            dense_outer_accumulate(
+                time_target,
+                time_weights[2],
+                self.x_time_derivative_exit.row(row),
+            );
+            for (a, b, lhs, rhs) in time_cross_weights {
+                let weight = primary_hessian[[a, b]];
+                if weight == 0.0 {
+                    continue;
+                }
+                dense_symmetric_cross_accumulate(time_target, weight, lhs.row(row), rhs.row(row));
+            }
+        }
+
+        let mean_weight = primary_hessian[[LATENT_SURVIVAL_PRIMARY_MU, LATENT_SURVIVAL_PRIMARY_MU]];
+        self.x_mean
+            .syr_row_into_view(
+                row,
+                mean_weight,
+                target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
+            )
+            .expect("latent survival mean pullback dimension mismatch");
+
+        let mean_row = self.x_mean.row_chunk(row..row + 1);
+        let mean_vec = mean_row.row(0);
+        let time_mean_weights = [
+            (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
+            (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
+            (
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                self.x_time_derivative_exit.row(row),
+            ),
+        ];
+        for (primary_idx, time_vec) in time_mean_weights {
+            let weight = primary_hessian[[primary_idx, LATENT_SURVIVAL_PRIMARY_MU]];
+            if weight == 0.0 {
+                continue;
+            }
+            for i in 0..time_vec.len() {
+                let xi = time_vec[i];
+                if xi == 0.0 {
+                    continue;
+                }
+                for j in 0..mean_vec.len() {
+                    let xj = mean_vec[j];
+                    if xj == 0.0 {
+                        continue;
+                    }
+                    target[[slices.time.start + i, slices.mean.start + j]] += weight * xi * xj;
+                    target[[slices.mean.start + j, slices.time.start + i]] += weight * xj * xi;
+                }
+            }
+        }
+
+        if let Some(log_sigma) = &slices.log_sigma {
+            let sigma_idx = log_sigma.start;
+            target[[sigma_idx, sigma_idx]] += primary_hessian[[
+                LATENT_SURVIVAL_PRIMARY_LOG_SIGMA,
+                LATENT_SURVIVAL_PRIMARY_LOG_SIGMA,
+            ]];
+
+            for (primary_idx, time_vec) in [
+                (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
+                (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
+                (
+                    LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                    self.x_time_derivative_exit.row(row),
+                ),
+            ] {
+                let weight = primary_hessian[[primary_idx, LATENT_SURVIVAL_PRIMARY_LOG_SIGMA]];
+                if weight == 0.0 {
+                    continue;
+                }
+                for i in 0..time_vec.len() {
+                    let xi = time_vec[i];
+                    if xi == 0.0 {
+                        continue;
+                    }
+                    target[[slices.time.start + i, sigma_idx]] += weight * xi;
+                    target[[sigma_idx, slices.time.start + i]] += weight * xi;
+                }
+            }
+
+            let mean_sigma_weight = primary_hessian[[
+                LATENT_SURVIVAL_PRIMARY_MU,
+                LATENT_SURVIVAL_PRIMARY_LOG_SIGMA,
+            ]];
+            if mean_sigma_weight != 0.0 {
+                for j in 0..mean_vec.len() {
+                    let xj = mean_vec[j];
+                    if xj == 0.0 {
+                        continue;
+                    }
+                    target[[slices.mean.start + j, sigma_idx]] += mean_sigma_weight * xj;
+                    target[[sigma_idx, slices.mean.start + j]] += mean_sigma_weight * xj;
+                }
+            }
+        }
+    }
+
+    fn joint_outer_hyper_surrogate_hessian_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Array2<f64>, String> {
+        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let sigma = self.latent_sd(block_states)?;
+        let slices = self.joint_slices();
+        let include_log_sigma = slices.log_sigma.is_some();
+        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let event_type = if self.event_target[row_idx] >= 1 {
+                LatentSurvivalEventType::ExactEvent
+            } else {
+                LatentSurvivalEventType::RightCensored
+            };
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                event_type,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                self.unloaded_hazard_exit[row_idx],
+            )?;
+            let (_, _, primary_hessian) = latent_survival_row_primary_gradient_hessian(
+                &self.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                mu[row_idx],
+                sigma,
+                include_log_sigma,
+            )?;
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary_hessian));
+        }
+        Ok(out)
+    }
+
+    fn joint_outer_hyper_surrogate_dh_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let sigma = self.latent_sd(block_states)?;
+        let slices = self.joint_slices();
+        if d_beta_flat.len() != slices.total {
+            return Err(format!(
+                "latent survival joint dH direction length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                slices.total
+            ));
+        }
+        let include_log_sigma = slices.log_sigma.is_some();
+        let mut out = Array2::<f64>::zeros((slices.total, slices.total));
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let event_type = if self.event_target[row_idx] >= 1 {
+                LatentSurvivalEventType::ExactEvent
+            } else {
+                LatentSurvivalEventType::RightCensored
+            };
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                event_type,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                self.unloaded_hazard_exit[row_idx],
+            )?;
+            let direction = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_flat);
+            let third = latent_survival_row_primary_third_contracted(
+                &self.quadctx,
+                &row,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                mu[row_idx],
+                sigma,
+                &direction,
+                include_log_sigma,
+            )?;
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * third));
+        }
+        Ok(out)
+    }
+}
+
 fn log_kernel_ratio(
     bundle: &crate::families::lognormal_kernel::LogLognormalKernelBundle,
     num: usize,
@@ -943,7 +1920,13 @@ fn latent_survival_time_jet(
     }
 }
 
-fn dense_outer_accumulate(target: &mut Array2<f64>, weight: f64, x: ArrayView1<'_, f64>) {
+fn dense_outer_accumulate<S>(
+    target: &mut ndarray::ArrayBase<S, ndarray::Ix2>,
+    weight: f64,
+    x: ArrayView1<'_, f64>,
+) where
+    S: ndarray::DataMut<Elem = f64>,
+{
     for a in 0..x.len() {
         let xa = x[a];
         if xa == 0.0 {
@@ -959,12 +1942,14 @@ fn dense_outer_accumulate(target: &mut Array2<f64>, weight: f64, x: ArrayView1<'
     }
 }
 
-fn dense_symmetric_cross_accumulate(
-    target: &mut Array2<f64>,
+fn dense_symmetric_cross_accumulate<S>(
+    target: &mut ndarray::ArrayBase<S, ndarray::Ix2>,
     weight: f64,
     x: ArrayView1<'_, f64>,
     y: ArrayView1<'_, f64>,
-) {
+) where
+    S: ndarray::DataMut<Elem = f64>,
+{
     for a in 0..x.len() {
         let xa = x[a];
         let ya = y[a];
@@ -1259,6 +2244,25 @@ impl CustomFamily for LatentSurvivalFamily {
         }
     }
 
+    fn joint_outer_hyper_surrogate_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.joint_outer_hyper_surrogate_hessian_dense(block_states)
+            .map(Some)
+    }
+
+    fn joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.joint_outer_hyper_surrogate_dh_dense(block_states, d_beta_flat)
+            .map(Some)
+    }
+
     fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
@@ -1413,5 +2417,128 @@ impl CustomFamily for LatentBinaryFamily {
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::families::custom_family::BlockWorkingSet;
+    use crate::matrix::DenseDesignMatrix;
+    use ndarray::array;
+
+    #[test]
+    fn latent_survival_learnable_sigma_block_matches_family_fd() {
+        let sigma = 0.35;
+        let log_sigma = sigma.ln();
+        let h = 1e-5;
+
+        let learnable_family = LatentSurvivalFamily {
+            event_target: array![1u8],
+            weights: array![1.0],
+            latent_sd_fixed: None,
+            hazard_loading: HazardLoading::Full,
+            unloaded_mass_entry: array![0.0],
+            unloaded_mass_exit: array![0.0],
+            unloaded_hazard_exit: array![0.0],
+            x_time_entry: array![[1.0]],
+            x_time_exit: array![[1.0]],
+            x_time_derivative_exit: array![[1.0]],
+            x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
+            time_linear_constraints: None,
+            quadctx: Arc::new(QuadratureContext::new()),
+        };
+        let fixed_family = LatentSurvivalFamily {
+            latent_sd_fixed: Some(sigma),
+            ..learnable_family.clone()
+        };
+
+        let time_eta = array![0.2, 0.6, 0.8];
+        let mean_eta = array![0.15];
+        let fixed_states = vec![
+            ParameterBlockState {
+                beta: time_eta.clone(),
+                eta: time_eta.clone(),
+            },
+            ParameterBlockState {
+                beta: mean_eta.clone(),
+                eta: mean_eta.clone(),
+            },
+        ];
+        let states = vec![
+            ParameterBlockState {
+                beta: time_eta.clone(),
+                eta: time_eta,
+            },
+            ParameterBlockState {
+                beta: mean_eta.clone(),
+                eta: mean_eta,
+            },
+            ParameterBlockState {
+                beta: array![log_sigma],
+                eta: array![log_sigma],
+            },
+        ];
+
+        let eval = learnable_family
+            .evaluate(&states)
+            .expect("learnable latent survival evaluation");
+        let fixed_eval = fixed_family
+            .evaluate(&fixed_states)
+            .expect("fixed latent survival evaluation");
+        assert!(
+            (eval.log_likelihood - fixed_eval.log_likelihood).abs() < 1e-12,
+            "learnable/fixed ll mismatch: {} vs {}",
+            eval.log_likelihood,
+            fixed_eval.log_likelihood
+        );
+        assert_eq!(eval.blockworking_sets.len(), 3);
+        assert_eq!(fixed_eval.blockworking_sets.len(), 2);
+
+        let (grad, neg_hess) = match &eval.blockworking_sets[LatentSurvivalFamily::BLOCK_LOG_SIGMA]
+        {
+            BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                let neg_hess = match hessian {
+                    SymmetricMatrix::Dense(mat) => mat[[0, 0]],
+                    _ => panic!("log_sigma block should use a dense exact-Newton Hessian"),
+                };
+                (gradient[0], neg_hess)
+            }
+            _ => panic!("log_sigma block should use ExactNewton"),
+        };
+        assert!(grad.is_finite());
+        assert!(neg_hess.is_finite());
+
+        let mut states_plus = states.clone();
+        states_plus[LatentSurvivalFamily::BLOCK_LOG_SIGMA].beta[0] += h;
+        states_plus[LatentSurvivalFamily::BLOCK_LOG_SIGMA].eta[0] += h;
+        let ll_plus = learnable_family
+            .log_likelihood_only(&states_plus)
+            .expect("ll plus");
+
+        let ll_0 = learnable_family
+            .log_likelihood_only(&states)
+            .expect("ll base");
+
+        let mut states_minus = states.clone();
+        states_minus[LatentSurvivalFamily::BLOCK_LOG_SIGMA].beta[0] -= h;
+        states_minus[LatentSurvivalFamily::BLOCK_LOG_SIGMA].eta[0] -= h;
+        let ll_minus = learnable_family
+            .log_likelihood_only(&states_minus)
+            .expect("ll minus");
+
+        let fd_grad = (ll_plus - ll_minus) / (2.0 * h);
+        let fd_neg_hess = -(ll_plus - 2.0 * ll_0 + ll_minus) / (h * h);
+
+        assert!(
+            (grad - fd_grad).abs() / fd_grad.abs().max(1e-15) < 5e-3,
+            "family log_sigma grad={}, fd={fd_grad}",
+            grad
+        );
+        assert!(
+            (neg_hess - fd_neg_hess).abs() / fd_neg_hess.abs().max(1e-12) < 2e-2,
+            "family log_sigma neg_hess={}, fd={fd_neg_hess}",
+            neg_hess
+        );
     }
 }
