@@ -1372,7 +1372,7 @@ mod tests {
     fn survival_right_censored_loaded_vs_unloaded_score_fd() {
         let ctx = QuadratureContext::new();
         let mu = 0.15;
-        let sigma = 0.35;
+        let sigma: f64 = 0.35;
         let h = 1e-6;
         let row = LatentSurvivalRow::right_censored(0.4, 1.7, 0.1, 0.5);
         let ll_p = LatentSurvivalRowJet::evaluate(&ctx, &row, mu + h, sigma)
@@ -1416,7 +1416,7 @@ mod tests {
     fn survival_right_censored_log_sigma_derivatives_match_fd() {
         let ctx = QuadratureContext::new();
         let mu = 0.15;
-        let sigma = 0.35;
+        let sigma: f64 = 0.35;
         let log_sigma = sigma.ln();
         let h = 1e-5;
         let row = LatentSurvivalRow::right_censored(0.4, 1.7, 0.1, 0.5);
