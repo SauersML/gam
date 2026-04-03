@@ -2911,7 +2911,7 @@ pub fn fit_transformation_normal(
             Ok((geometry.family.clone(), fit))
         },
         // exact_fn
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let cache_ref = exact_geometry_cache.borrow();
             let geometry = cache_ref
@@ -2919,6 +2919,7 @@ pub fn fit_transformation_normal(
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let blocks =
                 build_blocks_from_base_spec(&geometry.base_block_spec, beta_hint.borrow().as_ref());
+            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
 
             let eval = evaluate_custom_family_joint_hyper(
                 &geometry.family,
@@ -2955,7 +2956,7 @@ pub fn fit_transformation_normal(
 
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let cache_ref = exact_geometry_cache.borrow();
             let geometry = cache_ref
@@ -2963,6 +2964,7 @@ pub fn fit_transformation_normal(
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let blocks =
                 build_blocks_from_base_spec(&geometry.base_block_spec, beta_hint.borrow().as_ref());
+            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
                 &blocks,

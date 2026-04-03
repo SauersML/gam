@@ -9110,7 +9110,8 @@ pub(crate) fn fit_survival_location_scale_terms(
         crate::seeding::SeedRiskProfile::Survival,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let fit = fit_survival_location_scale(build_spec(
                 rho,
                 &specs[0],
@@ -9124,13 +9125,14 @@ pub(crate) fn fit_survival_location_scale_terms(
             wiggle_beta_hint.replace(fit.beta_link_wiggle());
             Ok(fit)
         },
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             if !analytic_joint_gradient_available {
                 return Err(
                     "analytic spatial psi derivatives are unavailable for survival exact two-block path"
                         .to_string(),
                 );
             }
+            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let assembled = build_spec(rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
             let prepared = prepare_survival_location_scale_model(&assembled)?;
             let threshold_derivs = build_survival_covariate_block_psi_derivatives(
@@ -9168,13 +9170,14 @@ pub(crate) fn fit_survival_location_scale_terms(
             exact_warm_start.replace(Some(eval.warm_start));
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
-        |rho, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             if !analytic_joint_gradient_available {
                 return Err(
                     "analytic spatial psi derivatives are unavailable for survival exact two-block path"
                         .to_string(),
                 );
             }
+            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let assembled = build_spec(rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
             let prepared = prepare_survival_location_scale_model(&assembled)?;
             let threshold_derivs = build_survival_covariate_block_psi_derivatives(
