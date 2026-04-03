@@ -6,7 +6,6 @@ pub mod gamlss;
 pub mod latent_survival;
 pub mod lognormal_kernel;
 pub mod monotone_root;
-pub mod profile_scalar;
 pub mod row_kernel;
 pub mod royston_parmar;
 pub mod scale_design;

@@ -11397,7 +11397,7 @@ where
     // -----------------------------------------------------------------------
     // Fast path: kappa disabled or no spatial terms — build designs once.
     // -----------------------------------------------------------------------
-    if !kappa_options.enabled && joint_setup.auxiliary_dim() == 0 {
+    if joint_setup.auxiliary_dim() == 0 && (!kappa_options.enabled || log_kappa_dim == 0) {
         let (designs, resolved_specs) = build_term_collection_designs_and_freeze_joint(
             data, block_specs,
         )
@@ -11549,12 +11549,7 @@ where
             let designs = collect_designs(&ctx.cache);
             let need_hessian = matches!(order, OuterEvalOrder::ValueGradientHessian)
                 && analytic_outer_hessian_available;
-                match (&mut *exact_fn_cell.borrow_mut())(
-                    theta,
-                    &specs,
-                    &designs,
-                    need_hessian,
-            ) {
+            match (&mut *exact_fn_cell.borrow_mut())(theta, &specs, &designs, need_hessian) {
                 Ok((cost, grad, hess)) => {
                     ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
                     ctx.track_best(theta, cost);

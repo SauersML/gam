@@ -19,7 +19,7 @@ use gam::families::cubic_cell_kernel as exact_kernel;
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
 };
-use gam::families::latent_survival::{fixed_latent_hazard_frailty, latent_hazard_loading};
+use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
     ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
     infer_non_intercept_start,
@@ -7911,7 +7911,7 @@ fn fixed_hazard_multiplier_from_saved_family(
         Some(gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
             sigma_fixed: None,
             ..
-        }) => Err("saved latent survival/binary model requires a fixed HazardMultiplier sigma; learnable sigma is not implemented for latent hazard-window families".to_string()),
+        }) => Err("saved latent survival/binary model must store a concrete HazardMultiplier sigma in family_state.frailty".to_string()),
         Some(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { .. })
         | Some(gam::families::lognormal_kernel::FrailtySpec::None)
         | None => Err(

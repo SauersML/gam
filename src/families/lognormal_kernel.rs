@@ -1441,8 +1441,7 @@ mod tests {
             jet.score_log_sigma
         );
         assert!(
-            (jet.neg_hessian_log_sigma - fd_neg_hessian).abs()
-                / fd_neg_hessian.abs().max(1e-12)
+            (jet.neg_hessian_log_sigma - fd_neg_hessian).abs() / fd_neg_hessian.abs().max(1e-12)
                 < 2e-2,
             "log-sigma neg_hessian={}, fd={fd_neg_hessian}",
             jet.neg_hessian_log_sigma
