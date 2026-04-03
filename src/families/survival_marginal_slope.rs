@@ -2998,8 +2998,8 @@ impl SurvivalMarginalSlopeFamily {
             })?;
         Self::add_sigma_hessian_linear_terms(&hessian, &mask, &mut hessian_psi);
         Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi: eval.gradient.dot(&direction),
-            score_psi: hessian.dot(&direction) + &(&mask * &eval.gradient),
+            objective_psi: -eval.gradient.dot(&direction),
+            score_psi: hessian.dot(&direction) - &(&mask * &eval.gradient),
             hessian_psi,
             hessian_psi_operator: None,
         }))
@@ -14572,6 +14572,140 @@ mod tests {
         assert_eq!(hess_dir.nrows(), slices.total);
         assert_eq!(hess_dir.ncols(), slices.total);
         assert!(hess_dir.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn sigma_exact_joint_psi_terms_match_finite_differences_for_flexible_family() {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let marginal_design = array![[0.7, -0.2]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_beta = array![0.2];
+        let sigma = 0.65;
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: Some(sigma),
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(array![[1.0]]),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_beta.clone(),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_runtime.basis_dim()).map(|idx| 0.02 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_runtime.basis_dim()).map(|idx| -0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(1),
+            },
+        ];
+        let specs = vec![
+            dummy_blockspec(1),
+            dummy_blockspec(marginal_design.ncols()),
+            dummy_blockspec(1),
+            dummy_blockspec(score_runtime.basis_dim()),
+            dummy_blockspec(link_runtime.basis_dim()),
+        ];
+
+        let terms = family
+            .sigma_exact_joint_psi_terms(&block_states, &specs)
+            .expect("sigma psi terms")
+            .expect("sigma psi terms present");
+
+        let log_sigma = sigma.ln();
+        let eps = 1e-6;
+        let mut family_plus = family.clone();
+        family_plus.gaussian_frailty_sd = Some((log_sigma + eps).exp());
+        let mut family_minus = family.clone();
+        family_minus.gaussian_frailty_sd = Some((log_sigma - eps).exp());
+
+        let ll_plus = family_plus
+            .log_likelihood_only(&block_states)
+            .expect("plus log likelihood");
+        let ll_minus = family_minus
+            .log_likelihood_only(&block_states)
+            .expect("minus log likelihood");
+        let objective_fd = -(ll_plus - ll_minus) / (2.0 * eps);
+
+        let grad_plus = family_plus
+            .exact_newton_joint_gradient_evaluation(&block_states, &specs)
+            .expect("plus joint gradient")
+            .expect("plus exact joint gradient")
+            .gradient;
+        let grad_minus = family_minus
+            .exact_newton_joint_gradient_evaluation(&block_states, &specs)
+            .expect("minus joint gradient")
+            .expect("minus exact joint gradient")
+            .gradient;
+        let score_fd = -(&grad_plus - &grad_minus) / (2.0 * eps);
+
+        let hess_plus = family_plus
+            .exact_newton_joint_hessian(&block_states)
+            .expect("plus joint hessian")
+            .expect("plus exact joint hessian");
+        let hess_minus = family_minus
+            .exact_newton_joint_hessian(&block_states)
+            .expect("minus joint hessian")
+            .expect("minus exact joint hessian");
+        let hessian_fd = (&hess_plus - &hess_minus) / (2.0 * eps);
+
+        assert!(
+            (terms.objective_psi - objective_fd).abs() < 5e-4,
+            "objective sigma derivative mismatch: analytic={} fd={}",
+            terms.objective_psi,
+            objective_fd
+        );
+        assert_eq!(terms.score_psi.len(), score_fd.len());
+        for idx in 0..score_fd.len() {
+            assert!(
+                (terms.score_psi[idx] - score_fd[idx]).abs() < 2e-3,
+                "score sigma derivative mismatch at {idx}: analytic={} fd={}",
+                terms.score_psi[idx],
+                score_fd[idx]
+            );
+        }
+        assert_eq!(terms.hessian_psi.dim(), hessian_fd.dim());
+        for i in 0..hessian_fd.nrows() {
+            for j in 0..hessian_fd.ncols() {
+                assert!(
+                    (terms.hessian_psi[[i, j]] - hessian_fd[[i, j]]).abs() < 8e-3,
+                    "hessian sigma derivative mismatch at ({i},{j}): analytic={} fd={}",
+                    terms.hessian_psi[[i, j]],
+                    hessian_fd[[i, j]]
+                );
+            }
+        }
     }
 
     #[test]
