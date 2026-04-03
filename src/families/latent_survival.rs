@@ -23,6 +23,7 @@ use crate::families::lognormal_kernel::{
     FrailtySpec, HazardLoading, LatentSurvivalEventType, LatentSurvivalRow, LatentSurvivalRowJet,
     log_kernel_bundle,
 };
+use crate::families::sigma_link::{exp_sigma_eta_for_sigma_scalar, exp_sigma_from_eta_scalar};
 use crate::families::survival_location_scale::{
     TimeBlockInput, project_onto_linear_constraints, structural_time_coefficient_constraints,
 };
@@ -57,6 +58,7 @@ pub struct LatentSurvivalTermFitResult {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
+    pub latent_sd: f64,
 }
 
 #[derive(Clone)]
@@ -93,7 +95,7 @@ struct PreparedLatentTimeBlock {
 pub struct LatentSurvivalFamily {
     pub event_target: Array1<u8>,
     pub weights: Array1<f64>,
-    pub latent_sd: f64,
+    pub latent_sd_fixed: Option<f64>,
     pub hazard_loading: HazardLoading,
     pub unloaded_mass_entry: Array1<f64>,
     pub unloaded_mass_exit: Array1<f64>,
@@ -124,6 +126,7 @@ pub struct LatentBinaryFamily {
 impl LatentSurvivalFamily {
     pub const BLOCK_TIME: usize = 0;
     pub const BLOCK_MEAN: usize = 1;
+    pub const BLOCK_LOG_SIGMA: usize = 2;
 
     pub fn parameter_names() -> &'static [&'static str] {
         &["time_transform", "mean"]
@@ -153,10 +156,11 @@ impl LatentSurvivalFamily {
         ),
         String,
     > {
-        if block_states.len() != 2 {
+        let expected_blocks = if self.latent_sd_fixed.is_some() { 2 } else { 3 };
+        if block_states.len() != expected_blocks {
             return Err(format!(
-                "LatentSurvivalFamily expects 2 blocks, got {}",
-                block_states.len()
+                "LatentSurvivalFamily expects {expected_blocks} blocks, got {}",
+                block_states.len(),
             ));
         }
         let n = self.event_target.len();
@@ -178,6 +182,23 @@ impl LatentSurvivalFamily {
             eta_time.slice(s![2 * n..3 * n]),
             eta_mean,
         ))
+    }
+
+    fn latent_sd(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        if let Some(sigma) = self.latent_sd_fixed {
+            return Ok(sigma);
+        }
+        let eta = *block_states
+            .get(Self::BLOCK_LOG_SIGMA)
+            .and_then(|state| state.eta.get(0))
+            .ok_or_else(|| "latent survival learnable log_sigma block is missing".to_string())?;
+        let sigma = exp_sigma_from_eta_scalar(eta);
+        if !(sigma.is_finite() && sigma > 0.0) {
+            return Err(format!(
+                "latent survival learnable sigma became invalid: log_sigma={eta}, sigma={sigma}"
+            ));
+        }
+        Ok(sigma)
     }
 }
 
@@ -245,6 +266,18 @@ pub fn fixed_latent_hazard_frailty(
     }
 }
 
+pub fn latent_hazard_loading(frailty: &FrailtySpec, context: &str) -> Result<HazardLoading, String> {
+    match frailty {
+        FrailtySpec::HazardMultiplier { loading, .. } => Ok(*loading),
+        FrailtySpec::GaussianShift { .. } => Err(format!(
+            "{context} requires HazardMultiplier frailty, not GaussianShift"
+        )),
+        FrailtySpec::None => Err(format!(
+            "{context} requires a HazardMultiplier frailty specification"
+        )),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LatentSurvivalTimeJet {
     grad_entry: f64,
@@ -263,7 +296,7 @@ pub fn fit_latent_survival_terms(
     options: &BlockwiseFitOptions,
 ) -> Result<LatentSurvivalTermFitResult, String> {
     let latent_sd = validate_latent_survival_inputs(data, &spec, &frailty)?;
-    let (_, hazard_loading) = fixed_latent_hazard_frailty(&frailty, "latent-survival")?;
+    let hazard_loading = latent_hazard_loading(&frailty, "latent-survival")?;
     let mean_design =
         build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
     let resolvedspec = freeze_term_collection_from_design(&spec.meanspec, &mean_design)
@@ -273,7 +306,7 @@ pub fn fit_latent_survival_terms(
     let family = LatentSurvivalFamily {
         event_target: spec.event_target.clone(),
         weights: spec.weights.clone(),
-        latent_sd,
+        latent_sd_fixed: latent_sd,
         hazard_loading,
         unloaded_mass_entry: spec.unloaded_mass_entry.clone(),
         unloaded_mass_exit: spec.unloaded_mass_exit.clone(),
@@ -286,15 +319,20 @@ pub fn fit_latent_survival_terms(
         quadctx: Arc::new(QuadratureContext::new()),
     };
 
-    let blocks = vec![
+    let mut blocks = vec![
         build_time_blockspec(&time_prepared, &spec.time_block),
         build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
     ];
+    if latent_sd.is_none() {
+        blocks.push(build_log_sigma_blockspec(0.5));
+    }
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
+    let latent_sd = family.latent_sd(&fit.block_states)?;
     Ok(LatentSurvivalTermFitResult {
         fit,
         design: mean_design,
         resolvedspec,
+        latent_sd,
     })
 }
 
@@ -342,8 +380,30 @@ fn validate_latent_survival_inputs(
     data: ArrayView2<'_, f64>,
     spec: &LatentSurvivalTermSpec,
     frailty: &FrailtySpec,
-) -> Result<f64, String> {
-    let (sigma, hazard_loading) = fixed_latent_hazard_frailty(frailty, "latent-survival")?;
+) -> Result<Option<f64>, String> {
+    let (sigma, hazard_loading) = match frailty {
+        FrailtySpec::HazardMultiplier {
+            sigma_fixed,
+            loading,
+        } => {
+            if let Some(sigma) = sigma_fixed
+                && (!sigma.is_finite() || *sigma < 0.0)
+            {
+                return Err(format!(
+                    "latent-survival requires a finite hazard-multiplier sigma >= 0, got {sigma}"
+                ));
+            }
+            (*sigma_fixed, *loading)
+        }
+        FrailtySpec::GaussianShift { .. } => {
+            return Err("latent-survival requires HazardMultiplier frailty, not GaussianShift".to_string())
+        }
+        FrailtySpec::None => {
+            return Err(
+                "latent-survival requires a HazardMultiplier frailty specification".to_string(),
+            )
+        }
+    };
     let n = data.nrows();
     if n == 0 {
         return Err("latent-survival requires a non-empty dataset".to_string());
@@ -740,6 +800,23 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
     }
 }
 
+fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
+    ParameterBlockSpec {
+        name: "log_sigma".to_string(),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
+            Array2::from_elem((1, 1), 1.0),
+        ))),
+        offset: Array1::zeros(1),
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(Array1::from_elem(
+            1,
+            exp_sigma_eta_for_sigma_scalar(initial_sigma),
+        )),
+    }
+}
+
 fn log_kernel_ratio(
     bundle: &crate::families::lognormal_kernel::LogLognormalKernelBundle,
     num: usize,
@@ -1018,6 +1095,7 @@ fn binary_from_log_survival(log_survival: f64, event: u8) -> Result<BinaryFromLo
 impl CustomFamily for LatentSurvivalFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let latent_sd = self.latent_sd(block_states)?;
         let n = self.event_target.len();
         let p_time = self.x_time_exit.ncols();
         let p_mean = self.x_mean.ncols();
@@ -1027,6 +1105,8 @@ impl CustomFamily for LatentSurvivalFamily {
         let mut hess_time = Array2::<f64>::zeros((p_time, p_time));
         let mut grad_mean = Array1::<f64>::zeros(p_mean);
         let mut hess_mean = Array2::<f64>::zeros((p_mean, p_mean));
+        let mut grad_log_sigma = 0.0_f64;
+        let mut hess_log_sigma = 0.0_f64;
 
         for i in 0..n {
             let wi = self.weights[i];
@@ -1065,7 +1145,7 @@ impl CustomFamily for LatentSurvivalFamily {
                 self.unloaded_hazard_exit[i],
             )?;
             let row_jet =
-                LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
+                LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
                     .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
             ll += wi * row_jet.log_lik;
 
@@ -1076,8 +1156,11 @@ impl CustomFamily for LatentSurvivalFamily {
             }
             dense_outer_accumulate(&mut hess_mean, wi * row_jet.neg_hessian, mean_vec);
 
+            grad_log_sigma += wi * row_jet.score_log_sigma;
+            hess_log_sigma += wi * row_jet.neg_hessian_log_sigma;
+
             let time_jet =
-                latent_survival_time_jet(&self.quadctx, &row, qdot_exit[i], mu[i], self.latent_sd)?;
+                latent_survival_time_jet(&self.quadctx, &row, qdot_exit[i], mu[i], latent_sd)?;
             let t_entry = self.x_time_entry.row(i);
             let t_exit = self.x_time_exit.row(i);
             let t_deriv = self.x_time_derivative_exit.row(i);
@@ -1102,23 +1185,32 @@ impl CustomFamily for LatentSurvivalFamily {
             }
         }
 
+        let mut blockworking_sets = vec![
+            BlockWorkingSet::ExactNewton {
+                gradient: grad_time,
+                hessian: SymmetricMatrix::Dense(hess_time),
+            },
+            BlockWorkingSet::ExactNewton {
+                gradient: grad_mean,
+                hessian: SymmetricMatrix::Dense(hess_mean),
+            },
+        ];
+        if self.latent_sd_fixed.is_none() {
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient: Array1::from_elem(1, grad_log_sigma),
+                hessian: SymmetricMatrix::Dense(Array2::from_elem((1, 1), hess_log_sigma)),
+            });
+        }
+
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets: vec![
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_time,
-                    hessian: SymmetricMatrix::Dense(hess_time),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_mean,
-                    hessian: SymmetricMatrix::Dense(hess_mean),
-                },
-            ],
+            blockworking_sets,
         })
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let latent_sd = self.latent_sd(block_states)?;
         let n = self.event_target.len();
         let mut ll = 0.0;
         for i in 0..n {
@@ -1142,7 +1234,7 @@ impl CustomFamily for LatentSurvivalFamily {
                 self.unloaded_mass_exit[i],
                 self.unloaded_hazard_exit[i],
             )?;
-            let jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
+            let jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
                 .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
             ll += wi * jet.log_lik;
         }

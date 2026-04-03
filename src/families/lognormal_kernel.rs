@@ -461,6 +461,8 @@ pub struct LogKernelSumJet {
     pub d2: f64,
     /// d³/dμ³ log(Σ a_j K_j)
     pub d3: f64,
+    /// d⁴/dμ⁴ log(Σ a_j K_j)
+    pub d4: f64,
     pub mode: IntegratedExpectationMode,
 }
 
@@ -472,6 +474,7 @@ impl LogKernelSumJet {
             d1: 0.0,
             d2: 0.0,
             d3: 0.0,
+            d4: 0.0,
             mode,
         }
     }
@@ -485,11 +488,14 @@ impl LogKernelSumJet {
         let r1 = ratio[1];
         let r2 = ratio[2];
         let r3 = ratio[3];
+        let r4 = ratio[4];
         Self {
             value,
             d1: r1,
             d2: r2 - r1 * r1,
             d3: r3 - 3.0 * r1 * r2 + 2.0 * r1 * r1 * r1,
+            d4: r4 - 4.0 * r1 * r3 - 3.0 * r2 * r2 + 12.0 * r1 * r1 * r2
+                - 6.0 * r1.powi(4),
             mode,
         }
     }
@@ -538,12 +544,15 @@ impl LogKernelSumJet {
         let wr1 = w0 * ratio0[1] + w1 * ratio1[1];
         let wr2 = w0 * ratio0[2] + w1 * ratio1[2];
         let wr3 = w0 * ratio0[3] + w1 * ratio1[3];
+        let wr4 = w0 * ratio0[4] + w1 * ratio1[4];
 
         Ok(Self {
             value: log_s,
             d1: wr1,
             d2: wr2 - wr1 * wr1,
             d3: wr3 - 3.0 * wr1 * wr2 + 2.0 * wr1 * wr1 * wr1,
+            d4: wr4 - 4.0 * wr1 * wr3 - 3.0 * wr2 * wr2 + 12.0 * wr1 * wr1 * wr2
+                - 6.0 * wr1.powi(4),
             mode: overall_mode,
         })
     }
@@ -606,6 +615,7 @@ impl LogKernelSumJet {
                 d1: jet.d1,
                 d2: jet.d2,
                 d3: jet.d3,
+                d4: jet.d4,
                 mode: jet.mode,
             });
         }
@@ -661,11 +671,13 @@ impl LogKernelSumJet {
         let mut wr1 = 0.0;
         let mut wr2 = 0.0;
         let mut wr3 = 0.0;
+        let mut wr4 = 0.0;
         for i in 0..terms.len() {
             let w = sign_s * signs[i] * (log_mags[i] - log_s).exp();
             wr1 += w * ratios[i][1];
             wr2 += w * ratios[i][2];
             wr3 += w * ratios[i][3];
+            wr4 += w * ratios[i][4];
         }
 
         Ok(Self {
@@ -673,6 +685,8 @@ impl LogKernelSumJet {
             d1: wr1,
             d2: wr2 - wr1 * wr1,
             d3: wr3 - 3.0 * wr1 * wr2 + 2.0 * wr1 * wr1 * wr1,
+            d4: wr4 - 4.0 * wr1 * wr3 - 3.0 * wr2 * wr2 + 12.0 * wr1 * wr1 * wr2
+                - 6.0 * wr1.powi(4),
             mode: overall_mode,
         })
     }
@@ -1025,6 +1039,7 @@ fn exact_event_kernel_jet(
                 d1: jet.d1,
                 d2: jet.d2,
                 d3: jet.d3,
+                d4: jet.d4,
                 mode: jet.mode,
             })
         }
@@ -1035,6 +1050,7 @@ fn exact_event_kernel_jet(
                 d1: jet.d1,
                 d2: jet.d2,
                 d3: jet.d3,
+                d4: jet.d4,
                 mode: jet.mode,
             })
         }
@@ -1057,6 +1073,27 @@ pub struct LatentSurvivalRowJet {
     pub score: f64,
     pub neg_hessian: f64,
     pub d3: f64,
+    pub score_log_sigma: f64,
+    pub neg_hessian_log_sigma: f64,
+}
+
+#[inline]
+fn log_sigma_score_from_log_sum(jet: &LogKernelSumJet, sigma: f64) -> f64 {
+    let sigma2 = sigma * sigma;
+    sigma2 * (jet.d2 + jet.d1 * jet.d1)
+}
+
+#[inline]
+fn log_sigma_neg_hessian_from_log_sum(jet: &LogKernelSumJet, sigma: f64) -> f64 {
+    let sigma2 = sigma * sigma;
+    let sigma4 = sigma2 * sigma2;
+    let r2 = jet.d2 + jet.d1 * jet.d1;
+    let r4 = jet.d4
+        + 4.0 * jet.d1 * jet.d3
+        + 3.0 * jet.d2 * jet.d2
+        + 6.0 * jet.d1 * jet.d1 * jet.d2
+        + jet.d1.powi(4);
+    -(2.0 * sigma2 * r2 + sigma4 * (r4 - r2 * r2))
 }
 
 impl LatentSurvivalRowJet {
@@ -1113,6 +1150,10 @@ impl LatentSurvivalRowJet {
                 score: num.d1 - den.d1,
                 neg_hessian: -(num.d2 - den.d2),
                 d3: num.d3 - den.d3,
+                score_log_sigma: log_sigma_score_from_log_sum(&num, sigma)
+                    - log_sigma_score_from_log_sum(&den, sigma),
+                neg_hessian_log_sigma: log_sigma_neg_hessian_from_log_sum(&num, sigma)
+                    - log_sigma_neg_hessian_from_log_sum(&den, sigma),
             })
         } else {
             Ok(Self {
@@ -1120,6 +1161,8 @@ impl LatentSurvivalRowJet {
                 score: num.d1,
                 neg_hessian: -num.d2,
                 d3: num.d3,
+                score_log_sigma: log_sigma_score_from_log_sum(&num, sigma),
+                neg_hessian_log_sigma: log_sigma_neg_hessian_from_log_sum(&num, sigma),
             })
         }
     }
@@ -1148,6 +1191,10 @@ impl LatentSurvivalRowJet {
                 score: num.d1 - den.d1,
                 neg_hessian: -(num.d2 - den.d2),
                 d3: num.d3 - den.d3,
+                score_log_sigma: log_sigma_score_from_log_sum(&num, sigma)
+                    - log_sigma_score_from_log_sum(&den, sigma),
+                neg_hessian_log_sigma: log_sigma_neg_hessian_from_log_sum(&num, sigma)
+                    - log_sigma_neg_hessian_from_log_sum(&den, sigma),
             })
         } else {
             Ok(Self {
@@ -1155,6 +1202,8 @@ impl LatentSurvivalRowJet {
                 score: num.d1,
                 neg_hessian: -num.d2,
                 d3: num.d3,
+                score_log_sigma: log_sigma_score_from_log_sum(&num, sigma),
+                neg_hessian_log_sigma: log_sigma_neg_hessian_from_log_sum(&num, sigma),
             })
         }
     }
@@ -1187,6 +1236,10 @@ impl LatentSurvivalRowJet {
                 score: num.d1 - den.d1,
                 neg_hessian: -(num.d2 - den.d2),
                 d3: num.d3 - den.d3,
+                score_log_sigma: log_sigma_score_from_log_sum(&num, sigma)
+                    - log_sigma_score_from_log_sum(&den, sigma),
+                neg_hessian_log_sigma: log_sigma_neg_hessian_from_log_sum(&num, sigma)
+                    - log_sigma_neg_hessian_from_log_sum(&den, sigma),
             })
         } else {
             Ok(Self {
@@ -1194,6 +1247,8 @@ impl LatentSurvivalRowJet {
                 score: num.d1,
                 neg_hessian: -num.d2,
                 d3: num.d3,
+                score_log_sigma: log_sigma_score_from_log_sum(&num, sigma),
+                neg_hessian_log_sigma: log_sigma_neg_hessian_from_log_sum(&num, sigma),
             })
         }
     }

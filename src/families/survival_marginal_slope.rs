@@ -20,6 +20,7 @@ use crate::families::bernoulli_marginal_slope::{
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
+use crate::families::profile_scalar::minimize_positive_profile;
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
@@ -12930,65 +12931,20 @@ pub fn fit_survival_marginal_slope_terms(
 
     // ── Profile optimization over sigma ───────────────────────────────
     let (solved, final_sigma) = if sigma_learnable {
-        let candidates = [0.1, 0.3, 0.5, 0.8, 1.2];
-        let mut best_cost = f64::INFINITY;
-        let mut best_sigma = 0.5_f64;
-        let mut best_result = None;
-        for &sigma_try in &candidates {
-            match run_at_sigma(Some(sigma_try)) {
-                Ok(res) => {
-                    let cost = res.fit.reml_score;
-                    log::debug!(
-                        "survival marginal-slope sigma profile: sigma={sigma_try:.3}, REML={cost:.6}"
-                    );
-                    if cost < best_cost {
-                        best_cost = cost;
-                        best_sigma = sigma_try;
-                        best_result = Some(res);
-                    }
-                }
-                Err(e) => {
-                    log::debug!(
-                        "survival marginal-slope sigma profile: sigma={sigma_try:.3} failed: {e}"
-                    );
-                }
-            }
-        }
-
-        const PHI: f64 = 0.6180339887498949;
-        let mut lo = (best_sigma * 0.3).max(0.01);
-        let mut hi = (best_sigma * 3.0).min(5.0);
-        for _ in 0..8 {
-            if (hi - lo) < 0.02 * best_sigma.max(0.05) {
-                break;
-            }
-            let m1 = hi - PHI * (hi - lo);
-            let m2 = lo + PHI * (hi - lo);
-            let c1 = run_at_sigma(Some(m1))
-                .map(|r| r.fit.reml_score)
-                .unwrap_or(f64::INFINITY);
-            let c2 = run_at_sigma(Some(m2))
-                .map(|r| r.fit.reml_score)
-                .unwrap_or(f64::INFINITY);
-            if c1 < c2 {
-                hi = m2;
-            } else {
-                lo = m1;
-            }
-        }
-        let refined_sigma = 0.5 * (lo + hi);
-        let final_result = run_at_sigma(Some(refined_sigma))?;
-        let final_cost = final_result.fit.reml_score;
-        if final_cost <= best_cost {
-            (final_result, Some(refined_sigma))
-        } else {
-            (
-                best_result.ok_or_else(|| {
-                    "survival marginal-slope sigma profile: no valid grid point".to_string()
-                })?,
-                Some(best_sigma),
-            )
-        }
+        let optimum = minimize_positive_profile(
+            "survival marginal-slope sigma profile",
+            initial_sigma.unwrap_or(0.5),
+            0.01,
+            5.0,
+            0.02,
+            8,
+            24,
+            |sigma_try| {
+                let res = run_at_sigma(Some(sigma_try))?;
+                Ok((res.fit.reml_score, res))
+            },
+        )?;
+        (optimum.payload, Some(optimum.point))
     } else {
         let solved = run_at_sigma(initial_sigma)?;
         (solved, initial_sigma)
