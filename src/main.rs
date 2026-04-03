@@ -19,7 +19,7 @@ use gam::families::cubic_cell_kernel as exact_kernel;
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_familyname,
 };
-use gam::families::latent_survival::fixed_latent_hazard_frailty;
+use gam::families::latent_survival::{fixed_latent_hazard_frailty, latent_hazard_loading};
 use gam::families::scale_design::{
     ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
     infer_non_intercept_start,
@@ -5338,7 +5338,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             "latent binary"
         };
         let frailty = fit_frailty_spec_from_survival_args(&args, latent_context)?;
-        let (_, latent_loading) = fixed_latent_hazard_frailty(&frailty, latent_context)?;
+        let latent_loading = latent_hazard_loading(&frailty, latent_context)?;
         let latent_derivative_guard = DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
         let options = gam::families::custom_family::BlockwiseFitOptions {
             compute_covariance: false,
@@ -5466,10 +5466,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 "running latent binary optimization"
             },
         );
-        let fit = match likelihood_mode {
+        let (fit, learned_latent_sd) = match likelihood_mode {
             SurvivalLikelihoodMode::Latent => {
                 match fit_model(FitRequest::LatentSurvival(build_survival_request(prepared))) {
-                    Ok(FitResult::LatentSurvival(result)) => result.fit,
+                    Ok(FitResult::LatentSurvival(result)) => (result.fit, Some(result.latent_sd)),
                     Ok(_) => {
                         return Err(
                             "internal latent survival workflow returned the wrong result variant"
@@ -5481,7 +5481,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
             SurvivalLikelihoodMode::LatentBinary => {
                 match fit_model(FitRequest::LatentBinary(build_binary_request(prepared))) {
-                    Ok(FitResult::LatentBinary(result)) => result.fit,
+                    Ok(FitResult::LatentBinary(result)) => (result.fit, None),
                     Ok(_) => {
                         return Err(
                             "internal latent binary workflow returned the wrong result variant"
@@ -5521,7 +5521,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 ModelKind::Survival,
                 match likelihood_mode {
                     SurvivalLikelihoodMode::Latent => FittedFamily::LatentSurvival {
-                        frailty: frailty.clone(),
+                        frailty: match &frailty {
+                            gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                                sigma_fixed: None,
+                                loading,
+                            } => gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                                sigma_fixed: learned_latent_sd,
+                                loading: *loading,
+                            },
+                            _ => frailty.clone(),
+                        },
                     },
                     SurvivalLikelihoodMode::LatentBinary => FittedFamily::LatentBinary {
                         frailty: frailty.clone(),

@@ -18,7 +18,7 @@ use crate::families::gamlss::{
 use crate::families::latent_survival::{
     LatentBinaryTermFitResult, LatentBinaryTermSpec, LatentSurvivalTermFitResult,
     LatentSurvivalTermSpec, fit_latent_binary_terms, fit_latent_survival_terms,
-    fixed_latent_hazard_frailty,
+    latent_hazard_loading,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::survival_location_scale::{
@@ -1746,7 +1746,10 @@ fn materialize_survival<'a>(
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
     ) {
         let frailty = config.frailty.as_ref().unwrap_or(&FrailtySpec::None);
-        Some(fixed_latent_hazard_frailty(frailty, "workflow latent survival/binary")?.1)
+        Some(latent_hazard_loading(
+            frailty,
+            "workflow latent survival/binary",
+        )?)
     } else {
         None
     };
