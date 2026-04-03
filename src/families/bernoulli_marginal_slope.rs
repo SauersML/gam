@@ -2346,8 +2346,8 @@ impl BernoulliMarginalSlopeFamily {
             })?;
         Self::add_sigma_hessian_linear_terms(&hessian, &mask, &mut hessian_psi);
         Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi: eval.gradient.dot(&direction),
-            score_psi: hessian.dot(&direction) + &(&mask * &eval.gradient),
+            objective_psi: -eval.gradient.dot(&direction),
+            score_psi: hessian.dot(&direction) - &(&mask * &eval.gradient),
             hessian_psi,
             hessian_psi_operator: None,
         }))
@@ -13385,5 +13385,145 @@ mod tests {
                 .expect("flex psi workspace")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn sigma_exact_joint_psi_terms_match_finite_differences_for_flexible_family() {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let sigma = 0.7;
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                gaussian_frailty_sd: Some(sigma),
+                base_link: bernoulli_marginal_slope_probit_link(),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+            };
+        let beta_h = Array1::from_iter(
+            (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+        );
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: beta_h.clone(),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: beta_w.clone(),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+        let specs = vec![
+            dummy_blockspec(1, z.len()),
+            dummy_blockspec(1, z.len()),
+            dummy_blockspec(score_prepared.block.design.ncols(), z.len()),
+            dummy_blockspec(link_prepared.block.design.ncols(), z.len()),
+        ];
+
+        let terms = family
+            .sigma_exact_joint_psi_terms(&block_states, &specs)
+            .expect("sigma psi terms")
+            .expect("sigma psi terms present");
+
+        let log_sigma = sigma.ln();
+        let eps = 1e-6;
+        let mut family_plus = family.clone();
+        family_plus.gaussian_frailty_sd = Some((log_sigma + eps).exp());
+        let mut family_minus = family.clone();
+        family_minus.gaussian_frailty_sd = Some((log_sigma - eps).exp());
+
+        let ll_plus = family_plus
+            .log_likelihood_only(&block_states)
+            .expect("plus log likelihood");
+        let ll_minus = family_minus
+            .log_likelihood_only(&block_states)
+            .expect("minus log likelihood");
+        let objective_fd = -(ll_plus - ll_minus) / (2.0 * eps);
+
+        let grad_plus = family_plus
+            .exact_newton_joint_gradient_evaluation(&block_states, &specs)
+            .expect("plus joint gradient")
+            .expect("plus exact joint gradient")
+            .gradient;
+        let grad_minus = family_minus
+            .exact_newton_joint_gradient_evaluation(&block_states, &specs)
+            .expect("minus joint gradient")
+            .expect("minus exact joint gradient")
+            .gradient;
+        let score_fd = -(&grad_plus - &grad_minus) / (2.0 * eps);
+
+        let hess_plus = family_plus
+            .exact_newton_joint_hessian(&block_states)
+            .expect("plus joint hessian")
+            .expect("plus exact joint hessian");
+        let hess_minus = family_minus
+            .exact_newton_joint_hessian(&block_states)
+            .expect("minus joint hessian")
+            .expect("minus exact joint hessian");
+        let hessian_fd = (&hess_plus - &hess_minus) / (2.0 * eps);
+
+        assert!(
+            (terms.objective_psi - objective_fd).abs() < 5e-4,
+            "objective sigma derivative mismatch: analytic={} fd={}",
+            terms.objective_psi,
+            objective_fd
+        );
+        assert_eq!(terms.score_psi.len(), score_fd.len());
+        for idx in 0..score_fd.len() {
+            assert!(
+                (terms.score_psi[idx] - score_fd[idx]).abs() < 2e-3,
+                "score sigma derivative mismatch at {idx}: analytic={} fd={}",
+                terms.score_psi[idx],
+                score_fd[idx]
+            );
+        }
+        assert_eq!(terms.hessian_psi.dim(), hessian_fd.dim());
+        for i in 0..hessian_fd.nrows() {
+            for j in 0..hessian_fd.ncols() {
+                assert!(
+                    (terms.hessian_psi[[i, j]] - hessian_fd[[i, j]]).abs() < 8e-3,
+                    "hessian sigma derivative mismatch at ({i},{j}): analytic={} fd={}",
+                    terms.hessian_psi[[i, j]],
+                    hessian_fd[[i, j]]
+                );
+            }
+        }
     }
 }
