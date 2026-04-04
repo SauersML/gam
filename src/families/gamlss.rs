@@ -1734,7 +1734,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let fit = {
                         let blocks = builder.build_blocks(
-                            rho,
+                            &rho,
                             &designs[0],
                             &designs[1],
                             mean_beta_hint_cell.borrow().clone(),
@@ -1770,7 +1770,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     }
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let blocks = builder.build_blocks(
-                        rho,
+                        &rho,
                         &designs[0],
                         &designs[1],
                         mean_beta_hint_cell.borrow().clone(),
@@ -1788,7 +1788,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &family,
                         &blocks,
                         options,
-                        rho,
+                        &rho,
                         &psiderivative_blocks,
                         None,
                         if need_hessian {
@@ -1814,7 +1814,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     }
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let blocks = builder.build_blocks(
-                        rho,
+                        &rho,
                         &designs[0],
                         &designs[1],
                         mean_beta_hint_cell.borrow().clone(),
@@ -1832,7 +1832,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &family,
                         &blocks,
                         options,
-                        rho,
+                        &rho,
                         &psiderivative_blocks,
                         None,
                     )?;
