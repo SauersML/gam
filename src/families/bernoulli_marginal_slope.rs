@@ -29,9 +29,8 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
-    SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::types::{InverseLink, LinkFunction};

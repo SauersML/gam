@@ -506,7 +506,9 @@ impl LogKernelSumJet {
     ) -> (f64, [f64; 5]) {
         (
             term.coeff.abs().ln() + bundle.get(term.k),
-            kernel_ratio_jet(bundle, term.k, term.m, 3),
+            // d4 is used by the exact log-sigma curvature, so this must carry
+            // ratios through order 4 rather than truncating at order 3.
+            kernel_ratio_jet(bundle, term.k, term.m, 4),
         )
     }
 
@@ -571,7 +573,7 @@ impl LogKernelSumJet {
         let lb = log_kernel_bundle(quadctx, m, mu, sigma, max_k_needed)?;
         Ok(Self::from_log_value_and_ratios(
             lb.get(k),
-            kernel_ratio_jet(&lb, k, m, 3),
+            kernel_ratio_jet(&lb, k, m, 4),
             lb.mode,
         ))
     }
@@ -654,7 +656,7 @@ impl LogKernelSumJet {
             let lb = get_lb(term.m);
             log_mags.push(term.coeff.abs().ln() + lb.get(term.k));
             signs.push(term.coeff.signum());
-            ratios.push(kernel_ratio_jet(lb, term.k, term.m, 3));
+            ratios.push(kernel_ratio_jet(lb, term.k, term.m, 4));
         }
 
         // Sign-aware log-sum-exp: compute log|S| and sign(S).
@@ -1086,13 +1088,17 @@ fn log_sigma_score_from_log_sum(jet: &LogKernelSumJet, sigma: f64) -> f64 {
 fn log_sigma_neg_hessian_from_log_sum(jet: &LogKernelSumJet, sigma: f64) -> f64 {
     let sigma2 = sigma * sigma;
     let sigma4 = sigma2 * sigma2;
-    let r2 = jet.d2 + jet.d1 * jet.d1;
-    let r4 = jet.d4
-        + 4.0 * jet.d1 * jet.d3
-        + 3.0 * jet.d2 * jet.d2
-        + 6.0 * jet.d1 * jet.d1 * jet.d2
-        + jet.d1.powi(4);
-    -(2.0 * sigma2 * r2 + sigma4 * (r4 - r2 * r2))
+    let d1 = jet.d1;
+    let d2 = jet.d2;
+    let d3 = jet.d3;
+    let d4 = jet.d4;
+    let s2_over_s = d2 + d1 * d1;
+    // For S = Σ a_j K_j, D = σ ∂_σ, and D S = σ² S_μμ:
+    // D² log S = 2σ² (S''/S) + σ⁴ (S''''/S - (S''/S)²).
+    // Express the final parenthesized term directly in log-derivatives to
+    // avoid the larger cancellation in `r4 - r2²`.
+    let s4_over_s_minus_s2_sq = d4 + 4.0 * d1 * d3 + 2.0 * d2 * d2 + 4.0 * d1 * d1 * d2;
+    -(2.0 * sigma2 * s2_over_s + sigma4 * s4_over_s_minus_s2_sq)
 }
 
 impl LatentSurvivalRowJet {
@@ -1413,38 +1419,33 @@ mod tests {
     }
 
     #[test]
-    fn survival_right_censored_log_sigma_derivatives_match_fd() {
+    fn log_kernel_single_term_log_sigma_derivatives_match_ghq_reference() {
         let ctx = QuadratureContext::new();
-        let mu = 0.15;
-        let sigma: f64 = 0.35;
-        let log_sigma = sigma.ln();
-        let h = 1e-5;
-        let row = LatentSurvivalRow::right_censored(0.4, 1.7, 0.1, 0.5);
-
-        let ll_p = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, (log_sigma + h).exp())
-            .unwrap()
-            .log_lik;
-        let ll_0 = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma)
-            .unwrap()
-            .log_lik;
-        let ll_m = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, (log_sigma - h).exp())
-            .unwrap()
-            .log_lik;
-
-        let fd_score = (ll_p - ll_m) / (2.0 * h);
-        let fd_neg_hessian = -(ll_p - 2.0 * ll_0 + ll_m) / (h * h);
-        let jet = LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma).unwrap();
+        let mu = 0.2;
+        let sigma = 1.0;
+        let jet = LogKernelSumJet::single_term(&ctx, 0, 1.0, mu, sigma).unwrap();
+        let ghq = crate::inference::quadrature::cloglog_ghq_derivatives_adaptive(&ctx, mu, sigma);
+        let survival = (1.0 - ghq.l).max(1e-300);
+        let survival_sigma_over_survival = -ghq.l_sigma / survival;
+        let ref_score = sigma * survival_sigma_over_survival;
+        let ref_neg_hessian = -(ref_score
+            + sigma
+                * sigma
+                * (-ghq.l_sigmasigma / survival - survival_sigma_over_survival.powi(2)));
 
         assert!(
-            (jet.score_log_sigma - fd_score).abs() / fd_score.abs().max(1e-15) < 5e-3,
-            "log-sigma score={}, fd={fd_score}",
-            jet.score_log_sigma
+            (log_sigma_score_from_log_sum(&jet, sigma) - ref_score).abs()
+                / ref_score.abs().max(1e-12)
+                < 1e-4,
+            "log-sigma score={}, ref={ref_score}",
+            log_sigma_score_from_log_sum(&jet, sigma)
         );
         assert!(
-            (jet.neg_hessian_log_sigma - fd_neg_hessian).abs() / fd_neg_hessian.abs().max(1e-12)
-                < 2e-2,
-            "log-sigma neg_hessian={}, fd={fd_neg_hessian}",
-            jet.neg_hessian_log_sigma
+            (log_sigma_neg_hessian_from_log_sum(&jet, sigma) - ref_neg_hessian).abs()
+                / ref_neg_hessian.abs().max(1e-12)
+                < 1e-3,
+            "log-sigma neg_hessian={}, ref={ref_neg_hessian}",
+            log_sigma_neg_hessian_from_log_sum(&jet, sigma)
         );
     }
 
@@ -1465,6 +1466,29 @@ mod tests {
             (jet.d1 - fd_d1).abs() / fd_d1.abs().max(1e-15) < 1e-3,
             "d1={}, fd={fd_d1}",
             jet.d1
+        );
+    }
+
+    #[test]
+    fn log_kernel_sum_jet_single_term_d4_fd() {
+        let ctx = QuadratureContext::new();
+        let mu = 0.35;
+        let sigma = 0.45;
+        let m = 1.2;
+        let k = 1usize;
+        let h = 2e-3;
+
+        let jet = LogKernelSumJet::single_term(&ctx, k, m, mu, sigma).unwrap();
+        let v_pp = log_kernel_term(&ctx, k, m, mu + 2.0 * h, sigma).unwrap().0;
+        let v_p = log_kernel_term(&ctx, k, m, mu + h, sigma).unwrap().0;
+        let v_0 = log_kernel_term(&ctx, k, m, mu, sigma).unwrap().0;
+        let v_m = log_kernel_term(&ctx, k, m, mu - h, sigma).unwrap().0;
+        let v_mm = log_kernel_term(&ctx, k, m, mu - 2.0 * h, sigma).unwrap().0;
+        let fd_d4 = (v_mm - 4.0 * v_m + 6.0 * v_0 - 4.0 * v_p + v_pp) / h.powi(4);
+        assert!(
+            (jet.d4 - fd_d4).abs() / jet.d4.abs().max(fd_d4.abs()).max(1e-8) < 2e-2,
+            "d4={}, fd={fd_d4}",
+            jet.d4
         );
     }
 

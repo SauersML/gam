@@ -2925,7 +2925,7 @@ pub fn fit_transformation_normal(
                 &geometry.family,
                 &blocks,
                 &options,
-                rho,
+                &rho,
                 &geometry.derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
                 if need_hessian {
@@ -2969,7 +2969,7 @@ pub fn fit_transformation_normal(
                 &geometry.family,
                 &blocks,
                 &options,
-                rho,
+                &rho,
                 &geometry.derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )

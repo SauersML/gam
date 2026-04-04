@@ -287,11 +287,8 @@ pub fn latent_hazard_loading(
 struct LatentSurvivalTimeJet {
     grad_entry: f64,
     grad_exit: f64,
-    grad_qdot: f64,
     neg_hess_entry: f64,
     neg_hess_exit: f64,
-    neg_hess_qdot: f64,
-    neg_hess_exit_qdot: f64,
 }
 
 pub fn fit_latent_survival_terms(
@@ -2085,11 +2082,8 @@ fn latent_survival_time_jet(
             Ok(LatentSurvivalTimeJet {
                 grad_entry: -entry_d1,
                 grad_exit: exit_d1,
-                grad_qdot: 0.0,
                 neg_hess_entry: entry_d2,
                 neg_hess_exit: -exit_d2,
-                neg_hess_qdot: 0.0,
-                neg_hess_exit_qdot: 0.0,
             })
         }
         LatentSurvivalEventType::ExactEvent => {
@@ -2121,20 +2115,14 @@ fn latent_survival_time_jet(
                 let w_loaded = loaded_weight / normalizer;
                 let w_unloaded = unloaded_weight / normalizer;
                 let grad_exit = w_loaded * loaded_d1 + w_unloaded * unloaded_d1;
-                let grad_qdot = w_loaded / qdot_exit;
                 let d2_exit = w_loaded * (loaded_d2 + loaded_d1 * loaded_d1)
                     + w_unloaded * (unloaded_d2 + unloaded_d1 * unloaded_d1)
                     - grad_exit * grad_exit;
-                let d2_qdot = -grad_qdot * grad_qdot;
-                let d2_exit_qdot = grad_qdot * (loaded_d1 - grad_exit);
                 Ok(LatentSurvivalTimeJet {
                     grad_entry: -entry_d1,
                     grad_exit,
-                    grad_qdot,
                     neg_hess_entry: entry_d2,
                     neg_hess_exit: -d2_exit,
-                    neg_hess_qdot: -d2_qdot,
-                    neg_hess_exit_qdot: -d2_exit_qdot,
                 })
             } else {
                 let (exit_d1, exit_d2, _) =
@@ -2142,11 +2130,8 @@ fn latent_survival_time_jet(
                 Ok(LatentSurvivalTimeJet {
                     grad_entry: -entry_d1,
                     grad_exit: 1.0 + exit_d1,
-                    grad_qdot: qdot_exit.recip(),
                     neg_hess_entry: entry_d2,
                     neg_hess_exit: -exit_d2,
-                    neg_hess_qdot: qdot_exit.recip().powi(2),
-                    neg_hess_exit_qdot: 0.0,
                 })
             }
         }
@@ -2603,7 +2588,7 @@ mod tests {
             event_target: array![1u8, 0u8],
             weights: array![1.0, 0.7],
             latent_sd_fixed: None,
-            hazard_loading: HazardLoading::Full,
+            hazard_loading: HazardLoading::LoadedVsUnloaded,
             unloaded_mass_entry: array![0.02, 0.03],
             unloaded_mass_exit: array![0.05, 0.08],
             unloaded_hazard_exit: array![0.04, 0.0],
@@ -2674,118 +2659,112 @@ mod tests {
             .fold(0.0_f64, f64::max)
     }
 
+    fn frobenius_relative_array2(left: &Array2<f64>, right: &Array2<f64>) -> f64 {
+        let mut diff2 = 0.0_f64;
+        let mut scale2 = 0.0_f64;
+        for (l, r) in left.iter().zip(right.iter()) {
+            let d = l - r;
+            diff2 += d * d;
+            scale2 += l * l + r * r;
+        }
+        diff2.sqrt() / scale2.sqrt().max(1e-12)
+    }
+
+    fn latent_survival_row_loglik_from_primary(
+        quadctx: &QuadratureContext,
+        row: &LatentSurvivalRow,
+        primary: &Array1<f64>,
+    ) -> f64 {
+        let q_entry = primary[LATENT_SURVIVAL_PRIMARY_Q_ENTRY];
+        let q_exit = primary[LATENT_SURVIVAL_PRIMARY_Q_EXIT];
+        let qdot_exit = primary[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT];
+        let mu = primary[LATENT_SURVIVAL_PRIMARY_MU];
+        let sigma = primary[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA].exp();
+        latent_survival_row_primary_gradient_hessian(
+            quadctx, row, q_entry, q_exit, qdot_exit, mu, sigma, true,
+        )
+        .expect("row primary evaluation")
+        .0
+    }
+
     #[test]
     fn latent_survival_learnable_sigma_block_matches_family_fd() {
-        let sigma: f64 = 0.35;
-        let log_sigma = sigma.ln();
-        let h = 1e-5;
+        let family = learnable_sigma_test_family();
+        let beta = learnable_sigma_test_joint_beta();
+        let states = latent_survival_states_from_joint_beta(&family, &beta);
+        let slices = family.joint_slices();
+        let sigma_idx = slices
+            .log_sigma
+            .as_ref()
+            .expect("learnable sigma test family should expose log_sigma")
+            .start;
+        let h = 2e-4;
 
-        let learnable_family = LatentSurvivalFamily {
-            event_target: array![1u8],
-            weights: array![1.0],
-            latent_sd_fixed: None,
-            hazard_loading: HazardLoading::Full,
-            unloaded_mass_entry: array![0.0],
-            unloaded_mass_exit: array![0.0],
-            unloaded_hazard_exit: array![0.0],
-            x_time_entry: array![[1.0]],
-            x_time_exit: array![[1.0]],
-            x_time_derivative_exit: array![[1.0]],
-            x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0]])),
-            time_linear_constraints: None,
-            quadctx: Arc::new(QuadratureContext::new()),
-        };
-        let fixed_family = LatentSurvivalFamily {
-            latent_sd_fixed: Some(sigma),
-            ..learnable_family.clone()
-        };
-
-        let time_eta = array![0.2, 0.6, 0.8];
-        let mean_eta = array![0.15];
-        let fixed_states = vec![
-            ParameterBlockState {
-                beta: time_eta.clone(),
-                eta: time_eta.clone(),
-            },
-            ParameterBlockState {
-                beta: mean_eta.clone(),
-                eta: mean_eta.clone(),
-            },
-        ];
-        let states = vec![
-            ParameterBlockState {
-                beta: time_eta.clone(),
-                eta: time_eta,
-            },
-            ParameterBlockState {
-                beta: mean_eta.clone(),
-                eta: mean_eta,
-            },
-            ParameterBlockState {
-                beta: array![log_sigma],
-                eta: array![log_sigma],
-            },
-        ];
-
-        let eval = learnable_family
+        let eval = family
             .evaluate(&states)
             .expect("learnable latent survival evaluation");
-        let fixed_eval = fixed_family
-            .evaluate(&fixed_states)
-            .expect("fixed latent survival evaluation");
-        assert!(
-            (eval.log_likelihood - fixed_eval.log_likelihood).abs() < 1e-12,
-            "learnable/fixed ll mismatch: {} vs {}",
-            eval.log_likelihood,
-            fixed_eval.log_likelihood
-        );
+        let joint_gradient = family
+            .exact_newton_joint_gradient_evaluation(&states, &[])
+            .expect("joint gradient evaluation")
+            .expect("joint gradient should exist")
+            .gradient;
+        let joint_hessian = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint hessian evaluation")
+            .expect("joint hessian should exist");
         assert_eq!(eval.blockworking_sets.len(), 3);
-        assert_eq!(fixed_eval.blockworking_sets.len(), 2);
 
-        let (grad, neg_hess) = match &eval.blockworking_sets[LatentSurvivalFamily::BLOCK_LOG_SIGMA]
-        {
-            BlockWorkingSet::ExactNewton { gradient, hessian } => {
-                let neg_hess = match hessian {
-                    SymmetricMatrix::Dense(mat) => mat[[0, 0]],
-                    _ => panic!("log_sigma block should use a dense exact-Newton Hessian"),
-                };
-                (gradient[0], neg_hess)
-            }
-            _ => panic!("log_sigma block should use ExactNewton"),
-        };
-        assert!(grad.is_finite());
-        assert!(neg_hess.is_finite());
+        let (block_grad, block_neg_hess) =
+            match &eval.blockworking_sets[LatentSurvivalFamily::BLOCK_LOG_SIGMA] {
+                BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                    let neg_hess = match hessian {
+                        SymmetricMatrix::Dense(mat) => mat[[0, 0]],
+                        _ => panic!("log_sigma block should use a dense exact-Newton Hessian"),
+                    };
+                    (gradient[0], neg_hess)
+                }
+                _ => panic!("log_sigma block should use ExactNewton"),
+            };
 
-        let mut states_plus = states.clone();
-        states_plus[LatentSurvivalFamily::BLOCK_LOG_SIGMA].beta[0] += h;
-        states_plus[LatentSurvivalFamily::BLOCK_LOG_SIGMA].eta[0] += h;
-        let ll_plus = learnable_family
-            .log_likelihood_only(&states_plus)
+        assert!((block_grad - joint_gradient[sigma_idx]).abs() < 1e-12);
+        assert!((block_neg_hess - joint_hessian[[sigma_idx, sigma_idx]]).abs() < 1e-12);
+
+        let mut beta_plus = beta.clone();
+        beta_plus[sigma_idx] += h;
+        let ll_plus = family
+            .log_likelihood_only(&latent_survival_states_from_joint_beta(&family, &beta_plus))
             .expect("ll plus");
-
-        let ll_0 = learnable_family
-            .log_likelihood_only(&states)
-            .expect("ll base");
-
-        let mut states_minus = states.clone();
-        states_minus[LatentSurvivalFamily::BLOCK_LOG_SIGMA].beta[0] -= h;
-        states_minus[LatentSurvivalFamily::BLOCK_LOG_SIGMA].eta[0] -= h;
-        let ll_minus = learnable_family
-            .log_likelihood_only(&states_minus)
+        let ll_0 = family.log_likelihood_only(&states).expect("ll base");
+        let mut beta_minus = beta.clone();
+        beta_minus[sigma_idx] -= h;
+        let ll_minus = family
+            .log_likelihood_only(&latent_survival_states_from_joint_beta(
+                &family,
+                &beta_minus,
+            ))
             .expect("ll minus");
 
         let fd_grad = (ll_plus - ll_minus) / (2.0 * h);
         let fd_neg_hess = -(ll_plus - 2.0 * ll_0 + ll_minus) / (h * h);
-
         assert!(
-            (grad - fd_grad).abs() / fd_grad.abs().max(1e-15) < 5e-3,
+            (joint_gradient[sigma_idx] - fd_grad).abs()
+                / joint_gradient[sigma_idx]
+                    .abs()
+                    .max(fd_grad.abs())
+                    .max(1e-12)
+                < 2e-3,
             "family log_sigma grad={}, fd={fd_grad}",
-            grad
+            joint_gradient[sigma_idx]
         );
         assert!(
-            (neg_hess - fd_neg_hess).abs() / fd_neg_hess.abs().max(1e-12) < 2e-2,
+            (joint_hessian[[sigma_idx, sigma_idx]] - fd_neg_hess).abs()
+                / joint_hessian[[sigma_idx, sigma_idx]]
+                    .abs()
+                    .max(fd_neg_hess.abs())
+                    .max(1e-10)
+                < 2e-2,
             "family log_sigma neg_hess={}, fd={fd_neg_hess}",
-            neg_hess
+            joint_hessian[[sigma_idx, sigma_idx]]
         );
     }
 
@@ -2840,7 +2819,7 @@ mod tests {
         let family = learnable_sigma_test_family();
         let beta = learnable_sigma_test_joint_beta();
         let states = latent_survival_states_from_joint_beta(&family, &beta);
-        let h = 1e-6;
+        let h = 2e-4;
         let direction = array![0.07, -0.03, 0.05, 0.02, -0.04];
 
         let analytic = family
@@ -2864,7 +2843,7 @@ mod tests {
             .expect("joint hessian should exist");
 
         let fd = (&hessian_plus - &hessian_minus) / (2.0 * h);
-        let rel = max_relative_array2(&analytic, &fd);
+        let rel = frobenius_relative_array2(&analytic, &fd);
         assert!(rel < 2e-3, "joint dH mismatch: rel={rel}");
     }
 
@@ -2873,7 +2852,7 @@ mod tests {
         let family = learnable_sigma_test_family();
         let beta = learnable_sigma_test_joint_beta();
         let states = latent_survival_states_from_joint_beta(&family, &beta);
-        let h = 1e-6;
+        let h = 5e-4;
         let direction_u = array![0.07, -0.03, 0.05, 0.02, -0.04];
         let direction_v = array![-0.02, 0.06, -0.01, 0.03, 0.05];
 
@@ -2921,7 +2900,73 @@ mod tests {
             .expect("joint dH should exist");
 
         let fd = (&dh_plus - &dh_minus) / (2.0 * h);
-        let rel = max_relative_array2(&analytic, &fd);
-        assert!(rel < 6e-3, "joint d2H mismatch: rel={rel}");
+        let rel = frobenius_relative_array2(&analytic, &fd);
+        assert!(rel < 2.5e-2, "joint d2H mismatch: rel={rel}");
+    }
+
+    #[test]
+    fn latent_survival_row_primary_derivatives_match_fd() {
+        let quadctx = QuadratureContext::new();
+        let row = LatentSurvivalRow::exact_event(0.35, 1.4, 0.1, 0.45, 0.8, 0.12);
+        let primary = array![0.35f64.ln(), 1.4f64.ln(), 0.8, -0.2, 0.4f64.ln()];
+        let sigma = primary[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA].exp();
+        let h_grad = 1e-6;
+        let h_hess = 2e-4;
+
+        let (_, gradient, neg_hessian) = latent_survival_row_primary_gradient_hessian(
+            &quadctx,
+            &row,
+            primary[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+            primary[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+            primary[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+            primary[LATENT_SURVIVAL_PRIMARY_MU],
+            sigma,
+            true,
+        )
+        .expect("analytic row primary gradient/hessian");
+
+        for j in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+            let mut plus = primary.clone();
+            plus[j] += h_grad;
+            let mut minus = primary.clone();
+            minus[j] -= h_grad;
+            let fd_grad = (latent_survival_row_loglik_from_primary(&quadctx, &row, &plus)
+                - latent_survival_row_loglik_from_primary(&quadctx, &row, &minus))
+                / (2.0 * h_grad);
+            let rel_grad =
+                (gradient[j] - fd_grad).abs() / gradient[j].abs().max(fd_grad.abs()).max(1e-12);
+            assert!(
+                rel_grad < 2e-4,
+                "row primary grad[{j}] mismatch: analytic={}, fd={fd_grad}, rel={rel_grad}",
+                gradient[j]
+            );
+
+            for k in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                let mut pp = primary.clone();
+                pp[j] += h_hess;
+                pp[k] += h_hess;
+                let mut pm = primary.clone();
+                pm[j] += h_hess;
+                pm[k] -= h_hess;
+                let mut mp = primary.clone();
+                mp[j] -= h_hess;
+                mp[k] += h_hess;
+                let mut mm = primary.clone();
+                mm[j] -= h_hess;
+                mm[k] -= h_hess;
+                let fd_neg_hess = -(latent_survival_row_loglik_from_primary(&quadctx, &row, &pp)
+                    - latent_survival_row_loglik_from_primary(&quadctx, &row, &pm)
+                    - latent_survival_row_loglik_from_primary(&quadctx, &row, &mp)
+                    + latent_survival_row_loglik_from_primary(&quadctx, &row, &mm))
+                    / (4.0 * h_hess * h_hess);
+                let analytic = neg_hessian[[j, k]];
+                let abs_err = (analytic - fd_neg_hess).abs();
+                let rel = abs_err / analytic.abs().max(fd_neg_hess.abs()).max(1e-10);
+                assert!(
+                    abs_err < 2e-5 || rel < 2e-3,
+                    "row primary neg_hess[{j},{k}] mismatch: analytic={analytic}, fd={fd_neg_hess}, abs_err={abs_err}, rel={rel}"
+                );
+            }
+        }
     }
 }

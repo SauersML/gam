@@ -23,7 +23,7 @@ use ::opt::{
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 /// Matrix-free outer Hessian operator.
 ///
@@ -3270,7 +3270,7 @@ mod tests {
             {
                 let screening_calls = Arc::clone(&screening_calls);
                 move |_: &mut (), _: &Array1<f64>| {
-                    screening_calls.fetch_add(1, Ordering::Relaxed);
+                    screening_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Ok(0.0)
                 }
             },
@@ -3293,7 +3293,7 @@ mod tests {
             )
             .expect("first generated EFS seed should be sufficient");
         assert_eq!(
-            screening_calls.load(Ordering::Relaxed),
+            screening_calls.load(std::sync::atomic::Ordering::Relaxed),
             0,
             "EFS startup should not call eval_cost just to screen seeds"
         );

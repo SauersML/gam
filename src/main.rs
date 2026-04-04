@@ -14373,11 +14373,31 @@ mod tests {
 
     #[test]
     fn run_predict_survival_supports_saved_latent_survival_model() {
+        let data = array![[10.0, 20.0], [12.0, 24.0]];
+        let age_entry = data.column(0).to_owned();
+        let age_exit = data.column(1).to_owned();
+        let time_cfg = gam::survival_construction::SurvivalTimeBasisConfig::ISpline {
+            degree: 2,
+            knots: Array1::zeros(0),
+            keep_cols: Vec::new(),
+            smooth_lambda: 1e-4,
+        };
+        let time_build = gam::survival_construction::build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            time_cfg,
+            Some((2, 1e-4)),
+        )
+        .expect("build latent survival test time basis");
+        let p_time = time_build.x_exit_time.ncols();
+        let time_anchor =
+            gam::survival_construction::resolve_survival_time_anchor_value(&age_entry, None)
+                .expect("resolve latent survival test time anchor");
         let blocks = vec![
             gam::estimate::FittedBlock {
-                beta: array![0.0],
+                beta: Array1::zeros(p_time),
                 role: BlockRole::Time,
-                edf: 1.0,
+                edf: p_time as f64,
                 lambdas: Array1::zeros(0),
             },
             gam::estimate::FittedBlock {
@@ -14391,7 +14411,7 @@ mod tests {
             blocks,
             Array1::zeros(0),
             1.0,
-            Some(Array2::<f64>::eye(2)),
+            Some(Array2::<f64>::eye(p_time + 1)),
             None,
             saved_fit_summary_stub(),
         );
@@ -14415,19 +14435,18 @@ mod tests {
         payload.survival_baseline_target = Some("weibull".to_string());
         payload.survival_baseline_scale = Some(15.0);
         payload.survival_baseline_shape = Some(1.3);
-        payload.survival_time_basis = Some("linear".to_string());
-        payload.survival_time_degree = Some(1);
-        payload.survival_time_knots = Some(vec![]);
-        payload.survival_time_keep_cols = Some(vec![0]);
+        payload.survival_time_basis = Some("ispline".to_string());
+        payload.survival_time_degree = time_build.degree;
+        payload.survival_time_knots = time_build.knots.clone();
+        payload.survival_time_keep_cols = time_build.keep_cols.clone();
         payload.survival_time_smooth_lambda = Some(1e-4);
-        payload.survival_time_anchor = Some(0.0);
-        payload.survival_beta_time = Some(vec![0.0]);
+        payload.survival_time_anchor = Some(time_anchor);
+        payload.survival_beta_time = Some(vec![0.0; p_time]);
         payload.survival_likelihood = Some("latent".to_string());
         payload.training_headers = Some(vec!["entry".to_string(), "exit".to_string()]);
         payload.resolved_termspec = Some(empty_termspec());
         let model = SavedModel::from_payload(payload);
 
-        let data = array![[10.0, 20.0], [12.0, 24.0]];
         let col_map = HashMap::from([("entry".to_string(), 0usize), ("exit".to_string(), 1usize)]);
         let out_dir = tempdir().expect("tempdir");
         let out_path = out_dir.path().join("latent_survival_pred.csv");

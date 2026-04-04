@@ -31,9 +31,8 @@ use crate::families::survival_location_scale::{
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
-    SpatialLengthScaleOptimizationResult, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::reml::unified::HyperOperator;

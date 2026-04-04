@@ -9113,7 +9113,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let fit = fit_survival_location_scale(build_spec(
-                rho,
+                &rho,
                 &specs[0],
                 &specs[1],
                 &designs[0],
@@ -9133,7 +9133,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 );
             }
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let assembled = build_spec(rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
+            let assembled = build_spec(&rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
             let prepared = prepare_survival_location_scale_model(&assembled)?;
             let threshold_derivs = build_survival_covariate_block_psi_derivatives(
                 data,
@@ -9157,7 +9157,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &prepared.family,
                 &prepared.blockspecs,
                 &survival_blockwise_fit_options(&assembled),
-                rho,
+                &rho,
                 &derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
                 if need_hessian && analytic_joint_hessian_available {
@@ -9178,7 +9178,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 );
             }
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let assembled = build_spec(rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
+            let assembled = build_spec(&rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
             let prepared = prepare_survival_location_scale_model(&assembled)?;
             let threshold_derivs = build_survival_covariate_block_psi_derivatives(
                 data,
@@ -9202,7 +9202,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &prepared.family,
                 &prepared.blockspecs,
                 &survival_blockwise_fit_options(&assembled),
-                rho,
+                &rho,
                 &derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )
