@@ -6243,6 +6243,10 @@ impl HessianOperator for DenseSpectralOperator {
         true
     }
 
+    fn prefers_stochastic_trace_estimation(&self) -> bool {
+        false
+    }
+
     fn logdet_traces_match_hinv_kernel(&self) -> bool {
         false
     }
@@ -6690,6 +6694,10 @@ impl HessianOperator for BlockCoupledOperator {
 
     fn is_dense(&self) -> bool {
         true
+    }
+
+    fn prefers_stochastic_trace_estimation(&self) -> bool {
+        false
     }
 
     fn logdet_traces_match_hinv_kernel(&self) -> bool {
@@ -8163,6 +8171,55 @@ mod tests {
         }
     }
 
+    fn build_large_dense_spectral_gaussian_solution(rho: f64) -> InnerSolution<'static> {
+        let p = 520usize;
+        let n = 2 * p;
+        let lambda = rho.exp();
+
+        let xtx_diag = Array1::from_shape_fn(p, |i| 5.0 + 0.01 * (i as f64));
+        let xtx = Array2::from_diag(&xtx_diag);
+        let penalty = Array2::<f64>::eye(p);
+
+        let mut h = xtx.clone();
+        h.scaled_add(lambda, &penalty);
+
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let xty = Array1::from_shape_fn(p, |i| 1.0 + 0.002 * (i as f64));
+        let beta = op.solve(&xty);
+
+        let penalty_quad = lambda * beta.dot(&beta);
+        let yty = 10.0 * (p as f64);
+        let deviance = yty - 2.0 * beta.dot(&xty) + beta.dot(&xtx.dot(&beta));
+        let log_likelihood = -0.5 * deviance;
+
+        InnerSolution {
+            log_likelihood,
+            penalty_quadratic: penalty_quad,
+            hessian_op: Arc::new(op),
+            beta,
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::<f64>::eye(p))],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: (p as f64) * rho,
+                first: array![p as f64],
+                second: None,
+            },
+            deriv_provider: Box::new(GaussianDerivatives),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            rho_curvature_scale: 1.0,
+            n_observations: n,
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::ProfiledGaussian,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        }
+    }
+
     /// The structural test: finite-difference gradient matches analytic gradient.
     ///
     /// Because the unified evaluator computes cost and gradient from the same
@@ -8260,13 +8317,45 @@ mod tests {
     }
 
     #[test]
+    fn dense_spectral_large_p_outer_gradient_matches_finite_difference() {
+        let rho = 0.2;
+        let solution = build_large_dense_spectral_gaussian_solution(rho);
+        let result =
+            reml_laml_evaluate(&solution, &[rho], EvalMode::ValueAndGradient, None).unwrap();
+        let analytic = result.gradient.expect("gradient")[0];
+
+        let eps = 1e-5;
+        let rho_plus = rho + eps;
+        let solution_plus = build_large_dense_spectral_gaussian_solution(rho_plus);
+        let cost_plus = reml_laml_evaluate(&solution_plus, &[rho_plus], EvalMode::ValueOnly, None)
+            .unwrap()
+            .cost;
+
+        let rho_minus = rho - eps;
+        let solution_minus = build_large_dense_spectral_gaussian_solution(rho_minus);
+        let cost_minus =
+            reml_laml_evaluate(&solution_minus, &[rho_minus], EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost;
+
+        let fd = (cost_plus - cost_minus) / (2.0 * eps);
+        let rel_err = (analytic - fd).abs() / (1.0 + analytic.abs());
+        assert!(
+            rel_err < 2e-4,
+            "large-p dense spectral gradient mismatch: analytic={analytic:.8e}, fd={fd:.8e}, rel_err={rel_err:.3e}"
+        );
+    }
+
+    #[test]
     fn dense_spectral_logdet_traces_do_not_claim_hinv_kernel_equivalence() {
         let h = array![[4.0, 1.0], [1.0, 3.0]];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        assert!(!op.prefers_stochastic_trace_estimation());
         assert!(!op.logdet_traces_match_hinv_kernel());
         assert!(!can_use_stochastic_logdet_hinv_kernel(&op, 1024, true));
 
         let block = BlockCoupledOperator::from_joint_hessian(&h).unwrap();
+        assert!(!block.prefers_stochastic_trace_estimation());
         assert!(!block.logdet_traces_match_hinv_kernel());
         assert!(!can_use_stochastic_logdet_hinv_kernel(&block, 1024, true));
     }

@@ -582,6 +582,7 @@ fn blockwise_options_from_fit_args(
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
     options.use_outer_hessian = true;
+    options.compute_covariance = true;
     Ok(options)
 }
 
@@ -10555,8 +10556,9 @@ mod tests {
         write_survival_prediction_csv,
     };
     use super::{
-        CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, needs_special_generate_handling,
-        needs_special_predict_handling, run_fit, run_predict, write_model_json,
+        Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg,
+        needs_special_generate_handling, needs_special_predict_handling, run_fit, run_predict,
+        write_model_json,
     };
     use csv::StringRecord;
     use gam::basis::{
@@ -11023,6 +11025,23 @@ mod tests {
             pilot_subsample_threshold: 0,
             out: Some(out),
         }
+    }
+
+    #[test]
+    fn cli_predict_defaults_to_posterior_mean_instead_of_map() {
+        let cli = Cli::parse_from([
+            "gam",
+            "predict",
+            "model.json",
+            "new_data.csv",
+            "--out",
+            "predictions.csv",
+        ]);
+        let Command::Predict(args) = cli.command else {
+            panic!("expected predict command");
+        };
+        assert_eq!(args.mode, PredictModeArg::PosteriorMean);
+        assert_ne!(args.mode, PredictModeArg::Map);
     }
 
     #[test]
